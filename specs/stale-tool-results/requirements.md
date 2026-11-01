@@ -103,6 +103,10 @@ tokens freed exceed both an absolute minimum threshold and a minimum fraction of
 the prompt whose cached prefix is disturbed; otherwise THE SYSTEM SHALL remove
 nothing on that turn.
 
+The tokens freed SHALL be the aggregate original result cost minus the aggregate
+replacement marker cost, floored at zero after summing both costs. A replacement
+that enlarges a small result SHALL count against the sweep's total gain.
+
 ### REQ-STR-007 — Keep Reuse Savings Stable Across Turns
 
 **Rationale:** Reuse of previously-processed context is what makes a long
@@ -161,3 +165,17 @@ SHALL govern both the result's text and its images: IF a result is retained its
 images are retained, and IF a result is removed its images are removed. THE
 SYSTEM SHALL NOT maintain a separate retirement schedule for images that removes
 them from a result still otherwise retained.
+
+### REQ-STR-012 — Preserve Interpretation Without Duplicating Memory
+
+WHEN clearing eligible stale tool output
+THE SYSTEM SHALL retain the producing call identity and persisted source locator alongside the removal marker
+AND SHALL NOT clear subsequent assistant interpretation, decisions, or user corrections merely because their source result was cleared
+AND SHALL preserve the immediate working set under REQ-STR-003 and the monotonic worthwhile sweep rules under REQ-STR-006/007.
+
+WHEN summarizing retained interpretation
+THE SYSTEM SHALL distinguish a historical observation, a delegate report, an agent inference, and an authentic user direction using known source attribution
+AND SHALL retain known uncertainty and later supersession rather than promote an old observation into a current verified fact
+AND SHALL provide retrieval references for omitted supporting evidence when known.
+
+The durable transcript SHALL remain the evidence authority. These obligations SHALL NOT require a second continuously synchronized semantic memory store or a distinct Coordinator retention engine.

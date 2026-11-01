@@ -1,0 +1,9 @@
+# Current-schema prepared-artifact installer
+
+User explicitly commissioned: improve installer to support new schema; parallel disk cleanup belongs solely to host. Implement an honest ordinary current-schema prepared-artifact upgrade path, separate from eligible legacy paired-database upgrade. Current production schema123 is rejected by legacy<=69/noProductConversation gate. Do not bypass or falsify that gate.
+
+Preserve exact commit/architecture/checksum/DeveloperID/hardened-runtime/timestamp/version and clean controller identity checks. Explicit mode selection and incompatibility validation. Consistent SQLite backup, integrity/FK/hash/ledger proof, real backup/restore/install capacity reservation, exclusive migration ownership, candidate schema compatibility, fail-closed unknown/newer schemas. Rollback only failed uncommitted activation with matching predecessor; never discard committed later writes. Explicit wake126/home127 irreversible semantics and recovery/finalization states. No new deployment framework, ad hoc DB copies, repair, security downgrade or restart loops.
+
+Read existing dev.py/helper, compatibility/deployment specs and ADRs first. Necessary normative contract/ADR updates included. Design plus independent review, deterministic fault tests, actual isolated legacy/current upgrade+rollback proof, exact-head CI/macOS. Reuse prepared artifacts without local heavy builds unless host resource admission. No production tests/deploy/cleanup/config changes: Global final admission and sole host operations required. Preserve exact evidence and prior failures.
+
+First execution: inspect source and reproduce schema123 rejection; report exact source anchors and failing regression. Sole source owner; coordinator supplies host contract and Global identity. Work can proceed independently of cleanup/signing/provider gates. Commit/publish focused PR; user reviews/merges, do not merge.

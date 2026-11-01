@@ -18,7 +18,6 @@
 //! and spec update (specs/browser-tool/requirements.md REQ-BT-017).
 
 // No imports needed — this module only exports constants (the JS scripts).
-// The hook is injected by BrowserSession::launch_and_init() in session.rs.
 // React detection is called by BrowserNavigateTool in tools.rs.
 
 // ============================================================================

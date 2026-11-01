@@ -35,3 +35,7 @@ Implement a persisted, versioned project-instruction bundle with an explicit use
 - [ ] Cache-read measurements repeat the cold, warm, tool-loop, and mid-session guidance-mutation matrix before and after implementation.
 - [ ] Specs describe bundle contents, stale detection, confirmation, queued activation, recovery, and generation boundaries.
 - [ ] `./dev.py check` passes.
+
+## Scope reconciliation — accepted turn-boundary refresh
+
+The user subsequently selected live refresh of both ordinary skill metadata and repository guidance at each new turn, retained through model/tool rounds. Skill invocation uses current same-name source/current instructions; executor reconstruction may rediscover. This supersedes this task's assumption that those inputs remain unchanged until manual refresh. The bounded turn-stability work does not implement or authorize this task's persisted bundle, refresh UI, token estimate, generation event or measurement campaign. Do not mark this task done based on that increment; reassess remaining scope against the accepted policy before further implementation.

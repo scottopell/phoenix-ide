@@ -142,8 +142,10 @@ different paths (common with symlinked skill directories).
 ### REQ-SK-007: Skill Metadata in System Prompt
 
 THE SYSTEM SHALL include a catalog of discovered skill names, descriptions,
-and argument hints in the system prompt so the LLM knows which skills are
+and source locations in the system prompt so the LLM knows which skills are
 available
+
+THE SYSTEM SHALL reserve argument hints for UI autocomplete
 
 THE SYSTEM SHALL NOT include skill bodies in the system prompt (they are loaded
 on invocation, not preloaded)
@@ -178,3 +180,52 @@ THE SYSTEM SHALL NOT allow a filesystem skill to grant itself Global Coordinator
 
 WHEN no eligible Global Coordinator built-in is discoverable
 THE SYSTEM SHALL omit the Coordinator skill catalog and SHALL NOT refer to a missing skill
+
+
+---
+
+### REQ-SK-009: Turn-scoped Ordinary Catalog Advertisement
+
+WHEN the first model request of a new ordinary conversation turn is constructed
+THE SYSTEM SHALL resolve and retain one metadata-only skill catalog for that turn
+AND SHALL reuse its exact advertised names, descriptions, and source locations throughout model calls, tool calls, retries, and mid-turn steering drains.
+
+WHEN a new input and its resulting turn state are successfully persisted, including ordinary user input, task-approval feedback, question answers, an automatic goal-continuation input, or a queued batch starting from Idle
+THE SYSTEM SHALL refresh the advertised catalog before that turn's first model request.
+A queued batch added to an already-running turn SHALL NOT refresh the catalog.
+Rejected input, failed input or turn-state persistence, and stale authoritative-input replay SHALL NOT refresh it.
+
+THE SYSTEM SHALL retain ordinary catalog authority in the system prompt.
+A boundary refresh MAY rebuild that prefix and incur a provider cache miss; no appended provider update is required.
+This contract SHALL NOT imply that other system-prompt content is frozen or that all prior provider history is append-only.
+
+WHEN an executor is reconstructed, including after process restart
+THE SYSTEM SHALL resolve a fresh catalog for its first model request
+AND SHALL NOT claim to restore the prior executor's advertised snapshot.
+In-process retries SHALL reuse the existing snapshot.
+
+WHEN an ordinary skill is invoked
+THE SYSTEM SHALL resolve the name using current audience-filtered discovery and precedence, and read the current body of the selected source.
+A new shadowing source or removal of the previous winner MAY change the selected path; the returned base directory SHALL identify the source actually invoked.
+If no current source matches, invocation SHALL report not found; if the selected filesystem source cannot be read, invocation SHALL report the read failure.
+The advertised catalog SHALL NOT pin a skill body or source identity and SHALL NOT grant execution permission.
+Live authorization, cancellation, and tool admission SHALL remain effective immediately.
+
+THE SYSTEM SHALL preserve the Global Coordinator's separate authenticated embedded catalog and trusted-result provenance contract in REQ-SK-008.
+
+### REQ-SK-010: Repository guidance shares the live-turn refresh boundary
+
+WHEN an ordinary executor dispatches the first model request of a new turn
+THE SYSTEM SHALL capture the ordered repository/ancestor guidance source paths and contents using the existing discovery precedence and deduplication
+AND SHALL retain them with the advertised skill metadata throughout that live turn's model/tool rounds and retries.
+
+Guidance SHALL refresh at the same committed new-input boundaries specified by REQ-SK-009, not mid-turn steering or rejected/failed input.
+
+WHEN an executor is reconstructed after a process restart, including resumption of an interrupted turn,
+OR a successor executor is constructed by Continue after context exhaustion,
+THE SYSTEM SHALL discover current repository guidance for its first ordinary model request
+AND SHALL NOT restore the predecessor executor's in-memory guidance snapshot.
+
+Guidance stability SHALL apply only within an uninterrupted live executor turn. Next-turn refresh, restart rediscovery and Continue successor rediscovery are intended adoption boundaries, not failures requiring snapshot persistence. This contract does not promise a persisted historical snapshot or stability of all other instruction/tool content.
+
+Guidance SHALL remain at its existing system/developer authority through provider translation. Next-turn replacement MAY incur a cache miss; no synthetic provider event, manual refresh action, new transcript or configuration version is required. Current runtime permissions, skill invocation bodies and MCP availability policies SHALL remain independent of this snapshot. Global Coordinator construction SHALL remain unchanged.

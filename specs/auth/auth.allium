@@ -15,6 +15,9 @@ config {
     -- When empty/unset, auth is disabled (open access).
     password: String?
     auth_enabled: password != null
+    -- Non-null owner passwords cannot have the complete receiver-issued peer
+    -- bearer shape. A leading phx_peer_ alone remains valid.
+    owner_password_domain_disjoint: password = null or not peer_bearer_shape(password)
 
     -- Consecutive Bearer-password failures from one peer before lockout.
     max_login_failures: Integer
@@ -23,6 +26,13 @@ config {
     -- Lifetime of a minted session token; also the phoenix-auth cookie Max-Age.
     session_ttl: Duration
 }
+
+------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------
+-- peer_bearer_shape(value: String) -> Boolean
+--     True exactly when value is `phx_peer_` followed by 43 URL-safe base64
+--     characters, the complete receiver-issued peer bearer credential domain.
 
 ------------------------------------------------------------
 -- External Entities
@@ -328,6 +338,12 @@ invariant NoTokensWithoutAuth {
     not config.auth_enabled implies ShareTokens.count = 0
 }
 
+-- Owner and peer authority cannot share one raw bearer. Configuration fails
+-- before requests are served when config.password has the complete peer shape.
+invariant OwnerCredentialDomainIsDisjoint {
+    config.owner_password_domain_disjoint
+}
+
 -- Throttling applies to password verification only. A request authenticated
 -- by a valid session-token cookie is never subject to the per-peer lockout:
 -- session_token_valid(request) consults the session store and touches no
@@ -358,11 +374,3 @@ invariant ThrottleScopedToPasswordChecks {
 -- Enforced at the call site, not as a structural invariant the model can
 -- verify -- the model has no notion of compare timing.
 -- Implementation: see crates/phoenix-ide/src/api/auth.rs (`constant_time_eq`).
-
-------------------------------------------------------------
--- Open Questions
-------------------------------------------------------------
-
--- RESOLVED: Share tokens are persisted to DB (share_tokens table).
--- They represent a user decision and should survive restarts.
--- Migration: CREATE TABLE share_tokens (conversation_id TEXT, token TEXT, created_at TEXT).

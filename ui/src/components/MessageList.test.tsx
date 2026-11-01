@@ -6,12 +6,13 @@ import { FocusScopeProvider, useFocusScopeCommands } from '../hooks/useFocusScop
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, waitFor, act, fireEvent, screen } from '@testing-library/react';
 import { GESTURE_STALE_MS } from './VirtualTranscript';
-import type { VirtualTranscriptPhysicalSnapshot, VirtualTranscriptRangeChange } from './VirtualTranscript';
+import type { VirtualTranscriptPhysicalSnapshot, VirtualTranscriptRangeChange, VirtualTranscriptPositioningAuthority } from './VirtualTranscript';
 import type { ConversationState, Message } from '../api';
 import type { AgentTextHighlight, AgentTextRevealRequest } from './MessageComponents';
 import { MessageList } from './MessageList';
+import * as scrollPolicy from '../conversation/scrollMachine';
 import type { HistoryScrollCommand } from '../conversation/historyExpansion';
-import type { TranscriptPositioningInput } from '../conversation/transcriptPositioning';
+import { transcriptPositioningCommandKey, type TranscriptPositioningInput } from '../conversation/transcriptPositioning';
 import { ConversationContext } from '../conversation/ConversationContext';
 import { ConversationStore } from '../conversation/ConversationStore';
 import { buildReadFileOutputProjection } from './viewer-find/searchProjections';
@@ -71,7 +72,9 @@ vi.mock('./MessageComponents', async () => {
         ...(revealRequest !== undefined ? { revealRequest } : {}),
         ...(activeHighlight !== undefined ? { activeHighlight } : {}),
       });
-      if (agentMessageMockState.autoHandleReveal && revealRequest && onRevealHandled) onRevealHandled(revealRequest);
+      React.useEffect(() => {
+        if (agentMessageMockState.autoHandleReveal && revealRequest && onRevealHandled) onRevealHandled(revealRequest);
+      }, [revealRequest, onRevealHandled]);
       return <div className="message agent" data-sequence-id={message.sequence_id} data-highlight-fragment={activeHighlight?.fragmentId ?? ''}>agent</div>;
     }),
     ToolOnlyAgentTurnGroup: ({ members, revealRequest, activeHighlight, onRevealHandled }: {
@@ -79,16 +82,18 @@ vi.mock('./MessageComponents', async () => {
       revealRequest?: AgentTextRevealRequest | null;
       activeHighlight?: AgentTextHighlight | null;
       onRevealHandled?: ((request: AgentTextRevealRequest) => void) | undefined;
-    }) => (
-      <>
+    }) => {
+      React.useEffect(() => {
+        if (agentMessageMockState.autoHandleReveal && revealRequest && onRevealHandled) onRevealHandled(revealRequest);
+      }, [revealRequest, onRevealHandled]);
+      return <>
         {members.map(({ agent }) => {
           agentRenderCounter.count++;
           agentMessageProps.push({ message: agent, forceExpandedText: false, isLatestAgentMessage: false, ...(revealRequest !== undefined ? { revealRequest } : {}), ...(activeHighlight !== undefined ? { activeHighlight } : {}) });
-          if (agentMessageMockState.autoHandleReveal && revealRequest && onRevealHandled) onRevealHandled(revealRequest);
           return <div key={agent.message_id} id={`message-${agent.message_id}`} className="message agent" data-sequence-id={agent.sequence_id}>agent</div>;
         })}
-      </>
-    ),
+      </>;
+    },
     SubAgentStatus: ({ stateData }: { stateData: { pending: Array<{ task: string }>; completed_results: Array<{ task: string }> } }) => (
       <div data-testid="subagent-status-mock">
         {stateData.completed_results.map((agent, index) => <div key={`completed-${index}`}>{`completed ${agent.task}`}</div>)}
@@ -130,7 +135,13 @@ vi.mock('./MessageContextMenu', () => ({
 // tests can exercise the manual auto-follow callback (see the
 // `handleTotalListHeightChanged` test group).
 const virtualTranscriptMock = {
+  rebindScroller: undefined as ((element: HTMLDivElement | null) => void) | undefined,
+  churnDuringLayout: false,
   scrollToIndex: vi.fn(),
+  scrollToOwnedIndex: vi.fn(),
+  completePosition: vi.fn(),
+  interruptPosition: vi.fn(),
+  cancelPosition: vi.fn(),
   scrollToTail: vi.fn(),
   setTailFollowAllowed: vi.fn(),
   isProgrammaticScroll: vi.fn(),
@@ -143,6 +154,8 @@ const virtualTranscriptMock = {
   totalExtentChanged: null as ((height: number) => void) | null,
   pinnedChanged: null as ((pinned: boolean) => void) | null,
   rangeChanged: null as ((snapshot: VirtualTranscriptRangeChange) => void) | null,
+  publishDuringLayout: false,
+  positioningAuthority: { kind: 'absent' } as VirtualTranscriptPositioningAuthority,
   currentSnapshot: { renderedRange: null, visibleRange: null, viewportTop: 0, layoutRevision: 1, targetMeasured: false } as VirtualTranscriptPhysicalSnapshot,
   renderedIndices: null as Set<number> | null,
 };
@@ -153,9 +166,13 @@ function indexOrZero(index: number): number {
 
 beforeEach(() => {
   virtualTranscriptMock.scrollToIndex = vi.fn();
+  virtualTranscriptMock.scrollToOwnedIndex = vi.fn((_owner: string, ...args: unknown[]) => virtualTranscriptMock.scrollToIndex(...args));
+  virtualTranscriptMock.cancelPosition = vi.fn();
   virtualTranscriptMock.scrollToTail = vi.fn();
   virtualTranscriptMock.setTailFollowAllowed = vi.fn();
   virtualTranscriptMock.isProgrammaticScroll = vi.fn(() => false);
+  virtualTranscriptMock.completePosition = vi.fn();
+  virtualTranscriptMock.interruptPosition = vi.fn();
   virtualTranscriptMock.captureVisibleAnchor = vi.fn(() => null);
   virtualTranscriptMock.preserveViewportOnNextItemsChange = vi.fn();
   virtualTranscriptMock.measureOffsetForIndex = vi.fn(() => null);
@@ -168,6 +185,8 @@ beforeEach(() => {
   virtualTranscriptMock.totalExtentChanged = null;
   virtualTranscriptMock.pinnedChanged = null;
   virtualTranscriptMock.rangeChanged = null;
+  virtualTranscriptMock.publishDuringLayout = false;
+  virtualTranscriptMock.positioningAuthority = { kind: 'absent' };
   virtualTranscriptMock.renderedIndices = null;
   agentRenderCounter.count = 0;
   agentMessageProps.length = 0;
@@ -188,6 +207,7 @@ vi.mock('./VirtualTranscript', async () => {
       onPinnedChange,
       onRangeChange,
       header,
+      positioningAuthority,
       empty,
     }: {
       items: readonly T[];
@@ -198,10 +218,12 @@ vi.mock('./VirtualTranscript', async () => {
       onTotalExtentChange?: (height: number) => void;
       onPinnedChange?: (pinned: boolean) => void;
       onRangeChange?: (snapshot: VirtualTranscriptRangeChange) => void;
+      positioningAuthority?: VirtualTranscriptPositioningAuthority;
       header?: React.ReactNode;
       empty?: React.ReactNode;
     }, ref: React.Ref<{ scrollToIndex: (index: number, align: 'start' | 'end', viewportStartOffset?: number) => void; scrollToTail: () => void; setTailFollowAllowed: (allowed: boolean) => void; isProgrammaticScroll: (scrollTop: number) => boolean; captureVisibleAnchor: () => unknown; preserveViewportOnNextItemsChange: () => void; measureOffsetForIndex: (index: number) => number | null; measureOffsetForIndexAtSnapshot: (index: number, snapshot: VirtualTranscriptPhysicalSnapshot) => number | null; layoutRevision: () => number; physicalSnapshot: (targetIndex?: number) => VirtualTranscriptPhysicalSnapshot }>) => {
       const containerRef = useRef<HTMLDivElement>(null);
+      virtualTranscriptMock.positioningAuthority = positioningAuthority ?? { kind: 'absent' };
       if (onTotalExtentChange) {
         virtualTranscriptMock.totalExtentChanged = onTotalExtentChange;
       }
@@ -216,6 +238,10 @@ vi.mock('./VirtualTranscript', async () => {
       }
       useImperativeHandle(ref, () => ({
         scrollToIndex: virtualTranscriptMock.scrollToIndex,
+        scrollToOwnedIndex: virtualTranscriptMock.scrollToOwnedIndex,
+        completePosition: virtualTranscriptMock.completePosition,
+        interruptPosition: virtualTranscriptMock.interruptPosition,
+        cancelPosition: virtualTranscriptMock.cancelPosition,
         scrollToTail: virtualTranscriptMock.scrollToTail,
         setTailFollowAllowed: virtualTranscriptMock.setTailFollowAllowed,
         isProgrammaticScroll: virtualTranscriptMock.isProgrammaticScroll,
@@ -226,6 +252,19 @@ vi.mock('./VirtualTranscript', async () => {
         layoutRevision: virtualTranscriptMock.layoutRevision,
         physicalSnapshot: virtualTranscriptMock.physicalSnapshot,
       }), []);
+      useLayoutEffect(() => {
+        if (virtualTranscriptMock.publishDuringLayout) {
+          virtualTranscriptMock.publishDuringLayout = false;
+          onRangeChange?.(virtualTranscriptMock.currentSnapshot);
+        }
+      });
+      virtualTranscriptMock.rebindScroller = scrollerRef;
+      useLayoutEffect(() => {
+        if (virtualTranscriptMock.churnDuringLayout) {
+          scrollerRef?.(null);
+          scrollerRef?.(containerRef.current);
+        }
+      });
       useLayoutEffect(() => {
         scrollerRef?.(containerRef.current);
         return () => scrollerRef?.(null);
@@ -255,6 +294,7 @@ function makeMessage(sequence_id: number, message_type: Message['message_type'] 
     ? { tool_use_id: `tool-${sequence_id}`, content: 'tool result', is_error: false }
     : { text: `message ${sequence_id}` };
   return {
+    event_presentation: null,
     message_id: `msg-${sequence_id}`,
     sequence_id,
     message_type,
@@ -316,6 +356,7 @@ describe('latest assistant expansion in compact mode', () => {
     render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -340,6 +381,7 @@ describe('MessageList', () => {
   it('claims find only while open, refocuses on repeat, and closes from transcript body', async () => {
     render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[makeMessage(1)]}
         pendingMessages={[]}
         convState={idleState}
@@ -375,6 +417,7 @@ describe('MessageList', () => {
   it('falls back to the live transcript when the find focus origin was virtualized away', async () => {
     render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[makeMessage(1)]}
         pendingMessages={[]}
         convState={idleState}
@@ -402,6 +445,7 @@ describe('MessageList', () => {
     const message = { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'hidden alpha match' }] } as Message;
     render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[message]}
         pendingMessages={[]}
         convState={idleState}
@@ -430,6 +474,7 @@ describe('MessageList', () => {
     const message = { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'alpha row match' }] } as Message;
     render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[message]}
         pendingMessages={[]}
         convState={idleState}
@@ -461,6 +506,7 @@ describe('MessageList', () => {
     ];
     const { rerender } = render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={initialMessages}
         pendingMessages={[]}
         convState={idleState}
@@ -482,6 +528,7 @@ describe('MessageList', () => {
 
     rerender(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={initialMessages.slice(0, 2)}
         pendingMessages={[]}
         convState={idleState}
@@ -503,6 +550,7 @@ describe('MessageList', () => {
   it('searches expanded system prompt text when visible in the transcript header', async () => {
     render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[makeMessage(1)]}
         pendingMessages={[]}
         convState={idleState}
@@ -525,6 +573,7 @@ describe('MessageList', () => {
   it('reveals and highlights the expanded system prompt header match instead of scrolling to a row', async () => {
     render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[makeMessage(1)]}
         pendingMessages={[]}
         convState={idleState}
@@ -558,6 +607,7 @@ describe('MessageList', () => {
       <ConversationContext.Provider value={store}>
         <FocusScopeProvider>
           <MessageList
+            streamingRequestId={null}
             slug="conv-stream-find"
             messages={messages}
             pendingMessages={[]}
@@ -601,6 +651,7 @@ describe('MessageList', () => {
   it('does not build transcript matches while find is closed or queryless', async () => {
     render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[makeMessage(1)]}
         pendingMessages={[]}
         convState={idleState}
@@ -625,6 +676,7 @@ describe('MessageList', () => {
     render(withConvContext(
       <PushScopeOnMount scopeId="overlay-scope">
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1)]}
           pendingMessages={[]}
           convState={idleState}
@@ -654,6 +706,7 @@ describe('MessageList', () => {
 
     render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[skillMessage]}
         pendingMessages={[]}
         convState={idleState}
@@ -677,6 +730,7 @@ describe('MessageList', () => {
 
     render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[]}
         pendingMessages={[]}
         convState={awaitingState}
@@ -711,6 +765,7 @@ describe('MessageList', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[skillMessage]}
           pendingMessages={[]}
           convState={idleState}
@@ -755,6 +810,7 @@ describe('MessageList', () => {
     const { container, rerender } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[pending]}
           convState={idleState}
@@ -778,6 +834,7 @@ describe('MessageList', () => {
     rerender(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[
             ...historical,
             {
@@ -817,6 +874,7 @@ describe('MessageList', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -841,6 +899,7 @@ describe('MessageList', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -867,7 +926,7 @@ describe('MessageList', () => {
     expect(getComputedStyle(messagesScroller!).overflowY).toBe('auto');
   });
 
-  it('sizes wide markdown tables from the non-scrolling chat boundary', () => {
+  it('keeps streaming and finalized markdown tables within the readable message width', () => {
     const chatViewRule = appCss.match(/#chat-view\.view\.active\s*{[^}]*}/s)?.[0];
     const tableFallbackRule = appCss.match(/\.markdown-table-scroll\s*{[^}]*}/s)?.[0];
     const tableBreakoutRule = appCss.match(/(\.message\.agent\s*>\s*\.message-content\s*>\s*\.agent-text-block\s*>\s*\.markdown-table-scroll)\s*{([^}]*)}/s);
@@ -879,12 +938,9 @@ describe('MessageList', () => {
     expect(chatViewRule).toMatch(/container-type:\s*inline-size/);
     expect(tableFallbackRule).toMatch(/max-width:\s*100%/);
     expect(tableFallbackRule).toMatch(/overflow-x:\s*auto/);
-    expect(tableBreakoutRule?.[1]).toBe('.message.agent > .message-content > .agent-text-block > .markdown-table-scroll');
-    expect(tableBreakoutRule?.[2]).toMatch(/width:\s*calc\(100cqw\s*-\s*16px\)/);
-    expect(tableBreakoutRule?.[2]).toMatch(/margin-inline:\s*calc\(\(100%\s*-\s*\(100cqw\s*-\s*16px\)\)\s*\/\s*2\)/);
-    expect(tableBreakoutRule?.[2]).not.toMatch(/transform|position|left:/);
-    expect(tableBreakoutTableRule).toMatch(/min-width:\s*min\(100%,\s*784px\)/);
-    expect(tableBreakoutTableRule).toMatch(/margin-inline:\s*auto/);
+    expect(tableBreakoutRule).toBeNull();
+    expect(tableBreakoutTableRule).toBeUndefined();
+    expect(appCss).not.toMatch(/100cqw/);
     expect(markdownTableRule).toMatch(/background:\s*var\(--bg-secondary\)/);
     expect(tableFallbackRule).not.toMatch(/background/);
     expect(tableCodeRule).toMatch(/font-size:\s*inherit/);
@@ -904,6 +960,7 @@ describe('MessageList', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -926,6 +983,7 @@ describe('MessageList', () => {
       const { container } = render(
         withConvContext(
           <MessageList
+            streamingRequestId={null}
             ref={listRef}
             messages={historical}
             pendingMessages={[]}
@@ -961,9 +1019,22 @@ describe('MessageList', () => {
     }
   });
 
+  it('uses only the admitted command and pulses the exact source tool when its disclosure mounts', async () => {
+    const source = { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'Sending' }, { type: 'tool_use', id: 'source-tool', name: 'send_conversation_message', input: { message: 'payload' } }] } as Message;
+    const view = { conversationId: 'aggregate-owner', generation: 1, transcriptGeneration: 1 };
+    render(withConvContext(<MessageList streamingRequestId={null} messages={[source]} pendingMessages={[]} convState={idleState} onRetry={vi.fn()} onOpenFile={undefined} conversationId="aggregate-owner" transcriptPositioning={{ kind: 'positioning', command: { kind: 'jump_to_message', token: 1, requestToken: 1, view, targetMessageId: source.message_id } }} sourceCallTarget={{ messageId: source.message_id, toolUseId: 'source-tool' }} />));
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(0, 'start', undefined, '[data-tool-id="source-tool"]');
+    const tool = document.createElement('div');
+    tool.dataset['toolId'] = 'source-tool';
+    document.querySelector('[data-render-unit-key="msg-1"]')!.append(tool);
+    await waitFor(() => expect(tool).toHaveClass('jump-highlight'));
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
+  });
+
   it('positions an admitted source call even when ordinary history positioning is idle', () => {
     const source = { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'Sending' }, { type: 'tool_use', id: 'source-tool', name: 'send_conversation_message', input: { message: 'payload' } }] } as Message;
-    render(withConvContext(<MessageList messages={[source]} pendingMessages={[]} convState={idleState} onRetry={vi.fn()} onOpenFile={undefined} conversationId="source-member" transcriptPositioning={{ kind: 'idle', view: { conversationId: 'source-member', generation: 1, transcriptGeneration: 1 } }} sourceCallTarget={{ messageId: source.message_id, toolUseId: 'source-tool' }} />));
+    render(withConvContext(<MessageList streamingRequestId={null} messages={[source]} pendingMessages={[]} convState={idleState} onRetry={vi.fn()} onOpenFile={undefined} conversationId="source-member" transcriptPositioning={{ kind: 'idle', view: { conversationId: 'source-member', generation: 1, transcriptGeneration: 1 } }} sourceCallTarget={{ messageId: source.message_id, toolUseId: 'source-tool' }} />));
     expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(0, 'start', 0, '[data-tool-id="source-tool"]');
   });
 
@@ -973,6 +1044,7 @@ describe('MessageList', () => {
     const second = { ...makeMessage(2, 'agent'), content: [{ type: 'tool_use', id: 'group-use-2', name: 'search', input: { pattern: 'two' } }] } as Message;
     const { container } = render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         ref={listRef}
         messages={[first, second]}
         pendingMessages={[]}
@@ -1001,6 +1073,7 @@ describe('MessageList', () => {
     virtualTranscriptMock.renderedIndices = new Set([0]);
     const renderList = () => withConvContext(
       <MessageList
+        streamingRequestId={null}
         ref={listRef}
         messages={historical}
         pendingMessages={[]}
@@ -1031,12 +1104,39 @@ describe('MessageList', () => {
     expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(2);
   });
 
+  it('keeps terminal probe ownership at issuance when a selected segment changes before finish', () => {
+    const message = makeMessage(1, 'user');
+    const view = { conversationId: 'probe-product', generation: 2, transcriptGeneration: 3 };
+    const command: HistoryScrollCommand = { kind: 'jump_to_message', token: 4, requestToken: 0, view, targetMessageId: message.message_id };
+    let probe: import('../hooks/conversationViewAnchorProbe').ViewAnchorProbe | null = null;
+    const register = (next: typeof probe) => { probe = next; };
+    virtualTranscriptMock.currentSnapshot = { renderedRange: null, visibleRange: null, viewportTop: 0, layoutRevision: 1, targetMeasured: false };
+    const list = (scope: string) => withConvContext(<MessageList
+      streamingRequestId={null} messages={[message]} pendingMessages={[]} convState={idleState}
+      onRetry={vi.fn()} onOpenFile={undefined} conversationId="probe-product"
+      transcriptPositioning={{ kind: 'positioning', command }}
+      viewAnchorIntent={{ scope, command }} onViewAnchorProbe={register}
+    />);
+    const { rerender } = render(list('original-segment'));
+    expect(probe!()).toEqual({ kind: 'pending' });
+    virtualTranscriptMock.currentSnapshot = { renderedRange: { startIndex: 0, endIndex: 0 }, visibleRange: { startIndex: 0, endIndex: 0 }, viewportTop: 0, layoutRevision: 2, targetMeasured: true };
+    rerender(list('new-segment'));
+    act(() => virtualTranscriptMock.rangeChanged?.(virtualTranscriptMock.currentSnapshot));
+    const calls = virtualTranscriptMock.physicalSnapshot.mock.calls.length;
+    expect(probe!()).toEqual({ kind: 'pending' });
+    expect(virtualTranscriptMock.physicalSnapshot).toHaveBeenCalledTimes(calls);
+    rerender(list('original-segment'));
+    expect(probe!()).toEqual({ kind: 'target', messageId: message.message_id, disposition: 'applied' });
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
+  });
+
   it('does not apply a pending highlight to a new conversation reusing the same row key', () => {
     const listRef = createRef<React.ElementRef<typeof MessageList>>();
     const messages = [makeMessage(1, 'user')];
     virtualTranscriptMock.renderedIndices = new Set();
     const renderList = (conversationId: string) => withConvContext(
       <MessageList
+        streamingRequestId={null}
         ref={listRef}
         messages={messages}
         pendingMessages={[]}
@@ -1065,6 +1165,7 @@ describe('MessageList', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -1096,6 +1197,41 @@ describe('MessageList', () => {
 });
 
 describe('history scroll acknowledgement + continuity suppression', () => {
+  it.each(['nonexistent', 'other-member', 'user-message', 'thinking-aside'])('finishes an exact source-tool jump as missing for %s instead of waiting for nonexistent geometry', kind => {
+    const first = { ...makeMessage(1, kind === 'user-message' ? 'user' : 'agent'), content: [{ type: 'tool_use', id: 'own-tool', name: kind === 'thinking-aside' ? 'think' : 'read_file', input: {} }] } as Message;
+    const second = { ...makeMessage(2, 'agent'), content: [{ type: 'tool_use', id: 'other-tool', name: 'search', input: {} }] } as Message;
+    const command = makeJumpToMessageCommand({ targetMessageId: first.message_id });
+    const handled = vi.fn();
+    render(withConvContext(<MessageList streamingRequestId={null} messages={[first, second]} pendingMessages={[]}
+      convState={idleState} onRetry={vi.fn()} onOpenFile={undefined} conversationId="conv-history"
+      sourceCallTarget={{ messageId: first.message_id, toolUseId: kind === 'other-member' ? 'other-tool' : kind === 'user-message' || kind === 'thinking-aside' ? 'own-tool' : 'gone' }}
+      transcriptPositioning={{ kind: 'positioning', command }} onHistoryScrollCommandHandled={handled} />));
+    expect(handled.mock.calls).toEqual([[{ commandKey: transcriptPositioningCommandKey(command), result: 'target_missing' }]]);
+    expect(virtualTranscriptMock.scrollToOwnedIndex).not.toHaveBeenCalled();
+    expect(virtualTranscriptMock.scrollToIndex).not.toHaveBeenCalled();
+  });
+
+  it('restores a valid reader anchor despite a stale source-tool refinement in the URL', () => {
+    const command = makeRestoreAfterPrefixExpansionCommand();
+    const handled = vi.fn();
+    render(withConvContext(<MessageList streamingRequestId={null} messages={[makeMessage(1), makeMessage(2)]} pendingMessages={[]}
+      convState={idleState} onRetry={vi.fn()} onOpenFile={undefined} conversationId="conv-history"
+      sourceCallTarget={{ messageId: 'msg-2', toolUseId: 'stale' }}
+      transcriptPositioning={transcriptPositioningForCommand(command)} onHistoryScrollCommandHandled={handled} />));
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start', -24, undefined, 'continuity');
+    expect(handled).not.toHaveBeenCalledWith(expect.objectContaining({ result: 'target_missing' }));
+  });
+
+  it('reports the full owning key and truthful missing result when no render unit owns the target', () => {
+    const command = makeJumpToMessageCommand({ targetMessageId: 'orphan-message' });
+    const handled = vi.fn();
+    render(withConvContext(<MessageList streamingRequestId={null} messages={[makeMessage(1)]} pendingMessages={[]}
+      convState={idleState} onRetry={vi.fn()} onOpenFile={undefined} conversationId="conv-history"
+      transcriptPositioning={{ kind: 'positioning', command }} onHistoryScrollCommandHandled={handled} />));
+    expect(handled.mock.calls).toEqual([[{ commandKey: transcriptPositioningCommandKey(command), result: 'target_missing' }]]);
+    expect(virtualTranscriptMock.scrollToOwnedIndex).not.toHaveBeenCalled();
+  });
+
   it('acknowledges restore commands exactly once after geometric continuity is verified', () => {
     const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
     const onHistoryScrollCommandHandled = vi.fn();
@@ -1104,6 +1240,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -1117,7 +1254,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
       ),
     );
 
-    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start', -24);
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start', -24, undefined, 'continuity');
     expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
 
     act(() => virtualTranscriptMock.rangeChanged?.({ renderedRange: { startIndex: 0, endIndex: 0 }, visibleRange: { startIndex: 0, endIndex: 0 }, viewportTop: 0, layoutRevision: virtualTranscriptMock.layoutRevision() }));
@@ -1129,7 +1266,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     act(() => virtualTranscriptMock.rangeChanged?.({ renderedRange: { startIndex: 1, endIndex: 2 }, visibleRange: { startIndex: 1, endIndex: 1 }, viewportTop: 0, layoutRevision: virtualTranscriptMock.layoutRevision(), targetIndex: 1, targetOffset: -22.5 }));
 
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'applied', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 } })), result: 'applied' });
     expect(onVisibleRangeChange).toHaveBeenCalledTimes(3);
 
     act(() => virtualTranscriptMock.rangeChanged?.({ renderedRange: { startIndex: 1, endIndex: 2 }, visibleRange: { startIndex: 0, endIndex: 0 }, viewportTop: 0, layoutRevision: virtualTranscriptMock.layoutRevision() }));
@@ -1143,6 +1280,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -1173,6 +1311,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const onVisibleRangeChange = vi.fn();
     const renderList = (historyScrollCommand?: HistoryScrollCommand) => withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={messages}
         pendingMessages={[]}
         convState={idleState}
@@ -1202,7 +1341,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
         });
     rerender(renderList(makeRestoreAfterPrefixExpansionCommand()));
 
-    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start', -24);
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start', -24, undefined, 'continuity');
     expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
 
     virtualTranscriptMock.physicalSnapshot.mockImplementation((targetIndex?: number) => targetIndex === undefined
@@ -1226,10 +1365,55 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     }));
 
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'applied', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 } })), result: 'applied' });
 
     act(() => virtualTranscriptMock.rangeChanged?.({ renderedRange: { startIndex: 0, endIndex: 2 }, visibleRange: { startIndex: 0, endIndex: 0 }, viewportTop: 0, layoutRevision: virtualTranscriptMock.layoutRevision(), targetMeasured: true }));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['idle', 'view-reset', 'replacement'] as const)('rejects child-layout settlement from the old render authority (%s)', (transition) => {
+    const command = makeRestoreAfterPrefixExpansionCommand();
+    const handled = vi.fn();
+    const props = { streamingRequestId: null, messages: [makeMessage(1), makeMessage(2), makeMessage(3)], pendingMessages: [],
+      convState: idleState, onRetry: vi.fn(), onOpenFile: undefined, conversationId: 'conv-history', onHistoryScrollCommandHandled: handled };
+    const mounted = render(withConvContext(<MessageList {...props} transcriptPositioning={{ kind: 'positioning', command }} />));
+    expect(handled).not.toHaveBeenCalled();
+    expect(virtualTranscriptMock.positioningAuthority).toEqual({ kind: 'command', commandKey: transcriptPositioningCommandKey(command) });
+    virtualTranscriptMock.measureOffsetForIndex.mockReturnValue(-24);
+    virtualTranscriptMock.currentSnapshot = { renderedRange: { startIndex: 1, endIndex: 1 }, visibleRange: { startIndex: 1, endIndex: 1 },
+      viewportTop: 100, layoutRevision: 2, targetMeasured: true };
+    virtualTranscriptMock.publishDuringLayout = true;
+    const next: TranscriptPositioningInput = transition === 'replacement'
+      ? { kind: 'positioning', command: { ...command, token: 2 } }
+      : { kind: 'idle', view: { ...command.view, transcriptGeneration: transition === 'view-reset' ? 2 : 1 } };
+    mounted.rerender(withConvContext(<MessageList {...props} transcriptPositioning={next} />));
+    expect(handled.mock.calls).toEqual(transition === 'replacement'
+      ? [[{ commandKey: transcriptPositioningCommandKey(command), result: 'superseded' }], [{ commandKey: transcriptPositioningCommandKey({ ...command, token: 2 }), result: 'applied' }]] : [[{ commandKey: transcriptPositioningCommandKey(command), result: 'superseded' }]]);
+    expect(virtualTranscriptMock.positioningAuthority).toEqual(next.kind === 'positioning'
+      ? { kind: 'command', commandKey: transcriptPositioningCommandKey(next.command) } : { kind: 'absent' });
+  });
+
+  it.each(['idle', 'user-interrupted', 'replacement'] as const)('cancels only the finished physical owner before acknowledging supersession (%s)', (transition) => {
+    const command = makeRestoreAfterPrefixExpansionCommand();
+    const owner = transcriptPositioningCommandKey(command);
+    const onHistoryScrollCommandHandled = vi.fn(() => {
+      expect(virtualTranscriptMock.cancelPosition).toHaveBeenCalledWith(owner);
+    });
+    const props = {
+      streamingRequestId: null, messages: [makeMessage(1), makeMessage(2), makeMessage(3)], pendingMessages: [],
+      convState: idleState, onRetry: vi.fn(), onOpenFile: undefined, conversationId: 'conv-history', onHistoryScrollCommandHandled,
+    };
+    const { container, rerender } = render(withConvContext(<MessageList {...props} transcriptPositioning={{ kind: 'positioning', command }} />));
+    if (transition === 'user-interrupted') fireEvent.wheel(container.querySelector('#messages')!, { deltaY: 10 });
+    else rerender(withConvContext(<MessageList {...props} transcriptPositioning={transition === 'idle'
+      ? { kind: 'idle', view: command.view }
+      : { kind: 'positioning', command: { ...command, token: 2 } }} />));
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(command), result: 'superseded' });
+    expect(virtualTranscriptMock.cancelPosition.mock.calls).toEqual([[owner]]);
+    expect(virtualTranscriptMock.scrollToOwnedIndex.mock.calls[0]?.[0]).toBe(owner);
+    if (transition === 'replacement') {
+      expect(virtualTranscriptMock.scrollToOwnedIndex.mock.calls.at(-1)?.[0]).toBe(transcriptPositioningCommandKey({ ...command, token: 2 }));
+    }
   });
 
   it('suppresses continuity until user input releases it before machine interaction dispatch', () => {
@@ -1239,6 +1423,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -1259,7 +1444,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     fireEvent.wheel(scroller, { deltaY: 10 });
     fireEvent.scroll(scroller);
     expect(onVisibleRangeChange).not.toHaveBeenCalled();
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 } })), result: 'superseded' });
 
     act(() => virtualTranscriptMock.rangeChanged?.({ renderedRange: { startIndex: 0, endIndex: 0 }, visibleRange: { startIndex: 0, endIndex: 0 }, viewportTop: 0, layoutRevision: virtualTranscriptMock.layoutRevision() }));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
@@ -1274,6 +1459,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -1291,7 +1477,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     fireEvent.scroll(container.querySelector<HTMLElement>('#messages')!);
 
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 } })), result: 'superseded' });
   });
 
   it('uses one atomic snapshot when scrollTop changes during suppressed-scroll observation', () => {
@@ -1300,6 +1486,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -1322,7 +1509,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
 
     fireEvent.scroll(container.querySelector<HTMLElement>('#messages')!);
 
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 } })), result: 'superseded' });
     expect(virtualTranscriptMock.measureOffsetForIndexAtSnapshot).not.toHaveBeenCalled();
   });
 
@@ -1332,6 +1519,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -1364,6 +1552,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -1396,6 +1585,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -1426,7 +1616,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     }));
 
     expect(virtualTranscriptMock.physicalSnapshot).toHaveBeenCalledWith(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'applied', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 } })), result: 'applied' });
   });
 
   it('reports only the true positive-area visible range when rendered and visible ranges differ', () => {
@@ -1435,6 +1625,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -1464,6 +1655,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -1488,6 +1680,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const currentHistoryView = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
     const renderList = (historyScrollCommand: HistoryScrollCommand) => withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={messages}
         pendingMessages={[]}
         convState={idleState}
@@ -1513,9 +1706,11 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     virtualTranscriptMock.physicalSnapshot.mockReturnValueOnce({ renderedRange: { startIndex: 2, endIndex: 2 }, visibleRange: { startIndex: 2, endIndex: 2 }, viewportTop: 0, layoutRevision: virtualTranscriptMock.layoutRevision(), targetIndex: 2, targetOffset: -24, targetMeasured: true });
     act(() => virtualTranscriptMock.rangeChanged?.({ renderedRange: { startIndex: 2, endIndex: 2 }, visibleRange: { startIndex: 2, endIndex: 2 }, viewportTop: 0, layoutRevision: virtualTranscriptMock.layoutRevision(), targetIndex: 2, targetOffset: -24, targetMeasured: true }));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(2);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(2, 'applied', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
-    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenLastCalledWith(2, 'start', -24);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 } })), result: 'superseded' });
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 2, view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 }, messageId: 'msg-3' })), result: 'applied' });
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenLastCalledWith(2, 'start', -24, undefined, 'continuity');
+    expect(virtualTranscriptMock.completePosition).toHaveBeenCalledTimes(1);
+    expect(virtualTranscriptMock.completePosition).toHaveBeenCalledWith(transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 2, view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 }, messageId: 'msg-3' })));
   });
 
   it('does not acknowledge jump until the visible target is measured, then finishes exactly once', () => {
@@ -1524,6 +1719,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const onHistoryScrollCommandHandled = vi.fn();
     const renderList = (historyScrollCommand: HistoryScrollCommand | null) => withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
         pendingMessages={[]}
         convState={idleState}
@@ -1548,6 +1744,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
 
     render(renderList(command));
 
+    expect(virtualTranscriptMock.completePosition).not.toHaveBeenCalled();
     expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start');
     expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
 
@@ -1572,7 +1769,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     }));
 
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'applied', view);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(command), result: 'applied' });
 
     act(() => virtualTranscriptMock.rangeChanged?.({
       renderedRange: { startIndex: 0, endIndex: 1 },
@@ -1584,6 +1781,8 @@ describe('history scroll acknowledgement + continuity suppression', () => {
       targetMeasured: true,
     }));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+    expect(virtualTranscriptMock.completePosition).toHaveBeenCalledTimes(1);
+    expect(virtualTranscriptMock.completePosition).toHaveBeenCalledWith(transcriptPositioningCommandKey(command));
   });
 
   it('supersedes an active restore when its command disappears', () => {
@@ -1592,6 +1791,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const onHistoryScrollCommandHandled = vi.fn();
     const renderList = (historyScrollCommand: HistoryScrollCommand | null) => withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
         pendingMessages={[]}
         convState={idleState}
@@ -1608,7 +1808,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
 
     rerender(renderList(null));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view })), result: 'superseded' });
   });
 
   it('supersedes a genuinely unmounted active owner exactly once', async () => {
@@ -1618,6 +1818,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
 
     const { unmount } = render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
         pendingMessages={[]}
         convState={idleState}
@@ -1634,7 +1835,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     await flushMicrotasks();
 
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view })), result: 'superseded' });
   });
 
   it('reconciles transcript positioning in layout before sibling passive effects observe it', async () => {
@@ -1651,6 +1852,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     render(withConvContext(
       <>
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -1677,6 +1879,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     render(withConvContext(
       <StrictMode>
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -1693,7 +1896,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     act(() => virtualTranscriptMock.rangeChanged?.({ renderedRange: { startIndex: 1, endIndex: 1 }, visibleRange: { startIndex: 1, endIndex: 1 }, viewportTop: 0, layoutRevision: virtualTranscriptMock.layoutRevision(), targetIndex: 1, targetOffset: -24, targetMeasured: true }));
 
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'applied', view);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(command), result: 'applied' });
   });
 
   it('supersedes a pending jump exactly once when a newer jump replaces it', () => {
@@ -1702,6 +1905,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const view = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
     const renderList = (command: HistoryScrollCommand) => withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={messages}
         pendingMessages={[]}
         convState={idleState}
@@ -1718,7 +1922,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
 
     rerender(renderList(makeJumpToMessageCommand({ token: 2, targetMessageId: 'msg-3', view })));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeJumpToMessageCommand({ token: 1, targetMessageId: 'msg-2', view })), result: 'superseded' });
     expect(virtualTranscriptMock.scrollToIndex).toHaveBeenLastCalledWith(2, 'start');
 
     rerender(renderList(makeJumpToMessageCommand({ token: 2, targetMessageId: 'msg-3', view })));
@@ -1731,6 +1935,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const onHistoryScrollCommandHandled = vi.fn();
     const renderList = (historyScrollCommand: HistoryScrollCommand | null) => withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
         pendingMessages={[]}
         convState={idleState}
@@ -1748,7 +1953,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     rerender(renderList(null));
     rerender(renderList(null));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeJumpToMessageCommand({ token: 1, targetMessageId: 'msg-2', view })), result: 'superseded' });
   });
 
   it('supersedes a pending jump exactly once on user interaction', () => {
@@ -1757,6 +1962,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -1774,7 +1980,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     fireEvent.pointerDown(scroller);
 
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeJumpToMessageCommand({ token: 1, targetMessageId: 'msg-2', view })), result: 'superseded' });
   });
 
   it('clears suppressed continuity on conversation change', () => {
@@ -1783,6 +1989,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const onVisibleRangeChange = vi.fn();
     const renderList = (conversationId: string, token: number) => withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={messages}
         pendingMessages={[]}
         convState={idleState}
@@ -1804,11 +2011,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     fireEvent.scroll(scroller);
     expect(onVisibleRangeChange).not.toHaveBeenCalled();
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(
-      1,
-      'superseded',
-      { conversationId: 'conv-history-a', generation: 1, transcriptGeneration: 1 },
-    );
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view: { conversationId: 'conv-history-a', generation: 1, transcriptGeneration: 1 } })), result: 'superseded' });
   });
 
   it('does not let a stale history range callback acknowledge a new conversation with overlapping indices', () => {
@@ -1816,6 +2019,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const onHistoryScrollCommandHandled = vi.fn();
     const renderList = (conversationId: string, token: number) => withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={messages}
         pendingMessages={[]}
         convState={idleState}
@@ -1835,11 +2039,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     rerender(renderList('conv-history-b', 2));
     act(() => virtualTranscriptMock.rangeChanged?.({ renderedRange: { startIndex: 1, endIndex: 2 }, visibleRange: { startIndex: 0, endIndex: 0 }, viewportTop: 0, layoutRevision: virtualTranscriptMock.layoutRevision() }));
 
-    expect(onHistoryScrollCommandHandled).not.toHaveBeenCalledWith(
-      1,
-      'applied',
-      { conversationId: 'conv-history-a', generation: 1, transcriptGeneration: 1 },
-    );
+    expect(onHistoryScrollCommandHandled).not.toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view: { conversationId: 'conv-history-a', generation: 1, transcriptGeneration: 1 } })), result: 'applied' });
   });
 
   it('keeps suppressed continuity local to the unmounted lifecycle', () => {
@@ -1849,6 +2049,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const { container, unmount } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -1880,6 +2081,7 @@ describe('history expansion feedback', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           ref={listRef}
           messages={[makeMessage(1, 'user'), makeMessage(2, 'agent'), makeMessage(3, 'user')]}
           pendingMessages={[]}
@@ -1932,6 +2134,7 @@ describe('history expansion feedback', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1, 'user'), makeMessage(2, 'agent'), makeMessage(3, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -1981,6 +2184,7 @@ describe('history expansion feedback', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1, 'user'), makeMessage(2, 'agent'), makeMessage(3, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -2028,6 +2232,7 @@ describe('history expansion feedback', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -2063,6 +2268,7 @@ describe('history expansion feedback', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -2100,6 +2306,7 @@ describe('history expansion feedback', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -2143,6 +2350,7 @@ describe('history expansion feedback', () => {
     render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -2181,6 +2389,7 @@ describe('history expansion feedback', () => {
     const onLoadOlderMessages = vi.fn();
     const renderList = (conversationId: string) => withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[makeMessage(1, 'user')]}
         pendingMessages={[]}
         convState={idleState}
@@ -2206,6 +2415,7 @@ describe('history expansion feedback', () => {
     render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -2245,6 +2455,7 @@ describe('render-unit identity across state ticks', () => {
     const { rerender } = render(
       wrap(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={pending}
           convState={idleState}
@@ -2264,6 +2475,7 @@ describe('render-unit identity across state ticks', () => {
     rerender(
       wrap(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={pending}
           convState={{ type: 'awaiting_llm' }}
@@ -2281,6 +2493,7 @@ describe('render-unit identity across state ticks', () => {
     rerender(
       wrap(
         <MessageList
+          streamingRequestId={null}
           messages={[...messages, makeMessage(4, 'agent')]}
           pendingMessages={pending}
           convState={{ type: 'awaiting_llm' }}
@@ -2317,6 +2530,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -2351,6 +2565,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -2386,6 +2601,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container, rerender } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[]}
           pendingMessages={[]}
           convState={idleState}
@@ -2407,6 +2623,7 @@ describe('handleTotalListHeightChanged', () => {
     rerender(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'))}
           pendingMessages={[]}
           convState={idleState}
@@ -2430,6 +2647,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container, rerender } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historicalA}
           pendingMessages={[]}
           convState={idleState}
@@ -2459,6 +2677,7 @@ describe('handleTotalListHeightChanged', () => {
     rerender(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historicalB}
           pendingMessages={[]}
           convState={idleState}
@@ -2496,6 +2715,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -2541,6 +2761,7 @@ describe('handleTotalListHeightChanged', () => {
       const { container } = render(
         withConvContext(
           <MessageList
+            streamingRequestId={null}
             messages={historical}
             pendingMessages={[]}
             convState={idleState}
@@ -2588,6 +2809,7 @@ describe('handleTotalListHeightChanged', () => {
       const { container } = render(
         withConvContext(
           <MessageList
+            streamingRequestId={null}
             messages={historical}
             pendingMessages={[]}
             convState={idleState}
@@ -2648,6 +2870,7 @@ describe('handleTotalListHeightChanged', () => {
     ['conversation reset', (_scroller: HTMLElement, rerender: (ui: React.ReactElement) => void) => {
       rerender(withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'))}
           pendingMessages={[]}
           convState={idleState}
@@ -2672,6 +2895,7 @@ describe('handleTotalListHeightChanged', () => {
       const { container, rerender } = render(
         withConvContext(
           <MessageList
+            streamingRequestId={null}
             messages={historical}
             pendingMessages={[]}
             convState={idleState}
@@ -2691,6 +2915,7 @@ describe('handleTotalListHeightChanged', () => {
 
       rerender(withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[...historical, makeMessage(6, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -2722,6 +2947,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={subAgentsState}
@@ -2760,6 +2986,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -2790,6 +3017,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -2828,6 +3056,7 @@ describe('handleTotalListHeightChanged', () => {
       const { container } = render(
         withConvContext(
           <MessageList
+            streamingRequestId={null}
             messages={historical}
             pendingMessages={[]}
             convState={idleState}
@@ -2874,6 +3103,7 @@ describe('handleTotalListHeightChanged', () => {
       const { container } = render(
         withConvContext(
           <MessageList
+            streamingRequestId={null}
             messages={historical}
             pendingMessages={[]}
             convState={idleState}
@@ -2930,6 +3160,7 @@ describe('handleTotalListHeightChanged', () => {
       const { container } = render(
         withConvContext(
           <MessageList
+            streamingRequestId={null}
             messages={historical}
             pendingMessages={[]}
             convState={subAgentsState}
@@ -2975,6 +3206,7 @@ describe('handleTotalListHeightChanged', () => {
       const { container } = render(
         withConvContext(
           <MessageList
+            streamingRequestId={null}
             messages={historical}
             pendingMessages={[]}
             convState={subAgentsState}
@@ -3026,6 +3258,7 @@ describe('handleTotalListHeightChanged', () => {
       const { container } = render(
         withConvContext(
           <MessageList
+            streamingRequestId={null}
             messages={historical}
             pendingMessages={[]}
             convState={subAgentsState}
@@ -3089,6 +3322,7 @@ describe('handleTotalListHeightChanged', () => {
       const { container } = render(
         withConvContext(
           <MessageList
+            streamingRequestId={null}
             messages={historical}
             pendingMessages={[]}
             convState={subAgentsState}
@@ -3137,6 +3371,7 @@ describe('handleTotalListHeightChanged', () => {
       const { container } = render(
         withConvContext(
           <MessageList
+            streamingRequestId={null}
             messages={historical}
             pendingMessages={[]}
             convState={subAgentsState}
@@ -3191,6 +3426,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3225,6 +3461,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3269,6 +3506,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -3303,6 +3541,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3347,6 +3586,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3390,6 +3630,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3442,6 +3683,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3487,6 +3729,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3534,6 +3777,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3584,6 +3828,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -3638,6 +3883,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -3684,6 +3930,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3727,6 +3974,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           ref={listRef}
           messages={historical}
           pendingMessages={[]}
@@ -3749,6 +3997,7 @@ describe('handleTotalListHeightChanged', () => {
     // stayed in its positioning phase and the arrival was refused.
     act(() => listRef.current?.scrollToUnitIndex(0));
     fireEvent.keyDown(scroller, { key: 'PageDown' });
+    expect(virtualTranscriptMock.interruptPosition).toHaveBeenCalled();
     setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
     fireEvent.scroll(scroller);
 
@@ -3764,6 +4013,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3811,6 +4061,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           ref={listRef}
           messages={historical}
           pendingMessages={[]}
@@ -3862,6 +4113,246 @@ describe('handleTotalListHeightChanged', () => {
     await waitFor(() => expect(onLoadOlderMessages).toHaveBeenCalledTimes(1));
   });
 
+function requiredTouchScroller(container: HTMLElement): HTMLDivElement {
+  const element = container.querySelector('#messages');
+  if (!(element instanceof HTMLDivElement)) throw new Error('Missing transcript div scroller');
+  return element;
+}
+
+function requiredTouchEvidence<T>(value: T | undefined, label: string): T {
+  if (value === undefined) throw new Error('Missing touch regression evidence: ' + label);
+  return value;
+}
+
+// Insert inside MessageList.test.tsx's describe; add namespace import of
+// '../conversation/scrollMachine' as scrollPolicy. These test the real component
+// and reducer, but invoke captured native callbacks with explicit event models.
+// They do not establish trusted browser delivery; the existing host owns that proof.
+for (const stopType of ['touchend', 'touchcancel'] as const) {
+  it(`retains detached ${stopType} through same-scroller ref churn after evidence expiry`, () => {
+    vi.useFakeTimers();
+    const registrations: Array<{ target: EventTarget; type: string; listener: EventListener }> = [];
+    const original = HTMLElement.prototype.addEventListener;
+    const add = vi.spyOn(HTMLElement.prototype, 'addEventListener').mockImplementation(function (this: HTMLElement, type, listener, options) {
+      if (typeof listener === 'function') registrations.push({ target: this, type, listener });
+      return original.call(this, type, listener, options);
+    });
+    const reducer = vi.spyOn(scrollPolicy, 'reduceScrollMachine');
+    try {
+      const view = render(withConvContext(<MessageList
+        messages={[makeMessage(1, 'user')]} pendingMessages={[]} streamingRequestId={null}
+        convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+        onRetry={vi.fn()} onOpenFile={undefined} conversationId="retained-target"
+        transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}
+      />));
+      const scroller = requiredTouchScroller(view.container);
+      setupScroller(scroller, { scrollHeight: 1000, scrollTop: 100, clientHeight: 400 });
+      act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+      const target = document.createElement('p'); scroller.append(target);
+      const touch = { identifier: 7, clientY: 100, target };
+      const start = { isTrusted: true, target, touches: [touch], changedTouches: [touch],
+        composedPath: () => [target, scroller, document, window] } as unknown as TouchEvent;
+      const startCallback = registrations.findLast(x => x.target === scroller && x.type === 'touchstart')!.listener;
+      act(() => startCallback(start));
+      fireEvent.touchMove(scroller, { touches: [touch] });
+      const stopCallback = registrations.findLast(x => x.target === target && x.type === stopType)!.listener;
+      target.remove();
+      act(() => {
+        vi.advanceTimersByTime(GESTURE_STALE_MS + 100);
+        virtualTranscriptMock.rebindScroller?.(null);
+        virtualTranscriptMock.rebindScroller?.(scroller);
+      });
+      const receiptCount = () => reducer.mock.calls.filter(([, event]) => event.type === (stopType === 'touchend' ? 'touchEnded' : 'touchCancelled')).length;
+      const count = receiptCount();
+      const end = { type: stopType, isTrusted: true, target, touches: [], changedTouches: [touch] } as unknown as TouchEvent;
+      act(() => stopCallback({ ...end, touches: [touch], changedTouches: [{ ...touch, identifier: 99 }] } as unknown as TouchEvent));
+      act(() => stopCallback({ ...end, isTrusted: false } as unknown as TouchEvent));
+      expect(receiptCount()).toBe(count);
+      act(() => { stopCallback(end); stopCallback(end); });
+      expect(receiptCount()).toBe(count + 1);
+      const result = reducer.mock.results.findLast((_, i) => requiredTouchEvidence(reducer.mock.calls[i], 'matching reducer call')[1].type === (stopType === 'touchend' ? 'touchEnded' : 'touchCancelled'))!.value;
+      expect(result.state).toMatchObject({ follow: { kind: 'reading' }, gesture: { kind: 'idle' } });
+      expect(result.effects).toEqual([]);
+      view.unmount();
+      act(() => stopCallback(end));
+      expect(receiptCount()).toBe(count + 1);
+    } finally { reducer.mockRestore(); add.mockRestore(); vi.useRealTimers(); }
+  });
+}
+
+it('unmount releases an outstanding original target before any end', () => {
+  const registrations: Array<{ target: EventTarget; type: string; listener: EventListener }> = [];
+  const original = HTMLElement.prototype.addEventListener;
+  const add = vi.spyOn(HTMLElement.prototype, 'addEventListener').mockImplementation(function (this: HTMLElement, type, listener, options) {
+    if (typeof listener === 'function') registrations.push({ target: this, type, listener });
+    return original.call(this, type, listener, options);
+  });
+  const reducer = vi.spyOn(scrollPolicy, 'reduceScrollMachine');
+  try {
+    const view = render(withConvContext(<MessageList
+      messages={[makeMessage(1, 'user')]} pendingMessages={[]} streamingRequestId={null}
+      convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+      onRetry={vi.fn()} onOpenFile={undefined} conversationId="retained-unmount"
+      transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}
+    />));
+    const scroller = requiredTouchScroller(view.container);
+    const target = document.createElement('p'); scroller.append(target);
+    const remove = vi.spyOn(target, 'removeEventListener');
+    const touch = { identifier: 7, target };
+    act(() => registrations.findLast(x => x.target === scroller && x.type === 'touchstart')!.listener({
+      isTrusted: true, target, touches: [touch], changedTouches: [touch], composedPath: () => [target, scroller],
+    } as unknown as TouchEvent));
+    const end = registrations.findLast(x => x.target === target && x.type === 'touchend')!.listener;
+    view.unmount();
+    expect(remove.mock.calls.map(([type]) => type)).toEqual(['touchend', 'touchcancel']);
+    const count = reducer.mock.calls.length;
+    end({ type: 'touchend', isTrusted: true, target, touches: [], changedTouches: [touch] } as unknown as TouchEvent);
+    expect(reducer.mock.calls).toHaveLength(count);
+  } finally { reducer.mockRestore(); add.mockRestore(); }
+});
+
+for (const scenario of ['owner-roundtrip', 'recycled-id', 'two-targets', 'two-target-batch', 'untrusted-start', 'live-list-prune', 'scroller-retirement', 'scroller-replacement', 'install-failure'] as const) {
+  it(`component retained touch admission: ${scenario}`, async () => {
+    const registrations: Array<{ target: EventTarget; type: string; listener: EventListener }> = [];
+    let failingTarget: EventTarget | null = null;
+    let injectedFailures = 0;
+    const original = HTMLElement.prototype.addEventListener;
+    const add = vi.spyOn(HTMLElement.prototype, 'addEventListener').mockImplementation(function (this: HTMLElement, type, listener, options) {
+      if (this === failingTarget && type === 'touchcancel') {
+        injectedFailures++;
+        throw new Error('install');
+      }
+      if (typeof listener === 'function') registrations.push({ target: this, type, listener });
+      return original.call(this, type, listener, options);
+    });
+    const reducer = vi.spyOn(scrollPolicy, 'reduceScrollMachine');
+    try {
+      const content = (conversationId: string) => withConvContext(<MessageList
+        conversationId={conversationId} messages={[makeMessage(1, 'user')]}
+        streamingRequestId={null} pendingMessages={[]} onRetry={vi.fn()} onOpenFile={undefined}
+        convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+        transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}
+      />);
+      const view = render(content('A'));
+      let scroller = requiredTouchScroller(view.container);
+      setupScroller(scroller, { scrollHeight: 1000, scrollTop: 100, clientHeight: 400 });
+      act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+      const first = document.createElement('p'), second = document.createElement('p');
+      scroller.append(first, second);
+      const one = { identifier: 1, clientY: 100, target: first };
+      const two = { identifier: 2, clientY: 100, target: second };
+      const start = (target: HTMLElement, changed: typeof one[], live: typeof one[], trusted = true) => {
+        const callback = registrations.findLast(x => x.target === scroller && x.type === 'touchstart')!.listener;
+        act(() => callback({ isTrusted: trusted, target, changedTouches: changed, touches: live,
+          composedPath: () => [target, scroller] } as unknown as TouchEvent));
+      };
+      const receipt = (target: HTMLElement, changed: typeof one[], live: typeof one[] = []) => ({
+        type: 'touchend', isTrusted: true, target, changedTouches: changed, touches: live,
+      }) as unknown as TouchEvent;
+      const count = () => reducer.mock.calls.filter(([, e]) => e.type === 'touchEnded').length;
+      start(first, [one], [one]);
+      const old = registrations.findLast(x => x.target === first && x.type === 'touchend')!.listener;
+      if (scenario === 'owner-roundtrip') {
+        virtualTranscriptMock.churnDuringLayout = true;
+        view.rerender(content('B')); view.rerender(content('A'));
+        virtualTranscriptMock.churnDuringLayout = false;
+        const before = count(); act(() => old(receipt(first, [one]))); expect(count()).toBe(before);
+        const retiredScroller = scroller;
+        scroller = requiredTouchScroller(view.container);
+        expect(scroller).not.toBe(retiredScroller);
+        expect(scroller.isConnected).toBe(true);
+        expect(retiredScroller.isConnected).toBe(false);
+        setupScroller(scroller, { scrollHeight: 1000, scrollTop: 100, clientHeight: 400 });
+        scroller.append(first);
+        const priorRegistrations = registrations.filter(x => x.target === first && x.type === 'touchend').length;
+        start(first, [one], [one]);
+        expect(registrations.filter(x => x.target === first && x.type === 'touchend')).toHaveLength(priorRegistrations + 1);
+        const fresh = registrations.findLast(x => x.target === first && x.type === 'touchend')!.listener;
+        act(() => { virtualTranscriptMock.rebindScroller?.(null); virtualTranscriptMock.rebindScroller?.(scroller); });
+        act(() => fresh(receipt(first, [one]))); expect(count()).toBe(before + 1);
+      } else if (scenario === 'recycled-id') {
+        start(first, [one], [one]);
+        const fresh = registrations.findLast(x => x.target === first && x.type === 'touchend')!.listener;
+        const before = count(); act(() => old(receipt(first, [one]))); expect(count()).toBe(before);
+        act(() => fresh(receipt(first, [one]))); expect(count()).toBe(before + 1);
+      } else if (scenario === 'scroller-retirement') {
+        const remove = vi.spyOn(first, 'removeEventListener');
+        await act(async () => {
+          virtualTranscriptMock.rebindScroller?.(null);
+          await new Promise<void>(resolve => queueMicrotask(resolve));
+        });
+        expect(remove).toHaveBeenCalledTimes(2);
+        const before = count(); act(() => old(receipt(first, [one]))); expect(count()).toBe(before);
+      } else if (scenario === 'scroller-replacement') {
+        const replacement = document.createElement('div');
+        const before = count();
+        act(() => virtualTranscriptMock.rebindScroller?.(replacement));
+        act(() => old(receipt(first, [one]))); expect(count()).toBe(before);
+      } else if (scenario === 'install-failure') {
+        failingTarget = second;
+        const remove = vi.spyOn(second, 'removeEventListener');
+        const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+        try {
+          const beforeStarts = reducer.mock.calls.filter(([, e]) => e.type === 'touchStarted').length;
+          start(second, [two], [one, two]);
+          expect(reducer.mock.calls.filter(([, e]) => e.type === 'touchStarted')).toHaveLength(beforeStarts + 1);
+          expect(injectedFailures).toBe(1);
+          expect(log).toHaveBeenCalledWith('owned-touch listener installation failed', expect.objectContaining({ identifier: 2 }));
+          expect(remove.mock.calls.map(([type]) => type)).toEqual(['touchend', 'touchcancel']);
+          const installedThenRolledBack = registrations.findLast(x => x.target === second && x.type === 'touchend')!.listener;
+          const preEnd = count();
+          act(() => installedThenRolledBack(receipt(second, [two], [one])));
+          expect(count()).toBe(preEnd);
+          act(() => { virtualTranscriptMock.rebindScroller?.(null); virtualTranscriptMock.rebindScroller?.(scroller); });
+          first.remove();
+          const before = count();
+          act(() => old(receipt(first, [one], [two])));
+          expect(count()).toBe(before + 1);
+          const firstResultIndex = reducer.mock.calls.findLastIndex(([, e]) => e.type === 'touchEnded');
+          expect(requiredTouchEvidence(reducer.mock.calls[firstResultIndex], 'first end call')[1]).toMatchObject({ remainingTouches: 1 });
+          expect(requiredTouchEvidence(reducer.mock.results[firstResultIndex], 'first end result').value.state.gesture.kind).toBe('touch');
+          const secondEnd = registrations.findLast(x => x.target === scroller && x.type === 'touchend')!.listener;
+          act(() => secondEnd(receipt(second, [{ ...two, identifier: 99 }], [two])));
+          expect(count()).toBe(before + 1);
+          act(() => secondEnd(receipt(second, [two])));
+          expect(count()).toBe(before + 2);
+          expect(reducer.mock.calls.findLast(([, e]) => e.type === 'touchEnded')![1]).toMatchObject({ remainingTouches: 0 });
+          view.rerender(content('B')); view.rerender(content('A'));
+          act(() => { old(receipt(first, [one])); secondEnd(receipt(second, [two])); });
+          expect(count()).toBe(before + 2);
+        } finally { failingTarget = null; remove.mockRestore(); log.mockRestore(); }
+      } else if (scenario === 'two-targets' || scenario === 'two-target-batch') {
+        start(second, [two], [one, two]);
+        const other = registrations.findLast(x => x.target === second && x.type === 'touchend')!.listener;
+        act(() => { virtualTranscriptMock.rebindScroller?.(null); virtualTranscriptMock.rebindScroller?.(scroller); });
+        first.remove(); second.remove();
+        const before = count();
+        if (scenario === 'two-target-batch') {
+          const batch = receipt(first, [one, two]);
+          act(() => { old(batch); other(batch); });
+          expect(count()).toBe(before + 1);
+          expect(reducer.mock.calls.findLast(([, e]) => e.type === 'touchEnded')![1]).toMatchObject({ remainingTouches: 0 });
+          view.unmount();
+          return;
+        }
+        const foreignFirst = receipt(second, [two], [one]);
+        act(() => old(foreignFirst)); expect(count()).toBe(before);
+        act(() => other(foreignFirst)); expect(count()).toBe(before + 1);
+        const firstReceipt = reducer.mock.calls.findLast(([, e]) => e.type === 'touchEnded')![1];
+        expect(firstReceipt).toMatchObject({ remainingTouches: 1 });
+        act(() => old(receipt(first, [one]))); expect(count()).toBe(before + 2);
+      } else if (scenario === 'untrusted-start') {
+        start(second, [two], [two], false);
+        const before = count(); act(() => old(receipt(first, [one]))); expect(count()).toBe(before + 1);
+      } else {
+        start(second, [two], [two]);
+        const before = count(); act(() => old(receipt(first, [one]))); expect(count()).toBe(before);
+      }
+      view.unmount();
+    } finally { virtualTranscriptMock.churnDuringLayout = false; reducer.mockRestore(); add.mockRestore(); }
+  });
+}
+
   it('an unobservable lift stops withholding tail-follow once its bound expires', () => {
     vi.useFakeTimers();
     try {
@@ -3869,6 +4360,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3912,6 +4404,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3955,6 +4448,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -4010,6 +4504,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           ref={listRef}
           messages={historical}
           pendingMessages={[]}
@@ -4050,6 +4545,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -4109,6 +4605,7 @@ it('find navigation searches the canonical patch display diff and carries its ty
 
   render(withConvContext(
     <MessageList
+      streamingRequestId={null}
       messages={messages}
       pendingMessages={[]}
       convState={idleState}
@@ -4156,6 +4653,7 @@ it('find navigation carries read_file fragment reveal target for offscreen navig
 
   render(withConvContext(
     <MessageList
+      streamingRequestId={null}
       messages={messages}
       pendingMessages={[]}
       convState={idleState}
@@ -4207,6 +4705,7 @@ it('find navigation carries keyword_search fragment reveal target for offscreen 
 
   render(withConvContext(
     <MessageList
+      streamingRequestId={null}
       messages={messages}
       pendingMessages={[]}
       convState={idleState}
@@ -4251,6 +4750,7 @@ it('find navigation carries search fragment reveal target for offscreen navigati
 
   render(withConvContext(
     <MessageList
+      streamingRequestId={null}
       messages={messages}
       pendingMessages={[]}
       convState={idleState}
@@ -4281,6 +4781,7 @@ it('find navigation requests reveal for compact hidden assistant second-line mat
 
   render(withConvContext(
     <MessageList
+      streamingRequestId={null}
       messages={messages}
       pendingMessages={[]}
       convState={idleState}

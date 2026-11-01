@@ -1,7 +1,7 @@
 //! `OpenAI` and `OpenAI`-compatible provider implementation
 
 use super::headers::apply_source_header;
-use super::models::ModelSpec;
+use super::models::{ModelSpec, RequestModelName};
 use super::rate_limit::{
     normalize_credit_depletion, parse_active_limit, parse_credits_snapshot, parse_promo_message,
     parse_rate_limit_for_limit, parse_rate_limit_reached_type, QuotaDetails,
@@ -13,6 +13,7 @@ use super::LlmError;
 use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
 use phoenix_core::domain::llm_types::ProviderRequestTier;
+use phoenix_core::domain::llm_types::UsageObservation;
 use phoenix_core::domain::provider_replay::ProviderReplayUpdate;
 use phoenix_core::domain::responses_replay::ResponsesResponseSet;
 use reqwest::header::HeaderMap;
@@ -53,10 +54,109 @@ fn resolve_chat_endpoint(base_url_override: Option<&str>) -> String {
 // Responses API
 // ---------------------------------------------------------------------------
 
+#[derive(Serialize)]
+struct ResponsesCountInput {
+    model: String,
+    input: Vec<ResponsesApiInputItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ResponsesApiTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ResponsesApiReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<ResponsesToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+}
+
+impl From<ResponsesApiRequest> for ResponsesCountInput {
+    fn from(request: ResponsesApiRequest) -> Self {
+        let ResponsesApiRequest {
+            model,
+            input,
+            instructions,
+            tools,
+            reasoning,
+            tool_choice,
+            parallel_tool_calls,
+            max_output_tokens: _,
+            stream: _,
+            store: _,
+            prompt_cache_key: _,
+            prompt_cache_options: _,
+            service_tier: _,
+            include: _,
+            tags: _,
+        } = request;
+        Self {
+            model,
+            input,
+            instructions,
+            tools,
+            reasoning,
+            tool_choice,
+            parallel_tool_calls,
+        }
+    }
+}
+
+fn count_input_body(
+    spec: &ModelSpec,
+    request_name: &RequestModelName,
+    request: &LlmRequest,
+) -> Result<serde_json::Value, LlmError> {
+    validate_responses_replay(request, request_name.as_str())?;
+    let wire =
+        translate_to_responses_request_for_model(spec, request_name.as_str(), request, false, true);
+    serde_json::to_value(ResponsesCountInput::from(wire))
+        .map_err(|_| LlmError::invalid_request("Cannot serialize counting input"))
+}
+
+pub(crate) async fn count_input(
+    spec: &ModelSpec,
+    request_name: &RequestModelName,
+    api_key: &str,
+    custom_headers: &[(String, String)],
+    request: &LlmRequest,
+) -> Result<super::ProviderInputCount, LlmError> {
+    let body = count_input_body(spec, request_name, request)?;
+    let client = Client::new();
+    let mut builder = client
+        .post("https://api.openai.com/v1/responses/input_tokens")
+        .bearer_auth(api_key)
+        .header("content-type", "application/json");
+    for (key, value) in custom_headers {
+        builder = builder.header(key, value);
+    }
+    let response = builder
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| LlmError::network("Input count transport failed"))?;
+    if !response.status().is_success() {
+        return Err(LlmError::network(format!(
+            "Input count returned HTTP {}",
+            response.status()
+        )));
+    }
+    let value: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| LlmError::network("Invalid input count response"))?;
+    let tokens = value
+        .get("input_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(|| LlmError::network("Missing input token count"))?;
+    Ok(super::ProviderInputCount::OpenAiCompleteInput { tokens })
+}
+
 /// Complete using the `OpenAI` Responses API.
 #[allow(clippy::too_many_arguments)]
 pub async fn complete(
     spec: &ModelSpec,
+    request_name: &RequestModelName,
     api_key: &str,
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
@@ -64,7 +164,7 @@ pub async fn complete(
     request: &LlmRequest,
     use_codex_backend: bool,
 ) -> Result<LlmResponse, LlmError> {
-    validate_responses_replay(request, &spec.api_name)?;
+    validate_responses_replay(request, request_name.as_str())?;
     if use_codex_backend {
         // Non-streaming callers do not consume deltas. Close the receiver so
         // awaited provider sends fail immediately instead of filling a bounded
@@ -73,6 +173,7 @@ pub async fn complete(
         drop(chunk_rx);
         return complete_streaming(
             spec,
+            request_name,
             api_key,
             base_url_override,
             custom_headers,
@@ -91,8 +192,9 @@ pub async fn complete(
             .attempt_capture
             .set_transport(crate::LlmTransport::HttpJson);
     }
-    let mut responses_request = translate_to_backend_request(
-        &spec.api_name,
+    let mut responses_request = translate_to_backend_request_for_model(
+        spec,
+        request_name.as_str(),
         request,
         use_codex_backend,
         use_codex_backend || is_official_responses_route(base_url_override),
@@ -108,7 +210,7 @@ pub async fn complete(
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json");
-    if use_codex_backend && supports_responses_lite(&spec.api_name) {
+    if use_codex_backend && supports_responses_lite(spec) {
         builder = builder.header("x-openai-internal-codex-responses-lite", "true");
     }
     builder = apply_source_header(builder, custom_headers);
@@ -146,10 +248,14 @@ pub async fn complete(
         LlmError::invalid_response("Failed to parse Responses API response")
     })?;
 
-    bind_responses_model(
+    let mut response = bind_responses_model(
         normalize_responses_api_response(responses_response)?,
-        &spec.api_name,
-    )
+        request_name.as_str(),
+    )?;
+    let raw: serde_json::Value =
+        serde_json::from_str(&body).map_err(|_| LlmError::invalid_response("Invalid response"))?;
+    response.usage_observation = UsageObservation::responses(&raw["usage"]);
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +402,7 @@ impl ResponsesReasoningUsage {
 
 /// Accumulates state across Responses API SSE stream events.
 struct ResponsesStreamAccumulator {
+    usage_observation: UsageObservation,
     input_tokens: u32,
     output_tokens: u32,
     reasoning_usage: ResponsesReasoningUsage,
@@ -370,6 +477,7 @@ impl ResponsesStreamAccumulator {
         Self {
             input_tokens: 0,
             output_tokens: 0,
+            usage_observation: UsageObservation::default(),
             reasoning_usage: ResponsesReasoningUsage::Absent,
             cached_tokens: 0,
             cache_write_tokens: 0,
@@ -562,6 +670,15 @@ impl ResponsesStreamAccumulator {
                         super::LlmErrorKind::ContentFilter,
                         format!("Response incomplete: {reason}"),
                     )
+                } else if reason == "max_output_tokens" {
+                    // Budget-limited stop, not a transport fault: terminal for
+                    // auto-retry, user-resumable. Any partial tool call in the
+                    // truncated response is discarded (we return Err rather than
+                    // assembling a response), and already-streamed visible text
+                    // stays in the ephemeral client buffer (REQ-LLM-006c).
+                    LlmError::output_tokens_exhausted(
+                        "Response stopped at its output token budget before finishing",
+                    )
                 } else {
                     LlmError::server_error(format!("Response incomplete: {reason}"))
                 });
@@ -582,7 +699,7 @@ impl ResponsesStreamAccumulator {
                     self.model = model.to_string();
                 }
                 if let Some(usage) = v.pointer("/response/usage") {
-                    tracing::debug!(usage = %usage, "responses_api usage extracted");
+                    self.usage_observation = UsageObservation::responses(usage);
                     self.input_tokens = u32::try_from(
                         usage
                             .get("input_tokens")
@@ -720,6 +837,7 @@ impl ResponsesStreamAccumulator {
                 id: self.response_id,
                 model: self.model,
                 status: "completed".to_string(),
+                incomplete_details: None,
                 output: self.output_items.into_values().collect(),
                 usage: ResponsesApiUsage {
                     input_tokens: self.input_tokens,
@@ -737,6 +855,7 @@ impl ResponsesStreamAccumulator {
             },
             self.observed_non_reasoning_output,
         )?;
+        response.usage_observation = self.usage_observation;
         telemetry.attach_success(&mut response);
         Ok(response)
     }
@@ -1484,6 +1603,7 @@ fn finalize_responses_stream(
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_streaming(
     spec: &ModelSpec,
+    request_name: &RequestModelName,
     api_key: &str,
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
@@ -1493,10 +1613,11 @@ pub async fn complete_streaming(
     use_codex_backend: bool,
     ws_sessions: Option<&Arc<Mutex<CodexWsSessions>>>,
 ) -> Result<LlmResponse, LlmError> {
-    validate_responses_replay(request, &spec.api_name)?;
+    validate_responses_replay(request, request_name.as_str())?;
     let url = resolve_endpoint(base_url_override);
-    let mut responses_request = translate_to_backend_request(
-        &spec.api_name,
+    let mut responses_request = translate_to_backend_request_for_model(
+        spec,
+        request_name.as_str(),
         request,
         use_codex_backend,
         use_codex_backend || is_official_responses_route(base_url_override),
@@ -1504,7 +1625,7 @@ pub async fn complete_streaming(
     responses_request.set_streaming();
     responses_request.set_tags(request_tags);
 
-    if use_codex_backend && supports_responses_lite(&spec.api_name) {
+    if use_codex_backend && supports_responses_lite(spec) {
         if let Some(sessions) = ws_sessions {
             if let Some(telemetry) = request.telemetry.as_ref() {
                 telemetry
@@ -1588,7 +1709,7 @@ pub async fn complete_streaming(
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json");
-    if use_codex_backend && supports_responses_lite(&spec.api_name) {
+    if use_codex_backend && supports_responses_lite(spec) {
         builder = builder.header("x-openai-internal-codex-responses-lite", "true");
     }
     builder = apply_source_header(builder, custom_headers);
@@ -1671,7 +1792,7 @@ pub async fn complete_streaming(
             .await?;
     }
 
-    finalize_responses_stream(acc, &spec.api_name)
+    finalize_responses_stream(acc, request_name.as_str())
 }
 
 /// Translate `LlmRequest` to `ResponsesApiRequest`.
@@ -1682,7 +1803,8 @@ pub async fn complete_streaming(
 ///   `ChatGPT` backend rejects requests without instructions, while the platform
 ///   Responses API tolerates omission.
 #[allow(clippy::too_many_lines)] // single-pass message translation; splitting would add indirection without clarity
-fn translate_to_responses_request(
+fn translate_to_responses_request_for_model(
+    spec: &ModelSpec,
     api_name: &str,
     request: &LlmRequest,
     use_codex_backend: bool,
@@ -1894,7 +2016,7 @@ fn translate_to_responses_request(
         };
 
     let explicit_cache_supported =
-        !use_codex_backend && official_openai_route && supports_explicit_prompt_cache(api_name);
+        !use_codex_backend && official_openai_route && supports_explicit_prompt_cache(spec);
     if explicit_cache_supported {
         place_explicit_cache_breakpoints(&mut input_items);
     }
@@ -1905,14 +2027,14 @@ fn translate_to_responses_request(
         input: input_items,
         instructions,
         tools,
+        // REQ-LLM-004f: Phoenix always resolves a concrete output-token
+        // budget; the codex backend forbids the field on the wire, so it is
+        // omitted here by design even though the request still carries the
+        // resolved budget for context planning.
         max_output_tokens: if use_codex_backend {
             None
         } else {
-            Some(
-                request
-                    .raised_output_token_ceiling()
-                    .unwrap_or_else(|| default_output_headroom(request.effective_effort.level())),
-            )
+            Some(request.max_tokens)
         },
         stream: None,
         store: if use_codex_backend || official_openai_route {
@@ -1931,7 +2053,7 @@ fn translate_to_responses_request(
             .map(platform_reasoning),
         service_tier: ProviderRequestTier::from_effective_service_tier(
             request.service_tier,
-            use_codex_backend || (official_openai_route && is_known_gpt_6(api_name)),
+            use_codex_backend || (official_openai_route && is_known_gpt_6(spec)),
         )
         .responses_request_value()
         .map(str::to_string),
@@ -2071,28 +2193,31 @@ fn chat_tool_choice(request: &LlmRequest, supported: bool) -> Option<ChatToolCho
     }
 }
 
-fn append_advisory(instructions: &mut Option<String>, request: &LlmRequest) {
-    let unavailable: Vec<_> = request
-        .tool_availability
+pub(crate) fn tool_advisory_text(
+    availability: &phoenix_core::domain::tool_availability::ToolAvailability,
+) -> Option<String> {
+    let unavailable: Vec<_> = availability
         .declarations()
         .iter()
-        .filter(|tool| !request.tool_availability.is_callable(&tool.name))
+        .filter(|tool| !availability.is_callable(&tool.name))
         .map(|tool| tool.name.as_str())
         .collect();
     if unavailable.is_empty() {
-        return;
+        return None;
     }
-    let text = instructions.get_or_insert_with(String::new);
-    text.push_str("\n\nThese tools are unavailable for new calls: ");
-    text.push_str(&unavailable.join(", "));
-    text.push_str(
-        ". Their definitions are retained for historical context. Choose available tools instead.",
-    );
-    tracing::debug!(
-        provider = "openai",
-        n = unavailable.len(),
-        "using advisory tool restriction on route without native support"
-    );
+    Some(format!("\n\nThese tools are unavailable for new calls: {}. Their definitions are retained for historical context. Choose available tools instead.", unavailable.join(", ")))
+}
+
+fn append_advisory(instructions: &mut Option<String>, request: &LlmRequest) {
+    if let Some(advisory) = tool_advisory_text(&request.tool_availability) {
+        instructions
+            .get_or_insert_with(String::new)
+            .push_str(&advisory);
+        tracing::debug!(
+            provider = "openai",
+            "using advisory tool restriction on route without native support"
+        );
+    }
 }
 
 fn bind_responses_model(
@@ -2143,14 +2268,6 @@ fn validate_responses_replay(request: &LlmRequest, api_name: &str) -> Result<(),
     Ok(())
 }
 
-fn default_output_headroom(effort: Option<ModelEffort>) -> u32 {
-    if effort.is_some_and(ModelEffort::needs_extended_output_headroom) {
-        64_000
-    } else {
-        16_384
-    }
-}
-
 fn platform_reasoning(effort: ModelEffort) -> ResponsesApiReasoning {
     ResponsesApiReasoning { effort }
 }
@@ -2162,38 +2279,94 @@ fn codex_lite_reasoning(effort: Option<ModelEffort>) -> CodexResponsesLiteReason
     }
 }
 
-fn translate_to_backend_request(
+fn translate_to_backend_request_for_model(
+    spec: &ModelSpec,
     api_name: &str,
     request: &LlmRequest,
     use_codex_backend: bool,
     official_openai_route: bool,
 ) -> ResponsesBackendRequest {
-    let platform =
-        translate_to_responses_request(api_name, request, use_codex_backend, official_openai_route);
-    if use_codex_backend && supports_responses_lite(api_name) {
+    let platform = translate_to_responses_request_for_model(
+        spec,
+        api_name,
+        request,
+        use_codex_backend,
+        official_openai_route,
+    );
+    if use_codex_backend && supports_responses_lite(spec) {
         ResponsesBackendRequest::CodexLite(CodexResponsesLiteRequest::from_platform(platform))
     } else {
         ResponsesBackendRequest::Platform(platform)
     }
 }
 
-fn is_known_gpt_6(api_name: &str) -> bool {
-    matches!(
+#[cfg(test)]
+fn test_model_spec(id: &str) -> ModelSpec {
+    let mut spec = crate::all_models()
+        .into_iter()
+        .find(|spec| spec.id == id)
+        .unwrap_or_else(|| {
+            crate::all_models()
+                .into_iter()
+                .find(|spec| spec.id == "gpt-5.6-sol")
+                .unwrap()
+        });
+    spec.id = id.to_owned();
+    spec
+}
+
+#[cfg(test)]
+fn translate_to_responses_request(
+    api_name: &str,
+    request: &LlmRequest,
+    use_codex_backend: bool,
+    official_openai_route: bool,
+) -> ResponsesApiRequest {
+    translate_to_responses_request_for_model(
+        &test_model_spec(api_name),
         api_name,
+        request,
+        use_codex_backend,
+        official_openai_route,
+    )
+}
+
+#[cfg(test)]
+fn translate_to_backend_request(
+    api_name: &str,
+    request: &LlmRequest,
+    use_codex_backend: bool,
+    official_openai_route: bool,
+) -> ResponsesBackendRequest {
+    translate_to_backend_request_for_model(
+        &test_model_spec(api_name),
+        api_name,
+        request,
+        use_codex_backend,
+        official_openai_route,
+    )
+}
+
+fn is_known_gpt_6(spec: &ModelSpec) -> bool {
+    matches!(
+        spec.id.as_str(),
         "gpt-6-astra" | "gpt-6.1-sol" | "gpt-6-sol" | "gpt-6-luna"
     )
 }
 
-fn supports_modern_responses(api_name: &str) -> bool {
-    api_name == "gpt-5.6" || api_name.starts_with("gpt-5.6-") || is_known_gpt_6(api_name)
+fn supports_modern_responses(spec: &ModelSpec) -> bool {
+    matches!(
+        spec.id.as_str(),
+        "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-luna" | "gpt-5.6-terra" | "gpt-5.6-2026-07-01"
+    ) || is_known_gpt_6(spec)
 }
 
-pub(crate) fn supports_responses_lite(api_name: &str) -> bool {
-    supports_modern_responses(api_name)
+pub(crate) fn supports_responses_lite(spec: &ModelSpec) -> bool {
+    supports_modern_responses(spec)
 }
 
-fn supports_explicit_prompt_cache(api_name: &str) -> bool {
-    supports_modern_responses(api_name)
+fn supports_explicit_prompt_cache(spec: &ModelSpec) -> bool {
+    supports_modern_responses(spec)
 }
 
 /// Preserve `OpenAI`'s historical read boundaries while leaving the latest
@@ -2333,6 +2506,26 @@ fn validate_responses_terminal_content(
     )))
 }
 
+/// Budget-limited stop (REQ-LLM-006c), checked before any output item is
+/// parsed so a truncated function-call argument never reaches JSON parsing:
+/// terminal for auto-retry, user-resumable. Mirrors the SSE
+/// `response.incomplete` + `max_output_tokens` handling for the
+/// non-streaming Responses API path.
+fn check_responses_output_budget(resp: &ResponsesApiResponse) -> Result<(), LlmError> {
+    if resp.status == "incomplete"
+        && resp
+            .incomplete_details
+            .as_ref()
+            .and_then(|details| details.reason.as_deref())
+            == Some("max_output_tokens")
+    {
+        return Err(LlmError::output_tokens_exhausted(
+            "Response stopped at its output token budget before finishing",
+        ));
+    }
+    Ok(())
+}
+
 /// Normalize `ResponsesApiResponse` to `LlmResponse`.
 fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmResponse, LlmError> {
     normalize_responses_api_response_with_evidence(resp, false)
@@ -2342,6 +2535,8 @@ fn normalize_responses_api_response_with_evidence(
     resp: ResponsesApiResponse,
     observed_non_reasoning_output: bool,
 ) -> Result<LlmResponse, LlmError> {
+    check_responses_output_budget(&resp)?;
+
     let output_items: Vec<serde_json::Value> =
         resp.output.iter().map(|item| item.0.clone()).collect();
     let mut content = Vec::new();
@@ -2913,8 +3108,16 @@ pub(crate) struct ResponsesApiResponse {
     #[serde(default)]
     pub(crate) model: String,
     pub(crate) status: String,
+    #[serde(default)]
+    pub(crate) incomplete_details: Option<ResponsesIncompleteDetails>,
     pub(crate) output: Vec<ResponsesApiOutput>,
     pub(crate) usage: ResponsesApiUsage,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ResponsesIncompleteDetails {
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -3192,7 +3395,8 @@ pub(crate) struct ResponsesApiUsage {
 /// Complete using the `OpenAI` Chat Completions API (non-streaming).
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_chat(
-    spec: &ModelSpec,
+    _spec: &ModelSpec,
+    request_name: &RequestModelName,
     api_key: &str,
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
@@ -3201,7 +3405,7 @@ pub async fn complete_chat(
 ) -> Result<LlmResponse, LlmError> {
     let url = resolve_chat_endpoint(base_url_override);
     let mut chat_request = translate_to_chat_request_with_route(
-        &spec.api_name,
+        request_name.as_str(),
         request,
         base_url_override.is_none_or(|url| url == "https://api.openai.com/v1/chat/completions"),
     );
@@ -3250,13 +3454,18 @@ pub async fn complete_chat(
         LlmError::invalid_response("Failed to parse Chat Completions response")
     })?;
 
-    normalize_chat_response(chat_response, &spec.api_name)
+    let mut response = normalize_chat_response(chat_response, request_name.as_str())?;
+    let raw: serde_json::Value =
+        serde_json::from_str(&body).map_err(|_| LlmError::invalid_response("Invalid response"))?;
+    response.usage_observation = UsageObservation::chat(&raw["usage"]);
+    Ok(response)
 }
 
 /// Complete using the `OpenAI` Chat Completions API (streaming).
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_streaming_chat(
-    spec: &ModelSpec,
+    _spec: &ModelSpec,
+    request_name: &RequestModelName,
     api_key: &str,
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
@@ -3268,7 +3477,7 @@ pub async fn complete_streaming_chat(
 
     let url = resolve_chat_endpoint(base_url_override);
     let mut chat_request = translate_to_chat_request_with_route(
-        &spec.api_name,
+        request_name.as_str(),
         request,
         base_url_override.is_none_or(|url| url == "https://api.openai.com/v1/chat/completions"),
     );
@@ -3541,7 +3750,7 @@ fn translate_to_chat_request_with_route(
         model: api_name.to_string(),
         messages,
         tools,
-        max_tokens: request.max_tokens,
+        max_tokens: Some(request.max_tokens),
         reasoning_effort: request.effective_effort.explicit_level(),
         stream: None,
         stream_options: None,
@@ -3581,10 +3790,14 @@ fn normalize_chat_response(
                 model,
                 resp.usage.as_ref().and_then(ChatUsage::reasoning_tokens),
             );
-            return Err(LlmError::invalid_response(
-                "Chat completions hit the output token limit before finishing. \
-                 Try again with a larger max_tokens value or a model with a higher output budget."
-                    .to_string(),
+            // finish_reason=length is a budget-limited stop, not a transport
+            // fault: terminal for auto-retry (an unchanged request exhausts
+            // again) and user-resumable. Any partial tool call in the truncated
+            // choice is discarded (we return Err rather than assembling a
+            // response); already-streamed visible text stays in the ephemeral
+            // client buffer (REQ-LLM-006c).
+            return Err(LlmError::output_tokens_exhausted(
+                "Chat completion stopped at its output token budget before finishing",
             ));
         }
         Some("content_filter") => {
@@ -3699,6 +3912,7 @@ enum ChatVisibleKind {
 }
 
 struct ChatStreamAccumulator {
+    usage_observation: UsageObservation,
     content: String,
     visible_kind: Option<ChatVisibleKind>,
     choice_index: Option<usize>,
@@ -3765,6 +3979,7 @@ impl ChatStreamAccumulator {
         Self {
             content: String::new(),
             visible_kind: None,
+            usage_observation: UsageObservation::default(),
             choice_index: None,
             tool_calls: Vec::new(),
             usage: None,
@@ -3792,6 +4007,11 @@ impl ChatStreamAccumulator {
         }
         let now = Instant::now();
         self.telemetry.record_provider_event_at(now);
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(data) {
+            if raw.get("usage").is_some_and(|usage| !usage.is_null()) {
+                self.usage_observation = UsageObservation::chat(&raw["usage"]);
+            }
+        }
         let event: ChatStreamChunk = serde_json::from_str(data).map_err(|e| {
             LlmError::invalid_response(format!("Failed to parse chat SSE data: {e}"))
         })?;
@@ -3833,10 +4053,12 @@ impl ChatStreamAccumulator {
                             "<streaming-chat-completions>",
                             reasoning_tokens,
                         );
-                        return Err(LlmError::invalid_response(
-                            "Chat completions hit the output token limit before finishing. \
-                             Try again with a larger max_tokens value or a model with a higher output budget."
-                                .to_string(),
+                        // Budget-limited stop (REQ-LLM-006c): terminal for
+                        // auto-retry, user-resumable. Returning Err discards any
+                        // partial tool call accumulated so far; already-streamed
+                        // visible text stays in the ephemeral client buffer.
+                        return Err(LlmError::output_tokens_exhausted(
+                            "Chat completion stopped at its output token budget before finishing",
                         ));
                     }
                     "content_filter" => {
@@ -3967,6 +4189,7 @@ impl ChatStreamAccumulator {
         };
         let mut response =
             chat_message_to_response(message, self.usage, "<streaming-chat-completions>")?;
+        response.usage_observation = self.usage_observation;
         telemetry.attach_success(&mut response);
         Ok(response)
     }
@@ -4438,12 +4661,12 @@ mod tests {
     fn codex_spec() -> ModelSpec {
         ModelSpec {
             id: "gpt-5.6".into(),
-            api_name: "gpt-5.6".into(),
+            default_request_name: "gpt-5.6".into(),
             backend: ModelBackend::OpenAIResponses,
             family: "OpenAI".into(),
             description: String::new(),
             context_window: 100_000,
-            max_output_tokens: Some(crate::DEFAULT_MAX_OUTPUT_TOKENS),
+            max_output_tokens: 16_384,
             recommended: false,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -4468,7 +4691,7 @@ mod tests {
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 vec![],
             ),
-            max_tokens: None,
+            max_tokens: 16_384,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
             telemetry: None,
@@ -4706,6 +4929,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responses_alias_binds_private_replay_to_request_not_physical_model() {
+        let captured = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let app = Router::new().route("/responses", axum::routing::post({
+            let captured = Arc::clone(&captured);
+            move |Json(body): Json<serde_json::Value>| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    captured.lock().await.push(body.clone());
+                    let physical = serde_json::json!({
+                        "id":"physical-response", "model":"physical-B", "status":"completed",
+                        "output":[{"type":"function_call","id":"item-1","call_id":"call-1","name":"bash","arguments":"{}"}],
+                        "usage":{"input_tokens":5,"output_tokens":2}
+                    });
+                    if body["stream"] == true {
+                        ([("content-type", "text/event-stream")], format!(
+                            "event: response.completed\ndata: {}\n\n",
+                            serde_json::json!({"type":"response.completed","response":physical})
+                        )).into_response()
+                    } else {
+                        Json(physical).into_response()
+                    }
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/responses", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let spec = test_model_spec("gpt-6.1-sol");
+        let alias = RequestModelName::from("gateway/alias-A");
+        let request = empty_request();
+        let json_response = complete(
+            &spec,
+            &alias,
+            "key",
+            Some(&url),
+            &[],
+            &BTreeMap::new(),
+            &request,
+            false,
+        )
+        .await
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let stream_response = complete_streaming(
+            &spec,
+            &alias,
+            "key",
+            Some(&url),
+            &[],
+            &BTreeMap::new(),
+            &request,
+            &tx,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        for response in [json_response, stream_response] {
+            let Some(ProviderReplayUpdate::Responses(set)) = response.provider_replay else {
+                panic!("function call must retain private replay");
+            };
+            assert_eq!(set.model, alias.as_str());
+            assert_eq!(set.response_id, "physical-response");
+            let set = set.with_owner_message_id("owner".into());
+            let restored: ResponsesResponseSet =
+                serde_json::from_value(serde_json::to_value(&set).unwrap()).unwrap();
+            assert_eq!(restored.model, alias.as_str());
+            let mut next = empty_request();
+            next.messages.push(LlmMessage {
+                source_message_id: Some("owner".into()),
+                role: MessageRole::Assistant,
+                content: set.public_content.clone(),
+            });
+            next.responses_replay.push(restored);
+            validate_responses_replay(&next, alias.as_str()).unwrap();
+            assert!(validate_responses_replay(&next, "physical-B").is_err());
+        }
+        assert_eq!(captured.lock().await.len(), 2);
+        assert!(captured
+            .lock()
+            .await
+            .iter()
+            .all(|wire| wire["model"] == alias.as_str()));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn nonstreaming_malformed_response_never_exposes_private_output() {
         let app = Router::new().route(
             "/responses",
@@ -4740,6 +5050,7 @@ mod tests {
         );
         let error = complete(
             &codex_spec(),
+            &codex_spec().default_request_name,
             "test-key",
             Some(&url),
             &[],
@@ -4787,6 +5098,7 @@ mod tests {
         for round in 1..=3 {
             let response = complete_streaming(
                 &codex_spec(),
+                &codex_spec().default_request_name,
                 "account-a",
                 Some(&url),
                 &[],
@@ -4876,6 +5188,7 @@ mod tests {
             async move {
                 complete_streaming(
                     &codex_spec(),
+                    &codex_spec().default_request_name,
                     "account-a",
                     Some(&url),
                     &[],
@@ -4961,6 +5274,7 @@ mod tests {
             async move {
                 complete_streaming(
                     &codex_spec(),
+                    &codex_spec().default_request_name,
                     "account-a",
                     Some(&url),
                     &[],
@@ -5011,7 +5325,7 @@ mod tests {
         // A cache-relevant property change also sends a full create on the same
         // live connection rather than applying stale continuation metadata.
         let mut property_changed = request_with(&[("changed", MessageRole::User)]);
-        property_changed.max_tokens = Some(42);
+        property_changed.max_tokens = 42;
         call(property_changed).await.unwrap();
         let requests = state.ws_requests.lock().await.clone();
         assert!(requests[3].1.get("previous_response_id").is_none());
@@ -5060,6 +5374,7 @@ mod tests {
             async move {
                 complete_streaming(
                     &codex_spec(),
+                    &codex_spec().default_request_name,
                     "secret",
                     Some(&url),
                     &[],
@@ -5099,6 +5414,7 @@ mod tests {
 
         complete_streaming(
             &codex_spec(),
+            &codex_spec().default_request_name,
             "secret",
             Some(&url),
             &[],
@@ -5128,6 +5444,7 @@ mod tests {
             async move {
                 complete_streaming(
                     &codex_spec(),
+                    &codex_spec().default_request_name,
                     "secret",
                     Some(&url),
                     &[],
@@ -5180,6 +5497,7 @@ mod tests {
         });
         complete_streaming(
             &codex_spec(),
+            &codex_spec().default_request_name,
             "secret",
             Some(&url),
             &[],
@@ -5231,6 +5549,7 @@ mod tests {
         ];
         complete_streaming(
             &codex_spec(),
+            &codex_spec().default_request_name,
             "secret",
             Some(&url),
             &headers,
@@ -5251,6 +5570,7 @@ mod tests {
         assert!((snapshot.primary.unwrap().used_percent - 42.0).abs() < f64::EPSILON);
         let text_response = complete_streaming(
             &codex_spec(),
+            &codex_spec().default_request_name,
             "secret",
             Some(&url),
             &headers,
@@ -5267,6 +5587,7 @@ mod tests {
 
         let http_only = complete_streaming(
             &codex_spec(),
+            &codex_spec().default_request_name,
             "secret",
             Some(&url),
             &headers,
@@ -5293,6 +5614,7 @@ mod tests {
 
         let error = complete_streaming(
             &codex_spec(),
+            &codex_spec().default_request_name,
             "secret",
             Some(&url),
             &headers,
@@ -5436,6 +5758,7 @@ mod tests {
         )]);
         let capture = crate::LlmAttemptCapture::new();
         request.telemetry = Some(crate::LlmRequestTelemetry {
+            capacity_plan_id: None,
             conversation_id: "deadline".to_string(),
             root_conversation_id: "deadline".to_string(),
             request_id: "deadline".to_string(),
@@ -5454,6 +5777,7 @@ mod tests {
                 &request,
                 complete_streaming(
                     &codex_spec(),
+                    &codex_spec().default_request_name,
                     "secret",
                     Some(&url),
                     &[],
@@ -5527,6 +5851,7 @@ mod tests {
         let headers_a = vec![("chatgpt-account-id".into(), "a".into())];
         complete_streaming(
             &codex_spec(),
+            &codex_spec().default_request_name,
             "secret",
             Some(&url),
             &headers_a,
@@ -5547,6 +5872,7 @@ mod tests {
         let headers_b = vec![("ChatGPT-Account-ID".into(), "b".into())];
         complete_streaming(
             &codex_spec(),
+            &codex_spec().default_request_name,
             "secret",
             Some(&url),
             &headers_b,
@@ -5571,6 +5897,7 @@ mod tests {
             async move {
                 complete_streaming(
                     &codex_spec(),
+                    &codex_spec().default_request_name,
                     "secret",
                     Some(&url),
                     &[],
@@ -5594,6 +5921,7 @@ mod tests {
         let _ = task.await;
         complete_streaming(
             &codex_spec(),
+            &codex_spec().default_request_name,
             "secret",
             Some(&url),
             &[],
@@ -5693,12 +6021,52 @@ mod tests {
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 vec![],
             ),
-            max_tokens: None,
+            max_tokens: 16_384,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
             telemetry: None,
             cache_key: PromptCacheKey::stable("test"),
         }
+    }
+
+    #[test]
+    fn counting_body_reuses_generation_input_tools_and_restrictions() {
+        let spec = test_model_spec("gpt-6");
+        let name = RequestModelName::from("wire-model");
+        let mut request = restricted_request(&["bash"]);
+        request
+            .system
+            .push(super::super::types::SystemContent::cached(
+                "fixed instructions",
+            ));
+        request.messages.push(LlmMessage {
+            source_message_id: None,
+            role: MessageRole::User,
+            content: vec![ContentBlock::text("history")],
+        });
+        let generation = serde_json::to_value(translate_to_backend_request_for_model(
+            &spec,
+            name.as_str(),
+            &request,
+            false,
+            true,
+        ))
+        .unwrap();
+        let count = count_input_body(&spec, &name, &request).unwrap();
+        for key in [
+            "model",
+            "input",
+            "instructions",
+            "tools",
+            "tool_choice",
+            "reasoning",
+            "text",
+        ] {
+            assert_eq!(count.get(key), generation.get(key), "{key}");
+        }
+        assert!(count.get("max_output_tokens").is_none());
+        assert_eq!(request.max_tokens, 16_384);
+        assert!(count["tools"].as_array().unwrap().len() >= 2);
     }
 
     fn restricted_request(callable: &[&str]) -> LlmRequest {
@@ -5829,8 +6197,12 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(translated["input"], serde_json::Value::Array(expected));
+        let count = count_input_body(&test_model_spec("gpt-6"), &"gpt-6".into(), &request).unwrap();
+        assert_eq!(count["input"], translated["input"]);
+        assert!(count["input"].to_string().contains("encrypted_content"));
         request.messages[0].content.clear();
         assert!(validate_responses_replay(&request, "gpt-6").is_err());
+        assert!(count_input_body(&test_model_spec("gpt-6"), &"gpt-6".into(), &request).is_err());
     }
 
     #[test]
@@ -5981,7 +6353,7 @@ mod tests {
     #[test]
     fn explicit_effort_serializes_on_platform_and_native_default_omits_reasoning() {
         let mut request = empty_request();
-        request.max_tokens = Some(16_384);
+        request.max_tokens = 16_384;
 
         let native = serde_json::to_value(translate_to_responses_request(
             "gpt-5.6-sol",
@@ -6078,7 +6450,7 @@ mod tests {
             translate_to_backend_request("gpt-6.1-sol", &request, true, false),
             ResponsesBackendRequest::CodexLite(_)
         ));
-        assert!(supports_responses_lite("gpt-6.1-sol"));
+        assert!(supports_responses_lite(&test_model_spec("gpt-6.1-sol")));
         let custom = serde_json::to_value(translate_to_backend_request(
             "gpt-6.1-sol",
             &request,
@@ -6102,8 +6474,10 @@ mod tests {
         ))
         .unwrap();
         assert!(direct.get("service_tier").is_none());
-        assert!(!supports_responses_lite("gpt-6-future"));
-        assert!(!supports_explicit_prompt_cache("gpt-6-future"));
+        assert!(!supports_responses_lite(&test_model_spec("gpt-6-future")));
+        assert!(!supports_explicit_prompt_cache(&test_model_spec(
+            "gpt-6-future"
+        )));
     }
 
     #[test]
@@ -6957,7 +7331,45 @@ mod tests {
             .process_event("response.incomplete", data, &tx)
             .await
             .unwrap_err();
-        assert_eq!(err.kind, LlmErrorKind::ServerError);
+        assert_eq!(err.kind, LlmErrorKind::OutputTokensExhausted);
+    }
+
+    /// The non-streaming Responses API reports the same budget-limited stop
+    /// via top-level `status`/`incomplete_details`, not an SSE event. A
+    /// truncated function-call argument string must never reach JSON
+    /// parsing — the exhaustion check must classify first.
+    #[test]
+    fn normalize_responses_json_incomplete_max_output_tokens_is_exhausted_not_invalid() {
+        let resp = ResponsesApiResponse {
+            id: "resp-truncated".to_string(),
+            model: "gpt-test".to_string(),
+            status: "incomplete".to_string(),
+            incomplete_details: Some(ResponsesIncompleteDetails {
+                reason: Some("max_output_tokens".to_string()),
+            }),
+            output: vec![ResponsesApiOutput(serde_json::json!({
+                "type": "function_call",
+                "name": "bash",
+                "call_id": "call-1",
+                "arguments": "{\"cmd\": \"ls -la /very/long/pa",
+            }))],
+            usage: ResponsesApiUsage {
+                input_tokens: 1000,
+                output_tokens: 4096,
+                input_tokens_details: ResponsesApiInputTokensDetails {
+                    cached_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                output_tokens_details: None,
+            },
+        };
+        let err = normalize_responses_api_response(resp).unwrap_err();
+        assert_eq!(
+            err.kind,
+            crate::LlmErrorKind::OutputTokensExhausted,
+            "status=incomplete with reason=max_output_tokens must classify as exhausted, \
+             not fall through to a parsed (or malformed-tool) success/invalid-response"
+        );
     }
 
     /// When the stream lacks `response.output_item.done` events but
@@ -7051,6 +7463,7 @@ mod tests {
             id: String::new(),
             model: String::new(),
             status: "completed".to_string(),
+            incomplete_details: None,
             output: acc.output_items.into_values().collect(),
             usage: ResponsesApiUsage {
                 input_tokens: acc.input_tokens,
@@ -7067,6 +7480,24 @@ mod tests {
         assert_eq!(resp.usage.input_tokens, 200);
         assert_eq!(resp.usage.cache_creation_tokens, 200);
         assert_eq!(resp.usage.context_window_used(), 1050);
+    }
+
+    #[test]
+    fn arbitrary_canonical_suffix_does_not_grant_modern_responses_features() {
+        let mut spec = test_model_spec("gpt-5.6-legacy");
+        spec.source = super::super::models::ModelSource::External;
+        spec.default_request_name = "gpt-5.5".into();
+        assert!(!supports_responses_lite(&spec));
+        assert!(!supports_explicit_prompt_cache(&spec));
+        let wire = serde_json::to_value(translate_to_responses_request_for_model(
+            &spec,
+            spec.default_request_name.as_str(),
+            &empty_request(),
+            false,
+            true,
+        ))
+        .unwrap();
+        assert!(wire.get("prompt_cache_options").is_none());
     }
 
     #[tokio::test]
@@ -7216,6 +7647,7 @@ mod tests {
             id: String::new(),
             model: String::new(),
             status: "completed".to_string(),
+            incomplete_details: None,
             output: vec![],
             usage,
         })
@@ -7235,6 +7667,7 @@ mod tests {
             id: String::new(),
             model: String::new(),
             status: "completed".to_string(),
+            incomplete_details: None,
             output: vec![],
             usage: ResponsesApiUsage {
                 input_tokens: 1000,
@@ -7260,6 +7693,7 @@ mod tests {
             id: "resp-reasoning-only".to_string(),
             model: "gpt-test".to_string(),
             status: "completed".to_string(),
+            incomplete_details: None,
             output: vec![ResponsesApiOutput(serde_json::json!({
                 "type": "reasoning",
                 "id": "reasoning-1",
@@ -7417,6 +7851,7 @@ mod tests {
             id: "resp-reasoning-fixture".to_string(),
             model: "gpt-test".to_string(),
             status: "completed".to_string(),
+            incomplete_details: None,
             output: output.into_iter().map(ResponsesApiOutput).collect(),
             usage: ResponsesApiUsage {
                 input_tokens: 1000,
@@ -7911,6 +8346,7 @@ mod tests {
         let resp = normalize_responses_api_response(ResponsesApiResponse {
             id: String::new(), model: String::new(),
             status: "completed".to_string(),
+            incomplete_details: None,
             output: vec![ResponsesApiOutput(serde_json::json!({"type":"message", "content":[{"type":"refusal", "refusal":"I can't help with that."}]}))],
             usage: ResponsesApiUsage {
                 input_tokens: 1000,
@@ -7966,6 +8402,51 @@ mod tests {
             1,
             "terminal output must not duplicate completed items"
         );
+    }
+
+    #[tokio::test]
+    async fn capacity_usage_observation_stream_missing_usage_differs_from_reported_zero() {
+        for usage in [
+            serde_json::Value::Null,
+            serde_json::json!({"input_tokens":0,"output_tokens":0}),
+            serde_json::json!({"input_tokens":0,"output_tokens":0,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}}),
+        ] {
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
+            let item = serde_json::json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]});
+            acc.process_event(
+                "response.output_item.done",
+                &serde_json::json!({"type":"response.output_item.done","item":item}).to_string(),
+                &tx,
+            )
+            .await
+            .unwrap();
+            let terminal = serde_json::json!({"type":"response.completed","response":{"usage":usage,"output":[item]}});
+            acc.process_event("response.completed", &terminal.to_string(), &tx)
+                .await
+                .unwrap();
+            let response = acc.into_response().unwrap();
+            assert_eq!(response.usage.input_tokens, 0);
+            assert_eq!(response.usage_observation.input_total, !usage.is_null());
+            assert_eq!(
+                response.usage_observation.cache_read,
+                usage
+                    .pointer("/input_tokens_details/cached_tokens")
+                    .is_some()
+            );
+        }
+        for usage in [
+            serde_json::Value::Null,
+            serde_json::json!({"prompt_tokens":0,"completion_tokens":0}),
+        ] {
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let mut acc = ChatStreamAccumulator::new(Instant::now(), &empty_request());
+            acc.process_event(&serde_json::json!({"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":usage}).to_string(),&tx).await.unwrap();
+            let response = acc.into_response().unwrap();
+            assert_eq!(response.usage.input_tokens, 0);
+            assert_eq!(response.usage_observation.input_total, !usage.is_null());
+            assert!(!response.usage_observation.cache_read);
+        }
     }
 
     #[test]
@@ -8228,6 +8709,39 @@ mod tests {
         );
     }
 
+    /// `finish_reason="length"` must classify as exhausted before a partial
+    /// tool call's malformed JSON arguments are ever parsed, so a truncated
+    /// response never surfaces as "malformed tool arguments" instead of the
+    /// budget-limited stop it actually is.
+    #[test]
+    fn chat_json_length_with_malformed_tool_call_is_exhausted_not_invalid() {
+        let truncated = ChatCompletionsResponse {
+            choices: vec![ChatChoice {
+                message: ChatResponseMessage {
+                    reasoning_content: None,
+                    content: None,
+                    refusal: None,
+                    tool_calls: Some(vec![ChatToolCall {
+                        id: "call-1".to_string(),
+                        r#type: "function".to_string(),
+                        function: ChatFunctionCall {
+                            name: "bash".to_string(),
+                            arguments: "{\"cmd\": \"ls -la /very/long/pa".to_string(),
+                        },
+                    }]),
+                },
+                finish_reason: Some("length".to_string()),
+            }],
+            usage: None,
+        };
+        assert_eq!(
+            normalize_chat_response(truncated, "compatible-chat-model")
+                .unwrap_err()
+                .kind,
+            crate::LlmErrorKind::OutputTokensExhausted
+        );
+    }
+
     #[tokio::test]
     async fn chat_stream_rejects_multiple_choices_and_invalid_tool_indices() {
         let request = empty_request();
@@ -8314,6 +8828,31 @@ mod tests {
             acc.into_response().unwrap_err().kind,
             crate::LlmErrorKind::InvalidResponse
         );
+    }
+
+    /// A partial tool-call delta followed by `finish_reason="length"` must
+    /// classify as exhausted without ever reaching `into_response`'s tool
+    /// argument JSON parse — the malformed, truncated arguments accumulated
+    /// so far must not surface as an unrelated "malformed tool" error.
+    #[tokio::test]
+    async fn chat_stream_partial_tool_then_length_is_exhausted_not_invalid() {
+        let request = empty_request();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut acc = ChatStreamAccumulator::new(Instant::now(), &request);
+        acc.process_event(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-9","function":{"name":"bash","arguments":"{\"cmd\": \"ls -la /very/long/pa"}}]}}]}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        let error = acc
+            .process_event(
+                r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#,
+                &tx,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, crate::LlmErrorKind::OutputTokensExhausted);
     }
 
     #[tokio::test]

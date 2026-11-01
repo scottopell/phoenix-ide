@@ -1,0 +1,75 @@
+diff --git a/dev/lib/index.js b/dev/lib/index.js
+index 51b7144..8c2e7f7 100644
+--- a/dev/lib/index.js
++++ b/dev/lib/index.js
+@@ -94,7 +94,7 @@ export function fromMarkdown(value, encoding, options) {
+  *
+  * @param {Options | null | undefined} [options]
+  */
+-function compiler(options) {
++export function compiler(options) {
+   /** @type {Config} */
+   const config = {
+     transforms: [],
+diff --git a/dev/lib/phoenix.js b/dev/lib/phoenix.js
+new file mode 100644
+index 0000000..a5cd49d
+--- /dev/null
++++ b/dev/lib/phoenix.js
+@@ -0,0 +1 @@
++export {compiler, fromMarkdown} from './index.js'
+diff --git a/lib/index.js b/lib/index.js
+index 90e17be..8b8f97e 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -84,7 +84,7 @@ export function fromMarkdown(value, encoding, options) {
+  *
+  * @param {Options | null | undefined} [options]
+  */
+-function compiler(options) {
++export function compiler(options) {
+   /** @type {Config} */
+   const config = {
+     transforms: [],
+diff --git a/lib/phoenix.d.ts b/lib/phoenix.d.ts
+new file mode 100644
+index 0000000..267ca88
+--- /dev/null
++++ b/lib/phoenix.d.ts
+@@ -0,0 +1,7 @@
++import type {Event} from 'micromark-util-types'
++import type {Root} from 'mdast'
++import type {Options} from './types.js'
++export {fromMarkdown} from './index.js'
++export type {Options} from './types.js'
++/** Native compiler: consumes postprocessed micromark events without reparsing. */
++export function compiler(options?: Options | null): (events: Event[]) => Root
+diff --git a/lib/phoenix.js b/lib/phoenix.js
+new file mode 100644
+index 0000000..a5cd49d
+--- /dev/null
++++ b/lib/phoenix.js
+@@ -0,0 +1 @@
++export {compiler, fromMarkdown} from './index.js'
+diff --git a/package.json b/package.json
+index 9829188..48d51a3 100644
+--- a/package.json
++++ b/package.json
+@@ -38,8 +38,15 @@
+     "xo": "^1.0.0"
+   },
+   "exports": {
+-    "development": "./dev/index.js",
+-    "default": "./index.js"
++    ".": {
++      "development": "./dev/index.js",
++      "default": "./index.js"
++    },
++    "./phoenix": {
++      "types": "./lib/phoenix.d.ts",
++      "development": "./dev/lib/phoenix.js",
++      "default": "./lib/phoenix.js"
++    }
+   },
+   "files": [
+     "dev/",

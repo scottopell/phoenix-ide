@@ -160,7 +160,7 @@ const makeProductConversation = (id: string, overrides: Partial<ProductConversat
   lifecycle: { state: 'open', close_action: { availability: 'available' } },
   latest_transcript_row_id: `latest-${id}`,
   updated_at: '2024-01-01T00:00:00Z',
-  presentation: { kind: 'state', display_name: `Display ${id}`, presentation_mode: 'idle' },
+  presentation: { kind: 'state', display_name: overrides.canonical_root?.title ?? `Root ${id}`, presentation_mode: 'idle' },
   ...overrides,
 });
 
@@ -530,11 +530,11 @@ describe('ConversationList — product conversations', () => {
     );
 
     const openRow = container.querySelector('[data-product-conversation-id="pc-open"]') as HTMLElement;
-    expect(getByText('Open Root')).toBeInTheDocument();
+    expect(getByText('Working surface')).toBeInTheDocument();
     expect(openRow).toHaveTextContent('Working');
     expect(openRow).toHaveTextContent('rel-2024-01-01T00:00:00Z');
     expect(openRow).toHaveTextContent('root-open');
-    expect(openRow).not.toHaveTextContent('Working surface');
+    expect(openRow).not.toHaveTextContent('Open Root');
     expect(openRow.querySelectorAll('.conv-item-title')).toHaveLength(1);
     expect(openRow.querySelectorAll('.conv-item-secondary-row')).toHaveLength(0);
 
@@ -551,9 +551,9 @@ describe('ConversationList — product conversations', () => {
     );
 
     const historyRow = container.querySelector('[data-product-conversation-id="pc-archived"]') as HTMLElement;
-    expect(getByText('Archived Root')).toBeInTheDocument();
+    expect(getByText('Retained history')).toBeInTheDocument();
     expect(historyRow).toHaveTextContent('Completed');
-    expect(historyRow).not.toHaveTextContent('Retained history');
+    expect(historyRow).not.toHaveTextContent('Archived Root');
   });
 
   it('uses server-authoritative Close availability without inferring from lifecycle or presentation', () => {
@@ -578,12 +578,12 @@ describe('ConversationList — product conversations', () => {
       </MemoryRouter>,
     );
 
-    fireEvent.click(getByRole('button', { name: 'Actions for conversation Root pc-blocked' }));
+    fireEvent.click(getByRole('button', { name: 'Actions for conversation Blocked' }));
     expect(getByRole('button', {
-      name: /Close conversation Root pc-blocked\. Resolve the pending task approval before closing/,
+      name: /Close conversation Blocked\. Resolve the pending task approval before closing/,
     })).toBeDisabled();
-    fireEvent.click(getByRole('button', { name: 'Actions for conversation Root pc-available' }));
-    fireEvent.click(getByRole('button', { name: 'Close conversation Root pc-available' }));
+    fireEvent.click(getByRole('button', { name: 'Actions for conversation Needs action' }));
+    fireEvent.click(getByRole('button', { name: 'Close conversation Needs action' }));
     expect(close).toHaveBeenCalledWith(available);
   });
 
@@ -736,13 +736,13 @@ describe('SIDE-04: Context menu should close on click-outside', () => {
 // emphasized. Standalone conversations remain unaffected. Per REQ-CHN-002
 // and specs/chains/design.md "Sidebar Grouping" / Phase 5 (task 02690).
 describe('Chain grouping in sidebar mode (REQ-CHN-002)', () => {
-  it('renders a chain block with the chain_name as header and members in chain order', () => {
+  it('renders a chain block with the title as header and members in chain order', () => {
     // Recency: leaf (Mar) > standalone (Feb) > root (Jan).
     // Chain block sits at leaf's position; members listed root → leaf.
     const root = makeConv('cr', 'root-slug', {
       updated_at: '2024-01-01T00:00:00Z',
       continued_in_conv_id: 'cl',
-      chain_name: 'auth refactor',
+      title: 'auth refactor',
     });
     const leaf = makeConv('cl', 'leaf-slug', {
       updated_at: '2024-03-01T00:00:00Z',
@@ -848,11 +848,11 @@ describe('Chain grouping in sidebar mode (REQ-CHN-002)', () => {
     expect(activeContainer.querySelector('[data-id="cr"]')!.classList.contains('conv-item-chain-completed')).toBe(false);
   });
 
-  it('falls back to root.slug when chain_name is null', () => {
+  it('falls back to root.slug when title is null', () => {
     const root = makeConv('rooty', 'root-slug-text', {
       updated_at: '2024-01-01T00:00:00Z',
       continued_in_conv_id: 'leafy',
-      // chain_name omitted → falls back to slug.
+      // title omitted → falls back to slug.
     });
     const leaf = makeConv('leafy', 'leaf-slug', {
       updated_at: '2024-02-01T00:00:00Z',
@@ -871,7 +871,7 @@ describe('Chain grouping in sidebar mode (REQ-CHN-002)', () => {
     const root = makeConv('cr', 'r', {
       updated_at: '2024-01-01T00:00:00Z',
       continued_in_conv_id: 'cl',
-      chain_name: 'mychain',
+      title: 'mychain',
     });
     const leaf = makeConv('cl', 'l', { updated_at: '2024-02-01T00:00:00Z' });
 
@@ -900,7 +900,7 @@ describe('Chain grouping in sidebar mode (REQ-CHN-002)', () => {
     const root = makeConv('myroot', 'r', {
       updated_at: '2024-01-01T00:00:00Z',
       continued_in_conv_id: 'leaf',
-      chain_name: 'authchain',
+      title: 'authchain',
     });
     const leaf = makeConv('leaf', 'l', { updated_at: '2024-02-01T00:00:00Z' });
 
@@ -967,7 +967,7 @@ describe('Chain grouping in sidebar mode (REQ-CHN-002)', () => {
     const root = makeConv('cr', 'r', {
       updated_at: '2024-01-01T00:00:00Z',
       continued_in_conv_id: 'cl',
-      chain_name: 'auth refactor',
+      title: 'auth refactor',
     });
     const leaf = makeConv('cl', 'l', { updated_at: '2024-02-01T00:00:00Z' });
 
@@ -1010,7 +1010,7 @@ describe('Chain lifecycle UI (task 02701)', () => {
     const root = makeConv('cr', 'root-slug', {
       updated_at: '2024-01-01T00:00:00Z',
       continued_in_conv_id: 'cl',
-      chain_name: 'auth refactor',
+      title: 'auth refactor',
       ...archivedBase,
     });
     const leaf = makeConv('cl', 'leaf-slug', {
@@ -1253,7 +1253,7 @@ describe('Mobile conversation list redesign', () => {
     const root = makeConv('root-id', 'root-slug', {
       updated_at: '2024-01-01T00:00:00Z',
       continued_in_conv_id: 'leaf-id',
-      chain_name: 'mobile chain',
+      title: 'mobile chain',
       presentation_mode: 'done',
       state: { type: 'terminal' },
       cached_pr: pr(1),
@@ -1481,7 +1481,7 @@ describe('Mobile conversation list redesign', () => {
   it('uses semantic chain and latest-title fallbacks in collapsed mobile chain summaries', () => {
     const root = makeConv('guid-root', 'f872dd1a-f701-49f3-ad25-2605c6b6f3dc', {
       continued_in_conv_id: 'guid-leaf',
-      chain_name: null,
+      title: null,
       task_title: 'Readable root task title',
       presentation_mode: 'done',
       state: { type: 'terminal' },
@@ -1507,7 +1507,7 @@ describe('Mobile conversation list redesign', () => {
   it('rejects generated prefixed UUID names in collapsed chain headers', () => {
     const root = makeConv('fork-root', 'fork-123e4567-e89b-42d3-a456-426614174000', {
       continued_in_conv_id: 'fork-leaf',
-      chain_name: null,
+      title: null,
       task_title: 'Readable fork task title',
       presentation_mode: 'done',
       state: { type: 'terminal' },
@@ -1530,7 +1530,7 @@ describe('Mobile conversation list redesign', () => {
   it('keeps cleaned-up terminal mobile chains collapsed by default', () => {
     const root = makeConv('cleanup-root', 'explore-options', {
       continued_in_conv_id: 'cleanup-middle',
-      chain_name: 'explore to cleanup',
+      title: 'explore to cleanup',
       conv_mode_label: 'EXPLORE',
       presentation_mode: 'done',
       state: { type: 'terminal' },
@@ -1790,13 +1790,13 @@ describe('ConversationList — chain render isolation (C5)', () => {
     const rootA = makeConv('rootA', 'rootA-slug', {
       updated_at: '2024-01-01T00:00:00Z',
       continued_in_conv_id: 'leafA',
-      chain_name: 'chain A',
+      title: 'chain A',
     });
     const leafA = makeConv('leafA', 'leafA-slug', { updated_at: '2024-02-01T00:00:00Z' });
     const rootB = makeConv('rootB', 'rootB-slug', {
       updated_at: '2024-03-01T00:00:00Z',
       continued_in_conv_id: 'leafB',
-      chain_name: 'chain B',
+      title: 'chain B',
     });
     const leafB = makeConv('leafB', 'leafB-slug', { updated_at: '2024-04-01T00:00:00Z' });
     return [leafA, rootA, leafB, rootB];

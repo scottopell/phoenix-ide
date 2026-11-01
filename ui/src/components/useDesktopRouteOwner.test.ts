@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { api, ApiResponseError, type ProductConversationSnapshotView } from '../api';
 import { notifyProductConversationSnapshotChanged } from '../notifications';
 import { useDesktopRouteOwner } from './useDesktopRouteOwner';
+import { extractProductRouteReference } from './desktopRouteReference';
 const snapshot = (product: string, member: string) => ({ product_conversation_id: product, requested_transcript_row_id: member, latest_transcript_row_id: 'latest' }) as ProductConversationSnapshotView;
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 describe('desktop validated route ownership', () => {
@@ -18,6 +19,37 @@ describe('desktop validated route ownership', () => {
     vi.spyOn(api, 'getProductConversationSnapshot').mockResolvedValue(snapshot('product', 'historical'));
     const { result } = renderHook(() => useDesktopRouteOwner('historical', 'historical', ''));
     await waitFor(() => expect(result.current).toBe('historical'));
+  });
+  it('decodes a Unicode /c reference once before loading its desktop owner', async () => {
+    const reference = 'café-日本-projection';
+    const extracted = extractProductRouteReference(`/c/${encodeURIComponent(reference)}`);
+    expect(extracted).toEqual({ productConversationId: reference, routeSlug: reference });
+    const get = vi.spyOn(api, 'getProductConversationSnapshot').mockResolvedValue({
+      ...snapshot('product', 'root'),
+      latest_transcript_row_id: 'unicode-owner',
+    });
+    const { result } = renderHook(() => useDesktopRouteOwner(
+      extracted?.productConversationId ?? null,
+      extracted?.routeSlug ?? null,
+      '',
+    ));
+    await waitFor(() => expect(result.current).toBe('unicode-owner'));
+    expect(get).toHaveBeenCalledWith(reference, { message_limit: 1 });
+  });
+  it.each(['c', 'product-conversations'])('accepts one terminal slash on /%s routes without accepting nested segments', (prefix) => {
+    const reference = 'café-日本';
+    expect(extractProductRouteReference(`/${prefix}/${encodeURIComponent(reference)}/`)).toEqual({
+      productConversationId: reference,
+      routeSlug: prefix === 'c' ? reference : null,
+    });
+    expect(extractProductRouteReference(`/${prefix}/product/child`)).toBeNull();
+    expect(extractProductRouteReference(`/${prefix}/product//`)).toBeNull();
+  });
+  it('falls back safely for a malformed percent escape in a /c reference', () => {
+    expect(extractProductRouteReference('/c/bad%escape')).toEqual({
+      productConversationId: 'bad%escape',
+      routeSlug: 'bad%escape',
+    });
   });
   it('uses latest ownership for the canonical product route', async () => {
     vi.spyOn(api, 'getProductConversationSnapshot').mockResolvedValue(snapshot('product', 'root'));

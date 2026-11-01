@@ -4,6 +4,7 @@ import { api, type CodexLoginPreflight, type LlmLanguageSetting, type Notificati
 import { refreshModels } from '../modelsPoller';
 import { clearCodexQuota, setCodexQuota, useCodexQuota } from '../codexQuota';
 import { CodexQuotaBlock } from './CodexQuotaBlock';
+import { CodexResetAction } from './CodexResetAction';
 import {
   getBrowserNotificationPermission,
   useNotificationSettings,
@@ -187,6 +188,7 @@ export function SettingsDropdown({
           ) : null}
           <NotificationsSection />
           <LlmLanguageSection onCloseMenu={() => setOpen(false)} />
+          <section className="settings-section"><button type="button" className="settings-inline-btn" onClick={() => { setOpen(false); navigate('/settings/slack'); }}>Slack gateway →</button></section>
           <section className="settings-section">
             <button
               type="button"
@@ -356,6 +358,7 @@ function CodexSection({
       </div>
       {error && <div className="settings-section__error">{error}</div>}
       {quota && <CodexQuotaBlock quota={quota} />}
+      <CodexResetAction key={preflight.account_id ?? 'signed-out'} surface="settings" />
     </section>
   );
 }

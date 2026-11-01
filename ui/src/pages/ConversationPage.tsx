@@ -1,6 +1,7 @@
+import { conversationGroundingContext } from '../components/FileExplorer/groundingContext';
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type ConversationRouteResponse, type FileAttachment, type ImageData, type Message } from '../api';
+import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type ConversationRouteResponse, type ContinueHandoffSource, type FileAttachment, type ImageData } from '../api';
 import { refreshModels } from '../modelsPoller';
 import {
   canCancelConversationState,
@@ -24,10 +25,9 @@ import {
   initialHistoryExpansionState,
   reduceHistoryExpansion,
   type HistoryIntent,
-  type HistoryScrollCommand,
   type RestoreBasis,
 } from '../conversation/historyExpansion';
-import { transcriptPositioningInputFromHistoryExpansion } from '../conversation/transcriptPositioning';
+import { transcriptPositioningCommandKey, transcriptPositioningInputFromHistoryExpansion, type TranscriptPositioningCompletion } from '../conversation/transcriptPositioning';
 import { transcriptCoverageAfterInit } from '../conversation/atom';
 import { resolveOwnedConversationTarget } from '../conversation/conversationNavigation';
 import {
@@ -42,7 +42,6 @@ import { MessageListSkeleton } from '../components/Skeleton';
 import { FileBrowserOverlay, useFileExplorer } from '../components/FileExplorer';
 import { PaneDivider } from '../components/PaneDivider';
 import { QuestionPanel } from '../components/QuestionPanel';
-import { WakeStatusBar } from '../components/WakeStatusBar';
 import {
   useMessageQueue,
   useConnection,
@@ -183,9 +182,7 @@ export interface EmbeddedConversationProjection {
   slug: string;
   conversationId?: string;
   conversation: Conversation | null;
-  messages: Message[];
   pendingMessages: PendingUserMessage[];
-  convState: ReturnType<typeof parseConversationState>;
   isArchived: boolean;
   serverArchived: boolean;
   onRetryPending: (localId: string) => void;
@@ -208,6 +205,7 @@ interface EmbeddedConversationHostProps {
   suppressTaskApprovalOwner?: boolean;
   onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
   onCloseCompleted?: () => void;
+  onStreamAttempt?: ((conversationId: string, openId: string, retryAttempt: number) => void) | undefined;
 }
 
 interface EmbeddedConversationPageProps extends ConversationPageProps, EmbeddedConversationHostProps {
@@ -235,6 +233,7 @@ export function EmbeddedConversationPage({
   onProjectionChange,
   suppressMessageViewerOwner = false,
   onCloseCompleted,
+  onStreamAttempt,
   suppressTaskApprovalOwner = false,
 }: EmbeddedConversationPageProps) {
   const navigate = useNavigate();
@@ -272,6 +271,7 @@ export function EmbeddedConversationPage({
         suppressCanonicalization={suppressCanonicalization}
         suppressMessageViewerOwner={suppressMessageViewerOwner}
         suppressTaskApprovalOwner={suppressTaskApprovalOwner}
+        onStreamAttempt={onStreamAttempt}
         {...(onProjectionChange ? { onProjectionChange } : {})}
         {...(onCloseCompleted ? { onCloseCompleted } : {})}
       />
@@ -309,6 +309,7 @@ function ConversationPageContent({
   suppressMessageViewerOwner,
   suppressTaskApprovalOwner,
   onCloseCompleted,
+  onStreamAttempt,
 }: {
   slug: string;
   routePrefix: '/c' | '/global';
@@ -323,6 +324,7 @@ function ConversationPageContent({
   suppressMessageViewerOwner: boolean;
   suppressTaskApprovalOwner: boolean;
   onCloseCompleted?: () => void;
+  onStreamAttempt?: ((conversationId: string, openId: string, retryAttempt: number) => void) | undefined;
 }) {
   const { setConversationReadiness } = useConversationReadiness();
   const navigate = useNavigate();
@@ -395,6 +397,8 @@ function ConversationPageContent({
   // Page-level state — not conversation data
   const [error, setError] = useState<string | null>(null);
   const [deletingConversation, setDeletingConversation] = useState(false);
+  // Bumped by every user send or dismissal; see ErrorBanner `userActionSeq`.
+  const userActionSeqRef = useRef(0);
   const historyGenerationRef = useRef(0);
   const historyRequestTokenRef = useRef(0);
   const historyCommandTokenRef = useRef(0);
@@ -776,6 +780,7 @@ function ConversationPageContent({
   }, [conversationId, atom.transcriptGeneration, atom.transcriptCoverage]);
 
   const connectionInfo = useConnection({
+    ...(onStreamAttempt ? { onStreamAttempt } : {}),
     conversationId: navigator.onLine ? resolvedRouteConversationId ?? undefined : undefined,
     dispatch,
     getLastAppliedEventSeq: () => atomRef.current.conversationId === resolvedRouteConversationId
@@ -1152,14 +1157,16 @@ function ConversationPageContent({
     }
   }, [targetMessageId, loadedTargetPresent, historyExpansion, loadOlderMessagesForIntent]);
 
-  const handleHistoryScrollCommand = useCallback((token: number, result: 'applied' | 'target_missing' | 'superseded', view: HistoryScrollCommand['view']) => {
+  const handleHistoryScrollCommand = useCallback((completion: TranscriptPositioningCompletion) => {
+    const command = historyExpansion.pendingCommand;
+    if (!command || transcriptPositioningCommandKey(command) !== completion.commandKey) return;
     dispatchHistoryExpansion({
       type: 'command_acknowledged',
-      commandToken: token,
-      view,
-      result,
+      commandToken: command.token,
+      view: command.view,
+      result: completion.result,
     });
-  }, []);
+  }, [historyExpansion.pendingCommand]);
 
   // Fetch system prompt once when conversationId is known
   useEffect(() => {
@@ -1400,6 +1407,7 @@ function ConversationPageContent({
 
   const handleSend = useCallback(async (text: string, attachedImages: ImageData[], attachedFiles: FileAttachment[] = []) => {
     if (!conversationId || isArchived) return;
+    userActionSeqRef.current += 1;
 
     const msg = enqueue(text, attachedImages, attachedFiles);
 
@@ -1796,9 +1804,7 @@ function ConversationPageContent({
       slug,
       ...(conversationId ? { conversationId } : {}),
       conversation: conversation ?? null,
-      messages: atom.messages,
       pendingMessages,
-      convState: convStateForChildren,
       isArchived,
       serverArchived,
       onRetryPending: handleRetry,
@@ -1819,9 +1825,7 @@ function ConversationPageContent({
     slug,
     conversationId,
     conversation,
-    atom.messages,
     pendingMessages,
-    convStateForChildren,
     isArchived,
     handleRetry,
     serverArchived,
@@ -1882,9 +1886,11 @@ function ConversationPageContent({
     }
   }, [convStateForChildren.type, conversationId]);
   const handleSendTextOnly = useCallback((text: string) => handleSend(text, []), [handleSend]);
-  const fileRootPath = routePrefix === '/global' || isArchived || !conversation
+  const grounding = conversationGroundingContext(conversation, routePrefix === '/global');
+  const isCoordinatorHome = grounding.kind === 'coordinator_home';
+  const fileRootPath = isArchived || !conversation
     ? null
-    : (conversation.worktree_path ?? conversation.cwd);
+    : (isCoordinatorHome ? conversation.cwd : (conversation.worktree_path ?? conversation.cwd));
   const handleOpenFiles = useCallback(() => {
     if (fileRootPath) setShowFileBrowser(true);
   }, [fileRootPath]);
@@ -1975,11 +1981,13 @@ function ConversationPageContent({
 
   const openExistingContinuation = useCallback(async () => {
     if (!conversation?.id || convStateForChildren.type !== 'context_exhausted') return;
+    const ownerGeneration = conversationRouteOwnerRef.current.generation;
     const res = await api.continueConversation(conversation.id, {
       handoff: convStateForChildren.summary,
       message_id: generateUUID(),
       user_agent: navigator.userAgent,
     });
+    if (conversationRouteOwnerRef.current.generation !== ownerGeneration) return;
     if (res.status === 'dispatch_failed') {
       throw new Error(res.error ?? 'The continuation exists, but its opening handoff could not be sent. Retry from this page.');
     }
@@ -1987,13 +1995,16 @@ function ConversationPageContent({
     navigate(`${routePrefix}/${res.conversation_id}`);
   }, [conversation?.id, convStateForChildren, navigate, routePrefix, showInfo]);
 
-  const handleContextExhaustedContinue = useCallback(async (handoff: string) => {
+  const handleContextExhaustedContinue = useCallback(async (handoff: string, source: ContinueHandoffSource) => {
     if (!conversation?.id) throw new Error('Conversation is unavailable.');
+    const ownerGeneration = conversationRouteOwnerRef.current.generation;
     const res = await api.continueConversation(conversation.id, {
       handoff,
+      source,
       message_id: generateUUID(),
       user_agent: navigator.userAgent,
     });
+    if (conversationRouteOwnerRef.current.generation !== ownerGeneration) return 'dispatch_failed' as const;
     if (res.status === 'dispatch_failed') {
       showError(res.error ?? 'The continuation was created, but its opening handoff could not be sent. Retry the durable handoff from this page.');
       return res.status;
@@ -2245,6 +2256,7 @@ function ConversationPageContent({
         <RenderProfiler id="MessageList">
           <ConversationNavStack
             messages={atom.messages}
+            streamingRequestId={atom.streamingRequestId}
             pendingMessages={pendingMessages}
             convState={convStateForChildren}
             onRetry={handleRetry}
@@ -2379,7 +2391,7 @@ function ConversationPageContent({
           </div>
         </div>
       )}
-      {convStateForChildren.type === 'recoverable_continuation_failure' && (
+      {convStateForChildren.type === 'recoverable_continuation_failure' && convStateForChildren.error_kind !== 'context_capacity_conflict' && (
         <div className="context-exhausted-banner context-exhausted-banner--expanded">
           <div className="context-exhausted-summary">
             <div className="error-body-title">Continuation summary failed</div>
@@ -2397,10 +2409,19 @@ function ConversationPageContent({
           </div>
         </div>
       )}
-      {convStateForChildren.type === 'context_exhausted' && (
+      {(convStateForChildren.type === 'context_exhausted' || (convStateForChildren.type === 'recoverable_continuation_failure' && convStateForChildren.error_kind === 'context_capacity_conflict')) && (
         <ContextExhaustedHandoff
+          key={conversation.id}
+          capacityConflict={convStateForChildren.type === 'recoverable_continuation_failure'}
+          failureMessage={convStateForChildren.type === 'recoverable_continuation_failure' ? convStateForChildren.message : ''}
+          recoveryRevision={convStateForChildren.type === 'recoverable_continuation_failure' ? `${convStateForChildren.operation_id}:${convStateForChildren.attempt}` : conversation.state_updated_at ?? ''}
+          generatedSource={(() => {
+            const message = [...atom.messages].reverse().find((row) => row.message_type === 'continuation' && row.conversation_id === conversation.id);
+            return message ? { kind: 'summary' as const, message_id: message.message_id } : null;
+          })()}
+          onRegenerate={handleTriggerContinuation}
           parentId={conversation.id}
-          generatedHandoff={convStateForChildren.summary}
+          generatedHandoff={convStateForChildren.type === 'context_exhausted' ? convStateForChildren.summary : ''}
           continuedInConvId={conversation.continued_in_conv_id}
           disabled={isArchived}
           onOpenExisting={async () => {
@@ -2440,7 +2461,7 @@ function ConversationPageContent({
           </button>
         </div>
       )}
-      {!isArchived && <WorkControlBar
+      {!isArchived && !isCoordinatorHome && <WorkControlBar
         mutationEnabled={mutationEnabled}
         conversationId={conversation.id}
         convModeLabel={conversation.conv_mode_label}
@@ -2499,10 +2520,14 @@ function ConversationPageContent({
       ) : convStateForChildren.type === 'error' ? (
         <>
         <ErrorBanner
+          key={conversation.id}
+          conversationId={conversation.id}
+          userActionSeq={userActionSeqRef}
           message={convStateForChildren.message}
           error={convStateForChildren.error}
           onRetry={readOnly || isArchived ? undefined : () => handleSend('continue', [])}
           onDismiss={readOnly || isArchived ? undefined : () => {
+            userActionSeqRef.current += 1;
             // No optimistic idle: `dismissError` resolves on enqueue, not on
             // persist, so faking idle could diverge if the executor races/
             // rejects. The server-broadcast state_change SSE drives idle.
@@ -2599,7 +2624,6 @@ function ConversationPageContent({
         </RenderProfiler>
         </>
       ) : null}
-      <WakeStatusBar conversationId={conversationId!} />
       <RenderProfiler id="StateBar">
       <ConnectedStateBar
         slug={slug!}
@@ -2714,6 +2738,7 @@ function ConversationPageContent({
       {/* Mobile file browser overlay */}
       {fileRootPath && (
         <FileBrowserOverlay
+          grounding={grounding}
           isOpen={showFileBrowser}
           rootPath={fileRootPath}
           conversationId={conversation.id}

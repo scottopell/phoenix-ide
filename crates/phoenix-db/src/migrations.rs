@@ -11,8 +11,14 @@ use phoenix_core::work_scope::WorkScopeId;
 
 use super::{DbError, DbResult, ProjectSeedId};
 
+mod federated_subscriptions;
+mod goal_execution;
+mod local_goal_watch;
 mod retire_commission_review;
 mod settle_historical_continuation;
+
+#[cfg(test)]
+mod conversation_tools_tests;
 
 struct Migration {
     version: u32,
@@ -631,7 +637,657 @@ const MIGRATIONS: &[Migration] = &[
         name: "allow_interrupted_active_close_snapshot_failure",
         sql: MIGRATION_123,
     },
+    Migration {
+        version: 124,
+        name: "persist_federation_peer_tls_trust",
+        sql: MIGRATION_124,
+    },
+    Migration {
+        version: 125,
+        name: "support_ipv6_federation_peer_hosts",
+        sql: MIGRATION_125,
+    },
+    Migration {
+        version: 126,
+        name: "retire_wake_feature_preserving_history",
+        sql: WAKE_FEATURE_RETIREMENT_SQL,
+    },
+    Migration {
+        version: 127,
+        name: "coordinator_owned_work_scope_home",
+        sql: include_str!("migrations/coordinator_home.sql"),
+    },
+    Migration {
+        version: 128,
+        name: "product_creation_provisioning_stage",
+        sql: MIGRATION_128,
+    },
+    Migration {
+        version: 129,
+        name: "single_conversation_name_and_route_projection",
+        sql: "",
+    },
+    Migration {
+        version: 130,
+        name: "continuation_handoff_candidates",
+        sql: "CREATE TABLE continuation_handoff_candidates (
+            id TEXT PRIMARY KEY NOT NULL,
+            conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            operation_id TEXT,
+            source_attempt INTEGER CHECK(source_attempt >= 1),
+            exhausted_state_updated_at TEXT,
+            source_message_id TEXT REFERENCES messages(message_id) ON DELETE CASCADE,
+            source_candidate_id TEXT REFERENCES continuation_handoff_candidates(id) ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+            origin TEXT NOT NULL CHECK(origin IN ('oversized_summary', 'ai_shortening', 'review_input')),
+            candidate_text TEXT NOT NULL CHECK(length(trim(candidate_text)) > 0),
+            created_at TEXT NOT NULL,
+            CHECK(origin != 'oversized_summary' OR operation_id IS NOT NULL),
+            CHECK(origin != 'review_input' OR (source_message_id IS NULL AND source_candidate_id IS NULL)),
+            CHECK((operation_id IS NOT NULL AND source_attempt IS NOT NULL AND exhausted_state_updated_at IS NULL)
+                OR (operation_id IS NULL AND source_attempt IS NULL AND exhausted_state_updated_at IS NOT NULL)),
+            UNIQUE(conversation_id, ordinal),
+            CHECK(source_message_id IS NULL OR source_candidate_id IS NULL)
+        ); CREATE INDEX continuation_handoff_candidates_conversation ON continuation_handoff_candidates(conversation_id, ordinal);",
+    },
+    Migration { version: 131, name: "request_capacity_diagnostics", sql: include_str!("migrations/request_capacity.sql") },
+    Migration {
+        version: 132,
+        name: "normalized_remote_input_origin",
+        sql: "",
+    },
+    Migration {
+        version: 133,
+        name: "bounded_federated_terminal_subscriptions",
+        sql: include_str!("federation_subscriptions/schema.sql"),
+    },
+    Migration {
+        version: 134,
+        name: "durable_conversation_goal_storage",
+        sql: include_str!("conversation_goals/schema.sql"),
+    },
+    Migration {
+        version: 135,
+        name: "opaque_federation_peer_notes",
+        sql: "ALTER TABLE federation_peer_connections ADD COLUMN notes TEXT NOT NULL DEFAULT ''
+              CHECK (typeof(notes) = 'text' AND length(CAST(notes AS BLOB)) <= 32768);",
+    },
+    Migration {
+        version: 136,
+        name: "durable_conversation_goal_user_control",
+        sql: MIGRATION_136,
+    },
+    Migration {
+        version: 137,
+        name: "local_watch_goal_capture",
+        sql: include_str!("coordinator_watches/goal_capture.sql"),
+    },
+    Migration {
+        version: 138,
+        name: "per_goal_execution_requests",
+        sql: MIGRATION_138,
+    },
+    Migration {
+        version: 139,
+        name: "goal_start_materialization_witness",
+        sql: include_str!("conversation_goals/start_materialization_candidate.sql"),
+    },
+    Migration {
+        version: 140,
+        name: "federation_local_stop_acceptance",
+        sql: include_str!("federation_subscriptions/local_stop_acceptance.sql"),
+    },
+    Migration {
+        version: 141,
+        name: "canonical_tool_round_receipts",
+        sql: include_str!("provider_replay/canonical_receipt.sql"),
+    },
+    Migration {
+        version: 142,
+        name: "slack_gateway_v1",
+        sql: include_str!("migrations/slack_gateway.sql"),
+    },
+    Migration {
+        version: 143,
+        name: "agent_creation_provenance",
+        sql: include_str!("migrations/agent_creation_provenance.sql"),
+    },
+    Migration {
+        version: 144,
+        name: "product_conversation_rename_receipts",
+        sql: include_str!("migrations/product_conversation_rename_receipts.sql"),
+    },
+    Migration {
+        version: 145,
+        name: "coordinator_goal_preparations",
+        sql: include_str!("conversation_goals/prepared.sql"),
+    },
+    Migration {
+        version: 146,
+        name: "retain_product_conversation_rename_receipts",
+        sql: include_str!("migrations/retain_product_conversation_rename_receipts.sql"),
+    },
+    Migration {
+        version: 147,
+        name: "retain_product_creation_receipts",
+        sql: include_str!("migrations/retain_product_creation_receipts.sql"),
+    },
+    Migration {
+        version: 148,
+        name: "product_creation_initial_execution_receipts",
+        sql: include_str!("migrations/product_creation_initial_execution_receipts.sql"),
+    },
+    Migration {
+        version: 149,
+        name: "product_creation_image_retirement",
+        sql: include_str!("migrations/product_creation_image_retirement.sql"),
+    },
 ];
+
+const MIGRATION_138: &str = concat!(
+    include_str!("conversation_goals/execution_candidate.sql"),
+    "\n",
+    include_str!("conversation_goals/start_candidate.sql"),
+);
+
+const MIGRATION_136: &str = concat!(
+    include_str!("conversation_goals/control_candidate.sql"),
+    "\n",
+    include_str!("conversation_goals/user_control_candidate.sql"),
+);
+
+async fn run_migration_132(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
+    let mut guard = WritableSchemaGuard::enable(pool).await?;
+    let result = async {
+        const OLD_CHECK: &str = "origin_kind IN ('unknown_historical', 'user_api', 'internal_conversation', 'system_generated', 'subscription_event')";
+        const NEW_CHECK: &str = "origin_kind IN ('unknown_historical', 'user_api', 'internal_conversation', 'system_generated', 'subscription_event', 'remote_api', 'remote_conversation', 'remote_coordinator')";
+
+        let mut tx = guard.connection().begin().await?;
+        let tables = [
+            ("messages", "messages"),
+            ("steering_messages", "steering"),
+            ("durable_turns", "durable_turn"),
+        ];
+        for (table, _) in tables {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE {table} ADD COLUMN origin_source_instance_id TEXT CHECK (
+                    origin_source_instance_id IS NULL OR (
+                        typeof(origin_source_instance_id) = 'text'
+                        AND length(origin_source_instance_id) = 36
+                        AND origin_source_instance_id = lower(origin_source_instance_id)
+                        AND substr(origin_source_instance_id, 9, 1) = '-'
+                        AND substr(origin_source_instance_id, 14, 1) = '-'
+                        AND substr(origin_source_instance_id, 15, 1) = '4'
+                        AND substr(origin_source_instance_id, 19, 1) = '-'
+                        AND substr(origin_source_instance_id, 20, 1) IN ('8', '9', 'a', 'b')
+                        AND substr(origin_source_instance_id, 24, 1) = '-'
+                        AND length(replace(origin_source_instance_id, '-', '')) = 32
+                        AND replace(origin_source_instance_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+                    )
+                )"
+            )))
+            .execute(&mut *tx)
+            .await?;
+        }
+        for (table, _) in tables {
+            let sql: String = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+            )
+            .bind(table)
+            .fetch_one(&mut *tx)
+            .await?;
+            if sql.matches(OLD_CHECK).count() != 1 {
+                return Err(DbError::Serialization(format!(
+                    "migration 132 found unexpected {table} origin CHECK"
+                )));
+            }
+            sqlx::query("UPDATE sqlite_schema SET sql = ?2 WHERE type = 'table' AND name = ?1")
+                .bind(table)
+                .bind(sql.replacen(OLD_CHECK, NEW_CHECK, 1))
+                .execute(&mut *tx)
+                .await?;
+        }
+        let schema_version: i64 = sqlx::query_scalar("PRAGMA schema_version")
+            .fetch_one(&mut *tx)
+            .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "PRAGMA schema_version = {}",
+            schema_version + 1
+        )))
+        .execute(&mut *tx)
+        .await?;
+        for (table, origin_trigger) in tables {
+            for operation in ["insert", "update"] {
+                let event = if operation == "insert" { "INSERT" } else { "UPDATE" };
+                sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                    "DROP TRIGGER {origin_trigger}_origin_{operation};
+                     DROP TRIGGER {table}_source_call_{operation};
+                     CREATE TRIGGER {origin_trigger}_origin_{operation} BEFORE {event} ON {table}
+                     WHEN (NEW.origin_kind = 'subscription_event') != (NEW.origin_subscription_event_id IS NOT NULL)
+                       OR (NEW.origin_kind IN ('remote_api', 'remote_conversation', 'remote_coordinator')) !=
+                          (NEW.origin_source_instance_id IS NOT NULL AND length(trim(NEW.origin_source_instance_id)) > 0)
+                       OR (NEW.origin_kind NOT IN ('remote_api', 'remote_conversation', 'remote_coordinator') AND NEW.origin_source_instance_id IS NOT NULL)
+                       OR (NEW.origin_kind IN ('internal_conversation', 'remote_conversation', 'remote_coordinator')) !=
+                          (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0
+                           AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0)
+                       OR (NEW.origin_kind NOT IN ('internal_conversation', 'remote_conversation', 'remote_coordinator') AND
+                           (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+                     BEGIN SELECT RAISE(ABORT, 'invalid input origin'); END;
+                     CREATE TRIGGER {table}_source_call_{operation} BEFORE {event} ON {table}
+                     WHEN (NEW.origin_source_message_id IS NOT NULL OR NEW.origin_source_tool_use_id IS NOT NULL) AND
+                       (NEW.origin_kind NOT IN ('internal_conversation', 'remote_conversation', 'remote_coordinator')
+                        OR NEW.origin_source_message_id IS NULL OR length(NEW.origin_source_message_id) = 0
+                        OR NEW.origin_source_tool_use_id IS NULL OR length(NEW.origin_source_tool_use_id) = 0)
+                     BEGIN SELECT RAISE(ABORT, 'invalid source call'); END;"
+                )))
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
+            .bind(migration.version)
+            .bind(migration.name)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+    let restore = guard.disable().await;
+    result?;
+    restore
+}
+
+#[cfg(test)]
+mod migration_132_tests {
+    use super::*;
+
+    async fn fixture() -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             CREATE TABLE messages (id TEXT PRIMARY KEY, payload TEXT);
+             CREATE TABLE steering_messages (id TEXT PRIMARY KEY, payload TEXT);
+             CREATE TABLE durable_turns (id TEXT PRIMARY KEY, payload TEXT);
+             CREATE TABLE coordinator_watch_events (event_id TEXT PRIMARY KEY);
+             INSERT INTO coordinator_watch_events VALUES ('event');
+             INSERT INTO messages VALUES ('historical', 'message');
+             INSERT INTO steering_messages VALUES ('historical', 'steering');
+             INSERT INTO durable_turns VALUES ('historical', 'turn');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_110).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_112).execute(&pool).await.unwrap();
+        for table in ["messages", "steering_messages", "durable_turns"] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE {table} ADD COLUMN origin_subscription_event_id TEXT REFERENCES coordinator_watch_events(event_id)"
+            )))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool
+    }
+
+    fn migration() -> &'static Migration {
+        MIGRATIONS.iter().find(|m| m.version == 132).unwrap()
+    }
+
+    #[tokio::test]
+    async fn widens_in_place_without_rewriting_history_or_foreign_keys() {
+        let pool = fixture().await;
+        let before: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT name, rootpage FROM sqlite_schema WHERE type = 'table' ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        run_migration_132(&pool, migration()).await.unwrap();
+        let after: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT name, rootpage FROM sqlite_schema WHERE type = 'table' ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(before, after);
+        for (table, payload) in [
+            ("messages", "message"),
+            ("steering_messages", "steering"),
+            ("durable_turns", "turn"),
+        ] {
+            let row: (String, String, Option<String>) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT payload, origin_kind, origin_source_instance_id FROM {table} WHERE id = 'historical'"
+            )))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(row, (payload.into(), "unknown_historical".into(), None));
+            let foreign_columns: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT \"from\" FROM pragma_foreign_key_list('{table}')"
+            )))
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(foreign_columns, ["origin_subscription_event_id"]);
+        }
+        let writable: i64 = sqlx::query_scalar("PRAGMA writable_schema")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(writable, 0);
+        let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn insert_and_update_enforce_all_origin_shapes() {
+        let pool = fixture().await;
+        run_migration_132(&pool, migration()).await.unwrap();
+        let instance = "f672a139-f8e5-47e6-83ed-883122aa3260";
+        for table in ["messages", "steering_messages", "durable_turns"] {
+            for (kind, product, transcript, event, peer, message, call, valid) in [
+                (
+                    "unknown_historical",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                ),
+                ("user_api", None, None, None, None, None, None, true),
+                ("system_generated", None, None, None, None, None, None, true),
+                (
+                    "subscription_event",
+                    None,
+                    None,
+                    Some("event"),
+                    None,
+                    None,
+                    None,
+                    true,
+                ),
+                (
+                    "internal_conversation",
+                    Some("product"),
+                    Some("transcript"),
+                    None,
+                    None,
+                    Some("message"),
+                    Some("call"),
+                    true,
+                ),
+                (
+                    "remote_api",
+                    None,
+                    None,
+                    None,
+                    Some(instance),
+                    None,
+                    None,
+                    true,
+                ),
+                (
+                    "remote_conversation",
+                    Some("product"),
+                    Some("transcript"),
+                    None,
+                    Some(instance),
+                    None,
+                    None,
+                    true,
+                ),
+                (
+                    "remote_coordinator",
+                    Some("product"),
+                    Some("transcript"),
+                    None,
+                    Some(instance),
+                    Some("message"),
+                    Some("call"),
+                    true,
+                ),
+                ("unknown_kind", None, None, None, None, None, None, false),
+                (
+                    "user_api",
+                    None,
+                    None,
+                    None,
+                    Some(instance),
+                    None,
+                    None,
+                    false,
+                ),
+                (
+                    "internal_conversation",
+                    Some("product"),
+                    Some("transcript"),
+                    None,
+                    Some(instance),
+                    None,
+                    None,
+                    false,
+                ),
+                ("remote_api", None, None, None, None, None, None, false),
+                ("remote_api", None, None, None, Some(" "), None, None, false),
+                (
+                    "remote_api",
+                    Some("product"),
+                    Some("transcript"),
+                    None,
+                    Some(instance),
+                    None,
+                    None,
+                    false,
+                ),
+                (
+                    "remote_api",
+                    None,
+                    None,
+                    None,
+                    Some(instance),
+                    Some("message"),
+                    Some("call"),
+                    false,
+                ),
+                (
+                    "remote_conversation",
+                    None,
+                    Some("transcript"),
+                    None,
+                    Some(instance),
+                    None,
+                    None,
+                    false,
+                ),
+                (
+                    "remote_conversation",
+                    Some("product"),
+                    Some(" "),
+                    None,
+                    Some(instance),
+                    None,
+                    None,
+                    false,
+                ),
+                (
+                    "remote_coordinator",
+                    Some("product"),
+                    Some("transcript"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                ),
+                (
+                    "remote_coordinator",
+                    Some("product"),
+                    Some("transcript"),
+                    None,
+                    Some(instance),
+                    Some("message"),
+                    None,
+                    false,
+                ),
+                (
+                    "remote_coordinator",
+                    Some("product"),
+                    Some("transcript"),
+                    None,
+                    Some(instance),
+                    Some("message"),
+                    Some(""),
+                    false,
+                ),
+                (
+                    "remote_conversation",
+                    Some("product"),
+                    Some("transcript"),
+                    Some("event"),
+                    Some(instance),
+                    None,
+                    None,
+                    false,
+                ),
+                (
+                    "subscription_event",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                ),
+                (
+                    "subscription_event",
+                    None,
+                    None,
+                    Some("missing-event"),
+                    None,
+                    None,
+                    None,
+                    false,
+                ),
+                (
+                    "subscription_event",
+                    None,
+                    None,
+                    Some("event"),
+                    Some(instance),
+                    None,
+                    None,
+                    false,
+                ),
+            ]
+            .into_iter()
+            .chain(
+                ["remote_api", "remote_conversation", "remote_coordinator"]
+                    .into_iter()
+                    .flat_map(|kind| {
+                        [
+                            "not-a-uuid",
+                            "F672A139-F8E5-47E6-83ED-883122AA3260",
+                            "00000000-0000-0000-0000-000000000000",
+                            "f672a139-f8e5-17e6-83ed-883122aa3260",
+                            "f672a139-f8e5-47e6-03ed-883122aa3260",
+                            "f672a139-f8e5-47e6-c3ed-883122aa3260",
+                            "f672a139-f8e5-47e6-83ed-883122aa326g",
+                            "f672a139_f8e5-47e6-83ed-883122aa3260",
+                            "f672a139f8e547e683ed883122aa3260",
+                            "f672a139-f8e5-47e6-83ed-883122aa326",
+                        ]
+                        .into_iter()
+                        .map(move |peer| {
+                            let conversation = kind != "remote_api";
+                            (
+                                kind,
+                                conversation.then_some("product"),
+                                conversation.then_some("transcript"),
+                                None,
+                                Some(peer),
+                                None,
+                                None,
+                                false,
+                            )
+                        })
+                    }),
+            ) {
+                for insert in [true, false] {
+                    let statement = if insert {
+                        format!("INSERT INTO {table} (id, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id) VALUES ('candidate', ?1, ?2, ?3, ?4, ?5, ?6, ?7)")
+                    } else {
+                        format!("UPDATE {table} SET origin_kind = ?1, origin_product_conversation_id = ?2, origin_transcript_id = ?3, origin_subscription_event_id = ?4, origin_source_instance_id = ?5, origin_source_message_id = ?6, origin_source_tool_use_id = ?7 WHERE id = 'historical'")
+                    };
+                    let result = sqlx::query(sqlx::AssertSqlSafe(statement))
+                        .bind(kind)
+                        .bind(product)
+                        .bind(transcript)
+                        .bind(event)
+                        .bind(peer)
+                        .bind(message)
+                        .bind(call)
+                        .execute(&pool)
+                        .await;
+                    assert_eq!(
+                        result.is_ok(),
+                        valid,
+                        "{table}: {kind}, insert={insert}: {result:?}"
+                    );
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
+                        "DELETE FROM {table} WHERE id = 'candidate'"
+                    )))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unexpected_check_rolls_back_columns_and_restores_guard() {
+        let pool = fixture().await;
+        let mut guard = WritableSchemaGuard::enable(&pool).await.unwrap();
+        sqlx::query("UPDATE sqlite_schema SET sql = replace(sql, 'subscription_event', 'unexpected') WHERE type = 'table' AND name = 'durable_turns'")
+            .execute(guard.connection()).await.unwrap();
+        guard.disable().await.unwrap();
+        assert!(run_migration_132(&pool, migration()).await.is_err());
+        for table in ["messages", "steering_messages", "durable_turns"] {
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM pragma_table_info('{table}') WHERE name = 'origin_source_instance_id'"
+            )))
+            .fetch_one(&pool).await.unwrap();
+            assert_eq!(count, 0);
+        }
+        let writable: i64 = sqlx::query_scalar("PRAGMA writable_schema")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(writable, 0);
+        let recorded: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM _migrations WHERE version = 132")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded, 0);
+    }
+}
+
+const WAKE_FEATURE_RETIREMENT_SQL: &str = include_str!("migrations/wake_feature_retirement.sql");
 
 const MIGRATION_123: &str = include_str!("migrations/close_startup_interruption.sql");
 
@@ -1509,6 +2165,135 @@ const MIGRATION_117: &str = concat!(
     include_str!("responses_replay.sql")
 );
 
+const MIGRATION_124: &str = r"
+ALTER TABLE federation_peer_connections
+ADD COLUMN tls_ca_certificate_pem TEXT
+CHECK (
+    tls_ca_certificate_pem IS NULL
+    OR (
+        typeof(tls_ca_certificate_pem) = 'text'
+        AND length(tls_ca_certificate_pem) BETWEEN 1 AND 32768
+        AND tls_ca_certificate_pem LIKE '-----BEGIN CERTIFICATE-----%'
+        AND tls_ca_certificate_pem LIKE '%-----END CERTIFICATE-----%'
+    )
+);
+";
+
+const MIGRATION_125: &str = r"
+CREATE TEMP TABLE federation_peer_connections_v125 (
+    peer_instance_id TEXT PRIMARY KEY NOT NULL CHECK(
+        typeof(peer_instance_id) = 'text'
+        AND length(peer_instance_id) = 36
+        AND peer_instance_id = lower(peer_instance_id)
+        AND substr(peer_instance_id, 9, 1) = '-'
+        AND substr(peer_instance_id, 14, 1) = '-'
+        AND substr(peer_instance_id, 15, 1) = '4'
+        AND substr(peer_instance_id, 19, 1) = '-'
+        AND substr(peer_instance_id, 20, 1) IN ('8', '9', 'a', 'b')
+        AND substr(peer_instance_id, 24, 1) = '-'
+        AND length(replace(peer_instance_id, '-', '')) = 32
+        AND replace(peer_instance_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    peer_display_name TEXT NOT NULL CHECK(length(trim(peer_display_name)) > 0),
+    domain_or_ipv4_host TEXT CHECK(
+        domain_or_ipv4_host IS NULL
+        OR (
+            typeof(domain_or_ipv4_host) = 'text'
+            AND length(domain_or_ipv4_host) > 0
+            AND domain_or_ipv4_host NOT GLOB '*[^A-Za-z0-9.-]*'
+        )
+    ),
+    ipv6_host BLOB CHECK(
+        ipv6_host IS NULL
+        OR (typeof(ipv6_host) = 'blob' AND length(ipv6_host) = 16)
+    ),
+    port INTEGER NOT NULL CHECK(
+        typeof(port) = 'integer' AND port BETWEEN 1 AND 65535
+    ),
+    bearer_credential TEXT NOT NULL UNIQUE CHECK(
+        bearer_credential GLOB 'phx_peer_*'
+        AND length(bearer_credential) = 52
+        AND substr(bearer_credential, 10) NOT GLOB '*[^A-Za-z0-9_-]*'
+    ),
+    tls_ca_certificate_pem TEXT CHECK(
+        tls_ca_certificate_pem IS NULL
+        OR (
+            typeof(tls_ca_certificate_pem) = 'text'
+            AND length(tls_ca_certificate_pem) BETWEEN 1 AND 32768
+            AND tls_ca_certificate_pem LIKE '-----BEGIN CERTIFICATE-----%'
+            AND tls_ca_certificate_pem LIKE '%-----END CERTIFICATE-----%'
+        )
+    ),
+    created_at_us INTEGER NOT NULL CHECK(
+        typeof(created_at_us) = 'integer' AND created_at_us >= 0
+    ),
+    CHECK((domain_or_ipv4_host IS NULL) <> (ipv6_host IS NULL)),
+    UNIQUE(domain_or_ipv4_host, port),
+    UNIQUE(ipv6_host, port)
+);
+INSERT INTO federation_peer_connections_v125 (
+    peer_instance_id, peer_display_name, domain_or_ipv4_host, ipv6_host, port,
+    bearer_credential, tls_ca_certificate_pem, created_at_us
+)
+SELECT peer_instance_id, peer_display_name, host, NULL, port,
+       bearer_credential, tls_ca_certificate_pem, created_at_us
+FROM federation_peer_connections;
+DROP TABLE federation_peer_connections;
+CREATE TABLE federation_peer_connections (
+    peer_instance_id TEXT PRIMARY KEY NOT NULL CHECK(
+        typeof(peer_instance_id) = 'text'
+        AND length(peer_instance_id) = 36
+        AND peer_instance_id = lower(peer_instance_id)
+        AND substr(peer_instance_id, 9, 1) = '-'
+        AND substr(peer_instance_id, 14, 1) = '-'
+        AND substr(peer_instance_id, 15, 1) = '4'
+        AND substr(peer_instance_id, 19, 1) = '-'
+        AND substr(peer_instance_id, 20, 1) IN ('8', '9', 'a', 'b')
+        AND substr(peer_instance_id, 24, 1) = '-'
+        AND length(replace(peer_instance_id, '-', '')) = 32
+        AND replace(peer_instance_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    peer_display_name TEXT NOT NULL CHECK(length(trim(peer_display_name)) > 0),
+    domain_or_ipv4_host TEXT CHECK(
+        domain_or_ipv4_host IS NULL
+        OR (
+            typeof(domain_or_ipv4_host) = 'text'
+            AND length(domain_or_ipv4_host) > 0
+            AND domain_or_ipv4_host NOT GLOB '*[^A-Za-z0-9.-]*'
+        )
+    ),
+    ipv6_host BLOB CHECK(
+        ipv6_host IS NULL
+        OR (typeof(ipv6_host) = 'blob' AND length(ipv6_host) = 16)
+    ),
+    port INTEGER NOT NULL CHECK(
+        typeof(port) = 'integer' AND port BETWEEN 1 AND 65535
+    ),
+    bearer_credential TEXT NOT NULL UNIQUE CHECK(
+        bearer_credential GLOB 'phx_peer_*'
+        AND length(bearer_credential) = 52
+        AND substr(bearer_credential, 10) NOT GLOB '*[^A-Za-z0-9_-]*'
+    ),
+    tls_ca_certificate_pem TEXT CHECK(
+        tls_ca_certificate_pem IS NULL
+        OR (
+            typeof(tls_ca_certificate_pem) = 'text'
+            AND length(tls_ca_certificate_pem) BETWEEN 1 AND 32768
+            AND tls_ca_certificate_pem LIKE '-----BEGIN CERTIFICATE-----%'
+            AND tls_ca_certificate_pem LIKE '%-----END CERTIFICATE-----%'
+        )
+    ),
+    created_at_us INTEGER NOT NULL CHECK(
+        typeof(created_at_us) = 'integer' AND created_at_us >= 0
+    ),
+    CHECK((domain_or_ipv4_host IS NULL) <> (ipv6_host IS NULL)),
+    UNIQUE(domain_or_ipv4_host, port),
+    UNIQUE(ipv6_host, port)
+);
+INSERT INTO federation_peer_connections SELECT * FROM federation_peer_connections_v125;
+DROP TABLE federation_peer_connections_v125;
+";
+
 const MIGRATION_113: &str = "";
 
 const MIGRATION_114: &str = r"
@@ -1619,6 +2404,25 @@ CREATE TRIGGER durable_turns_source_call_update BEFORE UPDATE ON durable_turns
 WHEN (NEW.origin_source_message_id IS NOT NULL OR NEW.origin_source_tool_use_id IS NOT NULL) AND
  (NEW.origin_kind <> 'internal_conversation' OR NEW.origin_source_message_id IS NULL OR length(NEW.origin_source_message_id) = 0 OR NEW.origin_source_tool_use_id IS NULL OR length(NEW.origin_source_tool_use_id) = 0)
 BEGIN SELECT RAISE(ABORT, 'invalid source call'); END;
+";
+
+const MIGRATION_128: &str = r"
+ALTER TABLE product_creation_jobs ADD COLUMN provisioning_stage TEXT NOT NULL
+    DEFAULT 'validate_intent'
+    CHECK (provisioning_stage IN ('validate_intent', 'resolve_repository', 'resolve_starting_pin',
+        'materialize_worktree', 'finalize_attachments', 'commit_metadata',
+        'bootstrap_initial_turn', 'finalize_publication'));
+ALTER TABLE product_creation_jobs ADD COLUMN stage_updated_at_unix_micros INTEGER NOT NULL DEFAULT 0
+    CHECK (typeof(stage_updated_at_unix_micros) = 'integer' AND stage_updated_at_unix_micros >= 0);
+UPDATE product_creation_jobs
+SET provisioning_stage = CASE
+        WHEN status = 'published' THEN 'finalize_publication'
+        WHEN status IN ('delivery_pending', 'delivery_failed') THEN 'bootstrap_initial_turn'
+        WHEN staging_path IS NOT NULL THEN 'materialize_worktree'
+        WHEN pin_exact_checkout_oid IS NOT NULL THEN 'resolve_starting_pin'
+        ELSE 'validate_intent'
+    END,
+    stage_updated_at_unix_micros = updated_at_unix_micros;
 ";
 
 const MIGRATION_111: &str = r"
@@ -1811,7 +2615,7 @@ WHERE type = 'table'
 
 #[cfg(test)]
 mod migration_121_tests {
-    use super::{run_pending_migrations, MIGRATIONS};
+    use super::{run_through_for_test, MIGRATIONS};
     use sqlx::{sqlite::SqlitePoolOptions, Row};
 
     #[tokio::test]
@@ -1842,7 +2646,7 @@ mod migration_121_tests {
         .unwrap();
         for migration in MIGRATIONS
             .iter()
-            .filter(|migration| migration.version != 121)
+            .filter(|migration| migration.version < 130 && migration.version != 121)
         {
             sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
                 .bind(migration.version)
@@ -1852,7 +2656,7 @@ mod migration_121_tests {
                 .unwrap();
         }
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 1);
         let schema: String =
             sqlx::query("SELECT sql FROM sqlite_schema WHERE name = 'conversations'")
                 .fetch_one(&pool)
@@ -1882,7 +2686,7 @@ mod migration_121_tests {
             .execute(&pool)
             .await
             .unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 0);
         let captured: String = sqlx::query_scalar(
             "SELECT captured_state_kind FROM close_attempt_members WHERE attempt_id = 'close'",
         )
@@ -11183,6 +11987,8 @@ async fn migration_080_prepare(tx: &mut Transaction<'_, Sqlite>) -> DbResult<boo
     Ok(true)
 }
 
+mod coordinator_home;
+
 struct WritableSchemaGuard {
     connection: Option<sqlx::pool::PoolConnection<Sqlite>>,
     armed: bool,
@@ -11280,17 +12086,73 @@ async fn run_migration_096(pool: &SqlitePool, migration: &Migration) -> DbResult
     restore
 }
 
+async fn migration_149_backfill_image_replay_identity(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> DbResult<()> {
+    let mut cursor = 0_i64;
+    loop {
+        let row: Option<(i64, String, i64, String, String)> = sqlx::query_as(
+            "SELECT rowid, request_id, ordinal, media_type, data FROM product_creation_job_images
+             WHERE rowid > ?1 ORDER BY rowid LIMIT 1",
+        )
+        .bind(cursor)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some((rowid, request_id, ordinal, media_type, data)) = row else {
+            break;
+        };
+        cursor = rowid;
+        sqlx::query("INSERT INTO product_creation_image_replay_identity (request_id, ordinal, media_type, data_sha256) VALUES (?1, ?2, ?3, ?4)")
+            .bind(request_id)
+            .bind(ordinal)
+            .bind(media_type)
+            .bind(crate::product_creation::creation_image_data_sha256(&data))
+            .execute(&mut **tx)
+            .await?;
+    }
+    sqlx::query(
+        "INSERT INTO product_creation_retired_images (request_id)
+         SELECT j.request_id FROM product_creation_jobs j
+         WHERE j.published_product_id IS NOT NULL
+           AND EXISTS (SELECT 1 FROM product_creation_image_replay_identity i WHERE i.request_id = j.request_id)
+           AND NOT EXISTS (SELECT 1 FROM product_conversations p WHERE p.id = j.published_product_id)",
+    )
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM product_creation_job_images WHERE request_id IN
+         (SELECT request_id FROM product_creation_retired_images)",
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 async fn apply_migration_body(
     tx: &mut Transaction<'_, Sqlite>,
     migration: &Migration,
 ) -> DbResult<()> {
+    if migration.version == 129 {
+        return crate::conversation_name::migrate_name_authority(tx).await;
+    }
     if migration.version == 120 {
         index_outbox_children_before_rebuild(tx).await?;
     }
     if migration.version == 113 {
         settle_historical_continuation::run(tx).await?;
     } else {
+        #[cfg(test)]
+        {
+            let sql = conversation_tools_tests::body_sql(tx, migration.sql).await?;
+            sqlx::raw_sql(sqlx::AssertSqlSafe(sql.as_ref()))
+                .execute(&mut **tx)
+                .await?;
+        }
+        #[cfg(not(test))]
         sqlx::raw_sql(migration.sql).execute(&mut **tx).await?;
+        if migration.version == 149 {
+            migration_149_backfill_image_replay_identity(tx).await?;
+        }
         if migration.version == 114 {
             sqlx::query(
                 "INSERT INTO instance_identity (singleton_key, instance_id) VALUES (1, ?1)",
@@ -11367,6 +12229,32 @@ async fn run_migration_121(pool: &SqlitePool, migration: &Migration) -> DbResult
     restore
 }
 
+pub(crate) fn migration_identities() -> impl Iterator<Item = (u32, &'static str)> {
+    MIGRATIONS
+        .iter()
+        .map(|migration| (migration.version, migration.name))
+}
+
+#[cfg(test)]
+pub(crate) async fn run_unpublished_tools_d3_for_test(pool: &SqlitePool) -> DbResult<u32> {
+    let unpublished: Vec<_> = MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= 149 && migration.version != 145)
+        .map(|migration| Migration {
+            version: migration.version,
+            name: migration.name,
+            sql: migration.sql,
+        })
+        .collect();
+    run_migration_list(pool, &unpublished).await
+}
+
+#[cfg(test)]
+pub(crate) async fn run_through_for_test(pool: &SqlitePool, version: u32) -> DbResult<u32> {
+    let end = MIGRATIONS.partition_point(|migration| migration.version <= version);
+    run_migration_list(pool, &MIGRATIONS[..end]).await
+}
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -11376,6 +12264,12 @@ async fn run_migration_121(pool: &SqlitePool, migration: &Migration) -> DbResult
 /// Returns a [`DbError`] if the underlying database operation fails.
 #[allow(clippy::too_many_lines)]
 pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
+    run_migration_list(pool, MIGRATIONS).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbResult<u32> {
+    super::lineage::preflight(pool, migration_identities()).await?;
     // Ensure the tracking table exists
     sqlx::raw_sql(
         "CREATE TABLE IF NOT EXISTS _migrations (\
@@ -11401,7 +12295,7 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
 
     let mut applied = 0u32;
 
-    for migration in MIGRATIONS {
+    for migration in migrations {
         if applied_versions.contains(&migration.version) {
             continue;
         }
@@ -11433,6 +12327,36 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
 
         if migration.version == 121 {
             run_migration_121(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 133 {
+            federated_subscriptions::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 138 {
+            goal_execution::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 137 {
+            local_goal_watch::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 132 {
+            run_migration_132(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 127 {
+            coordinator_home::run(pool, migration).await?;
             applied += 1;
             continue;
         }
@@ -12286,6 +13210,59 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn slack_final_schema_excludes_obsolete_prototype_storage() {
+        let db = crate::Database::open_in_memory().await.unwrap();
+        let identity: String = sqlx::query_scalar("SELECT name FROM _migrations WHERE version=142")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(identity, "slack_gateway_v1");
+        let obsolete: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM sqlite_schema WHERE name='slack_gateway_questions')
+            + (SELECT COUNT(*) FROM pragma_table_info('slack_gateway_requests') WHERE name IN ('question_id','question_transcript'))
+            + (SELECT COUNT(*) FROM pragma_table_info('slack_gateway_native_outcomes') WHERE name IN ('question_id','question_body'))
+            + (SELECT COUNT(*) FROM pragma_table_info('slack_gateway_returns') WHERE name IN ('response_kind','notification_inspect_after_us'))")
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(obsolete, 0);
+    }
+
+    #[tokio::test]
+    async fn slack_prototype_ledgers_are_refused_before_mutation() {
+        for (version, name) in [
+            (141, "slack_gateway"),
+            (141, "slack_gateway_v1"),
+            (142, "slack_gateway_first_observation"),
+        ] {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap();
+            sqlx::raw_sql("CREATE TABLE _migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT (datetime('now')));
+                CREATE TABLE prototype_work(instruction TEXT); INSERT INTO prototype_work VALUES('preserve this work');")
+                .execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO _migrations(version,name) VALUES (?1,?2)")
+                .bind(version)
+                .bind(name)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert!(run_pending_migrations(&pool).await.is_err());
+            let work: String = sqlx::query_scalar("SELECT instruction FROM prototype_work")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(work, "preserve this work");
+            let objects: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(objects, 2);
+        }
+    }
+
+    #[tokio::test]
     async fn migration_119_retains_retry_pending_plan_outbox_trigger_after_table_rebuild() {
         let db = crate::Database::open_in_memory().await.unwrap();
         let count: i64 = sqlx::query_scalar(
@@ -12296,7 +13273,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
-        assert_outbox_child_indexes_are_used(db.pool()).await;
+        assert_outbox_child_indexes_are_used(db.pool(), "subscription_delivery_identities").await;
         let ledger: Vec<i64> = sqlx::query_scalar(
             "SELECT version FROM _migrations WHERE version IN (119, 122) ORDER BY version",
         )
@@ -12308,6 +13285,853 @@ mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use sqlx::Row;
     use std::str::FromStr;
+
+    mod wake_feature_retirement_tests {
+        use super::*;
+
+        const WAKE_STATUSES: [&str; 9] = [
+            "Active",
+            "Cancelling",
+            "ManualResolution",
+            "Incompatible",
+            "DeletionPending",
+            "Completed",
+            "Failed",
+            "Cancelled",
+            "Deleted",
+        ];
+
+        async fn initialize_pre_retirement(db: crate::Database) -> crate::Database {
+            sqlx::raw_sql(
+                "CREATE TABLE _migrations (
+                     version INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            stamp_migration_versions(db.pool(), &[126]).await;
+            assert_eq!(
+                run_pending_migrations(db.pool()).await.unwrap() as usize,
+                MIGRATIONS.len() - 1
+            );
+            sqlx::query("DELETE FROM _migrations WHERE version = 126")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            let retirement_tables: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name IN (
+                     'workflow_feature_retirements', 'wake_occurrence_feature_retirements',
+                     'coordinator_event_feature_retirements'
+                 )",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(retirement_tables, 0);
+            db
+        }
+
+        async fn pre_retirement_in_memory() -> crate::Database {
+            let db = crate::Database::from_pool_for_tests(test_pool().await, String::new());
+            db.run_migrations().await.unwrap();
+            initialize_pre_retirement(db).await
+        }
+
+        async fn fixture() -> crate::Database {
+            seed_fixture(pre_retirement_in_memory().await).await
+        }
+
+        #[allow(clippy::too_many_lines)]
+        async fn seed_fixture(db: crate::Database) -> crate::Database {
+            for id in [
+                "wake-history",
+                "steering-history",
+                "seed-history",
+                "interaction-history",
+            ] {
+                db.create_conversation(id, id, "/tmp", true, None, None)
+                    .await
+                    .unwrap();
+                sqlx::query(
+                    "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type,
+                         content, created_at)
+                     VALUES (?1, ?2, 1, 'user', '{ \"text\" : \"preserved history\" }', '2026-01-01')",
+                )
+                .bind(format!("{id}:message"))
+                .bind(id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            }
+            for (index, status) in WAKE_STATUSES.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO workflows (workflow_id, profile_kind, profile_version,
+                         runtime_acceptance_enabled, external_acceptance_enabled, version, generation,
+                         status, snapshot_codec_family, snapshot_codec_version, snapshot_payload,
+                         created_at, updated_at)
+                     VALUES (?1, 'wake', ?1, 1, 0, 1, 7, ?2, 'wake.snapshot', 1, ?3, 10, 20)",
+                )
+                .bind(i64::try_from(index + 1).unwrap())
+                .bind(*status)
+                .bind(format!("{{ \"historical_status\" : \"{status}\" }}").into_bytes())
+                .execute(db.pool())
+                .await
+                .unwrap();
+            }
+            sqlx::raw_sql(
+                "INSERT INTO workflows (workflow_id, profile_kind, profile_version,
+                     runtime_acceptance_enabled, external_acceptance_enabled, version, generation,
+                     status, snapshot_codec_family, snapshot_codec_version, snapshot_payload,
+                     created_at, updated_at) VALUES
+                     (100, 'direct_turn', 1, 0, 1, 1, 7, 'Active', 'direct_turn.snapshot', 1, X'0001FF', 10, 20),
+                     (101, 'nonwake', 1, 1, 0, 1, 7, 'Active', 'wake.snapshot', 1, X'0002FE', 10, 20);
+                 INSERT INTO workflow_supported_codecs (workflow_id, codec_family, codec_version)
+                     SELECT workflow_id, 'historical.codec', 1 FROM workflows;
+                 INSERT INTO workflow_transitions (workflow_id, transition_id, from_version,
+                     to_version, generation, event_codec_family, event_codec_version, event_payload, committed_at)
+                     SELECT workflow_id, 1, 0, 1, 7, 'historical.event', 1, X'0000FEFF', 20 FROM workflows;
+                 INSERT INTO workflow_effects (workflow_id, effect_id, declared_workflow_version,
+                     family, kind, intent_codec_family, intent_codec_version, intent_payload, generation,
+                     role, capability_kind, status)
+                     SELECT workflow_id, 1, 0, 'historical', 'observe', 'historical.intent', 1,
+                         X'0001FF', 7, 'Required', 'ReclaimableObservation', 'Receipted' FROM workflows;
+                 INSERT INTO workflow_effects (workflow_id, effect_id, declared_workflow_version,
+                     family, kind, intent_codec_family, intent_codec_version, intent_payload, generation,
+                     role, capability_kind, status, next_eligible_at, pending_reconciliation)
+                     SELECT workflow_id, 2, 1, 'historical', 'observe', 'historical.intent', 1,
+                         X'FF0002', 7, 'Required', 'ReclaimableObservation',
+                         CASE status WHEN 'Cancelling' THEN 'Executing'
+                             WHEN 'ManualResolution' THEN 'AmbiguityWait'
+                             WHEN 'Incompatible' THEN 'RetryWait'
+                             WHEN 'DeletionPending' THEN 'Blocked'
+                             WHEN 'Completed' THEN 'Invalidated'
+                             WHEN 'Failed' THEN 'Invalidated'
+                             WHEN 'Cancelled' THEN 'Invalidated'
+                             WHEN 'Deleted' THEN 'Invalidated' ELSE 'Eligible' END,
+                         100, 1 FROM workflows;
+                 INSERT INTO workflow_effects (workflow_id, effect_id, declared_workflow_version,
+                     family, kind, intent_codec_family, intent_codec_version, intent_payload, generation,
+                     role, capability_kind, status)
+                     SELECT workflow_id, 3, 0, 'historical', 'observe', 'historical.intent', 1,
+                         X'0003FF', 7, 'Required', 'ReclaimableObservation', 'Receipted' FROM workflows;
+                 INSERT INTO workflow_attempts (workflow_id, effect_id, attempt_id, ordinal,
+                     declared_workflow_version, generation, process_incarnation, status, created_at)
+                     SELECT workflow_id, effect_id, effect_id, 0, 0, 7, 2, 'ReceiptAccepted', 15
+                     FROM workflow_effects WHERE effect_id IN (1, 3);
+                 INSERT INTO workflow_attempts (workflow_id, effect_id, attempt_id, ordinal,
+                     declared_workflow_version, generation, process_incarnation, status, created_at)
+                     VALUES (2, 2, 2, 0, 1, 7, 2, 'Begun', 20);
+                 INSERT INTO workflow_reclaimable_leases (workflow_id, attempt_id, lease_until)
+                     VALUES (2, 2, 200);
+                 INSERT INTO workflow_authoritative_observations (workflow_id, observation_id,
+                     effect_id, attempt_id, declared_workflow_version, generation, process_incarnation,
+                     observation_codec_family, observation_codec_version, observation_payload,
+                     observed_at, recorded_at)
+                     SELECT workflow_id, 1, 1, 1, 0, 7, 2, 'historical.observation', 1, X'00FF01', 16, 17
+                     FROM workflows;
+                 INSERT INTO workflow_receipts (workflow_id, receipt_id, effect_id, generation,
+                     declared_workflow_version, process_incarnation, attempt_id, origin,
+                     receipt_codec_family, receipt_codec_version, receipt_payload)
+                     SELECT workflow_id, effect_id, effect_id, 7, 0, 2, effect_id, 'Execution',
+                         'historical.receipt', 1, X'00FF02' FROM workflow_effects WHERE effect_id IN (1, 3);
+                 INSERT INTO workflow_deliveries (workflow_id, delivery_id, effect_id, consumer_kind,
+                     event_codec_family, event_codec_version, payload_kind, payload_blob,
+                     requires_runtime_acceptance, status, runtime_acceptance_status)
+                     SELECT workflow_id, 1, 1, 'conversation', 'historical.delivery', 1, 'Receipt',
+                         X'00FF03', 1, 'Pending', 'Owed' FROM workflows WHERE profile_kind = 'wake';
+                 INSERT INTO workflow_deliveries (workflow_id, delivery_id, effect_id, consumer_kind,
+                     event_codec_family, event_codec_version, payload_kind, payload_blob,
+                     requires_runtime_acceptance, status, runtime_acceptance_status, accepted_by_transition_id)
+                     SELECT workflow_id, 2, 3, 'conversation', 'historical.delivery', 1, 'Receipt',
+                         X'00FF04', 1, 'Accepted', 'Accepted', 1 FROM workflows WHERE profile_kind = 'wake';
+                 INSERT INTO workflow_schedules (workflow_id, schedule_id, policy, schedule_key,
+                     status, next_eligible_at, due_occurrence_id, due_generation, due_at)
+                     VALUES (1, 1, 'CoalesceLatest', 'historical-schedule', 'Due', 100, 5, 7, 90);
+                 INSERT INTO workflow_manual_resolutions (workflow_id, manual_resolution_id,
+                     workflow_version, effect_id, status)
+                     VALUES (3, 1, 1, 2, 'Required');
+                 INSERT INTO wake_bindings (workflow_id, conversation_id, contract_id, profile_kind,
+                     profile_version, work_scope_id, resource_kind, bash_handle_id,
+                     registering_tool_use_id, expires_at, resolved_at, prepared_fingerprint,
+                     observe_effect_id, created_at)
+                     SELECT w.workflow_id, c.id, 'contract-' || w.workflow_id, 'wake', w.profile_version,
+                         c.work_scope_id, 'Bash', 'b-' || w.workflow_id, 'tool-' || w.workflow_id,
+                         100, 18, 'historical-fingerprint', 1, 10
+                     FROM workflows w JOIN conversations c ON c.id = 'wake-history'
+                     WHERE w.profile_kind = 'wake' AND w.status <> 'Deleted';
+                 INSERT INTO wake_terminal_receipts (workflow_id, receipt_id, delivery_id,
+                     conversation_id, contract_id, resource_kind, terminal_kind, resolved_at,
+                     bash_handle_id, bash_status, occurred_at, exit_code, duration_ms)
+                     SELECT workflow_id, 1, 1, conversation_id, contract_id, 'Bash', 'Fired', 18,
+                         bash_handle_id, 'Exited', 16, 0, 2 FROM wake_bindings;
+                 INSERT INTO wake_terminal_receipts (workflow_id, receipt_id, delivery_id,
+                     conversation_id, contract_id, resource_kind, terminal_kind, resolved_at,
+                     bash_handle_id, bash_status, occurred_at, exit_code, duration_ms)
+                     SELECT workflow_id, 3, 2, conversation_id, contract_id, 'Bash', 'Fired', 18,
+                         bash_handle_id, 'Exited', 16, 0, 2 FROM wake_bindings;
+                 INSERT INTO wake_terminal_receipt_tails (workflow_id, receipt_id, ordinal, line)
+                     SELECT workflow_id, receipt_id, 0, 'unchanged historical tail' FROM wake_terminal_receipts;
+                 INSERT INTO wake_delivery_messages (workflow_id, delivery_id, conversation_id,
+                     message_id, registering_tool_use_id, terminal_kind, auto_resume, created_at)
+                     VALUES (6, 2, 'wake-history', 'wake-history:message', 'tool-6', 'Fired', 1, 20);
+                 INSERT INTO durable_turns (turn_id, workflow_id, conversation_id, client_turn_key,
+                     prepared_fingerprint, prepared_payload, disposition, generation, owns_conversation,
+                     canonical_message_id, materialized)
+                     VALUES (100, 100, 'wake-history', 'wake:6:2', 'accepted-fingerprint', X'FF000A',
+                         'Runtime', 7, 1, 'wake-history:message', 1);
+                 INSERT INTO workflow_external_acceptance_bindings (profile_kind, profile_version,
+                     target_scope, idempotency_key, intent_fingerprint, workflow_id,
+                     receipt_handle, disposition_handle, created_at)
+                     VALUES ('direct_turn', 1, 'wake-history', 'wake:6:2', 'accepted-fingerprint',
+                         100, X'00FF05', X'00FF06', 20);
+                 INSERT INTO durable_turn_submitted_images (turn_id, ordinal, media_type, data)
+                     VALUES (100, 0, 'image/png', 'historical submitted image');
+                 INSERT INTO durable_turn_delivery_images (turn_id, ordinal, media_type, data)
+                     VALUES (100, 0, 'image/png', 'historical delivery image');
+                 INSERT INTO steering_execution_occurrences (conversation_id, message_id, source_kind) VALUES
+                     ('wake-history', 'wake-history:message', 'wake'),
+                     ('steering-history', 'steering-history:message', 'steering'),
+                     ('seed-history', 'seed-history:message', 'seeded_fork'),
+                     ('interaction-history', 'interaction-history:message', 'interaction_response');",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::raw_sql(
+                "INSERT INTO coordinator_watches (id, source_product_conversation_id, enrolled_at_us)
+                     SELECT 1, product_conversation_id, 20 FROM conversations WHERE id = 'wake-history';
+                 INSERT INTO coordinator_watch_events (event_id, watch_id, source_occurrence_kind,
+                     source_occurrence_id, source_generation, source_transcript_id, terminal_kind,
+                     terminal_reason, occurred_at_us, delivery_state, accepted_transcript_id) VALUES
+                     ('wake-event-pending', 1, 'wake', 'pending-occurrence', 7, 'wake-history',
+                         'failed', 'unchanged historical failure', 30, 'pending', NULL),
+                     ('wake-event-accepted', 1, 'wake', 'accepted-occurrence', 7, 'wake-history',
+                         'completed', NULL, 31, 'accepted', 'wake-history'),
+                     ('wake-event-suppressed', 1, 'wake', 'suppressed-occurrence', 7, 'wake-history',
+                         'cancelled', NULL, 32, 'suppressed', NULL);",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            for kind in [
+                "direct_turn",
+                "creation",
+                "steering",
+                "seeded_fork",
+                "interaction_response",
+                "continuation_summary",
+            ] {
+                sqlx::query(
+                    "INSERT INTO coordinator_watch_events (event_id, watch_id, source_occurrence_kind,
+                         source_occurrence_id, source_generation, source_transcript_id, terminal_kind,
+                         occurred_at_us)
+                     VALUES (?1, 1, ?2, ?1, 7, 'wake-history', 'completed', 33)",
+                )
+                .bind(format!("nonwake-{kind}"))
+                .bind(kind)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            }
+            assert_foreign_keys(db.pool()).await;
+            db
+        }
+
+        async fn assert_foreign_keys(pool: &SqlitePool) {
+            let enabled: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            assert_eq!(enabled, 1);
+            assert!(sqlx::query("PRAGMA foreign_key_check")
+                .fetch_all(pool)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+
+        async fn historical_tables(pool: &SqlitePool) -> Vec<String> {
+            sqlx::query_scalar(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'table' AND name <> '_migrations' ORDER BY name",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap()
+        }
+
+        async fn snapshot_tables(
+            pool: &SqlitePool,
+            tables: &[String],
+        ) -> Vec<(String, Vec<Vec<String>>)> {
+            let mut snapshot = Vec::new();
+            for table in tables {
+                let columns: Vec<String> =
+                    sqlx::query_scalar("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
+                        .bind(table)
+                        .fetch_all(pool)
+                        .await
+                        .unwrap();
+                let projection = columns
+                    .iter()
+                    .map(|column| {
+                        let quoted = column.replace('"', "\"\"");
+                        format!("typeof(\"{quoted}\") || ':' || hex(CAST(\"{quoted}\" AS BLOB))")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let quoted_table = table.replace('"', "\"\"");
+                let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "SELECT {projection} FROM \"{quoted_table}\""
+                )))
+                .fetch_all(pool)
+                .await
+                .unwrap();
+                let mut cells: Vec<Vec<String>> = rows
+                    .iter()
+                    .map(|row| (0..columns.len()).map(|index| row.get(index)).collect())
+                    .collect();
+                cells.sort();
+                snapshot.push((table.clone(), cells));
+            }
+            snapshot
+        }
+
+        #[tokio::test]
+        async fn wake_feature_retirement_preserves_every_historical_row_and_snapshot_byte() {
+            let db = fixture().await;
+            let tables = historical_tables(db.pool()).await;
+            let before = snapshot_tables(db.pool(), &tables).await;
+            let snapshots: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+                "SELECT workflow_id, snapshot_payload FROM workflows ORDER BY workflow_id",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
+            let recorded: String =
+                sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 126")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(recorded, "retire_wake_feature_preserving_history");
+
+            let retired: Vec<(i64, String, String)> = sqlx::query_as(
+                "SELECT r.workflow_id, w.status, r.reason FROM workflow_feature_retirements r
+                 JOIN workflows w USING (workflow_id) ORDER BY r.workflow_id",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+            let expected: Vec<_> = WAKE_STATUSES
+                .iter()
+                .enumerate()
+                .map(|(index, status)| {
+                    (
+                        i64::try_from(index + 1).unwrap(),
+                        (*status).to_owned(),
+                        "WakeFeatureRetired".to_owned(),
+                    )
+                })
+                .collect();
+            assert_eq!(retired, expected);
+            let occurrences: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT conversation_id, message_id, reason FROM wake_occurrence_feature_retirements",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                occurrences,
+                vec![(
+                    "wake-history".into(),
+                    "wake-history:message".into(),
+                    "WakeFeatureRetired".into(),
+                )]
+            );
+            assert_eq!(snapshot_tables(db.pool(), &tables).await, before);
+            let after_snapshots: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+                "SELECT workflow_id, snapshot_payload FROM workflows ORDER BY workflow_id",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(after_snapshots, snapshots);
+            assert_foreign_keys(db.pool()).await;
+        }
+
+        #[tokio::test]
+        async fn wake_feature_retirement_excludes_coordinator_wake_events_without_rewriting_history(
+        ) {
+            let db = fixture().await;
+            let tables = historical_tables(db.pool()).await;
+            let before = snapshot_tables(db.pool(), &tables).await;
+            assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
+
+            let retired: Vec<(String, String)> = sqlx::query_as(
+                "SELECT event_id, reason FROM coordinator_event_feature_retirements ORDER BY event_id",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                retired,
+                vec![
+                    ("wake-event-accepted".into(), "WakeFeatureRetired".into()),
+                    ("wake-event-pending".into(), "WakeFeatureRetired".into()),
+                    ("wake-event-suppressed".into(), "WakeFeatureRetired".into()),
+                ]
+            );
+            let pending = db.pending_coordinator_watch_events(16).await.unwrap();
+            assert_eq!(pending.len(), 6);
+            assert!(pending
+                .iter()
+                .all(|event| event.source_occurrence_kind != "wake"));
+            assert_eq!(snapshot_tables(db.pool(), &tables).await, before);
+            assert_foreign_keys(db.pool()).await;
+        }
+
+        #[tokio::test]
+        #[allow(clippy::too_many_lines)]
+        async fn wake_feature_retirement_fences_event_admission_but_keeps_accepted_direct_turns() {
+            let db = fixture().await;
+            let coordinator = db
+                .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO workflows (workflow_id, profile_kind, profile_version,
+                     runtime_acceptance_enabled, external_acceptance_enabled, version, generation,
+                     status, snapshot_codec_family, snapshot_codec_version, snapshot_payload,
+                     created_at, updated_at)
+                 VALUES (102, 'direct_turn', 1, 0, 1, 1, 7, 'Active', 'direct_turn.snapshot', 1,
+                     X'0001FF', 10, 20),
+                     (103, 'direct_turn', 1, 0, 1, 1, 7, 'Active', 'direct_turn.snapshot', 1,
+                     X'0001FF', 10, 20)",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            let admission = "INSERT INTO durable_turns (turn_id, workflow_id, conversation_id,
+                    client_turn_key, prepared_fingerprint, prepared_payload, disposition,
+                    generation, owns_conversation, origin_kind, origin_subscription_event_id)
+                VALUES (?1, ?1, ?2, 'event-turn-' || ?1, 'event-fingerprint', X'FF000A', 'Runtime',
+                    7, 1, 'subscription_event', ?3)";
+            sqlx::query(admission)
+                .bind(102)
+                .bind(&coordinator.id)
+                .bind("wake-event-pending")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO coordinator_watch_events (event_id, watch_id, source_occurrence_kind,
+                     source_occurrence_id, source_generation, source_transcript_id, terminal_kind,
+                     occurred_at_us)
+                 VALUES ('wake-event-unaccepted', 1, 'wake', 'unaccepted-occurrence', 7,
+                     'wake-history', 'completed', 34)",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
+
+            let owned: (i64, i64, String) = sqlx::query_as(
+                "SELECT generation, owns_conversation, origin_subscription_event_id
+                 FROM durable_turns WHERE turn_id = 102",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(owned, (7, 1, "wake-event-pending".into()));
+            sqlx::query(
+                "UPDATE durable_turns SET terminal_kind = 'Completed', owns_conversation = 0
+                 WHERE turn_id = 102",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            let event: (String, String) = sqlx::query_as(
+                "SELECT delivery_state, accepted_transcript_id FROM coordinator_watch_events
+                 WHERE event_id = 'wake-event-pending'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(event, ("accepted".into(), coordinator.id.clone()));
+
+            let error = sqlx::query(admission)
+                .bind(103)
+                .bind(&coordinator.id)
+                .bind("wake-event-unaccepted")
+                .execute(db.pool())
+                .await
+                .unwrap_err();
+            assert!(error
+                .as_database_error()
+                .unwrap()
+                .message()
+                .contains("retired wake event has no delivery authority"));
+            for event_id in [
+                "wake-event-unaccepted",
+                "wake-event-accepted",
+                "wake-event-suppressed",
+            ] {
+                let error = sqlx::query(
+                    "INSERT INTO steering_messages (message_id, conversation_id, ordinal, text,
+                         origin_kind, origin_subscription_event_id)
+                     VALUES (?1, ?2, 0, 'historical wake event', 'subscription_event', ?1)",
+                )
+                .bind(event_id)
+                .bind(&coordinator.id)
+                .execute(db.pool())
+                .await
+                .unwrap_err();
+                assert!(error
+                    .as_database_error()
+                    .unwrap()
+                    .message()
+                    .contains("retired wake event has no delivery authority"));
+            }
+            sqlx::query(
+                "INSERT INTO steering_messages (message_id, conversation_id, ordinal, text,
+                     origin_kind, origin_subscription_event_id)
+                 VALUES ('ordinary-event', ?1, 0, 'ordinary event', 'subscription_event',
+                     'nonwake-creation')",
+            )
+            .bind(&coordinator.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            assert_foreign_keys(db.pool()).await;
+        }
+
+        #[tokio::test]
+        async fn permanent_delete_removes_only_owned_retired_wake_workflows_and_children() {
+            let db = fixture().await;
+            sqlx::raw_sql(
+                "UPDATE wake_bindings SET conversation_id = 'steering-history',
+                     work_scope_id = (SELECT work_scope_id FROM conversations WHERE id = 'steering-history')
+                 WHERE workflow_id = 8;
+                 UPDATE wake_terminal_receipts SET conversation_id = 'steering-history'
+                 WHERE workflow_id = 8;",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            assert_foreign_keys(db.pool()).await;
+            assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
+            db.delete_conversation("wake-history").await.unwrap();
+
+            let remaining: Vec<i64> =
+                sqlx::query_scalar("SELECT workflow_id FROM workflows ORDER BY workflow_id")
+                    .fetch_all(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(remaining, vec![8, 9, 101]);
+            for table in [
+                "workflow_feature_retirements",
+                "workflow_supported_codecs",
+                "workflow_transitions",
+                "workflow_effects",
+                "workflow_attempts",
+                "workflow_reclaimable_leases",
+                "workflow_authoritative_observations",
+                "workflow_receipts",
+                "workflow_deliveries",
+                "workflow_schedules",
+                "workflow_manual_resolutions",
+                "wake_bindings",
+                "wake_terminal_receipts",
+                "wake_terminal_receipt_tails",
+                "wake_delivery_messages",
+            ] {
+                let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                    "SELECT COUNT(*) FROM {table} WHERE workflow_id BETWEEN 1 AND 7"
+                )))
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                assert_eq!(count, 0, "owned child rows remained in {table}");
+            }
+            let survivor: (String, String) = sqlx::query_as(
+                "SELECT binding.conversation_id, workflow.status FROM wake_bindings binding
+                 JOIN workflows workflow USING (workflow_id) WHERE workflow_id = 8",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(survivor, ("steering-history".into(), "Cancelled".into()));
+            assert_eq!(
+                db.get_conversation("steering-history").await.unwrap().id,
+                "steering-history"
+            );
+            assert!(matches!(
+                db.get_conversation("wake-history").await,
+                Err(crate::DbError::ConversationNotFound(_))
+            ));
+            assert_foreign_keys(db.pool()).await;
+        }
+
+        #[tokio::test]
+        async fn wake_feature_retirement_runner_upgrade_is_idempotent_after_reopen() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("wake-retirement.db");
+            let path = path.to_str().unwrap();
+            let db = crate::Database::open(path).await.unwrap();
+            let db = seed_fixture(initialize_pre_retirement(db).await).await;
+            let historical = historical_tables(db.pool()).await;
+            let before = snapshot_tables(db.pool(), &historical).await;
+
+            assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
+            assert_eq!(snapshot_tables(db.pool(), &historical).await, before);
+            let tables = historical_tables(db.pool()).await;
+            let upgraded = snapshot_tables(db.pool(), &tables).await;
+            let ledger: Vec<(i64, String)> =
+                sqlx::query_as("SELECT version, name FROM _migrations ORDER BY version")
+                    .fetch_all(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                ledger,
+                compiled_migration_ledger()
+                    .into_iter()
+                    .map(|(version, name)| (version, name.to_owned()))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
+            assert_eq!(snapshot_tables(db.pool(), &tables).await, upgraded);
+            assert_foreign_keys(db.pool()).await;
+            db.pool().close().await;
+            drop(db);
+
+            let reopened = crate::Database::open(path).await.unwrap();
+            assert_eq!(run_pending_migrations(reopened.pool()).await.unwrap(), 0);
+            assert_eq!(historical_tables(reopened.pool()).await, tables);
+            assert_eq!(snapshot_tables(reopened.pool(), &tables).await, upgraded);
+            let reopened_ledger: Vec<(i64, String)> =
+                sqlx::query_as("SELECT version, name FROM _migrations ORDER BY version")
+                    .fetch_all(reopened.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(reopened_ledger, ledger);
+            assert_foreign_keys(reopened.pool()).await;
+            reopened.pool().close().await;
+        }
+
+        #[tokio::test]
+        async fn wake_feature_retirement_runner_failure_does_not_record_version() {
+            let db = fixture().await;
+            sqlx::query(
+                "CREATE TABLE wake_occurrence_feature_retirements (fixture_marker TEXT NOT NULL)",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            let tables = historical_tables(db.pool()).await;
+            let before = snapshot_tables(db.pool(), &tables).await;
+            assert!(run_pending_migrations(db.pool()).await.is_err());
+            let recorded: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM _migrations WHERE version = 126")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(recorded, 0);
+            assert_eq!(historical_tables(db.pool()).await, tables);
+            assert_eq!(snapshot_tables(db.pool(), &tables).await, before);
+            assert_foreign_keys(db.pool()).await;
+        }
+
+        #[tokio::test]
+        async fn wake_feature_retirement_keeps_accepted_owed_delivery_shape_forbidden() {
+            let db = fixture().await;
+            for after_retirement in [false, true] {
+                if after_retirement {
+                    let mut tx = db.pool().begin().await.unwrap();
+                    sqlx::raw_sql(WAKE_FEATURE_RETIREMENT_SQL)
+                        .execute(&mut *tx)
+                        .await
+                        .unwrap();
+                    tx.commit().await.unwrap();
+                }
+                let error = sqlx::query(
+                    "UPDATE workflow_deliveries SET runtime_acceptance_status = 'Owed'
+                     WHERE workflow_id = 6 AND delivery_id = 2",
+                )
+                .execute(db.pool())
+                .await
+                .unwrap_err();
+                assert!(error
+                    .as_database_error()
+                    .unwrap()
+                    .message()
+                    .contains("CHECK constraint failed"));
+                let statuses: Vec<(String, String)> = sqlx::query_as(
+                    "SELECT status, runtime_acceptance_status FROM workflow_deliveries
+                     WHERE workflow_id = 6 ORDER BY delivery_id",
+                )
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+                assert_eq!(
+                    statuses,
+                    vec![
+                        ("Pending".into(), "Owed".into()),
+                        ("Accepted".into(), "Accepted".into()),
+                    ]
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn wake_feature_retirement_rolls_back_metadata_and_leaves_history_unchanged() {
+            let db = fixture().await;
+            let tables = historical_tables(db.pool()).await;
+            let before = snapshot_tables(db.pool(), &tables).await;
+            let mut tx = db.pool().begin().await.unwrap();
+            sqlx::raw_sql(WAKE_FEATURE_RETIREMENT_SQL)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            let retired: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM workflow_feature_retirements")
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
+            assert_eq!(retired, 9);
+            let error = sqlx::query(
+                "INSERT INTO workflow_feature_retirements (workflow_id, reason)
+                 VALUES (99999, 'WakeFeatureRetired')",
+            )
+            .execute(&mut *tx)
+            .await
+            .unwrap_err();
+            assert!(error
+                .as_database_error()
+                .unwrap()
+                .message()
+                .contains("FOREIGN KEY constraint failed"));
+            tx.rollback().await.unwrap();
+            assert_eq!(historical_tables(db.pool()).await, tables);
+            assert_eq!(snapshot_tables(db.pool(), &tables).await, before);
+            assert_foreign_keys(db.pool()).await;
+        }
+
+        #[tokio::test]
+        async fn wake_feature_retirement_mid_script_failure_rolls_back_earlier_writes() {
+            let db = fixture().await;
+            sqlx::query(
+                "CREATE TABLE wake_occurrence_feature_retirements (fixture_marker TEXT NOT NULL)",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            let tables = historical_tables(db.pool()).await;
+            let before = snapshot_tables(db.pool(), &tables).await;
+            let mut tx = db.pool().begin().await.unwrap();
+            let error = sqlx::raw_sql(WAKE_FEATURE_RETIREMENT_SQL)
+                .execute(&mut *tx)
+                .await
+                .unwrap_err();
+            assert!(error
+                .as_database_error()
+                .unwrap()
+                .message()
+                .contains("already exists"));
+            let partial_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM workflow_feature_retirements")
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
+            assert_eq!(partial_count, 9);
+            tx.rollback().await.unwrap();
+            assert_eq!(historical_tables(db.pool()).await, tables);
+            assert_eq!(snapshot_tables(db.pool(), &tables).await, before);
+            assert_foreign_keys(db.pool()).await;
+        }
+
+        #[tokio::test]
+        async fn wake_feature_retirement_metadata_requires_retirement_reason_and_exact_message_owner(
+        ) {
+            let db = fixture().await;
+            let mut tx = db.pool().begin().await.unwrap();
+            sqlx::raw_sql(WAKE_FEATURE_RETIREMENT_SQL)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            for statement in [
+                "UPDATE workflow_feature_retirements SET reason = 'Cancelled' WHERE workflow_id = 1",
+                "UPDATE wake_occurrence_feature_retirements SET reason = 'Completed'
+                 WHERE conversation_id = 'wake-history'",
+                "UPDATE coordinator_event_feature_retirements SET reason = 'Cancelled'
+                 WHERE event_id = 'wake-event-pending'",
+            ] {
+                let error = sqlx::query(statement)
+                    .execute(db.pool())
+                    .await
+                    .unwrap_err();
+                assert!(error
+                    .as_database_error()
+                    .unwrap()
+                    .message()
+                    .contains("CHECK constraint failed"));
+            }
+            let error = sqlx::query(
+                "INSERT INTO wake_occurrence_feature_retirements (conversation_id, message_id, reason)
+                 VALUES ('steering-history', 'wake-history:message', 'WakeFeatureRetired')",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap_err();
+            assert!(error
+                .as_database_error()
+                .unwrap()
+                .message()
+                .contains("FOREIGN KEY constraint failed"));
+            let error = sqlx::query(
+                "INSERT INTO coordinator_event_feature_retirements (event_id, reason)
+                 VALUES ('missing-event', 'WakeFeatureRetired')",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap_err();
+            assert!(error
+                .as_database_error()
+                .unwrap()
+                .message()
+                .contains("FOREIGN KEY constraint failed"));
+            assert_foreign_keys(db.pool()).await;
+        }
+
+        #[tokio::test]
+        async fn wake_feature_retirement_accepts_empty_current_schema_without_inventing_work() {
+            let db = crate::Database::open_in_memory().await.unwrap();
+            let tables = historical_tables(db.pool()).await;
+            let before = snapshot_tables(db.pool(), &tables).await;
+            assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
+            let recorded: String =
+                sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 126")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(recorded, "retire_wake_feature_preserving_history");
+            let counts: (i64, i64, i64) = sqlx::query_as(
+                "SELECT (SELECT COUNT(*) FROM workflow_feature_retirements),
+                        (SELECT COUNT(*) FROM wake_occurrence_feature_retirements),
+                        (SELECT COUNT(*) FROM coordinator_event_feature_retirements)",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(counts, (0, 0, 0));
+            assert_eq!(snapshot_tables(db.pool(), &tables).await, before);
+            assert_foreign_keys(db.pool()).await;
+        }
+    }
 
     async fn historical_continuation_schema() -> SqlitePool {
         let pool = test_pool().await;
@@ -12367,7 +14191,7 @@ mod tests {
         .unwrap();
         sqlx::raw_sql(MIGRATION_074).execute(&pool).await.unwrap();
         sqlx::raw_sql(MIGRATION_100).execute(&pool).await.unwrap();
-        stamp_migrations_except(&pool, 113).await;
+        stamp_pre_130_migrations_except(&pool, 113).await;
         pool
     }
 
@@ -12400,8 +14224,8 @@ mod tests {
         );
         sqlx::raw_sql(MIGRATION_074).execute(&pool).await.unwrap();
         sqlx::raw_sql(MIGRATION_100).execute(&pool).await.unwrap();
-        stamp_migrations_except(&pool, 113).await;
-        run_pending_migrations(&pool).await.unwrap();
+        stamp_pre_130_migrations_except(&pool, 113).await;
+        run_through_for_test(&pool, 129).await.unwrap();
         let pending: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM continuation_dispatch_intents intent
              WHERE successor_conversation_id = 'successor' AND NOT EXISTS (
@@ -12430,7 +14254,7 @@ mod tests {
                 "user_authorized_instruction".into()
             )
         );
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 0);
         let message_count: i64 = sqlx::query_scalar("SELECT count(*) FROM messages")
             .fetch_one(&pool)
             .await
@@ -12513,13 +14337,13 @@ mod tests {
             let pool = historical_continuation_fixture(historical_rows).await;
             let before = historical_continuation_snapshot(&pool).await;
             assert_eq!(before.intents.len(), 1, "{name}");
-            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1, "{name}");
+            assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 1, "{name}");
             assert_eq!(
                 historical_continuation_snapshot(&pool).await,
                 before,
                 "{name}"
             );
-            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0, "{name}");
+            assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 0, "{name}");
             assert_eq!(
                 historical_continuation_snapshot(&pool).await,
                 before,
@@ -12544,9 +14368,9 @@ mod tests {
         .await
         .unwrap();
         let before = historical_continuation_snapshot(&pool).await;
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 1);
         assert_eq!(historical_continuation_snapshot(&pool).await, before);
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 0);
         assert_eq!(historical_continuation_snapshot(&pool).await, before);
     }
 
@@ -12567,9 +14391,9 @@ mod tests {
             sqlx::raw_sql(conflict).execute(&pool).await.unwrap();
             let before = historical_continuation_snapshot(&pool).await;
             assert_eq!(before.receipts.len(), 1);
-            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+            assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 1);
             assert_eq!(historical_continuation_snapshot(&pool).await, before);
-            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+            assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 0);
             assert_eq!(historical_continuation_snapshot(&pool).await, before);
         }
     }
@@ -12582,7 +14406,7 @@ mod tests {
             )
             .await;
             let before = historical_continuation_snapshot(&pool).await;
-            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+            assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 1);
             let settled = historical_continuation_snapshot(&pool).await;
             assert_eq!(settled.messages, before.messages);
             assert!(settled.intents.is_empty());
@@ -12596,7 +14420,7 @@ mod tests {
                     "user_authorized_instruction".into()
                 )]
             );
-            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+            assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 0);
             assert_eq!(historical_continuation_snapshot(&pool).await, settled);
         }
     }
@@ -12634,7 +14458,7 @@ mod tests {
             let before = historical_continuation_snapshot(&pool).await;
             assert_eq!(before.intents.len(), 2);
             sqlx::raw_sql(abort).execute(&pool).await.unwrap();
-            let error = run_pending_migrations(&pool).await.unwrap_err();
+            let error = run_through_for_test(&pool, 129).await.unwrap_err();
             assert!(error.to_string().contains("injected"), "{error}");
             assert_eq!(historical_continuation_snapshot(&pool).await, before);
             let stamped: bool =
@@ -12647,12 +14471,12 @@ mod tests {
                 .execute(&pool)
                 .await
                 .unwrap();
-            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+            assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 1);
             let settled = historical_continuation_snapshot(&pool).await;
             assert_eq!(settled.messages, before.messages);
             assert!(settled.intents.is_empty());
             assert_eq!(settled.receipts.len(), 2);
-            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+            assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 0);
             assert_eq!(historical_continuation_snapshot(&pool).await, settled);
         }
     }
@@ -12712,9 +14536,9 @@ mod tests {
         .await
         .unwrap();
 
-        stamp_migrations_except(&pool, 98).await;
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+        stamp_pre_130_migrations_except(&pool, 98).await;
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 0);
 
         let successor: Option<String> = sqlx::query_scalar(
             "SELECT continued_in_conv_id FROM conversations WHERE id = 'parent'",
@@ -12995,11 +14819,358 @@ mod tests {
         .is_err());
     }
 
+    #[tokio::test]
+    async fn migration_124_preserves_existing_peers_as_platform_root_trust() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(MIGRATION_116).execute(&pool).await.unwrap();
+        let peer = phoenix_core::domain::instance_identity::InstanceId::new();
+        sqlx::query(
+            "INSERT INTO federation_peer_connections
+                 (peer_instance_id, peer_display_name, host, port, bearer_credential, created_at_us)
+             VALUES (?1, 'peer', 'peer.example', 443, ?2, 1)",
+        )
+        .bind(peer.to_string())
+        .bind(format!("phx_peer_{}", "a".repeat(43)))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_124).execute(&pool).await.unwrap();
+        let trust: Option<String> = sqlx::query_scalar(
+            "SELECT tls_ca_certificate_pem FROM federation_peer_connections
+             WHERE peer_instance_id = ?1",
+        )
+        .bind(peer.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(trust, None);
+    }
+
+    #[tokio::test]
+    async fn migration_125_preserves_peers_and_admits_only_typed_ipv6_hosts() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(MIGRATION_116).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_124).execute(&pool).await.unwrap();
+        let existing_peer = phoenix_core::domain::instance_identity::InstanceId::new();
+        sqlx::query(
+            "INSERT INTO federation_peer_connections
+                 (peer_instance_id, peer_display_name, host, port, bearer_credential, created_at_us)
+             VALUES (?1, 'existing', 'peer.example', 443, ?2, 1)",
+        )
+        .bind(existing_peer.to_string())
+        .bind(format!("phx_peer_{}", "a".repeat(43)))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(
+            "CREATE TABLE legacy_schema_dependency (value TEXT);
+             CREATE TRIGGER legacy_schema_dependency_trigger
+             AFTER INSERT ON legacy_schema_dependency
+             BEGIN
+                 SELECT missing_column FROM conversations;
+             END;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let legacy_trigger_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema
+             WHERE type = 'trigger' AND name = 'legacy_schema_dependency_trigger'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_125).execute(&pool).await.unwrap();
+        let preserved: (String, Option<Vec<u8>>, String) = sqlx::query_as(
+            "SELECT domain_or_ipv4_host, ipv6_host, bearer_credential
+             FROM federation_peer_connections WHERE peer_instance_id = ?1",
+        )
+        .bind(existing_peer.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            preserved,
+            (
+                "peer.example".to_string(),
+                None,
+                format!("phx_peer_{}", "a".repeat(43)),
+            )
+        );
+        let preserved_trigger_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema
+             WHERE type = 'trigger' AND name = 'legacy_schema_dependency_trigger'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(preserved_trigger_sql, legacy_trigger_sql);
+
+        let ipv6_peer = phoenix_core::domain::instance_identity::InstanceId::new();
+        sqlx::query(
+            "INSERT INTO federation_peer_connections
+                 (peer_instance_id, peer_display_name, domain_or_ipv4_host, ipv6_host, port,
+                  bearer_credential, created_at_us)
+             VALUES (?1, 'ipv6', NULL, ?2, 8031, ?3, 2)",
+        )
+        .bind(ipv6_peer.to_string())
+        .bind(
+            "2001:db8::1"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets()
+                .to_vec(),
+        )
+        .bind(format!("phx_peer_{}", "b".repeat(43)))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for (domain_host, ipv6_host) in [
+            (Some("peer:example"), None),
+            (None, Some(vec![0; 15])),
+            (Some("peer.example"), Some(vec![0; 16])),
+            (None, None),
+        ] {
+            assert!(
+                sqlx::query(
+                    "INSERT INTO federation_peer_connections
+                     (peer_instance_id, peer_display_name, domain_or_ipv4_host, ipv6_host, port,
+                      bearer_credential, created_at_us)
+                 VALUES (?1, 'invalid', ?2, ?3, 443, ?4, 3)",
+                )
+                .bind(phoenix_core::domain::instance_identity::InstanceId::new().to_string())
+                .bind(domain_host)
+                .bind(&ipv6_host)
+                .bind(format!("phx_peer_{}", "c".repeat(43)))
+                .execute(&pool)
+                .await
+                .is_err(),
+                "{domain_host:?} {ipv6_host:?}"
+            );
+        }
+    }
+
+    fn validate_current_schema_with_controller(database_path: &std::path::Path, migrated: bool) {
+        let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let helper = repository.join("scripts/launchd_deploy_helper.py");
+        let registry = repository.join("crates/phoenix-db/src/migrations.rs");
+        let script = r#"
+import importlib.util
+import sys
+import tempfile
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("migration_contract_helper", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+source = Path(sys.argv[3])
+ledger = module.migration_registry(source, qualified_current_target=False)
+assert ledger[-1][0] > 128
+try:
+    module.migration_registry(source)
+except module.ActivationError as error:
+    assert "newer than the qualified target" in str(error)
+else:
+    raise AssertionError("incident controller accepted an unqualified newer registry")
+with tempfile.TemporaryDirectory() as directory:
+    registry = Path(directory) / "qualified-registry.rs"
+    entries = "".join(f'    Migration {{ version: {version}, name: "{name}", sql: "" }},\n'
+                      for version, name in ledger if version <= 128)
+    registry.write_text("const MIGRATIONS: &[Migration] = &[\n" + entries + "];\n")
+    module.validate_current_schema_database(
+        Path(sys.argv[2]), registry, migrated=sys.argv[4] == "target"
+    )
+"#;
+        let output = std::process::Command::new("python3")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .arg("-c")
+            .arg(script)
+            .arg(helper)
+            .arg(database_path)
+            .arg(registry)
+            .arg(if migrated { "target" } else { "baseline" })
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "controller rejected compiled migration schema: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    async fn seal_current_schema_snapshot_fixture(path: &std::path::Path) {
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(path)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete);
+        let connection = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn current_schema_controller_accepts_compiled_123_and_128_shapes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("current-schema.sqlite3");
+        let path_text = path.to_str().unwrap();
+        let db = crate::Database::open(path_text).await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS _migrations (\
+                version INTEGER PRIMARY KEY, \
+                name TEXT NOT NULL, \
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))\
+            )",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let baseline_count = MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 123)
+            .count();
+        assert_eq!(
+            run_through_for_test(db.pool(), 123).await.unwrap() as usize,
+            baseline_count
+        );
+        let fictional_members: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_schema \
+             WHERE type = 'table' AND name = 'product_conversation_members'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(fictional_members, 0);
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.pool().close().await;
+        drop(db);
+        seal_current_schema_snapshot_fixture(&path).await;
+
+        validate_current_schema_with_controller(&path, false);
+
+        let db = crate::Database::open(path_text).await.unwrap();
+        let target_count = MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > 123 && migration.version <= 128)
+            .count();
+        assert_eq!(
+            run_through_for_test(db.pool(), 128).await.unwrap() as usize,
+            target_count
+        );
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.pool().close().await;
+        drop(db);
+        seal_current_schema_snapshot_fixture(&path).await;
+
+        validate_current_schema_with_controller(&path, false);
+        validate_current_schema_with_controller(&path, true);
+    }
+
+    #[tokio::test]
+    async fn migration_128_backfills_relational_stages_and_enforces_constraints() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE product_creation_jobs (
+                request_id TEXT PRIMARY KEY, status TEXT NOT NULL,
+                updated_at_unix_micros INTEGER NOT NULL,
+                staging_path TEXT, pin_exact_checkout_oid TEXT
+             );
+             INSERT INTO product_creation_jobs VALUES
+                ('accepted', 'accepted', 11, NULL, NULL),
+                ('pinned', 'retry_scheduled', 12, NULL, 'oid'),
+                ('staged', 'failed', 13, '/worktree', 'oid'),
+                ('delivery', 'delivery_failed', 14, '/worktree', 'oid'),
+                ('published', 'published', 15, '/worktree', 'oid');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_128).execute(&pool).await.unwrap();
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT request_id, provisioning_stage, stage_updated_at_unix_micros
+             FROM product_creation_jobs ORDER BY updated_at_unix_micros",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("accepted".to_string(), "validate_intent".to_string(), 11),
+                ("pinned".to_string(), "resolve_starting_pin".to_string(), 12),
+                ("staged".to_string(), "materialize_worktree".to_string(), 13),
+                (
+                    "delivery".to_string(),
+                    "bootstrap_initial_turn".to_string(),
+                    14
+                ),
+                (
+                    "published".to_string(),
+                    "finalize_publication".to_string(),
+                    15
+                ),
+            ]
+        );
+        assert!(
+            sqlx::query("UPDATE product_creation_jobs SET provisioning_stage = 'unknown'")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        assert!(
+            sqlx::query("UPDATE product_creation_jobs SET stage_updated_at_unix_micros = -1")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
     fn capability_migrations_are_forward_only_and_unique() {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (149, "product_creation_image_retirement"),
+            (148, "product_creation_initial_execution_receipts"),
+            (147, "retain_product_creation_receipts"),
+            (146, "retain_product_conversation_rename_receipts"),
+            (145, "coordinator_goal_preparations"),
+            (144, "product_conversation_rename_receipts"),
+            (143, "agent_creation_provenance"),
+            (142, "slack_gateway_v1"),
+            (141, "canonical_tool_round_receipts"),
+            (140, "federation_local_stop_acceptance"),
+            (139, "goal_start_materialization_witness"),
+            (138, "per_goal_execution_requests"),
+            (137, "local_watch_goal_capture"),
+            (136, "durable_conversation_goal_user_control"),
+            (135, "opaque_federation_peer_notes"),
+            (134, "durable_conversation_goal_storage"),
+            (133, "bounded_federated_terminal_subscriptions"),
+            (132, "normalized_remote_input_origin"),
+            (131, "request_capacity_diagnostics"),
+            (130, "continuation_handoff_candidates"),
+            (129, "single_conversation_name_and_route_projection"),
+            (128, "product_creation_provisioning_stage"),
+            (127, "coordinator_owned_work_scope_home"),
+            (126, "retire_wake_feature_preserving_history"),
+            (125, "support_ipv6_federation_peer_hosts"),
+            (124, "persist_federation_peer_tls_trust"),
             (123, "allow_interrupted_active_close_snapshot_failure"),
             (122, "index_coordinator_event_child_foreign_keys"),
             (121, "admit_server_overload_retrying_state"),
@@ -13232,8 +15403,8 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        stamp_migrations_except(&pool, 110).await;
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        stamp_pre_130_migrations_except(&pool, 110).await;
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 1);
         for (select, invalid_update) in [
             (
                 "SELECT origin_kind, origin_product_conversation_id, origin_transcript_id FROM messages WHERE message_id = 'historical-message'",
@@ -13409,12 +15580,21 @@ mod tests {
         steps.load(Ordering::Relaxed)
     }
 
-    async fn assert_outbox_child_indexes_are_used(pool: &SqlitePool) {
-        let plan: Vec<String> = sqlx::query(
+    async fn assert_outbox_child_indexes_are_used(pool: &SqlitePool, parent_table: &str) {
+        assert!(matches!(
+            parent_table,
+            "coordinator_watch_events" | "subscription_delivery_identities"
+        ));
+        let parent_key = if parent_table == "subscription_delivery_identities" {
+            "id"
+        } else {
+            "event_id"
+        };
+        let plan: Vec<String> = sqlx::query(sqlx::AssertSqlSafe(format!(
             "EXPLAIN QUERY PLAN
-             DELETE FROM coordinator_watch_events
-             WHERE event_id = '__missing_event__'",
-        )
+             DELETE FROM {parent_table}
+             WHERE {parent_key} = '__missing_event__'"
+        )))
         .fetch_all(pool)
         .await
         .unwrap()
@@ -13432,13 +15612,81 @@ mod tests {
                 "idx_durable_turns_origin_subscription_event_id",
             ),
         ] {
+            let parents: Vec<String> = sqlx::query_scalar(
+                "SELECT \"table\" FROM pragma_foreign_key_list(?1)
+                 WHERE \"from\" = 'origin_subscription_event_id'",
+            )
+            .bind(table)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+            assert_eq!(parents, vec![parent_table], "{table} foreign-key parent");
             assert!(
                 plan.iter().any(|detail| {
                     detail.contains(&format!("SEARCH {table} USING COVERING INDEX {index}"))
                 }),
                 "missing indexed child lookup for {table}: {plan:?}"
             );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|detail| detail.starts_with(&format!("SCAN {table}"))),
+                "unindexed child scan for {table}: {plan:?}"
+            );
         }
+        if parent_table == "subscription_delivery_identities" {
+            let capture_parent: String = sqlx::query_scalar(
+                "SELECT \"table\" FROM pragma_foreign_key_list('coordinator_watch_goal_captures')
+                 WHERE \"from\" = 'event_id'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            assert_eq!(capture_parent, "coordinator_watch_events");
+            let event_plan: Vec<String> = sqlx::query(
+                "EXPLAIN QUERY PLAN DELETE FROM coordinator_watch_events
+                 WHERE event_id = '__missing_event__'",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get("detail"))
+            .collect();
+            assert!(
+                event_plan.iter().any(|detail| detail.contains(
+                    "SEARCH coordinator_watch_goal_captures USING COVERING INDEX sqlite_autoindex_coordinator_watch_goal_captures_1 (event_id=?)"
+                )),
+                "missing indexed capture lookup: {event_plan:?}"
+            );
+            assert!(event_plan.iter().any(|detail| detail.contains(
+                "SEARCH subscription_delivery_identities USING COVERING INDEX sqlite_autoindex_subscription_delivery_identities_2 (local_event_id=?)"
+            )), "missing indexed delivery identity lookup: {event_plan:?}");
+            assert!(
+                !event_plan
+                    .iter()
+                    .any(|detail| detail.starts_with("SCAN subscription_delivery_identities")),
+                "unindexed delivery identity scan: {event_plan:?}"
+            );
+            assert!(
+                !event_plan
+                    .iter()
+                    .any(|detail| detail.starts_with("SCAN coordinator_watch_goal_captures")),
+                "unindexed capture scan: {event_plan:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "missing indexed child lookup for messages")]
+    async fn outbox_child_index_assertion_rejects_a_missing_index() {
+        let pool = coordinator_event_child_fixture(1, 1).await;
+        sqlx::raw_sql(MIGRATION_122).execute(&pool).await.unwrap();
+        sqlx::query("DROP INDEX idx_messages_origin_subscription_event_id")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_outbox_child_indexes_are_used(&pool, "coordinator_watch_events").await;
     }
 
     #[tokio::test]
@@ -13458,7 +15706,7 @@ mod tests {
         sqlx::raw_sql(MIGRATION_122).execute(&small).await.unwrap();
         sqlx::raw_sql(MIGRATION_122).execute(&large).await.unwrap();
         sqlx::raw_sql(MIGRATION_122).execute(&large).await.unwrap();
-        assert_outbox_child_indexes_are_used(&large).await;
+        assert_outbox_child_indexes_are_used(&large, "coordinator_watch_events").await;
         let small_indexed = outbox_drop_vm_steps(&small).await;
         let large_indexed = outbox_drop_vm_steps(&large).await;
         eprintln!(
@@ -13578,7 +15826,7 @@ mod tests {
         .unwrap();
         for migration in MIGRATIONS
             .iter()
-            .filter(|migration| migration.version <= 121 || migration.version == 123)
+            .filter(|migration| migration.version < 130 && migration.version != 122)
         {
             sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
                 .bind(migration.version)
@@ -13588,15 +15836,15 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
-        assert_outbox_child_indexes_are_used(&pool).await;
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 1);
+        assert_outbox_child_indexes_are_used(&pool, "coordinator_watch_events").await;
         let recorded: String =
             sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 122")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
         assert_eq!(recorded, "index_coordinator_event_child_foreign_keys");
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -13813,14 +16061,14 @@ mod tests {
     }
 
     #[allow(dead_code)]
-    async fn stamp_migrations_except(pool: &SqlitePool, excluded_version: u32) {
+    async fn stamp_pre_130_migrations_except(pool: &SqlitePool, excluded_version: u32) {
         sqlx::query("CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT (datetime('now')))")
             .execute(pool)
             .await
             .unwrap();
         for migration in MIGRATIONS
             .iter()
-            .filter(|migration| migration.version != excluded_version)
+            .filter(|migration| migration.version < 130 && migration.version != excluded_version)
         {
             sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
                 .bind(migration.version)
@@ -13966,6 +16214,66 @@ mod tests {
         );
     }
 
+    async fn stamp_migration_versions(pool: &SqlitePool, versions: &[u32]) {
+        for version in versions {
+            let migration = MIGRATIONS
+                .iter()
+                .find(|migration| migration.version == *version)
+                .unwrap();
+            sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
+                .bind(migration.version)
+                .bind(migration.name)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_fixture_stamps_preserve_identity_and_lineage_guards() {
+        let pool = test_pool().await;
+        stamp_pre_130_migrations_except(&pool, 121).await;
+        let ledger: Vec<(u32, String)> =
+            sqlx::query_as("SELECT version, name FROM _migrations ORDER BY version")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let expected: Vec<_> = MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < 130 && migration.version != 121)
+            .map(|migration| (migration.version, migration.name.to_owned()))
+            .collect();
+        assert_eq!(ledger, expected);
+        assert_eq!(run_through_for_test(&pool, 120).await.unwrap(), 0);
+
+        stamp_migration_versions(&pool, &[130]).await;
+        let error = run_through_for_test(&pool, 120).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("canonical ledger 130 lacks its schema evidence"),
+            "bounded historical runs must retain the full lineage preflight: {error}"
+        );
+        let after: Vec<(u32, String)> =
+            sqlx::query_as("SELECT version, name FROM _migrations ORDER BY version")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let canonical_130 = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 130)
+            .unwrap();
+        let mut expected_after = ledger;
+        expected_after.push((130, canonical_130.name.to_owned()));
+        assert_eq!(after, expected_after);
+        let schema_tables: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(schema_tables, vec!["_migrations"]);
+    }
+
     async fn setup_workflow_only_schema(pool: &SqlitePool) {
         sqlx::raw_sql(
             "CREATE TABLE conversations (\
@@ -13992,7 +16300,7 @@ mod tests {
             .unwrap();
         for migration in MIGRATIONS
             .iter()
-            .filter(|migration| migration.version != 46)
+            .filter(|migration| migration.version < 130 && migration.version != 46)
         {
             sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
                 .bind(migration.version)
@@ -14123,9 +16431,9 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        stamp_migrations_except(&pool, 65).await;
+        stamp_pre_130_migrations_except(&pool, 65).await;
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 1);
 
         let repositories: Vec<String> =
             sqlx::query_scalar("SELECT id FROM git_repositories ORDER BY id")
@@ -14205,10 +16513,10 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        stamp_migrations_except(&pool, 65).await;
+        stamp_pre_130_migrations_except(&pool, 65).await;
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 0);
 
         let attachment_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM work_scope_git_repositories")
@@ -14261,9 +16569,9 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-            stamp_migrations_except(&pool, 65).await;
+            stamp_pre_130_migrations_except(&pool, 65).await;
 
-            let error = run_pending_migrations(&pool).await.unwrap_err();
+            let error = run_through_for_test(&pool, 129).await.unwrap_err();
             assert!(
                 error
                     .to_string()
@@ -14303,9 +16611,9 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        stamp_migrations_except(&pool, 65).await;
+        stamp_pre_130_migrations_except(&pool, 65).await;
 
-        assert!(run_pending_migrations(&pool).await.is_err());
+        assert!(run_through_for_test(&pool, 129).await.is_err());
 
         let shadow_table_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master
@@ -14335,9 +16643,9 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        stamp_migrations_except(&pool, 65).await;
+        stamp_pre_130_migrations_except(&pool, 65).await;
 
-        assert!(run_pending_migrations(&pool).await.is_err());
+        assert!(run_through_for_test(&pool, 129).await.is_err());
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -14383,9 +16691,9 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        stamp_migrations_except(&pool, 65).await;
+        stamp_pre_130_migrations_except(&pool, 65).await;
 
-        let error = run_pending_migrations(&pool).await.unwrap_err();
+        let error = run_through_for_test(&pool, 129).await.unwrap_err();
         let DbError::GitRepositoryWorkScopeProjectConflict {
             work_scope_id,
             project_ids,
@@ -14464,12 +16772,12 @@ mod tests {
                 .await
                 .unwrap();
             }
-            stamp_migrations_except(&pool, 65).await;
+            stamp_pre_130_migrations_except(&pool, 65).await;
 
             let DbError::GitRepositoryWorkScopeProjectConflict {
                 work_scope_id,
                 project_ids,
-            } = run_pending_migrations(&pool).await.unwrap_err()
+            } = run_through_for_test(&pool, 129).await.unwrap_err()
             else {
                 panic!("expected typed migration conflict");
             };
@@ -14508,8 +16816,8 @@ mod tests {
     async fn migration_065_text_primary_keys_are_explicitly_not_null_and_reject_nulls() {
         let pool = test_pool().await;
         setup_pre_065_git_repository_schema(&pool).await;
-        stamp_migrations_except(&pool, 65).await;
-        run_pending_migrations(&pool).await.unwrap();
+        stamp_pre_130_migrations_except(&pool, 65).await;
+        run_through_for_test(&pool, 129).await.unwrap();
 
         for (table, column) in [
             ("git_repositories", "id"),
@@ -14564,8 +16872,8 @@ mod tests {
     async fn migration_065_rejects_blob_storage_for_every_persisted_text_field() {
         let pool = test_pool().await;
         setup_pre_065_git_repository_schema(&pool).await;
-        stamp_migrations_except(&pool, 65).await;
-        run_pending_migrations(&pool).await.unwrap();
+        stamp_pre_130_migrations_except(&pool, 65).await;
+        run_through_for_test(&pool, 129).await.unwrap();
         sqlx::query("INSERT INTO git_repositories (id) VALUES ('repo-text')")
             .execute(&pool)
             .await
@@ -14606,8 +16914,8 @@ mod tests {
     async fn migration_065_rejects_nul_in_locator_paths_and_branch_names() {
         let pool = test_pool().await;
         setup_pre_065_git_repository_schema(&pool).await;
-        stamp_migrations_except(&pool, 65).await;
-        run_pending_migrations(&pool).await.unwrap();
+        stamp_pre_130_migrations_except(&pool, 65).await;
+        run_through_for_test(&pool, 129).await.unwrap();
         sqlx::query(
             "INSERT INTO git_repositories (id) VALUES
              ('repo-nul-insert'), ('repo-nul-update')",
@@ -14688,8 +16996,8 @@ mod tests {
     async fn migration_065_enforces_unix_microsecond_observation_times() {
         let pool = test_pool().await;
         setup_pre_065_git_repository_schema(&pool).await;
-        stamp_migrations_except(&pool, 65).await;
-        run_pending_migrations(&pool).await.unwrap();
+        stamp_pre_130_migrations_except(&pool, 65).await;
+        run_through_for_test(&pool, 129).await.unwrap();
         sqlx::query(
             "INSERT INTO git_repositories (id) VALUES
              ('repo-time-zero'),
@@ -14798,8 +17106,8 @@ mod tests {
     async fn migration_065_enforces_git_repository_shadow_constraints() {
         let pool = test_pool().await;
         setup_pre_065_git_repository_schema(&pool).await;
-        stamp_migrations_except(&pool, 65).await;
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        stamp_pre_130_migrations_except(&pool, 65).await;
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 1);
 
         assert!(sqlx::query("INSERT INTO git_repositories (id) VALUES ('')")
             .execute(&pool)
@@ -15008,9 +17316,9 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        stamp_migrations_except(&pool, 64).await;
+        stamp_pre_130_migrations_except(&pool, 64).await;
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 1);
 
         let archived: Vec<(String, i64)> =
             sqlx::query_as("SELECT id, archived FROM conversations ORDER BY id")
@@ -15171,8 +17479,8 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        stamp_migrations_except(&pool, 64).await;
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        stamp_pre_130_migrations_except(&pool, 64).await;
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 1);
 
         sqlx::query(
             "INSERT INTO conversations (id, state_kind, runtime_role, work_scope_id)
@@ -16745,9 +19053,9 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        stamp_migrations_except(&pool, 61).await;
+        stamp_pre_130_migrations_except(&pool, 61).await;
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 1);
 
         let attachments: Vec<(String, String)> = sqlx::query_as(
             "SELECT conversation_id, work_scope_id FROM conversation_work_scope_attachments ORDER BY conversation_id",
@@ -16784,7 +19092,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(bash_owner, "scope-a");
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -16803,9 +19111,9 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        stamp_migrations_except(&pool, 62).await;
+        stamp_pre_130_migrations_except(&pool, 62).await;
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 1);
         let fingerprint: Option<String> = sqlx::query_scalar(
             "SELECT request_fingerprint
              FROM steering_acceptance_receipts
@@ -16822,8 +19130,8 @@ mod tests {
     async fn migration_060_rejects_mismatched_state_kind_writes() {
         let pool = test_pool().await;
         setup_conversations_table(&pool).await;
-        stamp_migrations_except(&pool, 60).await;
-        let applied = run_pending_migrations(&pool).await.unwrap();
+        stamp_pre_130_migrations_except(&pool, 60).await;
+        let applied = run_through_for_test(&pool, 129).await.unwrap();
         assert_eq!(applied, 1);
 
         let mismatch = sqlx::query(
@@ -16848,7 +19156,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        stamp_migrations_except(&pool, 59).await;
+        stamp_pre_130_migrations_except(&pool, 59).await;
 
         for (id, state_json) in [
             ("idle", r#"{"type":"idle"}"#),
@@ -16873,7 +19181,7 @@ mod tests {
             .unwrap();
         }
 
-        let applied = run_pending_migrations(&pool).await.unwrap();
+        let applied = run_through_for_test(&pool, 129).await.unwrap();
         assert_eq!(applied, 1);
 
         let rows: Vec<(String, String)> =
@@ -17071,6 +19379,140 @@ mod tests {
         assert_eq!(column, ("INTEGER".to_string(), 1));
     }
 
+    #[test]
+    fn goal_tools_registry_contains_real_145_before_retention_tail() {
+        let tail: Vec<_> = MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version >= 143)
+            .map(|migration| (migration.version, migration.name))
+            .collect();
+        assert_eq!(
+            tail,
+            vec![
+                (143, "agent_creation_provenance"),
+                (144, "product_conversation_rename_receipts"),
+                (145, "coordinator_goal_preparations"),
+                (146, "retain_product_conversation_rename_receipts"),
+                (147, "retain_product_creation_receipts"),
+                (148, "product_creation_initial_execution_receipts"),
+                (149, "product_creation_image_retirement"),
+            ]
+        );
+        let goal = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 145)
+            .unwrap();
+        assert_eq!(goal.sql, include_str!("conversation_goals/prepared.sql"));
+        assert!(goal
+            .sql
+            .contains("CREATE TABLE conversation_goal_preparations"));
+        assert!(goal
+            .sql
+            .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
+        assert_eq!(MIGRATIONS.len(), 148);
+    }
+
+    #[tokio::test]
+    async fn image_retirement_migration_backfills_live_and_orphan_receipts_from_148() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_through_for_test(&pool, 148).await.unwrap();
+        for request in ["live-image", "orphan-image"] {
+            sqlx::query("INSERT INTO product_creation_jobs (request_id, product_conversation_id, cwd, objective, llm_language, status, accepted_at_unix_micros, updated_at_unix_micros) VALUES (?1, ?1, '/tmp', 'objective', 'caveman', 'accepted', 1, 1)")
+                .bind(request).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO product_creation_job_images (request_id, ordinal, media_type, data) VALUES (?1, 0, 'image/png', 'exact UTF8 é')")
+                .bind(request).execute(&pool).await.unwrap();
+        }
+        sqlx::query("UPDATE product_creation_jobs SET status = 'published', published_product_id = 'deleted-product', published_conversation_id = 'deleted-transcript' WHERE request_id = 'orphan-image'")
+            .execute(&pool).await.unwrap();
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        let identity: Vec<(String, String)> = sqlx::query_as(
+            "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
+        ).fetch_all(&pool).await.unwrap();
+        let expected = "763DAB0258E0A3A46C75E194A4414076B85FB08CF3366C59849282EA89FA78C2";
+        assert_eq!(
+            identity,
+            vec![
+                ("live-image".into(), expected.into()),
+                ("orphan-image".into(), expected.into())
+            ]
+        );
+        let orphan_payloads: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM product_creation_job_images WHERE request_id = 'orphan-image'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(orphan_payloads, 0);
+        let live_payloads: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM product_creation_job_images WHERE request_id = 'live-image'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(live_payloads, 1);
+        let retired: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_retired_images WHERE request_id = 'orphan-image'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(retired, 1);
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn image_retirement_migration_preserves_text_only_orphan_receipt_from_148() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_through_for_test(&pool, 148).await.unwrap();
+        sqlx::query(
+            "INSERT INTO product_creation_jobs
+             (request_id, product_conversation_id, cwd, objective, llm_language, status,
+              accepted_at_unix_micros, updated_at_unix_micros,
+              published_product_id, published_conversation_id)
+             VALUES ('orphan-text', 'orphan-text', '/tmp', 'objective', 'caveman', 'published',
+                     1, 1, 'deleted-product', 'deleted-transcript')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        let retained: (String, String, String) = sqlx::query_as(
+            "SELECT status, published_product_id, published_conversation_id
+             FROM product_creation_jobs WHERE request_id = 'orphan-text'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            retained,
+            (
+                "published".into(),
+                "deleted-product".into(),
+                "deleted-transcript".into()
+            )
+        );
+        let image_rows: (i64, i64, i64) = sqlx::query_as(
+            "SELECT
+             (SELECT COUNT(*) FROM product_creation_retired_images WHERE request_id = 'orphan-text'),
+             (SELECT COUNT(*) FROM product_creation_image_replay_identity WHERE request_id = 'orphan-text'),
+             (SELECT COUNT(*) FROM product_creation_job_images WHERE request_id = 'orphan-text')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(image_rows, (0, 0, 0));
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn migrations_are_idempotent() {
         let pool = test_pool().await;
@@ -17195,8 +19637,8 @@ mod tests {
             .map(|r| r.get::<String, _>("name"))
             .collect();
         assert!(
-            cols.iter().any(|c| c == "chain_name"),
-            "chain_name must be added by un-stamped migration 005, got: {cols:?}"
+            !cols.iter().any(|c| c == "chain_name"),
+            "migration 129 must retire chain_name after the sparse migrations, got: {cols:?}"
         );
         let chain_qa_exists: Option<String> = sqlx::query_scalar(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='chain_qa'",
@@ -17249,7 +19691,7 @@ mod tests {
         let pool = test_pool().await;
         setup_workflow_only_schema(&pool).await;
 
-        let applied = run_pending_migrations(&pool).await.unwrap();
+        let applied = run_through_for_test(&pool, 129).await.unwrap();
         assert_eq!(applied, 1);
 
         assert_workflow_foundation_tables(&pool).await;
@@ -18118,7 +20560,11 @@ mod tests {
         .await
         .unwrap();
 
-        run_pending_migrations(&pool).await.unwrap();
+        let migration = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 5)
+            .unwrap();
+        sqlx::raw_sql(migration.sql).execute(&pool).await.unwrap();
 
         let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")
             .fetch_all(&pool)
@@ -18141,6 +20587,15 @@ mod tests {
             chain_name.is_none(),
             "Existing rows should backfill chain_name to NULL, got: {chain_name:?}"
         );
+
+        sqlx::raw_sql("CREATE TABLE _migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT (datetime('now'))); INSERT INTO _migrations(version,name) VALUES (5,'add_chain_name_and_chain_qa');").execute(&pool).await.unwrap();
+        run_pending_migrations(&pool).await.unwrap();
+        let final_columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('conversations')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(!final_columns.iter().any(|column| column == "chain_name"));
 
         // chain_qa table exists with the expected columns
         let qa_columns: Vec<String> = sqlx::query("PRAGMA table_info(chain_qa)")
@@ -18238,6 +20693,7 @@ mod tests {
     /// flipped to archived; fully-archived and fully-unarchived chains are
     /// untouched; standalones are untouched.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn migration_006_archives_partially_archived_chains() {
         let pool = test_pool().await;
         setup_conversations_table(&pool).await;
@@ -18279,33 +20735,15 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query(
-            "INSERT INTO _migrations (version, name)
-             VALUES (70, 'temporarily_skip_product_conversation_migration'),
-                    (71, 'temporarily_skip_product_conversation_lifecycle_correction'),
-                    (72, 'temporarily_skip_product_conversation_lifecycle_retention'),
-                    (73, 'temporarily_skip_recursive_subordinate_parent_invariant'),
-                    (74, 'temporarily_skip_completed_continuation_handoffs'),
-                    (91, 'temporarily_skip_product_creation_jobs'),
-                    (92, 'temporarily_skip_creation_checkout_pin'),
-                    (93, 'temporarily_skip_product_creation_ownership'),
-                    (95, 'temporarily_skip_product_lifecycle_reconciliation'),
-                    (100, 'temporarily_skip_automatic_continuation_admission'),
-                    (101, 'temporarily_skip_svg_artifacts'),
-                    (102, 'temporarily_skip_automatic_continuation_superseded'),
-                    (103, 'temporarily_skip_automatic_continuation_resume_phase'),
-                    (108, 'temporarily_skip_authority_timestamp_storage_class'),
-                    (111, 'temporarily_skip_coordinator_watches'),
-                    (113, 'temporarily_skip_historical_continuation_settlement'),
-                    (119, 'temporarily_skip_close_cleanup_failures'),
-                    (120, 'temporarily_skip_coordinator_question_wait_events'),
-                    (122, 'temporarily_skip_coordinator_event_child_indexes'),
-                    (123, 'temporarily_skip_close_startup_interruption')",
+        stamp_migration_versions(
+            &pool,
+            &[
+                70, 71, 72, 73, 74, 91, 92, 93, 95, 100, 101, 102, 103, 108, 111, 113, 119, 120,
+                122, 123, 124, 125, 126, 127, 128, 129,
+            ],
         )
-        .execute(&pool)
-        .await
-        .unwrap();
-        run_pending_migrations(&pool).await.unwrap();
+        .await;
+        run_through_for_test(&pool, 129).await.unwrap();
 
         // Wire chain edges *after* migrations so 003 (the column) is in place.
         for (parent, child) in [
@@ -19044,48 +21482,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(migrated_fingerprint, ("fingerprint".to_string(), 1));
-        let replay_intent = phoenix_workflow::wake_profile::WakeRegistrationIntent {
-            contract_id: "contract".to_string(),
-            conversation_id: "branch-root".to_string(),
-            root_conversation_id: "branch-root".to_string(),
-            registration_scope: phoenix_workflow::wake_profile::WorkScopeIdentity(
-                wake_ownership.0.clone(),
-            ),
-            resource: phoenix_workflow::wake_profile::WakeResourceIdentity::Bash(
-                phoenix_workflow::wake_profile::BashResourceIdentity {
-                    work_scope: phoenix_workflow::wake_profile::WorkScopeIdentity(
-                        wake_ownership.0.clone(),
-                    ),
-                    handle_id: "b-52".to_string(),
-                },
-            ),
-            registering_tool_use_id: "tool-52".to_string(),
-            registered_at: phoenix_workflow::Timestamp(3),
-            expires_at: phoenix_workflow::Timestamp(100),
-        };
-        let replay = crate::workflow::wake::WakeRepository::new(pool.clone())
-            .register(
-                &replay_intent,
-                "opaque-fingerprint",
-                phoenix_workflow::Timestamp(3),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            replay,
-            crate::workflow::wake::WakeRegistrationOutcome::Replayed {
-                workflow_id: phoenix_workflow::WorkflowId(52),
-                ..
-            }
-        ));
-        let upgraded_fingerprint: (String, i64) = sqlx::query_as(
-            "SELECT prepared_fingerprint, fingerprint_needs_scope_upgrade
-             FROM wake_bindings WHERE workflow_id = 52",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(upgraded_fingerprint, ("opaque-fingerprint".to_string(), 0));
         let preserved_tail: String = sqlx::query_scalar(
             "SELECT line FROM wake_terminal_receipt_tails WHERE workflow_id = 52 AND receipt_id = 1 AND ordinal = 0",
         )
@@ -19182,33 +21578,15 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        sqlx::query(
-            "INSERT INTO _migrations (version, name)
-             VALUES (70, 'temporarily_skip_product_conversation_migration'),
-                    (71, 'temporarily_skip_product_conversation_lifecycle_correction'),
-                    (72, 'temporarily_skip_product_conversation_lifecycle_retention'),
-                    (73, 'temporarily_skip_recursive_subordinate_parent_invariant'),
-                    (74, 'temporarily_skip_completed_continuation_handoffs'),
-                    (91, 'temporarily_skip_product_creation_jobs'),
-                    (92, 'temporarily_skip_creation_checkout_pin'),
-                    (93, 'temporarily_skip_product_creation_ownership'),
-                    (95, 'temporarily_skip_product_lifecycle_reconciliation'),
-                    (100, 'temporarily_skip_automatic_continuation_admission'),
-                    (101, 'temporarily_skip_svg_artifacts'),
-                    (102, 'temporarily_skip_automatic_continuation_superseded'),
-                    (103, 'temporarily_skip_automatic_continuation_resume_phase'),
-                    (108, 'temporarily_skip_authority_timestamp_storage_class'),
-                    (111, 'temporarily_skip_coordinator_watches'),
-                    (113, 'temporarily_skip_historical_continuation_settlement'),
-                    (119, 'temporarily_skip_close_cleanup_failures'),
-                    (120, 'temporarily_skip_coordinator_question_wait_events'),
-                    (122, 'temporarily_skip_coordinator_event_child_indexes'),
-                    (123, 'temporarily_skip_close_startup_interruption')",
+        stamp_migration_versions(
+            pool,
+            &[
+                70, 71, 72, 73, 74, 91, 92, 93, 95, 100, 101, 102, 103, 108, 111, 113, 119, 120,
+                122, 123, 124, 125, 126, 127, 128, 129,
+            ],
         )
-        .execute(pool)
-        .await
-        .unwrap();
-        run_pending_migrations(pool).await.unwrap();
+        .await;
+        run_through_for_test(pool, 129).await.unwrap();
         sqlx::query("DELETE FROM _migrations WHERE version IN (70, 71, 72, 73)")
             .execute(pool)
             .await
@@ -19254,7 +21632,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 4);
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 4);
 
         for blank_id in ["   ", "\t", "\n", " \t\n "] {
             assert!(sqlx::query(
@@ -19360,7 +21738,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 4);
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 4);
         let membership: String = sqlx::query_scalar(
             "SELECT product_conversation_id FROM conversations WHERE id = 'orphan-worker'",
         )
@@ -19427,19 +21805,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(visible, 0);
-        let db = crate::Database::from_pool_for_tests(pool.clone(), String::new());
-        assert!(db
-            .list_conversations()
-            .await
-            .unwrap()
-            .iter()
-            .all(|conversation| conversation.product_conversation_id.as_str() != tombstone_id));
-        assert!(db
-            .list_archived_conversations()
-            .await
-            .unwrap()
-            .iter()
-            .all(|conversation| conversation.product_conversation_id.as_str() != tombstone_id));
     }
 
     #[tokio::test]
@@ -19480,7 +21845,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert!(run_pending_migrations(&pool).await.is_err());
+            assert!(run_through_for_test(&pool, 129).await.is_err());
             assert!(!sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(
                      SELECT 1 FROM pragma_table_info('conversations')
@@ -19497,7 +21862,7 @@ mod tests {
     async fn migration_070_rejects_invalid_membership_and_coordinator_lifecycle() {
         let pool = test_pool().await;
         setup_schema_before_migration_070(&pool).await;
-        run_pending_migrations(&pool).await.unwrap();
+        run_through_for_test(&pool, 129).await.unwrap();
 
         assert!(sqlx::query(
             "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
@@ -19580,7 +21945,7 @@ mod tests {
     async fn migration_070_rejects_invalid_continuation_and_parent_topology() {
         let pool = test_pool().await;
         setup_schema_before_migration_070(&pool).await;
-        run_pending_migrations(&pool).await.unwrap();
+        run_through_for_test(&pool, 129).await.unwrap();
         sqlx::raw_sql(
             "INSERT INTO product_conversations (id, kind, ordinary_lifecycle) VALUES
                  ('ordinary-a', 'ordinary', 'open'),
@@ -19790,14 +22155,8 @@ mod tests {
     async fn migration_073_reparents_preexisting_recursive_subordinate_parent() {
         let pool = test_pool().await;
         setup_schema_before_migration_070(&pool).await;
-        sqlx::query(
-            "INSERT INTO _migrations (version, name)
-             VALUES (73, 'temporarily_skip_recursive_subordinate_parent_invariant')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+        stamp_migration_versions(&pool, &[73]).await;
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 3);
 
         sqlx::raw_sql(
             "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
@@ -19824,7 +22183,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 1);
         let parent: String = sqlx::query_scalar(
             "SELECT parent_conversation_id FROM conversations WHERE id = 'recursive-subordinate'",
         )
@@ -19838,14 +22197,8 @@ mod tests {
     async fn migration_073_reparents_delimiter_bearing_legacy_ids() {
         let pool = test_pool().await;
         setup_schema_before_migration_070(&pool).await;
-        sqlx::query(
-            "INSERT INTO _migrations (version, name)
-             VALUES (73, 'temporarily_skip_recursive_subordinate_parent_invariant')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+        stamp_migration_versions(&pool, &[73]).await;
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 3);
 
         sqlx::raw_sql(
             "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
@@ -19874,7 +22227,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 1);
         let invalid_parents: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)
              FROM conversations child
@@ -19892,14 +22245,8 @@ mod tests {
     async fn migration_073_rejects_unrecoverable_recursive_subordinate_cycle() {
         let pool = test_pool().await;
         setup_schema_before_migration_070(&pool).await;
-        sqlx::query(
-            "INSERT INTO _migrations (version, name)
-             VALUES (73, 'temporarily_skip_recursive_subordinate_parent_invariant')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+        stamp_migration_versions(&pool, &[73]).await;
+        assert_eq!(run_through_for_test(&pool, 129).await.unwrap(), 3);
 
         sqlx::raw_sql(
             "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
@@ -19924,7 +22271,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        assert!(run_pending_migrations(&pool).await.is_err());
+        assert!(run_through_for_test(&pool, 129).await.is_err());
         assert!(!sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (SELECT 1 FROM _migrations WHERE version = 73)",
         )

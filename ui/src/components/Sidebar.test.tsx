@@ -5,8 +5,8 @@ import {
   subscribeProductConversationListRevision,
   subscribeProductConversationSnapshotChanged,
 } from '../notifications';
-import { render, fireEvent, waitFor } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { act, render, fireEvent, waitFor } from '@testing-library/react';
+import { Link, MemoryRouter, useLocation } from 'react-router-dom';
 import { ApiResponseError, ConflictError } from '../api';
 import type { Conversation, ProductConversationListRow } from '../api';
 
@@ -23,7 +23,7 @@ const { apiMock } = vi.hoisted(() => ({
     getChain: vi.fn(),
     deleteChain: vi.fn(),
     deleteConversation: vi.fn(),
-    renameConversation: vi.fn(),
+    regenerateProductConversationName: vi.fn(),
     renameProductConversation: vi.fn(),
     getProductConversationSnapshot: vi.fn(),
   },
@@ -71,7 +71,7 @@ const makeProductConversation = (id: string, overrides: Partial<ProductConversat
   lifecycle: { state: 'open', close_action: { availability: 'available' } },
   latest_transcript_row_id: `latest-${id}`,
   updated_at: '2024-01-01T00:00:00Z',
-  presentation: { kind: 'state', display_name: `Display ${id}`, presentation_mode: 'idle' },
+  presentation: { kind: 'state', display_name: overrides.canonical_root?.title ?? `Root ${id}`, presentation_mode: 'idle' },
   ...overrides,
 });
 
@@ -156,7 +156,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => {
-      expect(container.querySelector('[aria-label="Open Display pc-open"]')).toHaveClass('active');
+      expect(container.querySelector('[aria-label="Open Open Root"]')).toHaveClass('active');
     });
 
     fireEvent.click(getByRole('button', { name: /Expand sidebar/ }));
@@ -191,13 +191,17 @@ describe('Sidebar — ProductConversation navigation', () => {
     expect(apiMock.listProductConversations).toHaveBeenCalledTimes(2);
   });
 
-  it('renames product conversations through the canonical-root transcript id', async () => {
-    apiMock.renameConversation.mockResolvedValue({ conversation: makeConv('unused', 'renamed-product') });
+  it.each(['manual', 'generated'] as const)('names product conversations through the canonical aggregate (%s)', async (operation) => {
     const row = makeProductConversation('pc-continued', {
       canonical_root: { transcript_row_id: 'canonical-root-row', slug: 'old-product', title: 'Old Product' },
       latest_transcript_row_id: 'latest-continuation-row',
     });
     apiMock.listProductConversations.mockResolvedValue({ product_conversations: [row] });
+    apiMock.regenerateProductConversationName.mockResolvedValue({
+      ...row, canonical_route: '/c/generated-name',
+      canonical_root: { ...row.canonical_root, title: 'Generated Name', slug: 'generated-name' },
+      presentation: { kind: 'state', display_name: 'Generated Name', presentation_mode: 'idle' },
+    });
     apiMock.renameProductConversation.mockResolvedValue({
       ...row,
       canonical_root: { ...row.canonical_root, title: 'Renamed Product Title' },
@@ -216,11 +220,17 @@ describe('Sidebar — ProductConversation navigation', () => {
     fireEvent.click(await waitFor(() => getByRole('button', { name: 'Actions for conversation Old Product' })));
     fireEvent.click(getByRole('button', { name: /Rename conversation Old Product/ }));
     const input = getByRole('textbox');
-    fireEvent.change(input, { target: { value: 'Renamed Product Title' } });
-    fireEvent.click(getByRole('button', { name: 'Rename' }));
-
-    await waitFor(() => expect(apiMock.renameProductConversation).toHaveBeenCalledWith('pc-continued', 'Renamed Product Title'));
-    expect(apiMock.renameConversation).not.toHaveBeenCalled();
+    expect(input).toHaveValue('Old Product');
+    if (operation === 'manual') {
+      fireEvent.change(input, { target: { value: 'Renamed Product Title' } });
+      fireEvent.click(getByRole('button', { name: 'Rename' }));
+      await waitFor(() => expect(apiMock.renameProductConversation).toHaveBeenCalledWith('pc-continued', 'Renamed Product Title'));
+      expect(apiMock.regenerateProductConversationName).not.toHaveBeenCalled();
+    } else {
+      fireEvent.click(getByRole('button', { name: 'Generate with AI' }));
+      await waitFor(() => expect(apiMock.regenerateProductConversationName).toHaveBeenCalledWith('pc-continued'));
+      expect(apiMock.renameProductConversation).not.toHaveBeenCalled();
+    }
     await waitFor(() => expect(listRevisionListener).toHaveBeenCalledTimes(1));
     unsubscribe();
   });
@@ -459,6 +469,38 @@ describe('Sidebar — ProductConversation navigation', () => {
     fireEvent.click(getByRole('button', { name: 'Delete' }));
 
     await waitFor(() => expect(container.querySelector('.confirm-dialog[title="Delete Conversation"]')).toBeNull());
+  });
+
+  it('does not navigate back when a rename completes after leaving its route', async () => {
+    const original = makeProductConversation('pc-rename', {
+      canonical_root: { transcript_row_id: 'root-rename', slug: 'old-product', title: 'Old Product' },
+    });
+    const renamed = { ...original, canonical_route: '/c/new-product' };
+    let finishRename!: (row: ProductConversationListRow) => void;
+    apiMock.renameProductConversation.mockImplementationOnce(() => new Promise((resolve) => {
+      finishRename = resolve;
+    }));
+    apiMock.listProductConversations.mockResolvedValue({ product_conversations: [original] });
+    function NavigationProbe() {
+      const location = useLocation();
+      return <><Link to="/c/other?viewer=else#message-other">Leave conversation</Link>
+        <output data-testid="current-location">{location.pathname}{location.search}{location.hash}</output></>;
+    }
+    const { getByRole, findByRole, getByTestId } = render(
+      <MemoryRouter initialEntries={['/product-conversations/pc-rename']}>
+        <NavigationProbe />
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug="pc-rename" onConversationCreated={vi.fn()} />
+      </MemoryRouter>,
+    );
+    fireEvent.click(await findByRole('button', { name: 'Actions for conversation Old Product' }));
+    fireEvent.click(getByRole('button', { name: /Rename conversation Old Product/ }));
+    fireEvent.change(getByRole('textbox'), { target: { value: 'New Product' } });
+    fireEvent.click(getByRole('button', { name: 'Rename' }));
+    await waitFor(() => expect(apiMock.renameProductConversation).toHaveBeenCalled());
+    fireEvent.click(getByRole('link', { name: 'Leave conversation' }));
+    expect(getByTestId('current-location')).toHaveTextContent('/c/other?viewer=else#message-other');
+    await act(async () => { finishRename(renamed); });
+    expect(getByTestId('current-location')).toHaveTextContent('/c/other?viewer=else#message-other');
   });
 
   it('publishes the successful authoritative title to the active aggregate snapshot', async () => {

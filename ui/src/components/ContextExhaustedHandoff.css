@@ -224,3 +224,51 @@
     min-height: 44px;
   }
 }
+
+.conversation-history-boundary {
+  color: var(--text-muted, #888);
+  border-block: 1px solid var(--border-color, #444);
+  padding-block: 4px;
+  font-size: 0.85em;
+}
+
+.conversation-history-boundary summary { cursor: pointer; }
+
+.conversation-history-boundary-provenance {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 2px 8px;
+}
+
+.conversation-history-boundary-provenance dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.handoff-capacity dl {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 4px 16px;
+}
+
+.handoff-capacity dt,
+.handoff-capacity dd {
+  overflow-wrap: anywhere;
+}
+
+.handoff-capacity dd {
+  margin: 0;
+  text-align: right;
+}
+
+.handoff-candidate-preview {
+  border-top: 1px solid var(--border-color);
+  margin-top: 16px;
+  padding-top: 12px;
+}
+
+.context-exhausted-handoff select {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}

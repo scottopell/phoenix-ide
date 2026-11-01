@@ -30,6 +30,7 @@ function userUnit(id: string, text: string, seq = 1): HistoricalUnit {
     kind: 'user',
     key: id,
     message: {
+      event_presentation: null,
       message_id: id,
       sequence_id: seq,
       conversation_id: 'c1',
@@ -45,6 +46,7 @@ function agentTurnUnit(id: string, blocks: ContentBlock[], seq = 2): HistoricalU
     kind: 'agent_turn',
     key: id,
     agent: {
+      event_presentation: null,
       message_id: id,
       sequence_id: seq,
       conversation_id: 'c1',
@@ -62,6 +64,7 @@ function skillUnit(id: string): HistoricalUnit {
     kind: 'skill',
     key: id,
     message: {
+      event_presentation: null,
       message_id: id,
       sequence_id: 0,
       conversation_id: 'c1',
@@ -77,6 +80,7 @@ function systemUnit(id: string): HistoricalUnit {
     kind: 'system',
     key: id,
     message: {
+      event_presentation: null,
       message_id: id,
       sequence_id: 0,
       conversation_id: 'c1',
@@ -124,8 +128,8 @@ describe('buildConversationChapters', () => {
     const units = [userUnit('u1', 'first question', 5), userUnit('u2', 'second', 7)];
     const chapters = buildConversationChapters(units);
     expect(chapters).toEqual([
-      { unitIndex: 0, kind: 'prompt', label: 'first question', sequenceId: 5, origin: { kind: 'unknown_historical' } },
-      { unitIndex: 1, kind: 'prompt', label: 'second', sequenceId: 7, origin: { kind: 'unknown_historical' } },
+      { unitIndex: 0, kind: 'prompt', target: { kind: 'persisted', messageId: 'u1', transcriptId: 'c1' }, label: 'first question', sequenceId: 5, origin: { kind: 'unknown_historical' } },
+      { unitIndex: 1, kind: 'prompt', target: { kind: 'persisted', messageId: 'u2', transcriptId: 'c1' }, label: 'second', sequenceId: 7, origin: { kind: 'unknown_historical' } },
     ]);
   });
 
@@ -229,7 +233,7 @@ describe('buildConversationChapters', () => {
     const units = [pendingUserUnit('local-1', 'queued prompt')];
     const chapters = buildConversationChapters(units);
     expect(chapters).toEqual([
-      { unitIndex: 0, kind: 'prompt', label: 'queued prompt', sequenceId: undefined, origin: { kind: 'user_api' } },
+      { unitIndex: 0, kind: 'prompt', target: { kind: 'pending' }, label: 'queued prompt', sequenceId: undefined, origin: { kind: 'user_api' } },
     ]);
   });
 });
@@ -245,6 +249,7 @@ describe('chapter unitIndex matches buildRenderUnits coordinate space', () => {
 
   function userMsg(id: string, text: string, seq: number): Message {
     return {
+      event_presentation: null,
       message_id: id,
       sequence_id: seq,
       conversation_id: 'c1',
@@ -255,6 +260,7 @@ describe('chapter unitIndex matches buildRenderUnits coordinate space', () => {
   }
   function agentMsg(id: string, blocks: ContentBlock[], seq: number): Message {
     return {
+      event_presentation: null,
       message_id: id,
       sequence_id: seq,
       conversation_id: 'c1',
@@ -265,6 +271,7 @@ describe('chapter unitIndex matches buildRenderUnits coordinate space', () => {
   }
   function toolMsg(id: string, toolUseId: string): Message {
     return {
+      event_presentation: null,
       message_id: id,
       sequence_id: 0,
       conversation_id: 'c1',
@@ -303,5 +310,21 @@ describe('chapter unitIndex matches buildRenderUnits coordinate space', () => {
       if (c.kind === 'prompt') expect(unit?.kind).toBe('user');
       if (c.kind === 'prose') expect(unit?.kind).toBe('agent_turn');
     }
+  });
+});
+
+describe('continuous history boundaries', () => {
+  it('uses the same continuation unit as scrolling, retaining its exact message identity', () => {
+    const message: Message = {
+      message_id: 'handoff-exact', conversation_id: 'predecessor', sequence_id: 42,
+      message_type: 'continuation', content: { summary: 'handoff summary' }, created_at: '', event_presentation: null,
+    };
+    const chapters = buildConversationChapters([
+      userUnit('before', 'Earlier prompt'),
+      { kind: 'continuation', key: message.message_id, message },
+      userUnit('after', 'Later prompt'),
+    ]);
+    expect(chapters.map((chapter) => chapter.kind)).toEqual(['prompt', 'boundary', 'prompt']);
+    expect(chapters[1]).toMatchObject({ unitIndex: 1, messageId: 'handoff-exact', transcriptId: 'predecessor' });
   });
 });

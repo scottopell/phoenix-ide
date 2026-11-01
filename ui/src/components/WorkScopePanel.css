@@ -116,6 +116,22 @@
   overflow-y: auto;
 }
 
+.ws-load {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 10px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ws-load-label {
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
 /* The section's body flex-shares the column when expanded and scrolls
  * internally, so a long bash list can't squeeze sibling sections out.
  * Mirrors .skills-panel-body / .tasks-panel-body containment. */

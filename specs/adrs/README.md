@@ -7,10 +7,39 @@ was chosen; they are authoritative history, not a live behavioral contract.
 The live behavioral contract remains `requirements.md` plus `.allium` where an
 Allium spec exists. Status and verification coverage live in `executive.md`.
 
+The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-nonproject-home.md), affecting REQ-GR-006/007/013/016–018.
+
+The departing-document delivery evidence decision is [ADR-122](122_pagehide-delivery-uses-collector-and-export-evidence.md), affecting REQ-CVT-004/005/006.
+
+Complete exported span capacity is governed by [ADR-118](118_preserve-complete-span-schemas-with-bounded-capacity.md), affecting REQ-CVT-005/006/007.
+
+Controlled-functional build isolation is governed by [ADR-119](119_separate-controlled-functional-telemetry-build.md), affecting REQ-CVT-001/005/006.
+
+Creation terminal evidence and image delivery lifetime are governed by [ADR-207](207_creation-receipt-evidence-and-image-payload-lifetime.md), affecting REQ-CCR-013–015.
+
+Codex reset-credit visibility and manual redemption, including resuming the stopped conversation after a redemption from its quota error, are governed by [ADR-208](208_codex-reset-credits-are-manual-and-resume-the-stopped-conversation.md), affecting REQ-CRR-001–010.
+
+Strict local-only selection of Kache v1.2.2 on macOS arm64 is governed by [ADR-213](213_kache-v1-2-2-strict-local-only-selection.md), superseding only ADR-212's selection conclusion; ADR-211 and ADR-212 retain their historical v1.0.0 evidence. Remote caching remains deferred.
+
+## Numbering and validation
+
+ADRs use unique three-digit numeric IDs in `NNN_<slug>.md` filenames. The
+shared chain includes ADR-000; gaps between IDs are allowed so independent
+decisions do not depend on unrelated publication order. Duplicate numeric IDs
+are invalid even when their slugs differ. Keep existing IDs and accepted
+decision history unchanged; do not add placeholders or renumber records to fill
+gaps.
+
+Every ADR must retain its status, date, affected scope, required sections, and
+matching index link. Index links must resolve to the matching numbered record.
+Allowing gaps does not approve an ID allocation, decision, or publication.
+
 ## Quick reference
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [208](208_codex-reset-credits-are-manual-and-resume-the-stopped-conversation.md) | Codex reset credits are redeemed manually through a Phoenix proxy, and a redemption from the quota error resumes that conversation | Accepted | REQ-CRR-001–010 |
+| [207](207_creation-receipt-evidence-and-image-payload-lifetime.md) | Retain creation evidence and replay identity, retire delivery images at product deletion | Accepted | REQ-CCR-013, REQ-CCR-014, REQ-CCR-015 |
 | [000](000_adopt-spears-v2.md) | Phoenix adopts spEARS v2 for new specification work | Accepted | methodology-level |
 | [001](001_bash-first-class-handles.md) | Bash handles are first-class process-local entities with wait windows | Accepted | REQ-BASH-001, REQ-BASH-002, REQ-BASH-003, REQ-BASH-005, REQ-BASH-009, REQ-BASH-014, REQ-BASH-WS-001, REQ-BASH-WS-002 |
 | [002](002_bash-watch-backed-handle-state.md) | Bash handle state uses watch-backed exit notifications and snapshot shaping | Accepted | REQ-BASH-001, REQ-BASH-003, REQ-BASH-004, REQ-BASH-005, REQ-BASH-006, REQ-BASH-014, REQ-BASH-WS-002 |
@@ -22,8 +51,8 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [008](008_multi-pr-selection-uses-durable-branch-observations.md) | Multi-PR selection uses durable settled-branch observations plus explicit active-PR targeting | Accepted | REQ-PRA-000, REQ-PRA-000a, REQ-PRA-000b, REQ-PRA-000c, REQ-BASH-010a, REQ-BASH-010b, REQ-BASH-010c |
 | [009](009_shared-demand-driven-resource-observations.md) | Native process metrics use shared demand-driven observation generations | Accepted | REQ-DEPLOY-007a, REQ-PINSP-004, REQ-PINSP-008, REQ-WSUI-006, REQ-WSUI-010 |
 | [010](010_launchd-deployment-uses-independent-transaction-helper.md) | launchd deployment uses an independent transaction helper | Accepted | REQ-LDD-001 through REQ-LDD-010 |
-| [011](011_wake-plane-core-uses-registration-receipts-and-durable-runtime-observations.md) | Wake-plane core uses registration receipts and durable runtime observations | Accepted | REQ-WAKE-001, REQ-WAKE-002, REQ-WAKE-003, REQ-WAKE-004, REQ-WAKE-006, REQ-WAKE-008, REQ-WAKE-009, REQ-WAKE-012, REQ-WAKE-013, REQ-WAKE-016, REQ-WAKE-017, REQ-WAKE-018 |
-| [012](012_wake-resume-scheduling-uses-a-durable-acceptance-outbox.md) | Wake-resume scheduling uses a durable acceptance outbox | Accepted | REQ-WAKE-004, REQ-WAKE-005, REQ-WAKE-008, REQ-WAKE-012 |
+| [011](011_wake-plane-core-uses-registration-receipts-and-durable-runtime-observations.md) | Wake-plane core uses registration receipts and durable runtime observations | Superseded by ADR-098 | REQ-WAKE-001, REQ-WAKE-002, REQ-WAKE-003, REQ-WAKE-004, REQ-WAKE-006, REQ-WAKE-008, REQ-WAKE-009, REQ-WAKE-012, REQ-WAKE-013, REQ-WAKE-016, REQ-WAKE-017, REQ-WAKE-018 |
+| [012](012_wake-resume-scheduling-uses-a-durable-acceptance-outbox.md) | Wake-resume scheduling uses a durable acceptance outbox | Superseded by ADR-098 | REQ-WAKE-004, REQ-WAKE-005, REQ-WAKE-008, REQ-WAKE-012 |
 | [013](013_durable-workflows-use-normalized-core-and-typed-profiles.md) | Durable workflows use an engine-owned normalized core and typed profiles | Accepted | REQ-DWF-001–003, REQ-DWF-013, REQ-DWF-015–016, wake and creation profiles |
 | [014](014_workflow-cas-and-leased-effect-authority.md) | Workflow transitions use CAS and every claimed effect uses leased authority | Accepted | REQ-DWF-004–012, REQ-DWF-018 |
 | [015](015_observation-receipt-and-runtime-acceptance-are-distinct.md) | Observation, receipt, and runtime acceptance are distinct durable facts | Accepted | REQ-DWF-001–002, REQ-DWF-007, REQ-DWF-012, REQ-DWF-017, profile acceptance |
@@ -92,7 +121,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [076](076_prepared-artifact-paired-launchd-upgrade-fails-closed.md) | Prepared artifacts pair a clean controller with private SQLite proof and fail-closed rollback | Accepted | REQ-LDD-017, REQ-PD-018, REQ-COMP-003, REQ-DESKTOP-REL-010 |
 | [077](077_committed-paired-finalization-is-publication-only.md) | Committed paired finalization is publication-only; recovered startup checkpoints forbid snapshot replay | Accepted | REQ-LDD-017, REQ-LDD-018, REQ-PD-018, REQ-PD-020, REQ-COMP-003 |
 | [078](078_kache-first-automatic-compiler-cache.md) | Automatic compiler caching prefers released Kache | Superseded by ADR-079 | development methodology; REQ-COMP-001 |
-| [079](079_kache-explicit-pending-debug-fidelity.md) | Kache remains explicit pending restored debug fidelity | Superseded by ADR-092 | development methodology; REQ-COMP-001, REQ-COMP-008 |
+| [079](079_kache-explicit-pending-debug-fidelity.md) | Kache remains explicit pending restored debug fidelity | Accepted | development methodology; REQ-COMP-001, REQ-COMP-008 |
 | [080](080_close-stops-bound-fsmonitor-daemons.md) | Close stops bound fsmonitor daemons instead of reconfiguring Git | Partially superseded by ADR-088 | REQ-WL-002b; Close retirement quarantine and descriptor scan |
 | [081](081_global-coordinator-borrows-workscope-svg-source-authority.md) | Global Coordinator borrows WorkScope SVG source authority | Accepted | REQ-SVG-001, REQ-GR-007 |
 | [082](082_legacy-auq-waits-retain-identity-absence.md) | Legacy AUQ waits retain identity absence | Accepted | REQ-AUQ-009, REQ-COMP-001; `QuestionRequestId`, `AwaitingUserResponse` |
@@ -105,8 +134,79 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [089](089_canonical-short-product-navigation.md) | Canonical short ProductConversation navigation with exact evidence selectors | Accepted | REQ-GR-009 |
 | [090](090_bounded-selected-model-overload-retry.md) | Selected-model overload uses a durable bounded retry window | Accepted | REQ-LLM-006/006b, REQ-LRV-002/005/008, REQ-BED-006/007 |
 | [091](091_touch-reactions-dock-away-from-native-selection.md) | Touch reactions dock away from native selection | Accepted | REQ-PF-018, REQ-PF-020 |
-| [092](092_kache-v1-restores-automatic-selection.md) | Qualified Kache v1 restores automatic compiler-cache selection | Superseded by ADR-093 | development methodology; REQ-COMP-001, REQ-COMP-008 |
-| [093](093_kache-default-waits-for-identifiable-isolation-fix.md) | Kache default waits for an identifiable isolation fix | Accepted | development methodology; REQ-COMP-001, REQ-COMP-008 |
+| [092](092_federation-pins-imported-private-ca-trust-per-peer.md) | Federation pins imported private-CA trust per peer | Accepted | REQ-RQD-003, REQ-RQD-004; federation enrollment transfer and caller-side peer persistence |
+| [093](093_federation-validates-ca-capability-and-types-ipv6-persistence.md) | Federation validates CA capability and types IPv6 persistence | Accepted | REQ-RQD-003, REQ-RQD-004; peer origin and private-CA admission |
+| [094](094_owner-and-peer-credential-domains-are-disjoint.md) | Owner and peer credential domains are structurally disjoint | Accepted | REQ-AUTH-002, REQ-AUTH-009; `OwnerPassword`, `PeerBearerCredential` |
+| [095](095_workscope-cpu-history-and-demand-memory.md) | WorkScope CPU history with demand-driven memory | Accepted | REQ-WSLOAD-001–005, REQ-DEPLOY-007a |
+| [096](096_sampled-live-job-resource-visibility.md) | Sampled live-job visibility, not exhaustive accounting | Accepted | REQ-WSLOAD-001/002/005 |
+| [097](097_bounded-retrieval-reconciliation.md) | Bounded orphan pruning and terminal retrieval readiness | Accepted | REQ-RET-003 |
+| [098](098_retire-wake-execution-and-preserve-history.md) | Retire wake execution and preserve history | Accepted; supersedes wake execution obligations | REQ-WAKE-RETIRE-001–005; retired REQ-WAKE-001–018, REQ-DWF-WAKE-001–005, REQ-SA-009 |
+| [099](099_bounded-markdown-disclosures.md) | Recognize bounded Markdown disclosures within native parsing contexts | Accepted | REQ-CONV-025; REQ-CONV-002/019 |
+| [100](100_canonical-model-id-is-separate-from-request-addressing.md) | Canonical model ID is separate from request addressing | Accepted | REQ-LLM-014; `ModelSpec`, `RequestModelName`, `PHOENIX_LLM_REQUEST_MODELS` |
+| [101](101_coordinator-instance-owned-nonproject-home.md) | Coordinator owns a local non-project home through explicit WorkScope targeting | Accepted | REQ-GR-006, REQ-GR-007, REQ-GR-013, REQ-GR-016–018 |
+| [102](102_current-schema-prepared-activation-commits-at-database-write.md) | Current-schema prepared activation commits at the database-write boundary | Accepted; interval superseded by 105; protected-source restriction partially superseded by 115 | REQ-COMP-012, REQ-LDD-019–022, REQ-PD-021 |
+| [103](103_ordinary-forward-launch-is-the-downgrade-boundary.md) | Ordinary forward candidate launch is the downgrade boundary | Accepted; interval superseded by 105 | REQ-COMP-013, REQ-LDD-023, REQ-PD-022 |
+| [104](104_product-creation-stages-backfill-from-durable-evidence.md) | Product creation stages backfill from durable evidence | Accepted | REQ-CCR-002, REQ-CCR-003, REQ-CCR-012, REQ-COMP-001/002/005 |
+| [105](105_qualify-migration-128-for-bounded-current-schema-activation.md) | Qualify migration 128 for bounded current-schema activation | Accepted; supersedes interval portions of 102/103; source restriction partially superseded by ADR-114/115 | REQ-COMP-012/013, REQ-LDD-019–023, REQ-PD-021–022, REQ-CCR-012 |
+| [106](106_pre-stop-capacity-cleanup-is-cleanup-only-recovery.md) | Pre-stop capacity cleanup is a cleanup-only recovery boundary | Accepted | REQ-LDD-024 |
+| [107](107_standalone-browser-uses-session-daemon.md) | Standalone browser commands share a local session daemon | Accepted | REQ-BCLI-001–012 |
+| [108](108_snapshot-input-and-collection-boundaries.md) | Snapshot interactions enforce identity at native input dispatch | Accepted | REQ-BT-008, REQ-BT-009, REQ-BT-025 |
+| [109](109_console-capture-uses-ordered-context-identities.md) | Navigation console capture uses ordered context identities | Superseded by ADR-110 | REQ-BT-004, REQ-BCLI-007 |
+| [110](110_console-capture-tracks-document-incarnations.md) | Navigation console capture tracks document incarnations | Accepted | REQ-BT-004, REQ-BCLI-007 |
+| [111](111_console-capture-attaches-isolated-frame-targets.md) | Console capture attaches isolated frame targets | Accepted | REQ-BT-004, REQ-BCLI-007 |
+| [112](112_browser-cli-shares-verified-release-publication.md) | Browser CLI shares verified release publication | Accepted | REQ-DESKTOP-REL-005/009/010/011 |
+| [113](113_coordinator-api-recipes-are-non-exhaustive.md) | Coordinator API recipes are non-exhaustive | Accepted | REQ-GR-007, REQ-AUQ-009; Phoenix API guidance |
+| [114](114_admit-exact-target-ledger-for-prepared-current-schema-activation.md) | Admit the exact target ledger for prepared current-schema activation | Accepted; partially supersedes ADR-105's prepared-source restriction | REQ-COMP-012, REQ-LDD-019–022, REQ-PD-021 |
+| [115](115_protect-exact-114-to-128-published-release-activation.md) | Protect exact 114-to-128 published-release activation with an independently pinned controller | Accepted; partially supersedes ADR-102/105's protected-source restriction | REQ-COMP-012/013, REQ-LDD-004/011/019–024, REQ-PD-010/012/021–022 |
+| [116](116_protect-exact-65-to-128-systemd-published-release-activation.md) | Protect exact 65-to-128 systemd published-release activation | Accepted | REQ-COMP-014, REQ-PD-003/010/012/019, REQ-PD-023–027 |
+| [117](117_recover-interrupted-pre-marker-systemd-activation.md) | Recover interrupted pre-marker systemd activation | Accepted | REQ-COMP-014, REQ-PD-023–026 |
+| [129](129_qualify-exact-prepared-linux-systemd-candidate.md) | Qualify exact prepared Linux systemd candidate | Accepted | REQ-COMP-016, REQ-PD-002/003/012/021/024/025/029 |
+| [130](130_commission-exact-237100-linux-artifact-preparation.md) | Commission the exact 237100 Linux artifact operation | Accepted | REQ-DESKTOP-REL-013; REQ-DESKTOP-REL-012 and REQ-COMP-015 boundaries unchanged |
+| [131](131_single-conversation-name-and-allocated-slug.md) | One conversation name with an allocated route projection | Accepted | REQ-CID-001–006, REQ-CHN-007, REQ-COMP-001/002 |
+| [132](132_retire-duplicate-naming-mutations.md) | Retire duplicate naming mutations after caller migration | Accepted | REQ-CID-001/005, REQ-CHN-007, REQ-COMP-001/002 |
+| [128](128_repair-failure-stopped-truth-includes-persistence.md) | Repair failure stopped truth includes persistent auto-start absence | Accepted | REQ-LDD-025 |
+| [133](133_standalone-controller-owns-durability-and-supervision.md) | The standalone deployment controller owns durability and child supervision | Accepted | REQ-SDC-001, REQ-SDC-003–012; `DeploymentAttempt`, `AttemptStore`, `SupervisedChild` |
+| [134](134_controller-loss-detaches-and-fences-surviving-guardian.md) | Controller loss detaches and fences the surviving guardian | Accepted | REQ-SDC-008, REQ-SDC-012; `GuardianBinding`, `SurvivingGuardianBoundary` |
+| [135](135_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md) | Native guardian IPC and runner are same-build pre-adoption surfaces | Accepted | REQ-SDC-011–020; `DisposableNativeGuardianRunner` and native IPC, admission, persistence, reconnect, and qualification contracts |
+| [136](136_retained-native-results-use-application-only-recovery.md) | Retained native results use application-only recovery | Accepted | REQ-SDC-013, REQ-SDC-015, REQ-SDC-017–020; completed-but-unapplied native sampling recovery |
+| [137](137_owned-root-child-enumeration-is-distinct-native-authority.md) | Owned-root child enumeration is distinct native authority | Accepted | REQ-SDC-011, REQ-SDC-013, REQ-SDC-015, REQ-SDC-017–021; native `ListChildren`, schema v6, protocol v6 |
+| [138](138_exact-root-identity-observation-is-distinct-native-authority.md) | Exact-root identity observation is distinct native authority | Accepted | REQ-SDC-011, REQ-SDC-013, REQ-SDC-015, REQ-SDC-017–022; native `ObserveIdentity`, schema v7, protocol v8 |
+| [139](139_retained-exact-root-identity-results-use-application-only-recovery.md) | Retained exact-root identity results use application-only recovery | Accepted | REQ-SDC-018, REQ-SDC-022; completed-before-application native `ObserveIdentity`, schema v7, protocol v9 |
+| [140](140_already-durable-native-sampling-failures-use-explicit-custody-settlement.md) | Already-durable native sampling failures use explicit custody settlement | Accepted | REQ-SDC-018–020; native sampling failure custody, schema v8, protocol v10 |
+| [141](141_disposable-launchd-validation-precedes-installer-adoption.md) | Disposable launchd validation precedes installer adoption | Accepted | REQ-SDC-023; exact PreparedSource114 handoff validation without activation authority |
+| [127](127_bound-exact-arm-packaging-controller.md) | Bound the exact ARM packaging repair to a separate controller | Accepted | REQ-DESKTOP-REL-004/010/012, REQ-COMP-015 boundary unchanged |
+| [126](126_seal-exact-current-schema-forward-replacement.md) | Seal one exact current-schema forward replacement | Accepted | REQ-COMP-015, REQ-PD-028, REQ-LDD-025 |
+| [125](125_qualify-exact-prepared-source114-candidate.md) | Qualify one exact prepared source114 candidate | Accepted | REQ-COMP-012, REQ-PD-021, REQ-LDD-019–024 |
+| [124](124_public-literal-chat-uses-known-receiver-verification.md) | Public literal chat uses known-receiver verification | Accepted | REQ-API-031; built-in API guidance |
+| [118](118_preserve-complete-span-schemas-with-bounded-capacity.md) | Preserve complete span schemas with bounded provider capacity | Accepted | REQ-CVT-005, REQ-CVT-006, REQ-CVT-007 |
+| [119](119_separate-controlled-functional-telemetry-build.md) | Separate controlled-functional telemetry build | Accepted | REQ-CVT-001, REQ-CVT-005, REQ-CVT-006 |
+| [120](120_successful-position-settles-geometric-anchor.md) | Successful positioning settles geometry without retaining command capability | Accepted | REQ-VT-003, REQ-VT-006, REQ-VT-007 |
+| [121](121_web-history-selects-original-boundary-messages.md) | Web history selects original boundary messages without duplicating the default handoff projection | Accepted | REQ-API-030, REQ-CONV-023/026, REQ-COMP-001 |
+| [122](122_pagehide-delivery-uses-collector-and-export-evidence.md) | Departing-document delivery uses collector acceptance and export evidence | Accepted | REQ-CVT-004, REQ-CVT-005, REQ-CVT-006 |
+| [123](123_retain-pre-session-browser-authority.md) | Retain pre-session browser authority and distinguish CLI profile lifetimes | Accepted | REQ-BCLI-006a, REQ-BROWSER-WS-001 |
+| [142](142_ordinary-skill-catalog-is-executor-turn-local.md) | Ordinary skill catalog advertisement is executor-turn-local | Accepted | REQ-SK-007, REQ-SK-008, REQ-SK-009 |
+| [143](143_bounded-owned-child-settlement-after-launch.md) | Bound owned-child settlement after Bash launch | Proposed | REQ-BASH-017 |
+| [144](144_output-budget-is-declared-model-maximum-and-exhaustion-is-terminal.md) | Output budget is the declared model maximum, and output exhaustion is a distinct terminal error | Accepted | REQ-LLM-003, REQ-LLM-004f, REQ-LLM-006c |
+| [190](190_generic-ordinary-forward-proof-begins-after-quiescence.md) | Generic ordinary forward proof begins after quiescence | Accepted | REQ-COMP-013/019, REQ-LDD-023/028 |
+| [191](191_native-create-and-rename-use-shared-application-actions.md) | Native create and rename use shared application actions | Accepted | REQ-GR-007, REQ-CCR-013, REQ-CID-007 |
+| [192](192_goal-admission-requires-explicit-auto-continue.md) | Goal admission requires explicit automatic continuation | Accepted | REQ-GOAL-AC-001–004 |
+| [149](149_selective-coordinator-checkins.md) | Selective coordinator check-ins and attention-first briefings | Accepted | REQ-GR-011 |
+| [150](150_concrete-coordinator-reporting-and-blocker-recovery.md) | Concrete Coordinator reporting and blocked-work recovery | Accepted | REQ-GR-011 |
+| [148](148_qualify-exact-ordinary-launchd-source129-to-target131.md) | Qualify exact ordinary launchd source 129 to target 131 | Accepted | REQ-COMP-019, REQ-LDD-023/028 |
+| [147](147_readable-generated-handoffs-retain-source-authority.md) | Readable generated handoffs retain explicit source authority | Accepted; partially supersedes 054 | REQ-BED-020b/021/030, REQ-LLM-004m |
+| [146](146_context-capacity-preserves-output-and-semantic-continuity.md) | Shared capacity planning preserves output headroom and semantic continuity | Accepted | REQ-LLM-004f/004j–004m, REQ-BED-020a, REQ-STR-012, REQ-AN-011 |
+| [145](145_coordinator-check-in-drives-scoped-work.md) | Coordinator check-ins drive scoped work and report outcomes | Accepted | REQ-GR-010, REQ-GR-011, REQ-GR-013 |
+| [189](189_slack-owner-gestures-bind-intentional-returns.md) | Owner gestures bind intentional Slack returns | Accepted | REQ-SG-001–007/009–014/016 |
+| [151](151_bound-discovery-and-refresh-new-explicit-requests.md) | Bound discovery and refresh new explicit requests | Accepted | REQ-SG-003/017 |
+| [152](152_private-notifications-use-an-owner-command.md) | Private notifications use an owner command | Superseded by ADR-155 | REQ-SG-015 |
+| [153](153_slack-gateway-uses-native-conversation-services.md) | Slack ingress uses native conversation services | Accepted | REQ-SG-004/008/009, REQ-CCR-001 |
+| [154](154_slack-clarifications-hand-off-to-phoenix.md) | Slack clarifications hand off to Phoenix | Question-text publication superseded by ADR-155 | REQ-SG-012/013 |
+| [155](155_slack-signals-are-best-effort-and-questions-stay-native.md) | Slack signals are best effort and questions stay native | Prototype compatibility superseded by ADR-188 | REQ-SG-005/006/012/013/014/015/016/017 |
+| [188](188_slack-gateway-supports-only-its-final-public-schema.md) | Slack gateway supports only its final public schema | Accepted | REQ-SG-005/011/012/015/017; REQ-COMP-002/020 |
+| [210](210_original-target-touch-routing-follows-contact-ownership.md) | Original-target touch routing follows contact ownership | Accepted | REQ-MLRU-014, REQ-MLRU-017 |
+| [211](211_kache-v1-restores-automatic-selection.md) | Qualified Kache v1 restores automatic compiler-cache selection | Superseded by ADR-212 (selection); v1.0.0 debugger evidence remains historical | development methodology; REQ-COMP-001, REQ-COMP-008 |
+| [212](212_kache-default-waits-for-identifiable-isolation-fix.md) | Kache default waits for an identifiable isolation fix | Selection conclusion superseded by ADR-213; historical v1.0.0 evidence retained | development methodology; REQ-COMP-001, REQ-COMP-008 |
+| [213](213_kache-v1-2-2-strict-local-only-selection.md) | Select Kache v1.2.2 only behind a Phoenix-owned local-only boundary | Accepted | development methodology; REQ-COMP-001, REQ-COMP-008 |
 
 ## For agents: which decisions bind your task
 
@@ -114,12 +214,17 @@ Consult the relevant ADRs before starting work of each kind.
 
 | Task type | Relevant ADRs |
 | --- | --- |
+| Changing navigation console attribution or CDP context ownership | 110/111, superseding 109, with 107/108 |
+| Changing conversation Markdown disclosures, their source ranges, streaming selection, or find interpretation | 099 |
 | Changing Codex model discovery, availability, or account-bound routing | 062, then 052 and 034 |
+| Changing Codex reset-credit listing, redemption, or post-redemption resume | 208, then 062 and 085 |
 | Configuring named workers, tiers, or sub-agent model routes | 052, within 034's compatibility scope |
-| Selecting or qualifying development compiler-cache defaults | 093, then 092, 079, 078, and 034 |
+| Selecting or qualifying development compiler-cache defaults | 079, then 078 and 034 |
 | Changing pending-question identity compatibility or legacy tokenless settlement | 082, then 034 |
 | Specifying parallel Work-child qualification, admission, shared WorkScope collaboration, cancellation/start, or parent-result delivery | 059, then 052 and 026 |
 | Implementing federation instance identity or bounded known-credential SQL exclusions | 083, within 034's compatibility scope |
+| Implementing federation peer TLS trust, enrollment transfer, or peer origins | 093, then 092, 083, and 034 |
+| Changing owner-password or federation peer-credential domains | 094, then 083 and 034 |
 | Changing Codex route admission or private continuation account identity | 085, preserving 062's advisory discovery policy |
 | Changing MCP credential removal or restart recovery | 086, within 034's compatibility scope |
 | Specifying Close failure, startup observation, History cleanup attention, mandatory Global failure delivery, or explicit safe retry | 088 supersedes the Close recovery/finalization consequences of 026/040/041/042/080; retain their identity and ownership safeguards |
@@ -132,15 +237,20 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying bash process cleanup, shutdown cleanup, or kill escalation policy | 003 |
 | Specifying inline-terminal history commit, per-command rounds, or user-origin attribution | 004 |
 | Deciding which tools a user may invoke directly (user tool invocation eligibility) | 005 |
-| Specifying wake contracts, async terminal waits, or sub-agent terminal wake delivery | 006 |
+| Retiring wake execution and preserving wake history | 098, within 034's compatibility scope; 006/011/012 are historical only |
 | Specifying durable conversation creation, worker claims, retries, or provisioning cleanup | 007 |
+| Migrating product creation provisioning stages or changing checkpoint progression | 104, then 044, 043, 034, and 007 |
 | Specifying request-bound creation identity, immutable creation pins, atomic creation publication, or staging cleanup ownership | 043 for the private staging boundary, then 044, 007, and 031 |
 | Specifying multi-PR branch observation, active PR targeting, or bash terminal-edge reconciliation | 008 |
 | Specifying native process resource sampling, Work Scope health, or resource-observation freshness | 009 |
 | Specifying native macOS self-deployment, activation, rollback, or installed-state-preserving restart | 050, then 010 |
 | Specifying protected prepared artifacts or paired launchd ProductConversation database recovery | 076, 077, within 034; then 050 and 017 |
+| Qualifying prepared current-schema admission from exact migration 123 or the exact migration-128 target | 114 partially supersedes the prepared-source restriction in 105; retain the exact target from 105 and the activation/recovery boundaries from 102, then 034 |
+| Qualifying protected exact migration-114 to exact migration-128 published-release activation with separate controller pinning | 115 partially supersedes the protected-source restriction in 102/105; retain 105's exact target, 102's lifecycle, and 114's prepared admissions, then 034 |
+| Qualifying the migration-123 to exact migration-128 ordinary activation interval | 105 supersedes the interval portion of 103; retain its activation/recovery boundary, then 104 and 034 |
+| Modifying pre-stop capacity reservation cleanup, cleanup-only recovery, or reservation-evidence ownership | 106, then 010, 034, 102, and 076 |
 | Specifying authoritative build identity, candidate verification, legacy predecessor rollback, or bare-supervisor replacement | 064, then 017 and 010 |
-| Specifying wake-plane registration receipts, durable wake observations, or wake resume outbox | 006, 011, 012 |
+| Reviewing historical wake registration, observation, or resume records | 098 governs retirement; 006, 011, 012 record former behavior without execution authority |
 | Specifying the shared durable workflow engine, profiles, migration, or drain | 013, 014, 015, 016, 019, 020, 024 |
 | Specifying product conversation lifecycle versus WorkScope resource ownership, continuation topology, or worktree lifecycle across continuations | 026 |
 | Specifying Work-subagent trust, sandboxing, or inherited worktree ownership | 068, then 067 |
@@ -152,6 +262,13 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying post-tool direct-turn restart recovery or bounded owed-baton settlement | 074, then 024, 020, 014 |
 | Specifying observations, receipts, reducer delivery, or runtime acceptance | 015, 019 |
 | Specifying cross-platform production deployment, Linux activation, or shared candidate preparation | 017, 010 for launchd refinements |
+| Repairing protected packaging for the exact ARM forward-replacement candidate | 127; fixed candidate, separate controller, no generic selection or compatibility expansion |
+| Specifying the exact commissioned 237100 Linux artifact operation | 130; fixed candidate/target, closed two-file evidence, no generic Linux or deployment authority |
+| Replacing a committed/pending exact current-schema candidate without losing its fence | 126; sealed deterministic child, original claim, no predecessor or snapshot replay |
+| Qualifying the exact prepared source114 launchd candidate | 125, then 114, 115, 105 and 034; no generic prepared114 |
+| Specifying standalone controller durability, surviving guardian custody, native runner IPC, owned-root child enumeration, exact-root identity observation, retained-result application recovery, failed-result custody settlement, or disposable installer validation | 125, 133, 134, 135, 136, 137, 138, 139, 140, 141; 034 for compatibility limits |
+| Protecting the exact systemd prefix65-to-RC4-target128 published-release activation | 116 and 117, then 034 and 017; bounded pre-marker interruption recovery, no launchd impact or generic interval support |
+| Qualifying the exact prepared237100 Linux systemd prefix65-to-target128 activation | 129, then 116/117, 034 and 017; keep published protocol 2 and prepared protocol 3 as distinct exact source authorities |
 | Adding compatibility, downgrade, rollback, database-replacement, or internal SQLite timestamp guarantees | 034, then the owning feature ADRs (033 for GitRepository Foundation) |
 | Migrating invalid historical continuation dispatch intents | 053, then 034 and 026 |
 | Retiring commission-review execution, pending approval state, or specialized history/viewer authority | 038, then 034 |
@@ -181,8 +298,19 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-007 (Conversation creation uses fenced reconciliation)
       ├── ADR-008 (Multi-PR selection uses durable settled-branch observations plus explicit active-PR targeting)
       ├── ADR-009 (Native process metrics use shared demand-driven observation generations)
+      ├── ADR-083 (Federation establishes stable instance identity and excludes known credentials from agent SQL)
+      │   └── ADR-092 (Federation pins imported private-CA trust per peer)
+      │       └── ADR-093 (Federation validates CA capability and types IPv6 persistence)
       ├── ADR-034 (Compatibility guarantees are explicit and data-aware)
+      │   ├── ADR-116 (Protect exact 65-to-128 systemd published-release activation; independent exact-release exception)
+      │   │   └── ADR-117 (Recover interrupted pre-marker systemd activation; retained predecessor only, no launchd impact)
+      │   │       └── ADR-129 (Qualify exact prepared237100 Linux candidate; retain protected lifecycle and published route)
       │   ├── ADR-038 (Commission review is retired with forward history recovery)
+      │   ├── ADR-102 (Current-schema prepared activation commits at the database-write boundary)
+      │   │   └── ADR-103 (Ordinary forward candidate launch is the downgrade boundary)
+      │   │       └── ADR-105 (Qualify migration 128 for bounded current-schema activation; supersedes interval portions of 102/103 and applies ADR-104)
+      │   │           └── ADR-114 (Admit exact target ledger as a prepared source; retain 105 target and 102 boundary)
+      │   │               └── ADR-115 (Protect exact 114-to-128 published release; independent controller, same lifecycle; retain 114 prepared admissions)
       │   ├── ADR-053 (Invalid continuation intents retire without fabricated identity)
       │   ├── ADR-082 (Legacy AUQ waits retain identity absence)
       │   └── ADR-060 (Parallel Work admission is explicitly model-qualified)
@@ -191,12 +319,22 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-037 (Legacy direct-turn terminal ambiguity is retired as failure)
       │   └── applies ADR-024 and ADR-034 to pre-obligation materialized direct turns
       ├── ADR-010 (launchd deployment uses an independent transaction helper)
+      │   ├── ADR-106 (Pre-stop capacity cleanup is a cleanup-only recovery boundary)
       │   ├── ADR-017 (production deployment shares preparation but keeps backend-owned activation)
       │   │   └── ADR-018 (release updates use published release previews and approval-bound installations)
       │   │       └── ADR-063 [Proposed] (direct distribution uses protected signing and private draft publication)
       │   │           └── ADR-065 (Release candidates share the stable artifact path)
       │   │   └── ADR-064 (Modern build identity is full-length and legacy rollback is role-bound)
       │   └── ADR-050 (launchd restart preserves installed state through an independent helper)
+      │   └── ADR-133 (Standalone controller owns durability and child supervision)
+      │       └── ADR-134 (Controller loss detaches and fences the surviving guardian)
+      │           └── ADR-135 (Same-build pre-adoption native guardian IPC and runner)
+      │               ├── ADR-136 (Retained native results use application-only recovery)
+      │               │   ├── ADR-137 (Owned-root child enumeration is distinct native authority)
+      │               │   │   └── ADR-138 (Exact-root identity observation is distinct native authority)
+      │               │   │       └── ADR-139 (Retained exact-root identity results use application-only recovery)
+      │               │   └── ADR-140 (Already-durable native sampling failures use explicit custody settlement)
+      │               └── ADR-141 (Disposable validation; also extends exact PreparedSource114 ADR-125)
       ├── ADR-011 (Wake-plane core uses registration receipts and durable runtime observations)
       │   └── ADR-012 (Wake-resume scheduling uses a durable acceptance outbox)
       └── ADR-013 (Durable workflows use normalized core and typed profiles)
@@ -224,6 +362,7 @@ ADR-000 (adopt spEARS v2 for new work)
               ├── ADR-046 (ProductConversation owns aggregate presentation without duplicating transcript authority)
               ├── ADR-043 (Creation staging uses a private locked namespace)
               ├── ADR-044 (Creation publication uses request-bound identity and immutable starting pins)
+              │   └── ADR-104 (Product creation stages backfill from durable evidence)
               └── ADR-032 (GitRepository is hidden infrastructure; Project is retired)
                   ├── ADR-033 (Database rollback is offline and Foundation observations use relational scalar storage)
                   └── ADR-035 (Repository authority activation is consumer-triggered and offline)
@@ -240,3 +379,11 @@ ADR-000 (adopt spEARS v2 for new work)
   Never edit an accepted decision to match later reality.
 - **After adding an ADR,** add its row here and update the task-routing table if
   the decision should be consulted for a common kind of work.
+
+Capacity planning across ordinary requests, handoffs and model switches is governed by [ADR-146](146_context-capacity-preserves-output-and-semantic-continuity.md), affecting REQ-LLM-004f/004j–004m, REQ-BED-020a, REQ-STR-012 and REQ-AN-011.
+
+Generated handoff readability and explicit source authority are governed by [ADR-147](147_readable-generated-handoffs-retain-source-authority.md); automatic initiation remains governed by ADR-054.
+
+Goals schema extraction and refusal of unsupported migration lineages are governed by [187](187_goal-main-migration-identity-reconciliation.md), implementing REQ-COMP-020 without extending deployment compatibility.
+
+Goal admission requires explicit automatic continuation without locking existing Goal management or the OFF gesture: [192](192_goal-admission-requires-explicit-auto-continue.md), implementing REQ-GOAL-AC-001–004.

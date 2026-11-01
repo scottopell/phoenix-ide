@@ -181,6 +181,9 @@ fn apply_and_exec(cmd: &str) -> Result<std::convert::Infallible, String> {
             .current_dir(&policy.repo_root)
             .env_clear();
         policy.apply_child_env(&mut command);
+        if let Some(launch_uuid) = std::env::var_os(super::handle::BASH_LAUNCH_UUID_ENV_VAR) {
+            command.env(super::handle::BASH_LAUNCH_UUID_ENV_VAR, launch_uuid);
+        }
         let err = command.exec();
         Err(format!("failed to exec bash from PATH: {err}"))
     }

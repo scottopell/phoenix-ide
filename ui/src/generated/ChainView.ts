@@ -7,10 +7,8 @@ import type { ChainWorkIdentity } from "./ChainWorkIdentity";
  * Chain snapshot returned by `GET /api/chains/:rootId` and the body of the
  * PATCH name response.
  *
- * `display_name` is the resolved label the UI renders without re-running
- * the `chain_name → root.title → slug` fallback. `chain_name` is the
- * user-set override (or `None` when unset) — kept distinct so an "edit"
- * affordance can show the unset state. `current_member_count` and
+ * `display_name` is the root title. The legacy `chain_name` response slot
+ * is always null; it is not a separate editable authority. `current_member_count` and
  * `current_total_messages` let the UI compute staleness against each
  * stored Q&A's snapshot integers (REQ-CHN-005) without a second roundtrip.
  */

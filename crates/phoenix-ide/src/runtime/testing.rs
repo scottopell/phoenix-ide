@@ -8,6 +8,7 @@ use crate::state_machine::ConvState;
 use crate::tools::browser::BrowserSessionManager;
 use crate::tools::{ToolContext, ToolOutput};
 use async_trait::async_trait;
+use phoenix_core::domain::db_schema::FinalizedToolResult;
 use phoenix_core::domain::sm_event::{DirectTurnAttemptAuthority, PreparedDirectTurnPayload};
 use phoenix_db::workflow::DirectTurnMaterializationEligibility;
 use phoenix_llm::ModelRegistry;
@@ -183,6 +184,7 @@ impl LlmClient for StreamingMockLlmClient {
             content: vec![phoenix_llm::ContentBlock::text(self.final_text.clone())],
             end_turn: true,
             usage: phoenix_llm::Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         })
     }
@@ -616,6 +618,8 @@ type StoredSvgArtifacts = HashMap<
 /// In-memory storage for testing
 #[allow(dead_code)]
 pub struct InMemoryStorage {
+    pub handoff_candidates: Mutex<Vec<crate::db::ContinuationHandoffCandidate>>,
+
     svg_artifacts: Mutex<StoredSvgArtifacts>,
     tool_admission_policies:
         Mutex<HashMap<String, phoenix_core::domain::tool_availability::ToolAvailability>>,
@@ -641,6 +645,7 @@ pub struct InMemoryStorage {
     next_msg_id: Mutex<u64>,
     accepted_continuation_handoff_message_ids: Mutex<HashMap<String, String>>,
     fail_continuation_handoff_provenance: Mutex<bool>,
+    continuation_opening_reads: Mutex<HashMap<String, crate::db::ContinuationOpeningRead>>,
     complete_creation_job_results: Mutex<VecDeque<Result<crate::db::CreationCasOutcome, String>>>,
     complete_creation_job_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     complete_creation_job_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -694,6 +699,7 @@ pub struct InMemoryStorage {
     metrics_write_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     llm_request_metrics: Mutex<Vec<phoenix_llm::LlmAttemptMetrics>>,
     turn_usages: Mutex<Vec<(String, phoenix_llm::Usage)>>,
+    pub capacity_plans: Mutex<Vec<phoenix_core::domain::request_capacity::RequestCapacityPlan>>,
     provider_replay_updates:
         Mutex<Vec<phoenix_core::domain::provider_replay::ProviderReplayUpdate>>,
     metrics_written: tokio::sync::Notify,
@@ -721,6 +727,7 @@ impl InMemoryStorage {
 
     pub fn new() -> Self {
         Self {
+            handoff_candidates: Mutex::new(Vec::new()),
             svg_artifacts: Mutex::new(HashMap::new()),
             tool_admission_policies: Mutex::new(HashMap::new()),
             messages: Mutex::new(HashMap::new()),
@@ -736,6 +743,7 @@ impl InMemoryStorage {
             next_msg_id: Mutex::new(1),
             accepted_continuation_handoff_message_ids: Mutex::new(HashMap::new()),
             fail_continuation_handoff_provenance: Mutex::new(false),
+            continuation_opening_reads: Mutex::new(HashMap::new()),
             complete_creation_job_results: Mutex::new(VecDeque::new()),
             complete_creation_job_started: Mutex::new(None),
             complete_creation_job_release: Mutex::new(None),
@@ -784,6 +792,7 @@ impl InMemoryStorage {
             metrics_write_release: Mutex::new(None),
             llm_request_metrics: Mutex::new(Vec::new()),
             turn_usages: Mutex::new(Vec::new()),
+            capacity_plans: Mutex::new(Vec::new()),
             provider_replay_updates: Mutex::new(Vec::new()),
             metrics_written: tokio::sync::Notify::new(),
             steering_drain_failures: Mutex::new(0),
@@ -812,6 +821,17 @@ impl InMemoryStorage {
             .lock()
             .unwrap()
             .insert(conv_id.to_string(), message_id.to_string());
+    }
+
+    pub fn set_continuation_opening_read(
+        &self,
+        message_id: &str,
+        opening: crate::db::ContinuationOpeningRead,
+    ) {
+        self.continuation_opening_reads
+            .lock()
+            .unwrap()
+            .insert(message_id.to_string(), opening);
     }
 
     pub fn set_fail_continuation_handoff_provenance(&self, fail: bool) {
@@ -1256,6 +1276,32 @@ impl Default for InMemoryStorage {
 
 #[async_trait]
 impl MessageStore for InMemoryStorage {
+    async fn save_continuation_handoff_candidate(
+        &self,
+        candidate: &crate::db::ContinuationHandoffCandidate,
+    ) -> Result<(), String> {
+        self.handoff_candidates
+            .lock()
+            .unwrap()
+            .push(candidate.clone());
+        Ok(())
+    }
+
+    async fn read_message_continuation_opening(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<crate::db::ContinuationOpeningRead>, String> {
+        if *self.fail_continuation_handoff_provenance.lock().unwrap() {
+            return Err("injected continuation handoff provenance failure".into());
+        }
+        Ok(self
+            .continuation_opening_reads
+            .lock()
+            .unwrap()
+            .get(message_id)
+            .cloned())
+    }
+
     async fn has_pending_continuation_opening(&self, _conv_id: &str) -> Result<bool, String> {
         Ok(false)
     }
@@ -1955,7 +2001,7 @@ impl MessageStore for InMemoryStorage {
         &self,
         conv_id: &str,
         assistant: &Message,
-        tool_results: &[Message],
+        tool_results: &[FinalizedToolResult],
     ) -> Result<(), String> {
         if *self.fail_tool_round_persist.lock().unwrap() {
             return Err("injected tool round persist failure".to_string());
@@ -1970,8 +2016,8 @@ impl MessageStore for InMemoryStorage {
         let mut messages = self.messages.lock().unwrap();
         let bucket = messages.entry(conv_id.to_string()).or_default();
         bucket.push(assistant.clone());
-        for msg in tool_results {
-            bucket.push(msg.clone());
+        for result in tool_results {
+            bucket.push(result.row().clone());
         }
         Ok(())
     }
@@ -1980,7 +2026,7 @@ impl MessageStore for InMemoryStorage {
         &self,
         conv_id: &str,
         assistant: &Message,
-        tool_results: &[Message],
+        tool_results: &[FinalizedToolResult],
         state: &ConvState,
         state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), String> {
@@ -1993,7 +2039,7 @@ impl MessageStore for InMemoryStorage {
         &self,
         conv_id: &str,
         assistant: &Message,
-        tool_results: &[Message],
+        tool_results: &[FinalizedToolResult],
         settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
     ) -> crate::runtime::traits::TerminalMutationEstablishment {
         if *self.terminal_mutation_retired.lock().unwrap() {
@@ -2465,7 +2511,7 @@ impl StateStore for InMemoryStorage {
         &self,
         conversation_id: &str,
         assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
+        tool_results: &[FinalizedToolResult],
         state: &phoenix_core::domain::sm_state::ConvState,
         state_updated_at: chrono::DateTime<chrono::Utc>,
         _update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
@@ -2515,11 +2561,20 @@ impl StateStore for InMemoryStorage {
         _service_tier: phoenix_core::domain::llm_types::ServiceTier,
         usage: &phoenix_llm::Usage,
         _first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
+        _attempt: Option<&phoenix_core::domain::llm_types::UsageAttempt>,
     ) -> Result<(), String> {
         self.turn_usages
             .lock()
             .unwrap()
             .push((model.to_string(), usage.clone()));
+        Ok(())
+    }
+
+    async fn insert_request_capacity_plan(
+        &self,
+        plan: &phoenix_core::domain::request_capacity::RequestCapacityPlan,
+    ) -> Result<(), String> {
+        self.capacity_plans.lock().unwrap().push(plan.clone());
         Ok(())
     }
 
@@ -2681,7 +2736,7 @@ impl TestRuntimeBuilder<MockLlmClient, MockToolExecutor> {
         let tools = Arc::new(self.tools.unwrap_or_default());
 
         let model_id = llm.model_id().to_string();
-        let context = ConvContext::new(&self.conv_id, self.working_dir, model_id, 200_000);
+        let context = ConvContext::new(&self.conv_id, self.working_dir, model_id, 200_000, 16_384);
 
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcaster = crate::runtime::SseBroadcaster::new(128, 0);
@@ -2879,6 +2934,7 @@ mod tests {
             content: vec![ContentBlock::text("Hello")],
             end_turn: true,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
@@ -2890,7 +2946,7 @@ mod tests {
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 vec![],
             ),
-            max_tokens: Some(100),
+            max_tokens: 100,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
 
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
@@ -2967,6 +3023,7 @@ mod tests {
             content: vec![ContentBlock::text("Hello!")],
             end_turn: true,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
@@ -2997,6 +3054,7 @@ mod tests {
                 cache_creation_tokens: 0,
                 reasoning_tokens: Some(18),
             },
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
         llm.queue_response(LlmResponse {
@@ -3004,6 +3062,7 @@ mod tests {
             content: vec![ContentBlock::text("next turn succeeded")],
             end_turn: true,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
@@ -3097,6 +3156,7 @@ mod tests {
             )],
             end_turn: false,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
         // Second response: text after tool
@@ -3105,6 +3165,7 @@ mod tests {
             content: vec![ContentBlock::text("Done!")],
             end_turn: true,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
@@ -3158,6 +3219,7 @@ mod tests {
             content: vec![ContentBlock::text("Response that should be discarded")],
             end_turn: true,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
@@ -3165,7 +3227,13 @@ mod tests {
         let tools = Arc::new(MockToolExecutor::new());
         let request_started = llm.request_started.clone();
 
-        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
         let mut broadcast_rx = broadcast_tx.subscribe();
@@ -3273,6 +3341,7 @@ mod tests {
             )],
             end_turn: false,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
         // This response won't be used since tool is cancelled
@@ -3281,6 +3350,7 @@ mod tests {
             content: vec![ContentBlock::text("Done")],
             end_turn: true,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
@@ -3291,7 +3361,13 @@ mod tests {
         let execution_started = tools.execution_started.clone();
 
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
         let mut broadcast_rx = broadcast_tx.subscribe();
@@ -3388,6 +3464,7 @@ mod tests {
             )],
             end_turn: false,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
@@ -3398,7 +3475,13 @@ mod tests {
         let execution_started = tools.execution_started.clone();
 
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
         let mut broadcast_rx = broadcast_tx.subscribe();
@@ -3506,6 +3589,7 @@ mod tests {
             )],
             end_turn: false,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
@@ -3515,7 +3599,13 @@ mod tests {
         let execution_started = tools.execution_started.clone();
 
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
         let mut broadcast_rx = broadcast_tx.subscribe();
@@ -3646,7 +3736,13 @@ mod tests {
         use tokio::sync::mpsc;
 
         let storage = storage_with_spawn_round("test-conv", "spawn-1").await;
-        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx = mpsc::channel::<Event>(32).0;
         let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 2);
@@ -3736,7 +3832,7 @@ mod tests {
         use phoenix_llm::ContentBlock;
         use std::path::PathBuf;
 
-        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000);
+        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000, 16_384);
 
         // Build AssistantMessage with tool_use blocks for all 3 tools
         let assistant_message = AssistantMessage::new(
@@ -3826,7 +3922,8 @@ mod tests {
         assert!(persist.is_some(), "Should have PersistCheckpoint effect");
 
         if let Some(Effect::PersistCheckpoint { data }) = persist {
-            let CheckpointData::ToolRound { tool_results, .. } = data;
+            let CheckpointData::ToolRound(round) = data;
+            let tool_results = round.results();
             assert_eq!(tool_results.len(), 3, "Should have results for all 3 tools");
             assert!(
                 tool_results.iter().all(|r| !r.is_success()),
@@ -3852,6 +3949,7 @@ mod tests {
             PathBuf::from("/tmp"),
             "test-model",
             200_000,
+            16_384,
             "test-root",
         );
 
@@ -3908,6 +4006,7 @@ mod tests {
             PathBuf::from("/tmp"),
             "test-model",
             200_000,
+            16_384,
             "test-root",
         );
 
@@ -3962,6 +4061,7 @@ mod tests {
             PathBuf::from("/tmp"),
             "test-model",
             200_000,
+            16_384,
             "test-root",
         );
 
@@ -4011,6 +4111,7 @@ mod tests {
             PathBuf::from("/tmp"),
             "test-model",
             200_000,
+            16_384,
             "test-root",
         );
 
@@ -4080,7 +4181,13 @@ mod tests {
         use std::path::PathBuf;
 
         // Parent context (not sub-agent)
-        let context = ConvContext::new("parent-conv", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            "parent-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
 
         let state = ConvState::LlmRequesting { attempt: 1 };
 
@@ -4129,7 +4236,13 @@ mod tests {
         let llm = Arc::new(MockLlmClient::new("test-model"));
         let tools = Arc::new(MockToolExecutor::new());
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("parent-conv", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            "parent-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
         let _broadcast_rx = broadcast_tx.subscribe();
@@ -4211,6 +4324,7 @@ mod tests {
             )],
             end_turn: false,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
         // After tool completes, LLM returns text
@@ -4219,6 +4333,7 @@ mod tests {
             content: vec![ContentBlock::text("Done")],
             end_turn: true,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
@@ -4230,7 +4345,13 @@ mod tests {
         ));
 
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
         let mut broadcast_rx = broadcast_tx.subscribe();
@@ -4329,6 +4450,7 @@ mod tests {
                 )],
                 end_turn: false,
                 usage: Usage::default(),
+                usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
                 stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
             });
         }
@@ -4344,6 +4466,7 @@ mod tests {
             PathBuf::from("/tmp"),
             "test-model",
             200_000,
+            16_384,
         );
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcast_tx = crate::runtime::SseBroadcaster::new(256, 0);
@@ -4478,6 +4601,7 @@ mod tests {
                 PathBuf::from("/tmp"),
                 "streaming-mock",
                 200_000,
+                16_384,
             );
             let (event_tx, event_rx) = mpsc::channel(32);
             let broadcast_tx = crate::runtime::SseBroadcaster::new(4096, 0);
@@ -4542,7 +4666,7 @@ mod tests {
                         SseEvent::Token { .. } => {
                             last_token_idx = Some(idx);
                         }
-                        SseEvent::Message { message } => {
+                        SseEvent::Message { message, .. } => {
                             if matches!(message.message_type, MessageType::Agent)
                                 && first_agent_msg_idx.is_none()
                             {
@@ -4609,7 +4733,7 @@ mod tests {
         use crate::state_machine::{transition, ConvContext, Event};
         use std::path::PathBuf;
 
-        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000);
+        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000, 16_384);
 
         // Single pending agent: the real result drives the last-one → Idle arm.
         let state = ConvState::CancellingSubAgents {
@@ -4678,7 +4802,7 @@ mod tests {
         use crate::state_machine::{transition, ConvContext, Event};
         use std::path::PathBuf;
 
-        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000);
+        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000, 16_384);
 
         // Two pending: X already drained, only Y remains.
         let state = ConvState::CancellingSubAgents {
@@ -4723,7 +4847,7 @@ mod tests {
         use phoenix_llm::ContentBlock;
         use std::path::PathBuf;
 
-        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000);
+        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000, 16_384);
 
         // New round with a DIFFERENT tool_use_id ("new-id").
         let assistant_message = AssistantMessage::new(
@@ -4786,7 +4910,7 @@ mod tests {
         use crate::state_machine::{transition, ConvContext, Event};
         use std::path::PathBuf;
 
-        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000);
+        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000, 16_384);
 
         let res = transition(
             &ConvState::Idle,
@@ -4899,6 +5023,7 @@ mod tests {
             )],
             end_turn: false,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
         // Turn 2: a tool call (cooperative now), then...
@@ -4911,6 +5036,7 @@ mod tests {
             )],
             end_turn: false,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
         // ...the post-tool LLM round returns a plain text answer → AgentDone.
@@ -4919,6 +5045,7 @@ mod tests {
             content: vec![ContentBlock::text("done with second tool")],
             end_turn: true,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
@@ -4929,7 +5056,13 @@ mod tests {
         let cooperative_completed = tools.cooperative_completed.clone();
 
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcast_tx = crate::runtime::SseBroadcaster::new(256, 0);
         let mut broadcast_rx = broadcast_tx.subscribe();
@@ -5071,6 +5204,7 @@ mod tests {
             PathBuf::from("/tmp"),
             "test-model",
             200_000,
+            16_384,
             "parent-conv",
         );
 

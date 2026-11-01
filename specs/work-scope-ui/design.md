@@ -312,16 +312,12 @@ back to it. The `latest` recency label (max-`updated_at`, which can land on an
 intermediate member) is deliberately NOT used to pick the scope. Both surfaces
 render the same per-resource rows from shared code in `WorkScopePanel.tsx`.
 
-The leaf, not the root, is the right scope because the chain's members do not
-all share one scope. Shared-worktree chains (Worktree / Branch / Work) resolve
-every member to the same worktree scope, but Direct continuation chains resolve
-each member to a distinct `WorkScope::Conversation(<member id>)`, so the leaf's
-live resources are under its own scope, not the root's. The leaf's scope is
-correct for both: it is the shared worktree scope for the former and the leaf's
-own conversation scope for the latter. No per-member aggregation is needed — one
-query against the leaf's `WorkScope` key is complete; a conversation-keyed
-fan-out across every member with a client-side merge would add divergence risk
-for no gain.
+The selected leaf's exact persisted WorkScope is the resource query authority.
+Ordinary continuation retains that identity for both Direct/non-Git and
+worktree-backed environments. Historical chains may contain distinct attached
+scope identities; selecting the leaf must not substitute an arbitrary scope
+from the product's historical ownership set or coalesce scopes by cwd. The dock
+queries the selected attachment without a client-side resource merge.
 
 Because the chain dock has no per-conversation SSE channel (it omits
 `liveInventory`), its live-resource poll must stay active even while the dock is

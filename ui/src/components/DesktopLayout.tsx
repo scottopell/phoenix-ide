@@ -1,4 +1,6 @@
 import { useDesktopRouteOwner } from './useDesktopRouteOwner';
+import { extractProductRouteReference } from './desktopRouteReference';
+import { conversationGroundingContext } from './FileExplorer/groundingContext';
 import { useLocation } from 'react-router-dom';
 import { lazy, Suspense, useEffect, useLayoutEffect, useCallback, useMemo, useRef, useState } from 'react';
 import {
@@ -244,14 +246,16 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     };
   }, [showInfo]);
 
-  const slugMatch = location.pathname.match(/^\/c\/(.+)$/);
-  const productMatch = location.pathname.match(/^\/product-conversations\/([^/?#]+)/);
-  const routeSlug = slugMatch?.[1] ?? null;
-  const productConversationId = productMatch?.[1] ?? routeSlug;
-  const activeSlug = useDesktopRouteOwner(productConversationId, routeSlug, location.search);
+  const productRouteReference = extractProductRouteReference(location.pathname);
+  const routeSlug = productRouteReference?.routeSlug ?? null;
+  const productConversationId = productRouteReference?.productConversationId ?? null;
+  const ordinaryActiveSlug = useDesktopRouteOwner(productConversationId, routeSlug, location.search);
+  const globalMatch = location.pathname.match(/^\/global\/([^/?#]+)/);
+  const activeSlug = globalMatch?.[1] ?? ordinaryActiveSlug;
   const sidebarActiveIdentity = productConversationId ?? activeSlug;
   const activeConversation = useConversationSnapshot(activeSlug);
   const activeConversationId = activeConversation?.id;
+  const grounding = conversationGroundingContext(activeConversation, globalMatch !== null);
 
   useEffect(() => {
     setActiveNotificationConversationSlug(activeSlug);
@@ -277,6 +281,17 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     : (activeConversation?.worktree_path ?? activeConversation?.cwd ?? null);
   const activeWorkScopeKey = activeConversationReadOnly ? undefined : activeConversation?.work_scope_key;
   const activeLiveWorkScope = activeConversationReadOnly ? undefined : liveWorkScope;
+  const executionCapable = productConversationId !== null
+    && !new URLSearchParams(location.search).has('source_transcript')
+    && activeConversation !== null
+    && !activeConversation.archived
+    && !activeConversationReadOnly
+    && readinessConversationId === activeConversation.id
+    && confirmedLive
+    && activeWorkScopeKey?.startsWith('work:') === true
+    && activeWorkScopeKey.length > 5
+    && (activeLiveWorkScope == null || activeLiveWorkScope.scope_key === activeWorkScopeKey);
+
   const browserSessionActive = activeConversation?.browser_session_active;
   const browserSessionStateLoaded = activeConversation !== null
     && readinessConversationId === activeConversation.id;
@@ -326,6 +341,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
             collapsed={fileExplorerPane.collapsed}
             onToggle={() => fileExplorerPane.setCollapsed(!fileExplorerPane.collapsed)}
             rootPath={effectiveCwd}
+            grounding={grounding}
             conversationId={activeConversation?.id}
             showToast={showSuccess}
             showError={showError}
@@ -334,6 +350,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
             width={fileExplorerPane.collapsed ? undefined : fileExplorerPane.size}
             workScopeKey={activeWorkScopeKey}
             liveWorkScope={activeLiveWorkScope}
+            executionCapable={executionCapable}
             canOpenWorkspaceDiff={activeConversation?.conv_mode_label === 'Work' || activeConversation?.conv_mode_label === 'Branch' || activeConversation?.conv_mode_label === 'Approved Task'}
           />
         )}

@@ -4,10 +4,28 @@ use std::collections::HashSet;
 
 use phoenix_core::domain::llm_types::{ModelEffort, ServiceTier};
 
-/// Default maximum output tokens when a model does not declare a smaller cap.
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16_384;
+/// Endpoint-specific request addressing. Never use this value to infer model capabilities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestModelName(String);
 
-const EXTERNAL_MODEL_DEFAULT_OUTPUT_RESERVE: usize = 2_000;
+impl RequestModelName {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for RequestModelName {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for RequestModelName {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffortCapabilities {
@@ -301,7 +319,10 @@ struct ExternalModelSpec {
     family: Option<String>,
     description: String,
     context_window: usize,
-    max_output_tokens: Option<u32>,
+    /// REQ-LLM-004f: required. Phoenix sends the model's declared output
+    /// maximum as the resolved request budget; a model that cannot declare
+    /// one cannot be registered rather than being defaulted.
+    max_output_tokens: u32,
     recommended: bool,
     supports_tool_search: bool,
     effort_capabilities: Option<ExternalEffortCapabilities>,
@@ -329,8 +350,8 @@ pub enum ModelSource {
 pub struct ModelSpec {
     /// User-facing model ID (e.g., "claude-4.5-opus")
     pub id: String,
-    /// API name used by the provider (e.g., "claude-haiku-4-5-20251001")
-    pub api_name: String,
+    /// Default endpoint request spelling. `api_name` in external model config sets this.
+    pub default_request_name: RequestModelName,
     /// Backend route + wire protocol for this model.
     pub backend: ModelBackend,
     /// User-facing provider family.
@@ -344,9 +365,12 @@ pub struct ModelSpec {
     /// (which know whether they're on a bridge route) can still read it
     /// directly when needed; external callers must go through the method.
     pub(super) context_window: usize,
-    /// Operator-declared output ceiling for this route. `None` means use the
-    /// provider default/output-shape fallback for the active backend.
-    pub(super) max_output_tokens: Option<u32>,
+    /// Declared output-token maximum for this route (REQ-LLM-004f): the
+    /// single resolved budget Phoenix sends and reserves for every request.
+    /// There is no Phoenix-internal fallback for a missing value — built-in
+    /// specs declare a verified maximum and external registration rejects a
+    /// model that omits one.
+    pub(super) max_output_tokens: u32,
     /// Recommended for most users (shown by default in UI)
     pub recommended: bool,
     /// Whether this model supports Anthropic's tool search feature
@@ -381,22 +405,13 @@ impl ModelSpec {
     }
 
     #[must_use]
-    pub const fn output_token_limit(&self) -> Option<u32> {
+    pub const fn output_token_limit(&self) -> u32 {
         self.max_output_tokens
-    }
-
-    /// Provider compatibility-header value. A prefixed wire model name is the
-    /// routing authority; bare names fall back to the backend family.
-    #[must_use]
-    pub fn provider_header_value(&self) -> &str {
-        self.api_name
-            .split_once('/')
-            .map_or_else(|| self.backend.header_value(), |(prefix, _)| prefix)
     }
 
     #[must_use]
     pub fn effort_capabilities_for(&self, service: &dyn crate::LlmService) -> EffortCapabilities {
-        if matches!(self.api_name.as_str(), "gpt-6-sol" | "gpt-6-luna") {
+        if matches!(self.id.as_str(), "gpt-6-sol" | "gpt-6-luna") {
             if service.uses_codex_bridge() {
                 effort_gpt_6_sol_luna_codex()
             } else {
@@ -414,14 +429,14 @@ impl ModelSpec {
     ) -> ServiceTierCapabilities {
         let openai_fast = service.uses_codex_bridge()
             || (matches!(
-                self.api_name.as_str(),
+                self.id.as_str(),
                 "gpt-6-astra" | "gpt-6.1-sol" | "gpt-6-sol" | "gpt-6-luna"
             ) && service.uses_official_openai_responses());
         // Anthropic Fast mode is a research-preview capability of the official
         // direct Claude API only. A compatible/proxy base URL or a cloud route
         // must not advertise it, so gate on the official-Anthropic route.
         let anthropic_fast = self.backend == ModelBackend::Anthropic
-            && self.api_name == "claude-opus-5-5"
+            && self.id == "claude-opus-5-5"
             && service.uses_official_anthropic();
         if openai_fast || anthropic_fast {
             self.service_tier_capabilities
@@ -445,10 +460,7 @@ pub fn parse_external_models(raw: &str) -> Result<Vec<ModelSpec>, String> {
 
     let mut parsed = Vec::new();
     for (index, value) in specs.into_iter().enumerate() {
-        match serde_json::from_value::<ExternalModelSpec>(value)
-            .map_err(|_| format!("model at index {index} has invalid shape"))
-            .and_then(|spec| external_model_spec_from_config(index, spec))
-        {
+        match parse_external_model_entry(index, value) {
             Ok(spec) => parsed.push(spec),
             Err(error) => {
                 tracing::warn!(error = %error, "ignoring invalid PHOENIX_LLM_MODELS entry");
@@ -456,6 +468,18 @@ pub fn parse_external_models(raw: &str) -> Result<Vec<ModelSpec>, String> {
         }
     }
     Ok(parsed)
+}
+
+fn parse_external_model_entry(index: usize, value: serde_json::Value) -> Result<ModelSpec, String> {
+    let model_id = value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<missing id>")
+        .to_owned();
+    let spec = serde_json::from_value::<ExternalModelSpec>(value).map_err(|error| {
+        format!("model '{model_id}' at index {index} has invalid shape: {error}")
+    })?;
+    external_model_spec_from_config(index, spec)
 }
 
 fn validate_external_effort_capabilities(
@@ -535,54 +559,21 @@ fn external_model_spec_from_config(
         Some(value) => value.trim().to_string(),
         None => backend.default_family().to_string(),
     };
-    if let Some(max_output_tokens) = spec.max_output_tokens {
-        if max_output_tokens == 0
-            || usize::try_from(max_output_tokens).unwrap_or(usize::MAX) >= spec.context_window
-        {
-            return Err(format!(
-                "model '{id}' has invalid max_output_tokens {max_output_tokens} for context_window {}",
-                spec.context_window
-            ));
-        }
-    }
-    let effective_output_limit = spec.max_output_tokens.unwrap_or(
-        u32::try_from(
-            spec.context_window
-                .saturating_sub(EXTERNAL_MODEL_DEFAULT_OUTPUT_RESERVE)
-                .max(1),
-        )
-        .unwrap_or(u32::MAX)
-        .min(DEFAULT_MAX_OUTPUT_TOKENS),
-    );
-    if spec
-        .effort_capabilities
-        .as_ref()
-        .is_some_and(|capabilities| {
-            matches!(capabilities, ExternalEffortCapabilities::Supported { levels, .. }
-            if levels.iter().any(|level| level.needs_extended_output_headroom()))
-        })
-        && effective_output_limit < 64_000
+    // REQ-LLM-004f: the declared output maximum is the one resolved request
+    // budget; there is no Phoenix-internal fallback to invent one for a model
+    // that omits it, so a missing or invalid declaration is rejected here
+    // rather than silently defaulted.
+    if spec.max_output_tokens == 0
+        || usize::try_from(spec.max_output_tokens).unwrap_or(usize::MAX) >= spec.context_window
     {
         return Err(format!(
-            "model '{id}' declares xhigh/max effort but max_output_tokens is below 64000"
-        ));
-    }
-    if spec
-        .effort_capabilities
-        .as_ref()
-        .is_some_and(|capabilities| {
-            matches!(capabilities, ExternalEffortCapabilities::Supported { levels, .. }
-            if levels.iter().any(|level| level.needs_extended_output_headroom()))
-        })
-        && spec.context_window <= 64_000 + 4_096
-    {
-        return Err(format!(
-            "model '{id}' declares xhigh/max effort but context_window must exceed 68096"
+            "model '{id}' has invalid max_output_tokens {} for context_window {}",
+            spec.max_output_tokens, spec.context_window
         ));
     }
     Ok(ModelSpec {
         id,
-        api_name,
+        default_request_name: api_name.into(),
         backend,
         family,
         description,
@@ -629,12 +620,12 @@ pub fn all_models() -> Vec<ModelSpec> {
         // older models). See migration 009 for legacy `-1m` id rewrite.
         ModelSpec {
             id: "claude-opus-5-5".into(),
-            api_name: "claude-opus-5-5".into(),
+            default_request_name: "claude-opus-5-5".into(),
             backend: ModelBackend::Anthropic,
             family: "Anthropic".into(),
             description: "Claude Opus 5.5 (most capable, adaptive thinking)".into(),
             context_window: 1_000_000,
-            max_output_tokens: Some(128_000),
+            max_output_tokens: 128_000,
             recommended: true,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
@@ -646,12 +637,13 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "claude-opus-4-8".into(),
-            api_name: "claude-opus-4-8".into(),
+            default_request_name: "claude-opus-4-8".into(),
             backend: ModelBackend::Anthropic,
             family: "Anthropic".into(),
             description: "Claude Opus 4.8 (most capable, slower)".into(),
             context_window: 1_000_000,
-            max_output_tokens: None,
+            // Anthropic Messages API documented output ceiling for current-generation models.
+            max_output_tokens: 128_000,
             recommended: true,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
@@ -660,12 +652,13 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "claude-opus-4-7".into(),
-            api_name: "claude-opus-4-7".into(),
+            default_request_name: "claude-opus-4-7".into(),
             backend: ModelBackend::Anthropic,
             family: "Anthropic".into(),
             description: "Claude Opus 4.7 (legacy)".into(),
             context_window: 1_000_000,
-            max_output_tokens: None,
+            // Anthropic Messages API documented output ceiling for this legacy generation.
+            max_output_tokens: 128_000,
             recommended: false,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
@@ -674,12 +667,13 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "claude-opus-4-6".into(),
-            api_name: "claude-opus-4-6".into(),
+            default_request_name: "claude-opus-4-6".into(),
             backend: ModelBackend::Anthropic,
             family: "Anthropic".into(),
             description: "Claude Opus 4.6 (legacy)".into(),
             context_window: 1_000_000,
-            max_output_tokens: None,
+            // Anthropic Messages API documented output ceiling for this legacy generation.
+            max_output_tokens: 128_000,
             recommended: false,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
@@ -688,12 +682,12 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "claude-sonnet-5-5".into(),
-            api_name: "claude-sonnet-5-5".into(),
+            default_request_name: "claude-sonnet-5-5".into(),
             backend: ModelBackend::Anthropic,
             family: "Anthropic".into(),
             description: "Claude Sonnet 5.5 (balanced performance, adaptive thinking)".into(),
             context_window: 1_000_000,
-            max_output_tokens: Some(128_000),
+            max_output_tokens: 128_000,
             recommended: true,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
@@ -702,12 +696,13 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "claude-sonnet-5".into(),
-            api_name: "claude-sonnet-5".into(),
+            default_request_name: "claude-sonnet-5".into(),
             backend: ModelBackend::Anthropic,
             family: "Anthropic".into(),
             description: "Claude Sonnet 5 (balanced performance)".into(),
             context_window: 1_000_000,
-            max_output_tokens: None,
+            // Anthropic Messages API documented output ceiling for current-generation models.
+            max_output_tokens: 128_000,
             recommended: true,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
@@ -716,12 +711,13 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "claude-sonnet-4-6".into(),
-            api_name: "claude-sonnet-4-6".into(),
+            default_request_name: "claude-sonnet-4-6".into(),
             backend: ModelBackend::Anthropic,
             family: "Anthropic".into(),
             description: "Claude Sonnet 4.6 (legacy)".into(),
             context_window: 1_000_000,
-            max_output_tokens: None,
+            // Anthropic Messages API documented output ceiling for this legacy generation.
+            max_output_tokens: 128_000,
             recommended: false,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
@@ -730,12 +726,13 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "claude-haiku-4-5".into(),
-            api_name: "claude-haiku-4-5-20251001".into(),
+            default_request_name: "claude-haiku-4-5-20251001".into(),
             backend: ModelBackend::Anthropic,
             family: "Anthropic".into(),
             description: "Claude Haiku 4.5 (fast, efficient)".into(),
             context_window: 200_000,
-            max_output_tokens: None,
+            // Anthropic Messages API documented output ceiling for the Haiku line.
+            max_output_tokens: 64_000,
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -750,12 +747,12 @@ pub fn all_models() -> Vec<ModelSpec> {
         // only for direct/provider-compatible routes.
         ModelSpec {
             id: "gpt-6-astra".into(),
-            api_name: "gpt-6-astra".into(),
+            default_request_name: "gpt-6-astra".into(),
             backend: ModelBackend::OpenAIResponses,
             family: "OpenAI".into(),
             description: "GPT-6 Astra (most capable)".into(),
             context_window: 1_050_000,
-            max_output_tokens: Some(128_000),
+            max_output_tokens: 128_000,
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -764,12 +761,12 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "gpt-6.1-sol".into(),
-            api_name: "gpt-6.1-sol".into(),
+            default_request_name: "gpt-6.1-sol".into(),
             backend: ModelBackend::OpenAIResponses,
             family: "OpenAI".into(),
             description: "GPT-6.1 Sol (balanced speed and intelligence, 1.05M context)".into(),
             context_window: 1_050_000,
-            max_output_tokens: Some(128_000),
+            max_output_tokens: 128_000,
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -781,12 +778,12 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "gpt-6-sol".into(),
-            api_name: "gpt-6-sol".into(),
+            default_request_name: "gpt-6-sol".into(),
             backend: ModelBackend::OpenAIResponses,
             family: "OpenAI".into(),
             description: "GPT-6 Sol (workhorse, 1.05M context)".into(),
             context_window: 1_050_000,
-            max_output_tokens: Some(128_000),
+            max_output_tokens: 128_000,
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -795,12 +792,12 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "gpt-6-luna".into(),
-            api_name: "gpt-6-luna".into(),
+            default_request_name: "gpt-6-luna".into(),
             backend: ModelBackend::OpenAIResponses,
             family: "OpenAI".into(),
             description: "GPT-6 Luna (fast, affordable, 1.05M context)".into(),
             context_window: 1_050_000,
-            max_output_tokens: Some(128_000),
+            max_output_tokens: 128_000,
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -809,12 +806,13 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "gpt-5.6-sol".into(),
-            api_name: "gpt-5.6-sol".into(),
+            default_request_name: "gpt-5.6-sol".into(),
             backend: ModelBackend::OpenAIResponses,
             family: "OpenAI".into(),
             description: "GPT-5.6 Sol (frontier, 1M context)".into(),
             context_window: 1_000_000,
-            max_output_tokens: None,
+            // OpenAI Responses API documented output ceiling across the current catalog.
+            max_output_tokens: 128_000,
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -823,12 +821,13 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "gpt-5.6-luna".into(),
-            api_name: "gpt-5.6-luna".into(),
+            default_request_name: "gpt-5.6-luna".into(),
             backend: ModelBackend::OpenAIResponses,
             family: "OpenAI".into(),
             description: "GPT-5.6 Luna (frontier, 1M context)".into(),
             context_window: 1_000_000,
-            max_output_tokens: None,
+            // OpenAI Responses API documented output ceiling across the current catalog.
+            max_output_tokens: 128_000,
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -837,12 +836,13 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "gpt-5.6-terra".into(),
-            api_name: "gpt-5.6-terra".into(),
+            default_request_name: "gpt-5.6-terra".into(),
             backend: ModelBackend::OpenAIResponses,
             family: "OpenAI".into(),
             description: "GPT-5.6 Terra (frontier, 1M context)".into(),
             context_window: 1_000_000,
-            max_output_tokens: None,
+            // OpenAI Responses API documented output ceiling across the current catalog.
+            max_output_tokens: 128_000,
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -852,12 +852,13 @@ pub fn all_models() -> Vec<ModelSpec> {
         // Mock model for frontend development without API keys
         ModelSpec {
             id: "mock".into(),
-            api_name: "mock".into(),
+            default_request_name: "mock".into(),
             backend: ModelBackend::Mock,
             family: "Mock".into(),
             description: "Mock (lorem ipsum for UI dev)".into(),
             context_window: 200_000,
-            max_output_tokens: None,
+            // Not a real provider ceiling; generous synthetic value for UI dev.
+            max_output_tokens: 128_000,
             recommended: false,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -872,16 +873,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn catalog_output_maxima_are_explicit_and_fit_context() {
+        for model in all_models() {
+            let expected = if model.id == "claude-haiku-4-5" {
+                64_000
+            } else {
+                128_000
+            };
+            assert_eq!(model.output_token_limit(), expected, "{}", model.id);
+            assert!(usize::try_from(expected).unwrap() < model.context_window);
+        }
+    }
+
+    #[test]
+    fn external_glm_declares_its_full_output_budget_without_effort_metadata() {
+        let models = parse_external_models(r#"[{"id":"glm-5-3","backend":"openai_chat_completions","description":"GLM","context_window":1048576,"max_output_tokens":131072,"recommended":true,"supports_tool_search":false}]"#).unwrap();
+        assert_eq!(models[0].output_token_limit(), 131_072);
+        assert_eq!(models[0].effort_capabilities, EffortCapabilities::Unknown);
+    }
+
+    #[test]
     fn parses_external_model_with_api_name_defaulting_to_id() {
         let models = parse_external_models(
-            r#"[{"id":"baseten/moonshotai/Kimi-K2.6","backend":"anthropic","description":"Baseten Kimi K2.6 open-weight POC","context_window":262000,"recommended":false,"supports_tool_search":false}]"#,
+            r#"[{"id":"baseten/moonshotai/Kimi-K2.6","backend":"anthropic","description":"Baseten Kimi K2.6 open-weight POC","context_window":262000,"max_output_tokens":32768,"recommended":false,"supports_tool_search":false}]"#,
         )
         .expect("external model config should parse");
 
         assert_eq!(models.len(), 1);
         let model = &models[0];
         assert_eq!(model.id, "baseten/moonshotai/Kimi-K2.6");
-        assert_eq!(model.api_name, model.id);
+        assert_eq!(model.default_request_name.as_str(), model.id);
         assert_eq!(model.backend, ModelBackend::Anthropic);
         assert_eq!(model.backend.api_format(), ApiFormat::Anthropic);
         assert_eq!(model.context_window, 262_000);
@@ -891,7 +912,7 @@ mod tests {
     #[test]
     fn parses_documented_openai_external_names() {
         let models = parse_external_models(
-            r#"[{"id":"openai-compatible/model","backend":"openai_responses","description":"OpenAI-compatible POC","context_window":128000,"recommended":false,"supports_tool_search":false}]"#,
+            r#"[{"id":"openai-compatible/model","backend":"openai_responses","description":"OpenAI-compatible POC","context_window":128000,"max_output_tokens":32768,"recommended":false,"supports_tool_search":false}]"#,
         )
         .expect("documented OpenAI config values should parse");
 
@@ -910,9 +931,9 @@ mod tests {
         };
 
         let opus_55 = by_id("claude-opus-5-5");
-        assert_eq!(opus_55.api_name, "claude-opus-5-5");
+        assert_eq!(opus_55.default_request_name.as_str(), "claude-opus-5-5");
         assert_eq!(opus_55.context_window, 1_000_000);
-        assert_eq!(opus_55.output_token_limit(), Some(128_000));
+        assert_eq!(opus_55.output_token_limit(), 128_000);
         assert_eq!(opus_55.effort_capabilities, effort_anthropic_opus_55());
         assert!(opus_55.recommended);
         assert_eq!(
@@ -921,9 +942,9 @@ mod tests {
         );
 
         let sonnet_55 = by_id("claude-sonnet-5-5");
-        assert_eq!(sonnet_55.api_name, "claude-sonnet-5-5");
+        assert_eq!(sonnet_55.default_request_name.as_str(), "claude-sonnet-5-5");
         assert_eq!(sonnet_55.context_window, 1_000_000);
-        assert_eq!(sonnet_55.output_token_limit(), Some(128_000));
+        assert_eq!(sonnet_55.output_token_limit(), 128_000);
         assert_eq!(sonnet_55.effort_capabilities, effort_anthropic_xhigh());
         assert!(sonnet_55.recommended);
         assert_eq!(
@@ -948,7 +969,7 @@ mod tests {
             effort_gpt_6_astra()
         );
         assert_eq!(by_id("gpt-6-astra").context_window, 1_050_000);
-        assert_eq!(by_id("gpt-6-astra").output_token_limit(), Some(128_000));
+        assert_eq!(by_id("gpt-6-astra").output_token_limit(), 128_000);
         assert!(by_id("gpt-6-astra")
             .effort_capabilities
             .supports(ModelEffort::Max));
@@ -958,7 +979,7 @@ mod tests {
         for id in ["gpt-6-sol", "gpt-6-luna"] {
             let model = by_id(id);
             assert_eq!(model.context_window, 1_050_000);
-            assert_eq!(model.output_token_limit(), Some(128_000));
+            assert_eq!(model.output_token_limit(), 128_000);
             assert_eq!(model.effort_capabilities, effort_gpt_6_sol_luna_direct());
             assert!(model.effort_capabilities.supports(ModelEffort::None));
             assert_eq!(
@@ -1001,9 +1022,9 @@ mod tests {
             .into_iter()
             .find(|model| model.id == "gpt-6.1-sol")
             .unwrap();
-        assert_eq!(sol_61.api_name, "gpt-6.1-sol");
+        assert_eq!(sol_61.default_request_name.as_str(), "gpt-6.1-sol");
         assert_eq!(sol_61.context_window, 1_050_000);
-        assert_eq!(sol_61.output_token_limit(), Some(128_000));
+        assert_eq!(sol_61.output_token_limit(), 128_000);
         assert_eq!(
             sol_61.effort_capabilities,
             EffortCapabilities::supported_known(EFFORT_LEVELS_GPT_6_ASTRA, ModelEffort::Medium)
@@ -1019,9 +1040,9 @@ mod tests {
     fn external_effort_metadata_distinguishes_unknown_unsupported_and_supported() {
         let models = parse_external_models(
             r#"[
-                {"id":"absent","backend":"openai_responses","description":"Absent metadata","context_window":128000,"recommended":false,"supports_tool_search":false},
-                {"id":"unsupported","backend":"anthropic","description":"Unsupported","context_window":128000,"recommended":false,"supports_tool_search":false,"effort_capabilities":{"support":"unsupported"}},
-                {"id":"known-levels","backend":"openai_responses","description":"Known levels","context_window":128000,"recommended":false,"supports_tool_search":false,"effort_capabilities":{"support":"supported","levels":["low","high"]}}
+                {"id":"absent","backend":"openai_responses","description":"Absent metadata","context_window":128000,"max_output_tokens":32000,"recommended":false,"supports_tool_search":false},
+                {"id":"unsupported","backend":"anthropic","description":"Unsupported","context_window":128000,"max_output_tokens":32000,"recommended":false,"supports_tool_search":false,"effort_capabilities":{"support":"unsupported"}},
+                {"id":"known-levels","backend":"openai_responses","description":"Known levels","context_window":128000,"max_output_tokens":32000,"recommended":false,"supports_tool_search":false,"effort_capabilities":{"support":"supported","levels":["low","high"]}}
             ]"#,
         )
         .expect("external models parse");
@@ -1038,7 +1059,10 @@ mod tests {
     }
 
     #[test]
-    fn extended_external_effort_requires_output_capacity() {
+    fn external_model_output_tokens_must_be_below_context_window() {
+        // REQ-LLM-004f: there is no xhigh/max-specific output-capacity policy
+        // any more; the only remaining rule is the general sanity check that
+        // the declared output maximum fits under the context window.
         let models = parse_external_models(
             r#"[{"id":"small","backend":"openai_responses","description":"Small","context_window":50000,"max_output_tokens":50000,"recommended":false,"supports_tool_search":false,"effort_capabilities":{"support":"supported","levels":["xhigh"]}}]"#,
         )
@@ -1053,9 +1077,37 @@ mod tests {
     }
 
     #[test]
+    fn missing_output_limit_diagnostic_names_the_model_and_field() {
+        let error = parse_external_model_entry(
+            3,
+            serde_json::json!({
+                "id": "legacy-glm", "backend": "openai_chat_completions",
+                "description": "Legacy entry", "context_window": 1_048_576,
+                "recommended": false, "supports_tool_search": false,
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("legacy-glm"), "{error}");
+        assert!(error.contains("max_output_tokens"), "{error}");
+        assert!(error.contains("missing field"), "{error}");
+    }
+
+    #[test]
+    fn external_model_missing_max_output_tokens_is_rejected() {
+        // REQ-LLM-004f: Phoenix never invents a fallback output budget, so an
+        // external model config that omits the declared maximum is rejected
+        // at registration rather than silently defaulted.
+        let models = parse_external_models(
+            r#"[{"id":"no-output-cap","backend":"openai_responses","description":"Missing cap","context_window":128000,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .expect("top-level external model array parses");
+        assert!(models.is_empty());
+    }
+
+    #[test]
     fn anthropic_external_models_reject_non_native_effort_levels() {
         let models = parse_external_models(
-            r#"[{"id":"bad-anthropic","backend":"anthropic","description":"Bad","context_window":128000,"recommended":false,"supports_tool_search":false,"effort_capabilities":{"support":"supported","levels":["none","high"]}}]"#,
+            r#"[{"id":"bad-anthropic","backend":"anthropic","description":"Bad","context_window":128000,"max_output_tokens":32768,"recommended":false,"supports_tool_search":false,"effort_capabilities":{"support":"supported","levels":["none","high"]}}]"#,
         )
         .expect("top-level external model array parses");
         assert!(models.is_empty());
@@ -1064,7 +1116,7 @@ mod tests {
     #[test]
     fn external_native_default_must_be_supported() {
         let models = parse_external_models(
-            r#"[{"id":"bad","backend":"openai_responses","description":"Bad metadata","context_window":128000,"recommended":false,"supports_tool_search":false,"effort_capabilities":{"support":"supported","levels":["low"],"native_default":"high"}}]"#,
+            r#"[{"id":"bad","backend":"openai_responses","description":"Bad metadata","context_window":128000,"max_output_tokens":32768,"recommended":false,"supports_tool_search":false,"effort_capabilities":{"support":"supported","levels":["low"],"native_default":"high"}}]"#,
         )
         .expect("top-level external model array parses");
 
@@ -1082,14 +1134,17 @@ mod tests {
         assert_eq!(model.backend, ModelBackend::OpenAIChatCompletions);
         assert_eq!(model.backend.api_format(), ApiFormat::OpenAIChatCompletions);
         assert_eq!(model.family, "Example AI");
-        assert_eq!(model.provider_header_value(), "provider");
-        assert_eq!(model.output_token_limit(), Some(8_192));
+        assert_eq!(
+            model.default_request_name.as_str(),
+            "provider/example/chat-model"
+        );
+        assert_eq!(model.output_token_limit(), 8_192);
     }
 
     #[test]
     fn rejects_empty_family_and_output_cap_outside_context_window() {
         for raw in [
-            r#"[{"id":"bad-family","backend":"openai_chat_completions","family":" ","description":"Bad","context_window":128000,"recommended":false,"supports_tool_search":false}]"#,
+            r#"[{"id":"bad-family","backend":"openai_chat_completions","family":" ","description":"Bad","context_window":128000,"max_output_tokens":32768,"recommended":false,"supports_tool_search":false}]"#,
             r#"[{"id":"bad-output","backend":"openai_chat_completions","description":"Bad","context_window":8192,"max_output_tokens":8192,"recommended":false,"supports_tool_search":false}]"#,
         ] {
             assert!(parse_external_models(raw).unwrap().is_empty());
@@ -1099,7 +1154,7 @@ mod tests {
     #[test]
     fn skips_unknown_external_backend_entry() {
         let models = parse_external_models(
-            r#"[{"id":"bad-openai","backend":"not-a-backend","description":"Bad backend","context_window":128000,"recommended":false,"supports_tool_search":false}]"#,
+            r#"[{"id":"bad-openai","backend":"not-a-backend","description":"Bad backend","context_window":128000,"max_output_tokens":32768,"recommended":false,"supports_tool_search":false}]"#,
         )
         .expect("array syntax should parse even when an entry is invalid");
 
@@ -1127,7 +1182,7 @@ mod tests {
     #[test]
     fn duplicate_external_ids_do_not_override_builtins() {
         let external = parse_external_models(
-            r#"[{"id":"claude-sonnet-4-6","api_name":"other-wire-name","backend":"anthropic","description":"Override attempt","context_window":123,"recommended":false,"supports_tool_search":false}]"#,
+            r#"[{"id":"claude-sonnet-4-6","api_name":"other-wire-name","backend":"anthropic","description":"Override attempt","context_window":123,"max_output_tokens":64,"recommended":false,"supports_tool_search":false}]"#,
         )
         .unwrap();
 
@@ -1137,7 +1192,7 @@ mod tests {
             .find(|spec| spec.id == "claude-sonnet-4-6")
             .unwrap();
 
-        assert_ne!(sonnet.api_name, "other-wire-name");
+        assert_ne!(sonnet.default_request_name.as_str(), "other-wire-name");
         assert_ne!(sonnet.context_window, 123);
     }
 }

@@ -1,3 +1,4 @@
+import { bashLaunchOutcomes, bashLaunchReleaseUnknown } from '../../testFixtures/bashLaunchOutcomes';
 import { describe, expect, it } from 'vitest';
 import type { ContentBlock, ConversationState, Message } from '../../api';
 import type { QueuedMessage } from '../../hooks/useMessageQueue';
@@ -19,6 +20,7 @@ import {
 
 function userMsg(id: string, text = 'hi', files?: Array<{ original_name: string }>): Message {
   return {
+    event_presentation: null,
     message_id: id,
     sequence_id: 1,
     conversation_id: 'c1',
@@ -30,6 +32,7 @@ function userMsg(id: string, text = 'hi', files?: Array<{ original_name: string 
 
 function agentMsg(id: string, blocks: ContentBlock[] = []): Message {
   return {
+    event_presentation: null,
     message_id: id,
     sequence_id: 2,
     conversation_id: 'c1',
@@ -41,6 +44,7 @@ function agentMsg(id: string, blocks: ContentBlock[] = []): Message {
 
 function toolMsg(id: string, tool_use_id: string, content: Partial<Message['content']> & { content?: string; result?: string; error?: string }): Message {
   return {
+    event_presentation: null,
     message_id: id,
     sequence_id: 3,
     conversation_id: 'c1',
@@ -52,6 +56,7 @@ function toolMsg(id: string, tool_use_id: string, content: Partial<Message['cont
 
 function systemMsg(id: string, text: string): Message {
   return {
+    event_presentation: null,
     message_id: id,
     sequence_id: 4,
     conversation_id: 'c1',
@@ -63,6 +68,7 @@ function systemMsg(id: string, text: string): Message {
 
 function skillMsg(id: string, text: string): Message {
   return {
+    event_presentation: null,
     message_id: id,
     sequence_id: 5,
     conversation_id: 'c1',
@@ -95,7 +101,7 @@ describe('buildAgentTextFragments', () => {
   });
 
   it('excludes image alt text that is not rendered as visible Markdown text', () => {
-    const blocks = buildMarkdownDisplayBlocks('Visible ![hidden alt](image.png) text');
+    const blocks = buildMarkdownDisplayBlocks('Visible ![hidden alt](image.png) text', 'standard');
     expect(blocks[0]?.searchableText).toBe('Visible  text');
   });
 });
@@ -237,8 +243,15 @@ describe('buildDiffSearchProjection', () => {
 });
 
 describe('typed semantic display projections', () => {
+  it('indexes launch-release-unknown handle and retry warning', () => {
+    const projection = buildTerminalToolResultProjection('bash', JSON.stringify(bashLaunchReleaseUnknown), undefined);
+    expect(projection.fullText).toContain('handle: bash-handle-42');
+    expect(projection.fullText).toContain('Do not automatically retry');
+    expect(projection.fullText).not.toContain('{');
+  });
+
   it('parses Markdown into stable visible-text blocks without source punctuation', () => {
-    const blocks = buildMarkdownDisplayBlocks('# **Plan**\n\nUse `alpha` and ![diagram text](diagram.png).\n\n```ts\nconst beta = 1;\n```');
+    const blocks = buildMarkdownDisplayBlocks('# **Plan**\n\nUse `alpha` and ![diagram text](diagram.png).\n\n```ts\nconst beta = 1;\n```', 'standard');
     expect(blocks.map((block) => block.searchableText)).toEqual(expect.arrayContaining([
       'Plan',
       'Use alpha and .',
@@ -1035,6 +1048,7 @@ describe('buildConversationSearchProjection', () => {
       kind: 'user',
       key: 'u1',
       message: {
+        event_presentation: null,
         message_id: 'u1',
         sequence_id: 1,
         conversation_id: 'c1',
@@ -1121,4 +1135,31 @@ describe('buildConversationSearchProjection', () => {
     ]);
     expect(unitTargets.every((target) => target.unitKind !== 'streaming_agent')).toBe(true);
   });
+});
+
+describe('explicit disclosure projection modes', () => {
+  const source = '<details><summary>**Summary**</summary>\n\nBody **target**\n\n</details>';
+  it('indexes conversation summary and body but not wrapper syntax', () => {
+    const blocks = buildMarkdownDisplayBlocks(source, 'conversation');
+    expect(blocks.map(block => block.searchableText)).toEqual(['Summary', 'Body target']);
+    expect(blocks[0]?.kind).toBe('disclosureSummary');
+  });
+  it('does not promise conversation summaries in standard file projections', () => {
+    const blocks = buildMarkdownDisplayBlocks(source, 'standard');
+    expect(blocks.map(block => block.searchableText)).toEqual(['Body target']);
+    expect(buildMarkdownFileSearchProjection(source, 'Summary').matches).toHaveLength(0);
+  });
+});
+
+it.each(bashLaunchOutcomes)('indexes visible uncertainty for $status / $launch_error', (response) => {
+  const projection = buildTerminalToolResultProjection('bash', JSON.stringify(response), undefined);
+  expect(projection.fullText).toContain('no handle');
+  expect(projection.fullText).toContain('No controllable handle; descendants unverified.');
+  expect(projection.fullText).toContain('Output capture incomplete.');
+  expect(projection.fullText).toContain('retained-tail');
+  if (response.status === 'outcome_unknown') {
+    expect(projection.fullText).toContain('Do not automatically retry.');
+    expect(projection.fullText).not.toContain('exit code');
+    expect(projection.fullText).not.toContain('signal 9');
+  }
 });

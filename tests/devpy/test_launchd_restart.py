@@ -560,7 +560,12 @@ class RestartCommandTests(unittest.TestCase):
             deploy_dir = root / "deploy"
             deploy_dir.mkdir()
             deploy_status = deploy_dir / "status.json"
-            deploy_status.write_text('{"state":"committed","source_kind":"published_release"}\n')
+            terminal_deploy_status = (
+                '{"transaction_id":"prior","state":"committed",'
+                '"source_kind":"published_release","finalization_pending":false,'
+                '"rollback_failure":null}\n'
+            )
+            deploy_status.write_text(terminal_deploy_status)
             identity = self.dev.RuntimeIdentity("2.0.0", "a" * 40)
             commands = []
 
@@ -611,10 +616,7 @@ class RestartCommandTests(unittest.TestCase):
                 manifest["shutdown_timeout_secs"],
             )
             self.assertNotIn("installed-secret", json.dumps(manifest))
-            self.assertEqual(
-                '{"state":"committed","source_kind":"published_release"}\n',
-                deploy_status.read_text(),
-            )
+            self.assertEqual(terminal_deploy_status, deploy_status.read_text())
             flattened = [part for command in commands for part in command]
             self.assertNotIn("codesign", flattened)
             self.assertNotIn("bootout", flattened)

@@ -21,7 +21,10 @@
 //!   doesn't require swapping the `Arc<HandleState>` (which would
 //!   invalidate readers' ring snapshots).
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::SystemTime;
 
 use phoenix_core::process_identity::{current_process_identity, ProcessIdentity};
@@ -215,6 +218,7 @@ pub struct Handle {
     /// The current handle state. Always written through
     /// [`Self::transition_to_terminal`].
     state: RwLock<Arc<HandleState>>,
+    lifecycle_epoch: std::sync::Mutex<Option<Arc<AtomicU64>>>,
     /// Kill-attempt bookkeeping for `kill_pending_kernel` semantics.
     /// Separate from `LiveData` so recording an attempt does not require
     /// swapping the `Arc<HandleState>` (and therefore does not invalidate
@@ -454,6 +458,7 @@ impl Handle {
             working_dir,
             started_at: SystemTime::now(),
             state: RwLock::new(Arc::new(HandleState::Live(live))),
+            lifecycle_epoch: std::sync::Mutex::new(None),
             kill_attempt: RwLock::new(None),
             exit_signal: tx,
             exit_observer: rx,
@@ -466,6 +471,20 @@ impl Handle {
                 .unwrap_or(ProcessIdentity { pid, start_time: 0 }),
             launch_uuid: format!("synthetic-{}", uuid::Uuid::new_v4()),
         }
+    }
+
+    pub(crate) fn bind_lifecycle_epoch(&self, epoch: &Arc<AtomicU64>) {
+        *self
+            .lifecycle_epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(epoch.clone());
+    }
+
+    pub(crate) fn clear_lifecycle_epoch(&self) {
+        *self
+            .lifecycle_epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     /// Snapshot the current state. Cloning the `Arc` is cheap; callers
@@ -603,6 +622,14 @@ impl Handle {
                     kill_attempted_at,
                 };
                 *guard = Arc::new(HandleState::Tombstoned(tomb));
+                if let Some(epoch) = self
+                    .lifecycle_epoch
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                {
+                    epoch.fetch_add(1, Ordering::SeqCst);
+                }
                 true
             }
         }

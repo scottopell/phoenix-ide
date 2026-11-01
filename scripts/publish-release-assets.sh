@@ -131,23 +131,12 @@ release_metadata_by_id() {
   gh api "repos/$repo/releases/$release_id"
 }
 
-current_release_metadata() {
-  local metadata status
-  if metadata=$(published_release_metadata); then
-    printf '%s\n' "$metadata"
-    return 0
-  else
-    status=$?
-    [[ $status -eq 4 ]] || return "$status"
-  fi
-  draft_release_metadata
-}
-
 verify_release_assets() {
-  local expected_draft=$1
+  local release_id=$1
+  local expected_draft=$2
   local metadata="$work/release-$expected_draft.json"
-  current_release_metadata >"$metadata"
-  "$PYTHON3" - "$expected_digests" "$metadata" "$expected_draft" "$expected_prerelease" <<'PY'
+  release_metadata_by_id "$release_id" >"$metadata"
+  "$PYTHON3" - "$expected_digests" "$metadata" "$expected_draft" "$expected_prerelease" "$tag" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -157,6 +146,8 @@ for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
     name, digest = line.split("\t", 1)
     expected[name] = f"sha256:{digest}"
 release = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+if release.get("tag_name") != sys.argv[5]:
+    raise SystemExit("error: release no longer targets the exact tag")
 expected_draft = sys.argv[3] == "true"
 if bool(release.get("draft")) != expected_draft:
     raise SystemExit("error: release visibility does not match the required state")
@@ -261,7 +252,8 @@ upload_asset_to_draft() {
 
 verify_tag
 if metadata=$(published_release_metadata); then
-  verify_release_assets false
+  release_id=$(jq -er '.id' <<<"$metadata")
+  verify_release_assets "$release_id" false
   verify_tag
   verify_public_rc_is_not_latest
   echo "release $tag is already published with the exact asset set"
@@ -284,15 +276,14 @@ else
 fi
 if [[ -z "$metadata" ]]; then
   verify_tag
-  gh api --method POST "repos/$repo/releases" \
+  metadata=$(gh api --method POST "repos/$repo/releases" \
     -f tag_name="$tag" \
     -f name="$tag" \
     -f target_commitish="$expected_commit" \
     -F draft=true \
     -F prerelease="$expected_prerelease" \
     -f make_latest="$make_latest" \
-    -F generate_release_notes=true >/dev/null
-  metadata=$(draft_release_metadata)
+    -F generate_release_notes=true)
 fi
 
 release_id=$(jq -er '.id' <<<"$metadata")
@@ -325,6 +316,6 @@ assert_private_release "$metadata_file"
 assert_stable_is_newest_before_publication
 gh api --method PATCH "repos/$repo/releases/$release_id" \
   "${publication_args[@]}" >/dev/null
-verify_release_assets false
+verify_release_assets "$release_id" false
 verify_tag
 verify_latest_relationship

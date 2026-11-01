@@ -95,6 +95,17 @@ enum ContentKind {
 -- can be a transient per-window throttle (retry in seconds) or a quota
 -- window exhausted on a calendar boundary (retry next week). Collapsing
 -- them either wastes retries or misclassifies recovery.
+--
+-- output_tokens_exhausted and context_window_exceeded are deliberately
+-- distinct: the first is the model stopping because it hit the request's
+-- output-token budget (Chat finish_reason=length, Responses
+-- incomplete/max_output_tokens, Anthropic stop_reason=max_tokens); the
+-- second is the input plus reserved output not fitting the context
+-- window. They have different recovery (raise the budget / lower effort /
+-- different model vs. shorten input). output_tokens_exhausted is also
+-- distinct from invalid_response: a budget-limited stop is a well-formed
+-- provider response, not a transport/provider fault, so it is NOT
+-- auto-retried with an unchanged request.
 enum LlmErrorKind {
     network
     | timed_out
@@ -108,6 +119,7 @@ enum LlmErrorKind {
     | invalid_response
     | content_filter
     | context_window_exceeded
+    | output_tokens_exhausted
 }
 
 ------------------------------------------------------------
@@ -181,12 +193,19 @@ value ToolDeclaration {
 -- `cache_key` is the caller-chosen prompt-cache cohort
 -- id (PromptCacheKey) — mandatory on the typed request; consumed by the
 -- Responses API as `prompt_cache_key`, ignored by Anthropic.
+--
+-- `max_tokens` is the concrete output budget (REQ-LLM-004f). Ordinary and
+-- continuation agent turns default to the declared model maximum; bounded
+-- utility requests carry their smaller explicit contract limit.
+-- Every internal request carries a concrete budget. Native Codex omits the
+-- output-limit field only at wire translation; its internal reservation remains
+-- concrete.
 value LlmRequest {
     system: List<SystemContent>
     messages: List<LlmMessage>
     tool_availability: ToolAvailability
     tool_count: tool_availability.declarations.count
-    max_tokens: Integer?
+    max_tokens: Integer
     effective_effort: EffectiveEffort
     cache_key: String
 }
@@ -275,7 +294,10 @@ entity LlmError {
     -- auto-retryable, but is resumable after credentials are fixed.
     -- usage_limit_reached is never auto-retried, but its quota window resets
     -- on a clock boundary, so the user can resume once the window clears.
-    user_resumable: kind = auth or kind = network or kind = timed_out or kind = rate_limit or kind = server_error or kind = invalid_response or kind = server_overloaded or kind = usage_limit_reached or kind = prompt_rejected or kind = invalid_request
+    -- output_tokens_exhausted is never auto-retried (an unchanged request
+    -- would exhaust again), but the user can resume with a revised message
+    -- or settings that free output room.
+    user_resumable: kind = auth or kind = network or kind = timed_out or kind = rate_limit or kind = server_error or kind = invalid_response or kind = server_overloaded or kind = usage_limit_reached or kind = prompt_rejected or kind = invalid_request or kind = output_tokens_exhausted
 }
 
 ------------------------------------------------------------
@@ -583,7 +605,7 @@ invariant OverloadRetryablePartition {
 
 invariant UserResumablePartition {
     for e in LlmErrors:
-        e.user_resumable = (e.kind = auth or e.kind = network or e.kind = timed_out or e.kind = rate_limit or e.kind = server_error or e.kind = invalid_response or e.kind = server_overloaded or e.kind = usage_limit_reached or e.kind = prompt_rejected or e.kind = invalid_request)
+        e.user_resumable = (e.kind = auth or e.kind = network or e.kind = timed_out or e.kind = rate_limit or e.kind = server_error or e.kind = invalid_response or e.kind = server_overloaded or e.kind = usage_limit_reached or e.kind = prompt_rejected or e.kind = invalid_request or e.kind = output_tokens_exhausted)
 }
 
 -- Token accounting is non-negative. Each count is an unsigned quantity

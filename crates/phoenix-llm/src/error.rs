@@ -107,6 +107,14 @@ impl LlmError {
     pub fn context_window_exceeded(message: impl Into<String>) -> Self {
         Self::new(LlmErrorKind::ContextWindowExceeded, message)
     }
+
+    /// The model stopped at the request's output-token budget (Chat
+    /// `finish_reason=length`, Responses `incomplete/max_output_tokens`,
+    /// Anthropic `stop_reason=max_tokens`). Terminal for auto-retry,
+    /// user-resumable.
+    pub fn output_tokens_exhausted(message: impl Into<String>) -> Self {
+        Self::new(LlmErrorKind::OutputTokensExhausted, message)
+    }
 }
 
 // LlmErrorKind / LlmAttemptReason are co-owned by the llm layer (producer),

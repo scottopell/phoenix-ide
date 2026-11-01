@@ -23,11 +23,12 @@ The recommended remote-host workflow uses both:
 1. Keep one Phoenix private CA on the machine where you issue certs.
 2. Trust that CA once on each browser machine.
 3. Issue a per-host leaf certificate bundle for each Phoenix host.
-4. Copy only the leaf bundle to the remote host.
+4. Copy the leaf bundle and public CA certificate to the remote host.
 5. Install the bundle on the remote host, which configures manual TLS.
 
 The CA private key should not be copied to remote Phoenix hosts. A remote host
-only needs its own server certificate and server private key.
+needs its own server certificate and private key plus the public CA certificate
+that callers import as peer-scoped federation trust.
 
 ## Trust Model
 
@@ -157,10 +158,11 @@ The bundle contains:
 ```text
 server.pem
 server-key.pem
+ca.pem
 phoenix-tls.json
 ```
 
-It does not contain `phoenix-local-ca-key.pem`.
+It includes only the public CA certificate and does not contain `phoenix-local-ca-key.pem`.
 
 Copy the bundle to the remote host:
 
@@ -266,6 +268,7 @@ will need to reissue with the new name.
 | `PHOENIX_TLS_DIR` | Directory for the managed CA and auto-issued leaf cert. Defaults to the parent of `PHOENIX_DB_PATH` plus `/tls`; with the usual paths this is `~/.phoenix-ide/tls`. |
 | `PHOENIX_TLS_CERT_PATH` | Manual server certificate PEM path. If both cert and key paths are set, Phoenix uses manual TLS even if `PHOENIX_TLS` is unset. |
 | `PHOENIX_TLS_KEY_PATH` | Manual server private key PEM path. Required with `PHOENIX_TLS_CERT_PATH`. |
+| `PHOENIX_TLS_CA_CERT_PATH` | Optional public issuer-CA PEM for manual TLS. Federation enrollment exports this peer-scoped trust anchor; Phoenix never installs it into an OS trust store. |
 | `PHOENIX_PUBLIC_URL` | Display URL used by `./dev.py prod deploy` and `./dev.py prod status`. The Rust server does not read it. |
 | `VITE_API_SCHEME` | Dev-only Vite proxy scheme. `./dev.py up --https` sets this to `https`. |
 | `VITE_API_PROXY_SECURE` | Dev-only Vite proxy certificate verification toggle. `./dev.py up --https` sets this to `false` for the local private CA. |

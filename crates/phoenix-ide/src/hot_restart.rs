@@ -249,11 +249,20 @@ pub async fn shutdown_signal() {
     let mut sigterm = signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("Failed to install SIGINT handler");
 
-    let received = tokio::select! {
-        _ = sighup.recv() => ShutdownSignal::Hangup,
-        _ = sigterm.recv() => ShutdownSignal::Terminate,
-        _ = sigint.recv() => ShutdownSignal::Interrupt,
+    let signals = async {
+        tokio::select! {
+            _ = sighup.recv() => ShutdownSignal::Hangup,
+            _ = sigterm.recv() => ShutdownSignal::Terminate,
+            _ = sigint.recv() => ShutdownSignal::Interrupt,
+        }
     };
+    #[cfg(test)]
+    let received = tokio::select! {
+        () = crate::opening_qualifier::shutdown_requested() => return,
+        received = signals => received,
+    };
+    #[cfg(not(test))]
+    let received = signals.await;
 
     handle_shutdown_signal(received, activation());
 }

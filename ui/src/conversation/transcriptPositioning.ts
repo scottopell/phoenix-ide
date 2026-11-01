@@ -6,6 +6,11 @@ export type TranscriptPositioningInput =
 
 export type TranscriptPositioningFinishResult = 'applied' | 'target_missing' | 'superseded';
 
+export type TranscriptPositioningCompletion = {
+  commandKey: string;
+  result: TranscriptPositioningFinishResult;
+};
+
 export type TranscriptVisibleRange = {
   startIndex: number;
   endIndex: number;
@@ -95,6 +100,10 @@ export function transcriptPositioningCommandKey(command: HistoryScrollCommand): 
     command.view.transcriptGeneration,
     command.kind === 'jump_to_message' ? command.targetMessageId : command.messageId,
   ].join(':');
+}
+
+export function transcriptPositioningInputCommandKey(input: TranscriptPositioningInput): string | null {
+  return input.kind === 'positioning' ? transcriptPositioningCommandKey(input.command) : null;
 }
 
 export function sameHistoryView(left: HistoryView, right: HistoryView): boolean {

@@ -5,8 +5,8 @@
 -- Includes: Skill entity, discovery walk-up, slash invocation, LLM tool invocation,
 --           frontmatter stripping, argument substitution, system prompt catalog
 -- Excludes: Frontend autocomplete (see inline-references.allium)
---           context-mode: fork (open question below)
---           REQ-SK-002 delivery convergence (open question below)
+--           context-mode: fork (unsupported)
+-- Delivery: user slash instructions use user role; LLM invocation uses tool result.
 
 ------------------------------------------------------------
 -- External Entities
@@ -390,7 +390,18 @@ rule StripFrontmatter {
 rule InjectSkillCatalog {
     when: SystemPromptBuilt(working_dir, audience)
 
-    let catalog = collect_skills(working_dir, audience: audience)
+    let catalog = advertised_catalog(working_dir, audience: audience)
+    -- advertised_catalog: metadata-only catalog selected for prompt construction.
+    -- Ordinary audience: executor-local first-dispatch snapshot for the accepted
+    -- turn, reused across model/tool calls, retries and mid-turn steering. New
+    -- input turns (including automatic goal continuation and idle queued starts)
+    -- refresh it after input and turn state persist (including ordinary input,
+    -- approval feedback and question answers). Rejections, failed persistence
+    -- and stale authoritative replays retain it. A reconstructed
+    -- executor discovers afresh, not from a persisted snapshot. REQ-SK-009.
+    -- Coordinator audience: separate authenticated embedded catalog, REQ-SK-008.
+    -- Invocation rules above still use current collect_skills and current bodies;
+    -- same-name shadowing follows current precedence and reports its base_dir.
 
     requires: catalog.count > 0
 
@@ -410,7 +421,7 @@ rule InjectSkillCatalog {
     @guidance
         -- Full skill bodies are NOT included — the catalog is a lightweight index.
         -- argument_hint is omitted from the catalog (it is for UI autocomplete only).
-        -- Implementation: build_system_prompt_with_home() in src/system_prompt.rs.
+        -- Implementation: OrdinarySkillCatalog and build_system_prompt_with_catalog.
 }
 
 ------------------------------------------------------------

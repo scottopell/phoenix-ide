@@ -1,3 +1,4 @@
+import { bashLaunchOutcomes, bashLaunchReleaseUnknown } from '../testFixtures/bashLaunchOutcomes';
 import { describe, expect, it } from 'vitest';
 import type { Message } from '../api';
 import { deriveToolStripItems } from './agentTurnToolStrip';
@@ -5,6 +6,7 @@ import { isSignificantText, SIGNIFICANCE_THRESHOLD } from '../hooks/useDensity';
 
 function agentMessage(content: unknown): Message {
   return {
+    event_presentation: null,
     message_id: 'm1',
     message_type: 'agent',
     content,
@@ -13,6 +15,7 @@ function agentMessage(content: unknown): Message {
 
 function toolResult(toolUseId: string, opts: { isError?: boolean; content?: string } = {}): Message {
   return {
+    event_presentation: null,
     message_id: `r-${toolUseId}`,
     message_type: 'tool',
     content: {
@@ -24,6 +27,15 @@ function toolResult(toolUseId: string, opts: { isError?: boolean; content?: stri
 }
 
 describe('deriveToolStripItems', () => {
+  it('preserves launch-release-unknown semantics and handle in the compact card', () => {
+    const msg = agentMessage([{ type: 'tool_use', id: 'release-unknown', name: 'bash', input: { cmd: 'side-effecting-command' } }]);
+    const result = toolResult('release-unknown', { isError: true, content: JSON.stringify(bashLaunchReleaseUnknown) });
+    const [item] = deriveToolStripItems(msg, new Map([['release-unknown', result]]));
+    expect(item?.finalStatus).toContain('outcome uncertain');
+    expect(item?.finalStatus).toContain('do not automatically retry');
+    expect(item?.finalStatus).toContain('bash-handle-42');
+  });
+
   it('emits one item per non-think tool_use block, in document order', () => {
     const msg = agentMessage([
       { type: 'text', text: 'hello' },
@@ -205,4 +217,19 @@ describe('isSignificantText', () => {
   it('pins the default threshold at 280 characters', () => {
     expect(SIGNIFICANCE_THRESHOLD).toBe(280);
   });
+});
+
+it.each(bashLaunchOutcomes)('keeps compact launch uncertainty visible for $status / $launch_error', (response) => {
+  const msg = agentMessage([{ type: 'tool_use', id: 'launch', name: 'bash', input: { cmd: response.cmd } }]);
+  const [item] = deriveToolStripItems(msg, new Map([
+    ['launch', toolResult('launch', { content: JSON.stringify(response), isError: response.status === 'outcome_unknown' })],
+  ]));
+  expect(item?.finalStatus).toContain('no handle');
+  expect(item?.finalStatus).toContain('descendants unverified');
+  expect(item?.finalStatus).toContain('output incomplete');
+  expect(item?.outputTail).toBe('retained-tail');
+  if (response.status === 'outcome_unknown') {
+    expect(item?.finalStatus).toContain('do not automatically retry');
+    expect(item?.finalStatus).not.toContain('exit ');
+  }
 });

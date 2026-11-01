@@ -11,10 +11,7 @@ use super::session::{
     Dims, ShellIntegrationStatus, StopReason, TerminalChildKind, TerminalHandle,
     TerminalLaunchIdentity,
 };
-use nix::{
-    pty::openpty,
-    unistd::{close, execve, fork, setsid, ForkResult},
-};
+use nix::unistd::{close, execve, fork, setsid, ForkResult};
 use phoenix_core::process_identity::current_process_identity;
 use std::{
     ffi::CString,
@@ -117,7 +114,7 @@ pub fn spawn_pty(
     let launch_uuid = uuid::Uuid::new_v4().to_string();
 
     // --- PTY creation --------------------------------------------------------
-    let pty = openpty(None, None).map_err(|e| format!("openpty: {e}"))?;
+    let pty = crate::pty::allocate()?;
 
     // Extract raw fds before consuming OwnedFd wrappers.
     let master_raw: RawFd = pty.master.as_raw_fd();
@@ -287,6 +284,7 @@ pub fn spawn_pty(
             Ok(TerminalHandle {
                 master_fd: Mutex::new(Some(master_fd)),
                 child_pid: child,
+                child_lifecycle: crate::child_lifecycle::TerminalChildLifecycle::new(),
                 launch_identity,
                 child_kind,
                 tracker: Arc::new(Mutex::new(CommandTracker::new(session_id))),

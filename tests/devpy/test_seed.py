@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -16,11 +17,35 @@ def load_devpy():
     return module
 
 
+class MigrateSeedDatabaseTest(unittest.TestCase):
+    def test_migrate_only_uses_external_cargo_target_binary_and_environment(self):
+        dev = load_devpy()
+        with tempfile.TemporaryDirectory(prefix="phoenix-seed-target-") as directory:
+            target = Path(directory) / "cargo-target"
+            binary = target / "debug" / "phoenix_ide"
+            binary.parent.mkdir(parents=True)
+            binary.touch()
+            db_path = Path(directory) / "seed.db"
+            with (
+                mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": str(target)}),
+                mock.patch.object(dev, "get_db_path", return_value=db_path),
+                mock.patch.object(dev.subprocess, "run") as run,
+            ):
+                dev._migrate_seed_database(build=False, release=False)
+
+            run.assert_called_once()
+            args, kwargs = run.call_args
+            self.assertEqual([str(binary), "--migrate-only"], args[0])
+            self.assertEqual(str(db_path), kwargs["env"]["PHOENIX_DB_PATH"])
+            self.assertEqual(str(target), kwargs["env"]["CARGO_TARGET_DIR"])
+            self.assertTrue(kwargs["check"])
+
+
 class ModernSeedTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.dev = load_devpy()
-        binary = ROOT / "target" / "debug" / "phoenix_ide"
+        binary = cls.dev._cargo_target_dir(ROOT, os.environ) / "debug" / "phoenix_ide"
         cls.dev.build_rust()
         if not binary.exists():
             raise AssertionError(f"debug phoenix_ide binary was not built: {binary}")

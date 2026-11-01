@@ -420,6 +420,147 @@ pub struct UsageOverview {
     pub conversations: Vec<ConversationUsageRow>,
     pub turn_token_histogram: Vec<HistogramBucket>,
     pub ttft: TtftWindowSummary,
+    pub capacity: CapacityDiagnostics,
+}
+
+/// Bounded recent capacity plans; all aggregates describe this sample only.
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct CapacityDiagnostics {
+    pub sample_limit: u32,
+    pub local_refusals: u32,
+    pub comparable_input_count: u32,
+    pub mean_local_prediction_error_tokens: Option<f64>,
+    pub recent: Vec<CapacityDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct CapacityDiagnostic {
+    pub plan: phoenix_core::domain::request_capacity::RequestCapacityPlan,
+    pub created_at: String,
+    pub retained_input_tokens: u32,
+    pub input_occupancy: Option<f64>,
+    pub count_is_estimated: bool,
+    pub local_prediction_error_tokens: Option<f64>,
+    pub provider_count_error_tokens: Option<f64>,
+    pub attempt_status: CapacityAttemptStatus,
+    pub attempt: Option<CapacityProviderAttempt>,
+    pub usage: Option<CapacityObservedUsage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum CapacityAttemptStatus {
+    NotDispatched,
+    Observed,
+    Unknown,
+}
+
+fn capacity_attempt_status(
+    kind: phoenix_core::domain::request_capacity::RequestPlanKind,
+    outcome: phoenix_core::domain::request_capacity::RequestPlanOutcome,
+    metrics: bool,
+    usage: bool,
+) -> CapacityAttemptStatus {
+    if metrics || usage {
+        CapacityAttemptStatus::Observed
+    } else if kind == phoenix_core::domain::request_capacity::RequestPlanKind::SuccessorProjection
+        || outcome != phoenix_core::domain::request_capacity::RequestPlanOutcome::Ready
+    {
+        CapacityAttemptStatus::NotDispatched
+    } else {
+        CapacityAttemptStatus::Unknown
+    }
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct CapacityProviderAttempt {
+    pub outcome: String,
+    pub provider: String,
+    pub duration_ms: f64,
+    pub ttft_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+#[allow(clippy::struct_field_names)] // token units are part of the public usage contract
+pub struct CapacityObservedUsage {
+    pub input_tokens: Option<f64>,
+    pub output_tokens: Option<f64>,
+    pub cache_write_tokens: Option<f64>,
+    pub cache_read_tokens: Option<f64>,
+}
+
+fn capacity_diagnostics(rows: Vec<phoenix_db::CapacityDiagnosticRow>) -> CapacityDiagnostics {
+    let recent: Vec<_> = rows
+        .into_iter()
+        .map(|row| {
+            let retained_input_tokens = row.plan.retained_input_tokens();
+            let local_prediction_error_tokens = row
+                .actual_input_tokens
+                .map(|actual| f64::from(row.plan.local_prediction_tokens) - actual as f64);
+            let provider_count_error_tokens = row
+                .actual_input_tokens
+                .zip(row.plan.provider_input_tokens)
+                .map(|(actual, predicted)| f64::from(predicted) - actual as f64);
+            let count_is_estimated = row.plan.count_is_estimated();
+            let input_occupancy = (row.plan.context_window_tokens > 0).then(|| {
+                f64::from(retained_input_tokens) / f64::from(row.plan.context_window_tokens)
+            });
+            let attempt_status = capacity_attempt_status(
+                row.plan.kind,
+                row.plan.outcome,
+                row.attempt_outcome.is_some(),
+                row.usage_recorded,
+            );
+            CapacityDiagnostic {
+                attempt_status,
+                plan: row.plan,
+                created_at: row.created_at,
+                retained_input_tokens,
+                input_occupancy,
+                count_is_estimated,
+                local_prediction_error_tokens,
+                provider_count_error_tokens,
+                attempt: row.attempt_outcome.map(|outcome| CapacityProviderAttempt {
+                    outcome,
+                    provider: row.provider.expect("metrics row has provider"),
+                    duration_ms: row.provider_duration_ms.expect("metrics row has duration") as f64,
+                    ttft_ms: row.provider_ttft_ms.map(|v| v as f64),
+                }),
+                usage: row.usage_recorded.then_some(CapacityObservedUsage {
+                    input_tokens: row.actual_input_tokens.map(|v| v as f64),
+                    output_tokens: row.actual_output_tokens.map(|v| v as f64),
+                    cache_write_tokens: row.cache_write_tokens.map(|v| v as f64),
+                    cache_read_tokens: row.cache_read_tokens.map(|v| v as f64),
+                }),
+            }
+        })
+        .collect();
+    let errors: Vec<_> = recent
+        .iter()
+        .filter_map(|row| row.local_prediction_error_tokens)
+        .collect();
+    CapacityDiagnostics {
+        sample_limit: 200,
+        local_refusals: u32::try_from(
+            recent
+                .iter()
+                .filter(|row| {
+                    row.plan.outcome
+                        != phoenix_core::domain::request_capacity::RequestPlanOutcome::Ready
+                })
+                .count(),
+        )
+        .unwrap_or(u32::MAX),
+        comparable_input_count: u32::try_from(errors.len()).unwrap_or(u32::MAX),
+        mean_local_prediction_error_tokens: (!errors.is_empty())
+            .then(|| errors.iter().sum::<f64>() / errors.len() as f64),
+        recent,
+    }
 }
 
 /// One turn in the per-conversation drill-down.
@@ -450,6 +591,7 @@ pub struct ConversationUsageDetail {
     pub root_conversation_id: String,
     pub totals: Totals,
     pub turns: Vec<TurnPoint>,
+    pub capacity: CapacityDiagnostics,
 }
 
 /// Resolve a model id to a provider display name, or `"Unknown"` if the id is
@@ -904,6 +1046,21 @@ pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse 
         .collect();
     by_project.sort_by(|a, b| b.totals.total_tokens.total_cmp(&a.totals.total_tokens));
 
+    let capacity = match state
+        .db
+        .usage_capacity_diagnostics(None, &(Utc::now() - Duration::days(30)).to_rfc3339())
+        .await
+    {
+        Ok(rows) => capacity_diagnostics(rows),
+        Err(error) => {
+            tracing::error!(%error, "failed to load capacity diagnostics");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to load capacity diagnostics",
+            )
+                .into_response();
+        }
+    };
     let overview = UsageOverview {
         generated_at: now.to_rfc3339(),
         windows,
@@ -914,6 +1071,7 @@ pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse 
         conversations,
         turn_token_histogram: build_histogram(&per_turn),
         ttft,
+        capacity,
     };
 
     Json(overview).into_response()
@@ -971,10 +1129,22 @@ pub async fn usage_conversation_detail(
         .collect();
     totals.finish_cost();
 
+    let capacity = match state.db.usage_capacity_diagnostics(Some(&id), "").await {
+        Ok(rows) => capacity_diagnostics(rows),
+        Err(error) => {
+            tracing::error!(%error, "failed to load capacity diagnostics");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to load capacity diagnostics",
+            )
+                .into_response();
+        }
+    };
     Json(ConversationUsageDetail {
         root_conversation_id: id,
         totals,
         turns,
+        capacity,
     })
     .into_response()
 }
@@ -1325,5 +1495,38 @@ mod tests {
             .expect("daily retry row");
         assert_eq!(retry_day.error_count, 1.0);
         assert_eq!(retry_day.sample_count, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod capacity_attempt_status_tests {
+    use super::*;
+    use phoenix_core::domain::request_capacity::{RequestPlanKind as K, RequestPlanOutcome as O};
+    #[test]
+    fn capacity_diagnostics_absent_metrics_does_not_prove_absent_call() {
+        assert_eq!(
+            capacity_attempt_status(K::Ordinary, O::Ready, false, false),
+            CapacityAttemptStatus::Unknown
+        );
+        assert_eq!(
+            capacity_attempt_status(K::Ordinary, O::Ready, false, true),
+            CapacityAttemptStatus::Observed
+        );
+        assert_eq!(
+            capacity_attempt_status(K::Compaction, O::Ready, true, false),
+            CapacityAttemptStatus::Observed
+        );
+        assert_eq!(
+            capacity_attempt_status(K::Ordinary, O::NeedsCompaction, false, false),
+            CapacityAttemptStatus::NotDispatched
+        );
+        assert_eq!(
+            capacity_attempt_status(K::HandoffShortening, O::CapacityConflict, false, false),
+            CapacityAttemptStatus::NotDispatched
+        );
+        assert_eq!(
+            capacity_attempt_status(K::SuccessorProjection, O::Ready, false, false),
+            CapacityAttemptStatus::NotDispatched
+        );
     }
 }

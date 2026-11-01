@@ -1131,7 +1131,7 @@ mod tests {
             seed_parent_id: None,
             seed_label: None,
             continued_in_conv_id,
-            chain_name: None,
+
             llm_language: crate::llm_language::LlmLanguage::default(),
             spawned_from_conversation_id: None,
         }

@@ -1,6 +1,5 @@
-import remarkParse from 'remark-parse';
-import remarkGfm from 'remark-gfm';
-import { unified } from 'unified';
+import { eventCardFragments } from '../ConversationEventCard';
+import { prepareMarkdown, type MarkdownMode } from '../prepareMarkdown';
 
 import type { ContentBlock, Message, ToolResultContent } from '../../api';
 import type { BashToolProgress } from '../../generated/sse';
@@ -341,17 +340,17 @@ export type ConversationSearchProjection = SearchableSourceProjection<
 >;
 
 interface MarkdownNodePosition {
-  start?: { line?: number; offset?: number };
-  end?: { line?: number; offset?: number };
+  start?: { line?: number; offset?: number | undefined };
+  end?: { line?: number; offset?: number | undefined };
 }
 
 interface MarkdownNode {
   type: string;
-  position?: MarkdownNodePosition;
+  position?: MarkdownNodePosition | undefined;
   children?: MarkdownNode[];
-  value?: string;
-  alt?: string;
-  lang?: string;
+  value?: string | undefined;
+  alt?: string | null | undefined;
+  lang?: string | null | undefined;
 }
 
 export interface MarkdownDisplayBlock {
@@ -364,18 +363,25 @@ export interface MarkdownDisplayBlock {
 }
 
 function renderedMarkdownText(node: MarkdownNode): string {
-  if (node.type === 'image' || node.type === 'imageReference') return '';
-  if (typeof node.value === 'string') return node.value;
-  return node.children?.map(renderedMarkdownText).join('') ?? '';
+  const text: string[] = [];
+  const stack = [node];
+  while (stack.length) {
+    const current = stack.pop()!;
+    if (current.type === 'image' || current.type === 'imageReference') continue;
+    if (typeof current.value === 'string') text.push(current.value);
+    else if (current.children) for (let i = current.children.length - 1; i >= 0; i--) stack.push(current.children[i]!);
+  }
+  return text.join('');
 }
 
-export function buildMarkdownDisplayBlocks(markdown: string): readonly MarkdownDisplayBlock[] {
-  const processor = unified().use(remarkParse).use(remarkGfm);
-  const tree = processor.runSync(processor.parse(markdown)) as MarkdownNode;
+export function buildMarkdownDisplayBlocks(markdown: string, mode: MarkdownMode): readonly MarkdownDisplayBlock[] {
+  const tree: MarkdownNode = prepareMarkdown(markdown, mode);
   const blocks: MarkdownDisplayBlock[] = [];
-  const visit = (node: MarkdownNode, path: readonly number[]) => {
+  const stack: { node: MarkdownNode; path: number[] }[] = [{ node: tree, path: [] }];
+  while (stack.length) {
+    const { node, path } = stack.pop()!;
     if (node.type !== 'root' && node.position?.start?.line && node.position.start.offset !== undefined && node.position.end?.offset !== undefined) {
-      const isDisplayBlock = ['paragraph', 'heading', 'tableCell', 'code'].includes(node.type);
+      const isDisplayBlock = ['paragraph', 'heading', 'tableCell', 'code', 'disclosureSummary'].includes(node.type);
       if (isDisplayBlock) {
         const searchableText = renderedMarkdownText(node);
         if (searchableText) {
@@ -390,9 +396,8 @@ export function buildMarkdownDisplayBlocks(markdown: string): readonly MarkdownD
         }
       }
     }
-    node.children?.forEach((child, index) => visit(child, [...path, index]));
-  };
-  visit(tree, []);
+    if (node.children) for (let i = node.children.length - 1; i >= 0; i--) stack.push({ node: node.children[i]!, path: [...path, i] });
+  }
   return blocks;
 }
 
@@ -413,7 +418,7 @@ export interface BlockSearchSource extends SearchableSource<BlockSearchMatchTarg
 export type BlockSearchProjection = SearchableSourceProjection<BlockSearchMatchTarget, BlockSearchSource>;
 
 export function buildMarkdownFileSearchProjection(content: string, query: string): FileSearchProjection {
-  const sources: FileSearchSource[] = buildMarkdownDisplayBlocks(content)
+  const sources: FileSearchSource[] = buildMarkdownDisplayBlocks(content, 'standard')
     .filter((block) => block.kind !== 'code')
     .map((block) => ({
     id: `markdown:${block.id}`,
@@ -696,6 +701,13 @@ export function buildConversationSearchProjection(
   units.forEach((unit, unitIndex) => {
     switch (unit.kind) {
       case 'user':
+        if (unit.message.origin?.kind === 'subscription_event') {
+          const fragments = eventCardFragments(unit.message.event_presentation, unit.message.origin.event_id);
+          for (const [name, text] of Object.entries(fragments)) {
+            const fragmentId = `event-${name}`;
+            addConversationSource(sources, unitIndex, unit.kind, unit.key, fragmentId, text, fragmentId, { kind: 'message-text', fragmentId });
+          }
+        }
         addConversationMessageSources(sources, unitIndex, unit.kind, unit.key, 'user-message', userMessageParts(unit.message));
         break;
       case 'pending_user':
@@ -1235,12 +1247,13 @@ function semanticStructuredResultText(resultText: string, family: 'bash' | 'tmux
     const parsed = JSON.parse(resultText);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return resultText;
     const record = parsed as Record<string, unknown>;
-    if (typeof record['error'] === 'string') {
+    if (typeof record['error'] === 'string' && !(family === 'bash' && record['status'] === 'outcome_unknown')) {
       const messageKey = family === 'bash' ? 'error_message' : 'message';
       return [
         `error: ${record['error']}`,
         typeof record[messageKey] === 'string' ? record[messageKey] : '',
         family === 'bash' && typeof record['hint'] === 'string' ? record['hint'] : '',
+        family === 'bash' && typeof record['handle'] === 'string' ? `handle: ${record['handle']}` : '',
       ].filter(Boolean).join('\n');
     }
 
@@ -1254,13 +1267,21 @@ function semanticStructuredResultText(resultText: string, family: 'bash' | 'tmux
           : status === 'tombstoned' && typeof record['final_cause'] === 'string'
             ? `tombstoned · ${record['final_cause']}`
             : status;
-      if (statusLabel) visible.push(statusLabel);
+      const unregisteredLabel = status === 'unregistered_exited' ? 'exited · no handle'
+        : status === 'unregistered_killed' ? 'signaled · no handle'
+          : status === 'outcome_unknown' ? 'outcome unknown · no handle' : statusLabel;
+      if (unregisteredLabel) visible.push(unregisteredLabel);
+      if (typeof record['launch_error'] === 'string') {
+        visible.push('No controllable handle; descendants unverified.');
+        if (record['output_complete'] === false) visible.push('Output capture incomplete.');
+      }
+      if (typeof record['error_message'] === 'string') visible.push(record['error_message']);
       if (typeof record['handle'] === 'string') visible.push(record['handle']);
       if (typeof record['label'] === 'string') visible.push(record['label']);
-      if ((status === 'exited' || status === 'tombstoned') && record['exit_code'] !== null && record['exit_code'] !== undefined) {
+      if ((status === 'exited' || status === 'unregistered_exited' || status === 'tombstoned') && record['exit_code'] !== null && record['exit_code'] !== undefined) {
         visible.push(`exit code ${String(record['exit_code'])}`);
       }
-      if ((status === 'killed' || status === 'tombstoned') && typeof record['signal_number'] === 'number') {
+      if ((status === 'killed' || status === 'unregistered_killed' || status === 'tombstoned') && typeof record['signal_number'] === 'number') {
         visible.push(`signal ${String(record['signal_number'])}`);
       }
       if (typeof record['kill_signal_sent'] === 'string') visible.push(`kill: ${record['kill_signal_sent']}`);
@@ -1583,7 +1604,7 @@ export function buildAgentTextFragments(
     if (block.type !== 'text') return;
     const sourceText = block.text ?? '';
     const markdownBlocks = options.forSearch
-      ? buildMarkdownDisplayBlocks(sourceText).filter((markdownBlock) => markdownBlock.kind !== 'code' || markdownBlock.language === 'mermaid')
+      ? buildMarkdownDisplayBlocks(sourceText, 'conversation').filter((markdownBlock) => markdownBlock.kind !== 'code' || markdownBlock.language === 'mermaid')
       : [];
     const semanticText = options.forSearch
       ? markdownBlocks.map((markdownBlock) => markdownBlock.searchableText).join('\n')

@@ -1260,7 +1260,7 @@ mod tests {
             .await
             .unwrap();
         let before = report_now(&db.sqlite_workload_collector);
-        sqlx::query("INSERT INTO workflows (workflow_id, profile_kind, profile_version, runtime_acceptance_enabled, external_acceptance_enabled, version, generation, status, snapshot_codec_family, snapshot_codec_version, snapshot_payload, created_at, updated_at) VALUES (1,'wake',1,1,0,0,0,'Active','wake',1,X'00',1,1)")
+        sqlx::query("INSERT INTO workflows (workflow_id, profile_kind, profile_version, runtime_acceptance_enabled, external_acceptance_enabled, version, generation, status, snapshot_codec_family, snapshot_codec_version, snapshot_payload, created_at, updated_at) VALUES (1,'direct_turn',1,0,1,0,0,'Active','direct_turn',1,X'00',1,1)")
             .execute(&mut *connection)
             .await
             .unwrap();

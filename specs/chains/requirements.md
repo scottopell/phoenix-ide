@@ -192,6 +192,11 @@ rather than as a separate chain-specific naming action or lifecycle
 THE SYSTEM SHALL apply the chosen title consistently anywhere this one
 product conversation is named
 
+THE SYSTEM SHALL use the canonical root transcript title as that single name authority
+AND SHALL derive the current readable route from it under
+`specs/conversation-identity/requirements.md` REQ-CID-001–006
+AND SHALL expose naming only through the ProductConversation's ordinary manual-title and generated-name operations. Legacy chain-name mutation routes are not a supported naming interface.
+
 **Rationale:** The user names a conversation, not a second chain object.
 A separate chain-name affordance would duplicate the ordinary
 conversation title concept and risk divergence.
@@ -296,8 +301,7 @@ scope for that work.
 - **Separate chain page, route, or sidebar container.** The conversation
   page is the surface; dedicated chain navigation is explicitly not part
   of the product model.
-- **Separate chain rename or regenerate-name flow.** ProductConversation title
-  behavior is sufficient.
+- **Legacy chain-name mutation compatibility.** ProductConversation title and generated-name operations are the supported naming interfaces; legacy chain-name mutation routes are not part of the contract.
 - **Separate chain archive or delete lifecycle.** Ordinary conversation
   lifecycle rules apply; there is no second chain lifecycle.
 - **Follow-up Q&A with prior-answer model context.** Recall questions are

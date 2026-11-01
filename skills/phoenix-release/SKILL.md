@@ -65,12 +65,16 @@ bash scripts/verify-published-release.sh scottopell/phoenix-ide vX.Y.Z stable \
   phoenix_ide-aarch64-unknown-linux-musl-debug \
   phoenix_ide-x86_64-apple-darwin \
   phoenix_ide-aarch64-apple-darwin \
+  phoenix-browser-x86_64-unknown-linux-musl \
+  phoenix-browser-aarch64-unknown-linux-musl \
+  phoenix-browser-x86_64-apple-darwin \
+  phoenix-browser-aarch64-apple-darwin \
   Phoenix-macos-x86_64-apple-darwin-vX.Y.Z.zip \
   Phoenix-macos-aarch64-apple-darwin-vX.Y.Z.zip
 gh release view vX.Y.Z --json url -q .url
 ```
 
-The verifier downloads by captured asset IDs and checks the exact nine-name set, `SHA256SUMS`, downloaded bytes, GitHub-reported digests, stable-release classification, and tag identity. Expect status `success` and nine assets: primary binaries for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `aarch64-unknown-linux-musl`, and `x86_64-unknown-linux-musl`; symbol-rich `-debug` variants for both Linux targets; architecture-specific `Phoenix.app` ZIPs for Apple Silicon and Intel; and `SHA256SUMS` covering all eight payload assets. The release body at this point is GitHub's auto-generated "What's Changed" list — keep it as a fallback but replace it in the next step.
+The verifier downloads by captured asset IDs and checks the exact thirteen-name set, `SHA256SUMS`, downloaded bytes, GitHub-reported digests, stable-release classification, and tag identity. Expect status `success` and thirteen assets: server and browser CLI binaries for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `aarch64-unknown-linux-musl`, and `x86_64-unknown-linux-musl`; symbol-rich server `-debug` variants for both Linux targets; architecture-specific `Phoenix.app` ZIPs for Apple Silicon and Intel; and `SHA256SUMS` covering all twelve payload assets. Historical tagged sources without the browser CLI retain the original eight payloads and manifest; omit browser names when verifying those tags. The release body at this point is GitHub's auto-generated "What's Changed" list — keep it as a fallback but replace it in the next step.
 
 For an explicitly authorized RC, substitute the exact `vX.Y.Z-rc.N` tag and `rc` channel. Verify GitHub reports `prerelease=true` and `isLatest=false`; artifact names include the full RC tag. RCs use the same signed, notarized, stapled, Gatekeeper-validated, checksummed path. Final stable promotion is a new version bump and build, never relabeling RC bytes.
 

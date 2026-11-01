@@ -548,13 +548,6 @@ pub struct Conversation {
     /// `#[serde(default)]` handles old DB rows that predate this column.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continued_in_conv_id: Option<String>,
-    /// User-set name for the chain rooted at this conversation
-    /// (REQ-CHN-007). Only meaningful on the root of a chain; ignored at
-    /// read time on non-root members. NULL means "use this conversation's
-    /// title as the displayed chain name." `#[serde(default)]` handles old
-    /// DB rows that predate this column.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chain_name: Option<String>,
     /// LLM-facing prose language fixed at creation (e.g. `phoenix-native`,
     /// `caveman`). Chain continuations and sub-agents inherit it.
     /// `#[serde(default)]` handles old DB rows that predate this column.
@@ -762,6 +755,17 @@ pub enum ErrorKind {
     SubAgentError,
     /// Context window exhausted - not retryable
     ContextExhausted,
+    /// Required input and full output reservation cannot fit; input/model revision required.
+    ContextCapacityConflict,
+    /// Conservative local planning found reducible pressure before provider dispatch.
+    PlannedContextPressure,
+    /// The model stopped at the request's output-token budget (Chat
+    /// `finish_reason=length`, Responses `incomplete/max_output_tokens`,
+    /// Anthropic `stop_reason=max_tokens`). Not auto-retried — an unchanged
+    /// request would exhaust again — but user-resumable: a revised message or
+    /// settings can free output room. Distinct from `ContextExhausted`, which
+    /// is not resumable.
+    OutputTokensExhausted,
     /// Sub-agent exhausted its grace turn without a terminal outcome - not retryable
     TurnLimitExhausted,
     /// Content filter or safety block - not retryable
@@ -790,6 +794,9 @@ impl ErrorKind {
             | Self::Cancelled
             | Self::SubAgentError
             | Self::ContextExhausted
+            | Self::ContextCapacityConflict
+            | Self::PlannedContextPressure
+            | Self::OutputTokensExhausted
             | Self::TurnLimitExhausted
             | Self::ContentFilter => AutoRetryPolicy::NoAutoRetry,
         }
@@ -825,10 +832,15 @@ impl ErrorKind {
             | Self::UsageLimitReached
             | Self::TimedOut
             | Self::InvalidRequest
+            // An output-token-budget stop is terminal for auto-retry but the
+            // user can free output room with a revised message or settings.
+            | Self::OutputTokensExhausted
             | Self::PromptRejected => UserResumePolicy::Resumable,
             Self::Cancelled
             | Self::SubAgentError
             | Self::ContextExhausted
+            | Self::ContextCapacityConflict
+            | Self::PlannedContextPressure
             | Self::TurnLimitExhausted
             | Self::ContentFilter => UserResumePolicy::NotResumable,
         }
@@ -995,6 +1007,109 @@ impl ToolResult {
             ToolOutcome::Success { images, .. } | ToolOutcome::Error { images, .. } => images,
             ToolOutcome::TrustedInstructions { .. } | ToolOutcome::Cancelled { .. } => &[],
         }
+    }
+}
+
+#[must_use]
+pub fn merge_duration_into_display_data(
+    existing: Option<&serde_json::Value>,
+    duration_ms: Option<u64>,
+) -> Option<serde_json::Value> {
+    match (existing, duration_ms) {
+        (None, None) => None,
+        (Some(v), None) => Some(v.clone()),
+        (None, Some(ms)) => Some(serde_json::json!({ "duration_ms": ms })),
+        (Some(v), Some(ms)) => {
+            let mut merged = v.clone();
+            if let Some(obj) = merged.as_object_mut() {
+                obj.insert(
+                    "duration_ms".to_string(),
+                    serde_json::Value::Number(ms.into()),
+                );
+            }
+            Some(merged)
+        }
+    }
+}
+#[must_use]
+pub fn tool_result_message_content(result: &ToolResult) -> MessageContent {
+    MessageContent::Tool(tool_result_transcript_content(result))
+}
+
+/// Project a result for transcript consumers, replacing trusted instructions with a receipt.
+#[must_use]
+pub fn tool_result_transcript_content(result: &ToolResult) -> ToolContent {
+    let persisted_output = match &result.outcome {
+        ToolOutcome::TrustedInstructions { .. } => {
+            "Authenticated built-in skill instructions were delivered for this live request."
+        }
+        ToolOutcome::Success { .. } | ToolOutcome::Error { .. } | ToolOutcome::Cancelled { .. } => {
+            result.output()
+        }
+    };
+    ToolContent {
+        tool_use_id: result.tool_use_id.clone(),
+        content: persisted_output.to_owned(),
+        is_error: result.is_error(),
+        images: result.images().to_vec(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinalizedToolDisposition {
+    Success,
+    TrustedInstructions,
+    Error,
+    Cancelled,
+}
+
+#[derive(Clone, Debug)]
+pub struct FinalizedToolResult {
+    row: Message,
+    disposition: FinalizedToolDisposition,
+}
+
+impl FinalizedToolResult {
+    #[must_use]
+    pub fn new(
+        assistant_message_id: &str,
+        conversation_id: &str,
+        sequence_id: i64,
+        created_at: DateTime<Utc>,
+        result: &ToolResult,
+    ) -> Self {
+        let disposition = match &result.outcome {
+            ToolOutcome::Success { .. } => FinalizedToolDisposition::Success,
+            ToolOutcome::TrustedInstructions { .. } => {
+                FinalizedToolDisposition::TrustedInstructions
+            }
+            ToolOutcome::Error { .. } => FinalizedToolDisposition::Error,
+            ToolOutcome::Cancelled { .. } => FinalizedToolDisposition::Cancelled,
+        };
+        let row = super::tool_round::tool_result_message(
+            assistant_message_id,
+            conversation_id,
+            sequence_id,
+            created_at,
+            tool_result_transcript_content(result),
+            merge_duration_into_display_data(result.display_data(), result.duration_ms),
+        );
+        Self { row, disposition }
+    }
+
+    #[must_use]
+    pub fn row(&self) -> &Message {
+        &self.row
+    }
+
+    #[must_use]
+    pub fn into_message(self) -> Message {
+        self.row
+    }
+
+    #[must_use]
+    pub fn disposition(&self) -> FinalizedToolDisposition {
+        self.disposition
     }
 }
 
@@ -1574,6 +1689,10 @@ pub enum InputOrigin {
         source_call: Option<Box<SourceToolCall>>,
     },
     SystemGenerated,
+    /// Trusted gateway admission; the normalized request retains exact Slack source.
+    SlackGateway {
+        request_id: String,
+    },
     SubscriptionEvent {
         event_id: String,
     },
@@ -1607,6 +1726,7 @@ impl InputOrigin {
             Self::UnknownHistorical
             | Self::UserApi
             | Self::SystemGenerated
+            | Self::SlackGateway { .. }
             | Self::SubscriptionEvent { .. } => None,
         }
     }
@@ -1651,9 +1771,47 @@ impl InputOrigin {
                 None,
             ),
             Self::SystemGenerated => ("system_generated", None, None, None),
+            Self::SlackGateway { .. } => ("slack_gateway", None, None, None),
             Self::SubscriptionEvent { event_id } => {
                 ("subscription_event", None, None, Some(event_id))
             }
+        }
+    }
+
+    #[must_use]
+    pub fn slack_request_id(&self) -> Option<&str> {
+        match self {
+            Self::SlackGateway { request_id } => Some(request_id),
+            Self::UnknownHistorical
+            | Self::UserApi
+            | Self::InternalConversation { .. }
+            | Self::SystemGenerated
+            | Self::SubscriptionEvent { .. } => None,
+        }
+    }
+
+    /// Decode the independently normalized external source column.
+    /// # Errors
+    /// Rejects missing Slack identity or identity on another origin.
+    pub fn from_db_parts_with_slack(
+        kind: &str,
+        product: Option<String>,
+        transcript: Option<String>,
+        event: Option<String>,
+        slack: Option<String>,
+    ) -> Result<Self, String> {
+        match (kind, slack) {
+            ("slack_gateway", Some(request_id))
+                if !request_id.trim().is_empty()
+                    && product.is_none()
+                    && transcript.is_none()
+                    && event.is_none() =>
+            {
+                Ok(Self::SlackGateway { request_id })
+            }
+            ("slack_gateway", _) => Err("invalid Slack input origin".into()),
+            (_, None) => Self::from_db_parts(kind, product, transcript, event),
+            _ => Err("Slack source on non-Slack origin".into()),
         }
     }
 
@@ -2099,9 +2257,10 @@ mod error_kind_tests {
             max_attempts: OVERLOAD_MAX_ATTEMPTS,
         };
         use ErrorKind::{
-            Auth, Cancelled, ContentFilter, ContextExhausted, InvalidRequest, InvalidResponse,
-            Network, PromptRejected, RateLimit, ServerError, ServerOverloaded, SubAgentError,
-            TimedOut, TurnLimitExhausted, UsageLimitReached,
+            Auth, Cancelled, ContentFilter, ContextCapacityConflict, ContextExhausted,
+            InvalidRequest, InvalidResponse, Network, PlannedContextPressure, PromptRejected,
+            RateLimit, ServerError, ServerOverloaded, SubAgentError, TimedOut, TurnLimitExhausted,
+            UsageLimitReached,
         };
 
         let cases = [
@@ -2143,6 +2302,16 @@ mod error_kind_tests {
             ),
             (
                 ContextExhausted,
+                AutoRetryPolicy::NoAutoRetry,
+                UserResumePolicy::NotResumable,
+            ),
+            (
+                ContextCapacityConflict,
+                AutoRetryPolicy::NoAutoRetry,
+                UserResumePolicy::NotResumable,
+            ),
+            (
+                PlannedContextPressure,
                 AutoRetryPolicy::NoAutoRetry,
                 UserResumePolicy::NotResumable,
             ),
@@ -2192,6 +2361,138 @@ mod conversation_serde_tests {
         Utc.with_ymd_and_hms(2026, 4, 23, 12, 0, 0).unwrap()
     }
 
+    #[test]
+    fn finalized_tool_result_preserves_disposition_content_and_metadata() {
+        let images = vec![ToolContentImage {
+            media_type: "image/png".into(),
+            data: "aW1hZ2U=".into(),
+        }];
+        let cases = [
+            (
+                ToolOutcome::Success {
+                    output: "success output".into(),
+                    display_data: Some(serde_json::json!({"detail": "success", "duration_ms": 1})),
+                    images: images.clone(),
+                },
+                FinalizedToolDisposition::Success,
+                "success output",
+                false,
+                images.clone(),
+                serde_json::json!({"detail": "success", "duration_ms": 42}),
+            ),
+            (
+                ToolOutcome::Error {
+                    output: "error output".into(),
+                    display_data: Some(serde_json::json!({"detail": "error"})),
+                    images: images.clone(),
+                },
+                FinalizedToolDisposition::Error,
+                "error output",
+                true,
+                images,
+                serde_json::json!({"detail": "error", "duration_ms": 42}),
+            ),
+            (
+                ToolOutcome::Cancelled {
+                    message: "cancelled by user".into(),
+                },
+                FinalizedToolDisposition::Cancelled,
+                "cancelled by user",
+                false,
+                vec![],
+                serde_json::json!({"duration_ms": 42}),
+            ),
+            (
+                ToolOutcome::TrustedInstructions {
+                    output: "private live instructions: do not persist".into(),
+                },
+                FinalizedToolDisposition::TrustedInstructions,
+                "Authenticated built-in skill instructions were delivered for this live request.",
+                false,
+                vec![],
+                serde_json::json!({"duration_ms": 42}),
+            ),
+        ];
+
+        for (outcome, disposition, content, is_error, images, display_data) in cases {
+            let finalized = FinalizedToolResult::new(
+                "assistant:1",
+                "conversation:2",
+                17,
+                fixture_ts(),
+                &ToolResult {
+                    tool_use_id: "tool:3".into(),
+                    outcome,
+                    duration_ms: Some(42),
+                },
+            );
+            assert_eq!(finalized.disposition(), disposition);
+            let row = finalized.row();
+            assert_eq!(row.message_id, "tool-result:11:assistant:1:tool:3");
+            assert_eq!(row.conversation_id, "conversation:2");
+            assert_eq!(row.sequence_id, 17);
+            assert_eq!(row.created_at, fixture_ts());
+            assert_eq!(row.message_type, MessageType::Tool);
+            assert_eq!(row.origin, InputOrigin::SystemGenerated);
+            assert!(row.usage_data.is_none());
+            assert_eq!(row.display_data, Some(display_data));
+            assert_eq!(
+                row.content,
+                MessageContent::Tool(ToolContent {
+                    tool_use_id: "tool:3".into(),
+                    content: content.into(),
+                    is_error,
+                    images,
+                })
+            );
+            let expected = serde_json::to_value(row).unwrap();
+            assert_eq!(
+                serde_json::to_value(finalized.into_message()).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn finalized_tool_result_preserves_nonobject_display_data_and_optional_duration() {
+        let cases = [
+            (None, None, None),
+            (
+                Some(serde_json::json!({"detail": "kept"})),
+                None,
+                Some(serde_json::json!({"detail": "kept"})),
+            ),
+            (
+                Some(serde_json::json!(["nonobject"])),
+                Some(42),
+                Some(serde_json::json!(["nonobject"])),
+            ),
+            (
+                Some(serde_json::Value::Null),
+                Some(42),
+                Some(serde_json::Value::Null),
+            ),
+        ];
+        for (display_data, duration_ms, expected) in cases {
+            let finalized = FinalizedToolResult::new(
+                "assistant",
+                "conversation",
+                1,
+                fixture_ts(),
+                &ToolResult {
+                    tool_use_id: "tool".into(),
+                    outcome: ToolOutcome::Success {
+                        output: "ok".into(),
+                        display_data,
+                        images: vec![],
+                    },
+                    duration_ms,
+                },
+            );
+            assert_eq!(finalized.row().display_data, expected);
+        }
+    }
+
     fn fixture(continued_in_conv_id: Option<String>) -> Conversation {
         Conversation {
             id: "conv-1".to_string(),
@@ -2223,7 +2524,7 @@ mod conversation_serde_tests {
             seed_parent_id: None,
             seed_label: None,
             continued_in_conv_id,
-            chain_name: None,
+
             llm_language: crate::llm_language::LlmLanguage::default(),
             spawned_from_conversation_id: None,
         }

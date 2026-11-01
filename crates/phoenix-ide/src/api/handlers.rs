@@ -3,14 +3,16 @@
 //!
 //! REQ-API-001 through REQ-API-010
 
+mod exact_reads;
+
 use super::assets::{
     get_index_response, serve_favicon, serve_root_asset, serve_service_worker, serve_static,
     PUBLIC_ROOT_ASSETS,
 };
 use super::chains::{
-    archive_chain_handler, delete_chain_handler, get_chain, regenerate_chain_name, set_chain_name,
-    stream_chain, submit_chain_question,
+    archive_chain_handler, delete_chain_handler, get_chain, stream_chain, submit_chain_question,
 };
+use super::event_presentation::{enrich_messages, EventPresentations};
 use super::git_handlers::{
     create_pr_auto_fix_context, get_active_pr_diff, get_conversation_diff,
     get_conversation_git_status, get_conversation_pr_status, list_git_branches, pin_associated_pr,
@@ -25,7 +27,7 @@ use super::lifecycle_handlers::{
 };
 use super::product_conversations::{
     close_product_conversation, get_product_conversation, list_product_conversation_creations,
-    list_product_conversations, rename_product_conversation,
+    list_product_conversations, regenerate_product_conversation_name, rename_product_conversation,
 };
 use super::sse::{sse_stream, SseInitTrace};
 use super::types::{
@@ -43,9 +45,9 @@ use super::types::{
     ProductConversationRouteResponse, ProjectFileSearchQuery, ProjectSkillsQuery,
     ProjectTasksQuery, ReadFileResponse, RecentManagementRootSuggestion,
     RecentManagementRootSuggestionsResponse, ReconcileAcceptedMessagesRequest,
-    ReconcileAcceptedMessagesResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse,
-    SuggestRequest, SuggestResponse, SystemPromptResponse, TaskCountQuery, TaskCountResponse,
-    TaskEntry, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
+    ReconcileAcceptedMessagesResponse, SkillEntry, SkillsResponse, SuccessResponse, SuggestRequest,
+    SuggestResponse, SystemPromptResponse, TaskCountQuery, TaskCountResponse, TaskEntry,
+    TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
@@ -106,6 +108,7 @@ async fn trajectory_export_handler(
 /// stdout/file access log keeps them.
 const STREAMING_ROUTES: &[&str] = &[
     "/api/conversations/:id/stream",
+    "/api/conversation-reads/stream",
     "/api/chains/:rootId/stream",
     "/api/product-conversations/events",
     "/api/share/:token/events",
@@ -113,6 +116,8 @@ const STREAMING_ROUTES: &[&str] = &[
     "/api/terminal/global",
     "/api/conversations/:id/browser-view",
 ];
+
+const MAX_REMOTE_QUERY_REQUEST_BODY_BYTES: usize = 100 * 1024;
 
 /// Create the API router
 pub fn create_router(state: AppState) -> Router {
@@ -130,6 +135,8 @@ pub fn create_router(state: AppState) -> Router {
     let router = router
         // Static assets (embedded or filesystem fallback)
         .merge(crate::api::product_conversations::automatic_continuation_routes())
+        .merge(super::goal_commands::routes())
+        .merge(exact_reads::routes())
         .route("/assets/*path", get(serve_static))
         // Preview: serves files from absolute paths so relative references work
         .route("/preview/*filepath", get(serve_preview_file))
@@ -155,6 +162,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/product-conversations/:reference/title",
             axum::routing::patch(rename_product_conversation),
+        )
+        .route(
+            "/api/product-conversations/:reference/regenerate-name",
+            post(regenerate_product_conversation_name),
         )
         .route(
             "/api/product-conversations/:reference/close",
@@ -207,7 +218,7 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route(
             "/api/product-conversations/creation/:request_id",
-            delete(delete_product_conversation_creation),
+            get(get_product_conversation_creation).delete(delete_product_conversation_creation),
         )
         .route(
             "/api/recent-management-root-suggestions",
@@ -249,6 +260,10 @@ pub fn create_router(state: AppState) -> Router {
         // SSE streaming (REQ-API-005)
         .route("/api/conversations/:id/stream", get(stream_conversation))
         .route(
+            "/api/telemetry/conversation-view",
+            post(super::view_journey::report).layer(axum::extract::DefaultBodyLimit::max(8192)),
+        )
+        .route(
             "/api/telemetry/conversation-open",
             post(report_conversation_open),
         )
@@ -277,11 +292,6 @@ pub fn create_router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
         )
         .route("/api/conversations/:id/cancel", post(cancel_conversation))
-        .route("/api/conversations/:id/wake", get(get_wake_status))
-        .route(
-            "/api/conversations/:id/wake/:contract_id/cancel",
-            post(cancel_wake),
-        )
         // Steering queue management (task 01001)
         .route(
             "/api/conversations/:id/steering-queue/:message_id",
@@ -290,6 +300,14 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/conversations/:id/trigger-continuation",
             post(trigger_continuation),
+        )
+        .route(
+            "/api/conversations/:id/handoff-review",
+            post(review_continuation_handoff),
+        )
+        .route(
+            "/api/conversations/:id/handoff-candidates",
+            get(list_continuation_handoff_candidates),
         )
         // Context continuation worktree transfer (REQ-BED-030)
         .route(
@@ -348,7 +366,6 @@ pub fn create_router(state: AppState) -> Router {
         // unarchive — archive is not reversible.
         .route("/api/conversations/:id/archive", post(archive_conversation))
         .route("/api/conversations/:id/delete", post(delete_conversation))
-        .route("/api/conversations/:id/rename", post(rename_conversation))
         // Token usage (Phase 4)
         .route(
             "/api/conversations/:id/usage",
@@ -377,6 +394,8 @@ pub fn create_router(state: AppState) -> Router {
             "/api/work-scope/:scope_key/inventory",
             get(get_work_scope_inventory),
         )
+        .route("/api/work-scope/:scope_key/load", get(get_work_scope_load))
+        .route("/api/work-scopes/load", get(get_all_work_scope_load))
         .route(
             "/api/work-scope/:scope_key/browser-session",
             delete(stop_work_scope_browser_session),
@@ -400,14 +419,6 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/chains/:rootId", get(get_chain))
         .route("/api/chains/:rootId/qa", post(submit_chain_question))
-        .route(
-            "/api/chains/:rootId/name",
-            axum::routing::patch(set_chain_name),
-        )
-        .route(
-            "/api/chains/:rootId/regenerate-name",
-            post(regenerate_chain_name),
-        )
         .route("/api/chains/:rootId/stream", get(stream_chain))
         .route("/api/chains/:rootId/archive", post(archive_chain_handler))
         .route(
@@ -458,10 +469,6 @@ pub fn create_router(state: AppState) -> Router {
             post(invalidate_credential),
         )
         .route(
-            "/api/conversations/:id/regenerate-name",
-            post(regenerate_conversation_name),
-        )
-        .route(
             "/api/conversations/:id/upgrade-model",
             post(upgrade_conversation_model),
         )
@@ -502,6 +509,22 @@ pub fn create_router(state: AppState) -> Router {
         // Environment info
         .route("/api/env", get(get_env))
         // MCP management
+        .route(
+            "/api/slack-gateway",
+            get(crate::slack_gateway::http::get).put(crate::slack_gateway::http::put),
+        )
+        .route(
+            "/api/slack-gateway/requests/:id/source",
+            get(crate::slack_gateway::http::source),
+        )
+        .route(
+            "/api/slack-gateway/capabilities",
+            get(crate::slack_gateway::http::capabilities),
+        )
+        .route(
+            "/api/slack-gateway/inspect",
+            post(crate::slack_gateway::http::inspect),
+        )
         .route("/api/mcp/status", get(mcp_status))
         .route("/api/mcp/reload", post(reload_mcp))
         .route("/api/mcp/servers/:name/disable", post(disable_mcp_server))
@@ -524,6 +547,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/version", get(get_version_json))
         // About this deployment diagnostics
         .route("/api/deployment", get(super::deployment::deployment_info))
+        .route("/api/deployment/retrieval", get(retrieval_status))
         .route(
             "/api/about/resources",
             get(super::deployment::about_resources),
@@ -571,6 +595,10 @@ pub fn create_router(state: AppState) -> Router {
             post(super::federation::issue_enrollment),
         )
         .route(
+            "/api/federation/peers/import",
+            post(super::federation::import_peer_connection),
+        )
+        .route(
             "/api/federation/enrollments/:caller_instance_id/revoke",
             post(super::federation::revoke_enrollment),
         )
@@ -583,6 +611,14 @@ pub fn create_router(state: AppState) -> Router {
             get(super::codex_login::login_preflight),
         )
         .route("/api/codex/quota", get(super::codex_login::codex_quota))
+        .route(
+            "/api/codex/rate-limit-resets",
+            get(super::codex_login::codex_rate_limit_resets),
+        )
+        .route(
+            "/api/codex/rate-limit-resets/consume",
+            post(super::codex_login::codex_rate_limit_reset_consume),
+        )
         .route(
             "/api/codex/login/pkce/start",
             post(super::codex_login::pkce_start),
@@ -639,9 +675,30 @@ pub fn create_router(state: AppState) -> Router {
     // Register every SPA client route to serve the index.html shell, from the
     // single source of truth. These must be added before the auth layer below
     // so the middleware (which exempts them via the same SPA_ROUTES) wraps them.
+    let peer_router = Router::new()
+        .route(
+            "/api/federation/peer/query-database",
+            post(super::federation::query_database)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/api/federation/peer/read-conversation",
+            post(super::federation::read_conversation)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/api/federation/peer/resolve-reference",
+            post(super::federation::resolve_reference)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            super::auth::peer_auth_middleware,
+        ));
+
     let router = super::spa_routes::SPA_ROUTES
         .iter()
-        .fold(router, |router, route| {
+        .fold(router.merge(peer_router), |router, route| {
             router.route(route.pattern(), get(serve_spa))
         });
 
@@ -1039,7 +1096,7 @@ async fn resolve_coordinator_route(
         }
     };
     Ok(Json(CoordinatorRouteResponse {
-        coordinator_id: matched.then_some(coordinator_id),
+        coordinator_id: matched.then_some(root_id),
     }))
 }
 
@@ -1296,6 +1353,32 @@ fn clamp_conversation_search_limit(limit: Option<usize>) -> usize {
         .clamp(1, MAX_CONVERSATION_SEARCH_LIMIT)
 }
 
+async fn retrieval_status(
+    State(state): State<AppState>,
+) -> Json<phoenix_db::retrieval::ReconciliationStatus> {
+    Json(state.message_retriever.reconciliation_status())
+}
+
+fn require_retrieval_ready(
+    status: phoenix_db::retrieval::ReconciliationStatus,
+) -> Result<(), AppError> {
+    if let Some(message) = status.unavailable_message() {
+        let error_type = if matches!(
+            status,
+            phoenix_db::retrieval::ReconciliationStatus::Failed { .. }
+        ) {
+            "conversation_search_failed"
+        } else {
+            "conversation_search_warming"
+        };
+        return Err(AppError::TypedBadRequest {
+            message: message.to_string(),
+            error_type: error_type.to_string(),
+        });
+    }
+    Ok(())
+}
+
 async fn search_conversations(
     State(state): State<AppState>,
     Query(query): Query<ConversationSearchQuery>,
@@ -1304,14 +1387,7 @@ async fn search_conversations(
     if q.is_empty() {
         return Ok(Json(ConversationSearchResponse { hits: Vec::new() }));
     }
-    if !state.message_retriever.index_reconciled() {
-        return Err(AppError::TypedBadRequest {
-            message:
-                "the global message index is still warming; try again after startup reconciliation completes"
-                    .to_string(),
-            error_type: "conversation_search_warming".to_string(),
-        });
-    }
+    require_retrieval_ready(state.message_retriever.reconciliation_status())?;
     let limit = clamp_conversation_search_limit(query.limit);
     let hits = state
         .message_retriever
@@ -2021,6 +2097,137 @@ async fn retry_product_conversation_delivery(
     Ok(Json(serde_json::json!({ "accepted": true })))
 }
 
+async fn get_product_conversation_creation(
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+) -> Result<Json<super::types::ProductConversationCreationStatusResponse>, AppError> {
+    let read = state
+        .db
+        .read_public_product_creation_status(&request_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .ok_or_else(|| AppError::NotFound("product creation request not found".to_string()))?;
+    let job = read.job;
+    let route = match read.publication {
+        Some(crate::db::ProductCreationPublicationRead::Historical { conversation_id }) => {
+            return Ok(Json(
+                super::types::ProductConversationCreationStatusResponse::HistoricalPublished {
+                    request_id: job.request_id,
+                    product_conversation_id: job.product_conversation_id.to_string(),
+                    transcript_row_id: conversation_id,
+                },
+            ));
+        }
+        Some(crate::db::ProductCreationPublicationRead::Available { aggregate, .. })
+            if job.status == "published" =>
+        {
+            Some(super::product_conversations::canonical_route(&aggregate))
+        }
+        _ => None,
+    };
+    let delivery_retryable = if job.status == "delivery_failed" {
+        state
+            .db
+            .product_creation_delivery_retryable(&request_id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?
+    } else {
+        false
+    };
+    product_creation_status_response(job, delivery_retryable, route).map(Json)
+}
+
+pub(crate) fn product_creation_status_response(
+    job: crate::db::ProductCreationJobRecord,
+    delivery_retryable: bool,
+    canonical_route: Option<String>,
+) -> Result<super::types::ProductConversationCreationStatusResponse, AppError> {
+    use super::types::{
+        ProductConversationCreationFailureStatus as Failure,
+        ProductConversationCreationPendingStatus as Pending,
+        ProductConversationCreationStatusResponse as Response,
+    };
+
+    let pending = match job.status.as_str() {
+        "accepted" => Some(Pending::Accepted),
+        "claimed" => Some(Pending::Claimed),
+        "retry_scheduled" => Some(Pending::RetryScheduled),
+        "cancelling" => Some(Pending::Cancelling),
+        "deletion_pending" => Some(Pending::DeletionPending),
+        "delivery_pending" => Some(Pending::DeliveryPending),
+        _ => None,
+    };
+    if let Some(status) = pending {
+        return Ok(Response::Pending {
+            request_id: job.request_id,
+            product_conversation_id: job.product_conversation_id.to_string(),
+            status,
+            provisioning_stage: job.provisioning_stage,
+            stage_updated_at: job.stage_updated_at.to_rfc3339(),
+            retry_at: job
+                .retry_at
+                .or(job.delivery_retry_at)
+                .map(|at| at.to_rfc3339()),
+            allowed_actions: super::product_conversations::creation_allowed_actions(
+                &job.status,
+                delivery_retryable,
+            ),
+        });
+    }
+    if job.status == "published" {
+        let product_id = job.published_product_id.ok_or_else(|| {
+            AppError::Internal("published creation missing product identity".to_string())
+        })?;
+        if product_id != job.product_conversation_id {
+            return Err(AppError::Internal(
+                "published creation product identity mismatch".to_string(),
+            ));
+        }
+        let transcript_row_id = job.published_conversation_id.ok_or_else(|| {
+            AppError::Internal("published creation missing transcript identity".to_string())
+        })?;
+        return Ok(Response::Published {
+            request_id: job.request_id,
+            canonical_route: canonical_route.ok_or_else(|| {
+                AppError::Internal("published creation missing canonical route".to_string())
+            })?,
+            product_conversation_id: product_id.to_string(),
+            transcript_row_id,
+        });
+    }
+    let allowed_actions =
+        super::product_conversations::creation_allowed_actions(&job.status, delivery_retryable);
+    if job.status == "cancelled" {
+        return Ok(Response::Cancelled {
+            request_id: job.request_id,
+            product_conversation_id: job.product_conversation_id.to_string(),
+            provisioning_stage: job.provisioning_stage,
+            stage_updated_at: job.stage_updated_at.to_rfc3339(),
+            error: job.last_error,
+            allowed_actions,
+        });
+    }
+    let status = match job.status.as_str() {
+        "failed" => Failure::Failed,
+        "cleanup_ambiguous" => Failure::CleanupAmbiguous,
+        "delivery_failed" => Failure::DeliveryFailed,
+        other => {
+            return Err(AppError::Internal(format!(
+                "unknown product creation status: {other}"
+            )));
+        }
+    };
+    Ok(Response::Failed {
+        request_id: job.request_id,
+        product_conversation_id: job.product_conversation_id.to_string(),
+        status,
+        provisioning_stage: job.provisioning_stage,
+        stage_updated_at: job.stage_updated_at.to_rfc3339(),
+        error: job.last_error,
+        allowed_actions,
+    })
+}
+
 async fn delete_product_conversation_creation(
     State(state): State<AppState>,
     Path(request_id): Path<String>,
@@ -2043,194 +2250,569 @@ async fn delete_product_conversation_creation(
     Ok(Json(SuccessResponse { success: true }))
 }
 
-fn product_creation_processing_error_type(status: Option<&str>) -> &'static str {
-    match status {
-        Some(
-            "accepted" | "claimed" | "retry_scheduled" | "cancelling" | "deletion_pending"
-            | "delivery_pending",
-        ) => "product_creation_retry_scheduled",
-        _ => "product_creation_failed",
-    }
-}
-
-#[cfg(test)]
-mod product_creation_error_classification_tests {
-    use super::product_creation_processing_error_type;
-
-    #[test]
-    fn auto_advancing_statuses_report_scheduled_recovery() {
-        for status in [
-            "accepted",
-            "claimed",
-            "retry_scheduled",
-            "cancelling",
-            "deletion_pending",
-            "delivery_pending",
-        ] {
-            assert_eq!(
-                product_creation_processing_error_type(Some(status)),
-                "product_creation_retry_scheduled",
-                "status {status}"
-            );
-        }
-    }
-
-    #[test]
-    fn recovery_action_and_terminal_statuses_never_report_scheduled_retry() {
-        for status in [
-            "cancelled",
-            "delivery_failed",
-            "failed",
-            "cleanup_ambiguous",
-            "published",
-        ] {
-            assert_eq!(
-                product_creation_processing_error_type(Some(status)),
-                "product_creation_failed",
-                "status {status}"
-            );
-        }
-        assert_eq!(
-            product_creation_processing_error_type(None),
-            "product_creation_failed"
-        );
-        assert_eq!(
-            product_creation_processing_error_type(Some("unknown")),
-            "product_creation_failed"
-        );
-    }
-}
-
-#[allow(clippy::too_many_lines)]
 async fn create_product_conversation(
     State(state): State<AppState>,
     Json(req): Json<CreateProductConversationRequest>,
-) -> Result<Json<ProductConversationCreateAcceptedResponse>, AppError> {
-    let _owner = state.runtime.acquire_local_authority_pass().map_err(|()| {
-        AppError::Internal("runtime admission closed after fatal local authority loss".to_string())
-    })?;
-    uuid::Uuid::parse_str(&req.request_id)
-        .map_err(|_| AppError::BadRequest("request_id must be a UUID".to_string()))?;
-    let existing_job = state
-        .db
-        .get_product_creation_job(&req.request_id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
-    if req.objective.trim().is_empty() && req.images.is_empty() {
-        return Err(AppError::BadRequest(
-            "Product creation requires objective text or an image".to_string(),
-        ));
-    }
-    if req
-        .images
-        .iter()
-        .any(|image| image.media_type.trim().is_empty() || image.data.trim().is_empty())
-    {
-        return Err(AppError::BadRequest(
-            "Product creation images require a media type and non-empty payload".to_string(),
-        ));
-    }
-    if req.images.len() > 20
-        || req
-            .images
-            .iter()
-            .map(|image| image.data.len())
-            .sum::<usize>()
-            > 35_000_000
-    {
-        return Err(AppError::BadRequest(
-            "Product creation images exceed the request limit".to_string(),
-        ));
-    }
-    if existing_job.is_none() && state.llm_registry.get(&req.model).is_none() {
-        return Err(AppError::BadRequest(format!(
-            "Unknown or unavailable model '{}'",
-            req.model
-        )));
-    }
-    if let Some(effort) = req.effort {
-        if existing_job.is_none() && !state.llm_registry.supports_effort(&req.model, effort) {
-            return Err(AppError::BadRequest(format!(
-                "Model '{}' does not support effort '{effort:?}'",
-                req.model
-            )));
-        }
-    }
-    let canonical_cwd = match existing_job.as_ref() {
-        Some(existing) if req.cwd == existing.intent.cwd => existing.intent.cwd.clone(),
-        _ => crate::conversation_cwd::normalize_product_creation_cwd_intent(
-            &req.cwd,
-            state.runtime_env.home(),
-        )
-        .map_err(|error| AppError::BadRequest(error.to_string()))?,
-    };
-    let selected_llm_language = match existing_job {
-        Some(existing) => existing.intent.llm_language,
-        None => match req.llm_language {
-            Some(language) => language,
-            None => state
-                .runtime
-                .db()
-                .get_default_llm_language()
-                .await
-                .map_err(|error| AppError::Internal(error.to_string()))?,
-        },
-    };
-    let intent = crate::db::ProductCreationIntent {
-        origin: phoenix_db::ProductCreationOrigin::UserApi,
-        cwd: canonical_cwd,
-        objective: req.objective,
-        model: Some(req.model),
-        effort: req.effort,
-        llm_language: selected_llm_language,
-        images: req
-            .images
-            .into_iter()
-            .map(|image| crate::db::ProductCreationImage {
-                media_type: image.media_type,
-                data: image.data,
-            })
-            .collect(),
-    };
-    match state
-        .db
-        .accept_product_creation(&req.request_id, &intent)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-    {
-        crate::db::ProductCreationAcceptOutcome::Conflict(_) => {
-            return Err(AppError::BadRequest(
-                "request_id conflicts with immutable creation intent".to_string(),
-            ));
-        }
-        crate::db::ProductCreationAcceptOutcome::Accepted(_)
-        | crate::db::ProductCreationAcceptOutcome::Replayed(_) => {}
-    }
-    let published = match crate::runtime::creation_worker::process_product_creation_request(
+) -> Result<(StatusCode, Json<ProductConversationCreateAcceptedResponse>), AppError> {
+    let accepted = crate::conversation_actions::accept_create(
         &state.runtime,
-        &req.request_id,
+        req,
+        crate::conversation_actions::CreateSource::UserApi,
     )
-    .await
-    {
-        Ok(published) => published,
-        Err(message) => {
-            let status = state
-                .db
-                .get_product_creation_job(&req.request_id)
-                .await
-                .map_err(|error| AppError::Internal(error.to_string()))?
-                .map(|job| job.status);
-            return Err(AppError::TypedInternal {
-                message,
-                error_type: product_creation_processing_error_type(status.as_deref()).to_string(),
-            });
+    .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ProductConversationCreateAcceptedResponse {
+            request_id: accepted.request_id,
+            product_conversation_id: accepted.product_conversation_id.to_string(),
+        }),
+    ))
+}
+
+#[cfg(test)]
+mod product_creation_acceptance_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn request_body(request_id: &str, cwd: &str) -> Value {
+        serde_json::json!({
+            "request_id": request_id,
+            "cwd": cwd,
+            "model": "claude-sonnet-5",
+            "objective": "inspect the repository"
+        })
+    }
+
+    async fn post_creation(app: &Router, body: &Value) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::post("/api/product-conversations/new")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn json_body(response: axum::response::Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn blocked_repository_lock_does_not_delay_acceptance_or_replay() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let repo = tempfile::tempdir().unwrap();
+        crate::git_ops::run_git(repo.path(), &["init", "--quiet"]).unwrap();
+        let _lock =
+            crate::runtime::creation_worker::RepositoryMutationLock::acquire(repo.path()).unwrap();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let body = request_body(&request_id, repo.path().to_str().unwrap());
+        let app = create_router(state.clone());
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            post_creation(&app, &body),
+        )
+        .await
+        .expect("acceptance must not wait for repository provisioning");
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let receipt = json_body(first).await;
+        assert_eq!(receipt["request_id"], request_id);
+        assert_eq!(receipt.as_object().unwrap().len(), 2);
+        let replay = post_creation(&app, &body).await;
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        assert_eq!(json_body(replay).await, receipt);
+        let job = state
+            .db
+            .get_product_creation_job(&request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, "accepted");
+        assert_eq!(
+            receipt["product_conversation_id"],
+            job.product_conversation_id.to_string()
+        );
+        assert!(job.published_conversation_id.is_none());
+        let mut conflict = body.clone();
+        conflict["objective"] = serde_json::json!("different intent");
+        assert_eq!(
+            post_creation(&app, &conflict).await.status(),
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_preserves_default_language_but_rejects_explicit_language_change() {
+        use phoenix_core::llm_language::LlmLanguage;
+
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        state
+            .db
+            .set_default_llm_language(LlmLanguage::Caveman)
+            .await
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let app = create_router(state.clone());
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let body = request_body(&request_id, directory.path().to_str().unwrap());
+        let first = post_creation(&app, &body).await;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let receipt = json_body(first).await;
+
+        state
+            .db
+            .set_default_llm_language(LlmLanguage::PhoenixNative)
+            .await
+            .unwrap();
+        let replay = post_creation(&app, &body).await;
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        assert_eq!(json_body(replay).await, receipt);
+
+        let mut explicit = body;
+        explicit["llm_language"] = serde_json::json!("caveman");
+        let same_language = post_creation(&app, &explicit).await;
+        assert_eq!(same_language.status(), StatusCode::ACCEPTED);
+        assert_eq!(json_body(same_language).await, receipt);
+
+        explicit["llm_language"] = serde_json::json!("phoenix-native");
+        let conflict = post_creation(&app, &explicit).await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            json_body(conflict).await["error_type"],
+            "product_creation_request_conflict"
+        );
+        let job = state
+            .db
+            .get_product_creation_job(&request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.intent.llm_language, LlmLanguage::Caveman);
+    }
+
+    #[tokio::test]
+    async fn model_is_optional_for_product_creation() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let directory = tempfile::tempdir().unwrap();
+        let app = create_router(state.clone());
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let mut body = request_body(&request_id, directory.path().to_str().unwrap());
+        body.as_object_mut().unwrap().remove("model");
+        let response = post_creation(&app, &body).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let job = state
+            .db
+            .get_product_creation_job(&request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            job.intent.model,
+            Some(state.llm_registry.default_model_id())
+        );
+    }
+
+    #[tokio::test]
+    async fn status_projection_covers_all_durable_states_without_premature_routes() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let directory = tempfile::tempdir().unwrap();
+        let app = create_router(state.clone());
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let response = post_creation(
+            &app,
+            &request_body(&request_id, directory.path().to_str().unwrap()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let job = state
+            .db
+            .get_product_creation_job(&request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        for (kind, statuses) in [
+            (
+                "pending",
+                &[
+                    "accepted",
+                    "claimed",
+                    "retry_scheduled",
+                    "cancelling",
+                    "deletion_pending",
+                    "delivery_pending",
+                ][..],
+            ),
+            (
+                "failed",
+                &["failed", "cleanup_ambiguous", "delivery_failed"][..],
+            ),
+        ] {
+            for status in statuses {
+                let mut projected_job = job.clone();
+                projected_job.status = (*status).to_string();
+                projected_job.last_error = Some("provisioning stopped".to_string());
+                let projected = serde_json::to_value(
+                    product_creation_status_response(projected_job, false, None).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(projected["kind"], kind);
+                assert_eq!(projected["status"], *status);
+                assert_eq!(projected["request_id"], request_id);
+                assert_eq!(projected["provisioning_stage"], "validate_intent");
+                assert!(projected["stage_updated_at"].as_str().is_some());
+                assert!(projected.get("canonical_route").is_none());
+                assert!(projected.get("transcript_row_id").is_none());
+                let expected_actions: &[&str] = match *status {
+                    "accepted" | "claimed" | "retry_scheduled" => &["cancel", "delete"],
+                    "cancelling" | "cleanup_ambiguous" => &["delete"],
+                    "failed" => &["delete", "start_over"],
+                    "delivery_pending" => &["cancel"],
+                    "deletion_pending" | "delivery_failed" => &[],
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    projected["allowed_actions"],
+                    serde_json::json!(expected_actions),
+                    "{status}"
+                );
+                if kind == "failed" {
+                    assert_eq!(projected["error"], "provisioning stopped");
+                }
+            }
         }
-    };
-    Ok(Json(ProductConversationCreateAcceptedResponse {
-        canonical_route: format!("/c/{}", published.product_conversation_id),
-        product_conversation_id: published.product_conversation_id,
-        transcript_row_id: published.transcript_row_id,
-    }))
+        let mut retryable = job.clone();
+        retryable.status = "delivery_failed".to_string();
+        let projected =
+            serde_json::to_value(product_creation_status_response(retryable, true, None).unwrap())
+                .unwrap();
+        assert_eq!(projected["kind"], "failed");
+        assert_eq!(projected["status"], "delivery_failed");
+        assert_eq!(
+            projected["allowed_actions"],
+            serde_json::json!(["retry_delivery"])
+        );
+        assert!(projected.get("canonical_route").is_none());
+        assert!(projected.get("transcript_row_id").is_none());
+        let mut unknown = job;
+        unknown.status = "unknown".to_string();
+        assert!(product_creation_status_response(unknown, false, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_request_get_is_pending_or_recovery_and_unknown_is_not_found() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let directory = tempfile::tempdir().unwrap();
+        let app = create_router(state.clone());
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let other_id = uuid::Uuid::new_v4().to_string();
+        for id in [&request_id, &other_id] {
+            assert_eq!(
+                post_creation(&app, &request_body(id, directory.path().to_str().unwrap()))
+                    .await
+                    .status(),
+                StatusCode::ACCEPTED
+            );
+        }
+        let uri = format!("/api/product-conversations/creation/{request_id}");
+        let get = |uri: String| {
+            app.clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+        };
+        let response = get(uri.clone()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let pending = json_body(response).await;
+        assert_eq!(pending["request_id"], request_id);
+        assert_eq!(pending["kind"], "pending");
+        assert_eq!(pending["status"], "accepted");
+        assert!(pending.get("canonical_route").is_none());
+        state
+            .db
+            .cancel_product_creation(&request_id, chrono::Utc::now())
+            .await
+            .unwrap();
+        let cancelling = json_body(get(uri).await.unwrap()).await;
+        assert_eq!(cancelling["request_id"], request_id);
+        assert_eq!(cancelling["kind"], "pending");
+        assert_eq!(cancelling["status"], "cancelling");
+        let other = json_body(
+            get(format!("/api/product-conversations/creation/{other_id}"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(other["request_id"], other_id);
+        assert_eq!(other["status"], "accepted");
+        let job = state
+            .db
+            .get_product_creation_job(&request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut cancelled = job.clone();
+        cancelled.status = "cancelled".to_string();
+        let recovery =
+            serde_json::to_value(product_creation_status_response(cancelled, false, None).unwrap())
+                .unwrap();
+        assert_eq!(recovery["kind"], "cancelled");
+        assert_eq!(
+            recovery["allowed_actions"],
+            serde_json::json!(["delete", "start_over"])
+        );
+        assert!(recovery.get("transcript_row_id").is_none());
+        let mut published = job;
+        published.status = "published".to_string();
+        assert!(product_creation_status_response(published.clone(), false, None).is_err());
+        published.published_product_id = Some(published.product_conversation_id.clone());
+        published.published_conversation_id = Some("canonical-transcript".to_string());
+        let ready = serde_json::to_value(
+            product_creation_status_response(
+                published,
+                false,
+                Some("/c/readable-name".to_string()),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ready["kind"], "published");
+        assert_eq!(ready["transcript_row_id"], "canonical-transcript");
+        assert_eq!(ready["canonical_route"], "/c/readable-name");
+        assert_eq!(
+            get("/api/product-conversations/creation/unknown-request".to_string())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    mod product_conversation_create_tests {
+        use super::*;
+        use crate::db::{ContinueOutcome, ProductCreationProvisioningStage as Stage};
+        use phoenix_core::domain::db_schema::ConvMode;
+        use phoenix_core::domain::sm_state::ConvState;
+        use phoenix_core::work_scope::{
+            AuthorityKind, EnvironmentContext, RuntimeRole, WorkScopeId,
+        };
+
+        async fn get_creation(app: &Router, request_id: &str) -> axum::response::Response {
+            app.clone()
+                .oneshot(
+                    Request::get(format!("/api/product-conversations/creation/{request_id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+
+        async fn publish_accepted(state: &AppState, request_id: &str) -> String {
+            let job = state
+                .db
+                .get_product_creation_job(request_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let claimed = state
+                .db
+                .claim_product_creation(
+                    request_id,
+                    "public-history-fixture",
+                    "public-history-claim",
+                    chrono::Utc::now(),
+                    chrono::Duration::minutes(5),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            for stage in [
+                Stage::ResolveRepository,
+                Stage::ResolveStartingPin,
+                Stage::MaterializeWorktree,
+                Stage::FinalizeAttachments,
+                Stage::CommitMetadata,
+            ] {
+                assert!(state
+                    .db
+                    .advance_product_creation_provisioning_stage(request_id, &claimed.claim, stage)
+                    .await
+                    .unwrap());
+            }
+            let original = format!("published-{request_id}");
+            let template = format!("template-{request_id}");
+            let mut conversation = state
+                .db
+                .create_conversation(&template, &template, &job.intent.cwd, true, None, None)
+                .await
+                .unwrap();
+            state.db.delete_conversation(&template).await.unwrap();
+            conversation.id = original.clone();
+            conversation.slug = Some(original.clone());
+            conversation.product_conversation_id = job.product_conversation_id;
+            conversation.cwd = job.intent.cwd.clone();
+            conversation.model = job.intent.model.clone();
+            conversation.effort = job.intent.effort;
+            conversation.llm_language = job.intent.llm_language;
+            conversation.conv_mode = ConvMode::Direct;
+            conversation.runtime_role = RuntimeRole::User;
+            conversation.attached_work_scope_id = Some(WorkScopeId::new());
+            assert!(state
+                .db
+                .publish_product_creation_atomically(&crate::db::ProductCreationPublishInput {
+                    request_id: request_id.to_string(),
+                    claim: claimed.claim.clone(),
+                    conversation,
+                    authority_kind: AuthorityKind::Work,
+                    environment: EnvironmentContext::UnownedCwd {
+                        cwd: job.intent.cwd,
+                    },
+                    git_publication: None,
+                })
+                .await
+                .unwrap());
+            complete_delivery(state, request_id, claimed.claim).await;
+            original
+        }
+
+        async fn complete_delivery(
+            state: &AppState,
+            request_id: &str,
+            claim: crate::db::ProductCreationClaim,
+        ) {
+            let delivery = crate::db::ClaimedProductCreationJob {
+                claim,
+                job: state
+                    .db
+                    .get_product_creation_job(request_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            };
+            let fingerprint = format!("product-create:{request_id}");
+            let entry = phoenix_core::domain::sm_event::SteerEntry {
+                text: delivery.job.intent.objective.clone(),
+                origin: delivery.job.intent.origin.input_origin(),
+                message_id: request_id.to_string(),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: None,
+                skill_invocation: None,
+            };
+            state
+                .db
+                .append_product_creation_steering_entry(&delivery, &entry, &fingerprint)
+                .await
+                .unwrap();
+            assert!(state
+                .db
+                .complete_product_creation_delivery(
+                    request_id,
+                    &delivery.claim,
+                    &crate::db::SteeringAcceptanceFingerprint::Exact(fingerprint),
+                    &delivery.job.intent.live_intent().unwrap(),
+                )
+                .await
+                .unwrap());
+        }
+
+        async fn assert_historical(
+            app: &Router,
+            request_id: &str,
+            product_id: &Value,
+            original: &str,
+        ) {
+            let response = get_creation(app, request_id).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let status = json_body(response).await;
+            assert_eq!(status["kind"], "historical_published", "{status}");
+            assert_eq!(status["request_id"], request_id);
+            assert_eq!(&status["product_conversation_id"], product_id);
+            assert_eq!(status["transcript_row_id"], original);
+            assert!(status.get("canonical_route").is_none(), "{status}");
+            assert!(status.get("allowed_actions").is_none(), "{status}");
+            assert!(status.get("status").is_none(), "{status}");
+            assert_eq!(status.as_object().unwrap().len(), 4, "{status}");
+        }
+
+        #[tokio::test]
+        async fn public_get_retains_original_historical_creation_with_successor_and_after_last_deletion(
+        ) {
+            let state = hard_delete_cascade_tests::make_test_state().await;
+            let directory = tempfile::tempdir().unwrap();
+            let app = create_router(state.clone());
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let accepted = post_creation(
+                &app,
+                &request_body(&request_id, directory.path().to_str().unwrap()),
+            )
+            .await;
+            assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+            let receipt = json_body(accepted).await;
+            let original = publish_accepted(&state, &request_id).await;
+            let live_response = get_creation(&app, &request_id).await;
+            assert_eq!(live_response.status(), StatusCode::OK);
+            let live = json_body(live_response).await;
+            assert_eq!(live["kind"], "published", "{live}");
+            assert_eq!(live["request_id"], request_id);
+            assert_eq!(
+                live["product_conversation_id"],
+                receipt["product_conversation_id"]
+            );
+            assert_eq!(live["transcript_row_id"], original);
+            assert!(live["canonical_route"].as_str().is_some());
+            assert!(live.get("allowed_actions").is_none());
+
+            state
+                .db
+                .update_conversation_state(
+                    &original,
+                    &ConvState::ContextExhausted {
+                        summary: "exhausted".to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+            let successor = match state.db.continue_conversation(&original).await.unwrap() {
+                ContinueOutcome::Created(successor) => successor,
+                other => panic!("expected successor, got {other:?}"),
+            };
+            assert_eq!(
+                successor.product_conversation_id.to_string(),
+                receipt["product_conversation_id"]
+            );
+            state.db.delete_conversation(&original).await.unwrap();
+            assert_eq!(
+                state.db.get_conversation(&successor.id).await.unwrap().id,
+                successor.id
+            );
+            assert_historical(
+                &app,
+                &request_id,
+                &receipt["product_conversation_id"],
+                &original,
+            )
+            .await;
+
+            state.db.delete_conversation(&successor.id).await.unwrap();
+            assert_historical(
+                &app,
+                &request_id,
+                &receipt["product_conversation_id"],
+                &original,
+            )
+            .await;
+            assert_eq!(
+                get_creation(&app, "never-accepted").await.status(),
+                StatusCode::NOT_FOUND
+            );
+        }
+    }
 }
 
 async fn list_recent_management_roots(
@@ -3240,10 +3822,8 @@ async fn get_conversation(
     let conversation = stable.conversation;
     let messages = stable.value;
 
-    let enriched_msgs: Vec<super::wire::EnrichedMessage> = messages
-        .iter()
-        .map(super::wire::EnrichedMessage::from)
-        .collect();
+    let enriched_msgs: Vec<super::wire::EnrichedMessage> =
+        enrich_messages(&state.db, &messages).await;
 
     let context_window_size = messages
         .iter()
@@ -3306,7 +3886,17 @@ where
             .get_conversation(conversation_id)
             .await
             .map_err(|e| AppError::NotFound(e.to_string()))?;
-        let value = read_value(db, conversation_id, attempt).await?;
+        let value = match read_value(db, conversation_id, attempt).await {
+            Err(AppError::TranscriptSnapshotChanged) => {
+                tracing::debug!(
+                    conversation_id,
+                    attempt,
+                    "retrying changed opening snapshot"
+                );
+                continue;
+            }
+            result => result?,
+        };
         bump_transcript_generation_for_test(db, conversation_id).await?;
         let after = db
             .get_conversation(conversation_id)
@@ -3365,17 +3955,15 @@ async fn bump_transcript_generation_for_test(
     Ok(())
 }
 
-fn build_message_slice_response(
+async fn build_message_slice_response(
+    db: &crate::db::Database,
     messages: &[crate::db::Message],
     transcript_generation: i64,
     server_message_tail: Option<i64>,
     has_older_messages: bool,
 ) -> ConversationMessageSliceResponse {
     ConversationMessageSliceResponse {
-        messages: messages
-            .iter()
-            .map(super::wire::EnrichedMessage::from)
-            .collect(),
+        messages: enrich_messages(db, messages).await,
         tombstones: vec![],
         transcript_generation: Some(transcript_generation),
         server_message_tail,
@@ -3383,7 +3971,8 @@ fn build_message_slice_response(
     }
 }
 
-fn build_message_range_response(
+async fn build_message_range_response(
+    db: &crate::db::Database,
     messages: &[crate::db::Message],
     start_message_sequence: i64,
     end_message_sequence: i64,
@@ -3395,10 +3984,7 @@ fn build_message_range_response(
         .filter(|seq| !present.contains(seq))
         .collect();
     ConversationMessageRangeResponse {
-        messages: messages
-            .iter()
-            .map(super::wire::EnrichedMessage::from)
-            .collect(),
+        messages: enrich_messages(db, messages).await,
         missing_sequences,
         tombstones: vec![],
         transcript_generation: Some(transcript_generation),
@@ -3406,21 +3992,16 @@ fn build_message_range_response(
     }
 }
 
-fn build_messages_around_response(
+async fn build_messages_around_response(
+    db: &crate::db::Database,
     before: &[crate::db::Message],
     after: &[crate::db::Message],
     transcript_generation: i64,
     server_message_tail: Option<i64>,
 ) -> ConversationMessagesAroundResponse {
     ConversationMessagesAroundResponse {
-        before: before
-            .iter()
-            .map(super::wire::EnrichedMessage::from)
-            .collect(),
-        after: after
-            .iter()
-            .map(super::wire::EnrichedMessage::from)
-            .collect(),
+        before: enrich_messages(db, before).await,
+        after: enrich_messages(db, after).await,
         tombstones: vec![],
         transcript_generation: Some(transcript_generation),
         server_message_tail,
@@ -3657,7 +4238,11 @@ async fn reconcile_accepted_messages(
     for message_id in req.message_ids {
         let disposition = match state.db.get_message_by_id(&message_id).await {
             Ok(message) if message.conversation_id == id => AcceptedMessageDisposition::Persisted {
-                message: Box::new(super::wire::EnrichedMessage::from(&message)),
+                message: Box::new(
+                    EventPresentations::load(&state.db, [&message])
+                        .await
+                        .enrich(&message),
+                ),
             },
             Err(crate::db::DbError::MessageNotFound(_))
                 if queued_ids.contains(message_id.as_str()) =>
@@ -3706,12 +4291,16 @@ async fn get_conversation_messages_latest(
     })
     .await?;
     let (messages, has_older_messages, server_message_tail) = stable.value;
-    Ok(Json(build_message_slice_response(
-        &messages,
-        stable.conversation.transcript_generation,
-        server_message_tail,
-        has_older_messages,
-    )))
+    Ok(Json(
+        build_message_slice_response(
+            &state.db,
+            &messages,
+            stable.conversation.transcript_generation,
+            server_message_tail,
+            has_older_messages,
+        )
+        .await,
+    ))
 }
 
 async fn get_conversation_messages(
@@ -3742,12 +4331,16 @@ async fn get_conversation_messages(
             })
             .await?;
             let (messages, has_older_messages, server_message_tail) = stable.value;
-            Ok(Json(build_message_slice_response(
-                &messages,
-                stable.conversation.transcript_generation,
-                server_message_tail,
-                has_older_messages,
-            )))
+            Ok(Json(
+                build_message_slice_response(
+                    &state.db,
+                    &messages,
+                    stable.conversation.transcript_generation,
+                    server_message_tail,
+                    has_older_messages,
+                )
+                .await,
+            ))
         }
         (None, Some(after)) => {
             let stable = stable_transcript_read(db, &id, |db, id, _attempt| {
@@ -3762,12 +4355,16 @@ async fn get_conversation_messages(
             })
             .await?;
             let (messages, server_message_tail) = stable.value;
-            Ok(Json(build_message_slice_response(
-                &messages,
-                stable.conversation.transcript_generation,
-                server_message_tail,
-                false,
-            )))
+            Ok(Json(
+                build_message_slice_response(
+                    &state.db,
+                    &messages,
+                    stable.conversation.transcript_generation,
+                    server_message_tail,
+                    false,
+                )
+                .await,
+            ))
         }
     }
 }
@@ -3808,13 +4405,17 @@ async fn get_conversation_message_range(
     })
     .await?;
     let (messages, server_message_tail) = stable.value;
-    Ok(Json(build_message_range_response(
-        &messages,
-        start_message_sequence,
-        end_message_sequence,
-        stable.conversation.transcript_generation,
-        server_message_tail,
-    )))
+    Ok(Json(
+        build_message_range_response(
+            &state.db,
+            &messages,
+            start_message_sequence,
+            end_message_sequence,
+            stable.conversation.transcript_generation,
+            server_message_tail,
+        )
+        .await,
+    ))
 }
 
 async fn get_conversation_messages_around(
@@ -3837,12 +4438,16 @@ async fn get_conversation_messages_around(
     })
     .await?;
     let (before_messages, after_messages, server_message_tail) = stable.value;
-    Ok(Json(build_messages_around_response(
-        &before_messages,
-        &after_messages,
-        stable.conversation.transcript_generation,
-        server_message_tail,
-    )))
+    Ok(Json(
+        build_messages_around_response(
+            &state.db,
+            &before_messages,
+            &after_messages,
+            stable.conversation.transcript_generation,
+            server_message_tail,
+        )
+        .await,
+    ))
 }
 
 /// `GET /api/conversations/:id/slug` — compatibility lookup used by links that
@@ -3943,6 +4548,75 @@ async fn work_scope_actor(
         .map_err(|error| AppError::Internal(error.to_string()))
 }
 
+async fn load_request_scope(
+    state: &AppState,
+    conversation_id: &str,
+    requested: Option<&crate::work_scope::ResourceScopeKey>,
+) -> Result<(), AppError> {
+    let conversation = state
+        .db
+        .get_conversation(conversation_id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let resolved =
+        crate::resource_authority::resolve_resource_authority(state.runtime.db(), &conversation)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+    if conversation.runtime_role == crate::work_scope::RuntimeRole::Coordinator {
+        let current = state
+            .db
+            .coordinator_conversation_id()
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        if current.as_deref() == Some(conversation_id) {
+            return Ok(());
+        }
+    }
+    if requested.is_some_and(|scope| {
+        resolved.scope == *scope && matches!(scope, crate::work_scope::ResourceScopeKey::Work(_))
+    }) {
+        return Ok(());
+    }
+    Err(AppError::Forbidden("WorkScope load is limited to the attached scope; across-scope load requires the current Global Coordinator".into()))
+}
+
+async fn get_work_scope_load(
+    State(state): State<AppState>,
+    Path(scope_key): Path<String>,
+    Query(query): Query<WorkScopeActorQuery>,
+) -> Result<Json<super::work_scope_load::WorkScopeLoadSummary>, AppError> {
+    let Some(scope @ crate::work_scope::ResourceScopeKey::Work(_)) =
+        crate::work_scope::ResourceScopeKey::from_stable_key(&scope_key)
+    else {
+        return Err(AppError::BadRequest("invalid WorkScope key".into()));
+    };
+    load_request_scope(&state, &query.conversation_id, Some(&scope)).await?;
+    if !state
+        .runtime
+        .work_scope_load()
+        .contains_scope(&state.db, &scope)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        return Err(AppError::NotFound("active WorkScope not found".into()));
+    }
+    Ok(Json(state.runtime.work_scope_load().summary(&scope).await))
+}
+
+async fn get_all_work_scope_load(
+    State(state): State<AppState>,
+    Query(query): Query<WorkScopeActorQuery>,
+) -> Result<Json<Vec<super::work_scope_load::WorkScopeLoadSummary>>, AppError> {
+    load_request_scope(&state, &query.conversation_id, None).await?;
+    let summaries = state
+        .runtime
+        .work_scope_load()
+        .summaries(&state.db)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    Ok(Json(summaries))
+}
+
 async fn get_work_scope_inventory(
     State(state): State<AppState>,
     Path(scope_key): Path<String>,
@@ -3973,18 +4647,22 @@ async fn get_work_scope_inventory(
     if inventory.bash.iter().any(|handle| handle.state.is_live()) {
         let generation = state.resource_monitor.observe(&state).await;
         for handle in &mut inventory.bash {
-            if let Some(pids) = generation.handle_pids(&scope_key, &handle.handle_id) {
-                handle.health = Some(super::resource_monitor::health_for_pids(&generation, pids));
+            if handle.state.is_live() {
+                handle.health =
+                    Some(generation.bash_health_for_handles(
+                        &scope_key,
+                        std::slice::from_ref(&handle.handle_id),
+                    ));
             }
         }
         let visible_handle_ids = inventory
             .bash
             .iter()
+            .filter(|handle| handle.state.is_live())
             .map(|handle| handle.handle_id.clone())
             .collect::<Vec<_>>();
-        let visible_pids = generation.visible_handle_pids(&scope_key, &visible_handle_ids);
-        inventory.health = (!visible_pids.is_empty())
-            .then(|| super::resource_monitor::health_for_pids(&generation, &visible_pids));
+        inventory.health =
+            Some(generation.bash_health_for_handles(&scope_key, &visible_handle_ids));
         inventory.health_sampled_at = Some(generation.sampled_at);
     }
 
@@ -4205,14 +4883,7 @@ async fn inspect_bash_handle(
     if assembly.live_pgid.is_some() {
         let generation = state.resource_monitor.observe(&state).await;
         let scope_key = assembly.owner.stable_key();
-        let health = generation.handle_pids(&scope_key, &handle_id).map_or_else(
-            || phoenix_core::domain::work_scope_inventory::ResourceHealth {
-                cpu_percent: None,
-                memory_bytes: None,
-                process_count: None,
-            },
-            |pids| super::resource_monitor::health_for_pids(&generation, pids),
-        );
+        let health = generation.bash_health_for_handles(&scope_key, &[handle_id]);
         assembly.inspection.resources_sampled_at = Some(generation.sampled_at);
         assembly.inspection.resources =
             Some(phoenix_core::domain::process_inspection::ResourceSample {
@@ -4289,10 +4960,20 @@ async fn get_system_prompt(
     );
     let system_prompt = if is_coordinator {
         let catalog = crate::skills::AuthenticatedCoordinatorSkillCatalog::discover(None);
-        crate::system_prompt::build_coordinator_system_prompt(
+        let mut prompt = crate::system_prompt::build_coordinator_system_prompt(
             conversation.llm_language,
             catalog.as_ref(),
-        )
+        );
+        crate::coordinator_home::append_context(
+            &mut prompt,
+            state
+                .runtime
+                .db()
+                .coordinator_work_scope()
+                .await
+                .map_err(|error| error.to_string()),
+        );
+        prompt
     } else {
         let cwd = std::path::PathBuf::from(&conversation.cwd);
         let tasks_dir_name = taskmd_core::discover::discover_or_default(&cwd)
@@ -4458,7 +5139,7 @@ async fn read_stream_init_messages_with_tail(
 }
 
 async fn stream_aggregate_events(State(state): State<AppState>) -> impl IntoResponse {
-    super::sse::aggregate_event_stream(state.runtime.subscribe_aggregate_events())
+    super::sse::aggregate_event_stream(state.db.clone(), state.runtime.subscribe_aggregate_events())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4562,7 +5243,7 @@ async fn stream_conversation(
     let stable = stable_transcript_read(db, &id, |db, id, attempt| {
         let query = query.clone();
         Box::pin(async move {
-            read_stream_init_messages_with_tail(
+            let value = read_stream_init_messages_with_tail(
                 db,
                 id,
                 &query,
@@ -4570,18 +5251,34 @@ async fn stream_conversation(
                 attempt,
                 get_stream_last_sequence_id(db, id).await,
             )
-            .await
+            .await?;
+            let generation = db
+                .get_conversation(id)
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?
+                .transcript_generation;
+            let opening = db
+                .read_continuation_opening_at_snapshot(id, generation, value.3)
+                .await
+                .map_err(|error| match error {
+                    crate::db::DbError::TranscriptSnapshotChanged => {
+                        AppError::TranscriptSnapshotChanged
+                    }
+                    error => AppError::Internal(error.to_string()),
+                })?;
+            Ok((value, opening))
         })
     })
     .await?;
     let conversation = stable.conversation;
+    let (stream_value, opening) = stable.value;
     let (
         last_sequence_id,
         db_message_selection,
         messages,
         _server_message_tail,
         transcript_coverage,
-    ) = stable.value;
+    ) = stream_value;
     init_trace.record_ms("stream.transcript_read_ms", transcript_started.elapsed());
     init_trace.record_message_count(messages.len());
     let highest_message_seq = match db_message_selection {
@@ -4682,6 +5379,7 @@ async fn stream_conversation(
         crate::runtime::TranscriptCoverage::Preserve => crate::runtime::InitTranscript::Preserve,
     };
     let init_event = SseEvent::Init {
+        opening: Some(opening.into()),
         sequence_id: init_seq,
         conversation: Box::new(init_conversation),
         transcript_generation: conversation.transcript_generation,
@@ -4699,6 +5397,7 @@ async fn stream_conversation(
     };
 
     Ok(sse_stream(
+        state.runtime.db().clone(),
         id,
         init_event,
         broadcast_rx,
@@ -4755,7 +5454,7 @@ async fn send_chat(
             images: req.images,
             files: req.files,
             user_agent: req.user_agent,
-            expansion_policy: crate::send_chat_service::MessageExpansionPolicy::ExpandReferences,
+            expansion_policy: req.expansion_policy.into(),
         })
         .await
         .map_err(|error| match error {
@@ -4826,102 +5525,6 @@ async fn send_chat(
             ))));
         }
     }))
-}
-
-#[derive(Debug, serde::Serialize)]
-struct WakeStatusResponse {
-    pending_count: usize,
-    soonest_expires_at: Option<u64>,
-    contracts: Vec<WakeContractStatus>,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct WakeContractStatus {
-    workflow_id: u64,
-    contract_id: String,
-    expires_at: u64,
-}
-
-async fn get_wake_status(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<axum::Json<WakeStatusResponse>, AppError> {
-    state
-        .db
-        .get_conversation(&id)
-        .await
-        .map_err(|error| AppError::NotFound(error.to_string()))?;
-    let rows = state
-        .db
-        .wake_repository()
-        .list_active_unresolved_for_conversation(&id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
-    let contracts: Vec<_> = rows
-        .into_iter()
-        .map(|row| WakeContractStatus {
-            workflow_id: row.workflow_id.0,
-            contract_id: row.contract_id,
-            expires_at: row.expires_at.0,
-        })
-        .collect();
-    Ok(axum::Json(WakeStatusResponse {
-        pending_count: contracts.len(),
-        soonest_expires_at: contracts.iter().map(|row| row.expires_at).min(),
-        contracts,
-    }))
-}
-
-async fn cancel_wake(
-    State(state): State<AppState>,
-    Path((id, contract_id)): Path<(String, String)>,
-) -> Result<axum::Json<SuccessResponse>, AppError> {
-    state
-        .db
-        .get_conversation(&id)
-        .await
-        .map_err(|error| AppError::NotFound(error.to_string()))?;
-    let repo = state.db.wake_repository();
-    let row = repo
-        .fetch_binding_for_conversation_contract(&id, &contract_id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-        .ok_or_else(|| AppError::NotFound("Wake contract not found".to_string()))?;
-    let outcome = repo
-        .cancel_allocated(&phoenix_db::workflow::wake::WakeCancelIfUnresolvedInput {
-            workflow_id: row.workflow_id,
-            expected_conversation_id: Some(id.clone()),
-            expected_contract_id: Some(contract_id.clone()),
-            timestamp: phoenix_workflow::Timestamp(
-                chrono::Utc::now().timestamp().max(0).cast_unsigned(),
-            ),
-            reason: phoenix_workflow::wake_profile::WakeCancellationReason::ExplicitCancel,
-        })
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
-    match outcome {
-        phoenix_db::workflow::wake::WakeCancellationOutcome::Cancelled { .. } => {}
-        phoenix_db::workflow::wake::WakeCancellationOutcome::Replayed { delivery, .. } => {
-            let terminal = &delivery.receipt.terminal;
-            if !matches!(
-                terminal,
-                phoenix_workflow::wake_profile::WakeTerminalPayload::Cancelled { .. }
-            ) {
-                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                    "Wake contract is already resolved",
-                    "wake_already_resolved",
-                ))));
-            }
-        }
-        phoenix_db::workflow::wake::WakeCancellationOutcome::Stale => {
-            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                "Wake contract is already resolved",
-                "wake_already_resolved",
-            ))));
-        }
-    }
-    state.runtime.kick_wake_worker();
-    Ok(axum::Json(SuccessResponse { success: true }))
 }
 
 async fn cancel_active_direct_turn(
@@ -5010,7 +5613,9 @@ async fn cancel_conversation(
             | AppError::TypedBadRequest { .. }
             | AppError::Forbidden(_)
             | AppError::UnprocessableEntity(_) => ("request_error", false),
-            AppError::Internal(_) | AppError::TypedInternal { .. } => ("server_error", true),
+            AppError::Internal(_)
+            | AppError::TypedInternal { .. }
+            | AppError::TranscriptSnapshotChanged => ("server_error", true),
         };
         span.record("outcome", outcome);
         if is_server_error {
@@ -5136,12 +5741,10 @@ async fn cancel_conversation_inner(
                     | crate::runtime::SteeringWakeOutcome::NothingToDrain,
                 ) => {}
                 Ok(crate::runtime::SteeringWakeOutcome::Conflict) => {
-                    return Err(AppError::Conflict(Box::new(
-                        ConflictErrorResponse::new(
-                            "Deferred steering could not be reconciled with the current conversation state",
-                            "steering_wake_conflict",
-                        ),
-                    )));
+                    return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                        "Deferred steering could not be reconciled with the current conversation state",
+                        "steering_wake_conflict",
+                    ))));
                 }
                 Ok(crate::runtime::SteeringWakeOutcome::DispatchFailed) => {
                     return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
@@ -5236,7 +5839,7 @@ async fn cancel_conversation_inner(
     }))
 }
 
-pub(super) fn map_ordinary_mutation_admission(
+pub(crate) fn map_ordinary_mutation_admission(
     admission: &phoenix_db::MessageTargetAdmission,
     operation: &str,
 ) -> Result<(), AppError> {
@@ -5289,7 +5892,7 @@ pub(super) fn map_hard_delete_admission(
     }
 }
 
-pub(super) fn map_admission_db_error(error: DbError) -> AppError {
+pub(crate) fn map_admission_db_error(error: DbError) -> AppError {
     match error {
         DbError::ConversationNotFound(id) => AppError::NotFound(id),
         error => AppError::Internal(error.to_string()),
@@ -5331,6 +5934,7 @@ async fn admit_model_change(state: &AppState, id: &str) -> Result<(), AppError> 
 /// Allowed from `Idle`, `Error`, or `RecoverableContinuationFailure` -- cannot
 /// upgrade while an LLM request, tool execution, or other operation is in flight (see
 /// `ConvState::allows_model_change`).
+#[allow(clippy::too_many_lines)]
 async fn upgrade_conversation_model(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -5418,16 +6022,43 @@ async fn upgrade_conversation_model(
         }
     };
 
+    let old_effective_model = conv
+        .model
+        .clone()
+        .unwrap_or_else(|| state.llm_registry.default_model_id());
+    let capacity_replan_request = match &effective_state {
+        ConvState::RecoverableContinuationFailure { failure }
+            if failure.error_kind == crate::db::ErrorKind::ContextCapacityConflict
+                && old_effective_model != req.model =>
+        {
+            let transition =
+                phoenix_state_machine::transition::replan_continuation_failure(failure);
+            match transition.new_state {
+                phoenix_core::domain::sm_state::CoreState::AwaitingContinuation { request } => {
+                    Some(request)
+                }
+                _ => {
+                    return Err(AppError::Internal(
+                        "Continuation replan did not produce its required request owner"
+                            .to_string(),
+                    ))
+                }
+            }
+        }
+        _ => None,
+    };
+
     // Update in DB
     state
         .runtime
         .db()
-        .update_conversation_model_and_effort(
+        .update_conversation_model_and_effort_with_replan(
             &id,
             &req.model,
             next_effort,
             next_service_tier,
             &connection,
+            capacity_replan_request.as_ref(),
         )
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -5435,8 +6066,21 @@ async fn upgrade_conversation_model(
     // Evict the active runtime so it gets recreated with the new model
     state
         .runtime
-        .evict_runtime(&id, crate::runtime::EvictionReason::ModelUpgrade)
+        .evict_runtime(
+            &id,
+            crate::runtime::EvictionReason::ModelUpgrade {
+                model_changed: old_effective_model != req.model,
+            },
+        )
         .await;
+
+    if capacity_replan_request.is_some() {
+        state
+            .runtime
+            .get_or_create(&id)
+            .await
+            .map_err(AppError::BadRequest)?;
+    }
 
     tracing::info!(
         conv_id = %id,
@@ -5457,10 +6101,121 @@ fn continuation_operation_id(state: ConvState) -> String {
 }
 
 /// Manually trigger context continuation (REQ-BED-023)
+async fn list_continuation_handoff_candidates(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<crate::db::ContinuationHandoffCandidate>>, AppError> {
+    state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    state
+        .db
+        .continuation_handoff_candidates(&id)
+        .await
+        .map(Json)
+        .map_err(|error| AppError::Internal(error.to_string()))
+}
+
+async fn review_continuation_handoff(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<crate::api::types::HandoffReviewRequest>,
+) -> Result<Json<crate::runtime::HandoffReviewResponse>, AppError> {
+    let parent = state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let _product_admission = state
+        .runtime
+        .lock_product_message_admission(parent.product_conversation_id.as_str())
+        .await;
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(map_admission_db_error)?;
+    let _admission = admission.lock().await;
+    require_ordinary_mutation_admission(&state, &id, "handoff review").await?;
+    if req.handoff.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "Handoff must not be empty".to_string(),
+        ));
+    }
+    let parent = state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let opening_authority = match &req.source {
+        crate::api::types::ContinueHandoffSource::Manual => phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction,
+        crate::api::types::ContinueHandoffSource::Summary { .. } | crate::api::types::ContinueHandoffSource::Candidate { .. } => phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext,
+    };
+    let source_candidate_id = match &req.source {
+        crate::api::types::ContinueHandoffSource::Manual => None,
+        crate::api::types::ContinueHandoffSource::Candidate { candidate_id } => {
+            let candidates = state
+                .db
+                .continuation_handoff_candidates(&id)
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?;
+            if !candidates.iter().any(|candidate| {
+                &candidate.id == candidate_id
+                    && candidate.text == req.handoff
+                    && candidate.origin.is_generated()
+                    && candidate.origin.revision().is_current_for(&parent)
+            }) {
+                return Err(AppError::BadRequest(
+                    "Shortening source must match its current retained candidate".to_string(),
+                ));
+            }
+            Some(candidate_id.clone())
+        }
+        crate::api::types::ContinueHandoffSource::Summary { message_id } => {
+            let message = state
+                .db
+                .get_message_by_id_in_conversation(&id, message_id)
+                .await
+                .map_err(|error| AppError::BadRequest(error.to_string()))?;
+            if !matches!(&parent.state, ConvState::ContextExhausted { summary } if summary == &req.handoff)
+                || !matches!(message.content, crate::db::MessageContent::Continuation(content) if content.summary == req.handoff)
+            {
+                return Err(AppError::BadRequest(
+                    "Shortening source must match its current generated summary".to_string(),
+                ));
+            }
+            None
+        }
+    };
+    state
+        .runtime
+        .review_continuation_handoff_with_source(
+            &id,
+            req.handoff,
+            req.shorten,
+            source_candidate_id,
+            opening_authority,
+        )
+        .await
+        .map(Json)
+        .map_err(AppError::BadRequest)
+}
+
 async fn trigger_continuation(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
+    let parent = state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let _product_admission = state
+        .runtime
+        .lock_product_message_admission(parent.product_conversation_id.as_str())
+        .await;
     let admission = state
         .runtime
         .mutation_admission(&id)
@@ -5723,11 +6478,61 @@ async fn continue_conversation(
         .lock_product_message_admission(parent.product_conversation_id.as_str())
         .await;
 
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(map_admission_db_error)?;
+    let _mutation_admission = admission.lock().await;
+    let parent = state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
     if req.handoff.trim().is_empty() {
         return Err(AppError::BadRequest(
             "Continuation handoff must not be empty.".to_string(),
         ));
     }
+    let generated_context = if parent.continued_in_conv_id.is_some() {
+        false
+    } else {
+        match &req.source {
+            crate::api::types::ContinueHandoffSource::Manual => false,
+            crate::api::types::ContinueHandoffSource::Candidate { candidate_id } => {
+                let candidates = state
+                    .db
+                    .continuation_handoff_candidates(&id)
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?;
+                if !candidates.iter().any(|candidate| {
+                    &candidate.id == candidate_id
+                        && candidate.text == req.handoff
+                        && candidate.origin.is_generated()
+                        && candidate.origin.revision().is_current_for(&parent)
+                }) {
+                    return Err(AppError::BadRequest("Accepted candidate must exactly match a retained generated preview. Submit edits as a separate manual handoff.".to_string()));
+                }
+                true
+            }
+            crate::api::types::ContinueHandoffSource::Summary { message_id } => {
+                let message = state
+                    .db
+                    .get_message_by_id_in_conversation(&id, message_id)
+                    .await
+                    .map_err(|error| AppError::BadRequest(error.to_string()))?;
+                if !matches!(&parent.state, ConvState::ContextExhausted { summary } if summary == &req.handoff)
+                    || !matches!(message.content, crate::db::MessageContent::Continuation(content) if content.summary == req.handoff)
+                {
+                    return Err(AppError::BadRequest(
+                        "Accepted generated summary must exactly match its transcript row"
+                            .to_string(),
+                    ));
+                }
+                true
+            }
+        }
+    };
     let mut automatic_retry_phase = None;
     let _automatic_retry_authority = if req.retry_failed_automatic {
         Some(
@@ -5820,9 +6625,33 @@ async fn continue_conversation(
             continuation_message_id(req.message_id.clone())?,
             req.handoff,
             req.user_agent,
-            phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction,
+            if generated_context {
+                phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext
+            } else {
+                phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction
+            },
         )
     };
+
+    if parent.continued_in_conv_id.is_none() {
+        require_ordinary_mutation_admission(&state, &id, "continuation admission").await?;
+        let review = state
+            .runtime
+            .review_continuation_admission(&id, handoff.clone(), opening_authority)
+            .await
+            .map_err(AppError::BadRequest)?;
+        if !review.source.fits() {
+            let message = match review.source.status {
+                crate::runtime::HandoffCapacityStatus::RequiredOverhead => "Required instructions/tools and full output reservation leave no successor working room. Handoff editing and shortening cannot fix this overhead; explicitly change model or revise required instructions/tools.",
+                crate::runtime::HandoffCapacityStatus::HandoffTooLarge { .. } => "The supplied handoff leaves insufficient successor working room. Review the capacity target, edit the handoff, request one shortening candidate, or explicitly change model.",
+                crate::runtime::HandoffCapacityStatus::Ready { .. } => unreachable!("fit checked above"),
+            };
+            let mut conflict =
+                ConflictErrorResponse::new(message, "continuation_capacity_conflict");
+            conflict.capacity = Some(review.source);
+            return Err(AppError::Conflict(Box::new(conflict)));
+        }
+    }
 
     let (outcome, intent) = state
         .runtime
@@ -5870,24 +6699,6 @@ async fn continue_conversation(
 
     match outcome {
         ContinueOutcome::Created(new_conv) => {
-            let parent = state
-                .runtime
-                .db()
-                .get_conversation(&id)
-                .await
-                .map_err(|error| AppError::Internal(error.to_string()))?;
-            if parent.attached_work_scope_id == new_conv.attached_work_scope_id {
-                crate::runtime::wake::transfer_active_for_continuation(
-                    &state.runtime,
-                    &id,
-                    &new_conv.id,
-                    phoenix_workflow::Timestamp(
-                        u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
-                    ),
-                )
-                .await
-                .map_err(|error| AppError::Internal(error.to_string()))?;
-            }
             tracing::info!(
                 parent_id = %id,
                 continuation_id = %new_conv.id,
@@ -5928,24 +6739,6 @@ async fn continue_conversation(
             }))
         }
         ContinueOutcome::AlreadyContinued(existing) => {
-            let parent = state
-                .runtime
-                .db()
-                .get_conversation(&id)
-                .await
-                .map_err(|error| AppError::Internal(error.to_string()))?;
-            if parent.attached_work_scope_id == existing.attached_work_scope_id {
-                crate::runtime::wake::transfer_active_for_continuation(
-                    &state.runtime,
-                    &id,
-                    &existing.id,
-                    phoenix_workflow::Timestamp(
-                        u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
-                    ),
-                )
-                .await
-                .map_err(|error| AppError::Internal(error.to_string()))?;
-            }
             tracing::info!(
                 parent_id = %id,
                 existing_continuation = %existing.id,
@@ -6007,7 +6800,7 @@ struct DismissQuestionPayload {
     request_id: Option<crate::state_machine::state::QuestionRequestId>,
 }
 
-fn validate_question_request_identity(
+pub(crate) fn validate_question_request_identity(
     pending: Option<&crate::state_machine::state::QuestionRequestId>,
     submitted: Option<&crate::state_machine::state::QuestionRequestId>,
 ) -> Result<(), AppError> {
@@ -6073,45 +6866,12 @@ async fn respond_to_question(
     Path(id): Path<String>,
     Json(req): Json<RespondToQuestionPayload>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    let admission = state
-        .runtime
-        .mutation_admission(&id)
-        .await
-        .map_err(map_admission_db_error)?;
-    let _admission_guard = admission.lock().await;
-
-    let conv = state
-        .runtime
-        .db()
-        .get_conversation(&id)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
-
-    let ConvState::AwaitingUserResponse {
-        request_authority, ..
-    } = &conv.state
-    else {
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            "Conversation is not awaiting a user response",
-            "wrong_state",
-        ))));
-    };
-    validate_question_request_identity(request_authority.request_id(), req.request_id.as_ref())?;
-
-    require_ordinary_mutation_admission(&state, &id, "question response").await?;
-
-    state
-        .runtime
-        .send_event(
-            &id,
-            Event::UserQuestionResponse {
-                request_id: req.request_id,
-                answers: req.answers,
-                annotations: req.annotations,
-            },
-        )
-        .await
-        .map_err(AppError::BadRequest)?;
+    crate::send_chat_service::SendChatApplicationService::new(
+        state.db.clone(),
+        state.runtime.clone(),
+    )
+    .respond_to_question(&id, req.request_id, req.answers, req.annotations, None)
+    .await?;
 
     Ok(Json(SuccessResponse { success: true }))
 }
@@ -6301,18 +7061,6 @@ async fn archive_conversation(
 #[cfg(test)]
 pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
     refuse_if_coordinator(state, id, "archive").await?;
-    if state
-        .db
-        .wake_repository()
-        .has_owed_work_for_conversation(id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-    {
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            "Conversation has pending background work",
-            "pending_wake",
-        ))));
-    }
     let conv = state
         .runtime
         .db()
@@ -6554,7 +7302,7 @@ pub(crate) async fn run_runtime_resource_cleanup_cascade(
     )
     .await;
     let had_live_handles = !bash_report.live_handle_pgids.is_empty();
-    let had_kill_failures = !bash_report.kill_failures.is_empty();
+    let had_kill_failures = bash_report.has_failures();
     if had_kill_failures {
         tracing::warn!(
             conv_id = %id,
@@ -6562,7 +7310,8 @@ pub(crate) async fn run_runtime_resource_cleanup_cascade(
             live_handle_pgids = ?bash_report.live_handle_pgids,
             kill_pending_kernel_pids = ?bash_report.kill_pending_kernel_pids,
             kill_failures = ?bash_report.kill_failures,
-            "bash cleanup had kill failures; orphan process groups may remain"
+            scope_uncertainty = ?bash_report.scope_uncertainty,
+            "bash cleanup could not verify shutdown; processes may remain"
         );
     } else if had_live_handles {
         tracing::debug!(
@@ -6728,18 +7477,6 @@ pub(super) async fn prepare_hard_delete_cascade(
     #[cfg(test)]
     state.runtime.wait_at_hard_delete_barrier().await;
     refuse_if_coordinator(state, id, "delete").await?;
-    if state
-        .db
-        .wake_repository()
-        .has_owed_work_for_conversation(id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-    {
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            "Conversation has pending background work",
-            "pending_wake",
-        ))));
-    }
     // Step 1: reject-if-busy. Read the conversation's persisted state
     // (the DB is updated before any side effect per persist-before-broadcast,
     // so DB state is the authoritative answer to "is this conversation busy?").
@@ -7179,6 +7916,35 @@ async fn cascade_projects_on_delete(
         return CascadeProjectsReport::default();
     };
 
+    match runtime.db().coordinator_work_scope().await {
+        Ok(Some(home)) => {
+            let crate::work_scope::EnvironmentContext::CoordinatorHome { cwd } = home.context
+            else {
+                return CascadeProjectsReport {
+                    error: Some("Invalid Coordinator home ownership".into()),
+                    ..Default::default()
+                };
+            };
+            let worker = PathBuf::from(&worktree_path);
+            let worker = worker.canonicalize().unwrap_or(worker);
+            let home = PathBuf::from(cwd);
+            if home.starts_with(&worker) || worker.starts_with(&home) {
+                return CascadeProjectsReport {
+                    error: Some("Cleanup refused: worker path overlaps Coordinator home".into()),
+                    ..Default::default()
+                };
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return CascadeProjectsReport {
+                error: Some(format!(
+                    "Cannot establish Coordinator home retention: {error}"
+                )),
+                ..Default::default()
+            }
+        }
+    }
     let mut report = CascadeProjectsReport {
         worktree_path: Some(worktree_path.clone()),
         branch_name: Some(branch_name.clone()),
@@ -7225,8 +7991,8 @@ async fn cascade_projects_on_delete(
                     if worktree_dir.exists() {
                         if let Err(rm_err) = std::fs::remove_dir_all(&worktree_dir) {
                             return Err(format!(
-                            "git worktree remove failed: {e}; fs fallback also failed: {rm_err}"
-                        ));
+                                "git worktree remove failed: {e}; fs fallback also failed: {rm_err}"
+                            ));
                         }
                     }
                     let _ = run_git(repo, &["worktree", "prune"]);
@@ -7287,106 +8053,6 @@ async fn cleanup_pending_fork_orphans_on_delete(
         .cleanup_pending_fork_orphans_on_delete(&conv.id, authority)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))
-}
-
-async fn rename_conversation(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(req): Json<RenameRequest>,
-) -> Result<Json<ConversationResponse>, AppError> {
-    state
-        .runtime
-        .db()
-        .rename_conversation(&id, &req.name)
-        .await
-        .map_err(|e| match e {
-            crate::db::DbError::SlugExists(_) => {
-                AppError::BadRequest("Slug already exists".to_string())
-            }
-            _ => AppError::NotFound(e.to_string()),
-        })?;
-
-    conversation_response(&state, &id).await
-}
-
-async fn regenerate_conversation_name(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<ConversationResponse>, AppError> {
-    let opening = state
-        .runtime
-        .db()
-        .first_opening_message_text(&id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .ok_or_else(|| {
-            tracing::debug!(
-                conv_id = %id,
-                "conversation regenerate-name: no opening message; leaving slug unchanged"
-            );
-            AppError::Internal(
-                "cannot regenerate conversation name: no opening message to summarize".to_string(),
-            )
-        })?;
-
-    let (cheap_model_id, cheap_model) =
-        state
-            .llm_registry
-            .get_cheap_model_with_id()
-            .ok_or_else(|| {
-                AppError::Internal(
-                    "no cheap LLM model is available for name regeneration".to_string(),
-                )
-            })?;
-    let effective_effort = state.llm_registry.effective_effort(&cheap_model_id, None);
-
-    let generated = crate::title_generator::generate_title(
-        &opening,
-        cheap_model,
-        effective_effort,
-        state.llm_registry.output_token_limit(&cheap_model_id),
-    )
-    .await
-    .filter(|slug| !slug.is_empty())
-    .ok_or_else(|| {
-        AppError::Internal(
-            "conversation name regeneration failed — the existing name is unchanged".to_string(),
-        )
-    })?;
-
-    rename_conversation_slug(&state, &id, &generated).await?;
-    conversation_response(&state, &id).await
-}
-
-async fn rename_conversation_slug(state: &AppState, id: &str, slug: &str) -> Result<(), AppError> {
-    state
-        .runtime
-        .db()
-        .rename_conversation(id, slug)
-        .await
-        .map_err(|e| match e {
-            crate::db::DbError::SlugExists(_) => {
-                AppError::BadRequest("Slug already exists".to_string())
-            }
-            crate::db::DbError::ConversationNotFound(_) => AppError::NotFound(e.to_string()),
-            _ => AppError::Internal(e.to_string()),
-        })
-}
-
-async fn conversation_response(
-    state: &AppState,
-    id: &str,
-) -> Result<Json<ConversationResponse>, AppError> {
-    let conversation = state
-        .runtime
-        .db()
-        .get_conversation(id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    Ok(Json(ConversationResponse {
-        conversation: conversation_to_json_with_seed(state, &conversation, true).await?,
-    }))
 }
 
 pub(crate) fn title_from_text(text: &str) -> String {
@@ -7500,10 +8166,8 @@ async fn get_by_slug(
     let conversation = stable.conversation;
     let messages = stable.value;
 
-    let enriched_msgs: Vec<super::wire::EnrichedMessage> = messages
-        .iter()
-        .map(super::wire::EnrichedMessage::from)
-        .collect();
+    let enriched_msgs: Vec<super::wire::EnrichedMessage> =
+        enrich_messages(&state.db, &messages).await;
 
     let context_window_size = messages
         .iter()
@@ -7726,6 +8390,22 @@ async fn preview_root_allowlist(state: &AppState) -> Vec<PathBuf> {
         .filter_map(|root| fs::canonicalize(root).ok())
         .collect();
 
+    match state.db.coordinator_work_scope().await {
+        Ok(Some(home)) => {
+            if let crate::work_scope::EnvironmentContext::CoordinatorHome { cwd } = home.context {
+                match crate::coordinator_home::validate_home(std::path::Path::new(&cwd)) {
+                    Ok(path) => roots.push(path),
+                    Err(error) => {
+                        tracing::warn!(%error, "Coordinator home excluded from file allowlist");
+                    }
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, "Coordinator home ownership lookup failed for file allowlist");
+        }
+    }
     for skill_root in state.runtime_env.skill_viewer_roots() {
         if let Ok(dir) = fs::canonicalize(skill_root) {
             roots.push(dir);
@@ -9113,9 +9793,10 @@ async fn get_shared_conversation(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
+    let presentations = EventPresentations::redacted();
     let enriched_msgs: Vec<super::wire::EnrichedMessage> = messages
         .iter()
-        .map(super::wire::EnrichedMessage::from)
+        .map(|message| presentations.enrich(message))
         .collect();
 
     let context_window_size = messages
@@ -9136,6 +9817,7 @@ async fn get_shared_conversation(
 /// SSE stream for a shared conversation. Validates token, then subscribes.
 ///
 /// REQ-AUTH-006 + REQ-AUTH-007: Token-validated, supports multiple simultaneous viewers.
+#[allow(clippy::too_many_lines)]
 async fn shared_sse_stream(
     State(state): State<AppState>,
     Path(token): Path<String>,
@@ -9146,13 +9828,6 @@ async fn shared_sse_stream(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("Invalid share token".to_string()))?;
-
-    let conversation = state
-        .runtime
-        .db()
-        .get_conversation(&conversation_id)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     // A read-only share viewer must never *start* a runtime: `shared_sse_stream`
     // is auth-exempt (token-gated), so calling `get_or_create` here would let an
@@ -9188,17 +9863,44 @@ async fn shared_sse_stream(
     let (pending_anchor_sequence_id, pending_truncated, highest_pending_seq, pending_events) =
         broadcast_tx.snapshot_pending();
 
-    let messages = state
-        .runtime
-        .db()
-        .get_messages(&conversation_id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let transcript_coverage = latest_stream_transcript_coverage(
-        &messages,
-        get_server_message_tail(state.runtime.db(), &conversation_id).await?,
-        false,
-    );
+    let stable =
+        stable_transcript_read(state.runtime.db(), &conversation_id, |db, id, _attempt| {
+            Box::pin(async move {
+                let generation = db
+                    .get_conversation(id)
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?
+                    .transcript_generation;
+                let messages = db
+                    .get_messages(id)
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?;
+                #[cfg(test)]
+                shared_stream_snapshot_tests::change_snapshot(db, id).await?;
+                let opening = db
+                    .read_continuation_opening_at_snapshot(
+                        id,
+                        generation,
+                        messages.iter().map(|message| message.sequence_id).max(),
+                    )
+                    .await
+                    .map_err(|error| match error {
+                        crate::db::DbError::TranscriptSnapshotChanged => {
+                            AppError::TranscriptSnapshotChanged
+                        }
+                        error => AppError::Internal(error.to_string()),
+                    })?;
+                let coverage = latest_stream_transcript_coverage(
+                    &messages,
+                    get_server_message_tail(db, id).await?,
+                    false,
+                );
+                Ok((messages, coverage, opening))
+            })
+        })
+        .await?;
+    let conversation = stable.conversation;
+    let (messages, transcript_coverage, opening) = stable.value;
     let highest_message_seq = messages.iter().map(|m| m.sequence_id).max().unwrap_or(0);
     let init_seq = std::cmp::max(
         std::cmp::max(last_sequence_id, highest_pending_seq),
@@ -9230,6 +9932,7 @@ async fn shared_sse_stream(
         crate::runtime::TranscriptCoverage::Preserve => crate::runtime::InitTranscript::Preserve,
     };
     let init_event = SseEvent::Init {
+        opening: Some(opening.into()),
         sequence_id: init_seq,
         conversation: Box::new(enrich_conversation_with_seed(&state, &conversation, false).await?),
         transcript_generation: conversation.transcript_generation,
@@ -9248,12 +9951,212 @@ async fn shared_sse_stream(
     };
 
     Ok(sse_stream(
+        state.runtime.db().clone(),
         conversation_id,
         init_event,
         broadcast_rx,
         None,
         crate::api::sse::SseStreamAudience::SharedTranscript,
     ))
+}
+
+#[cfg(test)]
+mod shared_stream_snapshot_tests {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    enum SnapshotChange {
+        Append,
+        Mutate,
+    }
+
+    thread_local! {
+        static CHANGE: std::cell::RefCell<Option<(String, SnapshotChange, usize)>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    pub(super) async fn change_snapshot(
+        db: &crate::db::Database,
+        id: &str,
+    ) -> Result<(), AppError> {
+        let change = CHANGE.with(|hook| {
+            let mut hook = hook.borrow_mut();
+            let (target, change, remaining) = hook.as_mut()?;
+            if target != id {
+                return None;
+            }
+            let change = *change;
+            *remaining -= 1;
+            if *remaining == 0 {
+                *hook = None;
+            }
+            Some(change)
+        });
+        match change {
+            Some(SnapshotChange::Append) => {
+                db.add_message(
+                    "shared-appended",
+                    id,
+                    &crate::db::MessageContent::user("appended"),
+                    None,
+                    None,
+                )
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?;
+            }
+            Some(SnapshotChange::Mutate) => {
+                db.update_message_display_data(
+                    "shared-initial",
+                    &serde_json::json!({"race": true}),
+                )
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?;
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    async fn shared_init(state: AppState, token: String) -> serde_json::Value {
+        use futures::StreamExt as _;
+        let response = shared_sse_stream(State(state), Path(token))
+            .await
+            .expect("shared stable init")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let chunk = body.next().await.expect("init chunk").expect("init bytes");
+        let chunk = std::str::from_utf8(&chunk).unwrap();
+        assert!(chunk.lines().any(|line| line == "event: init"));
+        let data = chunk
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        serde_json::from_str(data).unwrap()
+    }
+
+    async fn assert_shared_snapshot_race(change: SnapshotChange) {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let id = "shared-snapshot-race";
+        state
+            .db
+            .create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .add_message(
+                "shared-initial",
+                id,
+                &crate::db::MessageContent::user("initial"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let token = state.db.create_share_token(id).await.unwrap();
+        let before = state
+            .db
+            .get_conversation(id)
+            .await
+            .unwrap()
+            .transcript_generation;
+        CHANGE.with(|hook| *hook.borrow_mut() = Some((id.into(), change, 1)));
+        let init = shared_init(state.clone(), token).await;
+        assert!(CHANGE.with(|hook| hook.borrow().is_none()));
+        assert_eq!(init["messages"][0]["message_id"], "shared-initial");
+        assert_eq!(init["opening"], serde_json::json!({"status": "none"}));
+        assert_eq!(init["transcript_coverage"], "complete");
+        let persisted = state.db.get_messages(id).await.unwrap();
+        assert_eq!(init["messages"].as_array().unwrap().len(), persisted.len());
+        let tail = persisted
+            .iter()
+            .map(|message| message.sequence_id)
+            .max()
+            .unwrap();
+        assert_eq!(init["sequence_id"], tail);
+        assert_eq!(init["last_sequence_id"], tail);
+        let generation = state
+            .db
+            .get_conversation(id)
+            .await
+            .unwrap()
+            .transcript_generation;
+        assert_eq!(init["transcript_generation"], generation);
+        assert_eq!(init["conversation"]["transcript_generation"], generation);
+        match change {
+            SnapshotChange::Append => {
+                assert_eq!(init["messages"][1]["message_id"], "shared-appended");
+                assert_eq!(generation, before);
+            }
+            SnapshotChange::Mutate => {
+                assert_eq!(init["messages"][0]["display_data"]["race"], true);
+                assert_eq!(generation, before + 1);
+            }
+        }
+        assert!(state.runtime.try_get_handle(id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn shared_stream_retries_append_between_messages_and_opening() {
+        assert_shared_snapshot_race(SnapshotChange::Append).await;
+    }
+
+    #[tokio::test]
+    async fn shared_stream_retries_mutation_between_messages_and_opening() {
+        assert_shared_snapshot_race(SnapshotChange::Mutate).await;
+    }
+
+    #[tokio::test]
+    async fn opening_snapshot_retry_is_bounded() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let id = "shared-snapshot-exhausted";
+        state
+            .db
+            .create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .add_message(
+                "shared-initial",
+                id,
+                &crate::db::MessageContent::user("initial"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let token = state.db.create_share_token(id).await.unwrap();
+        let before = state
+            .db
+            .get_conversation(id)
+            .await
+            .unwrap()
+            .transcript_generation;
+        CHANGE.with(|hook| {
+            *hook.borrow_mut() = Some((
+                id.into(),
+                SnapshotChange::Mutate,
+                STABLE_TRANSCRIPT_READ_MAX_ATTEMPTS,
+            ));
+        });
+        let result = shared_sse_stream(State(state.clone()), Path(token)).await;
+        assert!(matches!(result, Err(AppError::Internal(_))));
+        assert!(CHANGE.with(|hook| hook.borrow().is_none()));
+        let after = state
+            .db
+            .get_conversation(id)
+            .await
+            .unwrap()
+            .transcript_generation;
+        assert_eq!(
+            after - before,
+            i64::try_from(STABLE_TRANSCRIPT_READ_MAX_ATTEMPTS).unwrap()
+        );
+        assert!(state.runtime.try_get_handle(id).await.is_none());
+    }
 }
 
 // ============================================================
@@ -9271,6 +10174,7 @@ pub(crate) enum AppError {
     /// 403 — the action is restricted to a caller on the server host.
     Forbidden(String),
     Internal(String),
+    TranscriptSnapshotChanged,
     TypedInternal {
         message: String,
         error_type: String,
@@ -9282,6 +10186,23 @@ pub(crate) enum AppError {
     Conflict(Box<ConflictErrorResponse>),
     /// 422 — expansion reference validation failure (REQ-IR-007)
     UnprocessableEntity(ExpansionErrorResponse),
+}
+
+impl std::fmt::Display for AppError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message: &str = match self {
+            Self::BadRequest(message)
+            | Self::NotFound(message)
+            | Self::Forbidden(message)
+            | Self::Internal(message)
+            | Self::TypedBadRequest { message, .. }
+            | Self::TypedInternal { message, .. } => message,
+            Self::TranscriptSnapshotChanged => "transcript changed during opening observation read",
+            Self::Conflict(detail) => &detail.error,
+            Self::UnprocessableEntity(detail) => &detail.error,
+        };
+        formatter.write_str(message)
+    }
 }
 
 impl IntoResponse for AppError {
@@ -9313,6 +10234,10 @@ impl IntoResponse for AppError {
             AppError::Forbidden(ref msg) => {
                 tracing::debug!(error = %msg, "403 Forbidden");
                 (StatusCode::FORBIDDEN, Json(ErrorResponse::new(msg.clone()))).into_response()
+            }
+            AppError::TranscriptSnapshotChanged => {
+                AppError::Internal("transcript changed during opening observation read".into())
+                    .into_response()
             }
             AppError::Internal(ref msg) => {
                 tracing::error!(error = %msg, "500 Internal Server Error");
@@ -9886,6 +10811,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 content: vec![],
                 end_turn: true,
                 usage: phoenix_llm::Usage::default(),
+                usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
                 stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
             })
         }
@@ -9945,8 +10871,14 @@ pub(crate) mod hard_delete_cascade_tests {
     /// works when the test wants to verify SSE events; conversations
     /// are otherwise inert (no LLM calls fire).
     pub(crate) async fn make_test_state() -> AppState {
+        make_test_state_with_llm(Arc::new(TestLlm)).await
+    }
+
+    pub(crate) async fn make_test_state_with_llm(
+        llm: Arc<dyn phoenix_llm::LlmService>,
+    ) -> AppState {
         let db = Database::open_in_memory().await.expect("open db");
-        let llm_registry = Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(TestLlm)));
+        let llm_registry = Arc::new(ModelRegistry::for_test_with_sonnet(llm));
         let platform = PlatformCapability::None {
             details: "test".into(),
         };
@@ -9964,6 +10896,7 @@ pub(crate) mod hard_delete_cascade_tests {
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
+            slack_gateway_access: crate::slack_gateway::access_gate(),
             runtime,
             llm_registry,
             db,
@@ -9976,6 +10909,8 @@ pub(crate) mod hard_delete_cascade_tests {
             terminals,
             chain_qa,
             message_retriever,
+            federation_tls_trust:
+                phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
@@ -12157,6 +13092,47 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
+    async fn stable_read_retries_typed_opening_snapshot_mismatch() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "opening-snapshot-retry",
+            "opening-snapshot-retry",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let stable = stable_transcript_read(&db, "opening-snapshot-retry", |db, id, attempt| {
+            Box::pin(async move {
+                let generation = db
+                    .get_conversation(id)
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?
+                    .transcript_generation;
+                db.read_continuation_opening_at_snapshot(
+                    id,
+                    generation,
+                    if attempt == 1 { Some(1) } else { None },
+                )
+                .await
+                .map_err(|error| match error {
+                    crate::db::DbError::TranscriptSnapshotChanged => {
+                        AppError::TranscriptSnapshotChanged
+                    }
+                    error => AppError::Internal(error.to_string()),
+                })?;
+                Ok(attempt)
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(stable.attempts, 2);
+        assert_eq!(stable.value, 2);
+    }
+
+    #[tokio::test]
     async fn stable_stream_read_keeps_latest_selection_after_none_generation_race() {
         let state = make_test_state().await;
         state
@@ -12550,6 +13526,139 @@ pub(crate) mod hard_delete_cascade_tests {
         assert!(inv.bash.is_empty());
         assert!(inv.tmux.is_none());
         assert!(inv.browser.is_none());
+    }
+
+    #[tokio::test]
+    async fn work_scope_load_admits_attached_only_and_current_global_across_scopes() {
+        let state = make_test_state().await;
+        let first = create_inspector_actor(&state, "load-first", "Load first").await;
+        let second = create_inspector_actor(&state, "load-second", "Load second").await;
+        super::load_request_scope(&state, "load-first", Some(&first))
+            .await
+            .unwrap();
+        assert!(matches!(
+            super::load_request_scope(&state, "load-first", Some(&second)).await,
+            Err(super::AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            super::load_request_scope(&state, "load-first", None).await,
+            Err(super::AppError::Forbidden(_))
+        ));
+        let global = state
+            .db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        super::load_request_scope(&state, &global.id, Some(&second))
+            .await
+            .unwrap();
+        super::load_request_scope(&state, &global.id, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            super::get_work_scope_load(
+                State(state.clone()),
+                Path("work:does-not-exist".into()),
+                Query(super::WorkScopeActorQuery {
+                    conversation_id: global.id.clone()
+                }),
+            )
+            .await,
+            Err(super::AppError::NotFound(_))
+        ));
+        let Json(empty) = super::get_work_scope_load(
+            State(state.clone()),
+            Path(first.stable_key()),
+            Query(super::WorkScopeActorQuery {
+                conversation_id: "load-first".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(empty.memory_bytes, Some(0));
+        assert!(empty.cpu_one_minute.sampled_seconds.abs() < f64::EPSILON);
+        assert_eq!(empty.live_jobs, 0);
+        assert_eq!(empty.cpu_cores_latest, Some(0.0));
+        assert_eq!(
+            serde_json::to_value(&empty).unwrap()["measurement_basis"],
+            "live_tracked_bash_groups"
+        );
+        let Json(all) = super::get_all_work_scope_load(
+            State(state),
+            Query(super::WorkScopeActorQuery {
+                conversation_id: global.id,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(all
+            .iter()
+            .any(|summary| summary.scope_key == first.stable_key()));
+        assert!(all
+            .iter()
+            .any(|summary| summary.scope_key == second.stable_key()));
+    }
+
+    #[tokio::test]
+    async fn work_scope_load_http_routes_enforce_actor_authority() {
+        use tower::ServiceExt;
+        let state = make_test_state().await;
+        let first = create_inspector_actor(&state, "http-load-first", "Load first").await;
+        let second = create_inspector_actor(&state, "http-load-second", "Load second").await;
+        let global = state
+            .db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let router = super::create_router(state);
+        for (path, expected) in [
+            (
+                format!(
+                    "/api/work-scope/{}/load?conversation_id=http-load-first",
+                    first.stable_key()
+                ),
+                StatusCode::OK,
+            ),
+            (
+                format!(
+                    "/api/work-scope/{}/load?conversation_id=http-load-first",
+                    second.stable_key()
+                ),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "/api/work-scopes/load?conversation_id=http-load-first".into(),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                format!(
+                    "/api/work-scope/{}/load?conversation_id={}",
+                    second.stable_key(),
+                    global.id
+                ),
+                StatusCode::OK,
+            ),
+            (
+                format!("/api/work-scopes/load?conversation_id={}", global.id),
+                StatusCode::OK,
+            ),
+            (
+                "/api/work-scopes/load?conversation_id=unknown".into(),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(&path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{path}");
+        }
     }
 
     #[tokio::test]
@@ -13105,7 +14214,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("live message after subscribe");
         match live {
-            SseEvent::Message { message } => assert_eq!(message.message_id, msg.message_id),
+            SseEvent::Message { message, .. } => assert_eq!(message.message_id, msg.message_id),
             other => panic!("expected live message event, got {other:?}"),
         }
     }
@@ -15512,42 +16621,6 @@ pub(crate) mod hard_delete_cascade_tests {
         (tmp, repo, worktree, branch)
     }
 
-    /// A first-pass Work-mode Close captures its inventory before retirement.
-    #[tokio::test]
-    async fn archive_chain_captures_first_pass_close_inventory() {
-        let state = make_test_state().await;
-        let ids = ["sc-a", "sc-a2", "sc-a3"];
-        let (_tmp, repo, worktree, branch) =
-            build_workmode_chain_with_shared_worktree(&state, &ids).await;
-
-        assert!(worktree.exists(), "precondition: worktree must exist");
-        assert!(
-            crate::git_ops::run_git(&repo, &["rev-parse", "--verify", &branch]).is_ok(),
-            "precondition: branch must exist"
-        );
-
-        let _ = crate::api::chains::archive_chain_handler(
-            axum::extract::State(state.clone()),
-            axum::extract::Path("sc-a".to_string()),
-        )
-        .await
-        .expect("first-pass Close must capture inventory and converge");
-
-        assert!(!worktree.exists(), "Close must retire the shared worktree");
-        assert!(
-            crate::git_ops::run_git(&repo, &["rev-parse", "--verify", &branch]).is_ok(),
-            "archive preserves the shared task branch"
-        );
-        for id in ids {
-            let conv = state
-                .db
-                .get_conversation(id)
-                .await
-                .unwrap_or_else(|_| panic!("{id} row preserved in History"));
-            assert!(conv.archived, "{id} must be archived after Close");
-        }
-    }
-
     /// Chain hard-delete must tear down the chain's shared worktree +
     /// branch exactly once and remove every row. Root-first iteration
     /// (FK on `continued_in_conv_id` requires it) plus the in-cascade
@@ -15971,7 +17044,12 @@ pub(crate) mod hard_delete_cascade_tests {
         drop(parent_rx);
         state
             .runtime
-            .evict_runtime("wl-parent", crate::runtime::EvictionReason::ModelUpgrade)
+            .evict_runtime(
+                "wl-parent",
+                crate::runtime::EvictionReason::ModelUpgrade {
+                    model_changed: false,
+                },
+            )
             .await;
 
         run_hard_delete_cascade(&state, "wl-parent")
@@ -16258,26 +17336,40 @@ mod regenerate_conversation_name_tests {
         ContentBlock, LlmError, LlmRequest, LlmResponse, LlmService, ModelRegistry, Usage,
     };
     use std::sync::Arc;
+    use tower::ServiceExt;
 
     #[derive(Debug)]
     enum StubLlm {
         Ok(&'static str),
+        Long,
+        Paused {
+            started: Arc<tokio::sync::Semaphore>,
+            resume: Arc<tokio::sync::Semaphore>,
+        },
         Err,
     }
 
     #[async_trait]
     impl LlmService for StubLlm {
         async fn complete(&self, _r: &LlmRequest) -> Result<LlmResponse, LlmError> {
-            match self {
-                StubLlm::Ok(text) => Ok(LlmResponse {
-                    provider_replay: None,
-                    content: vec![ContentBlock::text(*text)],
-                    end_turn: true,
-                    usage: Usage::default(),
-                    stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
-                }),
-                StubLlm::Err => Err(LlmError::server_error("temporary outage")),
-            }
+            let text = match self {
+                StubLlm::Ok(text) => (*text).to_string(),
+                StubLlm::Long => "Word ".repeat(100),
+                StubLlm::Paused { started, resume } => {
+                    started.add_permits(1);
+                    resume.acquire().await.unwrap().forget();
+                    "Stale Generated Name".to_string()
+                }
+                StubLlm::Err => return Err(LlmError::server_error("temporary outage")),
+            };
+            Ok(LlmResponse {
+                provider_replay: None,
+                content: vec![ContentBlock::text(text)],
+                end_turn: true,
+                usage: Usage::default(),
+                usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            })
         }
 
         async fn complete_streaming(
@@ -16313,6 +17405,7 @@ mod regenerate_conversation_name_tests {
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
+            slack_gateway_access: crate::slack_gateway::access_gate(),
             runtime,
             llm_registry,
             db,
@@ -16325,6 +17418,8 @@ mod regenerate_conversation_name_tests {
             terminals,
             chain_qa,
             message_retriever,
+            federation_tls_trust:
+                phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
@@ -16361,32 +17456,236 @@ mod regenerate_conversation_name_tests {
 
     async fn regenerate(
         state: &AppState,
-        id: &str,
-    ) -> Result<Json<ConversationResponse>, AppError> {
-        regenerate_conversation_name(State(state.clone()), Path(id.to_string())).await
+        reference: &str,
+    ) -> Result<Json<crate::api::types::ProductConversationListRow>, AppError> {
+        crate::api::product_conversations::regenerate_product_conversation_name(
+            State(state.clone()),
+            Path(reference.to_string()),
+        )
+        .await
     }
 
     #[tokio::test]
-    async fn rename_response_uses_canonical_presentation_serializer() {
+    async fn canonical_regenerate_name_route_returns_product_conversation_row() {
         let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
-            StubLlm::Ok("unused"),
+            StubLlm::Ok("Route Generated Name"),
         ))))
         .await;
-        seed_conversation(&state, "conv-rename", "before-rename").await;
+        seed_conversation(&state, "conv-route-name", "initial-name").await;
+        seed_opening(&state, "conv-route-name", "name this conversation").await;
 
-        let Json(response) = rename_conversation(
-            State(state.clone()),
-            Path("conv-rename".to_string()),
-            Json(RenameRequest {
-                name: "After Rename".to_string(),
-            }),
+        let owner = state
+            .db
+            .get_conversation("conv-route-name")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        let router = create_router(state);
+        for reference in [
+            "initial-name",
+            owner.as_str(),
+            "conv-route-name",
+            "route-generated-name",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "/api/product-conversations/{reference}/regenerate-name"
+                        ))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["canonical_root"]["title"], "Route Generated Name");
+            assert_eq!(body["canonical_root"]["slug"], "route-generated-name");
+        }
+    }
+
+    #[tokio::test]
+    async fn removed_name_management_routes_are_not_registered() {
+        let state = make_test_state(Arc::new(ModelRegistry::new_empty())).await;
+        let router = create_router(state).route_layer(axum::middleware::map_response(
+            |mut response: axum::response::Response| async move {
+                response.headers_mut().insert(
+                    "x-test-registered-route",
+                    axum::http::HeaderValue::from_static("present"),
+                );
+                response
+            },
+        ));
+        let registered = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/product-conversations/unknown")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(registered.headers().contains_key("x-test-registered-route"));
+        for (method, uri) in [
+            ("POST", "/api/conversations/old/rename"),
+            ("POST", "/api/conversations/old/regenerate-name"),
+            ("PATCH", "/api/chains/old/name"),
+            ("POST", "/api/chains/old/regenerate-name"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(r#"{"name":"ignored"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                !response.headers().contains_key("x-test-registered-route"),
+                "obsolete route was registered: {method} {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_naming_preserves_validation_and_history_conflicts() {
+        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
+            StubLlm::Ok("Generated Name"),
+        ))))
+        .await;
+        seed_conversation(&state, "history-name", "retained-history-name").await;
+        seed_opening(&state, "history-name", "opening").await;
+        let before = state.db.get_conversation("history-name").await.unwrap();
+        let router = create_router(state.clone());
+        let invalid = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PATCH")
+                    .uri("/api/product-conversations/history-name/title")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"title":"  "}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), axum::http::StatusCode::BAD_REQUEST);
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
         )
+        .bind(before.product_conversation_id.as_str())
+        .execute(state.db.pool())
         .await
-        .expect("rename");
-        assert_eq!(response.conversation["slug"], "After Rename");
-        assert!(response.conversation.get("presentation_mode").is_some());
-        assert!(response.conversation.get("requires_action").is_some());
-        assert!(response.conversation.get("work_scope_key").is_some());
+        .unwrap();
+        for (method, suffix, body) in [
+            ("PATCH", "title", r#"{"title":"Changed Name"}"#),
+            ("POST", "regenerate-name", ""),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(format!(
+                            "/api/product-conversations/{}/{suffix}",
+                            before.product_conversation_id
+                        ))
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        }
+        let after = state.db.get_conversation("history-name").await.unwrap();
+        assert_eq!((after.title, after.slug), (before.title, before.slug));
+    }
+
+    #[tokio::test]
+    async fn canonical_generation_rejects_invalid_output_without_name_or_route_changes() {
+        for llm in [StubLlm::Long, StubLlm::Ok("\u{0007}"), StubLlm::Ok("")] {
+            let state =
+                make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(llm)))).await;
+            seed_conversation(&state, "invalid-generated", "retained-name").await;
+            seed_opening(&state, "invalid-generated", "opening").await;
+            let before = state
+                .db
+                .get_conversation("invalid-generated")
+                .await
+                .unwrap();
+            assert!(regenerate(&state, "retained-name").await.is_err());
+            let after = state
+                .db
+                .get_conversation("invalid-generated")
+                .await
+                .unwrap();
+            assert_eq!(after.title, before.title);
+            assert_eq!(after.slug, before.slug);
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_generation_pins_owner_and_rejects_aba_after_slug_reassignment() {
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let resume = Arc::new(tokio::sync::Semaphore::new(0));
+        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
+            StubLlm::Paused {
+                started: started.clone(),
+                resume: resume.clone(),
+            },
+        ))))
+        .await;
+        seed_conversation(&state, "generated-owner", "original-name").await;
+        seed_opening(&state, "generated-owner", "opening").await;
+        state
+            .db
+            .set_ordinary_product_conversation_title("generated-owner", "Original Name")
+            .await
+            .unwrap();
+        let generating_state = state.clone();
+        let generation =
+            tokio::spawn(async move { regenerate(&generating_state, "original-name").await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        state
+            .db
+            .set_ordinary_product_conversation_title("generated-owner", "Interim Name")
+            .await
+            .unwrap();
+        seed_conversation(&state, "other-owner", "original-name").await;
+        state
+            .db
+            .set_ordinary_product_conversation_title("generated-owner", "Original Name")
+            .await
+            .unwrap();
+        let before = state.db.get_conversation("generated-owner").await.unwrap();
+        let other_before = state.db.get_conversation("other-owner").await.unwrap();
+        resume.add_permits(1);
+        assert!(generation.await.unwrap().is_err());
+        let after = state.db.get_conversation("generated-owner").await.unwrap();
+        let other_after = state.db.get_conversation("other-owner").await.unwrap();
+        assert_eq!((after.title, after.slug), (before.title, before.slug));
+        assert_eq!(
+            (other_after.title, other_after.slug),
+            (other_before.title, other_before.slug)
+        );
     }
 
     #[tokio::test]
@@ -16404,13 +17703,15 @@ mod regenerate_conversation_name_tests {
         .await;
 
         let Json(response) = regenerate(&state, "conv-ok").await.expect("regenerate");
-        assert_eq!(response.conversation["slug"], "useful-auth-fix");
-        assert!(response
-            .conversation
-            .get("product_conversation_id")
-            .is_none());
-        assert!(response.conversation.get("presentation_mode").is_some());
-        assert!(response.conversation.get("work_scope_key").is_some());
+        assert_eq!(
+            response.canonical_root.slug.as_deref(),
+            Some("useful-auth-fix")
+        );
+        assert!(!response.product_conversation_id.is_empty());
+        assert!(matches!(
+            response.presentation,
+            crate::api::types::ProductConversationPresentationView::State { .. }
+        ));
         let reloaded = state.db.get_conversation("conv-ok").await.expect("reload");
         assert_eq!(reloaded.slug.as_deref(), Some("useful-auth-fix"));
     }
@@ -16451,7 +17752,7 @@ mod regenerate_conversation_name_tests {
     }
 
     #[tokio::test]
-    async fn duplicate_generated_slug_returns_error_and_leaves_slug_unchanged() {
+    async fn duplicate_generated_name_allocates_projection_and_preserves_prose() {
         let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
             StubLlm::Ok("Taken Slug"),
         ))))
@@ -16460,13 +17761,19 @@ mod regenerate_conversation_name_tests {
         seed_conversation(&state, "conv-rename", "deterministic-conv-rename").await;
         seed_opening(&state, "conv-rename", "rename this later").await;
 
-        assert!(regenerate(&state, "conv-rename").await.is_err());
+        let Json(response) = regenerate(&state, "conv-rename").await.expect("regenerate");
+        assert_eq!(
+            response.canonical_root.slug.as_deref(),
+            Some("taken-slug-2")
+        );
+        assert_eq!(response.canonical_root.title.as_deref(), Some("Taken Slug"));
         let reloaded = state
             .db
             .get_conversation("conv-rename")
             .await
             .expect("reload");
-        assert_eq!(reloaded.slug.as_deref(), Some("deterministic-conv-rename"));
+        assert_eq!(reloaded.slug.as_deref(), Some("taken-slug-2"));
+        assert_eq!(reloaded.title.as_deref(), Some("Taken Slug"));
     }
 
     #[tokio::test]
@@ -16513,6 +17820,7 @@ mod upgrade_model_state_guard_tests {
                 content: vec![ContentBlock::text("stub")],
                 end_turn: true,
                 usage: Usage::default(),
+                usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
                 stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
             })
         }
@@ -16530,8 +17838,14 @@ mod upgrade_model_state_guard_tests {
     }
 
     async fn make_test_state() -> AppState {
+        make_test_state_with_registry(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
+            StubLlm,
+        ))))
+        .await
+    }
+
+    async fn make_test_state_with_registry(llm_registry: Arc<ModelRegistry>) -> AppState {
         let db = Database::open_in_memory().await.expect("open db");
-        let llm_registry = Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(StubLlm)));
         let platform = PlatformCapability::None {
             details: "test".into(),
         };
@@ -16549,6 +17863,7 @@ mod upgrade_model_state_guard_tests {
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
+            slack_gateway_access: crate::slack_gateway::access_gate(),
             runtime,
             llm_registry,
             db,
@@ -16561,6 +17876,8 @@ mod upgrade_model_state_guard_tests {
             terminals,
             chain_qa,
             message_retriever,
+            federation_tls_trust:
+                phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
@@ -16571,6 +17888,181 @@ mod upgrade_model_state_guard_tests {
             }),
             resource_monitor: crate::api::resource_monitor::ResourceMonitor::new(),
         }
+    }
+
+    #[derive(Debug)]
+    struct CapturingLlm {
+        model: &'static str,
+        requests: Arc<std::sync::Mutex<Vec<(String, u32)>>>,
+    }
+
+    #[async_trait]
+    impl LlmService for CapturingLlm {
+        async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+            if request.telemetry.is_some() {
+                self.requests
+                    .lock()
+                    .unwrap()
+                    .push((self.model.to_owned(), request.max_tokens));
+            }
+            StubLlm.complete(request).await
+        }
+        fn model_id(&self) -> &str {
+            self.model
+        }
+    }
+
+    async fn ordinary_turn(state: &AppState, id: &str, message_id: &str, text: &str) {
+        use tower::ServiceExt as _;
+        let mut events = state.runtime.conversation_broadcaster(id).await.subscribe();
+        let response = create_router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/conversations/{id}/chat"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "text":text,"message_id":message_id,"expansion_policy":"literal_text"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut requesting = false;
+            loop {
+                match events.recv().await.unwrap() {
+                    crate::runtime::SseEvent::StateChange {
+                        state:
+                            ConvState::LlmRequesting { .. } | ConvState::SeededLlmRequesting { .. },
+                        ..
+                    } => requesting = true,
+                    crate::runtime::SseEvent::StateChange {
+                        state: ConvState::Idle,
+                        ..
+                    } if requesting => break,
+                    crate::runtime::SseEvent::ConversationBecameTerminal { .. } => break,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "ordinary request {message_id} did not settle: {:?}",
+            state.db.get_conversation(id).await.unwrap().state
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one real model-switch and pressure lifecycle
+    async fn accepted_model_switch_recreates_ordinary_request_limits_and_preserves_pressure_input()
+    {
+        use sqlx::Row as _;
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let models = [
+            ("claude-opus-4-7", 200_000, 16_000),
+            ("claude-sonnet-5", 64_000, 8_000),
+        ];
+        let registry = ModelRegistry::for_test_with_model_limits(
+            models
+                .iter()
+                .map(|&(id, context, output)| {
+                    (
+                        id,
+                        Arc::new(CapturingLlm {
+                            model: id,
+                            requests: requests.clone(),
+                        }) as Arc<dyn LlmService>,
+                        context,
+                        output,
+                    )
+                })
+                .collect(),
+        );
+        let state = make_test_state_with_registry(Arc::new(registry)).await;
+        state.runtime.start_sub_agent_handler().await;
+        state.runtime.start_direct_turn_worker().await.unwrap();
+        let id = "model-switch-dispatch";
+        seed(&state, id).await;
+        for (index, (model, context, output)) in [models[0], models[1], models[0], models[0]]
+            .into_iter()
+            .enumerate()
+        {
+            if index > 0 {
+                upgrade(&state, id, model).await.unwrap();
+            }
+            ordinary_turn(
+                &state,
+                id,
+                &format!("small-{index}"),
+                "Keep the correction and unfinished work.",
+            )
+            .await;
+            let plans = sqlx::query("SELECT plan_id,model,context_window_tokens,output_reservation_tokens,outcome,prefix_comparison FROM request_capacity_plans WHERE conversation_id=? AND kind='ordinary' ORDER BY rowid")
+                .bind(id).fetch_all(state.db.pool()).await.unwrap();
+            assert_eq!(plans.len(), index + 1);
+            let plan = &plans[index];
+            assert_eq!(plan.get::<String, _>("model"), model);
+            assert_eq!(
+                plan.get::<i64, _>("context_window_tokens"),
+                i64::try_from(context).unwrap()
+            );
+            assert_eq!(
+                plan.get::<i64, _>("output_reservation_tokens"),
+                i64::from(output)
+            );
+            assert_eq!(plan.get::<String, _>("outcome"), "ready");
+            assert_eq!(requests.lock().unwrap()[index], (model.to_owned(), output));
+            assert_eq!(plan.get::<String, _>("prefix_comparison"), "unknown");
+            let causes: Vec<String> = sqlx::query_scalar(
+                "SELECT cause FROM request_prefix_change_causes WHERE plan_id=? AND cause='model_route_switch'",
+            ).bind(plan.get::<String, _>("plan_id")).fetch_all(state.db.pool()).await.unwrap();
+            assert_eq!(causes.len(), usize::from(index == 1 || index == 2));
+        }
+        upgrade(&state, id, models[1].0).await.unwrap();
+        let pressure_input =
+            "preserve this original correction and unresolved obligation ".repeat(4_000);
+        ordinary_turn(&state, id, "downgrade-pressure", &pressure_input).await;
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            5,
+            "ordinary overflow must enter one real summary request"
+        );
+        let plan = sqlx::query("SELECT model,context_window_tokens,output_reservation_tokens,outcome FROM request_capacity_plans WHERE conversation_id=? AND kind='ordinary' ORDER BY rowid DESC LIMIT 1")
+            .bind(id).fetch_one(state.db.pool()).await.unwrap();
+        assert_eq!(plan.get::<String, _>("model"), models[1].0);
+        assert_eq!(plan.get::<i64, _>("context_window_tokens"), 64_000);
+        assert_eq!(plan.get::<i64, _>("output_reservation_tokens"), 8_000);
+        assert_eq!(plan.get::<String, _>("outcome"), "needs_compaction");
+        let summary_plan = sqlx::query("SELECT model,context_window_tokens,output_reservation_tokens,outcome FROM request_capacity_plans WHERE conversation_id=? AND kind='compaction' ORDER BY rowid DESC LIMIT 1")
+            .bind(id).fetch_one(state.db.pool()).await.unwrap();
+        assert_eq!(summary_plan.get::<String, _>("model"), models[1].0);
+        assert_eq!(summary_plan.get::<i64, _>("context_window_tokens"), 64_000);
+        assert_eq!(
+            summary_plan.get::<i64, _>("output_reservation_tokens"),
+            8_000
+        );
+        assert_eq!(summary_plan.get::<String, _>("outcome"), "ready");
+        assert_eq!(requests.lock().unwrap()[4], (models[1].0.to_owned(), 8_000));
+        let messages = state.db.get_messages(id).await.unwrap();
+        assert!(
+            messages.iter().any(|message| matches!(
+                &message.content,
+                crate::db::MessageContent::User(user) if user.text == pressure_input
+            )),
+            "the accepted original input must remain in the transcript"
+        );
+        assert!(matches!(
+            state.db.get_conversation(id).await.unwrap().state,
+            ConvState::ContextExhausted { summary } if summary == "stub"
+        ));
+        state.runtime.begin_process_shutdown();
+        state.runtime.drain_process_shutdown().await;
     }
 
     async fn upgrade(state: &AppState, id: &str, model: &str) -> Result<(), AppError> {
@@ -16848,6 +18340,7 @@ mod file_read_tests {
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
+            slack_gateway_access: crate::slack_gateway::access_gate(),
             runtime,
             llm_registry,
             db,
@@ -16860,6 +18353,8 @@ mod file_read_tests {
             terminals,
             chain_qa,
             message_retriever,
+            federation_tls_trust:
+                phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
@@ -17600,6 +19095,7 @@ mod chat_authority_tests {
     //! The fix: `effective_conversation_state` returns the live state; the
     //! handler queues a steering message instead.
     use super::*;
+    use crate::api::ChatExpansionPolicy;
     use crate::db::Database;
     use crate::platform::PlatformCapability;
     use crate::runtime::RuntimeManager;
@@ -17632,6 +19128,7 @@ mod chat_authority_tests {
         );
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
+            slack_gateway_access: crate::slack_gateway::access_gate(),
             runtime,
             llm_registry,
             db,
@@ -17644,6 +19141,8 @@ mod chat_authority_tests {
             terminals,
             chain_qa,
             message_retriever,
+            federation_tls_trust:
+                phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
@@ -17653,6 +19152,462 @@ mod chat_authority_tests {
                 ..crate::discovery::DiscoveryConfig::from_env()
             }),
             resource_monitor: crate::api::resource_monitor::ResourceMonitor::new(),
+        }
+    }
+
+    async fn public_chat_post(
+        state: &AppState,
+        id: &str,
+        body: &serde_json::Value,
+    ) -> axum::response::Response {
+        chat_post_path(state, &format!("/api/conversations/{id}/chat"), body).await
+    }
+
+    async fn chat_post_path(
+        state: &AppState,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> axum::response::Response {
+        use tower::ServiceExt as _;
+        create_router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn literal_chat_body(response: axum::response::Response) -> serde_json::Value {
+        serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn public_literal_chat_preserves_idle_and_running_payloads_and_retry_policy() {
+        use phoenix_core::domain::sm_event::PreparedDirectTurnPayload;
+        for running in [false, true] {
+            let state = make_state().await;
+            let id = "literal-chat";
+            state
+                .db
+                .create_conversation(id, id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            if running {
+                state
+                    .runtime
+                    .inject_handle_for_test(id, ConvState::LlmRequesting { attempt: 1 })
+                    .await;
+            }
+            let text = "/spears @Cargo.toml @file:missing @someone\n  exact café bytes  \n";
+            let body = serde_json::json!({
+                "text": text, "message_id": "literal-message", "expansion_policy": "literal_text",
+                "images": [{"media_type": "image/png", "data": "aW1hZ2U="}],
+                "files": [], "user_agent": "literal-test",
+            });
+            let response = public_chat_post(&state, id, &body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let response_body = literal_chat_body(response).await;
+            assert_eq!(
+                response_body,
+                if running {
+                    serde_json::json!({"queued": true, "steering": true})
+                } else {
+                    serde_json::json!({"queued": true})
+                }
+            );
+            if running {
+                let queue = state.db.get_steering_queue(id).await.unwrap();
+                assert_eq!(queue.len(), 1);
+                assert_eq!(queue[0].message_id, "literal-message");
+                assert_eq!(queue[0].text, text);
+                assert!(queue[0].llm_text.is_none());
+                assert!(queue[0].skill_invocation.is_none());
+                assert_eq!(queue[0].images[0].data, "aW1hZ2U=");
+                assert_eq!(queue[0].user_agent.as_deref(), Some("literal-test"));
+                assert_eq!(
+                    queue[0].origin,
+                    phoenix_core::domain::db_schema::InputOrigin::UserApi
+                );
+            } else {
+                let turn = state
+                    .db
+                    .workflow_repository()
+                    .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
+                        id.to_string(),
+                    ))
+                    .await
+                    .unwrap()
+                    .expect("accepted direct turn");
+                let payload =
+                    PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload()).unwrap();
+                assert_eq!(payload.message_id(), "literal-message");
+                assert_eq!(payload.delivery.text, text);
+                assert!(payload.delivery.llm_text.is_none());
+                assert!(payload.delivery.skill_invocation.is_none());
+                assert_eq!(payload.delivery.images[0].data, "aW1hZ2U=");
+                assert_eq!(payload.delivery.user_agent.as_deref(), Some("literal-test"));
+                assert_eq!(
+                    payload.submitted.expansion_policy,
+                    phoenix_core::domain::sm_event::SubmittedDirectTurnExpansionPolicy::LiteralText
+                );
+                assert_eq!(
+                    payload.submitted.origin,
+                    phoenix_core::domain::db_schema::InputOrigin::UserApi
+                );
+            }
+            assert_eq!(
+                public_chat_post(&state, id, &body).await.status(),
+                StatusCode::OK
+            );
+            let mut changed = body.clone();
+            changed["expansion_policy"] = serde_json::json!("expand_references");
+            let conflict = public_chat_post(&state, id, &changed).await;
+            assert_eq!(conflict.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                literal_chat_body(conflict).await["error_type"],
+                "idempotency_conflict"
+            );
+            if running {
+                assert_eq!(state.db.get_steering_queue(id).await.unwrap().len(), 1);
+            }
+        }
+    }
+
+    async fn pending_literal_manual_opening(
+        text: &str,
+    ) -> (
+        AppState,
+        crate::db::Conversation,
+        crate::db::ContinuationDispatchIntent,
+    ) {
+        use phoenix_workflow::ClientTurnKey;
+        let state = make_state().await;
+        let parent = "literal-opening-parent";
+        state
+            .db
+            .create_conversation(parent, parent, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_state(
+                parent,
+                &ConvState::ContextExhausted {
+                    summary: "predecessor summary".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let (outcome, intent) = state
+            .db
+            .continue_conversation_with_intent(
+                parent,
+                crate::db::NewContinuationDispatchIntent::user_authorized(
+                    ClientTurnKey::new("manual-opening").unwrap(),
+                    text.to_string(),
+                    Some("original-agent".to_string()),
+                ),
+            )
+            .await
+            .unwrap();
+        let crate::db::ContinueOutcome::Created(successor) = outcome else {
+            panic!("expected successor");
+        };
+        let intent = intent.expect("pending manual opening");
+        (state, successor, intent)
+    }
+
+    #[tokio::test]
+    async fn public_literal_chat_checks_pending_manual_opening_before_canonicalization() {
+        use phoenix_core::domain::sm_event::PreparedDirectTurnPayload;
+        use phoenix_workflow::ConversationAuthority;
+
+        for namespaced in [false, true] {
+            let text = "/spears @missing manual handoff\n  café  \n";
+            let (state, successor, intent) = pending_literal_manual_opening(text).await;
+            let message_id = if namespaced {
+                format!("{}:{}", successor.id, intent.message_id.as_str())
+            } else {
+                intent.message_id.as_str().to_string()
+            };
+            let body = serde_json::json!({
+                "text": text, "message_id": message_id, "expansion_policy": "literal_text",
+                "user_agent": "original-agent",
+            });
+            let mut conflicts = vec![body.clone(), body.clone()];
+            conflicts[0]["text"] = serde_json::json!("changed text");
+            conflicts[1]["user_agent"] = serde_json::json!("changed-agent");
+            if namespaced {
+                conflicts.push(body.clone());
+            }
+            for changed in conflicts {
+                let response = public_chat_post(&state, &successor.id, &changed).await;
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                assert_eq!(
+                    literal_chat_body(response).await["error_type"],
+                    "continuation_opening_mismatch"
+                );
+                assert!(state
+                    .db
+                    .workflow_repository()
+                    .load_active_runtime_turn(&ConversationAuthority(successor.id.clone()),)
+                    .await
+                    .unwrap()
+                    .is_none());
+                assert!(state
+                    .db
+                    .get_steering_queue(&successor.id)
+                    .await
+                    .unwrap()
+                    .is_empty());
+                assert!(state
+                    .db
+                    .get_messages(&successor.id)
+                    .await
+                    .unwrap()
+                    .is_empty());
+                assert_eq!(
+                    state
+                        .db
+                        .continuation_dispatch_intent_for_successor(&successor.id)
+                        .await
+                        .unwrap(),
+                    Some(intent.clone())
+                );
+            }
+            if namespaced {
+                continue;
+            }
+            assert_eq!(
+                public_chat_post(&state, &successor.id, &body)
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+            let turn = state
+                .db
+                .workflow_repository()
+                .load_active_runtime_turn(&ConversationAuthority(successor.id.clone()))
+                .await
+                .unwrap()
+                .expect("exact manual opening accepted");
+            let payload =
+                PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload()).unwrap();
+            assert_eq!(payload.submitted.message_id, intent.message_id.as_str());
+            assert_eq!(payload.submitted.text, text);
+            assert_eq!(payload.delivery.text, text);
+            assert_eq!(
+                payload.submitted.user_agent.as_deref(),
+                Some("original-agent")
+            );
+            assert_eq!(
+                payload.delivery.user_agent.as_deref(),
+                Some("original-agent")
+            );
+            assert!(payload.delivery.llm_text.is_none());
+            assert_eq!(
+                public_chat_post(&state, &successor.id, &body)
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_chat_default_still_expands_and_rejects_unknown_policy() {
+        let state = make_state().await;
+        let cwd = tempfile::tempdir().unwrap();
+        state
+            .db
+            .create_conversation(
+                "expand",
+                "expand",
+                cwd.path().to_str().unwrap(),
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        for policy in [None, Some("expand_references")] {
+            let mut body = serde_json::json!({"text": "@nonexistent-literal-chat-file.txt", "message_id": "m"});
+            if let Some(policy) = policy {
+                body["expansion_policy"] = serde_json::json!(policy);
+            }
+            let response = public_chat_post(&state, "expand", &body).await;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let error = literal_chat_body(response).await;
+            assert_eq!(error["error_type"], "file_not_found");
+            assert_eq!(error["reference"], "@nonexistent-literal-chat-file.txt");
+        }
+        let mut body = serde_json::json!({"text": "plain text", "message_id": "m"});
+        for (policy, expected_status) in [
+            (
+                serde_json::json!("generated_predecessor_context"),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                serde_json::json!("unknown"),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (serde_json::Value::Null, StatusCode::BAD_REQUEST),
+            (serde_json::json!(1), StatusCode::BAD_REQUEST),
+        ] {
+            body["expansion_policy"] = policy;
+            assert_eq!(
+                public_chat_post(&state, "expand", &body).await.status(),
+                expected_status,
+                "expansion_policy={}",
+                body["expansion_policy"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_literal_chat_keeps_auth_and_attachment_validation() {
+        let mut state = make_state().await;
+        state
+            .db
+            .create_conversation("bounds", "bounds", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let mut body = serde_json::json!({"text": "literal", "message_id": "m", "expansion_policy": "literal_text"});
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                "test-password".to_string(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            public_chat_post(&state, "bounds", &body).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        state.password = None;
+        body["files"] = serde_json::json!([{
+            "original_name": "secret", "media_type": "text/plain", "size_bytes": 1,
+            "stored_path": "/etc/passwd",
+        }]);
+        assert_eq!(
+            public_chat_post(&state, "bounds", &body).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(state
+            .db
+            .get_steering_queue("bounds")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .db
+            .workflow_repository()
+            .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
+                "bounds".to_string()
+            ))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn public_literal_chat_accepts_valid_bearer_authentication() {
+        use tower::ServiceExt as _;
+        let mut state = make_state().await;
+        let id = "literal-authenticated";
+        state
+            .db
+            .create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                "test-password".to_string(),
+            )
+            .unwrap(),
+        );
+        state
+            .runtime
+            .inject_handle_for_test(id, ConvState::LlmRequesting { attempt: 1 })
+            .await;
+        let text = "/spears @missing authenticated literal";
+        let body = serde_json::json!({
+            "text": text, "message_id": "authenticated-message", "expansion_policy": "literal_text",
+        });
+        let response = create_router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/conversations/{id}/chat"))
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-password")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(literal_chat_body(response).await["steering"], true);
+        let queue = state.db.get_steering_queue(id).await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].text, text);
+        assert!(queue[0].llm_text.is_none());
+        assert!(queue[0].skill_invocation.is_none());
+    }
+
+    #[tokio::test]
+    async fn public_literal_chat_keeps_close_and_history_admission() {
+        for (id, expected) in [
+            ("literal-closing", "close_admission_fenced"),
+            ("literal-history", "target_unavailable"),
+        ] {
+            let state = make_state().await;
+            state
+                .db
+                .create_conversation(id, id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            let conversation = state.db.get_conversation(id).await.unwrap();
+            if expected == "close_admission_fenced" {
+                state
+                    .db
+                    .begin_close_foundation(
+                        &conversation.product_conversation_id,
+                        &phoenix_core::domain::close::TranscriptConversationId::parse(id).unwrap(),
+                        "literal-close-attempt",
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                sqlx::query(
+                    "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+                )
+                .bind(conversation.product_conversation_id.as_str())
+                .execute(state.db.pool())
+                .await
+                .unwrap();
+            }
+            let body = serde_json::json!({"text": "/spears @Cargo.toml", "message_id": "m", "expansion_policy": "literal_text"});
+            let response = public_chat_post(&state, id, &body).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(literal_chat_body(response).await["error_type"], expected);
+            assert!(state.db.get_steering_queue(id).await.unwrap().is_empty());
+            assert!(state
+                .db
+                .workflow_repository()
+                .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(id.to_string()))
+                .await
+                .unwrap()
+                .is_none());
         }
     }
 
@@ -17700,6 +19655,7 @@ mod chat_authority_tests {
         // POST /chat: must queue as steering (not reject AgentBusy).
         let req = ChatRequest {
             text: "continue please".to_string(),
+            expansion_policy: ChatExpansionPolicy::ExpandReferences,
             message_id: uuid::Uuid::new_v4().to_string(),
             images: vec![],
             files: vec![],
@@ -17760,6 +19716,7 @@ mod chat_authority_tests {
             Path("c-cancel".to_string()),
             Json(ChatRequest {
                 text: "cancel me".to_string(),
+                expansion_policy: ChatExpansionPolicy::ExpandReferences,
                 message_id: message_id.clone(),
                 images: Vec::new(),
                 files: Vec::new(),
@@ -17827,6 +19784,7 @@ mod chat_authority_tests {
                 Path("c-order".to_string()),
                 Json(ChatRequest {
                     text: text.to_string(),
+                    expansion_policy: ChatExpansionPolicy::ExpandReferences,
                     message_id: message_id.to_string(),
                     images: Vec::new(),
                     files: Vec::new(),
@@ -17923,7 +19881,7 @@ mod chat_authority_tests {
 }
 
 #[cfg(test)]
-mod wake_handler_tests {
+mod lifecycle_handler_tests {
     use super::*;
     use crate::api::Database;
     use crate::chain_qa::ChainQa;
@@ -17956,6 +19914,7 @@ mod wake_handler_tests {
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
+            slack_gateway_access: crate::slack_gateway::access_gate(),
             runtime,
             llm_registry,
             db,
@@ -17968,6 +19927,8 @@ mod wake_handler_tests {
             terminals,
             chain_qa,
             message_retriever,
+            federation_tls_trust:
+                phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
@@ -17988,78 +19949,323 @@ mod wake_handler_tests {
             .expect("create conversation");
     }
 
-    async fn register_bash_wake(
-        state: &AppState,
-        workflow_id: u64,
-        conversation_id: &str,
-        contract_id: &str,
-    ) {
-        let repo = state.db.wake_repository();
-        let work_scope_id = state
-            .db
-            .get_conversation(conversation_id)
-            .await
-            .expect("load conversation")
-            .attached_work_scope_id
-            .expect("ordinary conversation scope");
-        let wake_scope =
-            phoenix_workflow::wake_profile::WorkScopeIdentity(work_scope_id.as_str().to_string());
-        let intent = phoenix_workflow::wake_profile::WakeRegistrationIntent {
-            contract_id: contract_id.to_string(),
-            conversation_id: conversation_id.to_string(),
-            root_conversation_id: conversation_id.to_string(),
-            registration_scope: wake_scope.clone(),
-            resource: phoenix_workflow::wake_profile::WakeResourceIdentity::Bash(
-                phoenix_workflow::wake_profile::BashResourceIdentity {
-                    work_scope: wake_scope,
-                    handle_id: format!("b-{workflow_id}"),
-                },
-            ),
-            registering_tool_use_id: format!("tool-{workflow_id}"),
-            registered_at: phoenix_workflow::Timestamp(10),
-            expires_at: phoenix_workflow::Timestamp(100 + workflow_id),
-        };
-        let outcome = repo
-            .register_allocated(
-                phoenix_workflow::WorkflowId(workflow_id),
-                &intent,
-                &format!("fp-{workflow_id}"),
-                phoenix_workflow::Timestamp(10),
+    #[tokio::test]
+    async fn peer_import_requires_owner_authentication() {
+        use phoenix_core::domain::instance_identity::InstanceId;
+        let mut state = hard_delete_cascade_tests::make_test_state().await;
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                "owner-password".to_string(),
             )
-            .await
-            .expect("register wake");
-        assert!(matches!(
-            outcome,
-            phoenix_db::workflow::wake::WakeRegistrationOutcome::Registered { .. }
-                | phoenix_db::workflow::wake::WakeRegistrationOutcome::Replayed { .. }
-        ));
-    }
+            .unwrap(),
+        );
+        let local = state.db.instance_id().await.unwrap();
+        let body = serde_json::json!({
+            "peer_display_name": "peer",
+            "base_url": "https://peer.example",
+            "enrollment": {
+                "receiver_instance_id": InstanceId::new(),
+                "caller_instance_id": local,
+                "token": format!("phx_peer_{}", "a".repeat(43)),
+                "tls_trust": { "kind": "platform_roots" },
+            }
+        });
+        let app = create_router(state);
 
-    async fn cancel_via_router(
-        state: &AppState,
-        conversation_id: &str,
-        contract_id: &str,
-    ) -> axum::response::Response {
-        create_router(state.clone())
+        let unauthorized = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri(format!(
-                        "/api/conversations/{conversation_id}/wake/{contract_id}/cancel"
-                    ))
-                    .body(Body::empty())
-                    .expect("request"),
+                    .uri("/api/federation/peers/import")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
             )
             .await
-            .expect("router response")
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let imported = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/federation/peers/import")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer owner-password")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(imported.status(), StatusCode::OK);
     }
 
     #[tokio::test]
-    async fn peer_namespace_cannot_login_as_owner_via_json() {
+    async fn peer_import_rejects_non_der_basic_constraints_without_persisting() {
+        use base64::Engine as _;
+        use phoenix_core::domain::instance_identity::InstanceId;
+        use tower::ServiceExt as _;
+
+        let mut state = hard_delete_cascade_tests::make_test_state().await;
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                "owner-password".to_string(),
+            )
+            .unwrap(),
+        );
+        let local = state.db.instance_id().await.unwrap();
+        for content in [
+            vec![0x30, 0x03, 0x21, 0x01, 0xff],
+            vec![0x30, 0x03, 0x01, 0x01, 0x01],
+        ] {
+            let peer = InstanceId::new();
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new())
+                .expect("empty SAN list is valid for CA certificates");
+            params.is_ca = rcgen::IsCa::NoCa;
+            params
+                .custom_extensions
+                .push(rcgen::CustomExtension::from_oid_content(
+                    &[2, 5, 29, 19],
+                    content,
+                ));
+            let key_pair = rcgen::KeyPair::generate().unwrap();
+            let certificate = params.self_signed(&key_pair).unwrap();
+            let certificate_pem = format!(
+                "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+                base64::engine::general_purpose::STANDARD.encode(certificate.der())
+            );
+            let body = serde_json::json!({
+                "peer_display_name": "peer",
+                "base_url": "https://peer.example",
+                "enrollment": {
+                    "receiver_instance_id": peer,
+                    "caller_instance_id": local,
+                    "token": format!("phx_peer_{}", "a".repeat(43)),
+                    "tls_trust": {
+                        "kind": "private_ca",
+                        "certificate_pem": certificate_pem,
+                    },
+                }
+            });
+
+            let response = create_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/federation/peers/import")
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer owner-password")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(state
+                .db
+                .federation_peer_connection(peer)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_query_database_requires_peer_auth_and_destination_identity() {
+        use axum::body::to_bytes;
         use tower::ServiceExt as _;
 
         let mut state = make_test_state().await;
-        state.password = Some("phx_peer_same-secret".to_string());
+        let owner_password = "phx_peer_owner-password";
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                owner_password.to_string(),
+            )
+            .unwrap(),
+        );
+        let destination = state.db.instance_id().await.unwrap();
+        let caller = phoenix_core::domain::instance_identity::InstanceId::new();
+        let token = format!("phx_peer_{}", "a".repeat(43));
+        state
+            .db
+            .replace_federation_enrollment(
+                caller,
+                "peer",
+                &phoenix_core::domain::instance_identity::FederationCredentialVerifier::from_bearer(
+                    token.as_bytes(),
+                ),
+            )
+            .await
+            .unwrap();
+        let request_body = serde_json::json!({
+            "destination_instance_id": destination,
+            "sql": "SELECT 1"
+        })
+        .to_string();
+
+        let unauthenticated = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/federation/peer/query-database")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let owner_credential = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/federation/peer/query-database")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {owner_password}"),
+                    )
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(owner_credential.status(), StatusCode::UNAUTHORIZED);
+
+        let mismatch = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/federation/peer/query-database")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "destination_instance_id": phoenix_core::domain::instance_identity::InstanceId::new(),
+                            "sql": "SELECT 1"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mismatch.status(), StatusCode::CONFLICT);
+
+        let success = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/federation/peer/query-database")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(success.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(success.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["destination_instance_id"], destination.to_string());
+        assert_eq!(body["caller_instance_id"], caller.to_string());
+        assert_eq!(body["result"]["rows"][0][0]["value"], 1);
+    }
+
+    #[tokio::test]
+    async fn peer_query_database_bounds_body_before_json_extraction() {
+        use tower::ServiceExt as _;
+
+        let mut state = make_test_state().await;
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                "owner-password".to_string(),
+            )
+            .unwrap(),
+        );
+        let caller = phoenix_core::domain::instance_identity::InstanceId::new();
+        let token = format!("phx_peer_{}", "a".repeat(43));
+        state
+            .db
+            .replace_federation_enrollment(
+                caller,
+                "peer",
+                &phoenix_core::domain::instance_identity::FederationCredentialVerifier::from_bearer(
+                    token.as_bytes(),
+                ),
+            )
+            .await
+            .unwrap();
+        let oversized_body = " ".repeat(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES + 1);
+
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/federation/peer/query-database")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(oversized_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn configured_password_in_peer_namespace_authenticates_owner_bearer() {
+        use axum::body::to_bytes;
+        use tower::ServiceExt as _;
+
+        let mut state = make_test_state().await;
+        let owner_password = "phx_peer_same-secret";
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                owner_password.to_string(),
+            )
+            .unwrap(),
+        );
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/status")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {owner_password}"),
+                    )
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        45123,
+                    ))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["authenticated"], true);
+    }
+
+    #[tokio::test]
+    async fn configured_password_in_peer_namespace_can_login_as_owner() {
+        use tower::ServiceExt as _;
+
+        let mut state = make_test_state().await;
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                "phx_peer_same-secret".to_string(),
+            )
+            .unwrap(),
+        );
         let response = create_router(state)
             .oneshot(
                 Request::builder()
@@ -18075,7 +20281,10 @@ mod wake_handler_tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .headers()
+            .contains_key(axum::http::header::SET_COOKIE));
     }
 
     #[tokio::test]
@@ -18085,7 +20294,12 @@ mod wake_handler_tests {
         use tower::ServiceExt as _;
 
         let mut state = make_test_state().await;
-        state.password = Some("owner-password".to_string());
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                "owner-password".to_string(),
+            )
+            .unwrap(),
+        );
         let caller = phoenix_core::domain::instance_identity::InstanceId::new();
         let request_body = serde_json::json!({
             "caller_instance_id": caller,
@@ -18282,34 +20496,6 @@ mod wake_handler_tests {
     }
 
     #[tokio::test]
-    async fn wake_status_lists_all_active_contracts_for_conversation_without_global_cap() {
-        let state = make_test_state().await;
-        seed_conversation(&state, "conv-target").await;
-        seed_conversation(&state, "conv-other").await;
-        for id in 0..1002_u64 {
-            register_bash_wake(&state, id + 1, "conv-other", &format!("other-{id}")).await;
-        }
-        register_bash_wake(&state, 5000, "conv-target", "target-a").await;
-        register_bash_wake(&state, 5001, "conv-target", "target-b").await;
-
-        let axum::Json(response) =
-            get_wake_status(State(state.clone()), Path("conv-target".to_string()))
-                .await
-                .expect("wake status");
-
-        assert_eq!(response.pending_count, 2);
-        assert_eq!(response.soonest_expires_at, Some(5100));
-        assert_eq!(
-            response
-                .contracts
-                .into_iter()
-                .map(|c| c.contract_id)
-                .collect::<Vec<_>>(),
-            vec!["target-a".to_string(), "target-b".to_string()]
-        );
-    }
-
-    #[tokio::test]
     async fn conversation_search_returns_typed_warming_error_before_reconcile() {
         let state = make_test_state().await;
         let response = create_router(state)
@@ -18328,6 +20514,108 @@ mod wake_handler_tests {
             .expect("body bytes");
         let payload: Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(payload["error_type"], "conversation_search_warming");
+    }
+
+    #[tokio::test]
+    async fn retrieval_status_reports_failed_and_search_does_not_call_it_warming() {
+        let mut state = make_test_state().await;
+        let retriever = Arc::new(state.db.fts_retriever());
+        let run = retriever.reconcile_with_admission(|| Ok(())).unwrap();
+        drop(run);
+        state.message_retriever = retriever;
+        let router = create_router(state);
+        for (path, expected) in [
+            ("/api/deployment/retrieval", StatusCode::OK),
+            ("/api/conversations/search?q=test", StatusCode::BAD_REQUEST),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            if expected == StatusCode::OK {
+                assert_eq!(payload["state"], "failed");
+                assert_eq!(payload["reason"]["kind"], "interrupted");
+            } else {
+                assert_eq!(payload["error_type"], "conversation_search_failed");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retrieval_status_requires_auth_and_reports_successful_search() {
+        let mut state = make_test_state().await;
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                "retrieval-status-test-password".to_string(),
+            )
+            .unwrap(),
+        );
+        state
+            .db
+            .create_conversation("retrieval-ready", "ready", "/tmp/ready", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .add_message(
+                "retrieval-hit",
+                "retrieval-ready",
+                &crate::db::MessageContent::user("reconciliationcanary"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let retriever = Arc::new(state.db.fts_retriever());
+        retriever.reconcile().await.unwrap();
+        state.message_retriever = retriever;
+        let router = create_router(state);
+        let unauthenticated = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/deployment/retrieval")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        for path in [
+            "/api/deployment/retrieval",
+            "/api/conversations/search?q=reconciliationcanary",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(
+                            axum::http::header::AUTHORIZATION,
+                            "Bearer retrieval-status-test-password",
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            if path == "/api/deployment/retrieval" {
+                assert_eq!(payload["state"], "ready");
+            } else {
+                assert_eq!(payload["hits"].as_array().unwrap().len(), 1);
+            }
+        }
     }
 
     #[tokio::test]
@@ -18902,84 +21190,603 @@ mod wake_handler_tests {
         let payload: Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(payload["hits"][0]["message_id"], "m-prefix");
     }
+}
 
-    #[tokio::test]
-    async fn cancel_wake_conflicts_when_canonical_result_already_fired() {
-        let state = make_test_state().await;
-        seed_conversation(&state, "conv-fired").await;
-        register_bash_wake(&state, 6100, "conv-fired", "contract-fired").await;
-        let repo = state.db.wake_repository();
-        let started = repo
-            .claim_observation_if_eligible(
-                phoenix_workflow::WorkflowId(6100),
-                phoenix_workflow::ProcessIncarnation(1),
-                phoenix_workflow::Timestamp(20),
-                phoenix_workflow::LeaseExpiry(30),
+#[cfg(test)]
+mod handoff_capacity_api_tests {
+    use super::hard_delete_cascade_tests::make_test_state;
+    use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
+    use tower::ServiceExt;
+
+    struct SummaryLlm;
+    #[async_trait::async_trait]
+    impl phoenix_llm::LlmService for SummaryLlm {
+        async fn complete(
+            &self,
+            _request: &phoenix_llm::LlmRequest,
+        ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
+            Ok(phoenix_llm::LlmResponse {
+                provider_replay: None,
+                content: vec![phoenix_llm::ContentBlock::text(
+                    "Fresh real summary: unfinished task and correction retained",
+                )],
+                end_turn: true,
+                usage: phoenix_llm::Usage::default(),
+                usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            })
+        }
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn model_id(&self) -> &str {
+            "claude-sonnet-5"
+        }
+    }
+
+    async fn post(
+        state: &AppState,
+        id: &str,
+        action: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/conversations/{id}/{action}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
             )
             .await
-            .expect("claim observation");
-        let authority = match started {
-            phoenix_db::workflow::wake::WakeObservationOutcome::Started { canonical } => {
-                canonical.authority.expect("authority")
-            }
-            other => panic!("expected Started, got {other:?}"),
-        };
-        let evidence = phoenix_workflow::wake_profile::WakeTerminalEvidence::Bash(
-            phoenix_workflow::wake_profile::BashTerminalEvidence {
-                identity: phoenix_workflow::wake_profile::BashResourceIdentity {
-                    work_scope: phoenix_workflow::wake_profile::WorkScopeIdentity(
-                        state
-                            .db
-                            .get_conversation("conv-fired")
-                            .await
-                            .expect("load conversation")
-                            .attached_work_scope_id
-                            .expect("ordinary conversation scope")
-                            .as_str()
-                            .to_string(),
-                    ),
-                    handle_id: "b-6100".into(),
-                },
-                status: phoenix_workflow::wake_profile::BashTerminalStatus::Exited,
-                occurred_at: phoenix_workflow::Timestamp(19),
-                exit_code: Some(0),
-                duration_ms: Some(1),
-                signal_number: None,
-                kill_signal_sent: None,
-                final_tail: vec!["done".into()],
-            },
-        );
-        repo.record_terminal_evidence(
-            phoenix_workflow::WorkflowId(6100),
-            &authority,
-            1,
-            phoenix_workflow::ReceiptId(1),
-            phoenix_workflow::DeliveryId(1),
-            phoenix_workflow::Timestamp(20),
-            &evidence,
-        )
-        .await
-        .expect("record evidence");
-
-        let response = cancel_via_router(&state, "conv-fired", "contract-fired").await;
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body bytes");
-        let payload: Value = serde_json::from_slice(&body).expect("json body");
-        assert_eq!(payload["error_type"], "wake_already_resolved");
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
     }
 
     #[tokio::test]
-    async fn cancel_wake_replayed_cancelled_is_idempotent_success() {
-        let state = make_test_state().await;
-        seed_conversation(&state, "conv-cancelled").await;
-        register_bash_wake(&state, 6200, "conv-cancelled", "contract-cancelled").await;
+    #[allow(clippy::too_many_lines)] // complete API recovery scenario
+    async fn exhausted_ordinary_and_coordinator_rows_support_review_and_regeneration() {
+        for coordinator in [false, true] {
+            let state = super::hard_delete_cascade_tests::make_test_state_with_llm(
+                std::sync::Arc::new(SummaryLlm),
+            )
+            .await;
+            state.runtime.start_sub_agent_handler().await;
+            let conversation = if coordinator {
+                state
+                    .db
+                    .get_or_create_coordinator(
+                        None,
+                        phoenix_core::llm_language::LlmLanguage::default(),
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                state
+                    .db
+                    .create_conversation(
+                        "legacy-capacity",
+                        "legacy-capacity",
+                        "/tmp",
+                        true,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap()
+            };
+            state
+                .db
+                .add_message(
+                    "original-user",
+                    &conversation.id,
+                    &crate::db::MessageContent::user("Unfinished task and correction"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            state
+                .db
+                .add_message(
+                    "legacy-boundary",
+                    &conversation.id,
+                    &crate::db::MessageContent::continuation("legacy generic notice"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            state
+                .db
+                .update_conversation_state(
+                    &conversation.id,
+                    &ConvState::ContextExhausted {
+                        summary: "legacy generic notice".to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+            let mut events = state
+                .runtime
+                .conversation_broadcaster(&conversation.id)
+                .await
+                .subscribe();
+            let (status, body) = post(
+                &state,
+                &conversation.id,
+                "handoff-review",
+                serde_json::json!({"handoff":"short handoff", "shorten":false}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["shortening"]["kind"], "not_requested");
+            assert!(
+                state
+                    .runtime
+                    .try_get_handle(&conversation.id)
+                    .await
+                    .is_none(),
+                "one-shot review actor must be retired before the response"
+            );
+            assert!(
+                !std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(
+                    event,
+                    crate::runtime::SseEvent::ConversationBecameTerminal { .. }
+                )),
+                "review must not emit terminal lifecycle notifications"
+            );
+            let (status, body) = post(
+                &state,
+                &conversation.id,
+                "trigger-continuation",
+                serde_json::json!({}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let completed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if matches!(
+                        events.recv().await.unwrap(),
+                        crate::runtime::SseEvent::ConversationBecameTerminal { .. }
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await;
+            assert!(
+                completed.is_ok(),
+                "regenerated summary did not complete; coordinator={coordinator}, persisted={:?}",
+                state
+                    .db
+                    .get_conversation(&conversation.id)
+                    .await
+                    .unwrap()
+                    .state
+            );
+            let regenerated = state.db.get_conversation(&conversation.id).await.unwrap();
+            assert!(
+                matches!(regenerated.state, ConvState::ContextExhausted { summary } if summary == "Fresh real summary: unfinished task and correction retained")
+            );
+            assert!(
+                !std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(
+                    event,
+                    crate::runtime::SseEvent::ConversationBecameTerminal { .. }
+                )),
+                "regeneration completes with one terminal notification"
+            );
+            let messages = state.db.get_messages(&conversation.id).await.unwrap();
+            assert!(messages
+                .iter()
+                .any(|message| message.message_id == "original-user"));
+            assert!(messages
+                .iter()
+                .any(|message| message.message_id == "legacy-boundary"));
+            assert!(state
+                .db
+                .get_conversation(&conversation.id)
+                .await
+                .unwrap()
+                .continued_in_conv_id
+                .is_none());
+        }
+    }
 
-        let first = cancel_via_router(&state, "conv-cancelled", "contract-cancelled").await;
-        assert_eq!(first.status(), StatusCode::OK);
-        let second = cancel_via_router(&state, "conv-cancelled", "contract-cancelled").await;
-        assert_eq!(second.status(), StatusCode::OK);
+    #[tokio::test]
+    async fn handoff_capacity_routes_obey_close_fence() {
+        let state = make_test_state().await;
+        let conversation = state
+            .db
+            .create_conversation("capacity-close", "capacity-close", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_state(
+                &conversation.id,
+                &ConvState::ContextExhausted {
+                    summary: "original".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .begin_close_foundation(
+                &conversation.product_conversation_id,
+                &phoenix_core::domain::close::TranscriptConversationId::parse(
+                    conversation.id.clone(),
+                )
+                .unwrap(),
+                "capacity-close-attempt",
+            )
+            .await
+            .unwrap();
+        for action in ["trigger-continuation", "handoff-review", "continue"] {
+            let (status, _) = post(
+                &state,
+                &conversation.id,
+                action,
+                serde_json::json!({"handoff":"original", "message_id":"opening", "shorten":true}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{action}");
+        }
+        assert!(state
+            .db
+            .continuation_handoff_candidates(&conversation.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .db
+            .get_conversation(&conversation.id)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn already_reserved_successor_is_returned_without_revalidating_losing_handoff() {
+        let state = make_test_state().await;
+        let conversation = state
+            .db
+            .create_conversation(
+                "capacity-existing",
+                "capacity-existing",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_state(
+                &conversation.id,
+                &ConvState::ContextExhausted {
+                    summary: "original".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let crate::db::ContinueOutcome::Created(successor) = state
+            .db
+            .continue_conversation(&conversation.id)
+            .await
+            .unwrap()
+        else {
+            panic!("created")
+        };
+        let (status, body) = post(&state, &conversation.id, "continue", serde_json::json!({"handoff":"oversized ".repeat(200_000), "message_id":"losing-opening"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["conversation_id"], successor.id);
+        let (status, _) = post(
+            &state,
+            &conversation.id,
+            "trigger-continuation",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // complete API recovery scenario
+    async fn reviewed_candidate_acceptance_preserves_generated_authority_and_original_failure() {
+        let state = make_test_state().await;
+        let conversation = state
+            .db
+            .create_conversation(
+                "capacity-candidate",
+                "capacity-candidate",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let failure = ConvState::RecoverableContinuationFailure {
+            failure: phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                    operation_id: "failed-operation".to_string(),
+                    rejected_tool_calls: vec![],
+                    attempt: 1,
+                },
+                error_kind: crate::db::ErrorKind::ContextCapacityConflict,
+                message: "too large".to_string(),
+            },
+        };
+        state
+            .db
+            .update_conversation_state(&conversation.id, &failure)
+            .await
+            .unwrap();
+        state
+            .db
+            .add_message(
+                "original-context",
+                &conversation.id,
+                &crate::db::MessageContent::user("original task"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .save_continuation_handoff_candidate(&crate::db::ContinuationHandoffCandidate {
+                id: "reviewed-candidate".to_string(),
+                conversation_id: conversation.id.clone(),
+                origin: crate::db::ContinuationCandidateOrigin::AiShortening {
+                    revision: crate::db::ContinuationSourceRevision::Operation {
+                        operation_id: "failed-operation".to_string(),
+                        attempt: 1,
+                    },
+                },
+                source: crate::db::ContinuationCandidateSource::UnattributedInput,
+                text: "short generated context".to_string(),
+            })
+            .await
+            .unwrap();
+        let (status, _) = post(&state, &conversation.id, "continue", serde_json::json!({"handoff":"different text", "message_id":"opening", "source":{"kind":"candidate", "candidate_id":"reviewed-candidate"}})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(state
+            .db
+            .get_conversation(&conversation.id)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .is_none());
+        let (status, body) = post(&state, &conversation.id, "continue", serde_json::json!({"handoff":"short generated context", "message_id":"opening", "source":{"kind":"candidate", "candidate_id":"reviewed-candidate"}})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "accepted", "{body}");
+        let intent = state
+            .db
+            .continuation_dispatch_intent(&conversation.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.opening_authority, phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext);
+        assert_eq!(
+            state
+                .db
+                .get_conversation(&conversation.id)
+                .await
+                .unwrap()
+                .state,
+            failure
+        );
+        assert!(state
+            .db
+            .get_messages(&conversation.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|message| message.message_id == "original-context"));
+        let mut opening_events = state
+            .runtime
+            .conversation_broadcaster(&intent.successor_conversation_id)
+            .await
+            .subscribe();
+        crate::runtime::direct_turn_worker::dispatch_standalone(
+            state.runtime.clone(),
+            &intent.successor_conversation_id,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let crate::runtime::SseEvent::Message { message, .. } = opening_events.recv().await.unwrap() {
+                    if matches!(message.content, crate::db::MessageContent::Continuation(content) if content.summary == "short generated context") { break; }
+                }
+            }
+        }).await.expect("generated opening materializes through the durable turn worker");
+        let receipt = state
+            .db
+            .read_continuation_opening(&intent.successor_conversation_id)
+            .await
+            .unwrap();
+        assert!(matches!(receipt, crate::db::ContinuationOpeningRead::Accepted { opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext, .. }));
+    }
+
+    #[tokio::test]
+    async fn stale_generated_candidate_is_rejected_after_source_regeneration() {
+        let state = make_test_state().await;
+        let conversation = state
+            .db
+            .create_conversation("stale-preview", "stale-preview", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_state(
+                &conversation.id,
+                &ConvState::ContextExhausted {
+                    summary: "source-a".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let source_a = state.db.get_conversation(&conversation.id).await.unwrap();
+        state
+            .db
+            .save_continuation_handoff_candidate(&crate::db::ContinuationHandoffCandidate {
+                id: "stale-preview-a".to_string(),
+                conversation_id: conversation.id.clone(),
+                origin: crate::db::ContinuationCandidateOrigin::AiShortening {
+                    revision: crate::db::ContinuationSourceRevision::ExhaustedState {
+                        state_updated_at: source_a.state_updated_at,
+                    },
+                },
+                source: crate::db::ContinuationCandidateSource::UnattributedInput,
+                text: "candidate-a".to_string(),
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_state(
+                &conversation.id,
+                &ConvState::ContextExhausted {
+                    summary: "source-b".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let (status, _) = post(&state, &conversation.id, "continue", serde_json::json!({"handoff":"candidate-a", "message_id":"opening", "source":{"kind":"candidate", "candidate_id":"stale-preview-a"}})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(state
+            .db
+            .get_conversation(&conversation.id)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .is_none());
+        assert_eq!(
+            state
+                .db
+                .continuation_handoff_candidates(&conversation.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn source_only_review_record_cannot_be_accepted_or_reviewed_as_generated() {
+        let state = make_test_state().await;
+        let conversation = state
+            .db
+            .create_conversation("review-input", "review-input", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_state(
+                &conversation.id,
+                &ConvState::ContextExhausted {
+                    summary: "original".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let current = state.db.get_conversation(&conversation.id).await.unwrap();
+        state
+            .db
+            .save_continuation_handoff_candidate(&crate::db::ContinuationHandoffCandidate {
+                id: "input-only".into(),
+                conversation_id: conversation.id.clone(),
+                origin: crate::db::ContinuationCandidateOrigin::ReviewInput {
+                    revision: crate::db::ContinuationSourceRevision::ExhaustedState {
+                        state_updated_at: current.state_updated_at,
+                    },
+                },
+                source: crate::db::ContinuationCandidateSource::UnattributedInput,
+                text: "exact draft".into(),
+            })
+            .await
+            .unwrap();
+        for action in ["continue", "handoff-review"] {
+            let (status, _) = post(&state, &conversation.id, action, serde_json::json!({"handoff":"exact draft", "message_id":"opening", "shorten":true, "source":{"kind":"candidate", "candidate_id":"input-only"}})).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        assert!(state
+            .db
+            .get_conversation(&conversation.id)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn continuation_admission_returns_typed_capacity_conflict_without_successor() {
+        let state = make_test_state().await;
+        let conversation = state
+            .db
+            .create_conversation("capacity-admit", "capacity-admit", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_state(
+                &conversation.id,
+                &ConvState::ContextExhausted {
+                    summary: "original".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let oversized = "<".repeat(1_000_000);
+        state
+            .db
+            .update_conversation_state(
+                &conversation.id,
+                &ConvState::ContextExhausted {
+                    summary: oversized.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .add_message(
+                "large-generated-source",
+                &conversation.id,
+                &crate::db::MessageContent::continuation(oversized.clone()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let (status, body) = post(
+            &state,
+            &conversation.id,
+            "continue",
+            serde_json::json!({"handoff":oversized, "message_id":"opening", "source":{"kind":"summary", "message_id":"large-generated-source"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error_type"], "continuation_capacity_conflict");
+        assert_eq!(body["capacity"]["status"]["kind"], "handoff_too_large");
+        assert!(state
+            .db
+            .get_conversation(&conversation.id)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .is_none());
     }
 }
 
@@ -19236,7 +22043,7 @@ mod detached_task_worktree_tests {
             seed_parent_id: None,
             seed_label: None,
             continued_in_conv_id: None,
-            chain_name: None,
+
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
             spawned_from_conversation_id: None,
         }

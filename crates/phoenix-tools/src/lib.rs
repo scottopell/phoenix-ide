@@ -33,8 +33,8 @@ pub use bash::{
 pub use browser::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,
     BrowserKeyPressTool, BrowserNavigateTool, BrowserProfileTool, BrowserRecentConsoleLogsTool,
-    BrowserResizeTool, BrowserSessionManager, BrowserTakeScreenshotTool, BrowserTypeTool,
-    BrowserWaitForSelectorTool,
+    BrowserResizeTool, BrowserSessionManager, BrowserSnapshotTool, BrowserTakeScreenshotTool,
+    BrowserTypeTool, BrowserWaitForSelectorTool,
 };
 pub use keyword_search::KeywordSearchTool;
 pub use patch::PatchTool;
@@ -69,10 +69,6 @@ use phoenix_core::domain::sm_state::ExploreBashCapability;
 use phoenix_core::llm_service::LlmSelector;
 use phoenix_core::platform::PlatformCapability;
 use phoenix_core::work_scope::ResourceScopeKey;
-use phoenix_workflow::wake_profile::{
-    WakeCancellationReason, WakeRegistrationIntent, WakeResourceIdentity, WorkScopeIdentity,
-};
-use phoenix_workflow::{Timestamp, WorkflowId};
 
 /// Test-only `LlmSelector` that offers no completion service.
 ///
@@ -112,91 +108,6 @@ where
 {
     fn emit(&self, progress: BashToolProgress) {
         self(progress);
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RegisterWakeInput {
-    pub contract_id: String,
-    pub conversation_id: String,
-    pub root_conversation_id: String,
-    pub registering_tool_use_id: String,
-    pub registration_scope: WorkScopeIdentity,
-    pub resource: WakeResourceIdentity,
-    pub expires_at: Timestamp,
-    pub prepared_fingerprint: String,
-}
-
-impl RegisterWakeInput {
-    #[must_use]
-    pub fn into_intent(self, registered_at: Timestamp) -> WakeRegistrationIntent {
-        WakeRegistrationIntent {
-            contract_id: self.contract_id,
-            conversation_id: self.conversation_id,
-            root_conversation_id: self.root_conversation_id,
-            registration_scope: self.registration_scope,
-            resource: self.resource,
-            registering_tool_use_id: self.registering_tool_use_id,
-            registered_at,
-            expires_at: self.expires_at,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CancelWakeInput {
-    pub workflow_id: WorkflowId,
-    pub timestamp: Timestamp,
-    pub reason: WakeCancellationReason,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RegisteredWake {
-    Registered { workflow_id: WorkflowId },
-    Replayed { workflow_id: WorkflowId },
-    Conflict,
-    Unavailable,
-    Cancelled,
-    CancelReplayed,
-    CancelStale,
-}
-
-impl RegisteredWake {
-    #[must_use]
-    pub fn workflow_id(&self) -> Option<WorkflowId> {
-        match self {
-            Self::Registered { workflow_id } | Self::Replayed { workflow_id } => Some(*workflow_id),
-            Self::Conflict
-            | Self::Unavailable
-            | Self::Cancelled
-            | Self::CancelReplayed
-            | Self::CancelStale => None,
-        }
-    }
-}
-
-#[async_trait]
-pub trait WakeRegistrar: Send + Sync {
-    async fn register(&self, input: RegisterWakeInput) -> Result<RegisteredWake, String>;
-    async fn cancel(&self, input: CancelWakeInput) -> Result<RegisteredWake, String>;
-}
-
-/// Converts a resource scope to the persisted identity that may own a durable wake.
-///
-/// # Errors
-/// Returns an error for the global terminal namespace, which has no durable work owner.
-pub fn work_scope_identity(scope: &ResourceScopeKey) -> Result<WorkScopeIdentity, String> {
-    match scope {
-        ResourceScopeKey::Work(id) => Ok(WorkScopeIdentity(id.as_str().to_string())),
-        ResourceScopeKey::Unattached(_) => {
-            Err("unattached scope cannot own a durable wake".to_string())
-        }
-        ResourceScopeKey::Coordinator => {
-            Err("coordinator scope cannot own a durable wake".to_string())
-        }
-        ResourceScopeKey::GlobalTerminal => {
-            Err("global terminal scope cannot own a durable wake".to_string())
-        }
     }
 }
 
@@ -381,6 +292,9 @@ pub struct ToolContext {
     /// The conversation this tool is executing within
     pub conversation_id: String,
 
+    /// Persisted same-scope transcript hint for pre-opaque-scope tmux sockets.
+    legacy_tmux_conversation_id: Option<String>,
+
     /// Actor identity and effective authority for same-scope resources.
     pub resource_access: phoenix_core::work_scope::EffectiveResourceAccess,
 
@@ -423,17 +337,14 @@ pub struct ToolContext {
     pub worktree_path: Option<PathBuf>,
 
     /// Durable owner for work-affine resources created by this tool call.
-    /// Worktree-backed conversations scope to the worktree path so resources
-    /// survive context-exhaustion continuations; Direct conversations fall
-    /// back to the conversation id.
     pub work_scope: ResourceScopeKey,
 
     /// Optional sink for typed ephemeral bash progress snapshots.
     bash_progress_sink: Option<Arc<dyn BashProgressSink>>,
     tool_use_id: Option<String>,
+    direct_turn_id: Option<phoenix_core::domain::sm_event::DirectTurnTurnId>,
     svg_assistant_message_id: Option<String>,
     svg_artifact_store: Option<Arc<dyn present_svg::SvgArtifactStore>>,
-    wake_registrar: Option<Arc<dyn WakeRegistrar>>,
 }
 
 impl ToolContext {
@@ -508,6 +419,7 @@ impl ToolContext {
         let root_conversation_id = conversation_id.clone();
         Self {
             cancel,
+            legacy_tmux_conversation_id: Some(conversation_id.clone()),
             resource_access: phoenix_core::work_scope::EffectiveResourceAccess::new(
                 conversation_id.clone(),
                 phoenix_core::work_scope::ResourceAuthority::Work,
@@ -524,9 +436,9 @@ impl ToolContext {
             work_scope: ResourceScopeKey::Coordinator,
             bash_progress_sink: None,
             tool_use_id: None,
+            direct_turn_id: None,
             svg_assistant_message_id: None,
             svg_artifact_store: None,
-            wake_registrar: None,
             llm_metrics_tx: None,
         }
     }
@@ -567,6 +479,7 @@ impl ToolContext {
         );
         Self {
             cancel,
+            legacy_tmux_conversation_id: Some(conversation_id.clone()),
             conversation_id,
             resource_access,
             root_conversation_id,
@@ -581,9 +494,9 @@ impl ToolContext {
             work_scope,
             bash_progress_sink: None,
             tool_use_id: None,
+            direct_turn_id: None,
             svg_assistant_message_id: None,
             svg_artifact_store: None,
-            wake_registrar: None,
         }
     }
 
@@ -602,6 +515,13 @@ impl ToolContext {
         self
     }
 
+    /// Replace the legacy socket hint; `None` disables conversation-socket fallback.
+    #[must_use]
+    pub fn with_legacy_tmux_conversation_id(mut self, conversation_id: Option<String>) -> Self {
+        self.legacy_tmux_conversation_id = conversation_id;
+        self
+    }
+
     #[must_use]
     pub fn with_root_conversation_id(mut self, root_conversation_id: String) -> Self {
         self.root_conversation_id = root_conversation_id;
@@ -617,12 +537,6 @@ impl ToolContext {
     #[must_use]
     pub fn with_svg_assistant_message_id(mut self, message_id: impl Into<String>) -> Self {
         self.svg_assistant_message_id = Some(message_id.into());
-        self
-    }
-
-    #[must_use]
-    pub fn with_wake_registrar(mut self, wake_registrar: Option<Arc<dyn WakeRegistrar>>) -> Self {
-        self.wake_registrar = wake_registrar;
         self
     }
 
@@ -711,6 +625,20 @@ impl ToolContext {
     }
 
     #[must_use]
+    pub fn direct_turn_id(&self) -> Option<phoenix_core::domain::sm_event::DirectTurnTurnId> {
+        self.direct_turn_id
+    }
+
+    #[must_use]
+    pub fn with_direct_turn_id(
+        mut self,
+        turn_id: phoenix_core::domain::sm_event::DirectTurnTurnId,
+    ) -> Self {
+        self.direct_turn_id = Some(turn_id);
+        self
+    }
+
+    #[must_use]
     pub fn source_tool_call(&self) -> Option<phoenix_core::domain::db_schema::SourceToolCall> {
         Some(phoenix_core::domain::db_schema::SourceToolCall {
             message_id: self.svg_assistant_message_id.clone()?,
@@ -721,11 +649,6 @@ impl ToolContext {
     #[must_use]
     pub fn tool_use_id(&self) -> Option<&str> {
         self.tool_use_id.as_deref()
-    }
-
-    #[must_use]
-    pub fn wake_registrar(&self) -> Option<&Arc<dyn WakeRegistrar>> {
-        self.wake_registrar.as_ref()
     }
 
     /// Resolve the conversation's tmux server, lazily spawning it on
@@ -750,7 +673,7 @@ impl ToolContext {
                 &self.work_scope,
                 self.working_dir(),
                 self.worktree_path.as_deref(),
-                Some(&self.conversation_id),
+                self.legacy_tmux_conversation_id.as_deref(),
             )
             .await
     }
@@ -938,6 +861,7 @@ fn write_tools() -> Vec<Arc<dyn Tool>> {
 fn browser_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(BrowserNavigateTool),
+        Arc::new(BrowserSnapshotTool),
         Arc::new(BrowserEvalTool),
         Arc::new(BrowserTakeScreenshotTool),
         Arc::new(BrowserRecentConsoleLogsTool),
@@ -1139,7 +1063,7 @@ impl ToolRegistry {
         Ok(self)
     }
 
-    /// Add one host-bound read-only capability after rejecting name collisions.
+    /// Add one host-bound capability after rejecting name collisions.
     ///
     /// # Errors
     ///
@@ -1339,6 +1263,97 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    fn legacy_tmux_test_context(
+        actor: &str,
+        cwd: PathBuf,
+        registry: Arc<TmuxRegistry>,
+    ) -> ToolContext {
+        ToolContext::new(
+            CancellationToken::new(),
+            actor.into(),
+            cwd,
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(BashHandleRegistry::new()),
+            Arc::new(NoLlm),
+            phoenix_terminal::ActiveTerminals::new(),
+            registry,
+            None,
+            phoenix_core::work_scope::WorkScopeId::parse("legacy-test-scope").unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn continued_tool_context_adopts_same_scope_predecessor_legacy_socket_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = tmux::fake_backend::FakeTmuxBackend::new();
+        let registry = Arc::new(TmuxRegistry::with_backend(
+            temp.path().into(),
+            fake.clone(),
+            None,
+        ));
+        let legacy = tmux::registry::socket_path_for(temp.path(), "legacy-parent");
+        registry
+            .ensure_live(
+                &ResourceScopeKey::Unattached("legacy-parent".into()),
+                temp.path(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let before = fake.server(&legacy).unwrap();
+        drop(registry);
+        let registry = Arc::new(TmuxRegistry::with_backend(
+            temp.path().into(),
+            fake.clone(),
+            None,
+        ));
+        let child = legacy_tmux_test_context("successor", temp.path().into(), registry)
+            .with_root_conversation_id("unrelated-product-root".into())
+            .with_legacy_tmux_conversation_id(Some("legacy-parent".into()));
+        let server = child.tmux().await.unwrap();
+        assert_eq!(server.read().await.socket_path, legacy);
+        assert_eq!(child.conversation_id, "successor");
+        assert_eq!(fake.server(&legacy).unwrap(), before);
+        assert_eq!(fake.spawn_count(&legacy), 1);
+        let canonical =
+            tmux::registry::socket_path_for_worktree(temp.path(), Path::new("legacy-test-scope"));
+        assert_eq!(fake.spawn_count(&canonical), 0);
+        assert_eq!(
+            fake.spawn_count(&tmux::registry::socket_path_for(temp.path(), "successor")),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_absence_of_same_scope_legacy_hint_does_not_adopt_actor_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = tmux::fake_backend::FakeTmuxBackend::new();
+        let registry = Arc::new(TmuxRegistry::with_backend(
+            temp.path().into(),
+            fake.clone(),
+            None,
+        ));
+        let legacy = tmux::registry::socket_path_for(temp.path(), "successor");
+        registry
+            .ensure_live(
+                &ResourceScopeKey::Unattached("successor".into()),
+                temp.path(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let before = fake.server(&legacy).unwrap();
+        let child = legacy_tmux_test_context("successor", temp.path().into(), registry)
+            .with_legacy_tmux_conversation_id(None);
+        let server = child.tmux().await.unwrap();
+        let canonical =
+            tmux::registry::socket_path_for_worktree(temp.path(), Path::new("legacy-test-scope"));
+        assert_eq!(server.read().await.socket_path, canonical);
+        assert_eq!(fake.server(&legacy).unwrap(), before);
+    }
+
     struct NamedTool(&'static str);
 
     #[async_trait]
@@ -1486,6 +1501,7 @@ mod tests {
         let names = names(&ToolRegistry::standard());
         for expected in [
             "browser_navigate",
+            "browser_snapshot",
             "browser_eval",
             "browser_take_screenshot",
             "browser_recent_console_logs",
@@ -1791,65 +1807,5 @@ mod tests {
                 "{label}: deprecated `mode` should no longer appear in the schema"
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod wake_registrar_seam_tests {
-    use super::*;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
-
-    struct MockWakeRegistrar {
-        calls: Mutex<Vec<String>>,
-    }
-
-    #[async_trait]
-    impl WakeRegistrar for MockWakeRegistrar {
-        async fn register(&self, _input: RegisterWakeInput) -> Result<RegisteredWake, String> {
-            self.calls.lock().await.push("register".to_string());
-            Ok(RegisteredWake::Conflict)
-        }
-
-        async fn cancel(&self, _input: CancelWakeInput) -> Result<RegisteredWake, String> {
-            self.calls.lock().await.push("cancel".to_string());
-            Ok(RegisteredWake::CancelStale)
-        }
-    }
-
-    fn test_context() -> ToolContext {
-        ToolContext::new(
-            CancellationToken::new(),
-            "conv".to_string(),
-            PathBuf::from("/tmp"),
-            BrowserSessionManager::new(),
-            Arc::new(BashHandleRegistry::new()),
-            Arc::new(NoLlm),
-            phoenix_terminal::ActiveTerminals::new(),
-            Arc::new(TmuxRegistry::new()),
-            None,
-            phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
-        )
-    }
-
-    #[tokio::test]
-    async fn old_constructor_keeps_optional_fields_unset() {
-        let ctx = test_context();
-        assert_eq!(ctx.tool_use_id(), None);
-        assert!(ctx.wake_registrar().is_none());
-    }
-
-    #[tokio::test]
-    async fn builder_injects_tool_use_id_and_wake_registrar() {
-        let registrar: Arc<dyn WakeRegistrar> = Arc::new(MockWakeRegistrar {
-            calls: Mutex::new(Vec::new()),
-        });
-        let ctx = test_context()
-            .with_tool_use_id("tool-123")
-            .with_wake_registrar(Some(registrar.clone()));
-        assert_eq!(ctx.tool_use_id(), Some("tool-123"));
-        assert!(ctx.wake_registrar().is_some());
-        assert!(Arc::ptr_eq(ctx.wake_registrar().unwrap(), &registrar));
     }
 }

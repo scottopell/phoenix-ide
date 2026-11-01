@@ -150,7 +150,7 @@ function makeInitPayload(convId: string, slug: string) {
     context_window_size: 0,
     project_name: null,
     pending_anchor_sequence_id: 0,
-    pending_events: [] as unknown[],
+    opening: null, pending_events: [] as unknown[],
     pending_truncated: false,
   };
 }
@@ -191,7 +191,7 @@ describe('useConnection epoch stamping (task 08683)', () => {
 
     expect(FakeEventSource.instances).toHaveLength(1);
     expect(FakeEventSource.instances[0]!.url).toMatch(
-      /^\/api\/conversations\/conv-A\/stream\?open_id=[0-9a-f-]{36}$/,
+      /^\/api\/conversation-reads\/stream\?reference=conv-A&open_id=[0-9a-f-]{36}$/,
     );
   });
 
@@ -206,8 +206,34 @@ describe('useConnection epoch stamping (task 08683)', () => {
 
     expect(FakeEventSource.instances).toHaveLength(1);
     expect(FakeEventSource.instances[0]!.url).toMatch(
-      /^\/api\/conversations\/conv-A\/stream\?after_event_sequence=42&open_id=[0-9a-f-]{36}$/,
+      /^\/api\/conversation-reads\/stream\?reference=conv-A&after_event_sequence=42&open_id=[0-9a-f-]{36}$/,
     );
+  });
+
+  it.each(['.', '..', '/', 'a/b?c#d', '雪', '%E9%9B%AA', '%2F', '%', '%ZZ', 'a+b', 'a\\b', ' leading '])('passes opaque identity %s losslessly to the EventSource constructor and validates its init', conversationId => {
+    const dispatch = vi.fn<(a: SSEAction) => void>();
+    const onValidatedInit = vi.fn();
+    const { result, unmount } = renderHook(() => useConnection({
+      conversationId, dispatch, onValidatedInit,
+      getLastAppliedEventSeq: () => 42,
+      getTranscriptGeneration: () => 7,
+    }));
+    expect(FakeEventSource.instances).toHaveLength(1);
+    const stream = FakeEventSource.instances[0]!;
+    const request = new Request(new URL(stream.url, 'https://phoenix.test'));
+    const url = new URL(request.url);
+    expect(url.pathname).toBe('/api/conversation-reads/stream');
+    expect(url.hash).toBe('');
+    expect(url.searchParams.getAll('reference')).toEqual([conversationId]);
+    expect(url.searchParams.get('after_event_sequence')).toBe('42');
+    expect(url.searchParams.get('transcript_generation')).toBe('7');
+    expect(url.searchParams.get('open_id')).toMatch(/^[0-9a-f-]{36}$/);
+    act(() => stream.emit('init', makeInitPayload(conversationId, 'readable-slug')));
+    expect(result.current.state).toBe('connected');
+    expect(onValidatedInit).toHaveBeenCalledTimes(1);
+    expect(onValidatedInit.mock.calls[0]![0].conversation.id).toBe(conversationId);
+    unmount();
+    expect(stream.closed).toBe(true);
   });
 
   it('closes and schedules recovery when init identity differs from the route', () => {
@@ -416,11 +442,11 @@ describe('useConnection epoch stamping (task 08683)', () => {
     act(() => {
       es.emit('init', makeInitPayload('conv-A', 'slug-A'));
       es.emit('steer_message_queued', {
-        sequence_id: 1,
+        opening: null, sequence_id: 1,
         message: { message_id: 'external-1', origin: { kind: 'internal_conversation', source_call: null, product_conversation_id: 'coordinator', transcript_id: 'coordinator-transcript' }, text: 'from coordinator', images: [], files: [] },
         queue_position: 0,
       });
-      es.emit('steer_message_cancelled', { sequence_id: 2, message_id: 'external-1' });
+      es.emit('steer_message_cancelled', { opening: null, sequence_id: 2, message_id: 'external-1' });
       es.emit('rate_limit_snapshot', {
         sequence_id: 3,
         snapshot: {
@@ -521,8 +547,9 @@ describe('useConnection epoch stamping (task 08683)', () => {
     const messagesBefore = atomBAfterInit.messages.length;
     act(() => {
       esA.emit('message', {
-        sequence_id: 999,
+        opening: null, sequence_id: 999,
         message: {
+          event_presentation: null,
           message_id: 'leaked-msg-from-A',
           sequence_id: 999,
           conversation_id: 'conv-A',
@@ -604,6 +631,111 @@ describe('useConnection epoch stamping (task 08683)', () => {
 
       expect(FakeEventSource.instances).toHaveLength(2);
       expect(result.current.state).toBe('connecting');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('ignores unmounted stream callbacks across a real remount with a reused epoch and stamps the current init identity', () => {
+    vi.useFakeTimers();
+    try {
+      const store = new ConversationStore();
+      const rowId = 'conv-A';
+      const dispatch = vi.fn((action: SSEAction) => store.dispatch(rowId, action));
+      const oldValidatedInit = vi.fn();
+      const oldMount = renderHook(() => useConnection({
+        conversationId: rowId, dispatch, onValidatedInit: oldValidatedInit,
+      }));
+      const oldStream = FakeEventSource.instances[0]!;
+      const oldOpen = dispatch.mock.calls.map(([action]) => action)
+        .find((action) => action.type === 'connection_opened');
+      expect(oldOpen).toMatchObject({ type: 'connection_opened', epoch: 1 });
+      expect(oldOpen?.type === 'connection_opened' && typeof oldOpen.connectionId).toBe('symbol');
+      act(() => oldStream.emit('init', makeInitPayload(rowId, 'slug-A')));
+      expect(oldValidatedInit).toHaveBeenCalledOnce();
+      expect(oldMount.result.current.state).toBe('connected');
+
+      const snapshot = {
+        product_conversation_id: 'product-A', close: null, canonical_route: '/c/product-A',
+        requested_transcript_row_id: rowId,
+        canonical_root: { transcript_row_id: rowId, slug: 'slug-A', title: null },
+        ordinary_lifecycle: 'history' as const, latest_transcript_row_id: rowId,
+        writable_transcript_row_id: null, updated_at: '2024-06-01T00:00:00Z',
+        presentation: { kind: 'state' as const, display_name: 'A', presentation_mode: 'idle' },
+        work_identity: null, source: null, chain_qa_compatibility: null,
+        segments: [], latest_opening: { status: 'none' }, before: null, has_older: false,
+      };
+      store.observeProductConversationSnapshot(snapshot);
+      store.observeProductConversationSnapshot({ ...snapshot, ordinary_lifecycle: 'open' });
+      expect(store.getTranscriptAuthority(rowId)).toEqual({ kind: 'awaiting_init', connectionId: null });
+
+      oldMount.unmount();
+      act(() => vi.advanceTimersByTime(0));
+      expect(oldStream.closed).toBe(true);
+      dispatch.mockClear();
+      const afterUnmount = store.getSnapshot(rowId);
+      act(() => {
+        oldStream.emit('init', 'invalid JSON from an already unmounted stream');
+        oldStream.emit('message', 'invalid JSON from an already unmounted stream');
+        oldStream.emit('error', '');
+      });
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(store.getSnapshot(rowId)).toBe(afterUnmount);
+      expect(oldValidatedInit).toHaveBeenCalledOnce();
+
+      const currentValidatedInit = vi.fn();
+      const currentMount = renderHook(() => useConnection({
+        conversationId: rowId, dispatch, onValidatedInit: currentValidatedInit,
+      }));
+      expect(FakeEventSource.instances).toHaveLength(2);
+      const currentStream = FakeEventSource.instances[1]!;
+      const currentOpen = dispatch.mock.calls.map(([action]) => action)
+        .find((action) => action.type === 'connection_opened');
+      if (currentOpen?.type !== 'connection_opened' || oldOpen?.type !== 'connection_opened') {
+        throw new Error('Both mounts must dispatch connection_opened');
+      }
+      expect(currentOpen.epoch).toBe(oldOpen.epoch);
+      expect(currentOpen.connectionId).not.toBe(oldOpen.connectionId);
+      expect(typeof currentOpen.connectionId).toBe('symbol');
+      expect(store.getTranscriptAuthority(rowId)).toEqual({
+        kind: 'awaiting_init', connectionId: currentOpen.connectionId,
+      });
+      expect(currentMount.result.current.state).toBe('connecting');
+      dispatch.mockClear();
+      const beforeOldCallbacks = store.getSnapshot(rowId);
+      act(() => {
+        oldStream.emit('init', makeInitPayload(rowId, 'slug-A'));
+        oldStream.emit('message', 'invalid JSON from the old stream');
+        oldStream.emit('error', '');
+      });
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(store.getSnapshot(rowId)).toBe(beforeOldCallbacks);
+      expect(currentMount.result.current.state).toBe('connecting');
+      expect(currentValidatedInit).not.toHaveBeenCalled();
+      expect(oldValidatedInit).toHaveBeenCalledOnce();
+      expect(store.getTranscriptAuthority(rowId)).toEqual({
+        kind: 'awaiting_init', connectionId: currentOpen.connectionId,
+      });
+
+      act(() => currentStream.emit('init', {
+        ...makeInitPayload(rowId, 'slug-A'), transcript_coverage: 'preserve',
+      }));
+      expect(currentMount.result.current.state).toBe('connected');
+      expect(store.getTranscriptAuthority(rowId)).toEqual({
+        kind: 'awaiting_init', connectionId: currentOpen.connectionId,
+      });
+      act(() => currentStream.emit('init', makeInitPayload(rowId, 'slug-A')));
+      const currentInits = dispatch.mock.calls.map(([action]) => action)
+        .filter((action) => action.type === 'sse_init');
+      expect(currentInits).toHaveLength(2);
+      for (const init of currentInits) {
+        expect(init).toMatchObject({ epoch: currentOpen.epoch, connectionId: currentOpen.connectionId });
+      }
+      expect(currentValidatedInit).toHaveBeenCalledTimes(2);
+      expect(store.getTranscriptAuthority(rowId)).toEqual({ kind: 'live' });
+      expect(store.getSnapshot(rowId).conversationId).toBe(rowId);
+      currentMount.unmount();
+      act(() => vi.advanceTimersByTime(0));
     } finally {
       vi.useRealTimers();
     }

@@ -9,17 +9,30 @@ attempt fencing, optional reclaimable leasing, reconciliation, durable
 scheduling, canonical delivery, and runtime-acceptance bookkeeping where a
 profile requires it.
 
-Wake and conversation creation remain the two normative profiles. Wake remains
-the first intended implementation slice because it exercises observation,
-deadline precedence, canonical delivery, continuation, and runtime acceptance.
-Creation remains a second profile that exercises a richer dependency graph,
-resource reconciliation, and compensation.
+Direct-chat and conversation creation are the retained normative profiles.
+Creation exercises a richer dependency graph, resource reconciliation, and
+compensation. Wake is retired under `../wake-contracts/requirements.md` and
+ADR-098, without a replacement profile or redesign commitment.
 
 ## Current Reality
 
-The normalized engine foundation and wake vertical slice are implemented. Workflow attempts, receipts, deliveries, schedules, wake bindings, terminal evidence, and message links have normalized persisted authorities; wake is restart-safe for Bash/tmux obligations and remains the only profile with full end-to-end production coverage.
+The normalized engine foundation is implemented. Workflow attempts, receipts,
+deliveries, and schedules have normalized persisted authorities. Wake removal is
+a candidate implementation with migration and runtime verification ongoing; this
+summary claims neither final validation nor deployment. Historical wake bindings,
+terminal evidence, statuses, payloads, messages, and links are preserved as inert
+history by additive retirement metadata, not rewritten as settled execution.
+Already-admitted DirectTurns remain normal work on their existing authorities.
 
-Direct-chat foundations have landed partially. The aggregate/repository layer contains accepted-turn identity, immutable prepared payload, runtime acceptance, replay, and deterministic transaction-cut foundations. Production direct-turn materialization now returns a closed established/unclassified authority result, keeps proposed conversation state private until SQLite commits the accepted turn, reducer projection, and canonical message, and routes unclassified authority through one process fail-stop boundary that closes runtime admission and semantic publication before draining live runtimes. Production chat submission/reconciliation has not fully cut over to the durable profile, and equivalent authority-loss enforcement for other authoritative SQLite commands remains incomplete. Conversation creation is in a similar state: shell-first and protocol/model work exist, while production worker/orchestration cutover remains incomplete.
+Production Direct Turn admission, claim/reclaim, materialization, rearm, and terminalization actively consume the shared workflow transaction primitives. Materialization returns a closed established/unclassified authority result, keeps proposed conversation state private until SQLite commits the accepted turn, reducer projection, and canonical message, and routes unclassified authority through the process fail-stop boundary. Conversation creation has its own active protocol worker; its scheduling and worker kicks are not wake contracts.
+
+### Consumer classification after wake removal
+
+- **Active production:** shared workflow identity/codec types, Direct Turn model/profile, normalized tables, and transaction primitives used by the Direct Turn repository (`insert_workflow`, `commit_transition_plan`, `begin_attempt`, `accept_receipt_and_delivery`, delivery resolution, terminal fencing, and head CAS).
+- **Verification contract, not a production producer:** generic foundation engine/simulator and generic repository wrappers for observation, lease, schedule, manual-resolution, and row enumeration. Their tests verify the retained foundation requirements; they must not be described as active runtime enrollment or retained for a hypothetical wake replacement.
+- **Historical storage:** wake schemas and historical migration discriminants remain to preserve existing rows and forward upgrades. Operational wake profile, registration, repository, worker, and adoption code are removed.
+
+Wake removal does not establish new authority-loss coverage for other SQLite commands or claim a unified asynchronous-handle API.
 
 ## Normative Shape
 
@@ -28,9 +41,8 @@ The current normative package comprises:
 - `requirements.md`
 - `durable-workflows.allium`
 - `direct-chat-profile.allium`
-- `wake-profile.allium`
 - `creation-profile.allium`
-- ADR-013 through ADR-016, ADR-019, ADR-024, and ADR-036 in `specs/adrs/`
+- ADR-013 through ADR-016, ADR-019, ADR-024, ADR-036, and ADR-098 in `specs/adrs/`
 
 These artifacts now state:
 
@@ -63,7 +75,7 @@ These artifacts now state:
 | REQ-DWF-043 durable facts and local SQLite classification | Partial: direct-turn authoritative materialization enforced | `WorkflowRepository::materialize_authoritative_turn` returns the reusable closed `LocalAuthorityResult`, owns one exact classifier, and drives process fail-stop when unclassified. `ConversationRuntime::apply_transition_result` keeps proposed direct-turn state private until the accepted turn, reducer projection, and canonical message commit. Other authoritative commands remain outside this slice; pending-delivery materialization is tracked separately. |
 | REQ-DWF-CHAT-001–011 direct-chat profile | Specified only | Target-bound direct-turn durable acceptance, immutable prepared payloads, typed committed/replay outcomes, target-local runtime arbitration, exact-ID reconciliation, capability-isolated target resolution, and independent per-target fan-out have no matching vertical-slice implementation. |
 | REQ-DWF-CHAT-012–014, 016 direct-turn authority, refinement, verification, and restart baton | Partially implemented | The pure aggregate and authoritative repository implement scoped replay, immutable prepared semantics, runtime ownership, canonical materialization identity, terminal generation, atomic response-plus-terminal-obligation establishment, bounded settlement retry after durable establishment, active restart rematerialization, proactive post-tool startup dispatch under exact-turn ownership, bounded restart-loop failure, legacy ambiguous-turn retirement, deterministic transaction-cut tests, and commit-before-publication for direct-turn adoption. Exact-turn Stop fencing, exact terminal-row post-commit classification, and the complete interleaving matrix remain incomplete. |
-| REQ-DWF-WAKE-001–005 wake profile | Implemented | Durable Bash/tmux registration, observation, expiry and cancellation arbitration, continuation transfer, canonical terminal delivery, exact-set adoption, restart recovery, and coalesced auto-resume use the normalized foundation. |
+| REQ-DWF-WAKE-001–005 wake profile | Retired normative contract; candidate removal / verification ongoing | No wake execution authority. REQ-WAKE-RETIRE-001–005 govern inert historical data, additive retirement metadata, and preservation of already-admitted DirectTurns. |
 | REQ-DWF-CREATE-001–005 creation profile | Specified only | Conversation creation has no matching vertical-slice implementation against the normalized foundation; request-bound job identity, immutable starting-pin selection, atomic publication, and ambiguity-safe cleanup remain normative only. |
 
 ## Relationship to Historical ADRs
@@ -71,14 +83,20 @@ These artifacts now state:
 ADR-013 through ADR-016 remain historical records of the earlier durable-
 workflow direction. ADR-019 supersedes their permanent-selector,
 shadow-authority, exact-drain, and universal-lease conclusions for current
-normative work without rewriting those historical records.
+normative work without rewriting those historical records. ADR-098 supersedes
+wake-specific execution obligations while retaining shared foundation, direct-turn,
+and creation authority.
 
 ## Verification Expectations
 
-The implemented foundation and wake profile are covered by pure-engine,
-repository, migration, concurrency, restart, failpoint, runtime-recovery, and
-tool-registration tests. Full project validation checks Rust, TypeScript, E2E,
-code generation, specification shape, and Allium consistency.
+The foundation has pure-engine, repository, migration, concurrency, restart,
+failpoint, and runtime-recovery coverage. Historical wake-profile test results do
+not establish acceptance of retirement. Candidate validation must establish
+history-preserving migration, no wake admission/worker/runtime activation or
+lifecycle blocking, and normal execution and settlement of already-admitted
+DirectTurns. That implementation validation remains ongoing with the owning
+implementation slice. Full project validation checks Rust, TypeScript, E2E, code
+generation, specification shape, and Allium consistency.
 
 Remaining profile work is:
 
@@ -101,5 +119,7 @@ Remaining profile work is:
   and normalized child effects with one writable authority per fact.
 - ADR-036 selects process fail-stop when local SQLite authority cannot be established and makes process-local runtime and observer continuity disposable.
 - ADR-074 selects the active materialized direct turn as the sole post-tool restart baton and rejects transcript-only execution authority.
-- ADR-007, ADR-011, and ADR-012 remain historical profile-specific context for
-  creation and wake.
+- ADR-007 remains creation context; ADR-006, ADR-011, and ADR-012 remain
+  historical wake context superseded for execution by ADR-098.
+- ADR-098 removes operational wake authority, preserves history via additive
+  retirement metadata, and retains ordinary already-admitted DirectTurn settlement.

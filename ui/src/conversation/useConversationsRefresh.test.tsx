@@ -304,6 +304,7 @@ describe('useConversationsRefreshDriver — REQ-VS-014 hard-delete cascade', () 
         conversationId: 'conv-doomed',
         conversation: makeConv('old-slug', 'conv-doomed'),
         messages: [{
+          event_presentation: null,
           message_id: 'msg-1',
           sequence_id: 1,
           conversation_id: 'conv-doomed',

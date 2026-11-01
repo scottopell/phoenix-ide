@@ -1,6 +1,6 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { useLocation, useSearchParams } from 'react-router-dom';
+import { useLocation, useNavigate, useNavigationType, useSearchParams } from 'react-router-dom';
 import { useScopedState } from '../hooks/useScopedState';
 import type { OpenFileOptions, PatchContext } from '../components/FileExplorer/fileExplorerTypes';
 import type { ViewerFocus } from '../components/viewer/metaViewerTypes';
@@ -78,6 +78,14 @@ const ViewerSlotCommandsContext = createContext<ViewerSlotCommands | null>(null)
 const ViewerSlotDataContext = createContext<ViewerSlot | null>(null);
 const ViewerSlotBrowserActiveContext = createContext<boolean | null>(null);
 const ViewerSlotRestorationSettledContext = createContext<boolean | null>(null);
+const ReaderNavigationKeyContext = createContext<string | null>(null);
+
+interface ViewerUrlReplacement {
+  fromLocationKey: string;
+  pathname: string;
+  search: string;
+  hash: string;
+}
 
 const VIEWER_PARAM = 'viewer';
 const DIFF_PRESENTATION_PARAM = 'presentation';
@@ -234,8 +242,28 @@ export function ViewerSlotProvider({
   browserSessionActive,
   browserSessionStateLoaded = true,
 }: ViewerSlotProviderProps) {
-  const [searchParams, setSearchParams] = useSearchParams();
+  const [searchParams] = useSearchParams();
   const location = useLocation();
+  const navigate = useNavigate();
+  const navigationType = useNavigationType();
+  const viewerReplacementRef = useRef<ViewerUrlReplacement | null>(null);
+  const readerNavigationRef = useRef({ locationKey: location.key, readerKey: location.key });
+  const committedNavigation = readerNavigationRef.current;
+  const replacement = viewerReplacementRef.current;
+  const viewerOnly = navigationType === 'REPLACE'
+    && replacement?.fromLocationKey === committedNavigation.locationKey
+    && replacement.pathname === location.pathname
+    && replacement.search === location.search
+    && replacement.hash === location.hash;
+  const readerNavigation = useMemo(() => committedNavigation.locationKey === location.key ? committedNavigation : {
+    locationKey: location.key,
+    readerKey: viewerOnly ? committedNavigation.readerKey : location.key,
+  }, [committedNavigation, location.key, viewerOnly]);
+  useLayoutEffect(() => {
+    readerNavigationRef.current = readerNavigation;
+    if (viewerOnly && viewerReplacementRef.current === replacement) viewerReplacementRef.current = null;
+  }, [readerNavigation, replacement, viewerOnly]);
+  const readerNavigationKey = readerNavigation.readerKey;
 
   const [patchContext, setPatchContext] = useScopedState<PatchContext | null>(scopeKey, null);
 
@@ -250,16 +278,14 @@ export function ViewerSlotProvider({
   // directly. Mutual exclusion is structural — one `viewer` value at a time.
   const writeUrl = useCallback(
     (mutate: (next: URLSearchParams) => void) => {
-      setSearchParams(
-        (prev) => {
-          const next = new URLSearchParams(prev);
-          mutate(next);
-          return next;
-        },
-        { replace: true },
-      );
+      const next = new URLSearchParams(location.search);
+      mutate(next);
+      const query = next.toString();
+      const destination = { pathname: location.pathname, search: query ? `?${query}` : '', hash: location.hash };
+      viewerReplacementRef.current = { fromLocationKey: location.key, ...destination };
+      navigate(destination, { replace: true, state: location.state });
     },
-    [setSearchParams],
+    [location, navigate],
   );
 
   const openProse = useCallback(
@@ -423,8 +449,13 @@ export function ViewerSlotProvider({
     }
     enteredScopeRef.current = scopeKey;
     restorationScheduledForScopeRef.current = scopeKey;
-    setSearchParams(storedParams, { replace: true });
-  }, [scopeKey, browserSessionActive, browserSessionStateLoaded, location.key, searchParams, setSearchParams]);
+    writeUrl(next => {
+      clearSlotParams(next);
+      for (const param of SLOT_PARAMS) {
+        for (const value of storedParams.getAll(param)) next.append(param, value);
+      }
+    });
+  }, [scopeKey, browserSessionActive, browserSessionStateLoaded, location.key, searchParams, writeUrl]);
 
   useEffect(() => {
     if (restorationScheduledForScopeRef.current !== scopeKey) return;
@@ -516,19 +547,28 @@ export function ViewerSlotProvider({
   );
 
   return (
-    <ViewerSlotCommandsContext.Provider value={commands}>
-      <ViewerSlotDataContext.Provider value={slot}>
-        <ViewerSlotBrowserActiveContext.Provider value={browserSessionStateLoaded && browserSessionActive === true}>
-          <ViewerSlotRestorationSettledContext.Provider value={restorationSettled}>
-            {children}
-          </ViewerSlotRestorationSettledContext.Provider>
-        </ViewerSlotBrowserActiveContext.Provider>
-      </ViewerSlotDataContext.Provider>
-    </ViewerSlotCommandsContext.Provider>
+    <ReaderNavigationKeyContext.Provider value={readerNavigationKey}>
+      <ViewerSlotCommandsContext.Provider value={commands}>
+        <ViewerSlotDataContext.Provider value={slot}>
+          <ViewerSlotBrowserActiveContext.Provider value={browserSessionStateLoaded && browserSessionActive === true}>
+            <ViewerSlotRestorationSettledContext.Provider value={restorationSettled}>
+              {children}
+            </ViewerSlotRestorationSettledContext.Provider>
+          </ViewerSlotBrowserActiveContext.Provider>
+        </ViewerSlotDataContext.Provider>
+      </ViewerSlotCommandsContext.Provider>
+    </ReaderNavigationKeyContext.Provider>
   );
 }
 
 /* eslint-disable react-refresh/only-export-components -- hooks colocated with the provider */
+
+/** Router identity excluding only replacements authored by this viewer provider. */
+export function useReaderNavigationKey(): string {
+  const key = useContext(ReaderNavigationKeyContext);
+  if (key === null) throw new Error('useReaderNavigationKey must be used inside <ViewerSlotProvider>.');
+  return key;
+}
 
 /** Imperative slot commands only. Stable; never re-renders on slot/flag change. */
 export function useViewerSlotCommands(): ViewerSlotCommands {

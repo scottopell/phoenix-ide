@@ -21,7 +21,6 @@ pub(crate) enum SqliteOperation {
     FtsReconcileUpsert,
     FtsUpsert,
     UpdateMessageDisplayData,
-    WakePendingDeliveryMaterialization,
 }
 
 impl SqliteOperation {
@@ -33,7 +32,6 @@ impl SqliteOperation {
             Self::FtsReconcileUpsert => "fts.reconcile_upsert",
             Self::FtsUpsert => "fts.upsert",
             Self::UpdateMessageDisplayData => "message.update_display_data",
-            Self::WakePendingDeliveryMaterialization => "wake.pending_delivery_materialization",
         }
     }
 }

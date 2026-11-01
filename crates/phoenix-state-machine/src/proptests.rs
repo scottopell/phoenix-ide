@@ -20,7 +20,13 @@ use std::path::PathBuf;
 // ============================================================================
 
 pub(crate) fn test_context() -> ConvContext {
-    ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)
+    ConvContext::new(
+        "test-conv",
+        PathBuf::from("/tmp"),
+        "test-model",
+        200_000,
+        16_384,
+    )
 }
 
 /// Build an `AssistantMessage` with `ToolUse` content blocks for the given tool IDs.
@@ -370,6 +376,7 @@ fn arb_user_question_response_event() -> impl Strategy<Value = Event> {
             .into_iter()
             .collect::<std::collections::HashMap<String, String>>();
         Event::UserQuestionResponse {
+            source: None,
             request_id: Some(
                 QuestionRequestAuthority::new()
                     .request_id()
@@ -1022,7 +1029,8 @@ proptest! {
         prop_assert!(persist.is_some());
 
         if let Some(Effect::PersistCheckpoint { data }) = persist {
-            let CheckpointData::ToolRound { tool_results, .. } = data;
+            let CheckpointData::ToolRound(round) = data;
+            let tool_results = round.results();
             // aborted(1) + skipped (completed_results is empty in this test)
             let expected_len = 1 + skipped.len();
             prop_assert_eq!(tool_results.len(), expected_len);
@@ -1082,7 +1090,8 @@ proptest! {
 
         // Should still use synthetic results (all failed), not the actual success
         if let Some(Effect::PersistCheckpoint { data }) = tr.effects.iter().find(|e| matches!(e, Effect::PersistCheckpoint { .. })) {
-            let CheckpointData::ToolRound { tool_results, .. } = data;
+            let CheckpointData::ToolRound(round) = data;
+            let tool_results = round.results();
             // Find the result for our tool - it should be marked as cancelled, not successful
             let our_result = tool_results.iter().find(|r| r.tool_use_id == tool_use_id);
             prop_assert!(our_result.is_some());
@@ -1424,7 +1433,18 @@ fn test_cancel_mid_tool_chain() {
     let ctx = test_context();
 
     // t1 already completed (stored in completed_results)
-    let t1_result = ToolResult::success("t1".to_string(), "1".to_string());
+    let t1_result = ToolResult {
+        tool_use_id: "t1".into(),
+        outcome: phoenix_core::domain::db_schema::ToolOutcome::Success {
+            output: "completed image".into(),
+            display_data: Some(serde_json::json!({"caption":"keep", "duration_ms":999})),
+            images: vec![phoenix_core::domain::db_schema::ToolContentImage {
+                media_type: "image/png".into(),
+                data: "retained".into(),
+            }],
+        },
+        duration_ms: Some(17),
+    };
 
     // Build AssistantMessage with tool_use blocks for all 4 tools
     let assistant_message = AssistantMessage::new(
@@ -1476,7 +1496,7 @@ fn test_cancel_mid_tool_chain() {
                 )),
             ),
         ],
-        completed_results: vec![t1_result],
+        completed_results: vec![t1_result.clone()],
         pending_sub_agents: vec![],
         assistant_message,
     };
@@ -1525,7 +1545,8 @@ fn test_cancel_mid_tool_chain() {
     assert!(persist_effect.is_some(), "Should have PersistCheckpoint");
 
     if let Some(Effect::PersistCheckpoint { data }) = persist_effect {
-        let CheckpointData::ToolRound { tool_results, .. } = data;
+        let CheckpointData::ToolRound(round) = data;
+        let tool_results = round.results();
         // Should have results for completed (t1) + aborted (t2) + skipped (t3, t4) = 4 total
         assert_eq!(
             tool_results.len(),
@@ -1534,7 +1555,20 @@ fn test_cancel_mid_tool_chain() {
         );
         // t1 should be successful, t2/t3/t4 should be cancelled/skipped
         let t1 = tool_results.iter().find(|r| r.tool_use_id == "t1").unwrap();
-        assert!(t1.is_success(), "t1 should be successful (was completed)");
+        assert_eq!(
+            t1, &t1_result,
+            "completed metadata and outcome stay lossless"
+        );
+        assert_eq!(
+            tool_results
+                .iter()
+                .map(|result| result.tool_use_id.as_str())
+                .collect::<Vec<_>>(),
+            ["t1", "t2", "t3", "t4"]
+        );
+        assert_eq!(tool_results[1].output(), "Cancelled by user");
+        assert_eq!(tool_results[2].output(), "Skipped due to cancellation");
+        assert_eq!(tool_results[3].output(), "Skipped due to cancellation");
         assert!(
             tool_results
                 .iter()

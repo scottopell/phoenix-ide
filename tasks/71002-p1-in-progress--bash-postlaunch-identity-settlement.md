@@ -1,0 +1,4 @@
+Repair Bash post-launch identity failure without replay, fabricated launch identity, or unknown-PID signaling. Preserve owned-child wait custody and admission, bound output capture, surface verified terminal versus explicitly unknown outcomes, and qualify forced-probe faults on hosted Linux/macOS CI. Parent architecture/integration review remains required; no local compiler or production operations authorized.
+
+
+Publication: draft only, not merge-ready. Hosted Linux/macOS fault workflow and full CI remain pending. Generated TypeScript is known stale: retrieve hosted codegen artifacts after a result and integrate generated output, never hand-edit it. The zero-PGID diagnostic sentinel used for scope uncertainty is a known pre-merge blocker requiring a typed follow-up; it is not repaired in this publication slice. Local validation is limited to installed rustfmt and git diff checks; no Cargo/compiler/install, local tests, or production operations.

@@ -3,6 +3,7 @@ import json
 import hashlib
 import os
 import sqlite3
+import sys
 import subprocess
 import shutil
 import tempfile
@@ -526,7 +527,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
 
     def test_snapshot_cli_does_not_offer_custom_output(self):
         completed = subprocess.run(
-            ["python", str(ROOT / "scripts/conversation_search_benchmark.py"), "snapshot", "--help"],
+            [sys.executable, str(ROOT / "scripts/conversation_search_benchmark.py"), "snapshot", "--help"],
             capture_output=True, text=True, check=True,
         )
         self.assertNotIn("--output", completed.stdout)

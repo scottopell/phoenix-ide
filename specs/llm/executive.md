@@ -22,12 +22,14 @@ Tool availability is separated from retained declarations and historical calls. 
 | **REQ-LLM-003a:** Model Discovery | ✅ Complete | Opportunistic backend-scoped `/v1/models` discovery, falls back to configured models |
 | **REQ-LLM-003b:** Typed Model Effort Capability Registry | ✅ Complete | Constructor-validated known-native, unknown, unsupported, and supported-level capability states |
 | **REQ-LLM-004:** Request Format | ✅ Complete | LlmRequest with system, messages, tools |
-| **REQ-LLM-004a–004f:** Reasoning Effort Lifecycle | ✅ Complete | Native omission, explicit overrides, atomic switches, subagent inheritance, provider translation, and output reservation |
+| **REQ-LLM-004a–004e:** Reasoning Effort Lifecycle | ✅ Complete | Native omission, explicit overrides, atomic switches, subagent inheritance, and provider translation |
+| **REQ-LLM-004f:** Output Budget Resolution and Reservation | Implemented; qualification in progress | Concrete model output maxima flow through runtime context, ordinary and continuation requests, provider serialization, and reservation. External HTTP definitions require `max_output_tokens`; no effort-based cap or 4k continuation override. Native Codex retains wire omission. |
 | **REQ-LLM-004g:** Fast Request Speed | ✅ Complete | Capability-gated per-conversation Standard/Fast selection maps to each supported route's native control: Responses `priority` or direct Anthropic `speed: fast` with its feature header. Effective speed is persisted per turn for historical pricing, successful Anthropic responses must confirm Fast, continuations preserve it, and subagents default to Standard. |
 | **REQ-LLM-004h:** Codex Model Discovery and Route Identity | ✅ Complete | Supported built-ins require configured Codex credentials with an identified account, not provider-catalog membership. Account-bound construction excludes missing identity; startup/reload withdrawal and restoration regressions cover admission. Discovery remains advisory and cannot register unknown models or affect direct API registration. Route-native effort capabilities remain distinct. |
 | **REQ-LLM-004i:** Tool Availability and Provider Continuation | ✅ Complete | Durable declarations and native events; originating-request admission bound to the actual execution schema, including MCP recovery; provider-specific restrictions; complete active Responses envelopes including assistant phase and lossless terminal fallback; atomic switch settlement and native-prefix rebasing. Provider, SQLite restart, runtime withdrawal, QA, and WebSocket incarnation/incremental replay regressions cover these contracts. |
 | **REQ-LLM-005:** Response Handling | ✅ Complete | Public content uses typed blocks. Active Anthropic signed/encrypted blocks use private durable replay state, exact identity/ordinal reconstruction, explicit `drop_block` prefix policy, and content-free diagnostics; private payloads cannot enter public message or error wire shapes. |
 | **REQ-LLM-006:** Error Classification | ✅ Complete | Transient throttles, user-resumable quota exhaustion, model overload, provider prompt rejection, terminal refusal responses, and explicit Codex depletion states are classified separately. Refusals discard partial output and do not auto-retry or enter tool continuation. Invalid requests stop automatic retry but permit manual retry/dismiss, including persisted errors; exact access-program rejection coverage spans HTTP/WebSocket classification, state transitions, runtime recreation after model-change eviction, and recovery controls. Client decoding failures use a distinct non-actionable client state. |
+| **REQ-LLM-006c:** Output-Token Exhaustion Classification | Implemented; qualification in progress | Chat length, Responses incomplete/max_output_tokens (JSON and SSE), and Anthropic max_tokens produce a distinct non-auto-retryable, user-resumable error before partial tool-call normalization. Synthetic provider regressions pass. |
 | **REQ-LLM-006a:** Plan-Aware Quota Messages (Codex Backend) | ✅ Complete | Structured Codex quota normalization, plan-aware resumable messages, and authoritative account quota UI with reset timestamps formatted in the browser's local timezone |
 | **REQ-LLM-007:** Usage Tracking | ✅ Complete | Usage struct with token/cache counts; historical cost remains explicitly unknown when per-request context thresholds or route details are not preserved. |
 | **REQ-LLM-007a:** Reasoning Token and Effort Observability | ✅ Complete | Provider-reported reasoning tokens and effective effort are tracked without exposing reasoning content |
@@ -38,7 +40,51 @@ Tool availability is separated from retained declarations and historical calls. 
 | **REQ-LLM-011:** Absolute Provider-Attempt Deadline | ✅ Complete | One ten-minute service deadline covers credential resolution, WebSocket activity/recovery, HTTP/SSE fallback, body consumption, and normalization without renewal |
 | **REQ-LLM-012:** Total and Idempotent Attempt Outcomes | ✅ Complete | Timeout is distinct from cancellation/network failure; terminal capture and persistence are first-winner/idempotent |
 | **REQ-LLM-013:** Timeout Outcome Schema Migration | ✅ Complete | Forward migration preserves existing metrics, admits `timed_out`, and retains the closed outcome constraint |
+| **REQ-LLM-014:** Canonical Model Identity Is Distinct From Request Addressing | ✅ Complete | `ModelSpec.id` is the sole value read by capability/transport checks, the picker, and persistence; `RequestModelName` (default from configured `api_name`) carries only serialization, discovery matching, and replay/continuation binding. `PHOENIX_LLM_REQUEST_MODELS` validates its route→ID→spelling map atomically at startup, rejects the Codex route, and is ignored for native-Codex-routed built-ins. Automatic `provider` header inference is removed; explicit custom headers and native Codex account/protocol headers are unaffected. Responses replay and the normalized `model` field bind to the request spelling, not the provider's reported physical name. |
 
 **Progress:** All listed requirements complete.
 
 Active Responses exchanges retain original output envelopes, including assistant phase, through tool rounds, retry, and restart. Settled public history does not yet retain provider-owned assistant phase; that separate limitation is tracked in task 41010. Existing historical tools whose authentic declarations were never captured require catalog reconnection before valid replay.
+
+## Capacity-policy specification
+
+REQ-LLM-004j–004m have backend implementation and bounded deterministic
+qualification under task 44018. Shared prepared-request accounting reserves the
+selected model's full output allowance; counting has one bounded optional attempt
+and labelled fallback. Capacity diagnostics identify deliberate prefix changes.
+UI delivery, full integration validation, deployment and production recovery
+remain separate gates. ADR-146 records the decisions.
+
+Qualification reuses focused fixtures rather than claiming cache performance:
+`capacity_diagnostics_prefix_causes_are_multiple_and_content_free` covers a cold
+comparison, unchanged appended history, and classified deliberate invalidation;
+`skill_catalog_survives_tool_loop_and_refreshes_on_new_input` covers frozen turn
+guidance/skill metadata and new-turn refresh. Stale-result tests cover a stable
+rendered prefix after clearing, recent images, and original interpretation and
+corrections. `sqlite_runtime_anthropic_withdrawal_preserves_failed_exchange_after_reopen_and_retry`
+and `native_withdrawal_keeps_prefix_and_replays_original_position` cover live
+policy withdrawal and replay ordering. Responses fixtures
+`websocket_continuation_requires_exact_prefix_including_server_output` and
+`websocket_continuation_resets_on_non_prefix_or_property_change` cover exact
+private prefixes and required resets. `upgrade_model_state_guard_tests` covers
+permitted changes and rejects in-flight or fenced changes. These fixtures verify
+request/state preservation, not model understanding, actual provider cache
+residency, cache hit rate, or cross-route reuse. No paid long-session evaluation
+has been performed.
+
+The API integration fixture
+`accepted_model_switch_recreates_ordinary_request_limits_and_preserves_pressure_input`
+qualifies accepted model changes followed by actual ordinary dispatch through the
+direct-turn worker: 200,000 context / 16,000 output → 64,000 / 8,000 →
+200,000 / 16,000. Each persisted ordinary capacity plan and captured provider
+request uses the selected model and full output reservation after runtime
+recreation. Additional input pressure after another downgrade produces an
+ordinary `needs_compaction` plan and one real summary request using the smaller
+model and full 8,000-token reservation. Its original user input remains stored;
+the exhausted state contains the mock-generated summary. All seven owning API
+model-guard tests pass. These deterministic fixtures do not establish model
+understanding, cache hits, or full cross-provider interoperability.
+
+Independent specs-only review is recorded in
+`docs/reviews/context-capacity-spec-review.md`; independent implementation review
+and final integration remain delivery gates.

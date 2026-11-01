@@ -2,3 +2,7 @@ allowBuilds:
   '@swc/core': true
   esbuild: true
   msw: true
+
+patchedDependencies:
+  micromark@4.0.2: patches/micromark@4.0.2.patch
+  mdast-util-from-markdown@2.0.3: patches/mdast-util-from-markdown@2.0.3.patch

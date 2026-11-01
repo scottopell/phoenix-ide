@@ -1,18 +1,19 @@
-import { useLocation } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { memo, useCallback, useRef, useState } from 'react';
 import type { VirtualTranscriptRange } from './VirtualTranscript';
 import { MessageList, type MessageListHandle } from './MessageList';
 import { ConversationNav } from './ConversationNav';
 import { resolveActiveUnitIndex } from './conversationNavSpy';
-import type { Chapter } from '../conversation/conversationChapters';
+import type { Chapter, ChapterTarget } from '../conversation/conversationChapters';
 import type { RestoreBasis } from '../conversation/historyExpansion';
+import type { ConversationHistoryBoundaryView } from '../generated/ConversationHistoryBoundaryView';
 
 /** Everything MessageList accepts, minus the wiring this stack owns
  *  (`onVisibleRangeChange`, `onChaptersChange`, and the imperative ref). */
 type StackProps = Omit<
   React.ComponentProps<typeof MessageList>,
   'onVisibleRangeChange' | 'onChaptersChange' | 'ref'
->;
+> & { historyBoundaries?: ConversationHistoryBoundaryView[]; onViewChaptersReady?: ((count: number) => void) | undefined };
 
 /**
  * Coordinates the conversation nav strip with the virtualized message list.
@@ -22,15 +23,17 @@ type StackProps = Omit<
  * active index. Renders the nav as a fixed-height strip above the list.
  */
 export const ConversationNavStack = memo(function ConversationNavStack(props: StackProps) {
-  const { onLoadOlderMessages } = props;
+  const { onLoadOlderMessages, onUpdateOlderMessagesRestore, historyBoundaries, onViewChaptersReady, ...listProps } = props;
   const location = useLocation();
+  const navigate = useNavigate();
   const sourceToolId = new URLSearchParams(location.search).get('source_tool');
   let sourceCallTarget: { messageId: string; toolUseId: string } | null = null;
   if (sourceToolId && location.hash.startsWith('#message-')) {
     try { sourceCallTarget = { messageId: decodeURIComponent(location.hash.slice(9)), toolUseId: sourceToolId }; } catch { /* Invalid external locator is not a navigation target. */ }
   }
   const listRef = useRef<MessageListHandle>(null);
-  const [chapters, setChapters] = useState<Chapter[]>([]);
+  const [publishedChapters, setChapters] = useState<Chapter[] | null>(null);
+  const chapters = publishedChapters ?? [];
   const [activeUnitIndex, setActiveUnitIndex] = useState<number | null>(null);
 
   // Keep the latest chapters for the range callback without re-binding it.
@@ -46,9 +49,25 @@ export const ConversationNavStack = memo(function ConversationNavStack(props: St
     setActiveUnitIndex((prev) => (prev === next ? prev : next));
   }, []);
 
-  const handleJump = useCallback((unitIndex: number) => {
-    listRef.current?.scrollToUnitIndex(unitIndex);
-  }, []);
+  const selectChapterTarget = useCallback((target: ChapterTarget) => {
+    const query = new URLSearchParams(location.search);
+    query.delete('source_tool');
+    if (target.kind === 'pending') query.delete('source_transcript');
+    else if (target.transcriptId && (historyBoundaries !== undefined || query.has('source_transcript'))) query.set('source_transcript', target.transcriptId);
+    const state: Record<string, unknown> = { ...location.state };
+    if (target.kind === 'pending') state['chapterSelection'] = 'pending';
+    else delete state['chapterSelection'];
+    navigate({ pathname: location.pathname, search: query.toString(), hash: target.kind === 'persisted' ? `#message-${encodeURIComponent(target.messageId)}` : '' }, {
+      state,
+    });
+  }, [historyBoundaries, location.pathname, location.search, location.state, navigate]);
+
+  const handleJump = useCallback((chapter: Chapter) => {
+    onUpdateOlderMessagesRestore?.({ kind: 'reader_viewport' });
+    const target = chapter.kind === 'boundary' ? { kind: 'persisted' as const, messageId: chapter.messageId, transcriptId: chapter.transcriptId } : chapter.target;
+    selectChapterTarget(target);
+    if (target.kind === 'pending') listRef.current?.scrollToUnitIndex(chapter.unitIndex);
+  }, [selectChapterTarget, onUpdateOlderMessagesRestore]);
 
   const handleLoadOlderMessages = useCallback(async (restoreBasis?: RestoreBasis) => {
     if (!onLoadOlderMessages) return;
@@ -64,12 +83,20 @@ export const ConversationNavStack = memo(function ConversationNavStack(props: St
         chapters={chapters}
         activeUnitIndex={activeUnitIndex}
         onJump={handleJump}
+        historyBoundaries={historyBoundaries}
+        onChaptersReady={publishedChapters === null ? undefined : onViewChaptersReady}
+        onJumpBoundary={(messageId) => {
+          const loaded = chapters.find((chapter) => chapter.kind === 'boundary' && chapter.messageId === messageId);
+          const transcriptId = loaded?.kind === 'boundary' ? loaded.transcriptId : historyBoundaries?.find((candidate) => candidate.message_id === messageId)?.predecessor_transcript_row_id;
+          selectChapterTarget({ kind: 'persisted', messageId, transcriptId });
+        }}
       />
       <MessageList
         ref={listRef}
-        {...props}
+        {...listProps}
         sourceCallTarget={sourceCallTarget}
         onLoadOlderMessages={onLoadOlderMessages ? handleLoadOlderMessages : undefined}
+        onUpdateOlderMessagesRestore={onUpdateOlderMessagesRestore}
         onChaptersChange={handleChaptersChange}
         onVisibleRangeChange={handleVisibleRangeChange}
       />

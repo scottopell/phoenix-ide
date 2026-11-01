@@ -68,7 +68,12 @@ AND SHALL require the mapped replacement to be available instead of falling back
 THE SYSTEM SHALL preserve the original model identity on historical turns and requests or runtimes whose model was already resolved
 AND SHALL NOT use catalog family or version ordering to infer orchestration qualification for an unlisted model
 
-**Rationale:** Opportunistic discovery from exact endpoint overrides validates configured models without making model listing mandatory. Explicit compatibility mappings keep live pins deterministic while leaving historical attribution, in-flight work, and operator-defined routes authoritative.
+WHEN a model specification describes its output capability
+THE SYSTEM SHALL treat the model's declared supported output maximum as the authoritative source of its output budget (REQ-LLM-004f)
+AND SHALL require that maximum to be a verified catalog fact for every built-in model
+AND SHALL reject an operator-configured model on a compatible HTTP backend that carries no declared output maximum with a clear configuration error rather than substituting an invented numeric default
+
+**Rationale:** Opportunistic discovery from exact endpoint overrides validates configured models without making model listing mandatory. Explicit compatibility mappings keep live pins deterministic while leaving historical attribution, in-flight work, and operator-defined routes authoritative. The declared output maximum is what sets each request's budget, so an unknown maximum must fail honestly instead of silently manufacturing one.
 
 ---
 
@@ -164,6 +169,11 @@ THE SYSTEM SHALL preserve the explicit override exactly
 ---
 
 ### REQ-LLM-004c: Atomic Model Switch and Override Reset
+
+WHEN a user requests a conversation model change
+THE SYSTEM SHALL admit it only from Idle, Error, or RecoverableContinuationFailure
+AND SHALL evaluate admission against the authoritative effective conversation state
+AND SHALL reject the change in every other state without modifying configuration or queuing a deferred switch.
 
 WHEN the selected model changes for a conversation
 THE SYSTEM SHALL apply the new selected model and any simultaneous explicit reasoning-effort reset or replacement as one atomic state transition
@@ -269,19 +279,32 @@ THE SYSTEM SHALL compose it with the rest of the provider request shape rather t
 
 ---
 
-### REQ-LLM-004f: Output Headroom Reservation
+### REQ-LLM-004f: Output Budget Resolution and Reservation
 
-WHEN Phoenix prepares a request for a model with a bounded output budget
-THE SYSTEM SHALL reserve output headroom separately from input-context accounting
-AND SHALL apply reasoning-effort-dependent output headroom defaults before dispatch
-
-WHEN an explicit reasoning-effort selection changes the model's expected output budget
-THE SYSTEM SHALL recompute reserved output headroom from that effective selection
+WHEN Phoenix prepares an ordinary or continuation agent-turn request for a model with a bounded output budget
+THE SYSTEM SHALL resolve one output-token budget equal to the model's declared supported output maximum
+AND SHALL recover input room through the context-management policy when that preferred budget does not fit
+AND SHALL NOT silently reduce that budget to accommodate retained input
+AND SHALL use that single resolved budget both as the value sent in the provider's output-limit field and as the output headroom the context planner reserves
+AND SHALL NOT derive the budget from reasoning effort, a continuation-versus-normal distinction, or a Phoenix-internal fixed allowance
 
 WHEN reporting context-window usage
-THE SYSTEM SHALL distinguish consumed context from reserved output headroom rather than treating reserved output capacity as already-consumed input context
+THE SYSTEM SHALL distinguish consumed input context from reserved output budget rather than treating reserved output capacity as already-consumed input context
 
-**Rationale:** Input history and reserved completion budget are different quantities. Reasoning effort can change how much output space Phoenix must reserve, so the reservation has to be explicit and recomputable.
+WHEN the input plus the preferred reserved output budget does not fit the context window
+THE SYSTEM SHALL first trim or compact available input to recover room for the preferred output budget rather than silently shrinking the request to a tiny output budget
+AND SHALL, when a fixed prompt plus the reserved output budget still cannot fit, surface the condition through the context-management policy rather than dispatching a request whose output budget exceeds the model or context limit
+
+Bounded utility requests such as titles, command suggestions, search interpretation, and structured QA MAY declare a smaller output limit for their specific contract. They SHALL use that same explicit limit for their own request accounting and SHALL NOT change the ordinary or continuation agent-turn default.
+
+WHEN fitting an ordinary request before dispatch
+THE SYSTEM SHALL account for its system prompt, finalized retained tool declarations and restrictions, rendered history including nested images, matching provider-private replay, and output reservation
+AND SHALL attempt permitted stale-tool-result clearing before reporting a planned-capacity failure
+AND SHALL distinguish conservative local planning from authoritative provider token counts
+
+The completed-response continuation threshold remains governed by `specs/bedrock/requirements.md` REQ-BED-019; reserved future output SHALL NOT lower that threshold or reject an otherwise acceptable completed response.
+
+**Rationale:** The model's capability ceiling is the right default request budget; a smaller Phoenix-internal allowance tied to reasoning effort starved reasoning-heavy turns and produced output-exhaustion failures before any visible answer. One resolved value keeps the sent limit and the reserved headroom from diverging, while context fitting protects input rather than quietly collapsing the output budget.
 
 ---
 
@@ -492,6 +515,31 @@ AND SHALL NOT create another overload loop at the continuation-opening boundary
 
 ---
 
+### REQ-LLM-006c: Output-Token Exhaustion Classification
+
+WHEN a provider response terminates because the model reached the request's output-token budget (Chat Completions `finish_reason` length, Responses `incomplete` with reason `max_output_tokens`, or Anthropic `stop_reason` max_tokens)
+THE SYSTEM SHALL classify the outcome as a dedicated output-token-exhaustion category distinct from context-window exhaustion and from the malformed-response category
+AND SHALL NOT automatically retry the identical request, because repeating unchanged parameters does not correct the budget limit
+AND SHALL classify the persisted error as user-resumable so a revised message or revised settings that free output room can recover within the same conversation
+
+WHEN an output-token-exhausted response carries a partial or truncated tool call
+THE SYSTEM SHALL discard that tool call and SHALL NOT dispatch it
+
+WHEN visible content was already streamed to the user before the output budget was reached
+THE SYSTEM SHALL preserve that already-visible content under the existing streaming-buffer policy
+AND SHALL NOT persist the truncated turn as a completed assistant turn
+
+WHEN the input plus reserved output cannot fit the context window
+THE SYSTEM SHALL classify that condition as context-window exhaustion rather than output-token exhaustion
+
+The native Codex transport keeps its existing output-limit field handling and official terminal reasons unchanged; a provider response whose shape is malformed rather than budget-limited remains in the malformed-response category with its existing retry behavior.
+
+This classification reuses the existing persisted request-outcome value for token-budget exhaustion; it introduces no new persisted outcome value and therefore requires no outcome-schema migration. Missing failed-attempt usage SHALL NOT be interpreted as zero billing; extending failed-attempt usage capture is outside this contract.
+
+**Rationale:** An output budget stop is a well-formed provider response, not a transport fault, so retrying the identical request only wastes attempts and private reasoning. Users recover by freeing output room, so the error is terminal for automatic retry but resumable by the user. Keeping it separate from context-window exhaustion preserves distinct recovery guidance, and never dispatching a truncated tool call prevents a partial, structurally invalid call from executing.
+
+---
+
 ### REQ-LLM-007: Usage Tracking
 
 WHEN LLM response includes token counts
@@ -675,3 +723,110 @@ AND SHALL admit `timed_out`
 AND SHALL continue rejecting undeclared outcome values
 
 The migration is forward-only internal persistence under the project compatibility policy. It does not establish downgrade compatibility or a stable cross-version SQLite schema contract.
+
+---
+
+### REQ-LLM-014: Canonical Model Identity Is Distinct From Request Addressing
+
+THE SYSTEM SHALL treat a model's Phoenix ID as the sole canonical identity for the picker, persistence, continuation, agent/worker selection, and every capability or transport check
+
+THE SYSTEM SHALL represent the wire spelling used to address a provider request as a separate typed value, scoped to serialization, discovery-name matching, and replay/continuation binding only
+
+AND SHALL NOT accept that typed request-addressing value anywhere a feature, capability, or transport check reads canonical model identity
+
+AND SHALL NOT introduce a third identity field that duplicates either the canonical ID or the request-addressing value
+
+WHEN a configured model declares a wire model name
+THE SYSTEM SHALL preserve that configured name as the model's default request spelling
+AND SHALL NOT mutate the model's canonical spec to apply a deployment-specific request-addressing override
+
+WHEN resolving the request spelling for an outbound call
+THE SYSTEM SHALL first resolve the model's actual backend route
+AND SHALL then resolve the request spelling for that route
+AND SHALL ignore a configured request-addressing override when the resolved route is the native Codex bridge
+
+WHEN an operator configures `PHOENIX_LLM_REQUEST_MODELS` as an inline JSON map of backend route to Phoenix model ID to request spelling
+THE SYSTEM SHALL accept only the three backend-route keys corresponding to Anthropic, OpenAI Responses, and OpenAI Chat Completions
+AND SHALL reject the Codex bridge as a route key
+AND SHALL reject an unknown route, an unknown model ID, a model ID whose backend does not match its route key, a blank request spelling, duplicate route or model keys, and malformed JSON
+AND SHALL validate the entire map atomically before any entry takes effect, so a single invalid entry discards the whole configured map rather than applying a partial one
+
+WHEN a request-addressing override changes which spelling is sent on the wire
+THE SYSTEM SHALL change the derived continuation/route key accordingly
+AND SHALL NOT change the model's canonical ID, capability classification, or the continuation/route key produced in the absence of an override
+
+THE SYSTEM SHALL NOT automatically inject a `provider` request header inferred from model or route identity
+AND SHALL continue to honor explicitly configured custom headers and the headers required for native Codex account binding and protocol framing
+
+WHEN normalizing an OpenAI Responses API reply, whether delivered as a single JSON body or reassembled from a stream
+THE SYSTEM SHALL bind the normalized response's model field to the request spelling that was sent
+AND SHALL NOT bind it to the physical model name the provider reports in its reply, which may legitimately differ from the request spelling under a gateway or alias
+
+WHEN matching a model against provider-reported model-list discovery
+THE SYSTEM SHALL match using the model's resolved request spelling for its actual route, plus its canonical ID and normative backend-prefixed legacy aliases
+AND SHALL continue to treat the Codex advisory catalog as non-binding: absence from it SHALL NOT deregister a supported built-in, and presence in it SHALL NOT register a model absent from the built-in or operator-configured catalog
+
+**Rationale:** Conflating canonical identity with wire spelling forced every capability and transport check to special-case gateway-rewritten model names, and made an automatically inferred `provider` header silently wrong whenever a deployment's request spelling didn't match its actual provider. Splitting the two lets the picker, persistence, and capability checks stay keyed on a value that never changes under a gateway, while the wire spelling can be remapped per deployment through one validated, atomic configuration surface that native Codex — which owns its own account-bound addressing — is structurally excluded from.
+
+### REQ-LLM-004j: One Capacity Decision for the Prepared Request
+
+WHEN preparing an ordinary or tool-free continuation request
+THE SYSTEM SHALL resolve effective context capacity from the selected model and route
+AND SHALL freeze the complete input, tool declarations and restrictions, applicable private replay, generation settings, output reservation, and project-guidance snapshot before the capacity decision
+AND SHALL dispatch that same prepared request or discard its plan if any frozen input changes
+AND SHALL keep live execution authority and revocation checks authoritative at dispatch.
+
+THE SYSTEM SHALL distinguish ready, reducible input pressure, and irreducible capacity conflict as exhaustive planning outcomes
+AND SHALL distinguish locally planned pressure from an authoritative provider context rejection
+AND SHALL count cached input as occupying context.
+
+WHEN preferred output plus input does not fit
+THE SYSTEM SHALL attempt permitted worthwhile stale-result clearing, then route an eligible parent to durable compaction if retained history can be reduced
+AND SHALL expose a recoverable capacity conflict when mandatory input and preferred output cannot fit
+AND SHALL NOT retry the unchanged impossible plan or create a successor with an error notice as its handoff.
+
+Ordinary and continuation requests SHALL share capacity accounting, but MAY assemble different input under their retention contracts. Compaction SHALL NOT recursively compact itself. A sub-agent SHALL use its existing bounded terminal failure contract rather than create a parent continuation.
+
+### REQ-LLM-004k: Counting Evidence and Bounded Fallback
+
+WHEN determining input occupancy
+THE SYSTEM SHALL distinguish provider-counted, verified local-tokenizer, and conservatively estimated counts
+AND SHALL bind a count to the exact prepared request and selected route
+AND SHALL NOT treat model aliases, a shared API protocol, or public text tokenization alone as proof of complete request accounting.
+
+WHEN local planning would otherwise clear, compact, or reject input and the configured route explicitly supports input counting
+THE SYSTEM SHALL attempt at most one remote count across all candidates in one logical request-planning operation, including its clearing and handoff planning, with a finite absolute timeout and no counting retry
+AND SHALL use a supported count as planning evidence with any provider-documented uncertainty
+AND SHALL fall back to local planning on unavailable, failed, or timed-out counting without changing model, route, or credentials.
+
+THE SYSTEM SHALL compare predicted occupancy with actual provider usage only for the same dispatched prepared request
+AND SHALL preserve unknown usage as unknown
+AND SHALL NOT require remote counting for requests local planning accepts, automatic tokenizer downloads, endpoint capability probing, or a durable counting workflow.
+
+### REQ-LLM-004l: Model and Route Changes Preserve Work
+
+WHEN a selected model or route changes
+THE SYSTEM SHALL admit the change only under REQ-LLM-004c and apply the accepted selection to subsequent requests
+AND SHALL NOT change an in-flight request or introduce a queued model-switch lifecycle
+AND SHALL replan against the new effective limits and output maximum
+AND SHALL preserve portable public history, tool-call/result pairing, user corrections, and unresolved work
+AND SHALL retain provider-private replay and transport continuation state only when the destination route's existing compatibility contract permits it
+AND SHALL NOT silently select another model to avoid a capacity conflict.
+
+A switch SHALL use the same clearing, compaction, and conflict policy as other input pressure. A supported switch SHALL NOT require cache reuse or a shared tokenizer between routes.
+
+### REQ-LLM-004m: Predictable Prefix Changes
+
+WHEN input sources, retained history, model, route, and relevant settings are unchanged
+THE SYSTEM SHALL produce identical provider-visible historical input and declaration ordering
+AND SHALL append new activity without re-rendering old observations into new mutable summaries.
+
+THE SYSTEM SHALL refresh ordinary repository guidance and skill metadata at a new user-turn boundary and retain that snapshot throughout the turn's tool loop
+AND SHALL keep authoritative permission changes live regardless of snapshot stability.
+
+WHEN clearing, compaction, instruction refresh, model/route changes, or tool-policy changes require a prefix change
+THE SYSTEM SHALL preserve correct semantics even when cache reuse is lost
+AND SHALL identify the deliberate change in request diagnostics
+AND SHALL NOT promise provider cache residency, hit rate, or cross-model reuse.
+
+For Codex-auth, direct API, and compatible gateway routes, cache controls SHALL be selected from that route's verified capabilities rather than inferred from protocol name alone.

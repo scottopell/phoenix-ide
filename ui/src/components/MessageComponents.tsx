@@ -1,3 +1,4 @@
+import { ConversationEventCard } from './ConversationEventCard';
 import { SvgArtifactAccessContext } from '../contexts/SvgArtifactAccessContext';
 import { SvgArtifactCard } from './SvgArtifactCard';
 import { svgArtifactFromResult } from './svgArtifact';
@@ -18,9 +19,10 @@ import { svgArtifactFromResult } from './svgArtifact';
 import React, { memo, useState, useMemo, useCallback, useRef, useEffect, useLayoutEffect } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { MessageReviewAction } from './MessageReviewAction';
+import { AssistantMessageChrome, AssistantMessageMetadata } from './AssistantMessageChrome';
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import { MarkdownRenderer } from './MarkdownRenderer';
 import { SyntaxHighlighter, oneDark, oneLight } from '../utils/syntaxHighlighter';
 import { api } from '../api';
 import type { Message, InputOrigin, ContentBlock, ToolResultContent, ConversationState, PendingSubAgent, SubAgentResult } from '../api';
@@ -34,6 +36,7 @@ import { useIsDesktop } from '../hooks';
 import { useDensity } from '../hooks/useDensity';
 import { useConversationInlineStream, type InlineStreamState } from '../hooks/useConversationInlineStream';
 import { useSubAgentViewer } from '../contexts/SubAgentViewerContext';
+import { SubAgentTaskDetails } from './SubAgentTaskDetails';
 
 import { linkifyText } from '../utils/linkify';
 import { getMessageMarkdown } from '../utils/messageCopy';
@@ -52,7 +55,6 @@ import { MermaidDiagram } from './MermaidDiagram';
 import { StreamingBlocks } from './StreamingMessage';
 import './ReadFileResultView.css';
 import './MessageComponents.css';
-import { UserMetaMessage } from './UserMetaMessage';
 
 const CheckIcon = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -126,26 +128,10 @@ function DeferredSyntaxHighlighter({ language, syntaxStyle, children, ...props }
   );
 }
 
-// Stable plugin array -- avoids creating a new array reference on every render
-const REMARK_PLUGINS = [remarkGfm];
-const NO_REMARK_PLUGINS: typeof REMARK_PLUGINS = [];
-
 // Inline-code / prose file-path links open the file with no modified-line
 // selection. Share one empty Set rather than allocating a new one per markdown
 // node on every render. Never mutated.
 const EMPTY_LINE_SET = new Set<number>();
-
-function usesGfmSyntax(text: string): boolean {
-  return /(^|\n)\s*(?:[-*+]|\d+[.)])\s+\[[ xX]\]\s/.test(text)
-    || /(^|\n)\s*\|.*\|/.test(text)
-    || /(^|\n)\s*[-:| ]{3,}\|[-:| ]{3,}/.test(text)
-    || /(?:^|[^~])~[^\s~][^\n~]*[^\s~]~(?:[^~]|$)/.test(text)
-    || /~~[^\n]+~~/.test(text)
-    || /https?:\/\/\S+/.test(text)
-    || /www\.\S+/.test(text)
-    || /(^|[^\w.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/.test(text)
-    || /\[\^[^\]]+\]/.test(text);
-}
 
 /** Format a tool execution duration for display in the tool block header.
  *  < 1s    -> "743ms" (integer milliseconds)
@@ -380,6 +366,9 @@ function FileChips({
 }
 
 function InputSender({ origin }: { origin: InputOrigin | undefined }) {
+  if (origin?.kind === 'slack_gateway') {
+    return <span className="message-sender"><a href={'/api/slack-gateway/requests/' + encodeURIComponent(origin.request_id) + '/source'} target="_blank" rel="noreferrer">Slack request</a></span>;
+  }
   if (origin?.kind !== 'internal_conversation') {
     return <span className="message-sender">{inputOriginPresentation(origin).label}</span>;
   }
@@ -397,20 +386,38 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
   const text = content.text || (typeof message.content === 'string' ? message.content : '');
   const images = content.images || [];
   const files = content.files || [];
-  const displayData = message.display_data as { type?: string } | null;
-  const isWakeMeta = displayData?.type === 'wake_result' && content.is_meta === true;
   const isMeta = content.is_meta === true || inputOriginPresentation(message.origin).className === 'meta';
   const timestamp = message.created_at;
 
-  if (isWakeMeta) {
+  const body = (
+    <div className="message-content">
+      <span data-fragment-id="message-text">
+        {activeHighlight?.owner === 'message-text' && activeHighlight.fragmentId === 'message-text'
+          ? renderHighlightedText(text, activeHighlight.start, activeHighlight.end)
+          : <SkillCommandText text={text} />}
+      </span>
+      {images.length > 0 && (
+        <div className="message-images">
+          {images.map((img, idx) => (
+            <img
+              key={idx}
+              src={`data:${img.media_type};base64,${img.data}`}
+              alt={`Attachment ${idx + 1}`}
+              className="message-image"
+            />
+          ))}
+        </div>
+      )}
+      <FileChips files={files} activeHighlight={activeHighlight} />
+    </div>
+  );
+  if (message.origin?.kind === 'subscription_event') {
     return (
-      <UserMetaMessage
-        message={message}
-        text={text}
-        images={images}
-        files={files}
-        timestamp={timestamp}
-      />
+      <div id={`message-${message.message_id}`} className="message meta conversation-event-message" data-sequence-id={message.sequence_id}>
+        <ConversationEventCard presentation={message.event_presentation} eventId={message.origin.event_id} originalText={text} activeHighlight={activeHighlight}>
+          {body}
+        </ConversationEventCard>
+      </div>
     );
   }
 
@@ -430,26 +437,7 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
           <MessageCopyButton message={message} title={message.origin?.kind === 'system_generated' ? 'Copy system observation' : 'Copy input message'} />
         </span>
       </div>
-      <div className="message-content">
-        <span data-fragment-id="message-text">
-          {activeHighlight?.owner === 'message-text'
-            ? renderHighlightedText(text, activeHighlight.start, activeHighlight.end)
-            : <SkillCommandText text={text} />}
-        </span>
-        {images.length > 0 && (
-          <div className="message-images">
-            {images.map((img, idx) => (
-              <img
-                key={idx}
-                src={`data:${img.media_type};base64,${img.data}`}
-                alt={`Attachment ${idx + 1}`}
-                className="message-image"
-              />
-            ))}
-          </div>
-        )}
-        <FileChips files={files} activeHighlight={activeHighlight} />
-      </div>
+      {body}
     </div>
   );
 }
@@ -536,7 +524,7 @@ type HastNode = {
 
 function markdownHighlightForRange(markdown: string, start: number, end: number): MarkdownHighlight | null {
   let blockStart = 0;
-  for (const block of buildMarkdownDisplayBlocks(markdown).filter((block) => block.kind !== 'code' || block.language === 'mermaid')) {
+  for (const block of buildMarkdownDisplayBlocks(markdown, 'conversation').filter((block) => block.kind !== 'code' || block.language === 'mermaid')) {
     const blockEnd = blockStart + block.searchableText.length;
     if (start >= blockStart && end <= blockEnd) {
       return {
@@ -554,8 +542,12 @@ function markdownHighlightForRange(markdown: string, start: number, end: number)
 function markdownHighlightPlugin(highlight: MarkdownHighlight) {
   return () => (tree: HastNode) => {
     const target = findMarkdownHighlightTarget(tree, highlight);
-    if (target?.tagName === 'code') return;
-    if (target) decorateMarkdownTextNodes(target, highlight.start, highlight.end);
+    const targetId = `${highlight.sourceStart}:${highlight.sourceEnd}:${highlight.start}:${highlight.end}`;
+    if (target?.tagName === 'pre') {
+      target.properties = { ...target.properties, 'data-viewer-find-active-target': targetId };
+      return;
+    }
+    if (target) decorateMarkdownTextNodes(target, highlight.start, highlight.end, targetId);
   };
 }
 
@@ -570,12 +562,12 @@ function findMarkdownHighlightTarget(node: HastNode, highlight: MarkdownHighligh
   for (const child of node.children ?? []) {
     if (!child.children) continue;
     const target = findMarkdownHighlightTarget(child, highlight);
-    if (target) return target;
+    if (target) return target.tagName === 'code' && node.tagName === 'pre' ? node : target;
   }
   return node.children ? node : null;
 }
 
-function decorateMarkdownTextNodes(node: HastNode, start: number, end: number): void {
+function decorateMarkdownTextNodes(node: HastNode, start: number, end: number, targetId: string): void {
   let cursor = 0;
   const visit = (parent: HastNode) => {
     const nextChildren: HastNode[] = [];
@@ -596,7 +588,7 @@ function decorateMarkdownTextNodes(node: HastNode, start: number, end: number): 
         nextChildren.push({
           type: 'element',
           tagName: 'mark',
-          properties: { className: ['viewer-find-inline-match', 'viewer-find-inline-match--active'] },
+          properties: { className: ['viewer-find-inline-match', 'viewer-find-inline-match--active'], 'data-viewer-find-active-target': targetId },
           children: [{ type: 'text', value: child.value.slice(localStart, localEnd) }],
         });
         if (localEnd < child.value.length) nextChildren.push({ type: 'text', value: child.value.slice(localEnd) });
@@ -1253,7 +1245,6 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
   }, []);
 
   const renderTextFragment = useCallback((fragment: ConversationTextFragment) => {
-    const remarkPlugins = usesGfmSyntax(fragment.display.sourceText) ? REMARK_PLUGINS : NO_REMARK_PLUGINS;
     const expanded = forceExpandedText || fragment.display.mode === 'full' || expandedFragmentIds.has(fragment.fragmentId);
     const highlight = activeHighlight?.owner === 'agent-text' && activeHighlight.fragmentId === fragment.fragmentId
       ? activeHighlight
@@ -1276,14 +1267,13 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
     return (
       <div key={fragment.fragmentId} className="agent-text-fragment" data-fragment-id={fragment.fragmentId}>
         <div className="agent-text-block" {...(highlight ? { 'data-active-fragment-highlight': true } : {})}>
-          <ReactMarkdown
-            remarkPlugins={remarkPlugins}
+          <MarkdownRenderer mode="conversation"
             rehypePlugins={markdownHighlight ? [markdownHighlightPlugin(markdownHighlight)] : []}
             components={markdownComponents}
             urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}
           >
             {fragment.display.sourceText}
-          </ReactMarkdown>
+          </MarkdownRenderer>
         </div>
       </div>
     );
@@ -1312,35 +1302,26 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
   return (
     <div
       id={`message-${message.message_id}`}
-      className="message agent"
+      className="message agent assistant-message"
       data-sequence-id={message.sequence_id}
       data-message-id={message.message_id}
       data-inline-reaction-message={message.message_id}
       data-message-occurrence={(message.display_data as { productOccurrenceToken?: string } | null)?.productOccurrenceToken}
     >
-      {!suppressMessageCopy && !isFirstInTurn && (
-        <div className="message-mobile-copy-row">
-          <MessageReviewAction message={message} />
-          <MessageCopyButton message={message} title="Copy Phoenix message" />
-        </div>
-      )}
-      {isFirstInTurn && (
-        <div className="message-header">
-          <span className="message-sender">Phoenix</span>
-          {timestamp && (
-            <span className="message-time" title={new Date(timestamp).toLocaleString()}>
-              {formatMessageTime(timestamp)}
-            </span>
-          )}
-          <AgentRetryBadge message={message} />
-          {!suppressMessageCopy && (
-            <span className="message-header-actions">
-              <MessageReviewAction message={message} />
-              <MessageCopyButton message={message} title="Copy Phoenix message" />
-            </span>
-          )}
-        </div>
-      )}
+      <AssistantMessageChrome
+        isFirstInTurn={isFirstInTurn}
+        metadata={(
+          <AssistantMessageMetadata timestamp={timestamp} formattedTime={formatMessageTime(timestamp)}>
+            <AgentRetryBadge message={message} />
+          </AssistantMessageMetadata>
+        )}
+        actions={!suppressMessageCopy && (
+          <>
+            <MessageReviewAction message={message} />
+            <MessageCopyButton message={message} title="Copy Phoenix message" />
+          </>
+        )}
+      />
       <div className="message-content">
         {(() => {
           // In compact mode, all of a turn's tool blocks collapse into one
@@ -1644,6 +1625,9 @@ function bashStatusText(status: string, finalCause: string | null): string {
     case 'still_running': return 'still running';
     case 'kill_pending_kernel': return 'kill pending (kernel)';
     case 'tombstoned': return finalCause ? `tombstoned · ${finalCause}` : 'tombstoned';
+    case 'unregistered_exited': return 'exited · no handle';
+    case 'unregistered_killed': return 'signaled · no handle';
+    case 'outcome_unknown': return 'outcome unknown · no handle';
     case 'exited': return 'exited';
     case 'killed': return 'killed';
     default: return status;
@@ -1814,7 +1798,7 @@ function CoordinatorEnvironment({ displayData }: { displayData: Record<string, u
 
 function BashResponseView({ response }: { response: Record<string, unknown> }) {
   // Error envelope branch (REQ-BASH-008): `error` field present.
-  if (typeof response['error'] === 'string') {
+  if (typeof response['error'] === 'string' && response['status'] !== 'outcome_unknown') {
     return <BashErrorView response={response} />;
   }
   const status = String(response['status'] ?? '');
@@ -1833,8 +1817,8 @@ function BashResponseView({ response }: { response: Record<string, unknown> }) {
     ? (response['lines'] as Array<{ offset?: number; bytes?: string }>)
     : [];
 
-  const isExited = status === 'exited';
-  const isKilled = status === 'killed';
+  const isExited = status === 'exited' || status === 'unregistered_exited';
+  const isKilled = status === 'killed' || status === 'unregistered_killed';
   const isTombstone = status === 'tombstoned';
   const partial = typeof response['partial'] === 'string' ? response['partial'] : null;
   const lineTexts = lines.map((l) => l.bytes ?? '');
@@ -1857,8 +1841,11 @@ function BashResponseView({ response }: { response: Record<string, unknown> }) {
         {waitedMs !== null && <span className="bash-duration">waited {formatBashMillis(waitedMs)}</span>}
         {durationMs !== null && <span className="bash-duration">ran {formatBashMillis(durationMs)}</span>}
       </div>
+      {typeof response['launch_error'] === 'string' && (
+        <div className="bash-error-message">No controllable handle; descendants unverified.{response['output_complete'] === false ? ' Output capture incomplete.' : ''}</div>
+      )}
       <BashOutputView lines={lineTexts} partial={partial} truncatedBefore={truncatedBefore} />
-      {status === 'waiter_panicked' && typeof response['error_message'] === 'string' && (
+      {(status === 'waiter_panicked' || status === 'outcome_unknown') && typeof response['error_message'] === 'string' && (
         <div className="bash-error-message">{response['error_message']}</div>
       )}
     </div>
@@ -1875,6 +1862,10 @@ function BashErrorView({ response }: { response: Record<string, unknown> }) {
         <span className="bash-status bash-status-error">error: {error}</span>
       </div>
       {message && <div className="bash-error-message">{message}</div>}
+      {error === 'launch_release_unknown' && (
+        <div className="bash-error-hint">The command outcome is uncertain. Do not automatically retry.</div>
+      )}
+      {typeof response['handle'] === 'string' && <div className="bash-error-hint">handle: {response['handle']}</div>}
       {hint && <div className="bash-error-hint">{hint}</div>}
     </div>
   );
@@ -3290,7 +3281,7 @@ const ChildAgentActivity = memo(function ChildAgentActivity({ message, toolResul
           if (!text) return null;
           return (
             <div key={`${message.message_id}-text-${idx}`} className="subagent-activity-event agent-text">
-              <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>{text.length > 900 ? `${text.slice(0, 900)}…` : text}</ReactMarkdown>
+              <MarkdownRenderer mode="conversation" components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>{text.length > 900 ? `${text.slice(0, 900)}…` : text}</MarkdownRenderer>
             </div>
           );
         }
@@ -3366,7 +3357,7 @@ export function SubAgentTranscript({ inline, running, full = false, finalResult 
       {finalResult?.text && (
         <div className={`subagent-final-result ${finalResult.statusClass}`}>
           <div className="subagent-final-result-label">final outcome</div>
-          <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>{finalResult.text}</ReactMarkdown>
+          <MarkdownRenderer mode="conversation" components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>{finalResult.text}</MarkdownRenderer>
         </div>
       )}
     </div>
@@ -3378,10 +3369,15 @@ export function SubAgentTranscript({ inline, running, full = false, finalResult 
  * card. Owns its own read-only stream; `running` is the card's authoritative
  * status (the card is mounted whenever it's visible).
  */
-function ChildConversationActivity({ agentId, expanded, running, finalResult }: { agentId: string; expanded: boolean; running: boolean; finalResult?: { text: string; statusClass: string } | undefined }) {
+function ChildConversationActivity({ agentId, task, expanded, running, finalResult }: { agentId: string; task: string; expanded: boolean; running: boolean; finalResult?: { text: string; statusClass: string } | undefined }) {
   const inline = useConversationInlineStream(agentId, expanded, running);
   if (!expanded) return null;
-  return <SubAgentTranscript inline={inline} running={running} finalResult={finalResult} />;
+  return (
+    <>
+      <SubAgentTaskDetails task={task} inline={inline} />
+      <SubAgentTranscript inline={inline} running={running} finalResult={finalResult} />
+    </>
+  );
 }
 
 function SubAgentActivityCard({
@@ -3438,6 +3434,7 @@ function SubAgentActivityCard({
       {!isActive && (
         <ChildConversationActivity
           agentId={agentId}
+          task={task}
           expanded={expanded}
           running={running}
           finalResult={resultText ? { text: resultText, statusClass } : undefined}

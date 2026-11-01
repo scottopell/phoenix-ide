@@ -37,6 +37,18 @@ cat ~/.phoenix-ide/deploy/activation.log
 
 Status includes source kind/tag, expected version/SHA, terminal outcome, and rollback failure if any. It never includes plist environment values.
 
+## Exact prepared source114 qualification
+
+For the commissioned exact candidate only, use a **different newer clean controller checkout containing ADR-125's helper**, with the candidate commit present in its git object database. Do not rebuild or resign the prepared artifact and do not check out the candidate to run the controller. The public invocation is unchanged:
+
+```bash
+./dev.py prod deploy --prepared-artifact DIR --expected-full-commit 23badb8be4bc8d05a7e1c49c5367ceb14ebccd92 --current-schema-upgrade
+```
+
+The existing receipt/signature/notarization/version/embedded-SHA checks remain mandatory. This receipt commit automatically selects typed `prepared_source_baseline: 114` plus `candidate_registry_expected_sha256: a4eb047e59b21997ea068f1bd5e97c9c943f74a4c5670cdd8ff8ac10ffd5eee6` evidence. Registry bytes are materialized via `git show 23badb8be4bc8d05a7e1c49c5367ceb14ebccd92:crates/phoenix-db/src/migrations.rs` and must hash exactly to that digest; the controller's working-tree registry is not authority. The separately retained clean controller commit and hash-bound helper must differ from the candidate.
+
+Only exact complete prefix114 or exact target128 is admitted for this variant. RC4 registry semantics are unchanged; this is **not generic prepared114** and does not change published-release114 or generic prepared123/target128 admission. Capacity, exclusive offline snapshot and mandatory candidate `--migrate-only` apply. After durable `migration_started`, never start the predecessor or replay a snapshot, including after migration/start failure. Inspect `prod status` and retained evidence; use only the matching exact-candidate `prod finalize-current TXN` / `prod recover-current TXN` operations as the retained state permits. Qualification evidence is snapshot-bound; missing or altered evidence must be investigated, not edited away. Hosted CI, exact-head review and operator authorization are separate gates; this guidance is not production execution acceptance.
+
 ## Socket activation
 
 The launchd plist owns Phoenix's production listener through a socket named
@@ -107,7 +119,8 @@ tail -f ~/.phoenix-ide/prod-launchd-stderr.log        # Loader/pre-main failures
 ## If the deploy fails
 
 - Preparation or handoff failure leaves the running service untouched.
-- Ordinary activation failure after disruption attempts to restore and exactly verify the previous binary and plist. `activation_failed_rolled_back` means the predecessor was verified; `ordinary_activation_failed_rollback_failed` requires offline operator inspection.
+- Ordinary activation without pending migrations may restore and exactly verify the previous binary and plist. `activation_failed_rolled_back` means the predecessor was verified; `ordinary_activation_failed_rollback_failed` requires offline operator inspection.
+- Qualified ordinary forward migrations use a different candidate-start boundary: after any candidate startup attempt, never start the predecessor or replay a snapshot. The exact source129→target131 interval is qualified by REQ-COMP-019 / REQ-LDD-028 and its pinned registry; source129, partial130 or target131 may resume only through `./dev.py prod resume-forward TXN` with the exact retained candidate/helper/configuration and ownership evidence. This route does not claim protected backup/rehearsal proof. Do not widen historical route pins or remove the ownership fence manually.
 - For prepared-artifact paired transactions, helper absence never authorizes removing `~/.phoenix-ide/deploy/active`, redeploying, or restarting. Inspect `./dev.py prod status` and the retained transaction log. Use `./dev.py prod recover-paired TRANSACTION_ID` for interrupted preparation or unresolved recovery: it requires matching ownership and confirmed old-helper absence. Pre-handoff abandonment does not disrupt the runtime or restore the database; post-start checkpoint recovery verifies/finalizes the running predecessor without snapshot replay. A retained `activation_failed_rolled_back` checkpoint still requires this finalization rather than manual marker removal.
 - A committed paired transaction with pending publication/cleanup uses `./dev.py prod finalize-paired TRANSACTION_ID`, not rollback. The retained helper verifies the exact running candidate/configuration and retries publication and temporary reservation cleanup only: no stop/bootstrap/restart or database reads/writes. Failure/interruption retains its pending status and claim; missing publication does not establish login/reboot persistence.
 - A stale ordinary `prepared` or `activating` status requires inspecting its activation log, matching status/claim, and proving its exact helper absent before any ordinary marker repair. Never apply ordinary marker repair to a paired transaction. See the repository `LAUNCHD.md` for the prepared-artifact paired lifecycle and supported proof boundaries.

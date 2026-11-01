@@ -1,14 +1,34 @@
+import { viewReporterBuild } from './qualification/viewReporterBuild';
 import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
-import { readFileSync, writeFileSync } from 'fs';
+import { readFileSync, realpathSync, writeFileSync } from 'fs';
 import { resolve } from 'path';
+import { execFileSync } from 'node:child_process';
+
+function frontendSource() {
+  try {
+    return {
+      revision: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: __dirname, encoding: 'utf8', timeout: 1000 }).trim(),
+      dirty: execFileSync('git', ['status', '--porcelain'], { cwd: __dirname, encoding: 'utf8', timeout: 1000 }).trim().length > 0,
+    };
+  } catch {
+    return { revision: null, dirty: true };
+  }
+}
+const source = frontendSource();
+const sourceDefines = {
+  __PHOENIX_UI_SOURCE__: JSON.stringify(source.revision),
+  __PHOENIX_UI_SOURCE_DIRTY__: JSON.stringify(source.dirty || process.env.NODE_ENV !== 'production'),
+};
 
 // Restore .gitkeep after vite wipes dist/ so fresh worktrees compile.
 function gitkeep(): Plugin {
+  let output = resolve(__dirname, 'dist');
   return {
     name: 'gitkeep',
+    configResolved(config) { output = resolve(config.root, config.build.outDir); },
     closeBundle() {
-      writeFileSync(resolve(__dirname, 'dist/.gitkeep'), '');
+      writeFileSync(resolve(output, '.gitkeep'), '');
     },
   };
 }
@@ -160,9 +180,12 @@ const isLadle = process.env.PHOENIX_LADLE === '1';
 
 // https://vitejs.dev/config/
 export default defineConfig(isLadle ? {
+  define: sourceDefines,
   plugins: [gitkeep()],
+  server: { fs: { allow: [resolve(__dirname), realpathSync(resolve(__dirname, 'node_modules'))] } },
 } : {
-  plugins: [react(), shikiLangPrune(), gitkeep()],
+  define: sourceDefines,
+  plugins: [viewReporterBuild(), react(), shikiLangPrune(), gitkeep()],
   server: {
     allowedHosts: true,
     ...(httpsServer ? { https: httpsServer } : {}),

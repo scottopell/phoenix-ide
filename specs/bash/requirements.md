@@ -76,6 +76,58 @@ returned."
 
 ---
 
+### REQ-BASH-017: Post-launch Identity and Registration Settlement
+
+WHEN preparing a new Bash launch on supported Linux or Darwin hosts
+THE SYSTEM SHALL withhold the user command and its environment from execution until the owned launch process has one captured birth identity, a registered handle, and caller-independent waiter/output custody
+AND SHALL preserve that process identity across execution of Direct or Explore commands, applying the existing Explore sandbox before the command runs
+AND SHALL count a registered gated handle only once against capacity while retaining its pending custody lease until release or abort.
+
+WHEN releasing a registered launch fails or times out
+THE SYSTEM SHALL return `error: "launch_release_unknown"` with the retained controllable handle and explicit may-have-executed/no-automatic-retry guidance
+AND SHALL retain sticky scope uncertainty and settle the pending custody lease without removing the registered handle or claiming the command did not execute.
+
+THE SYSTEM SHALL NOT treat preventive launch gating, a successful later launch, or an application restart as reconciliation of historical unverified descendants
+AND SHALL NOT clear an existing uncertainty fence through these launch paths.
+
+WHEN OS process creation fails before a child is returned
+THE SYSTEM SHALL return `error: "spawn_failed"` and release spawn admission.
+
+WHEN process creation succeeds but the birth identity is unavailable or handle registration fails
+THE SYSTEM SHALL NOT report `spawn_failed`, replay the command, fabricate a birth identity, adopt a later PID observation, or signal an unknown process group
+AND SHALL establish caller-cancellation-independent custody of the owned child before awaiting registration or settlement.
+
+WHEN the owned child has a cached terminal status
+THE SYSTEM SHALL preserve its exit or signal information and captured output without requiring a controllable handle.
+
+WHILE an unregistered child is not terminal
+THE SYSTEM SHALL capture stdout/stderr into the byte-bounded ring during a bounded natural-exit grace period
+AND SHALL, after that grace, attempt termination only through the still-owned direct child API and bound the subsequent reap wait
+AND SHALL NOT interpret the caller's `wait_seconds` as this failure-path termination policy.
+
+WHEN direct-child terminal status is verified
+THE SYSTEM SHALL return `status: "unregistered_exited"` or `"unregistered_killed"` with exit/signal information, duration, label, command and ring window
+AND SHALL allow a bounded descendant-pipe drain only after direct-child termination.
+
+WHEN bounded direct-child settlement cannot verify termination
+THE SYSTEM SHALL return an error with `status: "outcome_unknown"` and `error: "launch_outcome_unknown"`
+AND SHALL state that side effects may have occurred, execution may continue, and automatic retry is prohibited
+AND SHALL omit handle, PID, process-group identity and fabricated exit information
+AND SHALL mark output capture incomplete when closing readers at the settlement deadline.
+
+WHEN any launch remains unregistered
+THE SYSTEM SHALL report `launch_error: "identity_unavailable"` or `"registration_failed"`, `descendants: "unverified"`, and `output_complete`
+AND SHALL set `output_complete: false` if reader capture is interrupted or any captured lines are evicted from the ring
+AND SHALL release pending admission after bounded settlement even on caller cancellation
+AND SHALL retain a process-local uncertainty record that fences subsequent spawns and causes teardown, including same-scope-inheritor cleanup, to report unverified shutdown rather than hang or claim resource absence
+AND SHALL delegate any unreaped direct child to the runtime's child reaper without inferring signal authority from a numeric PID
+AND SHALL preserve sandbox scratch because unverified descendants may still use it.
+
+WHEN these responses are displayed
+THE SYSTEM SHALL preserve output and the no-handle, descendant-uncertainty and incomplete-capture facts in full, compact and search projections.
+
+---
+
 ### REQ-BASH-002: Wait Semantics
 
 WHEN agent calls `bash(op="run", cmd=<command>, wait_seconds=N)`
@@ -248,10 +300,12 @@ THE SYSTEM SHALL append the bytes to a per-handle ring buffer bounded by
 AND split incoming bytes on newline boundaries to assign each complete line a
 monotonically increasing offset (line 0, 1, 2, ... since spawn)
 
-WHEN the ring buffer's retained complete-line bytes reach `RING_BUFFER_BYTES`
-and new content arrives
-THE SYSTEM SHALL evict the oldest lines until the new content fits
+WHEN inserting a complete line exceeds either `RING_BUFFER_BYTES` in retained
+complete-line content bytes or `RING_BUFFER_BYTES` in retained line count
+THE SYSTEM SHALL evict the oldest lines until both bounds are satisfied,
+retaining at least the newest line even when it alone exceeds the byte cap
 AND advance `start_offset` to the offset of the oldest still-retained line
+AND apply the line-count bound to empty lines without changing content-byte accounting
 
 THE SYSTEM SHALL track a monotonic count of total bytes the process has
 written — incremented on every append, inclusive of bytes currently held as
@@ -465,10 +519,10 @@ AND the kill path SHALL signal the entire process group via `kill(-pgid, signal)
 to catch immediate descendants
 
 WHEN Phoenix is shutting down (graceful or abnormal-but-handler-runnable)
-THE SYSTEM SHALL walk the live handle table and send `SIGKILL` to each
-handle's process group as a final cleanup pass before exit
-AND wait briefly (up to `SHUTDOWN_KILL_GRACE_SECONDS`, default 2) for those
-groups to exit before relinquishing control to the OS
+THE SYSTEM SHALL snapshot registered live handles and attempt `SIGKILL` through each handle's incarnation-bound signaling API, without holding registry locks during signaling
+AND SHALL use one global deadline, bounded by `SHUTDOWN_KILL_GRACE_SECONDS` (default 2), for registry snapshot, signal attempts, and available handle-exit observation
+AND SHALL report signaling errors, unsupported platforms, and deadline-incomplete work without claiming that a successful signal or leader exit proves descendant absence or complete process-group reaping
+AND SHALL NOT fall back to signaling a raw numeric PID or process-group ID
 
 THE SYSTEM SHALL NOT rely on parent-death cascades (SIGHUP-on-parent-exit) for
 child cleanup. SIGHUP delivers on controlling-terminal hangup, not on parent
@@ -482,8 +536,13 @@ wrong on Linux: SIGHUP is a TTY-hangup signal, not a parent-death signal, and
 Phoenix is not a controlling-terminal session leader. Without
 `PR_SET_CHILD_SUBREAPER`, double-forked daemons (`(cmd &) &`, `nohup`, programs
 that call `setsid`) and any descendant that resets its own pgid will outlive
-Phoenix and leak. With the subreaper bit set, escapees reparent to Phoenix
-rather than init, and the shutdown kill-tree pass cleans them up before exit.
+Phoenix and leak. With the subreaper bit set, escapees can reparent to Phoenix
+rather than init. Shutdown performs only bounded, incarnation-bound signal
+attempts for registered live handles; it cannot guarantee cleanup of unregistered
+descendants, prove that signaled processes exited, or prove complete
+process-group reaping. On platforms without an incarnation-bound signaling
+primitive, shutdown fails closed and logs the unsupported capability rather
+than using a raw process ID.
 
 `SIGKILL` at shutdown rather than `SIGTERM` because Phoenix is exiting anyway —
 no point waiting on graceful shutdown handlers when the parent is leaving.
@@ -791,11 +850,11 @@ AND SHALL reject the call without spawning a process when the `WorkScope` ID is 
 AND SHALL NOT assign the Coordinator a default cwd
 AND SHALL store the process solely under the selected `WorkScope`
 AND SHALL retain Coordinator continuation control as handle authorization metadata
-AND SHALL keep background-command handles available to Coordinator continuations for manual `peek`, `wait`, and `kill` without registering a durable WorkScope wake
+AND SHALL keep background-command handles available to Coordinator continuations for manual `peek`, `wait`, and `kill`
 AND SHALL keep Coordinator-controlled terminal events from triggering branch-observation reconciliation
 AND SHALL include the process in the owning WorkScope's inventory, lifecycle broadcasts, inspection, health attribution, and teardown
 AND SHALL preserve the same command, wait, label, output, process-count, handle-control, cancellation, teardown, and audit bounds as other Bash execution
-AND SHALL use one globally unique opaque handle ID for tool operations, wakes, events, APIs, UI, logs, and inspection
+AND SHALL use one globally unique opaque handle ID for tool operations, events, APIs, UI, logs, and inspection
 
 WHEN conversation bash, including Work-subagent bash, is authorized with write capability
 THE SYSTEM SHALL NOT apply the Explore read-only sandbox to bash
@@ -1024,7 +1083,7 @@ already available.
 | `PARTIAL_IDLE_FLUSH_SECONDS` | 10 | Reader idle interval after which a non-empty partial line is flushed as a complete line |
 | `LIVE_HANDLE_CAP` | 8 | Per-WorkScope cap on `running` handles |
 | `KILL_RESPONSE_TIMEOUT_SECONDS` | 30 | After signal sent, wait this long for exit before returning `kill_pending_kernel` |
-| `SHUTDOWN_KILL_GRACE_SECONDS` | 2 | Time Phoenix waits at shutdown for SIGKILL'd groups to exit |
+| `SHUTDOWN_KILL_GRACE_SECONDS` | 2 | One global shutdown budget for registered-handle snapshot, incarnation-bound SIGKILL attempts, and handle-exit observation |
 | `TOMBSTONE_TAIL_LINES` | 2000 | Lines retained in `final_tail` after exit demotion |
 | `DEFAULT_PEEK_LINES` | 200 | Lines returned when peek has no read modifier |
 | `MAX_LABEL_LENGTH` | 64 | Display bound on `label`; longer labels are deterministically shortened at the tool boundary |

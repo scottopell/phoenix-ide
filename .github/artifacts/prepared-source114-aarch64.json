@@ -1,0 +1,145 @@
+{
+  "schema_version": 1,
+  "record_kind": "prepared_source114_actions_artifact_provenance",
+  "repository": {
+    "id": 1152151096,
+    "full_name": "scottopell/phoenix-ide"
+  },
+  "artifact": {
+    "id": 12122737139,
+    "name": "desktop-preparation-aarch64-apple-darwin-23badb8be4bc8d05a7e1c49c5367ceb14ebccd92",
+    "size_in_bytes": 44634849,
+    "api_digest": "sha256:d9b46faf39fd838b0f029c8e421b23c4741b5204ebb3aed4c0e014dc91c4762a",
+    "created_at": "2026-10-18T02:37:45Z",
+    "expires_at": "2026-11-01T02:37:41Z",
+    "retention": {
+      "kind": "ephemeral_actions_artifact",
+      "disposition": "deterministic_reproduction_after_expiry",
+      "byte_identical_owner_copy_authorized": false,
+      "republish_authorized": false,
+      "note": "A regenerated artifact is new evidence and must never reuse this artifact identity."
+    }
+  },
+  "producer": {
+    "workflow_file": ".github/workflows/release.yml",
+    "workflow_file_sha256": "8383361c1c0cdff5cfa97d0db6d2a705d21c66c8eb62da294b9a434c41a84485",
+    "workflow_commit": "23badb8be4bc8d05a7e1c49c5367ceb14ebccd92",
+    "workflow_run_id": 39089498019,
+    "workflow_run_attempt": 1,
+    "workflow_run_event": "workflow_dispatch",
+    "workflow_run_branch": "main",
+    "workflow_run_display_title": "Release",
+    "workflow_run_conclusion": "failure",
+    "operation": "prepare-main",
+    "operation_log_marker": "if [[ \"true\" == true ]]; then",
+    "inputs": {
+      "operation": "prepare-main"
+    },
+    "qualified_job": {
+      "id": 117563040072,
+      "name": "build-macos (macos-15, aarch64-apple-darwin, phoenix_ide-aarch64-apple-darwin)",
+      "conclusion": "success"
+    },
+    "note": "The matrix run failed in the unrelated Intel job; the exact ARM preparation job succeeded and uploaded this artifact."
+  },
+  "candidate": {
+    "source_commit": "23badb8be4bc8d05a7e1c49c5367ceb14ebccd92",
+    "target": "aarch64-apple-darwin",
+    "prepared_source_baseline": 114,
+    "candidate_registry_sha256": "a4eb047e59b21997ea068f1bd5e97c9c943f74a4c5670cdd8ff8ac10ffd5eee6"
+  },
+  "controller_validation": {
+    "code_head": "4a73b7ad3f64ad55b99de2d0093c2be62a762a07",
+    "receipt_head": "63a26b6f1b2544e85160e52fc7011b61eadf188a",
+    "workflow_file": ".github/workflows/deployment-controller-macos.yml",
+    "macos_code_head_run": 39150739258,
+    "ci_code_head_run": 39150737450,
+    "macos_receipt_head_run": 39153477397,
+    "ci_receipt_head_run": 39153475900,
+    "helper_source_rule": "clean full controller head distinct from candidate.source_commit"
+  },
+  "reconciled_validation": {
+    "pre_hardening": {
+      "code_head": "6330246f2c383bda060bafbe33d3ea86c6e284b1",
+      "macos_run": 39159257402,
+      "ci_run": 39159257367
+    },
+    "hardened_code_head": {
+      "code_head": "efd277b6051c8096973d26dff501d1ecaee80d3f",
+      "manual_macos_run": 39164280946,
+      "ci_run": 39164278998,
+      "workflow_event": "workflow_dispatch",
+      "workflow_inputs": {
+        "validate_prepared_source114": true
+      },
+      "observed_database_ledger_entries": 113,
+      "observed_effects": {
+        "claim": 0,
+        "stop": 0,
+        "backup": 0,
+        "migrate": 0,
+        "publish": 0,
+        "activate": 0,
+        "cleanup": 0
+      }
+    }
+  },
+  "bundle": {
+    "sha256_observation": {
+      "head": "7d8ed9567b2dd1e515a42eae2fc06a915ff2e467",
+      "workflow_run_id": 39159177954,
+      "job_id": 117768652335,
+      "result": "all five hashes reported before intentional unsealed-manifest failure"
+    },
+    "files": [
+      {
+        "name": "phoenix_ide-aarch64-apple-darwin-prepared-23badb8be4bc",
+        "role": "standalone_payload",
+        "sha256": "31d299686fc891754e2a29d089405cfa9279f32491d32f338a4824547c801cc7"
+      },
+      {
+        "name": "Phoenix-macos-aarch64-apple-darwin-prepared-23badb8be4bc.zip",
+        "role": "app_archive_payload",
+        "sha256": "38900a0ccb224006dbf92aa201c368dab2d87a08f4cda2f839ee619b45a18b81"
+      },
+      {
+        "name": "PREPARATION-SHA256SUMS-aarch64-apple-darwin",
+        "role": "payload_checksum_manifest",
+        "sha256": "02c426035f7ba887ae2ff8ec1c1eaa5dff60f8f5755104868aef712c1b8873a4"
+      },
+      {
+        "name": "PREPARATION-RECEIPT-aarch64-apple-darwin.json",
+        "role": "preparation_receipt",
+        "sha256": "42e5eb1ec7406464ccf45715cce4c9d84e00bd782e13c656cc69ac16dc80992b"
+      },
+      {
+        "name": "HEADLESS-ACCEPTANCE-aarch64-apple-darwin.json",
+        "role": "headless_acceptance_proof",
+        "sha256": "9653e4a68d89327f6a1fc736f9d957dd1e2671df5642033da17aaa98419e2a24"
+      }
+    ]
+  },
+  "expected_validation": {
+    "runner_architecture": "arm64",
+    "harness_prefix": "launchd-validation-only: PASS",
+    "database_ledger_entries": 113,
+    "effects": {
+      "claim": 0,
+      "stop": 0,
+      "backup": 0,
+      "migrate": 0,
+      "publish": 0,
+      "activate": 0,
+      "cleanup": 0
+    },
+    "real_admission_required": true,
+    "artifact_size_or_api_digest_is_authenticity": false
+  },
+  "reproduction": {
+    "result_identity": "new_evidence_not_artifact_12122737139",
+    "preferred_exact_workflow": "rerun workflow run 39089498019 after separate owner authorization while GitHub still permits rerunning it",
+    "fallback": "no exact runnable fallback is defined after historical rerun eligibility ends; a separately authorized workflow and new evidence design is required",
+    "public_release_authorized": false,
+    "broad_download_or_build_authorized": false
+  }
+}

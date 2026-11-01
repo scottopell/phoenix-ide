@@ -173,7 +173,32 @@ message in `messages` is newer than the index has caught up to — so that
 a consuming surface (Transparency Contract item 3) can distinguish "no
 in-scope content matched" from "the index has not caught up yet." Until
 reconciliation completes, a surface MAY indicate that recall is still
-warming rather than presenting empty results as authoritative.
+warming rather than presenting empty results as authoritative, but only
+while the attempt is pending or running.
+
+WHEN startup reconciliation fails or its worker is interrupted
+THE SYSTEM SHALL report retrieval as unavailable rather than still warming
+AND SHALL retain a terminal failed status for that process's attempt
+AND SHALL NOT start another attempt automatically or on a search request.
+
+THE SYSTEM SHALL expose the attempt's pending, running, ready, or failed
+status through an authenticated, read-only deployment diagnostic that does
+not query or mutate the index. Running and failed status SHALL identify the
+phase and processed-message count; a database failure SHALL expose its
+available numeric extended code without message content or raw error text.
+Only successful completion of every reconciliation phase SHALL establish
+ready status. Worker cancellation or panic SHALL NOT leave running status.
+
+WHEN pruning orphaned index rows concurrently with message writes
+THE SYSTEM SHALL discover candidates without reserving the writer for the
+whole index sweep
+AND SHALL revalidate each candidate against current source rows after
+obtaining write admission
+AND SHALL delete physical index rows and their locators atomically in
+bounded pages of at most 128 candidate rows.
+The sweep SHALL have a fixed upper locator boundary so concurrent inserts
+cannot extend the pass indefinitely. Normal message mutation and deletion
+hooks remain responsible for rows changed behind that sweep boundary.
 
 THE index table SHALL be created by a database migration (not by serde
 defaults or ad-hoc runtime table creation). The migration creates the

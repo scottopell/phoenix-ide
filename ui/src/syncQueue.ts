@@ -43,9 +43,9 @@ export class SyncQueue {
         if (!op.payload.name) {
           throw new Error('rename requires name');
         }
-        await api.renameConversation(
+        await api.renameProductConversation(
           op.conversationId,
-          op.payload.name
+          op.payload.name,
         );
         break;
 

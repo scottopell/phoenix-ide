@@ -36,6 +36,37 @@ final class ConversationSessionReducerTests: XCTestCase {
     }
 
     @MainActor
+    func testLegacySnapshotMigratesAndSlackSnapshotFencesOlderWriters() async throws {
+        let session = makeSession()
+        struct LegacySnapshot: Codable {
+            var conversation: Conversation?
+            var messages: [Message]
+            var lastSequenceId: Int64
+            var syncedAt: Date?
+        }
+        let prior = LegacySnapshot(conversation: try conversation(),
+            messages: [try message(id: "legacy", content: "[]")], lastSequenceId: 2, syncedAt: Date())
+        XCTAssertTrue(DiskStore.saveVersioned(prior, name: "conv-c1", version: 1))
+        XCTAssertTrue(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
+        let restored = ConversationSession(conversationId: "c1",
+            api: PhoenixAPI(baseURL: URL(string: "https://phoenix.invalid")!, password: nil, allowSelfSigned: false)!,
+            connectivity: ConnectivityMonitor())
+        XCTAssertEqual(restored.messages.map(\.message_id), ["legacy"])
+        var slack = try message(id: "slack", type: "user", content: "[]")
+        slack.origin = .slackGateway(requestId: "request-1")
+        session.receive(.initSnapshot(.init(conversation: try conversation(), messages: [slack],
+            agentWorking: false, presentationMode: "idle", lastSequenceId: 0,
+            pendingAnchorSequenceId: 2, pendingEvents: [], pendingTruncated: false)))
+        let saved = await session.flushSnapshotPersistence()
+        XCTAssertTrue(saved)
+        guard case .incompatible(storedVersion: 2) = DiskStore.loadVersionedResult(
+            LegacySnapshot.self, name: "conv-c1", version: 1) else {
+            return XCTFail("Slack snapshots must be recognized as newer by an older client")
+        }
+        XCTAssertFalse(DiskStore.saveVersioned(prior, name: "conv-c1", version: 1))
+    }
+
+    @MainActor
     func testMessageUpdateWaitsForMessageIdentity() throws {
         let session = makeSession()
         session.receive(.initSnapshot(.init(

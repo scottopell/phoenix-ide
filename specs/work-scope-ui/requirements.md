@@ -9,9 +9,8 @@ glance what is running right now, spot a runaway process, and understand the
 side effects the agent is accumulating without reading back through the
 transcript.
 
-This panel is the human-facing complement to the agent-facing wake-contracts
-feature: both read the same underlying per-`WorkScope` resource state, one for
-the LLM's situational awareness and one for the operator's.
+This panel reads underlying per-`WorkScope` resource state for the operator's
+situational awareness; it does not register waits or activate runtime work.
 
 ## Domain
 

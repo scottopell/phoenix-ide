@@ -3,6 +3,8 @@ import {
   useEffect,
   useCallback,
   useState,
+  useMemo,
+  useLayoutEffect,
   forwardRef,
   useImperativeHandle,
   KeyboardEvent,
@@ -19,6 +21,9 @@ import { api, ExpansionError, MAX_FILE_ATTACHMENT_SIZE, MAX_FILE_ATTACHMENTS, MA
 import { canCancelConversationState, isAgentWorking, isCancellingState } from '../utils';
 import { ImageAttachments } from './ImageAttachments';
 import { VoiceRecorder, isWebSpeechSupported } from './VoiceInput';
+import type { VoiceRecorderHandle } from './VoiceInput/VoiceRecorder';
+import type { ComposerDraftRecovery, DraftRevision, RejectedSubmission } from '../conversation/DraftStore';
+import { useDraftRecovery } from '../hooks/useDraft';
 import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
 import { FILE_TREE_DRAG_TYPE } from './FileExplorer/FileTree';
 import './InputArea.css';
@@ -32,6 +37,12 @@ export interface ComposerQuickAction {
   label: string;
   compactLabel: string;
   prompt: string;
+}
+
+const EMPTY_FILES: FileAttachment[] = [];
+
+function sameItems<T>(a: T[], b: T[]): boolean {
+  return a.length === b.length && a.every((item, index) => item === b[index]);
 }
 
 interface InputAreaProps {
@@ -70,6 +81,7 @@ interface InputAreaProps {
   /** Called for every draft mutation (keystroke, autocomplete apply, voice
    *  commit, paste). */
   onDraftChange: (text: string) => void;
+  draftRecovery?: ComposerDraftRecovery;
   /**
    * Monotonic counter bumped by the parent when it wants the textarea
    * focused (terminal selection arrival, retry-of-failed, skill insert,
@@ -137,15 +149,16 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   scopeKey,
   convState,
   images,
-  setImages,
-  files = [],
-  setFiles = () => {},
+  setImages: onImagesChange,
+  files = EMPTY_FILES,
+  setFiles: onFilesChange,
   isOffline,
   failedMessages,
   convModeLabel,
   draft,
   onDraftChange,
   focusToken,
+  draftRecovery,
   onSend,
   quickAction,
   onCancel,
@@ -159,15 +172,45 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const acceptsChatMessage = !readOnly && canAcceptChatMessage(convState);
   const continuationOverloadReadOnly = convState.type === 'server_overload_retrying'
     && convState.target === 'continuation';
-  const setDraft = onDraftChange;
-  const clearDraft = useCallback(() => onDraftChange(''), [onDraftChange]);
+  const owner = useRef({ scopeKey, epoch: {}, revision: {}, draft, images, files, recording: false, uploading: false });
+  if (owner.current.scopeKey !== scopeKey) {
+    owner.current = { scopeKey, epoch: {}, revision: {}, draft, images, files, recording: false, uploading: false };
+  } else if (owner.current.draft !== draft || !sameItems(owner.current.images, images) || !sameItems(owner.current.files, files)) {
+    owner.current = { ...owner.current, revision: {}, draft, images, files };
+  }
+  const scopeEpoch = owner.current.epoch;
+  const mounted = useRef(false);
+  useLayoutEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+  const setDraft = useCallback((text: string) => {
+    owner.current = { ...owner.current, revision: {}, draft: text };
+    onDraftChange(text);
+  }, [onDraftChange]);
+  const setImages = useCallback((next: ImageData[]) => {
+    owner.current = { ...owner.current, revision: {}, images: next };
+    onImagesChange(next);
+  }, [onImagesChange]);
+  const setFiles = useCallback((update: SetStateAction<FileAttachment[]>) => {
+    const next = typeof update === 'function' ? update(owner.current.files) : update;
+    owner.current = { ...owner.current, revision: {}, files: next };
+    onFilesChange?.(next);
+  }, [onFilesChange]);
+  const [localRejected, setLocalRejected] = useState<{ scopeKey: string | undefined; submission: RejectedSubmission }[]>([]);
+  const rejected = draftRecovery?.rejected ?? localRejected.filter(item => item.scopeKey === scopeKey).map(item => item.submission);
+  const recorderRef = useRef<VoiceRecorderHandle>(null);
+  const [recorderGeneration, setRecorderGeneration] = useState(0);
+  const recorderIdentity = useMemo(() => ({ scopeEpoch, recorderGeneration }), [scopeEpoch, recorderGeneration]);
+  const recorderIdentityRef = useRef<object | null>(recorderIdentity);
+  recorderIdentityRef.current = recorderIdentity;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   // `scopeKey` is the conversation id for this (always in-conversation) composer;
   // attachment uploads target it, and this ref lets an in-flight upload detect a
   // conversation switch and discard its late response.
   const scopeKeyRef = useRef(scopeKey);
-  useEffect(() => { scopeKeyRef.current = scopeKey; }, [scopeKey]);
+  scopeKeyRef.current = scopeKey;
   const voiceSupported = isWebSpeechSupported();
   const [quickActionSending, setQuickActionSending] = useState(false);
 
@@ -190,6 +233,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   // Voice input: base text (accumulated finals) + interim (current partial)
   const [voiceBase, setVoiceBase] = useScopedState<string | null>(scopeKey, null); // null = not recording
   const [voiceInterim, setVoiceInterim] = useScopedState(scopeKey, '');
+  const voiceCurrent = useRef({ base: voiceBase, interim: voiceInterim });
+  voiceCurrent.current = { base: voiceBase, interim: voiceInterim };
 
   // =========================================================================
   // Inline autocomplete (REQ-IR-004, REQ-IR-005), scoped to `cwd`
@@ -223,6 +268,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   // File-attachment drag/drop state.
   const [isDragOver, setIsDragOver] = useState(false);
   const [isUploadingFiles, setIsUploadingFiles] = useState(false);
+  owner.current.uploading = isUploadingFiles;
 
   // External draft insertions (file-tree context menu, drag-and-drop) bypass
   // handleChange/refValueChange, so expansionError is never cleared. Listen
@@ -414,13 +460,27 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   // Send (with expansion error handling — REQ-IR-007)
   // =========================================================================
 
-  const handleSend = useCallback(async () => {
-    let text: string;
-    if (voiceBase !== null) {
-      text = voiceBase.trim() + (voiceInterim ? ' ' + voiceInterim.trim() : '');
+  const restoreSubmission = useCallback((submission: RejectedSubmission, epoch: object, revision: object, draftRevision?: DraftRevision) => {
+    const current = owner.current;
+    if (!mounted.current || current.epoch !== epoch || current.revision !== revision
+      || current.draft !== '' || current.images.length || current.files.length || current.recording || current.uploading) return false;
+    if (draftRecovery) {
+      if (!draftRevision || !draftRecovery.restoreIfUnchanged(draftRevision, submission.text)) return false;
+      owner.current = { ...current, revision: {}, draft: submission.text };
     } else {
-      text = draft.trim();
+      setDraft(submission.text);
     }
+    setImages(submission.images);
+    setFiles(submission.files);
+    setExpansionError(submission.error);
+    return true;
+  }, [draftRecovery, setDraft, setImages, setFiles, setExpansionError]);
+
+  const handleSend = useCallback(async () => {
+    const rawText = voiceBase !== null
+      ? (voiceBase.trim() ? voiceBase.trimEnd() + (voiceInterim ? ' ' + voiceInterim : '') : voiceInterim)
+      : draft;
+    const text = rawText.trim();
 
     if (!text && images.length === 0 && files.length === 0) return;
     if (!acceptsChatMessage || isUploadingFiles) return;
@@ -434,35 +494,36 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     // Close autocomplete and ghost text on send
     resetRefs();
 
-    // Clear draft and attachments eagerly — the message is already queued and
-    // visible in the message list, so there's no reason to keep the text in
-    // the input area while waiting for the network round-trip.  We only
-    // restore the draft if an ExpansionError comes back (user must fix the
-    // broken @reference before re-sending).
-    const previousVoiceBase = voiceBase;
-    if (voiceBase !== null) {
-      setVoiceBase(null);
-      setVoiceInterim('');
+    const submittedScope = scopeKey;
+    const submittedEpoch = owner.current.epoch;
+    const submitted = { id: crypto.randomUUID(), text: rawText, images: [...images], files: [...files] };
+    recorderIdentityRef.current = null;
+    recorderRef.current?.retire();
+    setRecorderGeneration(value => value + 1);
+    voiceCurrent.current = { base: null, interim: '' };
+    owner.current.recording = false;
+    setVoiceBase(null);
+    setVoiceInterim('');
+    const draftRevision = draftRecovery?.clearForSubmission();
+    if (draftRecovery) {
+      owner.current = { ...owner.current, revision: {}, draft: '' };
+    } else {
+      setDraft('');
     }
-    clearDraft();
     setImages([]);
     setFiles([]);
     setExpansionError(null);
+    const clearedRevision = owner.current.revision;
 
     try {
       await onSend(text, images, files);
     } catch (err) {
       if (err instanceof ExpansionError) {
-        // Surface expansion error inline and restore the draft (REQ-IR-007)
-        // so the user can fix or remove the broken @reference.
-        setExpansionError(err.detail.error);
-        if (previousVoiceBase !== null) {
-          setVoiceBase(previousVoiceBase);
-        } else {
-          setDraft(text);
+        const rejection = { ...submitted, error: err.detail.error };
+        if (!restoreSubmission(rejection, submittedEpoch, clearedRevision, draftRevision)) {
+          if (draftRecovery) draftRecovery.retainRejected(rejection);
+          else if (mounted.current) setLocalRejected(items => [...items, { scopeKey: submittedScope, submission: rejection }]);
         }
-        setImages(images);
-        setFiles(files);
       }
       // Non-expansion errors: draft is already cleared; the message queue
       // shows the failure with a retry button.
@@ -477,7 +538,9 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     expansionError,
     isUploadingFiles,
     onSend,
-    clearDraft,
+    draftRecovery,
+    scopeKey,
+    restoreSubmission,
     resetRefs,
     setExpansionError,
     setImages,
@@ -510,32 +573,38 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   // =========================================================================
 
   const handleVoiceStart = useCallback(() => {
-    setVoiceBase(draft);
+    if (recorderIdentityRef.current !== recorderIdentity) return;
+    owner.current = { ...owner.current, revision: {}, recording: true };
+    voiceCurrent.current = { base: owner.current.draft, interim: '' };
+    setVoiceBase(owner.current.draft);
     setVoiceInterim('');
-  }, [draft, setVoiceBase, setVoiceInterim]);
+  }, [recorderIdentity, setVoiceBase, setVoiceInterim]);
 
   const handleVoiceEnd = useCallback(() => {
-    setVoiceBase(prev => {
-      if (prev !== null) {
-        setDraft(prev);
-      }
-      return null;
-    });
+    if (recorderIdentityRef.current !== recorderIdentity || !owner.current.recording) return;
+    const base = voiceCurrent.current.base;
+    owner.current = { ...owner.current, revision: {}, recording: false };
+    voiceCurrent.current = { base: null, interim: '' };
+    if (base !== null) setDraft(base);
+    setVoiceBase(null);
     setVoiceInterim('');
-  }, [setDraft, setVoiceBase, setVoiceInterim]);
+  }, [recorderIdentity, setDraft, setVoiceBase, setVoiceInterim]);
 
   const handleVoiceFinal = useCallback((text: string) => {
-    if (!text) return;
-    setVoiceBase(prev => {
-      if (prev === null) return null;
-      return prev.trim() ? prev.trimEnd() + ' ' + text : text;
-    });
+    if (recorderIdentityRef.current !== recorderIdentity || !owner.current.recording || !text) return;
+    const prev = voiceCurrent.current.base;
+    if (prev === null) return;
+    const base = prev.trim() ? prev.trimEnd() + ' ' + text : text;
+    voiceCurrent.current = { base, interim: '' };
+    setVoiceBase(base);
     setVoiceInterim('');
-  }, [setVoiceBase, setVoiceInterim]);
+  }, [recorderIdentity, setVoiceBase, setVoiceInterim]);
 
   const handleVoiceInterim = useCallback((text: string) => {
+    if (recorderIdentityRef.current !== recorderIdentity || !owner.current.recording) return;
+    voiceCurrent.current.interim = text;
     setVoiceInterim(text);
-  }, [setVoiceInterim]);
+  }, [recorderIdentity, setVoiceInterim]);
 
   // =========================================================================
   // Textarea event handlers
@@ -562,6 +631,10 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const hasContent = displayedText.trim().length > 0 || voiceInterim.trim().length > 0 || images.length > 0 || files.length > 0;
   const canSend = acceptsChatMessage && !isUploadingFiles;
   const sendEnabled = !readOnly && canSend && hasContent && !expansionError;
+  const recoveryRevision = owner.current.revision;
+  const recoveryDraftRevision = draftRecovery?.readRevision();
+  const canRestoreRejected = !readOnly && !isUploadingFiles && voiceBase === null
+    && draft === '' && images.length === 0 && files.length === 0;
 
   // Cycle placeholder hint each time the input clears (e.g., after send).
   // Advances only when draft goes empty, not on a timer.
@@ -643,6 +716,36 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           Drop files to attach
         </div>
       )}
+
+      {rejected.map(submission => (
+        <details className="input-unsent-message" key={submission.id}>
+          <summary>Unsent message</summary>
+          <p>{submission.error}</p>
+          <pre>{submission.text}</pre>
+          <ul>
+            {submission.images.map((image, index) => (
+              <li key={`image-${index}`}>Image {index + 1}: {image.media_type}</li>
+            ))}
+            {submission.files.map((file, index) => (
+              <li key={`file-${index}`}>{file.original_name} · {file.media_type} · {formatBytes(file.size_bytes)}</li>
+            ))}
+          </ul>
+          <div className="input-unsent-actions">
+            <button type="button" disabled={!canRestoreRejected} onClick={() => {
+              if (!canRestoreRejected || !restoreSubmission(submission, scopeEpoch, recoveryRevision, recoveryDraftRevision)) return;
+              if (draftRecovery) draftRecovery.removeRejected(submission.id);
+              else setLocalRejected(items => items.filter(item => item.submission.id !== submission.id));
+            }}>Restore unsent message</button>
+            <button type="button" onClick={async () => {
+              try {
+                await navigator.clipboard.writeText(submission.text);
+              } catch (error) {
+                console.warn('Failed to copy unsent message', error);
+              }
+            }}>Copy text</button>
+          </div>
+        </details>
+      ))}
 
       <ImageAttachments images={images} onRemove={handleRemoveImage} />
       {files.length > 0 && (
@@ -762,6 +865,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
             )}
             {!agentWorking && voiceSupported && (
               <VoiceRecorder
+                key={`${scopeKey}:${recorderGeneration}`}
+                ref={recorderRef}
                 onStart={handleVoiceStart}
                 onEnd={handleVoiceEnd}
                 onSpeech={handleVoiceFinal}
@@ -804,7 +909,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
  * Hosting the subscription in this wrapper keeps the re-render scoped to
  * the composer subtree — sibling components don't see keystroke churn.
  */
-export type ConnectedInputAreaProps = Omit<InputAreaProps, 'draft' | 'onDraftChange'> & {
+export type ConnectedInputAreaProps = Omit<InputAreaProps, 'draft' | 'onDraftChange' | 'draftRecovery'> & {
   slug: string;
 };
 
@@ -812,6 +917,7 @@ export const ConnectedInputArea = forwardRef<InputAreaHandle, ConnectedInputArea
   function ConnectedInputArea({ slug, ...rest }, ref) {
     const draft = useDraftValue(slug);
     const { setDraft } = useDraftActions(slug);
-    return <InputArea ref={ref} {...rest} draft={draft} onDraftChange={setDraft} />;
+    const draftRecovery = useDraftRecovery(slug);
+    return <InputArea ref={ref} {...rest} draft={draft} onDraftChange={setDraft} draftRecovery={draftRecovery} />;
   },
 );

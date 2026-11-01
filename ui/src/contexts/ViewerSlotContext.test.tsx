@@ -6,9 +6,11 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { render, act, waitFor, fireEvent } from '@testing-library/react';
-import { useEffect, useState } from 'react';
+import { startTransition, Suspense, useEffect, useLayoutEffect, useState } from 'react';
+import type { NavigateFunction } from 'react-router-dom';
 import { MemoryRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom';
-import { ViewerSlotProvider, useBrowserSessionActive, useViewerRestorationSettled, useViewerSlot } from './ViewerSlotContext';
+import { ViewerSlotProvider, useBrowserSessionActive, useReaderNavigationKey, useViewerRestorationSettled, useViewerSlot } from './ViewerSlotContext';
+import type { Location } from 'react-router-dom';
 import type { ViewerSlotValue } from './ViewerSlotContext';
 import { getLastViewer, setLastViewer } from '../storage/lastViewerStorage';
 
@@ -38,9 +40,18 @@ function LocationCapture({ onSearch }: { onSearch: (s: string) => void }) {
   return null;
 }
 
-function renderSlot(initialEntry = '/c/conv-A', browserSessionActive = false) {
+function ReaderLocationCapture({ onLocation }: { onLocation: (location: Location, readerKey: string) => void }) {
+  const location = useLocation();
+  const readerKey = useReaderNavigationKey();
+  useEffect(() => { onLocation(location, readerKey); }, [location, readerKey, onLocation]);
+  return null;
+}
+
+function renderSlot(initialEntry: string | Partial<Location> = '/c/conv-A', browserSessionActive = false) {
   let latest: ViewerSlotValue | null = null;
   let search = '';
+  let location: Location;
+  let readerKey = '';
   render(
     <MemoryRouter initialEntries={[initialEntry]}>
       <Routes>
@@ -50,14 +61,144 @@ function renderSlot(initialEntry = '/c/conv-A', browserSessionActive = false) {
             <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={browserSessionActive}>
               <Capture onCtx={(c) => { latest = c; }} />
               <LocationCapture onSearch={(s) => { search = s; }} />
+              <ReaderLocationCapture onLocation={(next, key) => { location = next; readerKey = key; }} />
             </ViewerSlotProvider>
           }
         />
       </Routes>
     </MemoryRouter>,
   );
-  return { get: () => latest!, search: () => search };
+  return { get: () => latest!, search: () => search, location: () => location, readerKey: () => readerKey };
 }
+
+describe('ViewerSlot — reader navigation identity', () => {
+  it.each(['reader navigation', 'viewer replacement'] as const)('keeps the committed reader identity when a suspended %s is interrupted by closing the old viewer', async interruption => {
+    let latest: ViewerSlotValue;
+    let committedLocation: Location;
+    let committedReaderKey = '';
+    let navigate: NavigateFunction;
+    let suspendedAttempts = 0;
+    const suspended = new Promise<void>(() => {});
+    function InterruptibleContent() {
+      const location = useLocation();
+      const routeNavigate = useNavigate();
+      useEffect(() => { navigate = routeNavigate; }, [routeNavigate]);
+      if (location.search.includes('interrupted') || location.search.includes('presentation=pane')) {
+        suspendedAttempts += 1;
+        throw suspended;
+      }
+      return <span>committed reader</span>;
+    }
+    const { queryByText } = render(
+      <MemoryRouter initialEntries={[{
+        pathname: '/c/conv-A',
+        search: '?source_transcript=row-1&viewer=message&message=1&presentation=fullscreen',
+        hash: '#message-m-1',
+        state: { chapterSelection: 'pending' },
+      }]}>
+        <Suspense fallback={<span>suspended reader</span>}>
+          <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={false}>
+            <Capture onCtx={ctx => { latest = ctx; }} />
+            <ReaderLocationCapture onLocation={(location, key) => { committedLocation = location; committedReaderKey = key; }} />
+            <InterruptibleContent />
+          </ViewerSlotProvider>
+        </Suspense>
+      </MemoryRouter>,
+    );
+    const oldViewer = latest!;
+    const oldLocation = committedLocation!;
+    const oldReaderKey = committedReaderKey;
+    await act(async () => {
+      startTransition(() => {
+        if (interruption === 'reader navigation') navigate('?source_transcript=interrupted#message-other');
+        else oldViewer.setPresentation('pane');
+      });
+    });
+    expect(suspendedAttempts).toBeGreaterThan(0);
+    expect(queryByText('committed reader')).not.toBeNull();
+    expect(queryByText('suspended reader')).toBeNull();
+    expect(latest!).toBe(oldViewer);
+    expect(committedLocation!).toBe(oldLocation);
+
+    act(() => oldViewer.close());
+
+    expect(latest!.slot.kind).toBe('none');
+    expect(committedLocation!.key).not.toBe(oldLocation.key);
+    expect(committedReaderKey).toBe(oldReaderKey);
+    expect(committedLocation!.search).toBe('?source_transcript=row-1');
+    expect(committedLocation!.hash).toBe(oldLocation.hash);
+    expect(committedLocation!.state).toEqual(oldLocation.state);
+  });
+
+  it('does not consume a newer viewer replacement queued by a child layout effect', () => {
+    let latest: ViewerSlotValue;
+    let readerKey = '';
+    function ClosePaneOnCommit() {
+      const ctx = useViewerSlot();
+      useLayoutEffect(() => {
+        if (ctx.slot.kind === 'message' && ctx.slot.presentation === 'pane') ctx.close();
+      }, [ctx]);
+      return null;
+    }
+    render(
+      <MemoryRouter initialEntries={['/c/conv-A?viewer=message&message=1&presentation=fullscreen']}>
+        <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={false}>
+          <Capture onCtx={ctx => { latest = ctx; }} />
+          <ReaderLocationCapture onLocation={(_location, key) => { readerKey = key; }} />
+          <ClosePaneOnCommit />
+        </ViewerSlotProvider>
+      </MemoryRouter>,
+    );
+    const initialReaderKey = readerKey;
+    act(() => latest!.setPresentation('pane'));
+    expect(latest!.slot.kind).toBe('none');
+    expect(readerKey).toBe(initialReaderKey);
+  });
+
+  it.each([null, 'opaque-router-state', { chapterSelection: 'pending', context: { id: 'retained' } }])('preserves hash, reader query, state (%j), and reader identity on viewer writes', state => {
+    const h = renderSlot({ pathname: '/c/conv-A', search: '?source_transcript=row-1&source_tool=send-1&other=retained', hash: '#message-m-1', state });
+    const readerKey = h.readerKey();
+    let locationKey = h.location().key;
+    for (const mutate of [
+      () => h.get().openMessage(1, 'fullscreen', 'm-1'),
+      () => h.get().setPresentation('pane'),
+      () => h.get().openProse('/repo/a.ts', '/repo'),
+      () => h.get().setPresentation('fullscreen'),
+      () => h.get().close(),
+    ]) {
+      act(mutate);
+      expect(h.readerKey()).toBe(readerKey);
+      expect(h.location().key).not.toBe(locationKey);
+      expect(h.location().hash).toBe('#message-m-1');
+      expect(h.location().state).toEqual(state);
+      expect(h.search()).toContain('source_transcript=row-1&source_tool=send-1&other=retained');
+      locationKey = h.location().key;
+    }
+  });
+
+  it('restores only stored viewer params without replacing the destination reader identity', () => {
+    setLastViewer('conv-A', 'viewer=message&message=1&presentation=fullscreen&source_transcript=stale&unrelated=stale');
+    const state = { chapterSelection: 'pending' };
+    const h = renderSlot({ pathname: '/c/conv-A', key: 'in-app-entry', search: '?source_transcript=selected&unrelated=destination', hash: '#message-selected', state });
+    expect(h.get().slot.kind).toBe('message');
+    expect(h.readerKey()).toBe('in-app-entry');
+    expect(h.location().key).not.toBe('in-app-entry');
+    expect(h.search()).toContain('source_transcript=selected&unrelated=destination');
+    expect(h.search()).not.toContain('stale');
+    expect(h.location().hash).toBe('#message-selected');
+    expect(h.location().state).toEqual(state);
+  });
+
+  it('normalizes malformed viewer params without changing reader identity, hash, or state', () => {
+    const state = { chapterSelection: 'pending' };
+    const h = renderSlot({ pathname: '/c/conv-A', search: '?viewer=bogus&source_transcript=row-1', hash: '#message-m-1', state });
+    expect(h.get().slot.kind).toBe('none');
+    expect(h.readerKey()).toBe('default');
+    expect(h.search()).toBe('?source_transcript=row-1');
+    expect(h.location().hash).toBe('#message-m-1');
+    expect(h.location().state).toEqual(state);
+  });
+});
 
 describe('ViewerSlot — open/close transitions', () => {
   it('opens prose, diff, and browser, and closes back to none', () => {

@@ -3,12 +3,19 @@
 //! A Rust backend implementing a conversation state machine for
 //! interacting with LLM agents.
 
+#[cfg(test)]
+#[path = "opening_qualifier_tests.rs"]
+mod opening_qualifier;
+
 mod analytics;
 mod api;
 mod chain_qa;
 mod chain_runtime;
 mod continuation_service;
+mod conversation_action_tools;
+mod conversation_actions;
 mod conversation_cwd;
+mod coordinator_home;
 mod coordinator_tools;
 mod coordinator_watch_delivery;
 mod discovery;
@@ -23,6 +30,7 @@ mod resolution_root;
 mod resource_authority;
 mod runtime;
 mod send_chat_service;
+mod slack_gateway;
 mod suggest;
 mod system_prompt;
 mod task_listing;
@@ -113,7 +121,7 @@ fn build_deployment_config(
         (Some(source), Some(loaded)) => {
             let hosts = match source {
                 tls::ConfigSource::Auto { hosts, .. } => hosts.clone(),
-                tls::ConfigSource::Manual(_) => Vec::new(),
+                tls::ConfigSource::Manual { .. } => Vec::new(),
             };
             TlsInfo {
                 enabled: true,
@@ -379,7 +387,7 @@ fn build_disk_locations(
                 mode: MeasureMode::RecurseSmall,
             });
         }
-        (Some(tls::ConfigSource::Manual(_)), Some(loaded)) => {
+        (Some(tls::ConfigSource::Manual { .. }), Some(loaded)) => {
             locations.push(DiskLocation {
                 category: DiskCategory::Tls,
                 label: "TLS certificate".to_string(),
@@ -725,6 +733,9 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(path = %db_path, "Opening database");
     let db = open_database_with_migrations(&runtime_env).await?;
+    coordinator_home::initialize(&db, &runtime_env)
+        .await
+        .map_err(std::io::Error::other)?;
     db.clear_direct_turn_retirements().await?;
     let terminal_obligated_conversations = db.terminal_obligated_conversation_ids().await?;
     db.abandon_all_unactivated_sub_agent_batches(chrono::Utc::now())
@@ -836,7 +847,9 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Read optional auth password (REQ-AUTH-001)
     let password = std::env::var("PHOENIX_PASSWORD")
         .ok()
-        .filter(|p| !p.is_empty());
+        .filter(|password| !password.is_empty())
+        .map(phoenix_core::domain::instance_identity::OwnerPassword::parse)
+        .transpose()?;
     if password.is_some() {
         tracing::info!("Password authentication enabled (PHOENIX_PASSWORD is set)");
     }
@@ -846,6 +859,10 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let loaded_tls = match &tls_source {
         Some(source) => Some(tls::load_config(source)?),
         None => None,
+    };
+    let federation_tls_trust = match loaded_tls.as_ref() {
+        Some(tls) => tls.federation_tls_trust()?,
+        None => phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
     };
 
     // Bind (or adopt the systemd socket-activated) listener now, so the
@@ -951,7 +968,13 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // PTY PATH plus the env (API URL + capability token) it needs to call back.
     // The token persists across restarts (bound to the password fingerprint) so
     // terminals opened before a restart stay authorized.
-    let suggest_token = resolve_suggest_token(&db, password.as_deref()).await;
+    let suggest_token = resolve_suggest_token(
+        &db,
+        password
+            .as_ref()
+            .map(phoenix_core::domain::instance_identity::OwnerPassword::expose),
+    )
+    .await;
     setup_phx_companion(
         &runtime_env,
         bind_address,
@@ -970,6 +993,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         deployment,
         runtime_env,
         suggest_token,
+        federation_tls_trust,
     )
     .await?;
 
@@ -1003,6 +1027,8 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .signal_fatal_local_authority("automatic_continuation_driver_supervisor");
         }
     });
+
+    crate::slack_gateway::start(state.clone());
 
     // Create router
     //

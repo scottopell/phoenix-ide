@@ -13,7 +13,9 @@
 //!
 //! See `specs/terminal/` for the full behavioural specification.
 
+pub mod child_lifecycle;
 pub mod command_tracker;
+mod pty;
 pub mod relay;
 pub mod session;
 pub mod spawn;

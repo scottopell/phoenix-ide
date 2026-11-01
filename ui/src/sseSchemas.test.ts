@@ -1,3 +1,5 @@
+import { bashLaunchOutcomes, bashLaunchReleaseUnknown } from './testFixtures/bashLaunchOutcomes';
+import { BashErrorResponseSchema, BashResponseSchema } from './sseSchemas';
 /**
  * SSE wire-format validation tests (task 02674).
  *
@@ -37,6 +39,12 @@ import {
   ChainQaFailedSchema,
 } from './sseSchemas';
 import * as v from 'valibot';
+
+describe('BashErrorResponseSchema', () => {
+  it('accepts launch-release-unknown with its retained handle', () => {
+    expect(v.safeParse(BashErrorResponseSchema, bashLaunchReleaseUnknown).success).toBe(true);
+  });
+});
 
 function makeEvent(data: unknown): Event {
   // parseEvent casts Event -> MessageEvent and reads `.data`. happy-dom ships
@@ -129,7 +137,7 @@ describe('parseEvent', () => {
       context_window_size: 0,
       project_name: null,
       pending_anchor_sequence_id: 0,
-      pending_events: [],
+      opening: null, pending_events: [],
       pending_truncated: false,
     };
 
@@ -229,8 +237,25 @@ describe('parseEvent', () => {
     });
   });
 
+  it('retains both accepted-opening authority and event presentation in one live message', () => {
+    const {dispatch} = mockDispatch();
+    const presentation = {status: 'unavailable', event_id: 'event-merge', reason: 'redacted'};
+    const payload = {sequence_id: 5, opening: {status: 'none'}, message: {
+      message_id: 'event-message', sequence_id: 5, conversation_id: 'conv-1', message_type: 'user',
+      content: {text: 'event'}, origin: {kind: 'subscription_event', event_id: 'event-merge'}, created_at: '2024-01-01T00:00:00Z',
+      event_presentation: presentation,
+    }};
+    const parsed = parseEvent(SseMessageDataSchema, makeEvent(payload), 'message', dispatch);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.data.opening).toEqual({status: 'none'});
+      expect(parsed.data.message.event_presentation).toEqual(presentation);
+    }
+  });
+
   describe('message schema', () => {
     const goodMsg = {
+      event_presentation: null,
       message_id: 'msg-1',
       sequence_id: 5,
       conversation_id: 'conv-1',
@@ -244,7 +269,7 @@ describe('parseEvent', () => {
       const { dispatch, actions } = mockDispatch();
       const res = parseEvent(
         SseMessageDataSchema,
-        makeEvent({ sequence_id: 5, message: goodMsg }),
+        makeEvent({ opening: null, sequence_id: 5, message: goodMsg }),
         'message',
         dispatch,
       );
@@ -257,7 +282,7 @@ describe('parseEvent', () => {
       expect(_origin).toEqual({ kind: 'unknown_historical' });
       inProdMode(() => {
         const { dispatch } = mockDispatch();
-        expect(parseEvent(SseMessageDataSchema, makeEvent({ sequence_id: 5, message: withoutOrigin }), 'message', dispatch).ok).toBe(false);
+        expect(parseEvent(SseMessageDataSchema, makeEvent({ opening: null, sequence_id: 5, message: withoutOrigin }), 'message', dispatch).ok).toBe(false);
       });
     });
 
@@ -274,7 +299,7 @@ describe('parseEvent', () => {
         const res = parseEvent(
           SseMessageDataSchema,
           makeEvent({
-            sequence_id: 5,
+            opening: null, sequence_id: 5,
             message: { ...goodMsg, sequence_id: '5' },
           }),
           'message',
@@ -306,7 +331,7 @@ describe('parseEvent', () => {
         const res = parseEvent(
           SseMessageDataSchema,
           makeEvent({
-            sequence_id: 5,
+            opening: null, sequence_id: 5,
             message: { ...goodMsg, message_type: 'wizard' },
           }),
           'message',
@@ -324,7 +349,7 @@ describe('parseEvent', () => {
         delete rest['message_id'];
         const res = parseEvent(
           SseMessageDataSchema,
-          makeEvent({ sequence_id: 5, message: rest }),
+          makeEvent({ opening: null, sequence_id: 5, message: rest }),
           'message',
           dispatch,
         );
@@ -350,7 +375,7 @@ describe('parseEvent', () => {
       const res = parseEvent(
         SseMessageUpdatedDataSchema,
         makeEvent({
-          sequence_id: 7,
+          opening: null, sequence_id: 7,
           message_id: 'msg-1',
           transcript_generation: 3,
           display_data: { type: 'subagent_summary' },
@@ -368,7 +393,7 @@ describe('parseEvent', () => {
       const res = parseEvent(
         SseMessageUpdatedDataSchema,
         makeEvent({
-          sequence_id: 8,
+          opening: null, sequence_id: 8,
           message_id: 'msg-tool',
           transcript_generation: 4,
           display_data: null,
@@ -387,7 +412,7 @@ describe('parseEvent', () => {
       const res = parseEvent(
         SseMessageUpdatedDataSchema,
         makeEvent({
-          sequence_id: 9,
+          opening: null, sequence_id: 9,
           message_id: 'msg-subagent',
           transcript_generation: 5,
           display_data: { type: 'subagent_summary' },
@@ -433,7 +458,7 @@ describe('parseEvent', () => {
         const { dispatch, actions } = mockDispatch();
         const res = parseEvent(
           SseMessageUpdatedDataSchema,
-          makeEvent({ sequence_id: 7, message_id: 'msg-1', display_data: { type: 'x' } }),
+          makeEvent({ opening: null, sequence_id: 7, message_id: 'msg-1', display_data: { type: 'x' } }),
           'message_updated',
           dispatch,
         );
@@ -744,7 +769,7 @@ describe('parseEvent', () => {
       const res = parseEvent(
         SseErrorDataSchema,
         makeEvent({
-          sequence_id: 8,
+          opening: null, sequence_id: 8,
           message: 'rate limited',
           error: { title: 'Rate limited', detail: 'retry', kind: 'retryable' },
         }),
@@ -900,5 +925,24 @@ describe('chain Q&A SSE schemas', () => {
       error: 'no partial key',
     });
     expect(result.success).toBe(false);
+  });
+});
+
+it.each(bashLaunchOutcomes)('validates no-handle launch outcome $status / $launch_error', (response) => {
+  expect(v.parse(BashResponseSchema, response)).toEqual(response);
+  expect(response).not.toHaveProperty('handle');
+  expect(response).not.toHaveProperty('pid');
+  const missingCaptureFact: Record<string, unknown> = { ...response };
+  delete missingCaptureFact['output_complete'];
+  expect(v.safeParse(BashResponseSchema, missingCaptureFact).success).toBe(false);
+  for (const descendants of ['verified', 'absent', 'running', 'Unverified', '', null]) {
+    expect(v.safeParse(BashResponseSchema, { ...response, descendants }).success).toBe(false);
+  }
+});
+
+
+describe('capacity classification wire values', () => {
+  it.each(['context_capacity_conflict', 'planned_context_pressure'])('accepts the classified %s failure', (kind) => {
+    expect(v.safeParse(SseStateChangeDataSchema, { sequence_id: 1, state: { type: 'recoverable_continuation_failure', message: 'Capacity stopped', error_kind: kind, operation_id: 'op', attempt: 1 }, presentation_mode: 'error', state_updated_at: '2026-10-25T00:00:00Z', error: { kind, can_auto_retry: false, can_user_resume: false } }).success).toBe(true);
   });
 });

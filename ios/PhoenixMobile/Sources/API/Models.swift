@@ -459,10 +459,11 @@ enum InputOrigin: Codable, Equatable, Sendable {
     case userApi
     case internalConversation(productConversationId: String, transcriptId: String, sourceCall: SourceToolCall? = nil)
     case systemGenerated
+    case slackGateway(requestId: String)
     case subscriptionEvent(eventId: String)
 
     private enum CodingKeys: String, CodingKey {
-        case kind, product_conversation_id, transcript_id, event_id, source_call
+        case kind, product_conversation_id, transcript_id, event_id, source_call, request_id
     }
 
     init(from decoder: Decoder) throws {
@@ -476,6 +477,8 @@ enum InputOrigin: Codable, Equatable, Sendable {
                 transcriptId: try container.decode(String.self, forKey: .transcript_id),
                 sourceCall: try container.decodeIfPresent(SourceToolCall.self, forKey: .source_call))
         case "system_generated": self = .systemGenerated
+        case "slack_gateway":
+            self = .slackGateway(requestId: try container.decode(String.self, forKey: .request_id))
         case "subscription_event":
             self = .subscriptionEvent(eventId: try container.decode(String.self, forKey: .event_id))
         default:
@@ -495,6 +498,9 @@ enum InputOrigin: Codable, Equatable, Sendable {
             try container.encode(transcriptId, forKey: .transcript_id)
             try container.encode(sourceCall, forKey: .source_call)
         case .systemGenerated: try container.encode("system_generated", forKey: .kind)
+        case let .slackGateway(requestId):
+            try container.encode("slack_gateway", forKey: .kind)
+            try container.encode(requestId, forKey: .request_id)
         case let .subscriptionEvent(eventId):
             try container.encode("subscription_event", forKey: .kind)
             try container.encode(eventId, forKey: .event_id)
@@ -506,6 +512,14 @@ enum InputOrigin: Codable, Equatable, Sendable {
               let base = URL(string: serverURL),
               base.scheme == "https" || base.scheme == "http", base.host != nil else { return nil }
         return base.appendingPathComponent("c").appendingPathComponent(transcriptId)
+    }
+
+    func slackSourceURL(serverURL: String) -> URL? {
+        guard case let .slackGateway(requestId) = self,
+              let base = URL(string: serverURL),
+              base.scheme == "https" || base.scheme == "http", base.host != nil else { return nil }
+        return base.appendingPathComponent("api/slack-gateway/requests")
+            .appendingPathComponent(requestId).appendingPathComponent("source")
     }
 
     func sourceCallURL(serverURL: String) -> URL? {
@@ -533,6 +547,7 @@ enum InputOrigin: Codable, Equatable, Sendable {
         case let .internalConversation(productId, transcriptId, _):
             "Conversation from @transcript:\(transcriptId) (conversation ID \(productId))"
         case .systemGenerated: "System input"
+        case .slackGateway: "Slack request"
         case .subscriptionEvent: "Conversation event"
         }
     }

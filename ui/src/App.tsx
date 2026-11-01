@@ -1,5 +1,8 @@
-import { lazy, Suspense, useState, useEffect, useCallback, useRef } from 'react';
-import { BrowserRouter, Routes, Route, useNavigate, useParams, useLocation } from 'react-router-dom';
+import { lazy, Suspense, useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react';
+import { useConversationViewJourney } from './hooks/useConversationViewJourney';
+import { generateUUID } from './utils/uuid';
+import { BrowserRouter, Routes, Route, useNavigate, useLocation, useMatch } from 'react-router-dom';
+import { decodedRouteReference, transcriptSelector } from './transcriptReference';
 import { DesktopLayout } from './components/DesktopLayout';
 import { ShortcutHelpPanel } from './components/ShortcutHelpPanel';
 import { useGlobalKeyboardShortcuts, FocusScopeProvider } from './hooks';
@@ -49,6 +52,7 @@ const CoordinatorPage = lazy(() =>
 const TerminalPage = lazy(() =>
   import('./pages/TerminalPage').then((m) => ({ default: m.TerminalPage })),
 );
+const SlackGatewayPage = lazy(() => import('./pages/SlackGatewayPage').then(m => ({ default: m.SlackGatewayPage })));
 const LlmLanguagePage = lazy(() =>
   import('./pages/LlmLanguagePage').then((m) => ({ default: m.LlmLanguagePage })),
 );
@@ -60,8 +64,8 @@ const MobileConversationListFixturePage = import.meta.env.DEV
   : null;
 
 /** Route loading fallback — blank div sized to the viewport to avoid CLS. */
-function RouteFallback() {
-  return <div style={{ minHeight: '100vh' }} />;
+function RouteFallback({ viewRef }: { viewRef?: ((root: HTMLDivElement | null) => void) | undefined }) {
+  return <div ref={viewRef} style={{ minHeight: '100vh' }} />;
 }
 
 type AuthState =
@@ -100,13 +104,15 @@ function AppRoutes() {
                 <Route path="/new" element={<NewConversationPage />} />
                 <Route path="/terminal" element={<TerminalPage />} />
                 <Route path="/c/:slug" element={<ConversationRouteRedirect />} />
+                <Route path="/transcript" element={<ConversationRouteRedirect />} />
                 <Route path="/product-conversations/:slug" element={<ConversationRouteRedirect />} />
-                <Route path="/chains/:rootConvId" element={<ChainRouteRedirect />} />
+                <Route path="/chains/:rootConvId" element={<ConversationRouteRedirect />} />
                 <Route path="/codex/login" element={<CodexLoginPage />} />
                 <Route path="/about" element={<AboutDeploymentPage />} />
                 <Route path="/usage" element={<UsagePage />} />
                 <Route path="/global" element={<CoordinatorPage />} />
                 <Route path="/global/:slug" element={<CoordinatorPage />} />
+                <Route path="/settings/slack" element={<SlackGatewayPage />} />
                 <Route path="/settings/llm-language" element={<LlmLanguagePage />} />
               </Routes>
             </DesktopLayout>
@@ -119,38 +125,52 @@ function AppRoutes() {
 }
 
 export function ProductConversationAliasRedirect({ reference }: { reference: string | undefined }) {
+  const journey = useConversationViewJourney('ordinary');
+  const journeyRef = useRef(journey);
+  useLayoutEffect(() => { journeyRef.current = journey; }, [journey]);
   const navigate = useNavigate();
   const location = useLocation();
+  const exactEntry = useMatch('/transcript') !== null;
   const [fallbackSnapshot, setFallbackSnapshot] = useState<{
-    reference: string;
+    selectionKey: string;
     rowSlug: string;
     aggregateResolutionUnavailable: boolean;
   } | null>(null);
-  const [resolvedProduct, setResolvedProduct] = useState<{ reference: string; id: string } | null>(null);
-  const [exactMember, setExactMember] = useState<{ reference: string; transcript: string; lifecycleOpen: boolean; mutationEnabled: boolean } | null>(null);
-  const [pinError, setPinError] = useState<string | null>(null);
+  const [resolvedProduct, setResolvedProduct] = useState<{ id: string; admittedJourney: ReturnType<typeof useConversationViewJourney> } | null>(null);
+  const [validatedSelection, setValidatedSelection] = useState<string | null>(null);
+  const [pinFailure, setPinFailure] = useState<{ selectionKey: string; message: string } | null>(null);
   const [retryToken, setRetryToken] = useState(0);
   const locationRef = useRef(location);
   locationRef.current = location;
-  const sourcePins = new URLSearchParams(location.search).getAll('source_transcript');
-  const pinned = sourcePins[0];
-  const invalidPin = sourcePins.length > 1 || (pinned !== undefined && (!pinned || pinned.trim() !== pinned));
-  const activeFallback = fallbackSnapshot?.reference === reference ? fallbackSnapshot : null;
+  const selector = transcriptSelector(location.search);
+  const pinned = selector.kind === 'transcript' ? selector.id : undefined;
+  const invalidPin = selector.kind === 'invalid';
+  const selectionKey = JSON.stringify([reference, selector, location.pathname]);
+  const activeFallback = fallbackSnapshot?.selectionKey === selectionKey ? fallbackSnapshot : null;
+  const pinError = pinFailure?.selectionKey === selectionKey ? pinFailure.message : null;
 
   useEffect(() => {
     if (!reference) {
       setFallbackSnapshot(null);
       return;
     }
-    setExactMember(null);
-    setResolvedProduct(null);
+    setValidatedSelection(null);
     setFallbackSnapshot(null);
-    setPinError(null);
+    setPinFailure(null);
     if (invalidPin) {
-      setPinError('Invalid exact transcript reference.');
+      setPinFailure({ selectionKey, message: 'Invalid exact transcript reference.' });
       return;
     }
     let cancelled = false;
+    const requestJourney = journeyRef.current;
+    const peek = (id: string) => {
+      const openId = generateUUID();
+      const observation = requestJourney.requestStarted(openId);
+      return api.getProductConversationSnapshot(id, {
+        message_limit: 1,
+        ...(observation ? { open_id: openId, onTelemetry: observation.response } : {}),
+      });
+    };
     api.resolveCoordinatorRoute(reference)
       .then(async ({ coordinator_id }) => {
         if (cancelled) return null;
@@ -159,77 +179,88 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
             const [source, exact] = await Promise.all([api.resolveCoordinatorRoute(pinned), api.getConversation(pinned)]);
             if (exact.conversation.id !== pinned || source.coordinator_id !== coordinator_id) throw new Error('Transcript is not a member of this Global conversation');
           }
-          if (!cancelled) navigate({ pathname: `/global/${pinned ?? reference}`, search: locationRef.current.search, hash: locationRef.current.hash }, { replace: true });
+          if (!cancelled) navigate({
+            pathname: pinned === undefined ? `/global/${encodeURIComponent(reference)}` : '/global',
+            search: locationRef.current.search,
+            hash: locationRef.current.hash,
+          }, { replace: true, state: locationRef.current.state });
           return null;
         }
-        return api.getProductConversationSnapshot(reference, { message_limit: 1 });
+        return peek(reference);
       })
       .then(async (snapshot) => {
         if (!snapshot) return;
         if (!cancelled) {
           if (pinned !== undefined) {
-            const source = await api.getProductConversationSnapshot(pinned, { message_limit: 1 });
+            const source = await peek(pinned);
             if (source.product_conversation_id !== snapshot.product_conversation_id || source.requested_transcript_row_id !== pinned) {
               throw new Error('Transcript is not a member of this conversation');
             }
-            if (!cancelled) setExactMember({
-              reference,
-              transcript: pinned,
-              lifecycleOpen: snapshot.ordinary_lifecycle === 'open',
-              mutationEnabled: pinned === snapshot.writable_transcript_row_id,
-            });
+            if (!cancelled) {
+              setResolvedProduct({ id: snapshot.product_conversation_id, admittedJourney: requestJourney });
+              setValidatedSelection(selectionKey);
+              if (exactEntry) {
+                navigate({
+                  pathname: snapshot.canonical_route,
+                  search: locationRef.current.search,
+                  hash: locationRef.current.hash,
+                }, { replace: true, state: locationRef.current.state });
+              }
+            }
             return;
           }
           if (!locationRef.current.pathname.startsWith('/product-conversations/') &&
-              snapshot.requested_transcript_row_id === reference && reference !== snapshot.product_conversation_id) {
-            setExactMember({
-              reference,
-              transcript: reference,
-              lifecycleOpen: snapshot.ordinary_lifecycle === 'open',
-              mutationEnabled: reference === snapshot.writable_transcript_row_id,
-            });
+              snapshot.requested_transcript_row_id === reference && reference !== snapshot.product_conversation_id
+              && (locationRef.current.state as { chapterSelection?: unknown } | null)?.chapterSelection !== 'pending') {
+            const query = new URLSearchParams(locationRef.current.search);
+            query.set('source_transcript', reference);
+            navigate({ pathname: locationRef.current.pathname, search: query.toString(), hash: locationRef.current.hash }, { replace: true, state: locationRef.current.state });
             return;
           }
-          setResolvedProduct({ reference, id: snapshot.product_conversation_id });
+          setResolvedProduct({ id: snapshot.product_conversation_id, admittedJourney: requestJourney });
+          setValidatedSelection(selectionKey);
           if (locationRef.current.pathname !== snapshot.canonical_route) {
             navigate({
               pathname: snapshot.canonical_route,
               search: locationRef.current.search,
               hash: locationRef.current.hash,
-            }, { replace: true });
+            }, { replace: true, state: locationRef.current.state });
           }
         }
       })
       .catch((error: unknown) => {
         if (!cancelled) {
           if (pinned !== undefined) {
-            setPinError('Exact transcript unavailable or not a member of this conversation.');
+            setPinFailure({ selectionKey, message: 'Exact transcript unavailable or not a member of this conversation.' });
             return;
           }
           setFallbackSnapshot({
-            reference,
+            selectionKey,
             rowSlug: reference,
             aggregateResolutionUnavailable: !(error instanceof ApiResponseError && error.status === 404),
           });
         }
       });
     return () => { cancelled = true; };
-  }, [invalidPin, location.pathname, navigate, pinned, reference, retryToken]);
+  }, [exactEntry, invalidPin, location.pathname, navigate, pinned, reference, retryToken, selectionKey]);
 
-  if (pinError) return <main><div role="alert">{pinError}</div></main>;
+  useEffect(() => {
+    if (pinError || activeFallback) journey.finish('failed');
+  }, [journey, pinError, activeFallback]);
 
-  if (exactMember && exactMember.reference === reference) {
-    return <EmbeddedConversationPage slug={exactMember.transcript} suppressCanonicalization routePrefix="/c"
-      aggregateLifecycleOpen={exactMember.lifecycleOpen} mutationEnabled={exactMember.mutationEnabled} />;
+  if (resolvedProduct && !activeFallback) {
+    return <>
+      {pinError && <main ref={journey.attach}><div role="alert">{pinError}</div></main>}
+      <div ref={journey.attach} hidden={!!pinError || validatedSelection !== selectionKey} style={{ height: '100%' }}>
+        <ProductConversationPage productId={resolvedProduct.id} journey={validatedSelection === selectionKey ? journey : resolvedProduct.admittedJourney} />
+      </div>
+    </>;
   }
-
-  if (resolvedProduct && resolvedProduct.reference === reference && !activeFallback) {
-    return <ProductConversationPage productId={resolvedProduct.id} />;
-  }
+  if (pinError) return <main ref={journey.attach}><div role="alert">{pinError}</div></main>;
 
   if (activeFallback) {
     return (
-      <main className="conversation-alias-fallback">
+      <main ref={journey.attach} className="conversation-alias-fallback">
         <div role="alert" className="conversation-alias-fallback__status">
           Conversation route unavailable.
           <button type="button" onClick={() => { setFallbackSnapshot(null); setRetryToken((n) => n + 1); }}>Retry</button>
@@ -246,17 +277,22 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
       </main>
     );
   }
-  return <RouteFallback />;
+  return <RouteFallback viewRef={journey.attach} />;
 }
 
-function ConversationRouteRedirect() {
-  const { slug } = useParams<{ slug: string }>();
-  return <ProductConversationAliasRedirect reference={slug} />;
-}
-
-function ChainRouteRedirect() {
-  const { rootConvId } = useParams<{ rootConvId: string }>();
-  return <ProductConversationAliasRedirect reference={rootConvId} />;
+export function ConversationRouteRedirect() {
+  const location = useLocation();
+  const exactEntry = useMatch('/transcript') !== null;
+  const selector = transcriptSelector(location.search);
+  if (exactEntry && selector.kind !== 'transcript') {
+    return <main><div role="alert">Invalid exact transcript reference.</div></main>;
+  }
+  const reference = exactEntry && selector.kind === 'transcript'
+    ? selector.id
+    : decodedRouteReference(location.pathname);
+  return reference === undefined
+    ? <main><div role="alert">Invalid conversation reference.</div></main>
+    : <ProductConversationAliasRedirect reference={reference} />;
 }
 
 function App() {

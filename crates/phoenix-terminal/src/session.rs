@@ -6,6 +6,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{watch, Semaphore};
 
+use super::child_lifecycle::{ChildExitReceipt, TerminalChildLifecycle};
 use super::command_tracker::CommandTracker;
 use phoenix_core::{process_identity::ProcessIdentity, work_scope::ResourceScopeKey};
 
@@ -111,8 +112,9 @@ pub struct TerminalHandle {
     /// observed. That retained handle is the retry owner if exit does not
     /// settle within the bounded wait.
     pub master_fd: Mutex<Option<OwnedFd>>,
-    /// Child shell PID.  Reaped by the reader task on EIO.
+    /// Child shell PID, observed by the registry's single child monitor.
     pub child_pid: Pid,
+    pub child_lifecycle: TerminalChildLifecycle,
     /// Durable launch identity captured at spawn time.
     pub launch_identity: TerminalLaunchIdentity,
     pub child_kind: TerminalChildKind,
@@ -212,7 +214,7 @@ impl TerminalInstanceIdentity {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct TerminalRetirementPermit {
     pub work_scope: ResourceScopeKey,
     pub instance: Option<TerminalInstanceIdentity>,
@@ -220,6 +222,7 @@ pub struct TerminalRetirementPermit {
     deadline: tokio::time::Instant,
     owner: TerminalRetirementOwner,
     had_entry: bool,
+    child_exit: Option<ChildExitReceipt>,
 }
 
 impl TerminalRetirementPermit {
@@ -253,8 +256,8 @@ pub enum TerminalRetirementOutcome {
 }
 
 /// Typed ownership decision made when an attached relay reaches a destructive
-/// exit. Exactly one retirement owner is allowed to remove and reap the handle.
-#[derive(Debug, PartialEq, Eq)]
+/// exit. Exactly one retirement owner is allowed to remove the handle.
+#[derive(Debug)]
 pub enum RelayTeardownOwnership {
     /// Close already fenced this exact instance and owns completion.
     ExistingRetirementOwner,
@@ -390,8 +393,45 @@ impl ActiveTerminals {
             return Err(ActiveTerminalInsertError::Occupied);
         }
         let handle = Arc::new(handle);
-        map.handles.insert(scope, Arc::clone(&handle));
+        map.handles.insert(scope.clone(), Arc::clone(&handle));
+        self.install_child_observer(scope, &handle);
         Ok(handle)
+    }
+
+    fn install_child_observer(&self, scope: ResourceScopeKey, handle: &Arc<TerminalHandle>) {
+        let Some(observer) = handle.child_lifecycle.take_observer() else {
+            return;
+        };
+        let child_pid = handle.child_pid;
+        let registry = Arc::downgrade(&self.0);
+        let weak_handle = Arc::downgrade(handle);
+        let attach_permit = Arc::clone(&handle.attach_permit);
+        tokio::spawn(async move {
+            let outcome = observer.wait_and_publish(child_pid).await;
+            if let Err(error) = outcome {
+                tracing::warn!(%child_pid, %error, "terminal child exit observer failed");
+                return;
+            }
+            tracing::debug!(
+                %child_pid,
+                "terminal child reaped; cleanup awaits relay EOF, disconnect, or explicit Close if attached"
+            );
+            let Ok(_authority) = attach_permit.acquire_owned().await else {
+                return;
+            };
+            let (Some(registry), Some(handle)) = (registry.upgrade(), weak_handle.upgrade()) else {
+                return;
+            };
+            let mut map = registry.lock().expect("terminal registry poisoned");
+            if map
+                .handles
+                .get(&scope)
+                .is_some_and(|current| Arc::ptr_eq(current, &handle))
+            {
+                handle.close_master_fd();
+                map.handles.remove(&scope);
+            }
+        });
     }
 
     /// Release a fresh-terminal reservation after planning or spawn failure.
@@ -434,7 +474,8 @@ impl ActiveTerminals {
             return Err(ActiveTerminalInsertError::Occupied);
         }
         let arc = Arc::new(handle);
-        map.handles.insert(scope, Arc::clone(&arc));
+        map.handles.insert(scope.clone(), Arc::clone(&arc));
+        self.install_child_observer(scope, &arc);
         Ok(arc)
     }
 
@@ -529,7 +570,10 @@ impl ActiveTerminals {
         {
             return None;
         }
-        map.handles.get(scope).cloned()
+        map.handles
+            .get(scope)
+            .filter(|handle| !handle.child_lifecycle.receipt().exited())
+            .cloned()
     }
 
     /// Reset a reclaimed handle's stop channel only if it is still the current
@@ -545,6 +589,7 @@ impl ActiveTerminals {
             .retirements
             .get(scope)
             .is_some_and(|retirement| retirement.owner.is_some())
+            || handle.child_lifecycle.receipt().exited()
             || !map
                 .handles
                 .get(scope)
@@ -581,6 +626,10 @@ impl ActiveTerminals {
             .get(scope)
             .map(TerminalInstanceIdentity::from_handle);
         let had_entry = instance.is_some();
+        let child_exit = map
+            .handles
+            .get(scope)
+            .map(|handle| handle.child_lifecycle.receipt());
         let generation = map
             .retirements
             .get(scope)
@@ -599,6 +648,7 @@ impl ActiveTerminals {
             deadline,
             owner,
             had_entry,
+            child_exit,
         }
     }
 
@@ -662,6 +712,13 @@ impl ActiveTerminals {
             permit.instance.as_ref(),
         ) {
             (None, Some(expected)) => {
+                if permit
+                    .child_exit
+                    .as_ref()
+                    .is_some_and(ChildExitReceipt::exited)
+                {
+                    return TerminalRetirementOutcome::AbsenceVerified;
+                }
                 match observe_process_identity(expected.process_identity().pid) {
                     Some(current) if current == expected.process_identity() => {
                         TerminalRetirementOutcome::Residual {
@@ -702,8 +759,8 @@ impl ActiveTerminals {
     /// Retire only the exact terminal instance authorized by `permit`.
     ///
     /// A stale permit must not remove a replacement terminal. On an exact match,
-    /// this removes the registry-owned handle, signals relay teardown, and reaps
-    /// the shell when no relay is attached. The scope remains fenced until the
+    /// this signals relay teardown, closes the master under the attach permit,
+    /// and awaits the child monitor's receipt. The scope remains fenced until the
     /// exact owning permit or relay completion is consumed.
     ///
     /// # Panics
@@ -723,22 +780,18 @@ impl ActiveTerminals {
         self.complete_retirement_by_observing(
             permit,
             deadline,
-            wait_for_child_exit,
             phoenix_core::process_identity::current_process_identity,
         )
         .await
     }
 
-    pub(crate) async fn complete_retirement_by_observing<Wait, WaitFuture, Observe>(
+    pub(crate) async fn complete_retirement_by_observing<Observe>(
         &self,
         permit: &TerminalRetirementPermit,
         deadline: tokio::time::Instant,
-        wait_for_exit: Wait,
         observe_process_identity: Observe,
     ) -> TerminalRetirementOutcome
     where
-        Wait: FnOnce(Pid) -> WaitFuture,
-        WaitFuture: std::future::Future<Output = nix::Result<nix::sys::wait::WaitStatus>>,
         Observe: Fn(u32) -> Option<ProcessIdentity> + Copy,
     {
         let attach_permit = {
@@ -753,10 +806,6 @@ impl ActiveTerminals {
             Arc::clone(&handle.attach_permit)
         };
 
-        // An attached relay remains the teardown authority: do not retain an
-        // Arc that would keep its PTY master open while it waits and reaps. A
-        // detached terminal has no relay, so retirement acquires this authority
-        // immediately and actively closes the exact current handle's master.
         let Ok(Ok(relay_authority)) =
             tokio::time::timeout_at(deadline, attach_permit.acquire_owned()).await
         else {
@@ -783,12 +832,10 @@ impl ActiveTerminals {
             };
             Arc::clone(handle)
         };
-        let child_pid = handle.child_pid;
         handle.close_master_fd();
 
-        // SIGCHLD is the causal child-exit signal. The timeout is only the
-        // outer Close liveness bound, and it shares the relay deadline above.
-        let wait_outcome = tokio::time::timeout_at(deadline, wait_for_exit(child_pid)).await;
+        let receipt = handle.child_lifecycle.receipt();
+        let wait_outcome = tokio::time::timeout_at(deadline, receipt.wait()).await;
         if !matches!(wait_outcome, Ok(Ok(_))) {
             let expected = permit
                 .instance
@@ -805,7 +852,6 @@ impl ActiveTerminals {
                 }
             }
         }
-        drop(relay_authority);
         {
             let mut map = self.0.lock().expect("terminal registry poisoned");
             if !Self::matches_exact_instance(&map, permit) {
@@ -813,6 +859,7 @@ impl ActiveTerminals {
             }
             map.handles.remove(&permit.work_scope);
         }
+        drop(relay_authority);
         drop(handle);
         if permit.had_entry {
             TerminalRetirementOutcome::Retired
@@ -924,59 +971,6 @@ impl ActiveTerminals {
             outcome = ?outcome,
             "terminal: cascade teardown complete"
         );
-    }
-}
-
-#[cfg(unix)]
-fn terminal_child_exit(status: nix::sys::wait::WaitStatus) -> Option<nix::sys::wait::WaitStatus> {
-    use nix::sys::wait::WaitStatus;
-
-    match status {
-        outcome @ (WaitStatus::Exited(..) | WaitStatus::Signaled(..)) => Some(outcome),
-        WaitStatus::Stopped(..) | WaitStatus::Continued(_) | WaitStatus::StillAlive => None,
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        WaitStatus::PtraceEvent(..) | WaitStatus::PtraceSyscall(_) => None,
-    }
-}
-
-#[cfg(unix)]
-async fn wait_for_child_exit(child_pid: Pid) -> nix::Result<nix::sys::wait::WaitStatus> {
-    use nix::sys::wait::{waitpid, WaitPidFlag};
-
-    // Register for SIGCHLD before the first observation so an exit between the
-    // check and wait remains visible either as a pending signal or a zombie.
-    let mut child_signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
-        .map_err(|error| nix::Error::from_raw(error.raw_os_error().unwrap_or(libc::EIO)))?;
-    loop {
-        let status = waitpid(child_pid, Some(WaitPidFlag::WNOHANG))?;
-        if let Some(outcome) = terminal_child_exit(status) {
-            return Ok(outcome);
-        }
-        let _ = child_signal.recv().await;
-    }
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod linux_wait_status_tests {
-    use super::terminal_child_exit;
-    use nix::{
-        sys::{signal::Signal, wait::WaitStatus},
-        unistd::Pid,
-    };
-
-    #[test]
-    fn ptrace_observations_are_not_terminal_child_exits() {
-        let pid = Pid::from_raw(42);
-
-        assert_eq!(
-            terminal_child_exit(WaitStatus::PtraceEvent(
-                pid,
-                Signal::SIGTRAP,
-                libc::PTRACE_EVENT_EXIT
-            )),
-            None
-        );
-        assert_eq!(terminal_child_exit(WaitStatus::PtraceSyscall(pid)), None);
     }
 }
 

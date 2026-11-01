@@ -65,9 +65,9 @@ only the architectural seams.
   recreation without adding server-restart survival guarantees.
 - **Path defaults** treat blank cwd overrides as absent and resolve relative cwd
   values from the parent conversation.
-- **Sub-agent wake handle** is the child conversation / agent id. Wake contracts
-  can wait on that handle reaching terminal state, but the wake payload is not a
-  parent-to-child continuation channel and does not grant more budget.
+- **Wake retirement** removes REQ-SA-009's wake binding and delivery obligations
+  under ADR-098. Ordinary durable terminal evidence and parent fan-in remain;
+  candidate retirement implementation and verification are ongoing.
 - **Named workers** supply persona and execution preferences, never mode or tools.
   The XDG config and candidate catalog are owned by
   [`agents.allium`](../agents/agents.allium); [ADR-052](../adrs/052_workers-and-tiers-resolve-usable-model-routes.md)
@@ -85,11 +85,11 @@ only the architectural seams.
 | **REQ-SA-006:** Timeout Enforcement | ✅ Complete | `DEFAULT_SUBAGENT_TIMEOUT = 20 min`; deadline races in executor `select!` |
 | **REQ-SA-007:** Model Selection | ✅ Complete | `generic_omission_inherits_parent_execution`, `override_replaces_execution_and_keeps_persona`, and `explicit_connection_is_exact_and_never_falls_back`; persisted selection verified by `unattached_sub_agent_persists_selection_without_parent_effort_leak` |
 | **REQ-SA-008:** Context Injection via Read-First | ❌ Not Started | `read_first` field not yet on `SubAgentTask`; deferred |
-| **REQ-SA-009:** Terminal Handle Identity for Wake Contracts | Proposed | Child conversation / agent id is the sub-agent wake handle |
+| **REQ-SA-009:** Retired Wake Handle Contract | Retired | Historical traceability only; REQ-WAKE-RETIRE-001–005 replace wake execution obligations without changing normal fan-in. Candidate removal verification ongoing. |
 | **REQ-SA-010:** Turn-Limit Grace Prompt Integrity | ✅ Complete | Grace request advertises terminal tools only; Work guidance routes unfinished required edits through `submit_error` |
 | **REQ-SA-011:** Spawn Override Defaults and Path Base | ✅ Complete | `omitted_execution_and_blank_cwd_use_defaults`, `relative_cwd_resolves_from_parent_working_directory`, and `advertised_model_removed_from_live_registry_is_rejected` |
 
-**Progress:** 9 complete; 1 deferred; 1 proposed for wake runtime.
+**Progress:** 9 complete; 1 deferred; 1 retired wake requirement (retirement verification ongoing).
 
 ## Execution-selection verification
 

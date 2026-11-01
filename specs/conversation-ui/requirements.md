@@ -88,13 +88,20 @@ THEN THE SYSTEM SHALL present a transcript-local action to retry the acquisition
 WHEN agent message contains markdown
 THE SYSTEM SHALL render basic markdown (code blocks, bold, italic, paragraphs)
 
+WHEN a Markdown link destination is a root-relative or same-origin absolute URL whose parsed path matches `/c/:slug`, `/product-conversations/:slug`, `/chains/:root`, `/global`, or `/global/:slug`
+THE SYSTEM SHALL recognize it before local-file detection and navigate in the current application context
+AND SHALL preserve its query string and fragment
+AND SHALL retain native anchor keyboard and modified-click behavior
+
+Protocol-relative and document-relative destinations SHALL NOT be promoted to application routes. Links from the Coordinator to `/product-conversations/:slug` SHALL carry the same Coordinator return origin as links to `/c/:slug`; chain and Global destinations SHALL NOT acquire that return origin.
+
 WHEN agent prose contains a recognized local file path as raw text
-OR a Markdown link has that same recognized local file path as its destination
+OR a Markdown link has that same recognized local file path as its destination and is not a supported application route
 THE SYSTEM SHALL present the reference as an in-application file action
 AND SHALL open the path through the conversation's file viewer when activated
 AND SHALL preserve the Markdown label as the visible link text when one is present
 
-WHEN a Markdown link destination is not a recognized local file path
+WHEN a Markdown link destination is neither a supported application route nor a recognized local file path
 THE SYSTEM SHALL preserve ordinary safe browser-link behavior
 
 The local-path shapes recognized in raw text and Markdown destinations SHALL be identical. Path-shape recognition only identifies a file candidate; the server-side viewer-openability classification defined by `specs/file-explorer/requirements.md` remains authoritative for the resolved content.
@@ -613,9 +620,15 @@ AND assign the strip a single fixed role that does not change between cold load 
 THE SYSTEM SHALL treat as a chapter every user prompt except inputs whose stored provenance is a subscription event, and every assistant text block at or above the significance threshold (REQ-CONV-022)
 AND SHALL exclude subscription-event inputs from navigation stops without removing them from the chronological transcript or changing message anchors
 AND SHALL determine this exclusion from typed provenance, not from message text, so a user prompt quoting an event label remains navigable
-AND render each chapter as a type-styled pill distinguishing a user prompt from assistant prose
-AND label each pill with human-meaningful conversation text — the truncated prompt or the first line of the prose
+AND render each chapter as a type-styled pill distinguishing a user prompt, assistant prose, and a continuation boundary
+AND label prompt and prose pills with human-meaningful conversation text — the truncated prompt or the first line of the prose
+AND label continuation pills as context boundaries in aggregate chronological order
 AND NOT expose opaque internal display identifiers, render-unit keys, sequence numbers, or placeholder IDs as the chapter label
+
+THE SYSTEM SHALL use the same persisted continuation-message identity for the chronological boundary marker and its navigation stop
+AND SHALL make unloaded boundaries selectable from aggregate topology without eagerly fetching their message history
+AND SHALL resolve such a selection through the bounded earlier-history loader and exact-message positioning authority
+AND SHALL present completed boundaries as compact native web markers with handoff text and provenance disclosed on demand, not as ordinary conversational prose
 
 WHEN a chapter pill is clicked
 THE SYSTEM SHALL issue one virtualizer-owned positioning command to that chapter's message, including when the loaded target is outside the rendered window
@@ -667,3 +680,67 @@ AND SHALL NOT imply that the failure disables later automatic continuations for 
 AND SHALL NOT silently loop, fabricate progress, or introduce a separate automatic-retry action
 
 **Rationale:** Automatic continuation configuration belongs to the durable conversation users recognize, not to a replaceable transcript segment. Prospective semantics prevent a toggle from misrepresenting already-exhausted or already-admitted work, while the shared continuation operation remains the single recovery path.
+
+---
+
+### REQ-CONV-025: Bounded Markdown Disclosures
+
+WHEN conversation Markdown contains a complete top-level, non-nested `<details>` envelope with one leading `<summary>` element
+THE SYSTEM SHALL render a native disclosure whose summary contains Markdown phrasing content and whose body contains Markdown block content
+AND SHALL preserve native summary focus and keyboard activation
+AND SHALL default to collapsed unless the details opening contains the `open` attribute
+AND SHALL retain only boolean `open` from source wrapper attributes, with presence meaning true regardless of its value
+AND SHALL NOT enable raw HTML execution or raw HTML reparsing to provide this feature.
+
+Whitespace MAY precede the leading summary. Same-line and multiline summary/body boundaries SHALL use the same recognition rules. Summary content SHALL be parsed as phrasing, not as a block document, and SHALL NOT introduce reference definitions. Source attributes other than boolean `open`, including event handlers, styles, and identifiers, SHALL NOT become disclosure DOM properties. Existing Markdown URL safety policy SHALL remain in force.
+
+WHEN a candidate is malformed, incomplete, nested, lacks a leading summary, or occurs inside a native Markdown container rather than at document root
+THE SYSTEM SHALL NOT promote that candidate to a disclosure
+AND SHALL keep rejected wrapper syntax and ordinary following content visible under the surrounding Markdown interpretation, without swallowing the remainder of the message or manufacturing a closing delimiter.
+
+A completed outer wrapper SHALL suppress promotion of nested descendants even when the outer wrapper is malformed. An unclosed prefix MAY expose a subsequent complete envelope only when its summary has already ended and native document-root ownership was established before that envelope began. Candidates found under an unfinished summary or a missing-summary prefix SHALL NOT be retroactively promoted.
+
+Native code, escaped literals, link/image resources and titles, definitions, and opaque HTML contexts SHALL retain ownership of their contents; tag-shaped text in those contexts SHALL NOT become disclosure boundaries or definitions. This ownership SHALL NOT enable rendering of otherwise suppressed raw HTML. Rejected wrapper syntax outside such native-owned contexts SHALL remain literal text in its surrounding paragraph rather than forcing artificial block breaks.
+
+WHEN a native-complete reference-label construct contains disclosure-shaped text
+THE SYSTEM SHALL shield that text from disclosure recognition based on syntactic completeness, independently of whether a matching definition exists before or after it
+AND SHALL retain native literal rendering for undefined references
+AND SHALL NOT treat malformed or incomplete reference syntax as a blanket shield.
+
+This syntax-first shielding is explicit Phoenix extension precedence, not a CommonMark requirement that undefined references resolve. Recognition membership SHALL remain separate from actual reference definitions.
+
+WHEN rendering, streaming, selecting source ranges, or finding text in conversation Markdown
+THE SYSTEM SHALL derive disclosure boundaries, rendered nodes, and searchable text from one canonical interpretation of the same source and Markdown configuration
+AND SHALL retain original UTF-16 source offsets and line/column coordinates, including BOM and CRLF input
+AND SHALL keep accepted disclosure envelopes intact when selecting rendered chunks
+AND SHALL NOT rediscover definitions or boundaries through an independent chunk interpretation or by appending definition source to rendered chunks. A canonical interpretation MAY compile disjoint, native-owned source regions once with a shared real-definition context.
+
+Ordinary Markdown SHALL preserve native semantic behavior for the selected basic or GFM configuration; GFM SHALL NOT be enabled implicitly. Real document and body reference definitions SHALL be decoded by the native parser, collected in source order with first definition winning, and shared globally across summaries, bodies, and surrounding content, including forward references. Original-source coordinates SHALL take precedence over native BOM-stripped offsets. Standard Markdown file and plan viewers SHALL retain their own renderer configuration; their find projections SHALL NOT promise conversation-only disclosure transformations that those renderers cannot display or mark.
+
+For each source interpretation, let N be source length, E the native event count, and R any actual reference-context bytes copied. The extension SHALL bound character traversal by cN and event traversal by dE for fixed constants independent of candidate count, with O(N+E) auxiliary storage and O(N+E+R) extension overhead, or O(N+E log N+R) when indexed position relocation uses binary search. Native submissions over disjoint source regions SHALL have a documented fixed total source-volume bound. The extension SHALL NOT use input-dependent fixed-point rounds, overlapping ancestor/child reparsing, or per-candidate suffix parsing. These bounds govern extension work, not native speculative tokenization or downstream rendering internals; they SHALL NOT be represented as a whole-parser linear-time guarantee. Each streaming update is a separate interpretation, not a promise of incremental parsing across updates.
+
+**Rationale:** Authors can make long explanations skimmable without losing inspectable content. A single native-context interpretation prevents rendering, source selection, and find from disagreeing, while fixed extension work avoids candidate-dependent reparse amplification.
+
+### REQ-CONV-026: Continuous Aggregate History
+
+WHEN viewing an ordinary ProductConversation or Global Coordinator on the web
+THE SYSTEM SHALL present its continuation members as one chronological history
+AND SHALL acquire older aggregate pages lazily for scrolling, chapter selection, and exact-message deep links
+AND SHALL preserve original message identities, ordering, and reader anchors across acquisition and live continuation
+AND SHALL keep boundary selection and browser back/forward navigation under the same message-positioning authority
+
+WHEN a reader explicitly selects a prompt, prose, or context-boundary chapter
+THE SYSTEM SHALL make that selection supersede earlier unresolved chapter-positioning intent
+AND SHALL NOT position the reader at a superseded boundary when its delayed history page arrives
+AND SHALL retain valid acquired pages for the same aggregate independently of the superseded positioning intent
+
+WHILE a reader inspects a historical member
+THE SYSTEM SHALL keep the composer attached to the newest writable member independently of the reader's selected history
+AND SHALL retain exact source-transcript and source-tool evidence selection until the reader explicitly selects a different anchor
+AND SHALL preserve unrelated query parameters and browser history when navigating boundaries
+
+Aggregate history SHALL expose one `latest_opening` authority sum rather than a parallel pending boolean. Pending authority SHALL permit temporary deferral only of its exact reserved opening identity. Accepted generated context with boundary presentation SHALL settle that identity as represented by the named boundary; accepted user-authorized or edited content SHALL remain separately visible. Neither message role nor equal text without a completed handoff receipt SHALL authorize suppression.
+
+A committed live opening observation SHALL settle opening readiness without requiring a successful aggregate refresh. Refresh failure SHALL remain visible without reverting that accepted edge to pending. Delayed pending snapshots SHALL NOT undo an accepted observation for the same edge. A content-update observation SHALL recompute presentation while retaining the accepted edge and message identity. A delayed accepted-opening content update whose durable transcript generation has been superseded SHALL deliver a coherent committed content, generation, and presentation envelope for that same identity in both live and reconnect replay paths. It SHALL retain its event cursor and unrelated owed replay events. Missing or future generations and wrong content at the current generation SHALL NOT borrow newer opening authority. These reconciliation rules SHALL preserve reader anchors, message order, and independent composer authority under REQ-CONV-002 and REQ-CONV-006.
+
+Global aggregate history SHALL NOT acquire ordinary Open/History lifecycle, Close actions, work identity, or ordinary mutation authority. Native Swift navigation is outside this web contract.

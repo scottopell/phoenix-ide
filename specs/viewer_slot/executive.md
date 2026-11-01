@@ -29,9 +29,9 @@ Each requirement maps to where its behavior lives in the implementation.
 | Requirement | Implementation |
 |-------------|----------------|
 | **REQ-VS-001:** User Opens Prose Viewer | `ViewerSlotProvider.openProse` + URL search params; `ui/src/contexts/ViewerSlotContext.tsx` |
-| **REQ-VS-002:** Unified URL Slot Contract | One `ViewerSlotProvider` derives all viewer kinds from the URL; `FileExplorerProvider` is a thin adapter projecting prose state |
+| **REQ-VS-002:** Unified URL Slot Contract | One `ViewerSlotProvider` derives all viewer kinds from the URL; `FileExplorerProvider` is a thin adapter projecting prose state. Reader navigation isolation is specified in `requirements.md`; candidate browser qualification remains pending |
 | **REQ-VS-003:** User Opens Diff Viewer | `?viewer=diff&presentation=fullscreen` for primary View Diff, `?viewer=diff&presentation=pane` where split-pane is intentionally used; `ConversationDiffViewer` fetches the payload on mount from `GET /api/conversations/:id/diff` |
-| **REQ-VS-004:** User Closes Active Viewer | `ViewerSlotProvider.close` clears the `viewer`/`presentation`/`file`/`root` params via `setSearchParams` |
+| **REQ-VS-004:** User Closes Active Viewer | `ViewerSlotProvider.close` clears viewer-owned params; hash/state and reader identity preservation are candidate qualification obligations below |
 | **REQ-VS-005:** URL Hydrates Prose | `deriveSlot` reads `?viewer=prose&file=&root=` (and legacy `?file=&root=`) on every render |
 | **REQ-VS-006:** URL Hydrates Non-Prose Viewers | Diff and message identity plus presentation hydrate from the URL; browser and inspector retain their existing shapes; server-backed viewers re-fetch or resolve payloads on mount |
 | **REQ-VS-007:** Single-Slot Mutex | Structural: one `viewer` param at a time. The discriminated union enforces it; no coordinating effects |
@@ -46,6 +46,16 @@ Each requirement maps to where its behavior lives in the implementation.
 | **REQ-VS-016:** Focused Content Review | `ViewerSlotProvider.setPresentation`, `ViewerPresentationControl`, `useFocusedReviewExit`, `MetaViewer`, `MessageViewer` provide URL-restorable takeover and protected feedback resolution |
 
 The slot is realized as a single `ViewerSlotProvider` (mounted in `DesktopLayout`, which wraps every conversation route) that derives its state from the URL, with no coordinating effects -- the discriminated union enforces the mutex. The diff payload is a viewer-mounted fetch keyed on the conversation id, since the diff endpoint is conversation-keyed rather than comparator-addressable.
+
+## Reader Navigation Isolation — Candidate
+
+[REQ-VS-002 and REQ-VS-004](requirements.md) distinguish viewer-only URL replacement from reader navigation. The candidate preserves hash, router state, and reader navigation identity across viewer changes; actual push, replace, and history traversal retain their reader commands. Uncommitted concurrent renders must not become mutation authority.
+
+Qualification must audit the shared prose, diff, browser, inspector, and message viewer paths: supported close controls, Escape dismissal, and presentation changes where available, while retaining find/annotation/pending-feedback guards. Outside-click close is unsupported and is not an acceptance claim. Raw legacy `ConversationPage` narrow-layout remount behavior is not qualified by this candidate.
+
+Hosted Chromium run39471159966 qualifies candidate0f34a73c5 with 30 real review journeys: ordinary/Global,390/1100/1440px, middle/pinned-bottom, close/discard/send, Escape and wide fullscreen return. The same harness with only the prior page/provider restored records30 exits at scrollTop0 (18 middle readers and12 pinned readers); candidate records zero mismatches/errors. Artifact12288090449 preserves both controls. Middle readers retain their anchor; pinned readers remain at the bottom when sending notes grows the composer. Review sends append to the draft, not directly to the server.
+
+The shared slot mutation boundary is source/unit-audited for prose/diff/browser/inspector as well as message review; the browser matrix exercises message review, not every viewer. Native keyboard, installed-PWA and legacy raw-page layouts remain outside that rendered evidence. Final exact-head CI and deployment are separate from these candidate results.
 
 ## Validation
 

@@ -51,10 +51,8 @@ pub struct RingBuffer {
     /// when its `\n` arrives or on EOF via [`Self::flush_partial`].
     partial: Vec<u8>,
     /// Total bytes accounted for in `lines` (sum of `line.bytes.len()`).
-    /// Newline overhead is NOT counted here — eviction is by line content
-    /// bytes, which matches the spec's "per-handle live ring buffer
-    /// bounded by `RING_BUFFER_BYTES`" intent (the cap is on captured
-    /// content, not on framing).
+    /// Newline overhead is NOT counted here. The separate line-count bound
+    /// in [`Self::evict_to_cap`] also limits zero-content records.
     ///
     /// This is the *retained* byte count and exists ONLY to drive eviction.
     /// It is NOT the reported output size — that is [`Self::output_bytes`],
@@ -152,7 +150,7 @@ impl RingBuffer {
         self.lines.is_empty()
     }
 
-    /// Cap on retained bytes. Lines are evicted when `bytes_used > bytes_cap`.
+    /// Cap on retained content bytes and line count (at least one line is kept).
     #[must_use]
     pub fn bytes_cap(&self) -> usize {
         self.bytes_cap
@@ -162,7 +160,8 @@ impl RingBuffer {
     /// receive sequential offsets, a trailing partial chunk is held in
     /// `self.partial` until its `\n` arrives or `flush_partial` is called.
     ///
-    /// After appending, evicts oldest lines until `bytes_used <= bytes_cap`.
+    /// On each inserted line, evicts oldest lines until both retained content
+    /// bytes and line count fit `bytes_cap`.
     /// The most recently appended line is never evicted by this call —
     /// even a single line larger than `bytes_cap` is retained (with
     /// `start_offset` advanced past every prior line). This matches
@@ -191,7 +190,6 @@ impl RingBuffer {
                 self.push_line(line_bytes);
             }
         }
-        self.evict_to_cap();
     }
 
     /// Flush any held partial bytes as a final line. Used on EOF when the
@@ -201,7 +199,6 @@ impl RingBuffer {
         if !self.partial.is_empty() {
             let line_bytes = std::mem::take(&mut self.partial);
             self.push_line(line_bytes);
-            self.evict_to_cap();
         }
     }
 
@@ -213,14 +210,13 @@ impl RingBuffer {
         self.bytes_used += line.bytes.len();
         self.next_offset += 1;
         self.lines.push_back(line);
+        self.evict_to_cap();
     }
 
     fn evict_to_cap(&mut self) {
-        // Spec: drop oldest while bytes_used > cap AND more than one line
-        // remains. A single oversize line is kept (any read returns it
-        // with truncated_before=true if the requested view extends below
-        // the new start_offset).
-        while self.bytes_used > self.bytes_cap && self.lines.len() > 1 {
+        while (self.bytes_used > self.bytes_cap || self.lines.len() > self.bytes_cap)
+            && self.lines.len() > 1
+        {
             let evicted = self
                 .lines
                 .pop_front()
@@ -385,6 +381,50 @@ mod tests {
         let view = r.since(0);
         assert!(view.truncated_before, "since=0 < start_offset=2");
         assert_eq!(view.lines, vec![line(2, b"CCCC"), line(3, b"DDDD")]);
+    }
+
+    #[test]
+    fn empty_lines_are_bounded_and_eviction_is_reported() {
+        for cap in [0, 1, 8] {
+            let mut r = RingBuffer::new(cap);
+            // One append and repeated appends must obey the same bound.
+            r.append(&[b'\n'; 64]);
+            assert_eq!(r.len(), cap.max(1));
+            for _ in 0..64 {
+                r.append(b"\n");
+                assert_eq!(r.len(), cap.max(1));
+            }
+            assert_eq!(r.bytes_used(), 0);
+            assert_eq!(r.output_bytes(), 128);
+            assert_eq!(r.next_offset(), 128);
+            assert_eq!(r.start_offset(), 128 - cap.max(1) as u64);
+            let view = r.since(0);
+            assert!(view.truncated_before);
+            assert!(view.lines.iter().all(|line| line.bytes.is_empty()));
+            assert!(r.tail(usize::MAX).truncated_before);
+            assert!(!r.since(r.start_offset()).truncated_before);
+        }
+    }
+
+    #[test]
+    fn mixed_empty_and_nonempty_lines_preserve_content_byte_accounting() {
+        let mut r = RingBuffer::new(3);
+        r.append(b"abc\n\n\n");
+        assert_eq!(r.bytes_used(), 3);
+        assert_eq!(r.start_offset(), 0);
+        r.append(b"\n");
+        assert_eq!(r.len(), 3);
+        assert_eq!(r.bytes_used(), 0);
+        assert_eq!(r.start_offset(), 1);
+        assert!(r.since(0).truncated_before);
+        r.append(b"xy");
+        r.flush_partial();
+        assert_eq!(r.len(), 3);
+        assert_eq!(r.bytes_used(), 2);
+        assert_eq!(
+            r.since(0).lines,
+            vec![line(2, b""), line(3, b""), line(4, b"xy")]
+        );
     }
 
     #[test]

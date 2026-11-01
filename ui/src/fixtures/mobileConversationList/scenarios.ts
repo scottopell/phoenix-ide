@@ -51,7 +51,6 @@ function conv(id: string, slug: string, overrides: Partial<Conversation> = {}): 
     seed_label: null,
     seed_parent_slug: null,
     continued_in_conv_id: null,
-    chain_name: null,
     browser_session_active: false,
     terminal_uses_tmux: true,
     work_scope_key: `conversation:${id}`,
@@ -130,7 +129,7 @@ const chainConversations: Conversation[] = [
   }),
   conv('collapsed-chain-root', 'mobile-chain-root-history', {
     continued_in_conv_id: 'collapsed-chain-latest',
-    chain_name: 'mobile conversations redesign',
+    title: 'mobile conversations redesign',
     presentation_mode: 'done',
     state: state('terminal'),
     updated_at: isoAgo(1440),
@@ -139,7 +138,7 @@ const chainConversations: Conversation[] = [
   conv('approval-chain-latest', 'approval-needed-current-work', {
     conv_mode_label: 'WORK',
     continued_in_conv_id: null,
-    chain_name: 'approval chain stays current',
+    title: 'approval chain stays current',
     presentation_mode: 'needs_action',
     state: state('awaiting_task_approval'),
     cached_pr: pr(412, 'draft', 'Approval chain PR'),
@@ -148,7 +147,7 @@ const chainConversations: Conversation[] = [
   }),
   conv('approval-chain-root', 'approval-chain-completed-history', {
     continued_in_conv_id: 'approval-chain-latest',
-    chain_name: 'approval chain stays current',
+    title: 'approval chain stays current',
     presentation_mode: 'done',
     state: state('terminal'),
     updated_at: isoAgo(480),
@@ -180,7 +179,7 @@ const chainConversations: Conversation[] = [
   }),
   conv('cleanup-chain-part-1', 'explore-mobile-row-options', {
     continued_in_conv_id: 'cleanup-chain-part-2',
-    chain_name: 'explore → work → cleanup',
+    title: 'explore → work → cleanup',
     conv_mode_label: 'EXPLORE',
     presentation_mode: 'done',
     state: state('terminal'),

@@ -153,3 +153,29 @@ WHEN the path typed after `./` does not match any file in the autocomplete resul
 THE SYSTEM SHALL still allow the message to be sent without error
 
 **Rationale:** Sometimes the user wants to point the AI at a file and let it decide how and how much to read — a full read may be wasteful for a large file, or the agent may only need a specific function. By sending `./src/auth.rs` as literal text, the user delegates the read strategy to the agent. Because no server-side expansion occurs, there is nothing to validate or block on; the agent handles any path resolution itself.
+
+---
+
+### REQ-IR-009: Recover a Late Expansion Rejection Without Replacing New Work
+
+WHEN an expansion error rejects a submission after the composer has cleared it
+AND the originating composer is still mounted in the same scope and lifetime
+AND its post-clear draft revision is unchanged, with no text, attachments, upload, or independent recording in progress
+THE SYSTEM SHALL automatically restore the rejected submission's raw text and attachments for editing
+AND SHALL display the expansion error without resending the message.
+
+WHEN automatic restoration is prevented by newer text, attachments, an upload, an independent recording, a changed revision, or a departed composer
+AND the originating draft lifetime still exists
+THE SYSTEM SHALL leave newer work untouched
+AND SHALL retain the rejected raw text, attachments, and error separately for explicit recovery
+AND SHALL NOT silently concatenate the rejected submission with the current draft.
+
+THE SYSTEM SHALL bind recovery to the originating conversation's draft lifetime
+AND SHALL use revision identity rather than text equality to authorize restoration, including after edits that return the draft to its earlier value
+AND SHALL NOT let a late completion mutate another scope or a replacement lifetime after the originating draft is removed.
+
+WHEN the user explicitly restores a retained rejection
+THE SYSTEM SHALL require an empty, non-recording composer with no attachments or upload in progress
+AND SHALL recheck scope, lifetime, and revision before applying the rejected payload.
+
+This contract concerns expansion rejection only; it does not change transport-failure retry queues or conversation Close behavior. Recovery is in-memory within the originating draft lifetime, not a reload or restart persistence guarantee. Voice text recovery follows [REQ-VOICE-008](../voice-input/requirements.md#req-voice-008-voice-ownership-during-late-expansion-recovery).

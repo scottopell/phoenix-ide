@@ -12,10 +12,15 @@ on:
       - "crates/phoenix-ide/Cargo.toml"
       - "crates/phoenix-ide/src/api/installation_ownership.rs"
       - "crates/phoenix-ide/src/lib.rs"
+      - "dev.py"
+      - "scripts/launchd_deploy_helper.py"
+      - "tests/devpy/test_launchd_deploy.py"
+      - "tests/devpy/test_current_schema_prepared_upgrade.py"
       - "ui/src/generated/DeploymentInfo.ts"
       - ".github/workflows/macos-app.yml"
       - ".github/workflows/release.yml"
       - "scripts/publish-release-assets.sh"
+      - "scripts/sign-notarize-browser-cli.sh"
       - "scripts/release_version.py"
       - "scripts/test_release_version.py"
       - "scripts/verify-published-release.sh"
@@ -33,10 +38,15 @@ on:
       - "crates/phoenix-ide/Cargo.toml"
       - "crates/phoenix-ide/src/api/installation_ownership.rs"
       - "crates/phoenix-ide/src/lib.rs"
+      - "dev.py"
+      - "scripts/launchd_deploy_helper.py"
+      - "tests/devpy/test_launchd_deploy.py"
+      - "tests/devpy/test_current_schema_prepared_upgrade.py"
       - "ui/src/generated/DeploymentInfo.ts"
       - ".github/workflows/macos-app.yml"
       - ".github/workflows/release.yml"
       - "scripts/publish-release-assets.sh"
+      - "scripts/sign-notarize-browser-cli.sh"
       - "scripts/release_version.py"
       - "scripts/test_release_version.py"
       - "scripts/verify-published-release.sh"
@@ -56,6 +66,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 26
@@ -70,6 +82,8 @@ jobs:
           python3 scripts/test-desktop-release-workflow.py
           node --test scripts/test-check-signed-helper.cjs
           python3 scripts/test_release_version.py
+      - name: Test launchd deployment controller
+        run: python3 -m unittest tests.devpy.test_launchd_deploy tests.devpy.test_current_schema_prepared_upgrade
       - name: Build a real unsigned Release package
         run: |
           version=$(grep -m1 '^version' crates/phoenix-ide/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
@@ -130,3 +144,54 @@ jobs:
           set -e
           test "$status" -ne 0
           grep -F "Release builds require PHOENIX_SIDECAR_PATH" "$RUNNER_TEMP/release-without-sidecar.log"
+
+  owned-chrome-teardown:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'integration/v013-history-current-main'
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      RAYON_NUM_THREADS: '2'
+      RUST_TEST_THREADS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CHROME_QUALIFICATION_OUTPUT: ${{ github.workspace }}/owned-chrome-macos
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '26'
+      - uses: dtolnay/rust-toolchain@035fceb3c12fb0c6a9461b52775e16473133e591 # 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: owned-chrome-macos
+      - name: Admit exact app sources, build existing UI embed and install owned Chromium
+        run: |
+          git diff --exit-code f16afb227d9336a863c0b0345960ea9a6d62b7c7 HEAD -- crates
+          cd ui
+          npm install -g corepack@latest
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm run build
+          pnpm exec playwright install chromium
+      - name: Exact macOS owned group, executable shim and actual Chrome layout
+        run: |
+          export PHOENIX_CHROME_EXECUTABLE="$(cd ui && node -e 'console.log(require("playwright").chromium.executablePath())')"
+          cargo build -p phoenix-tools --bin phoenix-browser
+          export PHOENIX_TEST_CHROME=1
+          bash scripts/qualify-owned-chrome-teardown.sh
+      - name: Retain actual native test/layout evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: owned-chrome-macos-${{ github.event.pull_request.head.sha }}
+          path: owned-chrome-macos/
+          if-no-files-found: warn
+          retention-days: 7

@@ -32,6 +32,14 @@ interface CommandPaletteProps {
   activeConversation: Conversation | null;
 }
 
+function decodeRouteSegment(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
 export function CommandPalette({ conversations, productConversations = [], activeConversation }: CommandPaletteProps) {
   const [state, setState] = useState<PaletteState>(initialState);
   const isDesktop = useIsDesktop();
@@ -45,13 +53,15 @@ export function CommandPalette({ conversations, productConversations = [], activ
 
   // Extract current slug and active conversation
   const slugMatch = location.pathname.match(/^\/c\/(.+)$/);
-  const productMatch = location.pathname.match(/^\/product-conversations\/([^/]+)$/);
-  const currentSlug = slugMatch?.[1] ?? null;
+  const productMatch = location.pathname.match(/^\/(?:product-conversations|c)\/([^/]+)$/);
+  const routeIdentity = productMatch?.[1] ? decodeRouteSegment(productMatch[1]) : null;
+  const currentSlug = slugMatch?.[1] ? decodeRouteSegment(slugMatch[1]) : null;
   const activeProduct = productMatch
     ? productConversations.find((row) => (
-        row.product_conversation_id === productMatch[1]
-        || row.canonical_root.slug === productMatch[1]
-        || row.canonical_root.transcript_row_id === productMatch[1]
+        row.product_conversation_id === routeIdentity
+        || row.canonical_root.slug === routeIdentity
+        || row.canonical_root.transcript_row_id === routeIdentity
+        || row.latest_transcript_row_id === routeIdentity
         || row.latest_transcript_row_id === activeConversation?.id
       ))
     : undefined;

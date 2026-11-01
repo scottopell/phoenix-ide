@@ -5,9 +5,8 @@
 A side panel that shows, per `WorkScope`, the live runtime resources the agent
 has spawned — backgrounded bash processes, the tmux server, and the browser
 session — so the user can see "what is running right now" on both the
-conversation page and the chain page. It is the human-facing complement to the
-agent-facing wake-contracts feature; both read the same per-`WorkScope`
-resource state.
+conversation page and the chain page. It reads per-`WorkScope` resource state
+independently of the retired wake feature.
 
 The panel is a read-projection: it introduces no new persistence. A
 `WorkScopeInventory` snapshot is assembled on demand from the existing in-memory

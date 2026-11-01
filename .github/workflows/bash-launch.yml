@@ -1,0 +1,67 @@
+name: Bash launch settlement
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'crates/phoenix-tools/src/bash/**'
+      - 'crates/phoenix-core/src/process_identity.rs'
+      - 'crates/phoenix-core/src/domain/tool_wire.rs'
+      - 'crates/phoenix-ide/src/main.rs'
+      - 'crates/phoenix-tools/src/bash.rs'
+      - 'crates/phoenix-ide/src/runtime.rs'
+      - 'crates/phoenix-ide/src/runtime/**'
+      - 'crates/phoenix-ide/src/coordinator_tools.rs'
+      - '.github/workflows/bash-launch.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fault-tests:
+    if: github.event_name == 'workflow_dispatch' || !github.event.pull_request.draft
+    name: Bash launch faults (${{ matrix.os }}, exact head)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # Cold macOS builds compile/link the native binary and large IDE test harness.
+    timeout-minutes: ${{ matrix.os == 'macos-latest' && 60 || 30 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v5
+      - name: Generate wire contracts
+        run: ./dev.py codegen
+      - name: Build native launcher executable
+        run: cargo build -p phoenix_ide --bin phoenix_ide
+      - name: Fault-injected launch and identity regressions
+        env:
+          PHOENIX_BASH_LAUNCH_TEST_EXE: ${{ github.workspace }}/target/debug/phoenix_ide
+          PHOENIX_BASH_LAUNCH_TEST_REQUIRED: '1'
+        run: |
+          test -x "$PHOENIX_BASH_LAUNCH_TEST_EXE"
+          cargo test -p phoenix-core process_identity::tests -- --show-output
+          cargo test -p phoenix-core domain::tool_wire::bash_tmux_wire_tests -- --show-output
+          cargo test -p phoenix-tools bash::operations::tests -- --show-output
+          cargo test -p phoenix-tools bash::launch_protocol::tests -- --show-output
+          cargo test -p phoenix-tools bash::ring::tests -- --show-output
+          cargo test -p phoenix-tools bash::registry::tests -- --show-output
+          cargo test -p phoenix-tools bash::reaper::tests -- --show-output
+          # One libtest invocation preserves all filters without recompiling the
+          # large IDE test harness for each filter. Keep its cases serial.
+          cargo test -p phoenix_ide --lib -- --show-output --test-threads=1 \
+            browser_retirement \
+            coordinator_bash_executes_owned_home_with_zero_ordinary_conversations \
+            real_bash_wait_zero_and_normal_bounds_preserve_child_without_replay \
+            conversation_runtime_dispatches_real_zero_and_normal_bash_waits
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bash-wire-${{ matrix.os }}
+          path: ui/src/generated/

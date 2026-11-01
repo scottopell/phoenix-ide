@@ -11,18 +11,21 @@ mod chains;
 pub mod codex_login;
 mod deployment;
 mod discovery;
-mod federation;
+mod event_presentation;
+pub(crate) mod federation;
 mod git_handlers;
 pub(crate) mod global_read;
+mod goal_commands;
+pub(crate) use goal_commands::GoalCommandService;
 pub(crate) mod handlers;
 mod installation_ownership;
 mod lifecycle_handlers;
 mod local_reveal;
 pub(crate) mod pr_monitoring;
 mod process_sample;
-mod product_conversations;
+pub(crate) mod product_conversations;
 mod release_updates;
-mod resource_monitor;
+pub(crate) mod resource_monitor;
 mod share_svg_artifacts;
 mod spa_routes;
 mod sse;
@@ -30,7 +33,9 @@ mod svg_artifacts;
 mod terminal_ws;
 mod types;
 pub(crate) mod usage;
+mod view_journey;
 pub(crate) mod wire;
+pub(crate) mod work_scope_load;
 
 pub use deployment::{
     absolutize, DeploymentConfig, DiskCategory, DiskLocation, LaunchInstanceId, LogInfo,
@@ -49,6 +54,7 @@ use crate::platform::PlatformCapability;
 use crate::runtime::RuntimeManager;
 use crate::terminal::ActiveTerminals;
 use crate::tools::mcp::McpClientManager;
+use phoenix_core::domain::instance_identity::OwnerPassword;
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use phoenix_llm::ModelRegistry;
 use std::sync::Arc;
@@ -62,9 +68,10 @@ pub struct AppState {
     #[allow(dead_code)] // Exposed for future API handlers (e.g., /status endpoint)
     pub platform: PlatformCapability,
     pub mcp_manager: Arc<McpClientManager>,
+    pub(crate) slack_gateway_access: Arc<tokio::sync::Mutex<crate::slack_gateway::BudgetWindow>>,
     pub credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
     /// When set, all non-exempt API endpoints require this password (REQ-AUTH-001).
-    pub password: Option<String>,
+    pub password: Option<OwnerPassword>,
     /// Server-side store of valid browser session tokens. Login mints a random
     /// token into this set; the password itself never travels in a cookie.
     pub sessions: auth::SessionStore,
@@ -83,6 +90,7 @@ pub struct AppState {
     /// once at startup.
     #[allow(dead_code)] // Consumed by the chain Q&A agent loop (REQ-CHN-009, Phase 2)
     pub message_retriever: Arc<dyn MessageRetriever>,
+    pub federation_tls_trust: phoenix_core::domain::instance_identity::PeerTlsTrust,
     /// In-flight Codex/ChatGPT login flows. See [`codex_login`].
     pub codex_login: Arc<codex_login::CodexLoginManager>,
     /// Static deployment facts (binding, TLS, on-disk layout) resolved once at
@@ -209,10 +217,11 @@ impl AppState {
         platform: PlatformCapability,
         mcp_manager: Arc<McpClientManager>,
         credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
-        password: Option<String>,
+        password: Option<OwnerPassword>,
         deployment: Arc<DeploymentConfig>,
         runtime_env: Arc<PhoenixRuntimeEnvironment>,
         suggest_token: String,
+        federation_tls_trust: phoenix_core::domain::instance_identity::PeerTlsTrust,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Conversation-retrieval index: bring it in line with `messages` once
         // at startup (REQ-RET-003) off the request path.
@@ -233,21 +242,8 @@ impl AppState {
             .map_err(std::io::Error::other)?;
         observe_running_close_runs(&db, || {
             runtime.kick_direct_turn_worker();
-            runtime.kick_wake_worker();
         })
         .await?;
-        let retired_wakes = db
-            .wake_repository()
-            .retire_all_registrations(phoenix_workflow::Timestamp(
-                u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
-            ))
-            .await?;
-        if retired_wakes > 0 {
-            tracing::warn!(
-                retired = retired_wakes,
-                "retired automatic wake obligations before runtime startup"
-            );
-        }
         // Close inspection and exact retirement must fence resources before any
         // resource-producing bridge or worker begins admitting new instances.
         reconcile_startup_continuations(&runtime).await?;
@@ -260,11 +256,6 @@ impl AppState {
             .await;
         runtime.start_direct_turn_worker().await?;
         runtime.require_startup_local_authority()?;
-        runtime
-            .start_wake_worker()
-            .await
-            .map_err(std::io::Error::other)?;
-        runtime.require_startup_local_authority()?;
         tokio::spawn(crate::runtime::pr_status_poll::run(runtime.clone()));
         runtime.start_creation_worker().await?;
         runtime.require_startup_local_authority()?;
@@ -275,51 +266,21 @@ impl AppState {
         runtime.require_startup_local_authority()?;
         handlers::start_attachment_cleanup_task(db.clone(), Arc::clone(&runtime));
         let terminals = runtime.terminals.clone();
-        // Retrieval works on existing index rows while this sweep runs and
-        // reports `index_reconciled()` when complete.
         {
             let retriever = retriever.clone();
             let runtime = Arc::clone(&runtime);
-            tokio::spawn(async move {
-                let result = async {
-                    use phoenix_db::retrieval::{
-                        Fts5Retriever, FtsMessageReconcileOutcome, ReconcileStats, RetrievalError,
-                    };
-                    let plan = retriever.discover_reconcile_plan().await?;
-                    let mut stats = ReconcileStats::default();
-                    if Fts5Retriever::locator_repair_required(&plan) {
-                        let _admitted = runtime.acquire_local_authority_pass().map_err(|()| {
-                            RetrievalError::Db(sqlx::Error::Protocol(
-                                "fatal local authority closed during retrieval reconciliation"
-                                    .to_string(),
-                            ))
-                        })?;
-                        retriever.repair_locator_rows().await?;
-                    }
-                    for message in Fts5Retriever::messages(plan) {
-                        let _admitted = runtime.acquire_local_authority_pass().map_err(|()| {
-                            RetrievalError::Db(sqlx::Error::Protocol(
-                                "fatal local authority closed during retrieval reconciliation"
-                                    .to_string(),
-                            ))
-                        })?;
-                        match retriever.reconcile_message(message).await? {
-                            FtsMessageReconcileOutcome::Unchanged => {}
-                            FtsMessageReconcileOutcome::Indexed => stats.indexed += 1,
-                            FtsMessageReconcileOutcome::Reindexed => stats.reindexed += 1,
-                        }
-                    }
-                    let _admitted = runtime.acquire_local_authority_pass().map_err(|()| {
-                        RetrievalError::Db(sqlx::Error::Protocol(
+            let reconcile = retriever
+                .reconcile_with_admission(move || {
+                    runtime.acquire_local_authority_pass().map_err(|()| {
+                        phoenix_db::retrieval::RetrievalError::Db(sqlx::Error::Protocol(
                             "fatal local authority closed during retrieval reconciliation"
                                 .to_string(),
                         ))
-                    })?;
-                    stats.pruned = retriever.prune_orphans().await?;
-                    retriever.mark_reconciled();
-                    Ok::<_, RetrievalError>(stats)
-                }
-                .await;
+                    })
+                })
+                .map_err(std::io::Error::other)?;
+            tokio::spawn(async move {
+                let result = reconcile.await;
                 match result {
                     Ok(stats) => tracing::info!(
                         indexed = stats.indexed,
@@ -329,7 +290,7 @@ impl AppState {
                     ),
                     Err(e) => tracing::warn!(
                         error = %e,
-                        "conversation retrieval index reconcile failed; recall may be incomplete until next startup"
+                        "conversation retrieval index reconcile failed; search unavailable until next startup"
                     ),
                 }
             });
@@ -345,13 +306,15 @@ impl AppState {
         // them. Empty when auth is disabled (password None) — never consulted,
         // since the auth middleware short-circuits in that mode.
         let session_password_fingerprint = password
-            .as_deref()
+            .as_ref()
+            .map(OwnerPassword::expose)
             .map(auth::password_fingerprint)
             .unwrap_or_default();
         let sessions = auth::SessionStore::new(db.clone(), session_password_fingerprint);
         let discovery = crate::discovery::start(crate::discovery::DiscoveryConfig::from_env());
-        let resource_monitor = resource_monitor::ResourceMonitor::new();
+        let resource_monitor = runtime.work_scope_load().memory_monitor();
         Ok(Self {
+            slack_gateway_access: crate::slack_gateway::access_gate(),
             runtime,
             llm_registry,
             db,
@@ -364,6 +327,7 @@ impl AppState {
             terminals,
             chain_qa,
             message_retriever,
+            federation_tls_trust,
             codex_login,
             deployment,
             runtime_env,

@@ -161,6 +161,7 @@ interface UseConnectionOptions {
   onValidatedInit?: (payload: InitPayload) => void;
   /** Called when a validated live event transfers one steering identity to server authority. */
   onValidatedSteeringQueued?: (messageId: string) => void;
+  onStreamAttempt?: (conversationId: string, openId: string, retryAttempt: number) => void;
 }
 
 function buildStreamUrl(
@@ -169,7 +170,7 @@ function buildStreamUrl(
   transcriptGeneration: number | null,
   openId?: string,
 ): string {
-  const params = new URLSearchParams();
+  const params = new URLSearchParams({ reference: conversationId });
   if (lastAppliedEventSeq > 0) {
     params.set('after_event_sequence', String(lastAppliedEventSeq));
     if (transcriptGeneration !== null) {
@@ -177,10 +178,7 @@ function buildStreamUrl(
     }
   }
   if (openId) params.set('open_id', openId);
-  const query = params.toString();
-  return query.length > 0
-    ? `/api/conversations/${conversationId}/stream?${query}`
-    : `/api/conversations/${conversationId}/stream`;
+  return `/api/conversation-reads/stream?${params}`;
 }
 
 function transformInitData(raw: SseInitData): InitPayload {
@@ -196,6 +194,7 @@ function transformInitData(raw: SseInitData): InitPayload {
     conversation,
     messages,
     steeringMessages: raw.steering_messages,
+    opening: raw.opening,
     phase,
     contextWindow: {
       used: raw.context_window_size ?? 0,
@@ -228,6 +227,7 @@ export function useConnection({
   getTranscriptGeneration,
   onValidatedInit,
   onValidatedSteeringQueued,
+  onStreamAttempt,
 }: UseConnectionOptions): ConnectionInfo {
   const [machineState, setMachineState] = useState<ConnectionMachineState>(initialState);
   const [countdownSeconds, setCountdownSeconds] = useState<number | null>(null);
@@ -261,6 +261,8 @@ export function useConnection({
   const getTranscriptGenerationRef = useRef(getTranscriptGeneration);
   const onValidatedInitRef = useRef(onValidatedInit);
   const onValidatedSteeringQueuedRef = useRef(onValidatedSteeringQueued);
+  const onStreamAttemptRef = useRef(onStreamAttempt);
+  useEffect(() => { onStreamAttemptRef.current = onStreamAttempt; }, [onStreamAttempt]);
 
   useEffect(() => {
     dispatchRef.current = dispatch;
@@ -361,7 +363,8 @@ export function useConnection({
           const epoch = effect.epoch;
           const stampedDispatch = epochStampedDispatch(dispatchRef.current, epoch);
 
-          dispatchRef.current({ type: 'connection_opened', epoch });
+          const connectionId = Symbol('sse-open');
+          dispatchRef.current({ type: 'connection_opened', epoch, connectionId });
 
           const lastAppliedEventSeq = getLastAppliedEventSeqRef.current?.() ?? 0;
           const transcriptGeneration = getTranscriptGenerationRef.current?.() ?? null;
@@ -377,6 +380,7 @@ export function useConnection({
           es.addEventListener('open', () => measurement.nativeOpen());
           eventSourceRef.current = es;
           openMeasurementRef.current = measurement;
+          onStreamAttemptRef.current?.(convId, openId, openAttempt);
           const isCurrentOwner = () =>
             conversationIdRef.current === convId &&
             machineStateRef.current.epoch === epoch &&
@@ -435,6 +439,7 @@ export function useConnection({
             stampedDispatch({
               type: 'sse_init',
               payload,
+              connectionId,
             });
             onValidatedInitRef.current?.(payload);
             const telemetry = measurement.connected();
@@ -448,6 +453,7 @@ export function useConnection({
             stampedDispatch({
               type: 'sse_message',
               message: msg,
+              opening: res.data.opening,
               sequenceId: msg.sequence_id,
             });
           });
@@ -465,6 +471,7 @@ export function useConnection({
               type: 'sse_message_updated',
               sequenceId: data.sequence_id,
               messageId: data.message_id,
+              opening: data.opening,
               ...(data.transcript_generation != null && { transcriptGeneration: data.transcript_generation }),
               ...(data.display_data != null && { displayData: data.display_data as Record<string, unknown> }),
               ...(data.content != null && { content: data.content as import('../api').Message['content'] }),

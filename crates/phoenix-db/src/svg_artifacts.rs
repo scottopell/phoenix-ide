@@ -426,6 +426,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_keeps_promoted_svg_before_unfinished_call() {
+        use crate::MessageContent;
+        use phoenix_core::domain::llm_types::ContentBlock;
+        use phoenix_core::domain::sm_state::{ThinkInput, ToolCall, ToolInput};
+
+        let staging = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("owner", "owner", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let mut state = interrupted_svg_state(staging.path(), false);
+        let crate::ConvState::ToolExecuting {
+            current_tool,
+            remaining_tools,
+            assistant_message,
+            ..
+        } = &mut state
+        else {
+            panic!("fixture must be executing tools");
+        };
+        remaining_tools.push(current_tool.clone());
+        *current_tool = ToolCall::new(
+            "unfinished",
+            ToolInput::Think(ThinkInput {
+                thoughts: "pending".into(),
+            }),
+        );
+        assistant_message.content.insert(
+            1,
+            ContentBlock::tool_use(
+                "unfinished",
+                "think",
+                serde_json::json!({"thoughts":"pending"}),
+            ),
+        );
+        db.update_conversation_state("owner", &state).await.unwrap();
+        db.publish_svg_artifact(
+            "owner",
+            &SvgInvocationId::new("current-assistant", "svg"),
+            &SvgPresentationMetadata::new("Chart", "Retained").unwrap(),
+            &validated(),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+
+        db.reset_all_to_idle().await.unwrap();
+        let messages = db.get_messages("owner").await.unwrap();
+        let tool_ids: Vec<_> = messages
+            .iter()
+            .filter_map(|message| {
+                if let MessageContent::Tool(content) = &message.content {
+                    Some(content.tool_use_id.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(tool_ids, ["done", "svg", "unfinished"]);
+    }
+
+    #[tokio::test]
     async fn snapshot_survives_worktree_removal_and_scope_retirement() {
         use crate::{ConvMode, ConvState, NonEmptyString};
         use phoenix_core::work_scope::{

@@ -11,8 +11,9 @@ Do not rewrite it to match later reality — supersede it with a new ADR instead
 (set this one's Status to "Superseded by ADR-NNN", and have the new ADR cite
 this one in its Options considered).
 The only edit an accepted ADR should receive is a cross-reference to a newer,
-related ADR. ADRs live in ONE shared specs/adrs/ chain, numbered sequentially
-across the whole project.
+related ADR. ADRs live in ONE shared specs/adrs/ chain with unique numeric IDs
+across the whole project. Gaps are allowed; never renumber existing records or
+add placeholders to fill gaps. See README.md for numbering and validation.
 Scope is declared in Affects: above, never by directory location.
 -->
 

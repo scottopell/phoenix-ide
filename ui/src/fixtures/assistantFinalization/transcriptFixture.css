@@ -1,0 +1,25 @@
+.finalization-transcript-fixture {
+  display: flex;
+  flex-direction: column;
+  height: calc(100dvh - 32px);
+  min-height: 0;
+  max-width: 960px;
+  margin: 0 auto;
+}
+
+.finalization-transcript-controls {
+  flex: 0 0 auto;
+  padding: 8px;
+}
+
+.finalization-transcript-shell {
+  display: flex;
+  flex: 1 1 0;
+  min-height: 0;
+  min-width: 0;
+}
+
+.finalization-transcript-shell .chat-main-area {
+  min-width: 0;
+  width: 100%;
+}

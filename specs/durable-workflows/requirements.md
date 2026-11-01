@@ -11,10 +11,14 @@ for user-visible meaning.
 ## Scope
 
 This specification defines the shared durable-workflow engine plus the normative
-wake and conversation-creation profiles. The engine owns crash-spanning execution
+direct-chat and conversation-creation profiles. The engine owns crash-spanning execution
 truth for one Phoenix API-server process with one bundled SQLite database and one
 scheduler authority. Profiles own typed domain meaning, external adapters,
 reducer-event mapping, and user projections.
+
+Wake workflows are historical data without execution authority. Their retirement
+and preservation are governed by `specs/wake-contracts/requirements.md`; engine
+execution, reconciliation, and lifecycle obligations do not reactivate that data.
 
 ## Requirements
 
@@ -423,7 +427,7 @@ window-relative offset, or best-effort latest message guess.
 
 ### REQ-DWF-CHAT-007: Secondary Effects Cannot Reverse Acceptance
 
-WHEN follow-on reducer delivery, runtime startup, wake observation, notification,
+WHEN follow-on reducer delivery, runtime startup, notification,
 or any other secondary effect fails, retries, races, or is suppressed
 THE accepted direct-chat turn SHALL remain accepted.
 
@@ -546,7 +550,7 @@ WHEN the owned turn has safely persisted a complete tool-result round
 THE SYSTEM SHALL proactively materialize its runtime and dispatch exactly one next model step without client activity.
 An in-flight or unknown-effect tool SHALL first reconcile to typed terminal evidence or an explicit interrupted error result and SHALL NOT be blindly replayed.
 
-Cancellation, terminal settlement, pending approval, newer accepted input, continuation transfer, and wake delivery SHALL remain owned by their existing typed authorities.
+Cancellation, terminal settlement, pending approval, newer accepted input, and continuation transfer SHALL remain owned by their existing typed authorities.
 Restart discovery SHALL consume those authorities rather than introduce a second queue, scheduler, or lifecycle.
 
 WHEN repeated restart recovery for the exact turn reaches its no-progress bound
@@ -563,7 +567,7 @@ identity when present.
 
 The settlement path SHALL target only the latest-row accepted turn chosen by the owning
 conversation topology, while still permitting settlement authority to fan into existing
-typed child, shared-`WorkScope`, and wake-cancellation machinery already bound to that
+typed child and shared-`WorkScope` machinery already bound to that
 accepted turn.
 
 The settlement path SHALL reuse the profile's existing typed cancellation and recovery
@@ -675,92 +679,6 @@ existing profile.
 Implementation effort alone SHALL NOT justify routing such work around the shared
 engine.
 
-## Wake Profile
-
-### REQ-DWF-WAKE-001: Registration Mapping
-
-WHEN an authorized agent registers a bounded bash, Phoenix-managed tmux, or
-sub-agent terminal wait
-THE wake profile SHALL atomically create the workflow, typed observation effect,
-and durable registration binding before returning the provider-valid registration
-receipt. The complete tool round SHALL persist normally, and the later terminal
-outcome SHALL be a runtime observation correlated by contract identity, never a
-delayed tool result.
-
-Registration SHALL preserve the timeout range, WorkScope authorization, and
-receipt shape required by `specs/wake-contracts/requirements.md`. It SHALL
-reject registration with a typed rejection when the requested timeout is out of
-range, when the conversation is archived or terminal, or when the shared
-registration or lifecycle fence is closed.
-
-### REQ-DWF-WAKE-002: Terminal Evidence and Deadline Precedence
-
-The wake observation effect SHALL use `ReclaimableObservation`. For bash it SHALL
-map terminal handle evidence or unknowable-after-restart evidence; for tmux it
-SHALL map durable exit-marker, killed-window, and final-tail evidence by stable
-window identity; for sub-agents it SHALL map the durable child terminal record.
-
-Durable terminal evidence with occurrence time at or before `expires_at` SHALL
-win over later scheduler observation. In the absence of such evidence, an
-evaluable handle at or after the deadline SHALL map to `Expired`, and an
-unevaluable handle SHALL map to `Forgotten` using the contract-compatible
-forgotten reasons refined by `specs/wake-contracts/requirements.md`. Startup
-reconciliation SHALL forget an unrecoverable non-terminal wake before normal
-serving resumes rather than waiting for the original deadline. Each accepted
-contract SHALL yield exactly one terminal receipt.
-
-### REQ-DWF-WAKE-003: Canonical Delivery and Runtime Acceptance
-
-A wake terminal receipt SHALL enter the existing product reducer, which SHALL
-materialize exactly one canonical durable delivery item per accepted receipt.
-Replayed, duplicated, or restarted delivery of the same accepted receipt SHALL
-reuse that canonical item rather than append another one.
-
-Auto-resuming observations for an idle conversation SHALL be coalesced in
-committed order into one runtime-acceptance obligation over canonical delivery
-items. While that obligation remains owed, duplicate kicks or restart recovery
-SHALL preserve the same owed acceptance rather than creating another one. Busy
-arrivals SHALL remain owed without overlapping LLM requests.
-
-Runtime acceptance SHALL atomically persist the accepting `LlmRequesting`
-product state and accept or suppress the exact canonical items carried by that
-obligation before invoking the LLM. Items committed after the accepted snapshot
-upper bound SHALL remain for a later batch.
-
-### REQ-DWF-WAKE-004: Wake Cancellation and Lifecycle
-
-Explicit wake cancellation SHALL use the generation-bump transition and produce a
-`Cancelled` observation without scheduling an LLM turn solely for that
-cancellation. It SHALL NOT terminate the watched process unless separately
-requested through its owning profile.
-
-Pending wake obligations SHALL derive lifecycle blocking without redefining an
-idle conversation as runtime-busy. Destructive lifecycle actions SHALL conflict
-until pending waits are explicitly resolved, with the guard serialized against
-new registration.
-
-Close-driven settlement SHALL invoke the wake profile's existing explicit
-cancellation authority for each pending binding associated with the exact latest-row
-execution target and SHALL wait for the resulting typed terminal receipt/canonical-
-delivery settlement rather than inventing a separate wake-close state machine.
-
-This wake settlement authority is additive to ordinary direct-turn settlement rather
-than a second close-owned source of truth: shared `WorkScope`, sub-agent, and wake work
-are settled through the already typed child or wake boundaries of that same latest-row
-execution target.
-
-### REQ-DWF-WAKE-005: Continuation Transfer
-
-WHEN a conversation continues
-THE wake profile SHALL atomically transfer pending contracts, unconsumed
-canonical delivery items, and unaccepted runtime obligations to exactly one
-successor while preserving contract identity, watched resource identity,
-registration WorkScope, and deadline.
-
-A transferred materialized observation SHALL exist in successor history under a
-deterministic successor-safe identity without altering predecessor history or
-duplicating semantic delivery.
-
 ## Conversation-Creation Profile
 
 ### REQ-DWF-CREATE-001: Private-Binding-First Acceptance
@@ -837,6 +755,7 @@ The following immutable identifiers remain reserved for historical traceability 
 are superseded by the requirements above and SHALL NOT be used as current design
 authority:
 
+- REQ-DWF-WAKE-001 through REQ-DWF-WAKE-005 Retired — no execution authority; historical data is governed by `specs/wake-contracts/requirements.md`
 - REQ-DWF-015 Deprecated — selector-based one-scheduler authority semantics superseded by REQ-DWF-033
 - REQ-DWF-016 Deprecated — permanent parallel-authority migration semantics superseded by REQ-DWF-034
 - REQ-DWF-019 Deprecated — divergence-classification semantics removed from the current contract
@@ -845,7 +764,6 @@ authority:
 - REQ-DWF-022 Deprecated — shadow/drain client-boundary semantics superseded by REQ-DWF-029 through REQ-DWF-042
 
 Current normative authority is REQ-DWF-017, REQ-DWF-029 through REQ-DWF-043,
-REQ-DWF-WAKE-001 through REQ-DWF-WAKE-005, and REQ-DWF-CREATE-001 through
-REQ-DWF-CREATE-005 as defined in this document. Direct-chat authority and
+and REQ-DWF-CREATE-001 through REQ-DWF-CREATE-005 as defined in this document. Direct-chat authority and
 refinement are additionally governed by REQ-DWF-CHAT-012 through
 REQ-DWF-CHAT-014.

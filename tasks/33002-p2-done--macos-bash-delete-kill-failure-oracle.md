@@ -1,0 +1,3 @@
+# Qualify macOS Bash cascade-delete kill failure oracle
+
+During durable wake removal qualification, unchanged phoenix-tools test `bash::registry::tests::cascade_bash_on_delete_records_live_pgids_and_drops_entry` failed reproducibly on essmbp: expected two kill_failures, observed one (registry.rs assertion). The filtered tools suite passed 533 tests. Inspect whether the fixture's process groups and macOS signaling results make the oracle nondeterministic; preserve real cascade-delete behavior and regression coverage. Reproduce the named test alone, then its owning registry module under the shared atomic build reservation if compilation is needed. No production process signals or cache cleanup.

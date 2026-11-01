@@ -1202,7 +1202,10 @@ mod tests {
                  )
              );
              ALTER TABLE conversations ADD COLUMN product_conversation_id TEXT
-                 REFERENCES product_conversations(id) ON DELETE CASCADE;",
+                 REFERENCES product_conversations(id) ON DELETE CASCADE;
+             ALTER TABLE conversations DROP COLUMN chain_name;
+             ALTER TABLE conversations ADD COLUMN name_revision INTEGER NOT NULL DEFAULT 0
+                 CHECK (typeof(name_revision) = 'integer' AND name_revision >= 0);",
         )
         .execute(&upgraded)
         .await

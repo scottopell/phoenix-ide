@@ -137,6 +137,7 @@ impl LlmService for CountingLlm {
             content: vec![ContentBlock::text(self.response_text.clone())],
             end_turn: true,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         })
     }
@@ -296,6 +297,7 @@ impl LlmService for StreamingLlm {
             content: vec![ContentBlock::text(self.assembled())],
             end_turn: true,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         })
     }
@@ -317,6 +319,7 @@ impl LlmService for StreamingLlm {
             content: vec![ContentBlock::text(self.assembled())],
             end_turn: true,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         })
     }
@@ -342,6 +345,7 @@ impl LlmService for FailingStreamingLlm {
             content: vec![ContentBlock::text("")],
             end_turn: true,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         })
     }
@@ -582,6 +586,7 @@ impl LlmService for ScriptedToolLlm {
                 }],
                 end_turn: false,
                 usage: Usage::default(),
+                usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
                 stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
             })
         } else {
@@ -591,6 +596,7 @@ impl LlmService for ScriptedToolLlm {
                 content: vec![ContentBlock::text("")],
                 end_turn: true,
                 usage: Usage::default(),
+                usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
                 stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
             })
         }
@@ -611,6 +617,7 @@ impl LlmService for ScriptedToolLlm {
             content: vec![ContentBlock::text("final answer after search")],
             end_turn: true,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         })
     }
@@ -807,6 +814,7 @@ impl LlmService for AlwaysSearchLlm {
             }],
             end_turn: false,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         })
     }
@@ -825,6 +833,7 @@ impl LlmService for AlwaysSearchLlm {
             content: vec![ContentBlock::text("forced final answer")],
             end_turn: true,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         })
     }

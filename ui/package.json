@@ -40,8 +40,16 @@
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "lucide-react": "^1.16.0",
+    "mdast-util-from-markdown": "2.0.3",
+    "mdast-util-gfm": "3.1.0",
     "mdast-util-to-string": "^4.0.0",
     "mermaid": "^11.15.0",
+    "micromark": "4.0.2",
+    "micromark-core-commonmark": "2.0.3",
+    "micromark-extension-gfm": "3.0.0",
+    "micromark-factory-space": "2.0.1",
+    "micromark-util-character": "2.1.1",
+    "micromark-util-resolve-all": "2.0.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^10.1.0",
@@ -74,7 +82,9 @@
     "stylelint-config-standard": "^40.0.0",
     "typescript": "^5.9.3",
     "vite": "^8.0.14",
-    "vitest": "^4.1.7"
+    "vitest": "^4.1.7",
+    "micromark-util-types": "2.0.2",
+    "@types/mdast": "4.0.4"
   },
   "pnpm": {
     "overrides": {

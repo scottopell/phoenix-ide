@@ -41,6 +41,7 @@ mod anthropic;
 pub use anthropic::render_anthropic_request_for_test;
 pub mod codex_credential;
 pub mod codex_login;
+pub mod codex_reset_credits;
 pub mod credential_helper;
 mod discovery;
 mod error;
@@ -72,7 +73,7 @@ pub use retry_guidance::RetryAfter;
 // accessed via the `rate_limit` submodule.
 pub use models::{
     all_models, merge_model_specs, parse_external_models, EffortCapabilities, ModelBackend,
-    ModelInfo, ModelSource, ModelSpec, NativeDefault, DEFAULT_MAX_OUTPUT_TOKENS,
+    ModelInfo, ModelSource, ModelSpec, NativeDefault,
 };
 #[allow(unused_imports)]
 pub use rate_limit::{CreditsSnapshot, QuotaDetails, RateLimitWindow};
@@ -168,9 +169,47 @@ impl ContinuationRequestLimits {
     }
 }
 
+/// Provider counting evidence includes the endpoint's documented uncertainty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderInputCount {
+    OpenAiCompleteInput {
+        tokens: usize,
+    },
+    /// Anthropic describes this as an estimate and excludes prompt caching.
+    AnthropicEstimate {
+        tokens: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputCountFallback {
+    LocalReady,
+    BudgetSpent,
+    Unavailable,
+    Failed,
+    TimedOut,
+}
+
+impl ProviderInputCount {
+    #[must_use]
+    pub const fn tokens(self) -> usize {
+        match self {
+            Self::OpenAiCompleteInput { tokens } | Self::AnthropicEstimate { tokens } => tokens,
+        }
+    }
+}
+
 /// Common interface for LLM providers
 #[async_trait]
 pub trait LlmService: Send + Sync {
+    /// Complete provider-rendered input occupancy, without a generation attempt.
+    async fn count_input(
+        &self,
+        _request: &LlmRequest,
+    ) -> Result<Option<ProviderInputCount>, LlmError> {
+        Ok(None)
+    }
+
     /// Make a non-streaming completion request
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError>;
 
@@ -189,6 +228,10 @@ pub trait LlmService: Send + Sync {
 
     /// Get the model ID
     fn model_id(&self) -> &str;
+
+    fn diagnostic_route_class(&self) -> phoenix_core::domain::request_capacity::SafeRouteClass {
+        phoenix_core::domain::request_capacity::SafeRouteClass::Unknown
+    }
 
     fn continuation_route_key(&self) -> String {
         self.model_id().to_owned()
@@ -370,7 +413,12 @@ impl LoggingService {
                 LlmErrorKind::ServerOverloaded => LlmAttemptOutcome::ServerOverloaded,
                 LlmErrorKind::Network => LlmAttemptOutcome::NetworkError,
                 LlmErrorKind::TimedOut => LlmAttemptOutcome::TimedOut,
-                LlmErrorKind::ContextWindowExceeded => LlmAttemptOutcome::TokenBudgetExceeded,
+                // Output-token exhaustion reuses the existing token-budget
+                // outcome (REQ-LLM-006c): no new persisted outcome value, no
+                // outcome-schema migration owed.
+                LlmErrorKind::ContextWindowExceeded | LlmErrorKind::OutputTokensExhausted => {
+                    LlmAttemptOutcome::TokenBudgetExceeded
+                }
                 LlmErrorKind::Auth => LlmAttemptOutcome::AuthError,
                 LlmErrorKind::InvalidRequest
                 | LlmErrorKind::PromptRejected
@@ -414,6 +462,12 @@ impl LoggingService {
 
 #[async_trait]
 impl LlmService for LoggingService {
+    async fn count_input(
+        &self,
+        request: &LlmRequest,
+    ) -> Result<Option<ProviderInputCount>, LlmError> {
+        self.inner.count_input(request).await
+    }
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         let span = self.request_span(request, false);
         if self.streaming_transport == LlmTransport::InProcess {
@@ -528,6 +582,10 @@ impl LlmService for LoggingService {
         &self.model_id
     }
 
+    fn diagnostic_route_class(&self) -> phoenix_core::domain::request_capacity::SafeRouteClass {
+        self.inner.diagnostic_route_class()
+    }
+
     fn continuation_route_key(&self) -> String {
         self.inner.continuation_route_key()
     }
@@ -549,6 +607,21 @@ impl LlmService for LoggingService {
     }
 }
 
+/// Conservative character count for tool restrictions that a provider may append.
+#[must_use]
+pub fn tool_availability_advisory_chars(
+    availability: &phoenix_core::domain::tool_availability::ToolAvailability,
+) -> usize {
+    let openai = openai::tool_advisory_text(availability);
+    if openai.is_some() || anthropic::native_policy_needs_advisory(availability) {
+        openai
+            .as_ref()
+            .map_or(0, |text| text.chars().count())
+            .max(anthropic::tool_advisory(availability).chars().count())
+    } else {
+        0
+    }
+}
 #[cfg(test)]
 mod logging_tests {
     use super::*;

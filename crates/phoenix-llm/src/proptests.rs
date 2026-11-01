@@ -332,7 +332,7 @@ fn make_llm_request(messages: Vec<LlmMessage>) -> LlmRequest {
         provider_replay: None,
         responses_replay: Vec::new(),
         tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(vec![]),
-        max_tokens: None,
+        max_tokens: 16_384,
         effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
         service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
         telemetry: None,

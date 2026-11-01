@@ -175,6 +175,20 @@ The cargo-test step budget defaults to 900s; slow hosts can raise it with
 `PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS` in the environment or in the gitignored
 `.phoenix-ide.env` (the environment wins).
 
+For a low-resource check, set `PHOENIX_CHECK_WORKERS=1 ./dev.py check …`.
+The process-environment override must be a nonempty positive ASCII integer;
+invalid values fail before check setup. Unset means four, clamped to available
+CPUs; explicit values are also CPU-clamped. This setting is not loaded from
+`.phoenix-ide.env`. It caps Cargo build jobs, Rayon threads, Vitest workers,
+and Rust test/codegen threads (nextest and plain Cargo); Rust test execution
+may be capped further by the existing memory/CPU heuristic. Standalone
+`./dev.py codegen` is outside this check-only setting.
+
+Within one `check` invocation lanes run sequentially, including with budget one.
+This is a per-tool worker budget, **not** a global one-process or memory cap:
+compiler subprocesses, test-created threads/children, browser/E2E services,
+and other check invocations or separate hosted CI jobs can still coexist.
+
 **Workflow:** `./dev.py up` → make changes → `./dev.py restart` (Rust changes) or save (UI auto-reloads via Vite) → `./dev.py check` → commit
 
 In dev mode, Vite serves `ui/` with hot reload. In production, `ui/dist/` is embedded into the Rust binary via RustEmbed.

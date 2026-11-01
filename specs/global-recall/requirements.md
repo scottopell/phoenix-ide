@@ -11,7 +11,7 @@ The Coordinator is an open-ended cross-conversation console, not a manager for o
 - **Orientation should be evidence-based.** Current-work briefings should use bounded fresh relational facts and distinguish observation from interpretation.
 - **Long-running work should not fragment identity.** A continuation chain represents one work item even though it spans multiple conversations.
 - **Intervention should be narrow and trustworthy.** The Coordinator may send text to existing conversations, while the receiving conversation's authoritative state determines whether the message starts immediately, becomes steering, or is rejected.
-- **Committed actions should be transparent.** The Coordinator reports acceptance per target without implying that another agent understood, acknowledged, or completed the instruction.
+- **Committed actions should be truthful.** When reporting a delivery, the Coordinator distinguishes each target's acceptance from another agent's understanding, execution, or completion.
 - **Global access should be deliberate and bounded.** Write-capable ordinary ProductConversations and the Coordinator may inspect Phoenix-wide evidence and send singular messages; restricted planning conversations and sub-agents remain scoped.
 
 ## Transparency Contract
@@ -104,7 +104,7 @@ THE Coordinator SHALL use the normal transcript, composer, streaming, continuati
 THE SYSTEM SHALL structurally distinguish the Coordinator from ordinary product conversations rather than encoding that difference as omitted lifecycle fields or nullable product-conversation links
 
 THE SYSTEM SHALL NOT present the Coordinator as ordinary repository-backed coding work or as a user-created open-work item
-AND SHALL NOT give the Coordinator an ordinary ProductConversation Open/History lifecycle, WorkScope attachment, Close control, or Delete control
+AND SHALL NOT give the Coordinator an ordinary ProductConversation Open/History lifecycle, worker-owned WorkScope attachment, Close control, or Delete control
 
 THE SYSTEM SHALL reject archive and hard-delete operations targeting any member of the Coordinator continuation chain so its transcript and singleton identity remain durable
 
@@ -130,11 +130,24 @@ WHILE the singleton Global Coordinator is answering a user request
 THE SYSTEM MAY additionally provide host-bound tools for global reference resolution and unsandboxed Bash
 AND MAY provide a Coordinator-only built-in skill documenting supported Phoenix HTTP APIs
 
-WHEN the user authorizes a Coordinator lifecycle action supported by a documented Phoenix HTTP API
+WHEN the user authorizes a Coordinator action supported by a public Phoenix HTTP API
 THE Coordinator MAY invoke that API through explicitly WorkScope-targeted Bash
-AND SHALL preserve normal API authorization
-AND SHALL verify both the HTTP response and the resulting Phoenix state
-AND SHALL distinguish request acceptance from observed execution
+AND SHALL ground the operation in inspected current deployment/source contracts applicable to the selected destination
+AND SHALL treat built-in API recipes as non-exhaustive best practices rather than an endpoint allowlist
+AND SHALL treat gap inventories as illustrative and qualified by inspected deployment/source, permitting verified supported alternatives and bounded state reads within user authority
+AND SHALL NOT invent guarantees or receipts, bypass enforcement through databases/private handlers, or create background monitors to substitute for missing API semantics
+AND SHALL preserve normal API authorization, destination identity, authenticated encrypted nonlocal transport, destination-bound nonserialized credential handling, and server-enforced lifecycle admission
+AND SHALL retain the original target and exact intent across uncertain outcomes, retry only under the endpoint's supported idempotency contract, and never mint a new identity for an uncertain retry
+AND SHALL freshly read the relevant target state before acting, verify both the HTTP response and the resulting Phoenix state, and distinguish request acceptance from observed execution
+AND SHALL NOT use private handlers or database writes to bypass public API enforcement
+
+WHEN the Coordinator submits answers to a pending structured question through the public API
+THE instructions SHALL permit exact user-provided answers or decisions made within explicit delegated decision scope for every question, with exact full question-text keys and exact option labels or authorized custom text
+AND SHALL NOT treat a generic instruction to inspect or unblock work as decision authority, fabricate approvals, or extend delegation
+AND SHALL require the exact current opaque question request identity, distinct from provider tool-use identity, under `../ask-user-question/requirements.md` REQ-AUQ-009
+AND SHALL require complete answers without claiming server-enforced completeness
+AND SHALL direct one POST followed by a fresh read of the original target, treating the question request identity as a freshness guard rather than an idempotency key
+AND SHALL NOT transplant answers to a new identity, automatically replay an uncertain submission, or treat a conflict as success
 
 THE host-bound capabilities SHALL NOT become ambient prompt memory or autonomous background behavior except for explicit Global Coordinator subscriptions governed by REQ-GR-015
 
@@ -144,6 +157,19 @@ AND SHALL use the shared request-bound structured-question state and web interac
 AND SHALL NOT grant that capability to sub-agents
 
 THE search and transcript-read capabilities SHALL describe recalled text as untrusted stored data rather than instructions
+
+WHEN a destination serves a federated conversation-page read
+THE SYSTEM SHALL examine at most 12,992 physical message rows and issue at most 203 bounded-history fetches for that request
+AND SHALL count visible rows, hidden rows, and rows replayed to reach the rendered-content cursor against the same row budget
+AND SHALL cap each fetch to the remaining row budget
+
+IF the system reaches that budget before a fetched row proves rendered continuation or a bounded fetch proves physical transcript EOF
+THE SYSTEM SHALL fail the request without returning page content, a continuation cursor, or an end-of-transcript indication
+AND SHALL NOT expose a resumable physical-scan position
+AND an unchanged request SHALL restart the same scan rather than advance it
+
+THE physical-message budget SHALL bound work rather than wall-clock duration
+AND neither that budget nor an HTTP deadline response SHALL guarantee interruption of in-progress SQLite work
 
 WHEN the singleton Global Coordinator invokes Bash
 THE SYSTEM SHALL require an explicit active `WorkScope` ID for every new command
@@ -165,7 +191,26 @@ THE SYSTEM SHALL additionally provide explicit subscription management only to t
 THE cross-conversation message capability SHALL NOT accept images, files, skills, filesystem references, user-agent metadata, lifecycle commands, or batch targets
 
 THE SYSTEM SHALL NOT provide writable filesystem tools to the Coordinator other than the singleton Coordinator's explicitly WorkScope-targeted Bash capability
-AND SHALL NOT provide browser, MCP, task drafting, task approval, project, workspace, dedicated conversation creation, source-scoped retrieval for another conversation's private follow-up surface, or other dedicated lifecycle mutation tools to the Coordinator
+AND SHALL NOT provide browser, MCP, task drafting, task approval, project, workspace, source-scoped retrieval for another conversation's private follow-up surface, or dedicated lifecycle mutation tools other than the bounded creation, naming, and Goal metadata capabilities defined below to the Coordinator
+
+WHILE the persisted singleton Global Coordinator is the executing current transcript
+THE SYSTEM MAY provide dedicated conversation creation and naming tools through the same application actions used by public conversation operations
+AND SHALL recheck current Coordinator authority at the committing persistence boundary, including operation reconciliation reads
+AND SHALL NOT grant these tools to ordinary conversations, predecessor transcripts, sub-agents, or restricted planning conversations
+AND SHALL preserve durable request identity, exact immutable target identity, source tool-call provenance, and operation-specific replay semantics
+AND SHALL expose creation acceptance and historical naming receipts without claiming runtime completion or current naming state
+AND SHALL NOT thereby grant continuation, structured-answer, review, task approval, or other lifecycle mutation authority
+
+THE creation capability SHALL follow `../conversation-creation/requirements.md` REQ-CCR-013
+AND THE naming capability SHALL follow `../conversation-identity/requirements.md` REQ-CID-007
+
+WHEN the current authenticated Coordinator uses native Goal metadata tools
+THE SYSTEM MAY provide `read_goal`, `prepare_goal`, and reference-only `apply_goal` through the shared Goal command service
+AND SHALL enforce the same admission, provenance, retained-receipt, and history rules as owner Goal commands
+AND SHALL follow the admission, retained-state, safety-control, and no-implicit-execution requirements in [`goal-continuation/requirements.md`](../goal-continuation/requirements.md) REQ-GOAL-AC-001 through REQ-GOAL-AC-004
+AND SHALL require explicit persisted owner autoContinue enablement for new Goal creation or replacement without enabling that preference
+AND SHALL preserve Goal/history reads, Complete/Suspend safety exits, and retained receipt replay while that preference is OFF
+AND SHALL NOT expose these tools to ordinary conversations, predecessor transcripts, or sub-agents, schedule continuation, or dispatch target work through them
 
 ---
 
@@ -189,10 +234,11 @@ AND SHALL reject a bare identifier whose identity domain is ambiguous rather tha
 THE resolved target SHALL include the WorkScope attached to the selected transcript member, its lifecycle and environment kind, authoritative cwd and worktree path, and an effective path that prefers worktree path over cwd
 AND SHALL mark those paths as server-filesystem locations rather than caller-local paths
 
-WHEN an app-local `/c/<id>` reference identifies an authoritative ordinary ProductConversation and carries no explicit transcript or message selector
-THE SYSTEM SHALL interpret it as stable navigation that follows the current continuation
-AND SHALL emit `/c/<product_conversation_id>` as its canonical ordinary conversation route
-AND SHALL preserve `/product-conversations/<id>` as a compatibility alias
+WHEN an app-local `/c/<reference>` identifies an authoritative ordinary ProductConversation and carries no explicit transcript or message selector
+THE SYSTEM SHALL interpret it as conversation navigation that follows the current continuation
+AND SHALL emit the percent-encoded `/c/<allocated-root-slug>` as its current canonical ordinary conversation route under `specs/conversation-identity/requirements.md`
+AND SHALL preserve permanent ProductConversation IDs as durable reference identities and `/product-conversations/<id>` as a compatibility alias
+AND SHALL NOT promise that a former slug remains bound after rename
 
 WHEN an app-local reference contains a `source_transcript` selector
 THE SYSTEM SHALL validate that the selected transcript belongs to the referenced conversation and identity domain before selecting it
@@ -205,6 +251,10 @@ AND SHALL preserve explicit historical evidence, Global Coordinator routing, and
 
 WHEN a stable ProductConversation reference is resolved
 THE SYSTEM SHALL resolve the current transcript member and its attached WorkScope from one database point in time
+
+WHEN a stable ProductConversation reference is resolved through a bounded global conversation-read or reference-resolution surface
+THE SYSTEM SHALL resolve its eligible ordinary identity and topology from metadata
+AND SHALL NOT deserialize message content, continuation handoff content, or continuation opening content solely to resolve that identity
 
 WHEN an exact transcript-row reference is resolved
 THE SYSTEM SHALL resolve only that historical member's attached WorkScope and SHALL NOT substitute a current or successor member
@@ -240,7 +290,7 @@ THE watch activity surface SHALL reflect current subscription state rather than 
 
 THE SYSTEM SHALL NOT present a separate current-attention pane, open-work list, deterministic work search, cross-scope resource explorer, or Conversation/Work view selector
 
-THE composer SHALL provide a compact action that submits a normal read-only Coordinator message requesting a current-work briefing
+THE composer SHALL provide a compact action that submits a normal Coordinator message requesting a bounded whole-stack check-in and coordination pass through existing owners within verified standing authority
 
 THE briefing action SHALL preserve the user's draft and SHALL NOT create a separate message, streaming, persistence, or cancellation path
 
@@ -255,9 +305,22 @@ AND SHALL instruct the Coordinator to query relevant current transcript rows, ti
 WHEN the Coordinator dispatches a model request
 THE SYSTEM SHALL NOT automatically inject current activity facts into its system instructions or conversation context
 
-WHEN the user requests a current-work briefing through the composer action
-THE SYSTEM SHALL submit a normal read-only message requesting fresh relational facts, decisions or blockers needing user attention, and actively progressing work
-AND SHALL request supporting history only where needed, distinguish observed facts from uncertainty, and prohibit message delivery, mutation, and polling loops for that briefing
+WHEN the user requests a check-in through the composer action
+THE SYSTEM SHALL submit a normal message requesting a broad fresh check of commissioned work and selective intervention through established owners within verified standing scope and approvals
+AND SHALL direct the Coordinator to leave healthy progressing work alone, avoid redundant nudges, replanning or assignments merely to demonstrate activity, and not infer that an idle owner is stalled
+AND SHALL direct the Coordinator to investigate blocked or waiting owners before treating them as healthy or stalled, take the smallest recovery step allowed by existing authority through the established owner, and verify resumed work rather than message acceptance; progress elsewhere SHALL NOT discharge a blocked obligation
+AND SHALL reconcile later decisions and completed work before reviving questions or replaying earlier answers
+AND SHALL direct the Coordinator to recover unanswered user decisions from history and verify that each remains unresolved and material before prioritizing user input, while advancing independent authorized work first
+AND SHALL preserve prior decisions, corrections, pauses and gates; a repeated check-in SHALL NOT itself expand authority or reset them
+AND SHALL distinguish requested action and message acceptance from verified completion without requiring an announcement for every routine delivery
+AND SHALL lead the check-in briefing with still-needed user input, presenting genuine choices through `ask_user_question` with context and a recommendation, then explain what changed, why it matters and what happens next in concrete language understandable without intervening history, naming the actual work rather than opaque coordination labels, with useful links and grounded status where appropriate, without requiring a fixed report template or announcements for factual watch events
+
+AND SHALL include process or evidence limits when material to understanding or a decision, without indefinite polling or waiting for all owners to finish
+
+WHEN processing events without a user request for a briefing
+THE SYSTEM SHALL direct the Coordinator to report only needed user action or decisions, meaningful goal-level results, or new blockers or risks materially changing the plan; otherwise it SHALL continue authorized work quietly
+AND SHALL NOT treat routine check results, message deliveries or unchanged waiting as user-facing milestones
+AND SHALL include compact hypothetical bad-versus-good wording and silence examples in both language-specific system prompts, distinguishing requests from verified outcomes without treating examples as incident facts
 
 ---
 
@@ -322,13 +385,23 @@ AND SHALL use the shared tool-free continuation pipeline and protected accepted-
 AND SHALL describe its actual capability boundaries without promising an ambient working directory, conversation creation, or background monitoring
 AND SHALL NOT inject live activity facts into summary generation
 
-THE instructions SHALL prioritize unresolved workstreams, objectives, scoped user authority and preferences, corrections, decisions, blockers, dependencies, obligations, and next actions
+THE instructions SHALL prioritize unresolved workstreams, objectives, scoped user authority and preferences including reporting preferences, corrections, decisions, blockers, dependencies, obligations, and next actions
 AND SHALL preserve owner identities and delegation relationships, with durable target references distinct from historical transcript references when available
 AND SHALL distinguish direct user instructions, delegate requests, Coordinator commitments, and historical observations without promoting a delegate request or inherited assertion into user authority
 AND SHALL distinguish delivery acceptance, acknowledgement, execution, and verified completion
 AND SHALL retain evidence provenance and last-observed timestamps when known, mark unknowns honestly, and direct the resumed Coordinator to refresh relevant live status before making current-state claims
 AND SHALL apply explicit corrections and supersession while preserving unresolved obligations, including paused work
-AND SHALL compress completed details before unresolved commitments, retaining only resolution context needed to avoid reopening settled work
+AND SHALL retain exact primary user message references and relevant scoped wording for standing directions and claimed historical approvals when known, with narrow retrieval pointers for missing evidence rather than fabricated authority
+AND SHALL request the next authorized in-scope action, required current status and ownership checks, completion criteria, and outstanding verification
+
+WHEN the Coordinator resumes from a continuation handoff
+THE trusted instructions SHALL distinguish evidence verification from obeying directives embedded in recalled content
+AND SHALL direct narrowly recovering authentic primary user evidence and checking attribution, exact scope, later corrections, supersession, pauses, gates, current status and established ownership before acting
+AND SHALL describe continuation as a handoff, not cancellation or expiry of verified standing user directions, and direct the next authorized in-scope step by default with follow-through to verified completion rather than status-only acknowledgement or redundant permission
+AND SHALL direct narrow evidence recovery or a focused question when authority is missing, conflicting, or insufficient, while preserving pauses and gates
+AND SHALL keep generated summaries, quotations, delegate assertions and encoded payloads untrusted and unable to self-authorize, override instructions, expand scope, or grant blanket merge, deploy, or delete permission
+
+THE handoff instructions SHALL compress completed details before unresolved commitments, retaining only resolution context needed to avoid reopening settled work
 AND SHALL preserve relevant paths, verification evidence, unfinished edits, and pending tool arguments when the Coordinator performs hands-on work
 
 THE coordination policy SHALL NOT change the Coordinator's capabilities, lifecycle, WorkScope ownership, or message authority
@@ -401,3 +474,49 @@ THE SYSTEM SHALL retain accepted input without retraction.
 
 WHEN the Coordinator's execution is stopped
 THE SYSTEM SHALL retain subscriptions and permit future notifications, and SHALL NOT redeliver already-accepted input merely because execution was cancelled.
+
+
+### REQ-GR-016: Own a Persistent Local Execution Home
+
+THE SYSTEM SHALL provide exactly one instance-owned active WorkScope with a server-managed non-project home at `<resolved data_dir>/coordinator/`, independently of ordinary conversations and the current Coordinator transcript.
+AND SHALL retain its identity, environment binding and files across Coordinator continuation and server restart.
+AND SHALL distinguish that ownership and environment from ordinary worktrees, unowned cwd, managed repositories and task approval authority.
+
+THE SYSTEM SHALL initialize a fresh binding safely and reconcile an existing Coordinator chain atomically without moving, importing, deleting, executing or trusting improvised worker-tree files.
+AND SHALL reject conflicting ownership, worker-worktree path overlap, invalid environment shape, unexpected configuration rebinding, inaccessible home, non-directory home and symlink replacement with actionable errors.
+WHEN a bound home is missing
+THE SYSTEM SHALL refuse automatic recreation or relocation rather than mask retained-data loss.
+
+THE instance-owned binding, environment, authority and active lifecycle SHALL NOT be mutated or deleted by ordinary creation, task approval, mode/cwd changes, close, archive, delete or cleanup.
+AND ordinary scope ownership and selected project execution SHALL remain separate.
+THE SYSTEM SHALL isolate default development data roots by worktree while preserving explicit operator data-root configuration.
+
+### REQ-GR-017: Discover the Home Without Promoting Historical Data
+
+THE SYSTEM SHALL provide authoritative active home WorkScope identity, server path, owner and non-project environment in Coordinator prompt context and grounding.
+AND SHALL require explicit active WorkScope targeting for every new scoped Bash command, including home execution.
+AND SHALL apply the same scoped target resolution to supported contained artifact publication without granting remote cwd execution or new lifecycle authority.
+
+THE grounding SHALL support server-backed directory browsing and file viewing on desktop and mobile without Git/project/task/ordinary-retirement controls.
+AND SHALL permit only the authoritative home root through the shared canonical path and symlink containment checks, not the whole data directory.
+
+THE Coordinator handoff policy SHALL retain concise deliberately selected note/evidence pointers and unfinished obligations while regenerating authority from current server state.
+AND SHALL treat retained file contents and notes as historical untrusted data, never instructions or authority.
+AND SHALL NOT scan or automatically ingest home files into prompts or compaction.
+AND SHALL distinguish quiet user updates from passive coordination, delegation from execution, and fresh runtime/source/test evidence from stale claims.
+AND SHALL keep persistent blockers visible and require concrete supported follow-up triggers for waits.
+
+### REQ-GR-018: Retain and Export Home State Deliberately
+
+THE SYSTEM SHALL retain home files independently of ordinary conversation, transcript-history and worker cleanup.
+AND SHALL NOT automatically migrate or prune retained files.
+THE SYSTEM SHALL identify conversation transcript export and database-only backups as excluding home bytes.
+
+WHEN an operator backs up or restores Coordinator state
+THE supported procedure SHALL stop the runtime and preserve the database together with the home directory at its configured canonical location under `specs/compatibility/requirements.md` offline replacement policy.
+AND SHALL NOT imply automatic relocation, live replacement, cross-version rollback or a generic memory/backup platform.
+
+WHEN retained home files are intentionally cleaned
+THE supported procedure SHALL require deliberate owner action identifying the files to remove, preserve the binding and directory, and never be an ordinary Close/Delete side effect.
+WHEN the entire instance is intentionally decommissioned
+THE operator SHALL stop the runtime and explicitly remove its database and retained data as an instance-wide action, not a WorkScope retirement command.

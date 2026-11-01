@@ -50,6 +50,8 @@ actor LlmAgent {
 -- coverage may each be active or idle in any combination.
 enum CaptureState { idle | active }
 
+enum ThrottleState { acknowledged | unknown }
+
 -- A scenario run's terminal outcome. `blocked` means a readiness
 -- step did not satisfy its condition within its timeout; the run
 -- produces no sample and the operation fails (REQ-BT-019.1).
@@ -156,10 +158,10 @@ entity ProfilingSession {
     tracing:  CaptureState
     coverage: CaptureState
 
-    -- CPU-throttle override (REQ-BT-019.2). null = no override in
-    -- force (browser default). A non-null rate means setCPUThrottlingRate
-    -- was issued and a matching restore is owed.
-    throttle_rate: Decimal?
+    -- REQ-BT-019.2: rate 1 is acknowledged no-throttling, not absence.
+    -- Unknown carries no rate that a scenario could mistake for its baseline.
+    throttle_state: ThrottleState
+    throttle_rate: Decimal? when throttle_state = acknowledged
 
     -- Buffered trace events accumulated while tracing = active, via
     -- the Tracing.dataCollected listener. Drained and cleared on
@@ -198,8 +200,8 @@ entity ProfilingSession {
 --   CoverageStart(ps)   CoverageStop(ps)
 --
 -- Throttle override:
---   ThrottleSet(ps, rate)         -- rate >= 1; 1 == "no throttling"
---   ThrottleClear(ps)
+--   ThrottleSet(ps, rate, acknowledged_by_cdp) -- rate >= 1
+--   ThrottleClear(ps, acknowledged_by_cdp)     -- rate 1
 --
 -- One-shot reads (no state change; included for completeness):
 --   MetricsSnapshot(ps)           -- Performance.getMetrics (REQ-BT-019.3)
@@ -302,15 +304,29 @@ rule CoverageStopWhenActive {
 -- Rules: CPU throttle override (REQ-BT-019.2)
 ------------------------------------------------------------
 
+-- @guidance
+--   Standalone dispatch and acknowledgement bookkeeping hold one uninterrupted
+--   session write guard. Every dispatch first marks state unknown; failure,
+--   timeout or cancellation leaves it unknown. Only acknowledgement establishes
+--   the requested rate. Scenario application and restoration obey the same rule;
+--   contact-cleanup failure cannot erase a completed throttle acknowledgement.
+--   Fresh browser identity rate is acknowledged 1. ThrottleClear dispatches rate
+--   1, not an assignment of absent state.
 rule ThrottleSetEstablishesOverride {
-    when: ThrottleSet(ps, rate)
+    when: ThrottleSet(ps, rate, acknowledged_by_cdp)
     requires: rate >= 1
-    ensures: ps.throttle_rate = rate
+    ensures: acknowledged_by_cdp implies ps.throttle_state = acknowledged
+    ensures: acknowledged_by_cdp implies ps.throttle_rate = rate
+    ensures: not acknowledged_by_cdp implies ps.throttle_state = unknown
+    ensures: not acknowledged_by_cdp implies ps.throttle_rate = null
 }
 
 rule ThrottleClearRestoresDefault {
-    when: ThrottleClear(ps)
-    ensures: ps.throttle_rate = null
+    when: ThrottleClear(ps, acknowledged_by_cdp)
+    ensures: acknowledged_by_cdp implies ps.throttle_state = acknowledged
+    ensures: acknowledged_by_cdp implies ps.throttle_rate = 1
+    ensures: not acknowledged_by_cdp implies ps.throttle_state = unknown
+    ensures: not acknowledged_by_cdp implies ps.throttle_rate = null
 }
 
 ------------------------------------------------------------
@@ -318,10 +334,28 @@ rule ThrottleClearRestoresDefault {
 ------------------------------------------------------------
 
 -- @guidance
+--   Scenario setup applies explicit device configuration, then throttle_rate
+--   if supplied, before warmup or measured runs. Device/contact acknowledgement
+--   and task custody obey requirements.md REQ-BT-019.21/.22: the broker registers
+--   the worker before execution and owns it independently of the session lock.
+--   Competing admission returns busy without waiting for the running worker's
+--   session write guard. Before device mutation, throttle, reset or steps, a
+--   scenario requires an acknowledged prior throttle, even with an explicit
+--   scenario rate. Unknown requires explicit successful standalone throttle
+--   before another scenario; admission does not repair or guess it.
+--   Default device initialization shares one aggregate 15-second deadline for
+--   both CDP commands; failure enters common owned-launch cleanup without
+--   publishing the session (REQ-BT-019.21).
+--   Click/type steps acquire the native-input lease before target resolution or
+--   CDP input work and retain it through step completion (REQ-BT-019.22).
+--   The worker retains serialization through operation cancellation and cleanup;
+--   broker termination signals cancellation before waiting for that lock.
+--   Unacknowledged device/contact dispatch leaves unknown state, not fabricated
+--   acknowledgement. Unknown contact gates managed navigation/reset, resize,
+--   device mutation and non-cancel dispatch, not arbitrary eval/click navigation.
 --   Per-run sequence (REQ-BT-019.14/.15/.18/.20):
 --     reset (reload current URL by default, or explicit
 --       navigate/reload; skipped only on reset="none") ->
---     apply throttle_rate if supplied ->
 --     dispatch steps UP TO AND INCLUDING the first readiness step
 --       (steps contain NO navigate/reload) — this is UNTIMED setup;
 --       page load + framework mount + async settle happen here ->
@@ -338,12 +372,15 @@ rule ThrottleClearRestoresDefault {
 --     emit one RunSample. The window boundaries are performance.now()
 --       marks the PAGE sets, never host-side CDP getMetrics reads.
 --   Warmup runs (default >= 1) execute identically but are discarded.
---   Throttle applied for the scenario is restored on return (completed
---   OR blocked). The per-run snapshot bracketing is atomic within the
---   harness so the caller never reasons about interleaving — the
---   reason this is harness-owned, not skill-driven primitives.
+--   Completion, failure, caller closure and broker cancellation enter cleanup:
+--   contact cancellation and previous-throttle restoration share one five-second
+--   deadline before serialization is released. Idle contact receives no synthetic
+--   cancel. Restoration is successful only on acknowledgement; cleanup failure is
+--   returned or logged if the caller is absent. Browser destruction may supersede
+--   cleanup but is not CDP acknowledgement. Per-run bracketing remains atomic.
 rule RunScenarioCollectsRawSamples {
     when: RunScenario(ps, steps, runs, warmup, reset, gc_per_run, result)
+    requires: ps.throttle_state = acknowledged
     requires: count(steps) >= 1
     requires: runs >= 1
     requires: warmup >= 0
@@ -359,6 +396,7 @@ rule RunScenarioCollectsRawSamples {
 -- whole operation; no partial/averaged result is substituted.
 rule RunScenarioBlockedOnReadiness {
     when: RunScenario(ps, steps, runs, warmup, reset, gc_per_run, result)
+    requires: ps.throttle_state = acknowledged
     requires: count(steps) >= 1
     ensures: result.outcome = blocked implies count(result.samples) = 0
     -- The failure names the blocking step (result.blocked_step). A
@@ -376,6 +414,7 @@ rule RunScenarioBlockedOnReadiness {
 --   runs before the BEFORE snapshot.
 rule RunScenarioRejectsInlineNavigation {
     when: RunScenario(ps, steps, runs, warmup, reset, gc_per_run, result)
+    requires: ps.throttle_state = acknowledged
     -- Modelled as a precondition the harness enforces structurally
     -- (steps is validated to contain no navigate/reload kind before
     -- any run executes). On violation the operation does not produce
@@ -412,12 +451,13 @@ rule HeapDiffRequiresTwoSnapshots {
 --   killed (conversation delete), or torn down (shutdown), every
 --   capture sub-machine is forced to idle and any throttle override
 --   is dropped along with the Chrome instance. No stop edge is
---   issued to a dead browser; the state is reset structurally.
+--   issued to a dead browser; destruction does not acknowledge a rate.
 rule SessionDeathResetsAllCaptures {
     when: BrowserSessionDestroyed(ps)
     ensures: ps.cpu = idle
     ensures: ps.tracing = idle
     ensures: ps.coverage = idle
+    ensures: ps.throttle_state = unknown
     ensures: ps.throttle_rate = null
     ensures: ps.trace_event_count = 0
 }
@@ -445,7 +485,7 @@ invariant TraceBufferOnlyWhileActive {
 -- of at least 1 (1 == no throttling). A rate < 1 is not a valid
 -- override and must never be representable as established state.
 invariant ThrottleRateWellFormed {
-    for ps in ProfilingSession where ps.throttle_rate != null:
+    for ps in ProfilingSession where ps.throttle_state = acknowledged:
         ps.throttle_rate >= 1
 }
 

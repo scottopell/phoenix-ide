@@ -398,14 +398,22 @@ rule PrivateReasoningOmitted {
     ensures: normalized_visible_text(response) = response.final_text
 }
 
+-- finish_reason=length means the model stopped because it hit the
+-- request's output-token budget, not because the transport failed. It is
+-- classified as output_tokens_exhausted (non-auto-retryable, user
+-- resumable) rather than invalid_response, so an unchanged request is not
+-- auto-retried into the same wall. Any partial tool call in the truncated
+-- response is discarded and never dispatched; visible text already
+-- streamed to the user stays in the ephemeral client buffer under the
+-- shared streaming-buffer policy (llm/REQ-LLM-006).
 rule ChatLengthFinishRejected {
     when: NormalizeChatResponse(response)
 
     requires: response.finish_reason = length
 
     ensures: llm/LlmError.created(
-        kind: invalid_response,
-        message: "Chat completion ended at its output token limit",
+        kind: output_tokens_exhausted,
+        message: "Chat completion stopped at its output token budget before finishing",
         recovery_in_progress: false,
         has_quota: false
     )

@@ -49,6 +49,29 @@ describe('question response API identity', () => {
   });
 });
 
+describe('canonical product-conversation naming', () => {
+  beforeEach(() => vi.stubGlobal('fetch', vi.fn()));
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('uses one PATCH title and POST regenerate flow, returning aggregate rows', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    const row = { product_conversation_id: 'product-1' };
+    fetchMock.mockResolvedValue({ ok: true, json: async () => row } as unknown as Response);
+
+    await expect(api.renameProductConversation('conv/id', 'A title')).resolves.toEqual(row);
+    await expect(api.regenerateProductConversationName('product-1')).resolves.toEqual(row);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/product-conversations/conv%2Fid/title', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'A title' }),
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/product-conversations/product-1/regenerate-name', {
+      method: 'POST',
+    });
+  });
+});
+
 describe('api.continueConversation', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', vi.fn());
@@ -141,7 +164,7 @@ describe('conversation route client', () => {
     vi.unstubAllGlobals();
   });
 
-  it('GETs route by id', async () => {
+  it('reads route by id', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({
       ok: true,
@@ -151,10 +174,12 @@ describe('conversation route client', () => {
 
     await api.getConversationRoute('conv/1');
 
-    expect(fetchMock).toHaveBeenCalledWith('/api/conversations/conv%2F1/route');
+    expect(fetchMock).toHaveBeenCalledWith('/api/conversation-reads/route', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reference: 'conv/1' }),
+    });
   });
 
-  it('GETs route by slug', async () => {
+  it('reads route by slug', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({
       ok: true,
@@ -164,7 +189,9 @@ describe('conversation route client', () => {
 
     await api.getConversationRouteBySlug('slug one');
 
-    expect(fetchMock).toHaveBeenCalledWith('/api/conversations/by-slug/slug%20one/route');
+    expect(fetchMock).toHaveBeenCalledWith('/api/conversation-reads/route/by-slug', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reference: 'slug one' }),
+    });
   });
 });
 
@@ -199,7 +226,7 @@ describe('conversation message history clients', () => {
     vi.unstubAllGlobals();
   });
 
-  it('GETs latest messages with limit query', async () => {
+  it('reads latest messages with limit query', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({
       ok: true,
@@ -215,7 +242,8 @@ describe('conversation message history clients', () => {
     await api.getConversationMessagesLatest('conv/id', 25);
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/conversations/conv%2Fid/messages/latest?limit=25',
+      '/api/conversation-reads/messages/latest?limit=25',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ reference: 'conv/id' }) }),
     );
   });
 
@@ -252,7 +280,7 @@ describe('conversation message history clients', () => {
     });
   });
 
-  it('GETs messages before a sequence using before_message_sequence', async () => {
+  it('reads messages before a sequence using before_message_sequence', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({
       ok: true,
@@ -265,11 +293,12 @@ describe('conversation message history clients', () => {
     await api.getConversationMessagesBefore('conv-1', 77, 10);
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/conversations/conv-1/messages?before_message_sequence=77&limit=10',
+      '/api/conversation-reads/messages?before_message_sequence=77&limit=10',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ reference: 'conv-1' }) }),
     );
   });
 
-  it('GETs messages after a sequence using after_message_sequence', async () => {
+  it('reads messages after a sequence using after_message_sequence', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({
       ok: true,
@@ -282,11 +311,12 @@ describe('conversation message history clients', () => {
     await api.getConversationMessagesAfter('conv-1', 88, 11);
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/conversations/conv-1/messages?after_message_sequence=88&limit=11',
+      '/api/conversation-reads/messages?after_message_sequence=88&limit=11',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ reference: 'conv-1' }) }),
     );
   });
 
-  it('GETs an exact range with explicit start/end_message_sequence params', async () => {
+  it('reads an exact range with explicit start/end_message_sequence params', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({
       ok: true,
@@ -299,11 +329,12 @@ describe('conversation message history clients', () => {
     await api.getConversationMessageRange('conv-1', 5, 12);
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/conversations/conv-1/messages/range?start_message_sequence=5&end_message_sequence=12',
+      '/api/conversation-reads/messages/range?start_message_sequence=5&end_message_sequence=12',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ reference: 'conv-1' }) }),
     );
   });
 
-  it('GETs messages around a pivot sequence with before/after query params', async () => {
+  it('reads messages around a pivot sequence with before/after query params', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({
       ok: true,
@@ -316,7 +347,8 @@ describe('conversation message history clients', () => {
     await api.getConversationMessagesAround('conv-1', 17, 4, 6);
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/conversations/conv-1/messages/around/17?before=4&after=6',
+      '/api/conversation-reads/messages/around/17?before=4&after=6',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ reference: 'conv-1' }) }),
     );
   });
 
@@ -454,17 +486,18 @@ describe('conversation message history clients', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/product-conversations/creation/req%2F1', { method: 'DELETE' });
   });
 
-  it('GETs a product conversation snapshot with message_limit and before params', async () => {
+  it('reads a product conversation snapshot with message_limit and before params', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({
       ok: true,
       status: 200,
-      json: async () => ({ segments: [], has_older: false, before: null }),
+      json: async () => ({ latest_opening: { status: 'none' }, segments: [], has_older: false, before: null }),
     } as unknown as Response);
 
     await api.getProductConversationSnapshot('pc-1', { message_limit: 100, before: 'cursor-1' });
 
-    expect(fetchMock).toHaveBeenCalledWith('/api/product-conversations/pc-1?message_limit=100&before=cursor-1');
+    expect(fetchMock).toHaveBeenCalledWith('/api/product-conversation-reads/snapshot?message_limit=100&before=cursor-1',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ reference: 'pc-1' }) }));
   });
 
   it('preserves snapshot HTTP status for stale-cursor recovery', async () => {
@@ -476,47 +509,6 @@ describe('conversation message history clients', () => {
 
     await expect(api.getProductConversationSnapshot('pc-1', { before: 'stale' }))
       .rejects.toMatchObject({ status: 400 });
-  });
-});
-
-describe('api.regenerateConversationName', () => {
-  beforeEach(() => {
-    vi.stubGlobal('fetch', vi.fn());
-  });
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
-  it('POSTs /api/conversations/:id/regenerate-name and returns the refreshed conversation', async () => {
-    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
-    fetchMock.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        conversation: { id: 'conv-id', slug: 'generated-slug' },
-      }),
-    } as unknown as Response);
-
-    const res = await api.regenerateConversationName('conv-id');
-
-    expect(fetchMock).toHaveBeenCalledWith(
-      '/api/conversations/conv-id/regenerate-name',
-      { method: 'POST' },
-    );
-    expect(res.conversation.slug).toBe('generated-slug');
-  });
-
-  it('surfaces backend errors', async () => {
-    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
-    fetchMock.mockResolvedValueOnce({
-      ok: false,
-      status: 500,
-      json: async () => ({ error: 'name regeneration failed' }),
-    } as unknown as Response);
-
-    await expect(api.regenerateConversationName('conv-id')).rejects.toThrow(
-      /name regeneration failed/,
-    );
   });
 });
 
@@ -596,5 +588,78 @@ describe('directory-first resolution query encoding', () => {
       expect(url.searchParams.has('logical_base')).toBe(false);
       expect(url.searchParams.has('freshness')).toBe(false);
     }
+  });
+});
+
+describe('conversation-view response transport', () => {
+  afterEach(() => vi.unstubAllGlobals());
+  const open = 'a74e65c7-3bd0-43d5-87ed-1e2b3cfb7200';
+  const trace = '1234567890abcdef1234567890abcdef';
+  it.each(['ordinary', 'global', 'alias'] as const)('threads finite %s response correlation without changing data', async kind => {
+    const payload = { synthetic: 'private transcript body', latest_opening: { status: 'none' } };
+    const response = new Response(JSON.stringify(payload), { headers: { traceparent: `00-${trace}-1234567890abcdef-01`, 'content-length': '42' } });
+    const send = vi.fn().mockResolvedValue(response);
+    vi.stubGlobal('fetch', send);
+    const observer = vi.fn();
+    const options = { message_limit: 100, open_id: open, onTelemetry: observer };
+    const result = kind === 'ordinary' ? await api.getProductConversationHistorySnapshot('product', options)
+      : kind === 'global' ? await api.getCoordinatorHistory('root', options)
+        : await api.getProductConversationSnapshot('product', options);
+    expect(result).toEqual(payload);
+    expect(send.mock.calls[0]![0]).toContain(`open_id=${open}`);
+    expect(observer).toHaveBeenCalledExactlyOnceWith({ trace_id: trace, size_bucket: '0-10k' });
+    expect(JSON.stringify(observer.mock.calls)).not.toContain('private transcript body');
+  });
+  it('observes finite error metadata before throwing and contains observer failure', async () => {
+    const response = new Response('private failure', { status: 404, headers: { traceparent: `00-${trace}-1234567890abcdef-01` } });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response));
+    const observer = vi.fn();
+    await expect(api.getCoordinatorHistory('root', { open_id: open, onTelemetry: observer })).rejects.toMatchObject({ status: 404 });
+    expect(observer).toHaveBeenCalledExactlyOnceWith({ trace_id: trace, size_bucket: 'unknown' });
+    expect(response.bodyUsed).toBe(false);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ latest_opening: { status: 'none' } }))));
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => {});
+    await expect(api.getProductConversationSnapshot('product', { onTelemetry: () => { throw new Error('private observer'); } })).resolves.toEqual({ latest_opening: { status: 'none' } });
+    expect(JSON.stringify(debug.mock.calls)).not.toContain('private observer');
+    debug.mockRestore();
+  });
+  it.each(['ordinary', 'global'] as const)('uses request-only correlation for a %s fresh-tail recovery without initial-open attribution', async route => {
+    const send = vi.fn().mockResolvedValue(new Response(JSON.stringify({latest_opening: {status: 'none'}})));
+    vi.stubGlobal('fetch', send);
+    const observed = vi.fn();
+    await (route === 'global' ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot)('root', {request_id: open, onTelemetry: observed});
+    const url = new URL(send.mock.calls[0]![0] as string, 'http://localhost');
+    expect(url.searchParams.get('request_id')).toBe(open);
+    expect(url.searchParams.has('open_id')).toBe(false);
+    expect(url.searchParams.has('before')).toBe(false);
+    expect(observed).toHaveBeenCalledTimes(1);
+  });
+  it('forwards an explicitly owned Global older-page request ID without claiming an initial-open server span', async () => {
+    const send = vi.fn().mockResolvedValue(new Response(JSON.stringify({ latest_opening: { status: 'none' } })));
+    vi.stubGlobal('fetch', send);
+    await api.getCoordinatorHistory('root', { before: 'opaque-cursor', open_id: open, onTelemetry: vi.fn() });
+    const url = new URL(send.mock.calls[0]![0] as string, 'http://localhost');
+    expect(url.searchParams.get('before')).toBe('opaque-cursor');
+    expect(url.searchParams.get('open_id')).toBe(open);
+  });
+});
+
+
+describe('explicit handoff review sources', () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it('threads summary, manual, and candidate sources without inferring authority from text', async () => {
+    const fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) });
+    vi.stubGlobal('fetch', fetch);
+    for (const source of [{ kind: 'manual' as const }, { kind: 'summary' as const, message_id: 'actual-message' }, { kind: 'candidate' as const, candidate_id: 'reviewed-candidate' }]) {
+      await api.reviewHandoff('parent', { handoff: 'Same literal bytes', source, shorten: true });
+      expect(JSON.parse(fetch.mock.calls.at(-1)![1].body)).toEqual({ handoff: 'Same literal bytes', source, shorten: true });
+      await api.continueConversation('parent', { handoff: 'Same literal bytes', source, message_id: 'opening' });
+      expect(JSON.parse(fetch.mock.calls.at(-1)![1].body)).toEqual({ handoff: 'Same literal bytes', source, message_id: 'opening' });
+    }
+  });
+  it('retains typed capacity diagnostics on a 409 review conflict', async () => {
+    const detail = { error: 'Too large', error_type: 'continuation_capacity_conflict', capacity: { status: { kind: 'required_overhead' } } };
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 409, json: async () => detail }));
+    await expect(api.reviewHandoff('parent', { handoff: 'Draft', source: { kind: 'manual' } })).rejects.toMatchObject({ detail });
   });
 });

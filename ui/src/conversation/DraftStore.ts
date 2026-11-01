@@ -1,4 +1,31 @@
 import { RoutedStore } from './RoutedStore';
+import type { FileAttachment, ImageData } from '../api';
+
+export interface RejectedSubmission {
+  id: string;
+  text: string;
+  images: ImageData[];
+  files: FileAttachment[];
+  error: string;
+}
+
+const NO_REJECTIONS: readonly RejectedSubmission[] = [];
+
+/** Snapshot identity is a revision token, including text A → B → A. */
+export type DraftRevision = DraftAtom;
+
+export interface DraftRecovery {
+  readRevision(): DraftRevision;
+  clearForSubmission(): DraftRevision;
+  restoreIfUnchanged(revision: DraftRevision, text: string): boolean;
+  retainRejected(submission: RejectedSubmission): void;
+  removeRejected(id: string): void;
+}
+
+export interface ComposerDraftRecovery extends DraftRecovery {
+  rejected: readonly RejectedSubmission[];
+}
+
 
 /**
  * Per-slug draft state. Lives in a dedicated store so server-driven
@@ -20,7 +47,8 @@ export type DraftAction =
   | { type: 'set_draft'; text: string }
   | { type: 'set_draft_if_empty'; text: string }
   | { type: 'append_draft'; text: string }
-  | { type: 'clear_draft' };
+  | { type: 'clear_draft' }
+  | { type: 'clear_submitted_draft' };
 
 export function draftReducer(atom: DraftAtom, action: DraftAction): DraftAtom {
   switch (action.type) {
@@ -43,6 +71,9 @@ export function draftReducer(atom: DraftAtom, action: DraftAction): DraftAtom {
       return { draft: next };
     }
 
+    case 'clear_submitted_draft':
+      return { draft: '' };
+
     case 'clear_draft':
       if (atom.draft === '') return atom;
       return { draft: '' };
@@ -50,6 +81,47 @@ export function draftReducer(atom: DraftAtom, action: DraftAction): DraftAtom {
 }
 
 export class DraftStore extends RoutedStore<string, DraftAtom, DraftAction> {
+  private readonly rejected = new Map<string, readonly RejectedSubmission[]>();
+  private readonly recoveries = new Map<string, DraftRecovery>();
+  private readonly invalidRevision: DraftRevision = { draft: '' };
+
+  getRejected(slug: string): readonly RejectedSubmission[] {
+    return this.rejected.get(slug) ?? NO_REJECTIONS;
+  }
+
+  recovery(slug: string): DraftRecovery {
+    const existing = this.recoveries.get(slug);
+    if (existing) return existing;
+    // Materialize the atom so removeAtom notifies recovery-only subscribers.
+    this.getSnapshot(slug);
+    const isCurrent = () => this.recoveries.get(slug) === recovery;
+    const recovery: DraftRecovery = {
+      readRevision: () => isCurrent() ? this.getSnapshot(slug) : this.invalidRevision,
+      clearForSubmission: () => {
+        if (!isCurrent()) return this.invalidRevision;
+        this.dispatch(slug, { type: 'clear_submitted_draft' });
+        return isCurrent() ? this.getSnapshot(slug) : this.invalidRevision;
+      },
+      restoreIfUnchanged: (revision, text) => {
+        if (!isCurrent() || this.getSnapshot(slug) !== revision || revision.draft !== '') return false;
+        this.dispatch(slug, { type: 'set_draft', text });
+        return true;
+      },
+      retainRejected: submission => {
+        if (!isCurrent()) return;
+        this.rejected.set(slug, [...this.getRejected(slug), submission]);
+        this.notifyChanged(slug);
+      },
+      removeRejected: id => {
+        if (!isCurrent()) return;
+        this.rejected.set(slug, this.getRejected(slug).filter(item => item.id !== id));
+        this.notifyChanged(slug);
+      },
+    };
+    this.recoveries.set(slug, recovery);
+    return recovery;
+  }
+
   constructor() {
     super(() => ({ draft: '' }), draftReducer);
   }
@@ -63,6 +135,8 @@ export class DraftStore extends RoutedStore<string, DraftAtom, DraftAction> {
    * separately at the cascade site.
    */
   remove(slug: string): void {
+    this.recoveries.delete(slug);
+    this.rejected.delete(slug);
     this.removeAtom(slug);
   }
 }

@@ -4131,7 +4131,8 @@ mod tests {
             .await
             .err()
             .unwrap();
-        assert!(error.contains("superseded"), "{error}");
+        assert!(matches!(error, crate::McpOneShotError::NotDispatched(_)));
+        assert!(error.message().contains("superseded"), "{error:?}");
         assert_eq!(
             replacement
                 .requests

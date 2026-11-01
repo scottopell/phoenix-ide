@@ -113,7 +113,7 @@ describe('groupConversationsForSidebar', () => {
     const middleStandalone = makeConv('ms', '2024-02-01T00:00:00Z');
     const chainRoot = makeConv('cr', '2024-01-01T00:00:00Z', {
       continued_in_conv_id: 'cl',
-      chain_name: 'auth refactor',
+      title: 'auth refactor',
     });
     const olderStandalone = makeConv('os', '2023-12-01T00:00:00Z');
 
@@ -178,8 +178,8 @@ describe('groupConversationsForSidebar', () => {
     }
   });
 
-  it('falls back to root.slug when chain_name is null', () => {
-    const root = makeConv('rooty', '2024-01-01T00:00:00Z', { continued_in_conv_id: 'l' });
+  it('falls back to root.slug when the root title is empty', () => {
+    const root = makeConv('rooty', '2024-01-01T00:00:00Z', { continued_in_conv_id: 'l', title: '  ' });
     const leaf = makeConv('l', '2024-02-01T00:00:00Z');
     const grouped = groupConversationsForSidebar([leaf, root], computeChainRoots([leaf, root]));
     if (grouped[0]?.kind === 'chain') {

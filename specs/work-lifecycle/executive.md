@@ -51,4 +51,72 @@ These are acceptance obligations, **not tests reported as passing**:
 
 ## Validation Notes
 
-This is a specification-only slice. Targeted Allium parsing and repository spec-shape/anchor checks must be distinguished from whole-repository analyser baseline checks and implementation acceptance. No runtime, UI, production, or migration acceptance is claimed here; the required matrix above remains unvalidated until a source candidate is qualified against it.
+### Inventory preparation versus host cleanup
+
+`prepare_retirement_captures_and_seals_one_exact_shared_worktree` exercises the production first-pass inventory preparation boundary using retained SQLite identities, without a Git repository, watcher shutdown, or filesystem deletion. It replaces `archive_chain_captures_first_pass_close_inventory`, whose inventory assertion depended on full host cleanup succeeding. The regression checks one exact target for a three-member shared chain, retained snapshot, repeat preparation, admission fences, and no retirement evidence or lifecycle transition from capture alone.
+
+Aggregate archival remains covered by `archive_chain_handler_completes_one_aggregate_close`. Runtime cleanup-failure finalization, outbox rollback, and process-step failure ordering have separate deterministic tests; the inventory test does not duplicate those contracts. Git observation and exact-object deletion adapter tests remain separate coverage.
+
+### Safe-retry admission versus the live writer probe
+
+The exact safe-retry admission boundary rejects a fresh run (allocating no new run ordinal) exactly when the retry writer probe reports an external writer or fails to observe a candidate, and admits only when every candidate is absent or carries no positive writer evidence. `validate_close_safe_retry` runs this probe before `admit_close_safe_retry`, so a probe rejection short-circuits ordinal allocation.
+
+`probe_retry_worktree_writers` now threads the per-candidate observation (existence plus `quarantine_has_external_writer`) through an injectable closure consumed by the pure decision `probe_retry_worktree_writers_with`. Production passes the real observation; the decision is unchanged (same candidate order original -> quarantine -> tombstone object, same existence gate, same probe, same rejection message).
+
+`retry_writer_precondition_rejects_when_a_target_holds_a_positive_writer`, `retry_writer_precondition_rejects_when_observing_a_target_fails`, and `retry_writer_precondition_accepts_when_no_target_holds_a_writer` prove the decision over controlled observations with no filesystem or `/proc` access. The helper is a writer precondition only: it decides whether a retry writer is proven absent and does not itself allocate or admit a run ordinal, so the test names and assertions say "precondition accepts/rejects", not "admits a run". Ordinal allocation is covered by the separate DB admission tests. These three tests replace `safe_retry_writer_rejection_does_not_allocate_an_ordinal`, which scanned the host `/proc`, held a real descriptor into the captured worktree, and ran real Git plus real deletion retry to observe the ordinal effect.
+
+### Writer-evidence scan coverage after live-test removal
+
+The external-writer scans (`quarantine_has_open_descriptors`, `quarantine_has_process_cwd`, `quarantine_has_writable_mappings`) are inspected deterministically through their fake-`/proc` `_in` variants and pure parsers; the live host-scan tests were removed from the default module. The decision these scans feed is proven by the admission-seam tests above.
+
+The host-interacting effects of quarantine and removal (the fsmonitor shutdown and the descriptor/external-writer scans) are gathered at one narrow adapter, `CloseWorktreeEffects`, consumed by `quarantine_and_remove_exact_worktree_with_effects`. Production always passes `CloseWorktreeEffects::production()`, whose fields are the real functions (`stop_bound_fsmonitor_daemons`, `quarantine_has_open_descriptors`, `quarantine_has_external_writer`); there is no test-only global switch, and the decision logic is identical whether the real or an injected adapter is supplied. Default-module tests pass injected effects, so no default test launches the real fsmonitor shutdown or a global host `/proc` scan:
+
+- `post_inspection_write_survives_inode_bound_quarantine` injects a no-daemon fsmonitor stop and writer-free scans, so the `Residual` it asserts is forced by the production path-existence precondition alone (the late write recreated the original path). The confirmed loss and `.git` still land in quarantine.
+- `resumed_quarantine_change_requests_reinspection_without_deleting_loss` injects the same effects; the production reinspection precondition rejects deletion before any descriptor/writer scan, and the post-crash write is preserved. Its `bind_tombstone`/`after_quarantine` hooks panic to prove neither is reached.
+- `remove_exact_worktree_uses_bare_common_repository_root` injects writer-free effects while exercising the real quarantine, identity-bound deletion, and Git worktree-list evidence; the bare-common-root resolution under test is unaffected.
+- `failed_fsmonitor_stop_never_reaches_quarantine_or_later_effects` and `write_completed_during_fsmonitor_stop_requires_reinspection_before_quarantine` inject the fsmonitor-stop observation and additionally make the descriptor/writer probes panic, proving their control paths return before any scan.
+
+Old-to-new mapping and retained dependencies:
+
+| Removed live test | Behavior it exercised | Retained deterministic coverage | Coverage gap (reported, not faked) |
+|---|---|---|---|
+| `mapping_scan_detects_writable_shared_mapping_after_descriptor_is_closed` (linux) | real `mmap` MAP_SHARED writable mapping detected via real `/proc/self/maps` after the fd closed | `mapping_scan_ignores_ambient_unreadability_and_finds_readable_writer` (parses `rw-s` maps line, path-within match over fake `/proc`) | live `mmap` -> real `/proc/<pid>/maps` round trip no longer qualified in-suite |
+| `quarantine_detects_external_process_working_directory` (linux + macos) | real child process cwd within quarantine returns positive | linux: `cwd_scan_ignores_ambient_unreadability_and_finds_readable_writer` over fake `/proc`; macos: none | linux live `/proc/<pid>/cwd` round trip and the macos `proc_pidinfo(PROC_PIDVNODEPATHINFO)` syscall path are unqualified in-suite |
+| `quarantine_preserves_worktree_with_open_file_descriptor` (unix) | real open fd makes `quarantine_and_remove_exact_worktree` return `Residual` with writes landing in quarantine | `descriptor_scan_ignores_ambient_failures_and_finds_readable_writer` (fd symlink within quarantine -> positive over fake `/proc`) plus the admission-seam tests | end-to-end residual-on-open-descriptor path of `quarantine_and_remove_exact_worktree` is unqualified live |
+| `cwd_scan_treats_same_user_nondumpable_process_as_observational` + its `linux_nondumpable_process_helper` (linux) | a same-user nondumpable process is attributed `Relevant` from kernel credentials, and its cwd unreadability stays observational | `linux_status_parser_rejects_missing_malformed_and_ambiguous_credentials` (credential parser) plus the fake-`/proc` cwd/mapping scan tests | live `PR_SET_DUMPABLE` credential-attribution round trip is unqualified in-suite |
+
+Retained adjacent coverage unaffected by the removal: the descriptor-relative object-swap adapter tests, the Git evidence-generation adapter tests, and the fake-`/proc` canonicalization/no-evidence tests (`cwd_and_mapping_scans_treat_unavailable_proc_inventory_as_no_evidence`, `cwd_and_mapping_scans_keep_quarantine_canonicalization_authoritative`). Fail-closed semantics for invalid or unreadable evidence are unchanged: ambient `/proc` read errors remain observational (no proof of a writer), while a probe error at the admission boundary rejects the retry.
+
+These gaps are a deliberate choice to drop live-syscall qualification from the default gate rather than assert fake equivalence for it. They are a coverage gap, not a behavior change; the production scans and their platform syscalls are unchanged.
+
+The inventory and existing focused runtime tests above do not establish acceptance of the entire matrix. Targeted test and spec-check results must be distinguished from whole-repository qualification, UI acceptance, production deployment, and migration acceptance.
+
+### Process sequencing properties
+
+The seven `process_step_*` tests execute the same `run_close_process_steps` runner
+used by `complete_close_resource_lease`, with controlled typed effect observations
+and real in-memory Phoenix persistence. They replace the fixture that launched
+`sleep` process groups and a shell PTY solely to manufacture ordering failures.
+The tests assert exact effect order, first-failure stopping, persistence stopping
+later dispatch, successes surviving a later scope failure and outbox rollback,
+rejected observations producing no receipt, and a complete second pass dispatching
+nothing. Bash/terminal registry adapter tests own generation and process-identity
+validation; the scripted runner tests do not claim to re-test OS signaling.
+
+Git inspection adapters retain local temporary repositories where needed to
+produce evidence about staged, ignored, hidden and detached work. The ignored
+nested-submodule and detached-submodule tests no longer require a final successful
+deletion: observation of unique work is their property. Descriptor-relative
+object-swap/deletion adapter tests remain local-file tests, separate from lifecycle.
+
+### Narrow cleanup adapter boundary
+
+Retained quarantine adapter tests supply explicit daemon-stop and writer-observation
+results through `CloseWorktreeEffects`. Production binds the unchanged live
+functions. This keeps local Git/descriptor-relative filesystem mechanism tests
+without global host scans or daemon shutdown. A positive writer observation or
+probe error is explicitly tested to preserve the quarantined bytes and Git admin
+entry before the deletion/tombstone step. The same adapter tests retain original-
+path recreation, changed-snapshot and exact bare-common-root assertions. The
+source-text assertion forbidding the literal `lsof` command was removed: it did
+not prove writer-detection correctness.

@@ -34,6 +34,14 @@ class CompilerCacheTests(unittest.TestCase):
         self.addCleanup(self.environment.stop)
         self.socket_directory = Path(self.store_root.name) / "sockets"
         self.socket_directory.mkdir()
+        self.cache_directory = Path(self.store_root.name) / "durable-cache"
+        self.cache_directory.mkdir()
+        self.real_private_kache_cache_dir = self.dev._private_kache_cache_dir
+        self.private_cache = mock.patch.object(
+            self.dev, "_private_kache_cache_dir", return_value=self.cache_directory
+        )
+        self.private_cache.start()
+        self.addCleanup(self.private_cache.stop)
         self.real_private_kache_socket_dir = self.dev._private_kache_socket_dir
         self.private_socket = mock.patch.object(
             self.dev,
@@ -83,7 +91,7 @@ class CompilerCacheTests(unittest.TestCase):
         ), mock.patch.object(
             self.dev,
             "_kache_version",
-            return_value=("1.0.0", None),
+            return_value=("1.2.2", None),
         ), mock.patch.object(
             self.dev,
             "_usable_sccache",
@@ -127,7 +135,7 @@ class CompilerCacheTests(unittest.TestCase):
                 installed={"kache", "sccache"},
             )
         self.assertEqual("kache", selected)
-        output.assert_any_call("  Compiler cache: kache 1.0.0")
+        output.assert_any_call("  Compiler cache: kache 1.2.2")
         self.assertEqual(
             str(self.dev.Path("/bin/kache").resolve()), env["RUSTC_WRAPPER"]
         )
@@ -245,7 +253,7 @@ class CompilerCacheTests(unittest.TestCase):
 
     @unittest.skipUnless(
         sys.platform == "darwin" and platform.machine().lower() == "arm64",
-        "Kache v1.0.0 is qualified only on macOS arm64",
+        "Kache v1.2.2 is qualified only on macOS arm64",
     )
     def test_local_kache_binary_is_supported(self):
         with mock.patch.dict(
@@ -253,7 +261,7 @@ class CompilerCacheTests(unittest.TestCase):
         ), mock.patch.object(self.dev.Path, "is_file", return_value=True), mock.patch.object(
             self.dev.os, "access", return_value=True
         ), mock.patch.object(
-            self.dev, "_kache_version", return_value=("1.0.0", None)
+            self.dev, "_kache_version", return_value=("1.2.2", None)
         ), mock.patch.object(
             self.dev, "_ensure_kache_daemon", return_value=None
         ) as ensure:
@@ -264,7 +272,7 @@ class CompilerCacheTests(unittest.TestCase):
 
     def test_minimal_kache_configuration_gets_generated_socket(self):
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
-            self.dev, "_private_kache_socket_dir", return_value=Path("/tmp/private-kache")
+            self.dev, "_private_kache_socket_dir", return_value=self.socket_directory
         ), mock.patch.object(
             self.dev, "_kache_socket_lock", return_value=contextlib.nullcontext()
         ), mock.patch.object(
@@ -273,22 +281,8 @@ class CompilerCacheTests(unittest.TestCase):
             self.assertIsNone(self.dev._ensure_kache_daemon("/bin/kache"))
             self.assertRegex(
                 os.environ["KACHE_SOCKET_PATH"],
-                r"^/tmp/private-kache/[0-9a-f]{16}\.sock$",
+                rf"^{self.socket_directory}/local-only-v1\.2\.2/[0-9a-f]{{16}}\.sock$",
             )
-
-    def test_generated_socket_identity_includes_daemon_environment(self):
-        with mock.patch.object(
-            self.dev, "_private_kache_socket_dir", return_value=Path("/tmp/private-kache")
-        ), mock.patch.dict(
-            os.environ, {"KACHE_CACHE_DIR": "/cache/a"}, clear=True
-        ):
-            first = self.dev._generated_kache_socket("/bin/kache", cargo_cwd=Path("/repo"))
-            second = self.dev._generated_kache_socket("/bin/kache", cargo_cwd=Path("/repo"))
-            os.environ["KACHE_CACHE_DIR"] = "/cache/b"
-            changed = self.dev._generated_kache_socket("/bin/kache", cargo_cwd=Path("/repo"))
-
-        self.assertEqual(first, second)
-        self.assertNotEqual(first, changed)
 
     def test_daemon_identity_is_stable_across_worktrees_with_same_effective_inputs(self):
         with mock.patch.dict(
@@ -303,128 +297,116 @@ class CompilerCacheTests(unittest.TestCase):
 
         self.assertEqual(first, second)
 
-    def test_daemon_identity_tracks_implicit_config_cache_and_aws_inputs(self):
-        names = (
-            "HOME",
-            "XDG_CONFIG_HOME",
-            "XDG_CACHE_HOME",
-            "AWS_PROFILE",
-            "AWS_ACCESS_KEY_ID",
-            "AWS_SECRET_ACCESS_KEY",
-            "AWS_SHARED_CREDENTIALS_FILE",
-        )
-        with mock.patch.dict(os.environ, {}, clear=True):
-            baseline = self.dev._kache_daemon_identity(
-                "/bin/kache", cargo_cwd=Path("/repo")
-            )
-            for name in names:
-                with self.subTest(name=name):
-                    os.environ[name] = f"value-for-{name.lower()}"
-                    changed = self.dev._kache_daemon_identity(
-                        "/bin/kache", cargo_cwd=Path("/repo")
-                    )
-                    self.assertNotEqual(baseline, changed)
-                    os.environ.pop(name)
-
-    def test_daemon_identity_tracks_ci_write_policy_inputs(self):
-        names = (
-            "GITHUB_ACTIONS",
-            "GITHUB_EVENT_NAME",
-            "GITHUB_REF_TYPE",
-            "GITHUB_REF_PROTECTED",
-            "GITLAB_CI",
-            "CI",
-            "CI_COMMIT_REF_PROTECTED",
-            "CI_MERGE_REQUEST_ID",
-            "CI_MERGE_REQUEST_IID",
-            "CI_PIPELINE_SOURCE",
-        )
-        with mock.patch.dict(os.environ, {}, clear=True):
-            baseline = self.dev._kache_daemon_identity(
-                "/bin/kache", cargo_cwd=Path("/repo")
-            )
-            for name in names:
-                with self.subTest(name=name):
-                    os.environ[name] = f"value-for-{name.lower()}"
-                    changed = self.dev._kache_daemon_identity(
-                        "/bin/kache", cargo_cwd=Path("/repo")
-                    )
-                    self.assertNotEqual(baseline, changed)
-                    os.environ.pop(name)
-
-    @unittest.skipUnless(hasattr(os, "environb"), "requires byte environment")
-    def test_daemon_identity_preserves_surrogate_escaped_environment_bytes(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
-            os.environb[b"AWS_SECRET_ACCESS_KEY"] = b"abc\xffdef"
-            first = self.dev._kache_daemon_identity(
-                "/bin/kache", cargo_cwd=Path("/repo")
-            )
-            os.environb[b"AWS_SECRET_ACCESS_KEY"] = b"abc\xfedef"
-            second = self.dev._kache_daemon_identity(
-                "/bin/kache", cargo_cwd=Path("/repo")
-            )
-
-        self.assertRegex(first, r"^[0-9a-f]{64}$")
-        self.assertNotEqual(first, second)
-
-    def test_daemon_identity_tracks_google_adc_environment_and_contents(self):
-        with self.dev.tempfile.TemporaryDirectory() as temporary:
-            home = Path(temporary) / "home"
-            default_adc = home / ".config/gcloud/application_default_credentials.json"
-            default_adc.parent.mkdir(parents=True)
-            default_adc.write_text("default-one")
-            explicit_adc = Path(temporary) / "explicit-adc.json"
-            explicit_adc.write_text("explicit-one")
-            with mock.patch.dict(os.environ, {"HOME": str(home)}, clear=True):
-                default_one = self.dev._kache_daemon_identity(
-                    "/bin/kache", cargo_cwd=Path(temporary)
-                )
-                default_adc.write_text("default-two")
-                default_two = self.dev._kache_daemon_identity(
-                    "/bin/kache", cargo_cwd=Path(temporary)
-                )
-                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(explicit_adc)
-                explicit_one = self.dev._kache_daemon_identity(
-                    "/bin/kache", cargo_cwd=Path(temporary)
-                )
-                explicit_adc.write_text("explicit-two")
-                explicit_two = self.dev._kache_daemon_identity(
-                    "/bin/kache", cargo_cwd=Path(temporary)
-                )
-
-        self.assertNotEqual(default_one, default_two)
-        self.assertNotEqual(default_two, explicit_one)
-        self.assertNotEqual(explicit_one, explicit_two)
-
-    def test_daemon_identity_tracks_relative_aws_files_under_cargo_cwd(self):
-        with self.dev.tempfile.TemporaryDirectory() as temporary:
-            cargo_cwd = Path(temporary)
-            config = cargo_cwd / "aws-config"
-            token = cargo_cwd / "web-identity-token"
-            config.write_text("region=one")
-            token.write_text("token-one")
-            with mock.patch.dict(
-                os.environ,
-                {
-                    "AWS_CONFIG_FILE": config.name,
-                    "AWS_WEB_IDENTITY_TOKEN_FILE": token.name,
-                },
-                clear=True,
+    def test_exact_kache_version_only(self):
+        for output, accepted in (("kache 1.2.2", True), ("kache 1.2.1", False),
+                                 ("kache 1.2.3", False), ("kache 1.2.2-rc.1", False)):
+            with self.subTest(output=output), mock.patch.object(
+                self.dev, "_command_version", return_value=(output, None)
             ):
-                first = self.dev._kache_daemon_identity(
-                    "/bin/kache", cargo_cwd=cargo_cwd
-                )
-                config.write_text("region=two")
-                second = self.dev._kache_daemon_identity(
-                    "/bin/kache", cargo_cwd=cargo_cwd
-                )
-                token.write_text("token-two")
-                third = self.dev._kache_daemon_identity(
-                    "/bin/kache", cargo_cwd=cargo_cwd
-                )
+                version, error = self.dev._kache_version("/bin/kache")
+                self.assertEqual(version == "1.2.2", accepted)
+                self.assertEqual(error is None, accepted)
 
-        self.assertNotEqual(first, second)
-        self.assertNotEqual(second, third)
+    def test_forced_local_config_and_isolated_paths_ignore_remote_ambient(self):
+        import tomllib
+
+        with self.dev.tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "phoenix"
+            root.mkdir()
+            remote = Path(temporary) / "remote.toml"
+            remote.write_text('[cache]\nlocal_only = false\n')
+            ambient = Path(temporary) / "ambient"
+            ambient.mkdir()
+            (ambient / "queue").write_text("untouched")
+            with mock.patch.dict(os.environ, {
+                "KACHE_CONFIG": str(remote), "KACHE_HOST_CONFIG": str(remote),
+                "KACHE_LOCAL_ONLY": "false", "KACHE_SOCKET_PATH": str(ambient / "daemon.sock"),
+                "KACHE_CACHE_DIR": str(ambient), "KACHE_RUNTIME_DIR": str(ambient),
+                "KACHE_TRUST_DOMAIN": "remote", "KACHE_REMOTE_URL": "https://remote.invalid",
+                "KACHE_VOLUMES": "remote-volume", "KACHE_DISABLED": "0",
+                "AWS_ACCESS_KEY_ID": "remote-key",
+                "GOOGLE_APPLICATION_CREDENTIALS": str(remote), "AZURE_CLIENT_SECRET": "remote-secret",
+            }, clear=True), mock.patch.object(
+                self.dev, "_private_kache_socket_dir", return_value=root
+            ), mock.patch.object(
+                self.dev, "_kache_socket_lock", return_value=contextlib.nullcontext()
+            ), mock.patch.object(
+                self.dev, "_effective_kache_socket",
+                side_effect=lambda *_a, **_kw: (Path(os.environ["KACHE_SOCKET_PATH"]), None)
+            ) as status, mock.patch.object(
+                self.dev, "_start_kache_daemon_locked", return_value=None
+            ) as start:
+                self.assertIsNone(self.dev._ensure_kache_daemon("/bin/kache"))
+                self.assertEqual((ambient / "queue").read_text(), "untouched")
+                config = Path(os.environ["KACHE_CONFIG"])
+                self.assertEqual(str(config), os.environ["KACHE_HOST_CONFIG"])
+                self.assertEqual(config.parent, root / "local-only-v1.2.2")
+                cache = tomllib.loads(config.read_text())["cache"]
+                self.assertEqual(cache, {
+                    "local_only": True, "ignore_env": True,
+                    "local_store": str(self.cache_directory / "store"),
+                    "runtime_dir": str(config.parent / "runtime"),
+                })
+                self.assertEqual(os.environ["KACHE_LOCAL_ONLY"], "true")
+                self.assertNotIn("KACHE_DISABLED", os.environ)
+                self.assertEqual(os.environ["KACHE_CACHE_DIR"], cache["local_store"])
+                self.assertEqual(os.environ["KACHE_RUNTIME_DIR"], cache["runtime_dir"])
+                self.assertEqual(Path(os.environ["KACHE_SOCKET_PATH"]).parent, config.parent)
+                self.assertFalse(str(cache["local_store"]).startswith(str(root)))
+                for path in (cache["local_store"], cache["runtime_dir"]):
+                    self.assertTrue(Path(path).is_dir())
+                for key in ("KACHE_REMOTE_URL", "KACHE_VOLUMES", "KACHE_TRUST_DOMAIN"):
+                    self.assertNotIn(key, os.environ)
+                self.assertEqual(os.environ["AWS_ACCESS_KEY_ID"], "remote-key")
+                self.assertEqual(os.environ["GOOGLE_APPLICATION_CREDENTIALS"], str(remote))
+                self.assertEqual(os.environ["AZURE_CLIENT_SECRET"], "remote-secret")
+                self.assertNotEqual(config, remote)
+                self.assertEqual(status.call_count, 1)
+                self.assertEqual(start.call_count, 1)
+
+    def test_durable_cache_root_is_user_namespaced_and_private(self):
+        with self.dev.tempfile.TemporaryDirectory() as home, mock.patch.object(
+            self.dev.Path, "home", return_value=Path(home)
+        ):
+            root = self.real_private_kache_cache_dir()
+            self.assertEqual(
+                root, Path(home) / ".cache" / "phoenix-ide" / "kache" / "local-only-v1.2.2"
+            )
+            self.assertEqual(root.stat().st_mode & 0o777, 0o700)
+
+    def test_credential_file_not_read_for_local_identity(self):
+        with self.dev.tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "phoenix"
+            root.mkdir()
+            credentials = Path(temporary) / "credentials"
+            credentials.write_text("secret-one")
+            with mock.patch.object(self.dev, "_private_kache_socket_dir", return_value=root), \
+                 mock.patch.dict(os.environ, {"AWS_SHARED_CREDENTIALS_FILE": str(credentials),
+                                           "KACHE_CONFIG": str(credentials)}, clear=True), \
+                 mock.patch.object(self.dev, "_file_identity", side_effect=AssertionError("read")):
+                before = self.dev._kache_daemon_identity("/bin/kache", cargo_cwd=None)
+                credentials.write_text("secret-two")
+                os.environ["AWS_ACCESS_KEY_ID"] = "another-aws-key"
+                os.environ["AZURE_CLIENT_SECRET"] = "another-azure-secret"
+                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(credentials)
+                self.assertEqual(before, self.dev._kache_daemon_identity("/bin/kache", cargo_cwd=None))
+                self.dev._prepare_local_kache("/bin/kache", cargo_cwd=None)
+                self.assertEqual(before, self.dev._kache_daemon_identity("/bin/kache", cargo_cwd=None))
+                config = Path(os.environ["KACHE_CONFIG"])
+                content = config.read_text()
+                self.assertNotIn("secret", content)
+                self.assertNotIn("aws-key", content)
+                self.assertNotIn("AZURE_", content)
+                self.assertNotIn("GOOGLE_", content)
+                os.environ["AWS_ACCESS_KEY_ID"] = "third-aws-key"
+                os.environ["AZURE_CLIENT_SECRET"] = "third-azure-secret"
+                self.dev._prepare_local_kache("/bin/kache", cargo_cwd=None)
+                self.assertEqual(content, config.read_text())
+                self.assertEqual(before, self.dev._kache_daemon_identity("/bin/kache", cargo_cwd=None))
+                self.assertEqual(os.environ["AWS_SHARED_CREDENTIALS_FILE"], str(credentials))
+                self.assertEqual(os.environ["AWS_ACCESS_KEY_ID"], "third-aws-key")
+                self.assertEqual(os.environ["AZURE_CLIENT_SECRET"], "third-azure-secret")
+                self.assertEqual(os.environ["GOOGLE_APPLICATION_CREDENTIALS"], str(credentials))
 
     def test_non_object_daemon_receipt_is_not_trusted(self):
         with self.dev.tempfile.TemporaryDirectory() as temporary:
@@ -494,134 +476,6 @@ class CompilerCacheTests(unittest.TestCase):
                     self.dev._kache_daemon_receipt_matches(socket, "a" * 64)
                 )
 
-    def test_trust_domain_and_exact_socket_are_consistent_on_start_and_reuse(self):
-        cases = ("generated", "operator", "config", "pr-scoped")
-        for case in cases:
-            with self.subTest(case=case), self.dev.tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                base_socket = root / "base.sock"
-                effective_socket = root / "effective.sock"
-                environment = {"KACHE_TRUST_DOMAIN": "operator-domain"}
-                if case in {"operator", "pr-scoped"}:
-                    environment["KACHE_SOCKET_PATH"] = str(base_socket)
-                if case in {"config", "pr-scoped"}:
-                    config = root / "kache.toml"
-                    config.write_text(
-                        '[cache]\nignore_env = true\n'
-                        f'socket_path = "{effective_socket}"\n'
-                        '[cache.remote]\npull_request_prefix = "prs"\n'
-                    )
-                    environment["KACHE_CONFIG"] = str(config)
-                if case == "pr-scoped":
-                    environment["GITHUB_EVENT_NAME"] = "pull_request"
-
-                observations = []
-                started = False
-                selected_socket = None
-                child = mock.Mock(pid=1234, stderr=io.BytesIO())
-
-                def status(command, **kwargs):
-                    nonlocal selected_socket
-                    self.assertEqual(["/bin/kache", "--json", "daemon"], command)
-                    self.assertEqual(root, kwargs["cwd"])
-                    observations.append(("status", kwargs["env"]["KACHE_TRUST_DOMAIN"]))
-                    selected_socket = (
-                        effective_socket if case in {"config", "pr-scoped"}
-                        else Path(kwargs["env"]["KACHE_SOCKET_PATH"])
-                    ).resolve()
-                    return mock.Mock(
-                        returncode=0,
-                        stdout=self.dev.json.dumps({
-                            "daemon_running": started,
-                            "socket": str(selected_socket),
-                        }),
-                        stderr="",
-                    )
-
-                def launch(command, **kwargs):
-                    nonlocal started
-                    self.assertEqual(["/bin/kache", "daemon", "run"], command)
-                    observations.append(("start", kwargs["env"]["KACHE_TRUST_DOMAIN"]))
-                    selected_socket.write_text("mock socket")
-                    selected_socket.with_suffix(".state.json").write_text(
-                        '{"phase":"ready","pid":1234}'
-                    )
-                    started = True
-                    return child
-
-                with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
-                    self.dev.subprocess, "run", side_effect=status
-                ), mock.patch.object(
-                    self.dev.subprocess, "Popen", side_effect=launch
-                ) as spawn:
-                    identity = self.dev._kache_daemon_identity("/bin/kache", cargo_cwd=root)
-                    expected_domain = f"phoenix-{identity[:32]}"
-                    self.assertIsNone(self.dev._ensure_kache_daemon("/bin/kache", cargo_cwd=root))
-                    first_socket = os.environ["KACHE_SOCKET_PATH"]
-                    self.assertIsNone(self.dev._ensure_kache_daemon("/bin/kache", cargo_cwd=root))
-                    self.assertEqual(first_socket, os.environ["KACHE_SOCKET_PATH"])
-                    self.assertEqual(expected_domain, os.environ["KACHE_TRUST_DOMAIN"])
-                    self.assertEqual(
-                        identity, self.dev._kache_daemon_identity("/bin/kache", cargo_cwd=root)
-                    )
-                    self.assertTrue(self.dev._kache_daemon_receipt_matches(selected_socket, identity))
-
-                spawn.assert_called_once()
-                self.assertEqual(["status", "status", "start", "status", "status", "status"],
-                                 [event for event, _domain in observations])
-                self.assertTrue(all(domain == expected_domain for _event, domain in observations))
-                self.assertRegex(expected_domain, r"^phoenix-[0-9a-f]{32}$")
-                self.assertLessEqual(len(expected_domain), 64)
-                self.assertTrue(selected_socket.with_name(f"{selected_socket.name}.lock").exists())
-                if case in {"config", "pr-scoped"}:
-                    self.assertFalse(base_socket.with_name(f"{base_socket.name}.lock").exists())
-                    self.assertNotEqual(str(selected_socket), first_socket)
-
-    def test_different_identities_get_different_trust_domains_and_generated_sockets(self):
-        domains = []
-        sockets = []
-        identities = []
-        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
-            self.dev, "_start_kache_daemon_locked", return_value=None
-        ) as start:
-            for cache in ("shared-a", "shared-a", "shared-b"):
-                os.environ["KACHE_CACHE_DIR"] = str(Path(self.store_root.name) / cache)
-                os.environ.pop("KACHE_SOCKET_PATH", None)
-                self.assertIsNone(self.dev._ensure_kache_daemon("/bin/kache"))
-                domains.append(os.environ["KACHE_TRUST_DOMAIN"])
-                sockets.append(os.environ["KACHE_SOCKET_PATH"])
-                identities.append(start.call_args.kwargs["identity"])
-        self.assertEqual(domains[0], domains[1])
-        self.assertEqual(sockets[0], sockets[1])
-        self.assertEqual(identities[0], identities[1])
-        self.assertNotEqual(domains[1], domains[2])
-        self.assertNotEqual(sockets[1], sockets[2])
-        self.assertNotEqual(identities[1], identities[2])
-
-    def test_operator_socket_rejects_changed_identity_without_launch_or_new_receipt(self):
-        socket = Path(self.store_root.name) / "operator.sock"
-        socket.write_text("mock socket")
-        with mock.patch.dict(
-            os.environ, {"KACHE_SOCKET_PATH": str(socket), "KACHE_S3_BUCKET": "remote-a"}, clear=True
-        ), mock.patch.object(
-            self.dev.subprocess, "run",
-            return_value=mock.Mock(returncode=0, stdout=self.dev.json.dumps({
-                "daemon_running": True, "socket": str(socket),
-            }), stderr=""),
-        ), mock.patch.object(self.dev.subprocess, "Popen") as spawn:
-            identity = self.dev._kache_daemon_identity("/bin/kache", cargo_cwd=None)
-            self.assertIsNone(self.dev._record_kache_daemon_receipt(socket, identity))
-            receipt_path = self.dev._kache_daemon_receipt_path(socket)
-            receipt = receipt_path.read_bytes()
-            self.assertIsNone(self.dev._ensure_kache_daemon("/bin/kache"))
-            first_domain = os.environ["KACHE_TRUST_DOMAIN"]
-            os.environ["KACHE_S3_BUCKET"] = "remote-b"
-            error = self.dev._ensure_kache_daemon("/bin/kache")
-            self.assertNotEqual(first_domain, os.environ["KACHE_TRUST_DOMAIN"])
-            self.assertEqual(receipt, receipt_path.read_bytes())
-        self.assertIn("environment or process identity cannot be verified", error or "")
-        spawn.assert_not_called()
-
     def test_effective_socket_omission_or_status_failure_never_starts_daemon(self):
         for status in (
             mock.Mock(returncode=0, stdout='{"daemon_running":false}', stderr=""),
@@ -655,7 +509,7 @@ class CompilerCacheTests(unittest.TestCase):
             ), mock.patch.object(
                 self.dev, "_kache_binary", return_value="/bin/kache"
             ), mock.patch.object(
-                self.dev, "_kache_version", return_value=("1.0.0", None)
+                self.dev, "_kache_version", return_value=("1.2.2", None)
             ), mock.patch.object(
                 self.dev.shutil, "which", return_value="/bin/sccache"
             ), mock.patch.object(
@@ -667,6 +521,7 @@ class CompilerCacheTests(unittest.TestCase):
                 if requested == "auto":
                     self.assertEqual("sccache", self.dev._configure_compiler_cache(requested))
                     self.assertEqual("original-domain", os.environ["KACHE_TRUST_DOMAIN"])
+                    self.assertEqual(secret, os.environ["AWS_SECRET_ACCESS_KEY"])
                     self.assertNotIn("KACHE_SOCKET_PATH", os.environ)
                     detail = str(output.call_args_list)
                 else:
@@ -675,6 +530,8 @@ class CompilerCacheTests(unittest.TestCase):
                     detail = str(failure.exception)
                     self.assertIn("kache daemon failed to start", detail)
                     self.assertNotIn("RUSTC_WRAPPER", os.environ)
+                    self.assertEqual(secret, os.environ["AWS_SECRET_ACCESS_KEY"])
+                    self.assertEqual("original-domain", os.environ["KACHE_TRUST_DOMAIN"])
                 self.assertNotIn(secret, detail)
                 self.assertIn("[redacted]", detail)
 
@@ -869,9 +726,10 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertIn("[redacted backend diagnostic]", error or "")
         self.assertIn("spawned Kache child pid 2468 is no longer running", error or "")
 
-    def test_diagnostic_thread_failure_reports_live_child(self):
+    def test_diagnostic_thread_failure_settles_child(self):
         child = mock.Mock(pid=2468)
         child.poll.return_value = None
+        child.wait.return_value = -15
         with mock.patch.object(
             self.dev, "_kache_daemon_is_running", return_value=(False, None)
         ), mock.patch.object(
@@ -886,7 +744,12 @@ class CompilerCacheTests(unittest.TestCase):
                 identity="identity",
             )
         self.assertIn("thread unavailable", error or "")
-        self.assertIn("pid 2468 may still be live", error or "")
+        self.assertIn(
+            "pid 2468 is no longer running after diagnostic setup failure", error or ""
+        )
+        child.terminate.assert_called_once_with()
+        child.wait.assert_called_once_with(timeout=1.0)
+        child.stderr.close.assert_called_once_with()
 
     def test_live_child_after_receipt_failure_is_settled(self):
         child = mock.Mock(pid=2468)
@@ -1058,61 +921,6 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertEqual(Path("/tmp/kache.sock").resolve(), start.call_args.kwargs["socket"])
         self.assertRegex(start.call_args.kwargs["identity"], r"^[0-9a-f]{64}$")
 
-    def test_config_override_gets_generated_socket(self):
-        with mock.patch.dict(
-            os.environ, {"KACHE_CONFIG": "/tmp/config.toml"}, clear=True
-        ), mock.patch.object(
-            self.dev, "_private_kache_socket_dir", return_value=Path("/tmp/private-kache")
-        ), mock.patch.object(
-            self.dev, "_kache_socket_lock", return_value=contextlib.nullcontext()
-        ), mock.patch.object(
-            self.dev, "_start_kache_daemon_locked", return_value=None
-        ):
-            self.assertIsNone(self.dev._ensure_kache_daemon("/bin/kache"))
-            self.assertIn("KACHE_SOCKET_PATH", os.environ)
-            self.assertEqual("/tmp/config.toml", os.environ["KACHE_CONFIG"])
-
-    def test_kache_daemon_uses_cargo_working_directory(self):
-        child = mock.Mock(pid=1234)
-        cargo_cwd = self.dev.Path("/detached/build")
-        daemon_env = {}
-
-        def run_daemon(*_args, **kwargs):
-            daemon_env.update(kwargs["env"])
-            return child
-
-        with mock.patch.dict(
-            os.environ,
-            {
-                "KACHE_LOG_FILE": "kache=trace",
-                "KACHE_LOG_FILE_PATH": "/tmp/kache.log",
-                "KACHE_SOCKET_PATH": "/tmp/kache.sock",
-            },
-            clear=True,
-        ), mock.patch.object(
-            self.dev, "_kache_daemon_is_running", return_value=(False, None)
-        ), mock.patch.object(
-            self.dev.subprocess, "Popen", side_effect=run_daemon
-        ) as run, mock.patch.object(
-            self.dev, "_wait_for_kache_daemon", return_value=None
-        ) as wait, mock.patch.object(
-            self.dev, "_kache_daemon_serving_pid", return_value=1234
-        ), mock.patch.object(
-            self.dev, "_record_kache_daemon_receipt", return_value=None
-        ):
-            self.assertIsNone(
-                self.dev._ensure_kache_daemon("/bin/kache", cargo_cwd=cargo_cwd)
-            )
-
-        self.assertEqual(cargo_cwd, run.call_args.kwargs["cwd"])
-        self.assertEqual("kache=trace", daemon_env["KACHE_LOG_FILE"])
-        self.assertEqual("/tmp/kache.log", daemon_env["KACHE_LOG_FILE_PATH"])
-        wait.assert_called_once_with(
-            "/bin/kache",
-            cargo_cwd=cargo_cwd,
-            expected_socket=Path("/tmp/kache.sock").resolve(),
-        )
-
     def test_kache_lock_setup_failure_is_actionable(self):
         with mock.patch.dict(
             os.environ, {"KACHE_SOCKET_PATH": "/unwritable/kache.sock"}, clear=True
@@ -1180,75 +988,6 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertEqual(["lock", "check", "start", "ready", "unlock"], events)
 
     @unittest.skipUnless("fork" in multiprocessing.get_all_start_methods(), "requires fork")
-    def test_kache_daemon_serializes_cross_process_contenders(self):
-        context = multiprocessing.get_context("fork")
-        start = context.Event()
-        ready = context.Queue()
-        results = context.Queue()
-
-        with self.dev.tempfile.TemporaryDirectory() as temporary:
-            socket = Path(temporary) / "kache.sock"
-            marker = Path(temporary) / "daemon-environment"
-
-            def contend(candidate):
-                dev = load_devpy()
-
-                def status(*_args, **_kwargs):
-                    return marker.exists(), None
-
-                def launch(*_args, **_kwargs):
-                    marker.write_text(candidate)
-                    return mock.Mock(pid=1234)
-
-                with mock.patch.dict(
-                    os.environ,
-                    {
-                        "KACHE_SOCKET_PATH": str(socket),
-                        "KACHE_REMOTE_BUCKET": candidate,
-                    },
-                    clear=True,
-                ), mock.patch.object(
-                    dev, "_implicit_kache_files", return_value={}
-                ), mock.patch.object(
-                    dev, "_read_kache_daemon_status",
-                    return_value=(dev.KacheDaemonStatus.ABSENT, str(socket), None)
-                ), mock.patch.object(
-                    dev, "_kache_daemon_is_running", side_effect=status
-                ), mock.patch.object(
-                    dev.subprocess, "Popen", side_effect=launch
-                ), mock.patch.object(
-                    dev, "_wait_for_kache_daemon", return_value=None
-                ), mock.patch.object(
-                    dev, "_kache_daemon_serving_pid", return_value=1234
-                ), mock.patch.object(
-                    dev, "_record_kache_daemon_receipt", return_value=None
-                ):
-                    ready.put(candidate)
-                    start.wait()
-                    results.put((candidate, dev._ensure_kache_daemon("/bin/kache")))
-
-            contenders = [
-                context.Process(target=contend, args=(candidate,))
-                for candidate in ("bucket-a", "bucket-b")
-            ]
-            for contender in contenders:
-                contender.start()
-            self.assertEqual({ready.get(timeout=5), ready.get(timeout=5)}, {"bucket-a", "bucket-b"})
-            start.set()
-            outcomes = dict(results.get(timeout=5) for _ in contenders)
-            for contender in contenders:
-                contender.join(timeout=5)
-                self.assertEqual(0, contender.exitcode)
-
-            winner = marker.read_text()
-            loser = "bucket-b" if winner == "bucket-a" else "bucket-a"
-            self.assertIsNone(outcomes[winner])
-            self.assertIn(
-                "environment or process identity cannot be verified",
-                outcomes[loser] or "",
-            )
-            self.assertTrue(socket.with_name(f"{socket.name}.lock").exists())
-
     def test_kache_daemon_rejects_running_process_with_unverifiable_environment(self):
         with mock.patch.dict(
             os.environ, {"KACHE_SOCKET_PATH": "/tmp/kache.sock"}, clear=True
@@ -1397,7 +1136,7 @@ class CompilerCacheTests(unittest.TestCase):
                 socket_path = Path(os.environ["KACHE_SOCKET_PATH"])
                 self.assertEqual(
                     socket_path.parent,
-                    Path(temporary) / f"phoenix-kache-{os.getuid()}",
+                    Path(temporary) / f"phoenix-kache-{os.getuid()}" / "local-only-v1.2.2",
                 )
                 self.assertEqual(socket_path.parent.stat().st_mode & 0o777, 0o700)
                 self.assertRegex(socket_path.name, r"^[0-9a-f]{16}\.sock$")
@@ -1432,7 +1171,7 @@ class CompilerCacheTests(unittest.TestCase):
         ), mock.patch.object(
             self.dev, "_kache_host_error", return_value=None
         ), mock.patch.object(
-            self.dev, "_kache_version", return_value=("1.0.0", None)
+            self.dev, "_kache_version", return_value=("1.2.2", None)
         ), mock.patch.object(
             self.dev, "_ensure_kache_daemon", return_value="socket failed"
         ), mock.patch.object(
@@ -1454,7 +1193,7 @@ class CompilerCacheTests(unittest.TestCase):
         ), mock.patch.object(
             self.dev, "_kache_host_error", return_value=None
         ), mock.patch.object(
-            self.dev, "_kache_version", return_value=("1.0.0", None)
+            self.dev, "_kache_version", return_value=("1.2.2", None)
         ), mock.patch.object(
             self.dev, "_ensure_kache_daemon", return_value="socket failed"
         ), mock.patch.object(
@@ -1531,7 +1270,7 @@ class CompilerCacheTests(unittest.TestCase):
         ), mock.patch.object(
             self.dev, "_kache_host_error", return_value=None
         ), mock.patch.object(
-            self.dev, "_kache_version", return_value=("1.0.0", None)
+            self.dev, "_kache_version", return_value=("1.2.2", None)
         ), mock.patch.object(self.dev, "_ensure_kache_daemon", return_value="socket failed"):
             with self.assertRaisesRegex(SystemExit, "kache daemon failed to start: socket failed"):
                 self.dev._configure_compiler_cache("kache")
@@ -1547,34 +1286,6 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertEqual("kache \ufffd", detail)
         self.assertIsNone(error)
         self.assertEqual("replace", run.call_args.kwargs["errors"])
-
-    def test_kache_version_rejects_unpublished_local_candidate_version(self):
-        with mock.patch.object(
-            self.dev, "_command_version", return_value=("kache 1.0.0", None)
-        ):
-            version, error = self.dev._kache_version("/bin/kache")
-        self.assertIsNone(version)
-        self.assertIn("no published Kache release", error or "")
-
-    def test_kache_version_accepts_deliberately_qualified_release(self):
-        with mock.patch.object(
-            self.dev, "_SUPPORTED_KACHE_VERSION", "1.0.1"
-        ), mock.patch.object(
-            self.dev, "_command_version", return_value=("kache 1.0.1", None)
-        ):
-            self.assertEqual(("1.0.1", None), self.dev._kache_version("/bin/kache"))
-
-    def test_kache_version_rejects_unqualified_patch_and_prerelease(self):
-        for output, expected in (
-            ("kache 1.0.1", "no published Kache release"),
-            ("kache 1.0.0-rc1", "unrecognized"),
-        ):
-            with self.subTest(output=output), mock.patch.object(
-                self.dev, "_command_version", return_value=(output, None)
-            ):
-                version, error = self.dev._kache_version("/bin/kache")
-                self.assertIsNone(version)
-                self.assertIn(expected, error or "")
 
     def test_explicit_kache_rejects_unsupported_release(self):
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
@@ -1758,17 +1469,6 @@ class CompilerCacheTests(unittest.TestCase):
                 "/workspace/credentials/gcs.json",
                 os.environ["SCCACHE_GCS_KEY_PATH"],
             )
-
-    def test_kache_implicit_config_is_pinned_from_invoking_tree(self):
-        with self.dev.tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            nested = root / "nested" / "worktree"
-            nested.mkdir(parents=True)
-            config = root / ".kache.toml"
-            config.write_text("[cache]\n")
-            with mock.patch.dict(os.environ, {}, clear=True):
-                self.dev._normalize_cache_paths("kache", nested)
-                self.assertEqual(str(config.resolve()), os.environ["KACHE_CONFIG"])
 
     def test_sccache_cwd_paths_and_abstract_uds(self):
         with mock.patch.dict(

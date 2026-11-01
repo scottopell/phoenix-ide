@@ -31,6 +31,12 @@ result parsing, certificate-pin decisions, legacy conversation decoding,
 and reducer ordering/hard-delete behavior. Remaining verification steps:
 on-device build and an airplane-mode queue/drain test pass.
 
+Slack gateway input provenance is a typed origin with an exact request source
+link. Conversation snapshots use version 2 and migrate version-1 envelopes;
+older writers are fenced from overwriting the expanded origin vocabulary.
+Wire-model type checking is available locally; simulator execution remains a
+separate qualification when no simulator runtime is installed.
+
 ## Requirement Coverage
 
 | Requirement | Surface |

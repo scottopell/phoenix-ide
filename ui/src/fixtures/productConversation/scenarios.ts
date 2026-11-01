@@ -1,7 +1,7 @@
-import type { ChainView, ConversationState, Message, ProductConversationSnapshotView } from '../../api';
+import type { ChainView, ConversationState, Message, ProductConversationHistorySnapshotView as ProductConversationSnapshotView, CoordinatorConversationSnapshotView } from '../../api';
 import type { EnrichedMessage } from '../../generated/EnrichedMessage';
 import { productConversationScenarioDefinitions } from './types';
-import type { ProductConversationScenario, ProductConversationScenarioId } from './types';
+import type { ProductConversationScenario, ProductConversationScenarioId, OrdinaryProductConversationScenario, GlobalProductConversationScenario } from './types';
 
 const now = Date.parse('2026-07-01T12:00:00Z');
 const isoAgo = (minutes: number) => new Date(now - minutes * 60_000).toISOString();
@@ -25,6 +25,7 @@ function state(type: ConversationState['type']): ConversationState {
 
 function textMessage(id: string, sequenceId: number, messageType: 'user' | 'agent' | 'system', text: string, conversationState?: ConversationState): FixtureMessage {
   return {
+    event_presentation: null,
     message_id: id,
     conversation_id: ALIGNED_PREFIX_TRANSCRIPT_ROW_ID,
     sequence_id: sequenceId,
@@ -49,21 +50,20 @@ function segment(
     transcript_row_id: transcriptRowId,
     slug: transcriptRowId,
     title,
-    messages,
-    handoff: handoffSummary === null ? null : {
-      kind: 'historical' as const,
-      predecessor_transcript_row_id: `prev-${transcriptRowId}`,
-      successor_transcript_row_id: transcriptRowId,
-      continuation_message_id: `continue-${transcriptRowId}`,
-      summary: handoffSummary,
-    },
+    messages: (handoffSummary === null ? messages : [...messages, {
+      ...textMessage(`continue-${transcriptRowId}`, Math.max(0, ...messages.map((message) => message.sequence_id)) + 1, 'system', handoffSummary),
+      conversation_id: transcriptRowId, message_type: 'continuation' as const, content: { summary: handoffSummary },
+    }]).map(message => ({ ...message, conversation_id: transcriptRowId })),
+
   };
 }
 
 function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}): ProductConversationSnapshotView {
-  return {
+  const snapshot: ProductConversationSnapshotView = {
     product_conversation_id: 'pc-product-alpha',
     close: null,
+    boundaries: [],
+    latest_opening: { status: 'none' },
     canonical_route: '/product-conversations/pc-product-alpha',
     requested_transcript_row_id: 'row-work',
     canonical_root: { transcript_row_id: 'row-root', slug: 'product-alpha-root', title: 'Product Alpha root' },
@@ -106,6 +106,12 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
     has_older: false,
     ...overrides,
   };
+  snapshot.boundaries = overrides.boundaries ?? snapshot.segments.flatMap((segment, index) => segment.messages.filter(message => message.message_type === 'continuation').map(message => ({
+    message_id: message.message_id, represented_successor_opening_message_id: null, predecessor_transcript_row_id: segment.transcript_row_id,
+    successor_transcript_row_id: snapshot.segments[index + 1]?.transcript_row_id ?? snapshot.latest_transcript_row_id,
+    segment_ordinal: segment.segment_ordinal,
+  })));
+  return snapshot;
 }
 
 export const ALIGNED_PREFIX_BOUNDARY_TOOL_ID = 'aligned-prefix-boundary-tool';
@@ -301,7 +307,47 @@ function makeOlderPage(): ProductConversationSnapshotView {
   });
 }
 
+export function coordinatorSnapshot(snapshot: ProductConversationSnapshotView): CoordinatorConversationSnapshotView {
+  return {
+    product_conversation_id: snapshot.product_conversation_id,
+    canonical_route: `/global/${snapshot.latest_transcript_row_id}`,
+    requested_transcript_row_id: snapshot.requested_transcript_row_id,
+    canonical_root: snapshot.canonical_root,
+    latest_transcript_row_id: snapshot.latest_transcript_row_id,
+    writable_transcript_row_id: snapshot.writable_transcript_row_id,
+    latest_opening: snapshot.latest_opening,
+    updated_at: snapshot.updated_at, segments: snapshot.segments,
+    boundaries: snapshot.boundaries, before: snapshot.before, has_older: snapshot.has_older,
+  };
+}
+
+function lazyHistoryScenario(kind: 'ordinary' | 'coordinator'): ProductConversationScenario {
+  const full = makeSnapshot({ product_conversation_id: 'fixture-product-conversation',
+    requested_transcript_row_id: 'history-3', latest_transcript_row_id: 'history-3', writable_transcript_row_id: 'history-3',
+    canonical_root: { transcript_row_id: 'history-1', slug: 'history-1', title: 'First member' },
+    work_identity: null, source: null, chain_qa_compatibility: null,
+    segments: [1, 2, 3].map(n => segment(n - 1, `history-${n}`, `Member ${n}`, [
+      textMessage(`history-prompt-${n}`, 1, 'user', `Member ${n} request`),
+      textMessage(`history-answer-${n}`, 2, 'agent', n === 1
+        ? 'Member 1 answer\n\n<details><summary>Historical investigation</summary>\n\nHistorical **outer evidence**. This retained member records the investigation before continuation; opening its disclosure must not reacquire history or change the newest composer.\n\n<details><summary>Nested historical evidence</summary>\n\nPreserved **nested prose marker**.\n\n</details>\n\n</details>'
+        : n === 2
+          ? 'Member 2 answer\n\n<details><summary>Historical nonnested investigation</summary>\n\nHistorical **outer evidence**. This retained member records the investigation before continuation; opening its disclosure must not reacquire history or change the newest composer. The persisted source and its completed boundary remain independently addressable.\n\nPreserved **historical prose marker**.\n\n- Compare the acquired prefix.\n- Keep newest-member authority.\n\n</details>'
+          : `Member ${n} answer`),
+    ], n < 3 ? `Preserved summary from member ${n}` : null)),
+  });
+  const page = (member: number): ProductConversationSnapshotView => ({ ...full,
+    segments: full.segments.map(segment => ({ ...segment, messages: segment.segment_ordinal === member - 1 ? segment.messages : [] })),
+    before: member > 1 ? `history-before-${member}` : null, has_older: member > 1,
+  });
+  const common = { ...productConversationScenarioDefinitions.find(def => def.id === `${kind === 'ordinary' ? 'ordinary' : 'global'}-lazy-history`)!, latestConversationState: state('idle') };
+  return kind === 'ordinary'
+    ? { ...common, kind, snapshot: page(3), olderPages: { 'history-before-3': page(2), 'history-before-2': page(1) } }
+    : { ...common, kind, snapshot: coordinatorSnapshot(page(3)), olderPages: { 'history-before-3': coordinatorSnapshot(page(2)), 'history-before-2': coordinatorSnapshot(page(1)) } };
+}
+
 export const productConversationScenarios = [
+  lazyHistoryScenario('ordinary'),
+  lazyHistoryScenario('coordinator'),
   {
     ...productConversationScenarioDefinitions[0],
     snapshot: makeSnapshot(),
@@ -504,20 +550,24 @@ export const productConversationScenarios = [
     const sourceMessage = { ...textMessage('source-assistant', 3, 'agent', 'Forwarding the requested observation.'),
       content: [{ type: 'text' as const, text: 'Forwarding the requested observation.' }, { type: 'tool_use' as const, id: 'source-send-call', name: 'send_conversation_message', input: { target: '@conv:receiver', message: 'Source jump fixture payload', message_id: 'fixture-send' } }] };
     const history = Array.from({ length: 36 }, (_, i) => textMessage(`source-history-${i}`, i + 5, i % 2 ? 'agent' : 'user', `Historical context ${i}`));
-    const source = makeSnapshot({ product_conversation_id: 'source-product', canonical_route: '/product-conversations/source-product', latest_transcript_row_id: 'source-successor', writable_transcript_row_id: 'source-successor',
-      segments: [segment(1, 'source-member', 'Original source member', [textMessage('source-request', 1, 'user', 'Send observation'), sourceMessage, ...history], null), segment(2, 'source-successor', 'Continued source', [textMessage('successor-request', 60, 'user', 'Continue work')], 'Continued after source send')] });
+    const source = makeSnapshot({ product_conversation_id: 'source-product', canonical_route: '/product-conversations/source-product', requested_transcript_row_id: 'source-member', latest_transcript_row_id: 'source-successor', writable_transcript_row_id: 'source-successor',
+      canonical_root: { transcript_row_id: 'source-member', slug: 'source-member', title: 'Original source member' }, work_identity: null, source: null, chain_qa_compatibility: null,
+      segments: [segment(0, 'source-member', 'Original source member', [textMessage('source-request', 1, 'user', 'Send observation'), sourceMessage, ...history], 'Continued after source send'), segment(1, 'source-successor', 'Continued source', [textMessage('successor-request', 60, 'user', 'Continue work')], null)] });
     return { ...productConversationScenarioDefinitions.find(def => def.id === id)!, sourceIsGlobal: id === 'source-call-global', sourceSnapshot: source,
       snapshot: makeSnapshot({ segments: [segment(1, ALIGNED_PREFIX_TRANSCRIPT_ROW_ID, 'Receiver', [{ ...textMessage('received-send', 1, 'user', 'Source jump fixture payload'), origin: { kind: 'internal_conversation' as const, product_conversation_id: 'source-product', transcript_id: 'source-member', source_call: { message_id: 'source-assistant', tool_use_id: 'source-send-call' } } }], null)] }) };
   }),
 ] as const satisfies readonly ProductConversationScenario[];
 
+export function getProductConversationScenario(id: 'global-lazy-history'): GlobalProductConversationScenario;
+export function getProductConversationScenario(id: Exclude<ProductConversationScenarioId, 'global-lazy-history'>): OrdinaryProductConversationScenario;
+export function getProductConversationScenario(id: ProductConversationScenarioId): ProductConversationScenario;
 export function getProductConversationScenario(id: ProductConversationScenarioId): ProductConversationScenario {
   const scenario = productConversationScenarios.find((item) => item.id === id);
   if (!scenario) throw new Error(`Unknown ProductConversation scenario: ${id}`);
   return scenario;
 }
 
-export function makeVirtualizedReactionScenario(): ProductConversationScenario {
+export function makeVirtualizedReactionScenario(): OrdinaryProductConversationScenario {
   const base = getProductConversationScenario('inline-message-reactions');
   const snapshot = base.snapshot!;
   const subjects = ['interrupted tools', 'draft preservation', 'stale completions', 'retry identity', 'continuation boundaries', 'reconnect timing'];

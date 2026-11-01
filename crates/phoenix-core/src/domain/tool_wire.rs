@@ -54,9 +54,64 @@ pub enum BashResponse {
     Exited(BashRunTombstonePayload),
     /// Run-path: process was signal-terminated inside the wait window.
     Killed(BashRunTombstonePayload),
+    /// Owned child exited, but no controllable handle was registered.
+    UnregisteredExited(BashUnregisteredTerminalPayload),
+    /// Owned child was signal-terminated without a registered handle.
+    UnregisteredKilled(BashUnregisteredTerminalPayload),
+    /// A child launched but bounded settlement could not verify its outcome.
+    OutcomeUnknown(BashUnregisteredUnknownPayload),
     /// Waiter task panicked; surface as a structured response so callers
     /// don't hang. Only fields needed for diagnosis are emitted.
     WaiterPanicked(BashWaiterPanickedPayload),
+}
+
+/// Post-launch failure, distinct from an OS spawn failure.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum BashLaunchError {
+    IdentityUnavailable,
+    RegistrationFailed,
+}
+
+/// Descendant state without a registered process-group identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum BashUnregisteredDescendants {
+    Unverified,
+}
+
+/// An unregistered child has no handle or PID/group control authority.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct BashUnregisteredRun {
+    pub cmd: String,
+    pub label: Option<String>,
+    pub launch_error: BashLaunchError,
+    pub descendants: BashUnregisteredDescendants,
+    pub output_complete: bool,
+    pub duration_ms: u64,
+    #[serde(flatten)]
+    pub window: BashRingWindow,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct BashUnregisteredTerminalPayload {
+    #[serde(flatten)]
+    pub run: BashUnregisteredRun,
+    pub exit_code: Option<i32>,
+    pub signal_number: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct BashUnregisteredUnknownPayload {
+    #[serde(flatten)]
+    pub run: BashUnregisteredRun,
+    pub error: String,
+    pub error_message: String,
 }
 
 /// Common ring-buffer view returned alongside any handle response
@@ -277,6 +332,10 @@ pub enum BashErrorResponse {
     SpawnFailed {
         error_message: String,
     },
+    LaunchReleaseUnknown {
+        error_message: String,
+        handle: String,
+    },
     /// Catch-all for input-shape failures the schema didn't reject:
     /// missing `op`, missing required peer field for the chosen op,
     /// invalid `lines` value (REQ-BASH-010). The variant name is
@@ -338,6 +397,44 @@ pub struct TmuxErrorResponse {
 #[cfg(test)]
 mod bash_tmux_wire_tests {
     use super::*;
+
+    #[test]
+    fn unregistered_descendants_is_a_closed_wire_state() {
+        assert_eq!(
+            serde_json::to_value(BashUnregisteredDescendants::Unverified).unwrap(),
+            serde_json::json!("unverified")
+        );
+        assert_eq!(
+            serde_json::from_value::<BashUnregisteredDescendants>(serde_json::json!("unverified"))
+                .unwrap(),
+            BashUnregisteredDescendants::Unverified
+        );
+        for invalid in ["verified", "absent", "running", "Unverified", ""] {
+            assert!(
+                serde_json::from_value::<BashUnregisteredDescendants>(serde_json::json!(invalid))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn launch_release_unknown_has_stable_error_and_handle() {
+        let value = serde_json::to_value(BashErrorResponse::LaunchReleaseUnknown {
+            error_message: "execution may have started; do not retry".into(),
+            handle: "b-42".into(),
+        })
+        .unwrap();
+        assert_eq!(value["error"], "launch_release_unknown");
+        assert_eq!(value["handle"], "b-42");
+        assert_eq!(
+            value["error_message"],
+            "execution may have started; do not retry"
+        );
+        assert!(matches!(
+            serde_json::from_value::<BashErrorResponse>(value).unwrap(),
+            BashErrorResponse::LaunchReleaseUnknown { handle, .. } if handle == "b-42"
+        ));
+    }
 
     #[test]
     fn bash_running_serializes_with_status_tag() {

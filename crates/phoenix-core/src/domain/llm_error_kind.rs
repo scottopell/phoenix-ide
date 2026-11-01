@@ -51,6 +51,14 @@ pub enum LlmErrorKind {
     /// Context window exceeded - not retryable in current conversation
     #[allow(dead_code)] // Will be used when providers detect context window errors
     ContextWindowExceeded,
+    /// The model stopped because it reached the request's output-token budget
+    /// (Chat `finish_reason=length`, Responses `incomplete/max_output_tokens`,
+    /// Anthropic `stop_reason=max_tokens`). A well-formed, budget-limited
+    /// provider response, not a transport fault: NOT auto-retried (an
+    /// unchanged request would exhaust again), but user-resumable because a
+    /// revised message or settings can free output room. Distinct from
+    /// `ContextWindowExceeded` and `InvalidResponse`.
+    OutputTokensExhausted,
 }
 
 /// The retryable-error classification that ships on the wire as part of
@@ -112,7 +120,8 @@ impl LlmAttemptReason {
             | LlmErrorKind::InvalidRequest
             | LlmErrorKind::PromptRejected
             | LlmErrorKind::ContentFilter
-            | LlmErrorKind::ContextWindowExceeded => None,
+            | LlmErrorKind::ContextWindowExceeded
+            | LlmErrorKind::OutputTokensExhausted => None,
         }
     }
 }
@@ -136,7 +145,8 @@ impl LlmErrorKind {
             | Self::InvalidRequest
             | Self::PromptRejected
             | Self::ContentFilter
-            | Self::ContextWindowExceeded => AutoRetryPolicy::NoAutoRetry,
+            | Self::ContextWindowExceeded
+            | Self::OutputTokensExhausted => AutoRetryPolicy::NoAutoRetry,
         }
     }
 
@@ -161,6 +171,10 @@ impl LlmErrorKind {
             | Self::ServerOverloaded
             | Self::UsageLimitReached
             | Self::InvalidRequest
+            // An output-token-budget stop is terminal for automatic retry, but
+            // the user recovers by freeing output room with a revised message
+            // or settings within the same conversation.
+            | Self::OutputTokensExhausted
             | Self::PromptRejected => UserResumePolicy::Resumable,
             Self::ContentFilter | Self::ContextWindowExceeded => UserResumePolicy::NotResumable,
         }
@@ -186,7 +200,8 @@ mod tests {
     fn all_llm_error_kinds_have_explicit_auto_retry_and_user_resume_policy() {
         use LlmErrorKind::{
             Auth, ContentFilter, ContextWindowExceeded, InvalidRequest, InvalidResponse, Network,
-            PromptRejected, RateLimit, ServerError, ServerOverloaded, UsageLimitReached,
+            OutputTokensExhausted, PromptRejected, RateLimit, ServerError, ServerOverloaded,
+            UsageLimitReached,
         };
 
         let cases = [
@@ -224,6 +239,11 @@ mod tests {
                 ContextWindowExceeded,
                 AutoRetryPolicy::NoAutoRetry,
                 UserResumePolicy::NotResumable,
+            ),
+            (
+                OutputTokensExhausted,
+                AutoRetryPolicy::NoAutoRetry,
+                UserResumePolicy::Resumable,
             ),
         ];
 

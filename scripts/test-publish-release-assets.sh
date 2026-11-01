@@ -175,7 +175,7 @@ if args and args[0] == "api":
         print(json.dumps(api_release(release)))
         raise SystemExit(0)
     if method == "GET" and endpoint.endswith("/releases?per_page=100"):
-        page = [] if release is None else [api_release(release)]
+        page = [] if release is None or os.environ.get("FAKE_HIDE_RELEASE_FROM_LIST") == "1" else [api_release(release)]
         latest_tag = os.environ.get("FAKE_LATEST_TAG")
         if latest_tag is not None and latest_tag != (release or {}).get("tag_name"):
             page.append({"tag_name": latest_tag, "draft": False, "prerelease": False, "assets": []})
@@ -269,7 +269,7 @@ publish() {
 reset_state() {
   rm -rf "$FAKE_STATE"
   mkdir -p "$FAKE_STATE"
-  unset FAKE_DIGEST_MISMATCH FAKE_PUBLISH_FAIL FAKE_TAG_MOVE_AFTER FAKE_UPLOAD_FAIL_AFTER FAKE_API_FAILURE FAKE_LATEST_TAG RELEASE_NOTES_FILE
+  unset FAKE_DIGEST_MISMATCH FAKE_PUBLISH_FAIL FAKE_TAG_MOVE_AFTER FAKE_UPLOAD_FAIL_AFTER FAKE_API_FAILURE FAKE_LATEST_TAG RELEASE_NOTES_FILE FAKE_HIDE_RELEASE_FROM_LIST
   export FAKE_TAG=v1.2.3
   export FAKE_CHANNEL=stable
 }
@@ -313,6 +313,23 @@ if grep -F -- '--method DELETE repos/owner/repo/releases/42' "$FAKE_STATE/gh.log
   echo "draft recovery must not delete the release" >&2
   exit 1
 fi
+
+# Creation and publication need no list visibility once the release ID is known.
+reset_state
+export FAKE_HIDE_RELEASE_FROM_LIST=1
+publish
+assert_published_exact
+python3 - "$FAKE_STATE/gh.log" <<'PY'
+import sys
+from pathlib import Path
+calls = Path(sys.argv[1]).read_text().splitlines()
+created = next(i for i, call in enumerate(calls) if call.startswith("api --method POST repos/owner/repo/releases "))
+first_upload = next(i for i, call in enumerate(calls) if call.startswith("api --method POST https://uploads.github.com/"))
+assert not any("/releases?per_page=100" in call for call in calls[created + 1:first_upload]), "release identity must not be rediscovered after creation"
+published = next(i for i, call in enumerate(calls) if call.startswith("api --method PATCH "))
+assert "api repos/owner/repo/releases/42" in calls[published + 1:]
+assert not any("/releases?per_page=100" in call for call in calls[published + 1:])
+PY
 
 # RC publication is explicitly a prerelease and never becomes latest, including an idempotent retry.
 reset_state

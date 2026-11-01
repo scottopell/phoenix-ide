@@ -468,3 +468,9 @@ describe('TaskApprovalReader shared find integration', () => {
     expect(screen.getAllByRole('button', { name: '1 notes' })).toHaveLength(1);
   });
 });
+
+it('keeps task plans on standard Markdown rather than conversation disclosures', () => {
+  const { container } = renderTaskApprovalReader('<details><summary>Summary</summary>\n\nBody **target**\n\n</details>');
+  expect(container.querySelector('details, summary')).toBeNull();
+  expect(screen.getByText('target')).toBeInTheDocument();
+});

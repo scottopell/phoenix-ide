@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { forwardRef, useState, useEffect, useCallback, useRef, useImperativeHandle } from 'react';
 import { VoiceButton } from './VoiceButton';
 import { VoicePermission } from './VoicePermission';
 
@@ -74,7 +74,12 @@ export function isWebSpeechSupported(): boolean {
   );
 }
 
+export interface VoiceRecorderHandle {
+  retire(): void;
+}
+
 interface VoiceRecorderProps {
+  /** Claims composer ownership at request time, before recognition.start(). */
   onStart?: () => void;
   onEnd?: () => void;
   onSpeech: (text: string) => void;
@@ -82,22 +87,32 @@ interface VoiceRecorderProps {
   disabled?: boolean;
 }
 
-export function VoiceRecorder({ onStart, onEnd, onSpeech, onInterim, disabled }: VoiceRecorderProps) {
+export const VoiceRecorder = forwardRef<VoiceRecorderHandle, VoiceRecorderProps>(function VoiceRecorder(
+  { onStart, onEnd, onSpeech, onInterim, disabled },
+  ref,
+) {
   const [state, setState] = useState<VoiceState>('idle');
   const [error, setError] = useState<VoiceError | null>(null);
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const lastInterimRef = useRef<string>('');
 
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      if (recognitionRef.current) {
-        recognitionRef.current.abort();
-        recognitionRef.current = null;
-      }
-    };
+  const abortRecording = useCallback(() => {
+    const recognition = recognitionRef.current;
+    recognitionRef.current = null;
+    lastInterimRef.current = '';
+    recognition?.abort();
   }, []);
+
+  useImperativeHandle(ref, () => ({
+    retire() {
+      abortRecording();
+      setState('idle');
+      setError(null);
+    },
+  }), [abortRecording]);
+
+  useEffect(() => abortRecording, [abortRecording]);
 
   const stopRecording = useCallback(() => {
     if (recognitionRef.current) {
@@ -144,25 +159,29 @@ export function VoiceRecorder({ onStart, onEnd, onSpeech, onInterim, disabled }:
     recognition.lang = navigator.language || 'en-US';
 
     recognition.onstart = () => {
+      if (recognitionRef.current !== recognition) return;
       setState('listening');
       setError(null);
-      if (onStart) onStart();
     };
 
     recognition.onresult = (event: SpeechRecognitionEvent) => {
+      if (recognitionRef.current !== recognition) return;
       let interim = '';
       
       for (let i = event.resultIndex; i < event.results.length; i++) {
+        if (recognitionRef.current !== recognition) return;
         const result = event.results[i];
         if (!result) continue;
         const transcript = result[0]?.transcript ?? '';
 
         if (result.isFinal) {
           // Clear interim and commit final text
-          if (lastInterimRef.current && onInterim) {
-            onInterim(''); // Clear interim display
-          }
+          const hadInterim = !!lastInterimRef.current;
           lastInterimRef.current = '';
+          if (hadInterim && onInterim) {
+            onInterim(''); // Clear interim display
+            if (recognitionRef.current !== recognition) return;
+          }
           
           const finalText = transcript.trim();
           if (finalText) {
@@ -174,6 +193,7 @@ export function VoiceRecorder({ onStart, onEnd, onSpeech, onInterim, disabled }:
       }
       
       // Update interim display
+      if (recognitionRef.current !== recognition) return;
       if (interim !== lastInterimRef.current) {
         lastInterimRef.current = interim;
         if (onInterim) {
@@ -183,6 +203,7 @@ export function VoiceRecorder({ onStart, onEnd, onSpeech, onInterim, disabled }:
     };
 
     recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+      if (recognitionRef.current !== recognition) return;
       console.error('Speech recognition error:', event.error);
 
       let voiceError: VoiceError;
@@ -222,20 +243,17 @@ export function VoiceRecorder({ onStart, onEnd, onSpeech, onInterim, disabled }:
     };
 
     recognition.onend = () => {
-      // Clear any remaining interim text
-      if (lastInterimRef.current && onInterim) {
-        onInterim('');
-      }
-      lastInterimRef.current = '';
-      
-      // Only reset to idle if we're not in error state
-      setState(prev => prev === 'error' ? 'error' : 'idle');
+      if (recognitionRef.current !== recognition) return;
       recognitionRef.current = null;
+      const hadInterim = !!lastInterimRef.current;
+      lastInterimRef.current = '';
+      setState(prev => prev === 'error' ? 'error' : 'idle');
+      if (hadInterim && onInterim) onInterim('');
       if (onEnd) onEnd();
     };
 
     return recognition;
-  }, [onStart, onEnd, onSpeech, onInterim]);
+  }, [onEnd, onSpeech, onInterim]);
 
   const startRecording = useCallback(async () => {
     if (!isWebSpeechSupported()) {
@@ -248,14 +266,20 @@ export function VoiceRecorder({ onStart, onEnd, onSpeech, onInterim, disabled }:
       return;
     }
 
+    abortRecording();
     setState('requesting');
     setError(null);
 
+    let requested = false;
     try {
       const recognition = createRecognition();
       recognitionRef.current = recognition;
+      requested = true;
+      onStart?.();
+      if (recognitionRef.current !== recognition) return;
       recognition.start();
     } catch (err) {
+      abortRecording();
       console.error('Failed to start speech recognition:', err);
       setError({
         type: 'unknown',
@@ -263,8 +287,9 @@ export function VoiceRecorder({ onStart, onEnd, onSpeech, onInterim, disabled }:
         recoverable: true,
       });
       setState('error');
+      if (requested) onEnd?.();
     }
-  }, [createRecognition]);
+  }, [abortRecording, createRecognition, onStart, onEnd]);
 
 
   const handleButtonClick = useCallback(() => {
@@ -308,4 +333,4 @@ export function VoiceRecorder({ onStart, onEnd, onSpeech, onInterim, disabled }:
       )}
     </div>
   );
-}
+});

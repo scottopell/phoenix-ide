@@ -93,6 +93,7 @@ function FixtureConversation({ scenario }: { scenario: CoordinatorScenario }) {
         <div id="app">
           <div className="conversation-column">
             <MessageList
+              streamingRequestId={null}
               messages={transcript.messages}
               pendingMessages={[]}
               convState={convState}

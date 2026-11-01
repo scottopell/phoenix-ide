@@ -1,0 +1,17 @@
+.streaming-table-fixture {
+  width: 100%;
+  min-width: 0;
+}
+
+.streaming-table-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px;
+}
+
+.streaming-table-fixture h2 {
+  font-size: 12px;
+  margin: 8px 0;
+  color: var(--text-muted);
+}

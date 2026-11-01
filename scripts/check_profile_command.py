@@ -117,38 +117,6 @@ def measure(
     if not command:
         raise ValueError("missing command after --")
 
-    started_wall_ns = time.time_ns()
-    started_monotonic_ns = time.monotonic_ns()
-    child_pid = os.fork()
-    if child_pid == 0:
-        try:
-            # Remain in the wrapper's process group. The owning check step can
-            # then terminate the complete wrapped tree with one group signal.
-            os.execvp(command[0], command)
-        except OSError as error:
-            print(f"check profile wrapper: cannot execute {command[0]}: {error}", file=sys.stderr)
-            os._exit(127)
-
-    previous_handlers: dict[int, object] = {}
-    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        previous_handlers[signum] = signal.getsignal(signum)
-        signal.signal(signum, lambda received, _frame, pid=child_pid: _forward_signal(pid, received))
-
-    try:
-        waited_pid, status, usage = os.wait4(child_pid, 0)
-        assert waited_pid == child_pid
-    finally:
-        for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
-
-    finished_monotonic_ns = time.monotonic_ns()
-    if os.WIFEXITED(status):
-        returncode = os.WEXITSTATUS(status)
-    elif os.WIFSIGNALED(status):
-        returncode = -os.WTERMSIG(status)
-    else:
-        returncode = 1
-
     nextest_name = os.environ.get("NEXTEST_TEST_NAME")
     nextest_binary = os.environ.get("NEXTEST_BINARY_ID")
     if nextest_name is None and "--exact" in command:
@@ -161,6 +129,132 @@ def measure(
         f"rust:{nextest_binary}:{nextest_name}"
         if nextest_name and nextest_binary else f"command:{command[0]}"
     )
+    evidence_dir = output_dir if output_dir is not None else (output or output_jsonl).parent
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    invocation_id = f"{os.getpid()}-{uuid.uuid4().hex}"
+    start_path = evidence_dir / f"invocation-{invocation_id}.start"
+    stdout_path = evidence_dir / f"invocation-{invocation_id}.stdout.log"
+    stderr_path = evidence_dir / f"invocation-{invocation_id}.stderr.log"
+    context = {
+        "invocation_id": invocation_id,
+        "identity": identity or inferred_identity,
+        "command": command,
+        "parent_pid": os.getpid(),
+        "test_name": nextest_name,
+        "binary_id": nextest_binary,
+        "attempt": os.environ.get("NEXTEST_ATTEMPT"),
+        "start_file": str(start_path),
+        "stdout_file": str(stdout_path),
+        "stderr_file": str(stderr_path),
+    }
+    started_wall_ns = time.time_ns()
+    started_monotonic_ns = time.monotonic_ns()
+
+    with stdout_path.open("wb", buffering=0) as stdout_writer, \
+         stderr_path.open("wb", buffering=0) as stderr_writer, \
+         stdout_path.open("rb", buffering=0) as stdout_reader, \
+         stderr_path.open("rb", buffering=0) as stderr_reader:
+        child_pid = os.fork()
+        if child_pid == 0:
+            try:
+                _write_atomic(start_path, {
+                    "schema_version": SCHEMA_VERSION,
+                    "event": "started",
+                    "started_unix_ns": started_wall_ns,
+                    **context,
+                    "pid": os.getpid(),
+                })
+                os.dup2(stdout_writer.fileno(), 1)
+                os.dup2(stderr_writer.fileno(), 2)
+                # Remain in the wrapper's process group. The owning check step can
+                # then terminate the complete wrapped tree with one group signal.
+                os.execvp(command[0], command)
+            except OSError as error:
+                print(f"check profile wrapper: cannot execute {command[0]}: {error}", file=sys.stderr)
+                os._exit(127)
+
+        owned_child_pid: int | None = child_pid
+        forwarded_signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+        def forward_signal(received, _frame):
+            if owned_child_pid is not None:
+                _forward_signal(owned_child_pid, received)
+
+        destinations = {"stdout": sys.stdout.buffer, "stderr": sys.stderr.buffer}
+        forwarding_errors = []
+
+        def forward_output(stream, chunk):
+            destination = destinations.get(stream)
+            if destination is None:
+                return
+            try:
+                destination.write(chunk)
+                destination.flush()
+            except OSError as error:
+                forwarding_errors.append({
+                    "stream": stream, "errno": error.errno, "error": str(error),
+                })
+                del destinations[stream]
+                # Buffered Python streams may retry the failed write at shutdown.
+                with open(os.devnull, "wb") as sink:
+                    os.dup2(sink.fileno(), destination.fileno())
+
+        previous_handlers: dict[int, object] = {}
+        for signum in forwarded_signals:
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, forward_signal)
+
+        try:
+            forward_output("stderr", (
+                f"check profile started: {start_path} identity={context['identity']!r} "
+                f"parent_pid={context['parent_pid']} pid={child_pid}\n"
+            ).encode())
+            while True:
+                previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, forwarded_signals)
+                try:
+                    waited_pid, status, usage = os.wait4(child_pid, os.WNOHANG)
+                    if waited_pid:
+                        owned_child_pid = None
+                finally:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                for source, stream in (
+                    (stdout_reader, "stdout"), (stderr_reader, "stderr"),
+                ):
+                    if stream not in destinations:
+                        continue
+                    # Regular files preserve output even if the wrapper is killed.
+                    # Bound each live read so a noisy child cannot starve wait4.
+                    remaining = (
+                        os.fstat(source.fileno()).st_size - source.tell()
+                        if waited_pid else 65536
+                    )
+                    while remaining > 0:
+                        chunk = source.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        forward_output(stream, chunk)
+                        remaining -= len(chunk)
+                        if stream not in destinations:
+                            break
+                if waited_pid:
+                    assert waited_pid == child_pid
+                    break
+                time.sleep(0.05)
+        finally:
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
+    finished_monotonic_ns = time.monotonic_ns()
+    if os.WIFEXITED(status):
+        returncode = os.WEXITSTATUS(status)
+    elif os.WIFSIGNALED(status):
+        returncode = -os.WTERMSIG(status)
+    else:
+        returncode = 1
+
+    wrapper_returncode = returncode if returncode >= 0 else 128 - returncode
+    if forwarding_errors and wrapper_returncode == 0:
+        wrapper_returncode = 1
+
     record = _record(
         identity=identity or inferred_identity,
         started_wall_ns=started_wall_ns,
@@ -170,17 +264,16 @@ def measure(
         system_cpu_ms=usage.ru_stime * 1000.0,
         provenance=PROCESS_TREE_PROVENANCE,
         extra={
-            "command": command,
+            **context,
             "pid": child_pid,
             "returncode": returncode,
+            "wrapper_returncode": wrapper_returncode,
+            "forwarding_errors": forwarding_errors,
             "kind": (
                 "rust_test" if nextest_name
                 else "step" if (identity or "").startswith("step:")
                 else "command"
             ),
-            "test_name": nextest_name,
-            "binary_id": nextest_binary,
-            "attempt": os.environ.get("NEXTEST_ATTEMPT"),
             # wait4 is exact for the command and descendants it reaped. A daemonized
             # descendant is outside that accounting boundary and cannot be proven
             # closed portably from this wrapper.
@@ -188,7 +281,7 @@ def measure(
         },
     )
     _write_record(record=record, output=output, output_dir=output_dir, output_jsonl=output_jsonl)
-    return returncode if returncode >= 0 else 128 - returncode
+    return wrapper_returncode
 
 
 def main(argv: list[str] | None = None) -> int:

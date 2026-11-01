@@ -209,11 +209,6 @@ impl ModelEffort {
     ];
 
     #[must_use]
-    pub const fn needs_extended_output_headroom(self) -> bool {
-        matches!(self, Self::Xhigh | Self::Max)
-    }
-
-    #[must_use]
     pub const fn as_wire_name(self) -> &'static str {
         match self {
             Self::None => "none",
@@ -344,6 +339,7 @@ impl EffectiveEffort {
 
 #[derive(Debug, Clone)]
 pub struct LlmRequestTelemetry {
+    pub capacity_plan_id: Option<String>,
     pub conversation_id: String,
     pub root_conversation_id: String,
     pub request_id: String,
@@ -418,6 +414,9 @@ pub enum LlmAttemptOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlmAttemptMetrics {
+    // owned: pre-capacity metrics have no prepared-plan identity.
+    #[serde(default)]
+    pub capacity_plan_id: Option<String>,
     pub conversation_id: String,
     pub root_conversation_id: String,
     pub request_id: String,
@@ -456,6 +455,7 @@ struct LlmAttemptCaptureState {
 
 #[derive(Debug, Clone)]
 struct LlmAttemptIdentity {
+    capacity_plan_id: Option<String>,
     conversation_id: String,
     root_conversation_id: String,
     request_id: String,
@@ -502,6 +502,7 @@ impl LlmAttemptCapture {
     ) {
         if let Ok(mut state) = self.0.lock() {
             state.identity = Some(LlmAttemptIdentity {
+                capacity_plan_id: telemetry.capacity_plan_id.clone(),
                 conversation_id: telemetry.conversation_id.clone(),
                 root_conversation_id: telemetry.root_conversation_id.clone(),
                 request_id: telemetry.request_id.clone(),
@@ -522,6 +523,7 @@ impl LlmAttemptCapture {
         }
         let identity = state.identity.clone()?;
         let metrics = LlmAttemptMetrics {
+            capacity_plan_id: identity.capacity_plan_id,
             conversation_id: identity.conversation_id,
             root_conversation_id: identity.root_conversation_id,
             request_id: identity.request_id,
@@ -556,6 +558,7 @@ impl LlmAttemptCapture {
             return LlmAttemptCancellationClaim::NotStarted;
         };
         let metrics = LlmAttemptMetrics {
+            capacity_plan_id: identity.capacity_plan_id,
             conversation_id: identity.conversation_id,
             root_conversation_id: identity.root_conversation_id,
             request_id: identity.request_id,
@@ -602,6 +605,7 @@ impl LlmAttemptCapture {
         }
         let identity = state.identity.clone()?;
         let metrics = LlmAttemptMetrics {
+            capacity_plan_id: identity.capacity_plan_id,
             conversation_id: identity.conversation_id,
             root_conversation_id: identity.root_conversation_id,
             request_id: identity.request_id,
@@ -649,7 +653,9 @@ pub struct LlmRequest {
     pub provider_replay: Option<super::provider_replay::AnthropicReplayPayload>,
     pub responses_replay: Vec<super::responses_replay::ResponsesResponseSet>,
     pub tool_availability: super::tool_availability::ToolAvailability,
-    pub max_tokens: Option<u32>,
+    /// Concrete output limit, also used for input-capacity reservation.
+    /// Agent-turn defaults and bounded utility calls follow REQ-LLM-004f.
+    pub max_tokens: u32,
     pub effective_effort: EffectiveEffort,
     pub service_tier: EffectiveServiceTier,
     pub telemetry: Option<LlmRequestTelemetry>,
@@ -661,23 +667,12 @@ pub struct LlmRequest {
 }
 
 impl LlmRequest {
+    /// The resolved output-token budget (REQ-LLM-004f). Equal to
+    /// `max_tokens` — a named accessor for call-site clarity. There is no
+    /// effort-based recomputation here: the budget was already resolved once
+    /// when the request was built.
     #[must_use]
-    pub fn reserved_output_tokens(&self) -> u32 {
-        self.raised_output_token_ceiling().unwrap_or_else(|| {
-            if self
-                .effective_effort
-                .level()
-                .is_some_and(ModelEffort::needs_extended_output_headroom)
-            {
-                64_000
-            } else {
-                16_384
-            }
-        })
-    }
-
-    #[must_use]
-    pub const fn raised_output_token_ceiling(&self) -> Option<u32> {
+    pub const fn reserved_output_tokens(&self) -> u32 {
         self.max_tokens
     }
 }
@@ -939,6 +934,65 @@ pub struct ToolDefinition {
     pub defer_loading: bool,
 }
 
+/// Presence evidence for canonical usage, independent of its numeric values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)] // independent provider-field presence, not lifecycle state
+pub struct UsageObservation {
+    pub input_total: bool,
+    pub output: bool,
+    pub cache_write: bool,
+    pub cache_read: bool,
+}
+
+impl UsageObservation {
+    #[must_use]
+    pub fn responses(value: &serde_json::Value) -> Self {
+        Self {
+            input_total: value
+                .get("input_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .is_some(),
+            output: value
+                .get("output_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .is_some(),
+            cache_write: value
+                .pointer("/input_tokens_details/cache_write_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .is_some(),
+            cache_read: value
+                .pointer("/input_tokens_details/cached_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .is_some(),
+        }
+    }
+    #[must_use]
+    pub fn chat(value: &serde_json::Value) -> Self {
+        Self {
+            input_total: value
+                .get("prompt_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .is_some(),
+            output: value
+                .get("completion_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .is_some(),
+            cache_write: false,
+            cache_read: value
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .is_some(),
+        }
+    }
+}
+
 /// LLM response
 #[derive(Debug, Clone)]
 pub struct LlmResponse {
@@ -948,6 +1002,7 @@ pub struct LlmResponse {
     pub provider_replay: Option<super::provider_replay::ProviderReplayUpdate>,
     pub end_turn: bool,
     pub usage: Usage,
+    pub usage_observation: UsageObservation,
     pub stream_telemetry: ProviderStreamTelemetry,
 }
 
@@ -959,6 +1014,7 @@ impl LlmResponse {
             provider_replay: None,
             end_turn,
             usage,
+            usage_observation: UsageObservation::default(),
             stream_telemetry: ProviderStreamTelemetry::non_streaming(),
         }
     }
@@ -1070,13 +1126,12 @@ mod attempt_capture_tests {
             provider_replay: None,
             responses_replay: Vec::new(),
             tool_availability: crate::domain::tool_availability::ToolAvailability::all(vec![]),
-            max_tokens: Some(50),
+            max_tokens: 50,
             effective_effort: EffectiveEffort::native_known(ModelEffort::Max),
             service_tier: EffectiveServiceTier::Standard,
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         };
-        assert_eq!(request.raised_output_token_ceiling(), Some(50));
         assert_eq!(request.reserved_output_tokens(), 50);
     }
 
@@ -1106,6 +1161,7 @@ mod attempt_capture_tests {
     fn timeout_and_cancellation_race_has_one_terminal_winner() {
         let capture = LlmAttemptCapture::new();
         let telemetry = LlmRequestTelemetry {
+            capacity_plan_id: Some("exact-prepared-plan".into()),
             conversation_id: "conv".to_string(),
             root_conversation_id: "root".to_string(),
             request_id: "request".to_string(),
@@ -1137,6 +1193,10 @@ mod attempt_capture_tests {
             })
             .expect("same terminal result");
 
+        assert_eq!(
+            timed_out.capacity_plan_id.as_deref(),
+            Some("exact-prepared-plan")
+        );
         assert_eq!(timed_out, cancelled);
         assert_eq!(timed_out, late_success);
         assert_eq!(timed_out.outcome, LlmAttemptOutcome::TimedOut);
@@ -1148,6 +1208,7 @@ mod attempt_capture_tests {
     fn transport_change_clears_progress_from_the_previous_transport() {
         let capture = LlmAttemptCapture::new();
         let telemetry = LlmRequestTelemetry {
+            capacity_plan_id: None,
             conversation_id: "conv".to_string(),
             root_conversation_id: "root".to_string(),
             request_id: "request".to_string(),
@@ -1178,6 +1239,7 @@ mod attempt_capture_tests {
             LlmAttemptCancellationClaim::NotStarted
         );
         let telemetry = LlmRequestTelemetry {
+            capacity_plan_id: None,
             conversation_id: "conv".to_string(),
             root_conversation_id: "root".to_string(),
             request_id: "request".to_string(),
@@ -1220,6 +1282,7 @@ mod attempt_capture_tests {
     fn cancelled_attempt_preserves_partial_provider_progress() {
         let capture = LlmAttemptCapture::new();
         let telemetry = LlmRequestTelemetry {
+            capacity_plan_id: None,
             conversation_id: "conv".to_string(),
             root_conversation_id: "root".to_string(),
             request_id: "request".to_string(),
@@ -1250,5 +1313,33 @@ mod attempt_capture_tests {
             Some(20)
         );
         assert!(!metrics.stream.completed);
+    }
+}
+
+/// Exact provider attempt that produced a canonical usage row.
+#[derive(Debug, Clone)]
+pub struct UsageAttempt {
+    pub capacity_plan_id: Option<String>,
+    pub request_id: String,
+    pub retry_attempt: u32,
+    pub observation: UsageObservation,
+}
+
+#[cfg(test)]
+mod capacity_usage_observation_tests {
+    use super::*;
+    #[test]
+    fn capacity_usage_observation_preserves_measured_zero_and_unknown_cache() {
+        let unknown = UsageObservation::responses(&serde_json::json!({}));
+        let zero =
+            UsageObservation::responses(&serde_json::json!({"input_tokens":0,"output_tokens":0}));
+        assert!(!unknown.input_total);
+        assert!(zero.input_total && zero.output);
+        assert!(!zero.cache_read && !zero.cache_write);
+        let cache_zero = UsageObservation::chat(
+            &serde_json::json!({"prompt_tokens":0,"completion_tokens":0,"prompt_tokens_details":{"cached_tokens":0}}),
+        );
+        assert!(cache_zero.input_total && cache_zero.cache_read);
+        assert!(!UsageObservation::chat(&serde_json::Value::Null).input_total);
     }
 }

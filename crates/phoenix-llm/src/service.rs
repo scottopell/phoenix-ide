@@ -67,6 +67,7 @@ fn empty_tags() -> &'static BTreeMap<String, String> {
 /// Unified service implementation that dispatches by API format
 pub struct LlmServiceImpl {
     pub spec: ModelSpec,
+    request_name: crate::models::RequestModelName,
     /// LLM auth: credential source + header style.
     pub auth: LlmAuth,
     pub anthropic_base_url: Option<String>,
@@ -108,6 +109,7 @@ impl LlmServiceImpl {
         request_tags: BTreeMap<String, String>,
     ) -> Self {
         Self {
+            request_name: spec.default_request_name.clone(),
             spec,
             auth,
             anthropic_base_url,
@@ -134,6 +136,7 @@ impl LlmServiceImpl {
         codex_credential: Arc<AccountBoundCodexCredential>,
     ) -> Self {
         Self {
+            request_name: spec.default_request_name.clone(),
             spec,
             auth,
             anthropic_base_url: None,
@@ -148,6 +151,12 @@ impl LlmServiceImpl {
             codex_ws_sessions: Arc::new(Mutex::new(openai::CodexWsSessions::default())),
             attempt_deadline: LlmAttemptDeadline::default(),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_request_name(mut self, name: crate::models::RequestModelName) -> Self {
+        self.request_name = name;
+        self
     }
 
     #[must_use]
@@ -174,6 +183,34 @@ impl LlmServiceImpl {
 
 #[async_trait]
 impl LlmService for LlmServiceImpl {
+    async fn count_input(
+        &self,
+        request: &LlmRequest,
+    ) -> Result<Option<super::ProviderInputCount>, LlmError> {
+        if self.uses_official_openai_responses() {
+            let key = self.auth.resolve().await?.credential;
+            openai::count_input(
+                &self.spec,
+                &self.request_name,
+                &key,
+                &self.headers_for_provider(),
+                request,
+            )
+            .await
+            .map(Some)
+        } else if self.uses_official_anthropic() {
+            anthropic::count_input(
+                &self.spec,
+                &self.request_name,
+                &self.resolve_auth().await?,
+                &self.headers_for_provider(),
+                request,
+            )
+            .await
+        } else {
+            Ok(None)
+        }
+    }
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         self.begin_provider_attempt(request, self.attempt_transport(false));
         Box::pin(enforce_attempt_deadline(
@@ -231,6 +268,23 @@ impl LlmService for LlmServiceImpl {
         &self.spec.id
     }
 
+    fn diagnostic_route_class(&self) -> phoenix_core::domain::request_capacity::SafeRouteClass {
+        use phoenix_core::domain::request_capacity::SafeRouteClass as R;
+        match self.spec.backend.api_format() {
+            ApiFormat::Anthropic if self.anthropic_base_url.is_none() => R::AnthropicDirect,
+            ApiFormat::Anthropic => R::AnthropicCompatible,
+            ApiFormat::OpenAIResponses if self.use_codex_backend => R::CodexAuth,
+            ApiFormat::OpenAIResponses if self.openai_responses_base_url.is_none() => {
+                R::OpenAiResponsesDirect
+            }
+            ApiFormat::OpenAIResponses => R::OpenAiResponsesCompatible,
+            ApiFormat::OpenAIChatCompletions if self.openai_chat_completions_base_url.is_none() => {
+                R::ChatCompletionsDirect
+            }
+            ApiFormat::OpenAIChatCompletions => R::ChatCompletionsCompatible,
+        }
+    }
+
     fn continuation_route_key(&self) -> String {
         let endpoint = match self.spec.backend.api_format() {
             ApiFormat::Anthropic => self
@@ -252,7 +306,7 @@ impl LlmService for LlmServiceImpl {
         let route = format!(
             "{}:{}:{endpoint}",
             self.spec.backend.header_value(),
-            self.spec.api_name
+            self.request_name.as_str()
         );
         if self.use_codex_backend {
             let account_id = self
@@ -284,7 +338,7 @@ impl LlmService for LlmServiceImpl {
     }
 
     fn continuation_request_limits(&self) -> super::ContinuationRequestLimits {
-        if self.use_codex_backend && openai::supports_responses_lite(&self.spec.api_name) {
+        if self.use_codex_backend && openai::supports_responses_lite(&self.spec) {
             super::ContinuationRequestLimits::codex_responses_lite()
         } else if self.use_codex_backend {
             super::ContinuationRequestLimits::codex_bridge()
@@ -295,27 +349,11 @@ impl LlmService for LlmServiceImpl {
 }
 
 impl LlmServiceImpl {
-    /// Build the custom headers for a request, auto-injecting `provider` based on the model spec.
+    /// Build explicit custom headers and native Codex headers.
     /// When the Codex bridge is in use, the account ID is pinned to the same
     /// registry generation as its discovered model catalog.
     fn headers_for_provider(&self) -> Vec<(String, String)> {
         let mut headers = self.custom_headers.clone();
-        if !headers.is_empty()
-            || self.anthropic_base_url.is_some()
-            || self.openai_responses_base_url.is_some()
-            || self.openai_chat_completions_base_url.is_some()
-        {
-            // Auto-inject provider header if not already present
-            if !headers
-                .iter()
-                .any(|(k, _)| k.eq_ignore_ascii_case("provider"))
-            {
-                headers.push((
-                    "provider".to_string(),
-                    self.spec.provider_header_value().to_string(),
-                ));
-            }
-        }
         if let Some(ref cred) = self.codex_credential {
             headers.retain(|(name, _)| !name.eq_ignore_ascii_case("chatgpt-account-id"));
             headers.push((
@@ -352,7 +390,7 @@ impl LlmServiceImpl {
         }
         if self.spec.backend.api_format() == ApiFormat::OpenAIResponses
             && self.use_codex_backend
-            && crate::openai::supports_responses_lite(&self.spec.api_name)
+            && crate::openai::supports_responses_lite(&self.spec)
         {
             super::LlmTransport::Websocket
         } else {
@@ -381,6 +419,7 @@ impl LlmServiceImpl {
                 let headers = self.headers_for_provider();
                 anthropic::complete(
                     &self.spec,
+                    &self.request_name,
                     &resolved,
                     self.anthropic_base_url.as_deref(),
                     &headers,
@@ -394,6 +433,7 @@ impl LlmServiceImpl {
                 let headers = self.headers_for_provider();
                 openai::complete(
                     &self.spec,
+                    &self.request_name,
                     &key,
                     self.openai_responses_base_url.as_deref(),
                     &headers,
@@ -408,6 +448,7 @@ impl LlmServiceImpl {
                 let headers = self.headers_for_provider();
                 openai::complete_chat(
                     &self.spec,
+                    &self.request_name,
                     &key,
                     self.openai_chat_completions_base_url.as_deref(),
                     &headers,
@@ -430,6 +471,7 @@ impl LlmServiceImpl {
                 let headers = self.headers_for_provider();
                 anthropic::complete_streaming(
                     &self.spec,
+                    &self.request_name,
                     &resolved,
                     self.anthropic_base_url.as_deref(),
                     &headers,
@@ -444,6 +486,7 @@ impl LlmServiceImpl {
                 let headers = self.headers_for_provider();
                 openai::complete_streaming(
                     &self.spec,
+                    &self.request_name,
                     &key,
                     self.openai_responses_base_url.as_deref(),
                     &headers,
@@ -460,6 +503,7 @@ impl LlmServiceImpl {
                 let headers = self.headers_for_provider();
                 openai::complete_streaming_chat(
                     &self.spec,
+                    &self.request_name,
                     &key,
                     self.openai_chat_completions_base_url.as_deref(),
                     &headers,
@@ -524,10 +568,11 @@ mod tests {
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 vec![],
             ),
-            max_tokens: None,
+            max_tokens: 16_384,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
             telemetry: Some(crate::LlmRequestTelemetry {
+                capacity_plan_id: None,
                 conversation_id: "conversation".to_string(),
                 root_conversation_id: "root".to_string(),
                 request_id: "request".to_string(),
@@ -703,7 +748,7 @@ mod tests {
             .find(|model| model.id == "gpt-5.6-sol")
             .expect("gpt-5.6-sol must be in the model registry");
         spec.backend = crate::ModelBackend::OpenAIResponses;
-        spec.api_name = "unsupported-codex-model".to_string();
+        spec.id = "unsupported-codex-model".into();
         let mut service = LlmServiceImpl::new(
             spec,
             LlmAuth::new(Arc::new(MissingCredential), AuthStyle::PlainBearer),
@@ -728,7 +773,7 @@ mod tests {
             .find(|model| model.id == "gpt-5.6-sol")
             .expect("gpt-5.6-sol must be in the model registry");
         spec.backend = crate::ModelBackend::OpenAIResponses;
-        spec.api_name = "unsupported-codex-model".to_string();
+        spec.id = "unsupported-codex-model".into();
         let mut service = LlmServiceImpl::new(
             spec,
             LlmAuth::new(Arc::new(MissingCredential), AuthStyle::PlainBearer),
@@ -763,7 +808,7 @@ mod tests {
             .find(|model| model.id == "gpt-5.6-sol")
             .expect("gpt-5.6-sol must be in the model registry");
         spec.backend = crate::ModelBackend::OpenAIResponses;
-        spec.api_name = "unsupported-codex-model".to_string();
+        spec.id = "unsupported-codex-model".into();
         let mut service = LlmServiceImpl::new(
             spec,
             LlmAuth::new(Arc::new(DelayedCredential), AuthStyle::PlainBearer),
@@ -902,7 +947,7 @@ mod tests {
             .into_iter()
             .find(|spec| spec.id == "gpt-6-astra")
             .unwrap();
-        spec.api_name = "gpt-6-astra".to_string();
+        spec.default_request_name = "gpt-6-astra".into();
         let auth = LlmAuth::new(
             Arc::clone(&bound) as Arc<dyn CredentialSource>,
             AuthStyle::PlainBearer,
@@ -915,6 +960,14 @@ mod tests {
 
         let headers = service.headers_for_provider();
         assert!(!headers.iter().any(|(_, value)| value == "custom-account"));
+        assert!(!headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("provider")));
+        assert!(service.continuation_route_key().contains(":gpt-6-astra:"));
+        assert_eq!(
+            service.attempt_transport(true),
+            crate::LlmTransport::Websocket
+        );
         assert!(headers.iter().any(|(name, value)| name
             .eq_ignore_ascii_case("chatgpt-account-id")
             && value == "catalog-account"));
@@ -926,9 +979,10 @@ mod tests {
             .into_iter()
             .find(|spec| spec.id == "gpt-6-astra")
             .expect("Astra spec");
-        spec.api_name = "gpt-6-astra".to_string();
+        spec.default_request_name = "gpt-6-astra".into();
         let auth = LlmAuth::new(Arc::new(StaticCredential::new("k")), AuthStyle::PlainBearer);
         let service = LlmServiceImpl {
+            request_name: spec.default_request_name.clone(),
             spec,
             auth,
             anthropic_base_url: None,
@@ -957,6 +1011,7 @@ mod tests {
                 .unwrap();
             let auth = LlmAuth::new(Arc::new(StaticCredential::new("k")), AuthStyle::PlainBearer);
             let service = LlmServiceImpl {
+                request_name: spec.default_request_name.clone(),
                 spec,
                 auth,
                 anthropic_base_url: None,
@@ -986,7 +1041,7 @@ mod tests {
             .find(|s| s.id == "gpt-5.6-sol")
             .expect("gpt-5.6-sol must be in the model registry");
         spec.backend = crate::ModelBackend::OpenAIChatCompletions;
-        spec.api_name = api_name.to_string();
+        spec.default_request_name = api_name.into();
         let auth = LlmAuth::new(Arc::new(StaticCredential::new("k")), AuthStyle::PlainBearer);
         LlmServiceImpl::new(
             spec,
@@ -1002,8 +1057,66 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn mapped_claude_and_gpt_requests_use_alias_without_implicit_provider_header() {
+        use axum::{
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            routing::post,
+            Json, Router,
+        };
+        async fn capture(
+            State(tx): State<
+                tokio::sync::mpsc::UnboundedSender<(serde_json::Value, Option<String>)>,
+            >,
+            headers: HeaderMap,
+            Json(body): Json<serde_json::Value>,
+        ) -> (StatusCode, &'static str) {
+            tx.send((
+                body,
+                headers
+                    .get("provider")
+                    .map(|v| v.to_str().unwrap().to_owned()),
+            ))
+            .unwrap();
+            (StatusCode::BAD_REQUEST, "{}")
+        }
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<(serde_json::Value, Option<String>)>();
+        let app = Router::new()
+            .route("/messages", post(capture))
+            .route("/responses", post(capture))
+            .with_state(tx);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for (id, path, alias) in [
+            ("claude-sonnet-5-5", "messages", "anthropic/claude-sonnet-5"),
+            ("gpt-6.1-sol", "responses", "gateway/gpt-sol"),
+        ] {
+            let spec = all_models().into_iter().find(|s| s.id == id).unwrap();
+            let before = spec.effort_capabilities.clone();
+            let service = LlmServiceImpl::new(
+                spec,
+                LlmAuth::new(Arc::new(StaticCredential::new("key")), AuthStyle::ApiKey),
+                (path == "messages").then(|| format!("{base}/messages")),
+                (path == "responses").then(|| format!("{base}/responses")),
+                None,
+                vec![],
+                BTreeMap::new(),
+            )
+            .with_request_name(alias.into());
+            assert_eq!(service.spec.effort_capabilities, before);
+            assert!(service.complete(&request_with_capture().0).await.is_err());
+            let (body, provider) = rx.try_recv().expect("request captured before HTTP reply");
+            assert_eq!(body["model"], alias);
+            assert_eq!(provider, None);
+        }
+        server.abort();
+    }
+
     #[test]
-    fn provider_header_uses_api_name_prefix_for_gateway_models() {
+    fn request_name_prefix_does_not_inject_provider_header() {
         let svc = chat_gateway_service_with_api_name("gateway-provider/example-org/Code-Model");
         let headers = svc.headers_for_provider();
         assert_eq!(
@@ -1011,7 +1124,7 @@ mod tests {
                 .iter()
                 .find(|(key, _)| key.eq_ignore_ascii_case("provider"))
                 .map(|(_, value)| value.as_str()),
-            Some("gateway-provider")
+            None
         );
     }
 

@@ -26,7 +26,7 @@
 --     within a ResourceScope but do NOT survive a Phoenix restart (see
 --     specs/tmux-integration/ for the persistent path)
 --
--- Requirement traceability: REQ-BASH-001 through REQ-BASH-016,
+-- Requirement traceability: REQ-BASH-001 through REQ-BASH-017,
 --   REQ-BASH-WS-001, REQ-BASH-WS-002. REQ-BASH-011 (command safety) is
 --   enforced by the permission seam (specs/permissions/) and is not modelled
 --   as a bash run-path rule here. REQ-BASH-010a..010c (terminal-edge
@@ -320,12 +320,6 @@ entity Handle {
     kill_signal_sent:  KillSignal? when status = kill_pending_kernel
 }
 
--- A durable wake attached to a background handle. Coordinator handles are
--- manually polled and never acquire this relationship.
-entity DurableWorkScopeWake {
-    handle: Handle
-}
-
 -- A WorkScope inventory reconciliation scheduled from a terminal lifecycle
 -- edge. Coordinator handle lifecycle is consumed without creating one.
 entity WorkScopeReconciliation {
@@ -398,6 +392,29 @@ config {
 --       and changes no command, path, scope, operation, handle, or wait value.
 --
 
+deferred BashPostLaunchSettlement
+    -- REQ-BASH-017. Implemented at bash/operations.rs::settle_unregistered_run
+    -- and bash/registry.rs::SpawnReservation. This is the exception path when
+    -- the OS returned an owned Child but birth identity or registration failed;
+    -- HandleSpawned and the registered wait-window rules do not create a Handle
+    -- on this path. A failed OS spawn alone returns spawn_failed.
+    -- Before the first await after OS launch, transfer the child and reservation
+    -- into a caller-independent owner task. Registration is bounded to one second.
+    -- An unregistered child keeps bounded ring readers open during natural-exit
+    -- grace, then start_kill on the held Child only, then a bounded owned wait.
+    -- No birth re-probe, numeric-PID signal, group signal, replay or handle adoption.
+    -- Cached try_wait terminal status is authoritative. Reader drain begins only
+    -- after direct-child terminal observation and lasts at most 200ms. Settlement
+    -- exhaustion closes capture explicitly as incomplete, returns outcome_unknown,
+    -- and delegates the unreaped child to Tokio's orphan reaper. Exit/killed
+    -- responses without handles are unregistered_exited/unregistered_killed.
+    -- Every unregistered response marks descendants unverified. Dropping the
+    -- reservation releases pending admission and records scope uncertainty before
+    -- notifying teardown. The uncertainty fences further spawn admission and is
+    -- surfaced through the retirement failure report; it never authorizes signals.
+    -- Teardown must return that failure, not wait forever or certify absence.
+    -- Unverified descendant scratch is retained, not recursively removed.
+
 deferred BashTerminalEdgeWorkScopeReconciliation
     -- REQ-BASH-010a, REQ-BASH-010b, REQ-BASH-010c. When a Work-owned bash handle
     -- reaches a terminal lifecycle edge, Phoenix schedules one authoritative local-Git
@@ -431,24 +448,24 @@ rule PhoenixSetsSubreaperOnStartup {
         -- still runs.
 }
 
--- REQ-BASH-007: at Phoenix shutdown, walk the live handle table and SIGKILL
--- every process group as a final cleanup pass. SIGKILL rather than SIGTERM
--- because Phoenix is exiting anyway — graceful-shutdown handlers in the
--- children would race with our exit.
+-- REQ-BASH-007: bounded best-effort shutdown, not a tree-reaping guarantee.
 rule PhoenixKillsLiveHandlesOnShutdown {
     when: PhoenixShutdownInitiated()
 
-    ensures: AllLiveHandleGroupsSigkilled()
-        -- Composite: for every Handle h with status = running, kill(-h.pgid, SIGKILL).
-    ensures: ShutdownKillGraceObserved(config.shutdown_kill_grace_seconds)
-        -- Wait briefly for the kernel to deliver exit before we leave.
+    ensures: IncarnationBoundShutdownPassBounded(config.shutdown_kill_grace_seconds)
+        -- Snapshot registered handles, attempt SIGKILL only through retained
+        -- incarnation-bound authority, and observe available exit notifications
+        -- within one shared deadline, including registry-lock acquisition.
+    ensures: UnverifiedShutdownEvidenceRetained()
+        -- Unsupported signaling, errors, and deadline expiry remain incomplete;
+        -- this pass must not discard registry or scratch evidence.
 
     @guidance
-        -- The reaper bit set at startup ensures that descendants reparented
-        -- to Phoenix are visible in the handle's process group; the SIGKILL
-        -- to -pgid catches them along with the immediate child. Any
-        -- escapees that re-setpgid'd remain a known limitation; they will
-        -- linger as orphans in the user's session until init reaps them.
+        -- Release registry locks before signal attempts or exit observation.
+        -- Never fall back to a raw numeric PID/PGID signal. Unsupported platforms
+        -- fail closed and report incomplete cleanup. A successful signal or
+        -- leader exit does not prove descendant absence or complete group reaping.
+        -- Subreaper adoption does not place escapees into the original group.
 }
 
 ------------------------------------------------------------
@@ -511,10 +528,12 @@ rule HandleSpawned {
         --   3. Check live cap. On reject, return handle_cap_reached;
         --      RunRejectedByCap governs.
         --   4. Allocate a globally unique opaque handle_id.
-        --   5. Spawn child via Command::new("bash").args(["-c", cmd]) with
-        --      pre_exec(setpgid(0,0)) so the child becomes its own process
-        --      group leader. stdout and stderr piped, stdin null. Working
-        --      dir from spawn_target.canonical_working_dir.
+        --   5. Launch a held native process-group leader without the user command
+        --      or environment. Capture birth identity exactly once and register
+        --      within a bounded caller-independent task. Identity/registration
+        --      failure invokes BashPostLaunchSettlement without releasing the
+        --      command or creating a controllable Handle. Registered pending
+        --      gates count once against capacity, but retain teardown custody.
         --   6. Spawn two reader tasks (stdout, stderr) feeding the same ring
         --      under a mutex. Each task ingests bytes, splits on '\n', and
         --      appends RingLine entries with monotonically increasing
@@ -523,8 +542,14 @@ rule HandleSpawned {
         --      HandleProcessExited / HandleProcessSignaled (depending on
         --      whether the kernel reported a status code or only a signal
         --      number).
-        --   8. The agent's response is shaped by RunExitsWithinWait or
-        --      RunExceedsWait, depending on which event fires first.
+        --   8. After waiter and reader custody exist, release the bounded command
+        --      payload. Direct restores its environment and null stdin; Explore
+        --      enters the existing sandbox before command execution. Exec retains
+        --      the captured process identity. Settle the pending gate lease.
+        --      Failed release retains the Handle and sticky scope uncertainty,
+        --      returning launch_release_unknown with no automatic retry; complete
+        --      delivery followed by EOF may have allowed execution. Otherwise the
+        --      response is shaped by RunExitsWithinWait or RunExceedsWait.
 }
 
 -- REQ-BASH-016: the Coordinator runtime surface discovers only its live
@@ -731,13 +756,14 @@ rule RingLineAppended {
         -- this model's granularity output is a sequence of complete lines.
 }
 
--- REQ-BASH-004: oldest line evicted because ring_bytes_used exceeded the
--- byte cap.
+-- REQ-BASH-004: oldest line evicted because retained content bytes or
+-- retained line count exceeded the cap (empty lines still occupy records).
 rule RingLineEvicted {
     when: RingBufferOverflow(handle)
 
     requires: handle.status = running
     requires: handle.ring_bytes_used > config.ring_buffer_bytes
+        or count(handle.ring_lines) > config.ring_buffer_bytes
     requires: count(handle.ring_lines) > 1
 
     let oldest = first_line(handle.ring_lines)
@@ -1108,6 +1134,10 @@ rule HandleKillNotFound {
 -- Rules — conversation hard-delete cascade
 ------------------------------------------------------------
 
+-- These execution-row cascade rules apply only when the ProductConversation
+-- is not being retired. Aggregate Close/Delete uses durable retirement authority:
+-- same-aggregate continuation/subagent rows do not veto resource cleanup; only
+-- a distinct still-Open aggregate retains a scope, with identity conflicts surfaced.
 -- REQ-BASH-006, REQ-BASH-WS-002: conversation hard-delete tears down the
 -- ResourceScope's handle table only when no live conversation OTHER THAN the one
 -- being deleted still owns the same ResourceScope. The cascade receives the
@@ -1155,8 +1185,8 @@ rule HandlesTornDownWhenNoInheritor {
 -- sibling such as a Work-mode sub-agent sharing its parent's scope. The
 -- surviving owner keeps the running processes and tombstones; a handle spawned
 -- before the boundary stays addressable. Scope equality subsumes per-kind
--- analysis: a Direct continuation resolves to a distinct Conversation scope
--- and falls through to teardown.
+-- analysis: ordinary continuation retains its exact parent scope, including
+-- Direct/non-Git continuation. A new transcript is not a new resource owner.
 rule HandlesPreservedOnScopeMatch {
     when: ConversationHardDeleted(conversation, inheritor_scope)
 
@@ -1217,11 +1247,6 @@ invariant LiveHandleCapBound {
 invariant HandleResourceScopeScoped {
     for h in Handle:
         h.owner_scope != null
-}
-
-invariant CoordinatorHandleHasNoDurableWake {
-    for h in Handle where h.controller_scope.kind = coordinator:
-        not DurableWorkScopeWake.exists(w => w.handle = h)
 }
 
 invariant CoordinatorHandleHasNoWorkScopeReconciliation {
@@ -1297,6 +1322,14 @@ surface AgentBashAccess {
         -- foreign handle remains unavailable even if its id is learned. A
         -- continuation chain shares one owner table, while Coordinator-run
         -- handles remain controllable through their Coordinator scope.
+
+    @guarantee LaunchCustodyBeforeCommandExecution
+        -- REQ-BASH-017. On supported Linux/Darwin hosts a new command cannot
+        -- execute before exact launch identity, registry and independent waiter/
+        -- output custody exist. A failed registered release returns the retained
+        -- handle with execution uncertainty and forbids automatic retry.
+        -- Preventive gating and application restart do not reconcile historical
+        -- unverified descendants or clear an existing scope uncertainty fence.
 
     @guarantee NoSilentEviction
         -- Within a single Phoenix process lifetime, a handle handed to the

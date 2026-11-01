@@ -421,8 +421,8 @@ impl WorkflowRepository {
                 turn_id, conversation_id, client_turn_key, prepared_fingerprint,
                 prepared_payload, disposition, generation, terminal_kind,
                 terminal_reason, owns_conversation, canonical_message_id, workflow_id,
-                origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, NULL, NULL, ?7, NULL, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, NULL, NULL, ?7, NULL, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         )
         .bind(to_i64(turn_id.0, "turn_id")?)
         .bind(&input.conversation().0)
@@ -442,9 +442,25 @@ impl WorkflowRepository {
         .bind(prepared_payload.submitted.origin.db_parts().3)
     .bind(prepared_payload.submitted.origin.source_call().map(|call| call.message_id.as_str()))
     .bind(prepared_payload.submitted.origin.source_call().map(|call| call.tool_use_id.as_str()))
+    .bind(prepared_payload.submitted.origin.slack_request_id())
         .execute(&mut *tx.tx)
         .await
         .map_err(map_constraint)?;
+        if input.disposition == AcceptedDisposition::Runtime {
+            let execution = phoenix_core::domain::conversation_goal::GoalExecution::parse(
+                to_i64(workflow_id.0, "workflow_id")?,
+                to_i64(turn_id.0, "turn_id")?,
+            )
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+            crate::conversation_goals::control::capture_runtime_control_tx(
+                &mut tx.tx,
+                execution,
+                self.goal_control_installation,
+            )
+            .await
+            .map_err(crate::conversation_goals::control::db_error)?;
+            crate::conversation_goals::capture_goal_at_new_turn_tx(&mut tx.tx, execution).await?;
+        }
         insert_prepared_turn_attachments_tx(&mut tx.tx, turn_id, &prepared_payload).await?;
         if cut == TransactionCut::BeforeCommit {
             tx.rollback().await?;
@@ -1518,7 +1534,7 @@ impl WorkflowRepository {
                     ) AS materialization_committed,
                     m.message_id, m.sequence_id, m.message_type, m.content,
                     m.display_data, m.usage_data, m.created_at,
-                    m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id, m.origin_subscription_event_id, m.origin_source_message_id, m.origin_source_tool_use_id
+                    m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id, m.origin_subscription_event_id, m.origin_source_message_id, m.origin_source_tool_use_id, m.origin_slack_request_id
              FROM durable_turns dt
              JOIN conversations c ON c.id = dt.conversation_id
              LEFT JOIN messages m ON m.message_id = dt.canonical_message_id
@@ -1712,7 +1728,7 @@ impl WorkflowRepository {
         )
         .await?;
         let updated = sqlx::query(
-            "UPDATE durable_turns SET canonical_message_id = ?2
+            "UPDATE durable_turns SET canonical_message_id = ?2, materialized = 1
                  WHERE turn_id = ?1 AND generation = ?3 AND terminal_kind IS NULL
                    AND canonical_message_id IS NULL AND workflow_id = ?4",
         )
@@ -2629,6 +2645,7 @@ impl WorkflowRepository {
                        JOIN messages source ON source.message_id = occurrence.message_id
                        JOIN messages turn_input ON turn_input.message_id = ?2
                        WHERE occurrence.conversation_id = ?1
+                         AND occurrence.source_kind IN ('steering', 'seeded_fork', 'interaction_response')
                          AND (
                            occurrence.source_kind = 'interaction_response'
                            OR source.sequence_id <= turn_input.sequence_id
@@ -3077,7 +3094,8 @@ async fn load_exact_execution_occurrence_tx(
     let occurrence = sqlx::query_as::<_, (String, String, String)>(
         "SELECT occurrence.source_kind, occurrence.conversation_id, occurrence.message_id
          FROM steering_execution_occurrences occurrence
-         WHERE occurrence.conversation_id = (
+         WHERE occurrence.source_kind IN ('steering', 'seeded_fork', 'interaction_response')
+           AND occurrence.conversation_id = (
                SELECT conversation_id FROM durable_turns WHERE turn_id = ?2
            )
            AND (
@@ -3116,7 +3134,8 @@ async fn has_execution_occurrence_for_turn_tx(
         "SELECT EXISTS(
              SELECT 1
              FROM steering_execution_occurrences occurrence
-             WHERE occurrence.conversation_id = (
+             WHERE occurrence.source_kind IN ('steering', 'seeded_fork', 'interaction_response')
+               AND occurrence.conversation_id = (
                  SELECT conversation_id FROM durable_turns WHERE turn_id = ?1
              )
          )",
@@ -3162,6 +3181,18 @@ async fn settle_captured_execution_occurrence_tx(
     };
     let source_kind =
         crate::coordinator_watches::MessageExecutionSource::from_db(&occurrence.source_kind)?;
+    if matches!(
+        &source_kind,
+        crate::coordinator_watches::MessageExecutionSource::Steering
+    ) {
+        crate::product_creation::record_initial_execution_receipt_tx(
+            tx,
+            &occurrence.conversation_id,
+            &occurrence.message_id,
+            terminal,
+        )
+        .await?;
+    }
     crate::coordinator_watches::record_steering_event_tx(
         tx,
         source_kind,
@@ -3384,7 +3415,7 @@ async fn load_prepared_payload_pool(
     pool: &sqlx::SqlitePool,
     turn_id: TurnAuthorityId,
 ) -> DbResult<PreparedDirectTurnPayload> {
-    let row = sqlx::query("SELECT prepared_payload, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id FROM durable_turns WHERE turn_id = ?1")
+    let row = sqlx::query("SELECT prepared_payload, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id FROM durable_turns WHERE turn_id = ?1")
         .bind(to_i64(turn_id.0, "turn_id")?)
         .fetch_one(pool)
         .await?;
@@ -3408,7 +3439,7 @@ async fn load_prepared_payload_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     turn_id: TurnAuthorityId,
 ) -> DbResult<PreparedDirectTurnPayload> {
-    let row = sqlx::query("SELECT prepared_payload, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id FROM durable_turns WHERE turn_id = ?1")
+    let row = sqlx::query("SELECT prepared_payload, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id FROM durable_turns WHERE turn_id = ?1")
         .bind(to_i64(turn_id.0, "turn_id")?)
         .fetch_one(&mut **tx)
         .await?;
@@ -3644,8 +3675,8 @@ async fn insert_canonical_message_tx(
     sqlx::query(
         "INSERT INTO messages (
             message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at,
-            origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
     )
     .bind(&canonical_message_id.0)
     .bind(&turn.conversation.0)
@@ -3660,6 +3691,7 @@ async fn insert_canonical_message_tx(
     .bind(prepared.submitted.origin.db_parts().3)
     .bind(prepared.submitted.origin.source_call().map(|call| call.message_id.as_str()))
     .bind(prepared.submitted.origin.source_call().map(|call| call.tool_use_id.as_str()))
+    .bind(prepared.submitted.origin.slack_request_id())
     .execute(&mut *tx.tx)
     .await
     .map_err(map_constraint)?;
@@ -3725,7 +3757,7 @@ async fn load_message_by_id_tx(
     message_id: &str,
 ) -> DbResult<Message> {
     let row = sqlx::query(
-        "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id
+        "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
          FROM messages WHERE message_id = ?1",
     )
     .bind(message_id)
@@ -4210,7 +4242,6 @@ mod tests {
     use super::*;
     use crate::migrations::run_pending_migrations;
     use crate::sqlite_telemetry::test_support::EventCapture;
-    use crate::workflow::wake::{WakeRegistrationOutcome, WakeRepository};
     use crate::Database;
     use crate::LocalAttemptAuthority;
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -4244,7 +4275,7 @@ mod tests {
     }
 
     async fn setup_repo_schema(pool: &sqlx::SqlitePool) {
-        sqlx::query("CREATE TABLE conversations (id TEXT PRIMARY KEY, slug TEXT, title TEXT NOT NULL DEFAULT '', conv_mode TEXT NOT NULL DEFAULT '{\"mode\":\"Explore\"}', state TEXT NOT NULL DEFAULT '{\"type\":\"idle\"}', cwd TEXT NOT NULL DEFAULT '/tmp', parent_conversation_id TEXT, project_id TEXT, user_initiated BOOLEAN NOT NULL DEFAULT 1, archived BOOLEAN NOT NULL DEFAULT 0, model TEXT, steering_queue TEXT NOT NULL DEFAULT '[]', state_updated_at TEXT NOT NULL DEFAULT '2025-01-01', created_at TEXT NOT NULL DEFAULT '2025-01-01', updated_at TEXT NOT NULL DEFAULT '2025-01-01')").execute(pool).await.unwrap();
+        sqlx::query("CREATE TABLE conversations (id TEXT PRIMARY KEY, slug TEXT, title TEXT NOT NULL DEFAULT '', conv_mode TEXT NOT NULL DEFAULT '{\"mode\":\"Explore\"}', state TEXT NOT NULL DEFAULT '{\"type\":\"idle\"}', cwd TEXT NOT NULL DEFAULT '/tmp', parent_conversation_id TEXT, project_id TEXT, user_initiated BOOLEAN NOT NULL DEFAULT 1, archived BOOLEAN NOT NULL DEFAULT 0, model TEXT, steering_queue TEXT NOT NULL DEFAULT '[]', state_updated_at TEXT NOT NULL DEFAULT '2025-01-01', desired_base_branch TEXT, created_at TEXT NOT NULL DEFAULT '2025-01-01', updated_at TEXT NOT NULL DEFAULT '2025-01-01')").execute(pool).await.unwrap();
         sqlx::query("CREATE TABLE projects (id TEXT PRIMARY KEY, canonical_path TEXT UNIQUE NOT NULL, main_ref TEXT NOT NULL DEFAULT 'main', created_at TEXT NOT NULL DEFAULT '2025-01-01')").execute(pool).await.unwrap();
         sqlx::query("CREATE TABLE messages (message_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, sequence_id INTEGER NOT NULL DEFAULT 1, message_type TEXT NOT NULL, content TEXT NOT NULL, display_data TEXT, usage_data TEXT, created_at TEXT NOT NULL DEFAULT '2025-01-01')").execute(pool).await.unwrap();
         run_pending_migrations(pool).await.unwrap();
@@ -5147,6 +5178,18 @@ mod tests {
                 MaterializeAuthoritativeTurnOutcome::Materialized(_)
             )
         ));
+        let (materialized, stored_message): (i64, Option<String>) = sqlx::query_as(
+            "SELECT materialized, canonical_message_id FROM durable_turns WHERE turn_id = ?",
+        )
+        .bind(i64::try_from(turn_id.0).unwrap())
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(materialized, 1);
+        assert_eq!(
+            stored_message.as_deref(),
+            Some(canonical_message_id("conv-a", "message-conv-a-typed-receipt").as_str())
+        );
         let result = sqlx::query(
             "SELECT r.receipt_payload, d.delivery_id, d.payload_blob
              FROM workflow_receipts r
@@ -5498,6 +5541,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn historical_wake_pointer_does_not_fence_or_settle_direct_turn() {
+        let repo = repo().await;
+        let (turn_id, workflow_id) = created_turn(&repo, "historical-pointer", 19).await;
+        sqlx::query("INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, created_at) VALUES ('historical-pointer', 'conv-a', 1, 'user', '{\"text\":\"historical observation\",\"is_meta\":true}', '2025-01-01')")
+            .execute(&repo.pool).await.unwrap();
+        sqlx::query("INSERT INTO steering_execution_occurrences (conversation_id, message_id, source_kind) VALUES ('conv-a', 'historical-pointer', 'wake')")
+            .execute(&repo.pool).await.unwrap();
+        let claim = repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 10))
+            .await
+            .unwrap()
+            .authority
+            .unwrap();
+        assert!(matches!(
+            repo.materialize_authoritative_turn(&materialize_input(
+                turn_id,
+                claim,
+                1,
+                1,
+                "message-conv-a-historical-pointer",
+                10
+            ))
+            .await,
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(
+                MaterializeAuthoritativeTurnOutcome::Materialized(_)
+            )
+        ));
+        let terminal = TerminalizeAuthoritativeTurnInput {
+            command: TurnCommand::Complete {
+                turn_id,
+                expected_generation: 0,
+            },
+            projection: Some(PersistedConversationProjection {
+                state: ConvState::Idle,
+                state_updated_at: Utc::now(),
+            }),
+            provider_replay_settlement:
+                phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
+        };
+        let mut tx = repo.pool.begin().await.unwrap();
+        assert!(
+            load_exact_execution_occurrence_tx(&mut tx, &terminal, Some("historical-pointer"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!has_execution_occurrence_for_turn_tx(&mut tx, &terminal)
+            .await
+            .unwrap());
+        tx.commit().await.unwrap();
+        assert!(matches!(
+            repo.terminalize_authoritative_turn_if_occurrence_unchanged(
+                &terminal,
+                ExecutionOccurrenceExpectation::Absent
+            )
+            .await
+            .unwrap(),
+            TerminalizeAuthoritativeTurnOutcome::Settled(_)
+        ));
+        let pointer: String = sqlx::query_scalar("SELECT source_kind FROM steering_execution_occurrences WHERE conversation_id = 'conv-a'")
+            .fetch_one(&repo.pool).await.unwrap();
+        assert_eq!(pointer, "wake");
+        assert!(!repo
+            .load_authoritative_turn(turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .owns_conversation());
+    }
+
+    #[tokio::test]
     async fn new_occurrence_fences_expected_absence_terminalization() {
         let repo = repo().await;
         let created = repo
@@ -5510,7 +5624,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO messages
                  (message_id, conversation_id, sequence_id, message_type, content, created_at)
-             VALUES ('new-occurrence', 'conv-a', 1, 'user', '{\"text\":\"wake\",\"is_meta\":false}', '2025-01-01')",
+             VALUES ('new-occurrence', 'conv-a', 1, 'user', '{\"text\":\"seeded input\",\"is_meta\":false}', '2025-01-01')",
         )
         .execute(&repo.pool)
         .await
@@ -5518,7 +5632,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO steering_execution_occurrences
                  (conversation_id, message_id, source_kind)
-             VALUES ('conv-a', 'new-occurrence', 'wake')",
+             VALUES ('conv-a', 'new-occurrence', 'seeded_fork')",
         )
         .execute(&repo.pool)
         .await
@@ -5593,7 +5707,7 @@ mod tests {
             sqlx::query(
                 "INSERT INTO messages
                      (message_id, conversation_id, sequence_id, message_type, content, created_at)
-                 VALUES (?1, 'conv-a', ?2, 'user', '{\"text\":\"wake\",\"is_meta\":false}', '2025-01-01')",
+                 VALUES (?1, 'conv-a', ?2, 'user', '{\"text\":\"seeded input\",\"is_meta\":false}', '2025-01-01')",
             )
             .bind(message_id)
             .bind(sequence_id)
@@ -5604,7 +5718,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO steering_execution_occurrences
                  (conversation_id, message_id, source_kind)
-             VALUES ('conv-a', 'replacement-occurrence', 'wake')",
+             VALUES ('conv-a', 'replacement-occurrence', 'seeded_fork')",
         )
         .execute(&repo.pool)
         .await
@@ -7141,7 +7255,7 @@ mod tests {
         .await
         .unwrap();
         assert!(sqlx::query(
-            "UPDATE durable_turns SET canonical_message_id = ?2 WHERE turn_id = ?1",
+            "UPDATE durable_turns SET canonical_message_id = ?2, materialized = 1 WHERE turn_id = ?1",
         )
         .bind(i64::try_from(turn_id.0).unwrap())
         .bind(canonical_message_id("conv-b", "foreign-message"))
@@ -7410,73 +7524,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["conv-a-subordinate"],
         );
-    }
-
-    #[tokio::test]
-    async fn direct_turn_and_wake_allocate_distinct_global_workflow_ids() {
-        let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation("conv-a", "A", "/tmp", true, None, None)
-            .await
-            .unwrap();
-        let workflow_repo = WorkflowRepository::new(db.pool().clone());
-        let wake_repo = WakeRepository::new(db.pool().clone());
-
-        let created = workflow_repo
-            .accept_authoritative_turn(&input("conv-a", "direct-first", 41))
-            .await
-            .unwrap();
-        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
-            panic!("expected direct turn creation")
-        };
-        let direct_workflow_id = workflow_repo
-            .workflow_id_for_turn(turn_id)
-            .await
-            .unwrap()
-            .unwrap();
-        let work_scope_id: String =
-            sqlx::query_scalar("SELECT work_scope_id FROM conversations WHERE id = 'conv-a'")
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
-        let wake_intent = phoenix_workflow::wake_profile::WakeRegistrationIntent {
-            contract_id: "contract-direct-cross-profile".to_string(),
-            conversation_id: "conv-a".to_string(),
-            root_conversation_id: "conv-a".to_string(),
-            registration_scope: phoenix_workflow::wake_profile::WorkScopeIdentity(
-                work_scope_id.clone(),
-            ),
-            resource: phoenix_workflow::wake_profile::WakeResourceIdentity::TmuxWindow(
-                phoenix_workflow::wake_profile::TmuxResourceIdentity {
-                    work_scope: phoenix_workflow::wake_profile::WorkScopeIdentity(work_scope_id),
-                    server_token: "server-direct-cross-profile".to_string(),
-                    window_id: "@direct-cross-profile".to_string(),
-                    completion_policy:
-                        phoenix_workflow::wake_profile::TmuxCompletionPolicy::KeepOpen,
-                },
-            ),
-            registering_tool_use_id: "tool-direct-cross-profile".to_string(),
-            registered_at: Timestamp(42),
-            expires_at: Timestamp(100),
-        };
-        let wake_workflow_id = match wake_repo
-            .register(&wake_intent, "wake-after-direct", Timestamp(42))
-            .await
-            .unwrap()
-        {
-            WakeRegistrationOutcome::Registered { workflow_id, .. } => workflow_id,
-            other @ (WakeRegistrationOutcome::Replayed { .. }
-            | WakeRegistrationOutcome::Conflict) => {
-                panic!("expected wake registration, got {other:?}")
-            }
-        };
-
-        assert_ne!(direct_workflow_id, wake_workflow_id);
-        let workflow_ids =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(DISTINCT workflow_id) FROM workflows")
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
-        assert_eq!(workflow_ids, 2);
     }
 
     #[tokio::test]

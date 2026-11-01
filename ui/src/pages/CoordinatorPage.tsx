@@ -4,9 +4,11 @@ import { api, type ActiveCoordinatorWatch, type LiveCoordinatorBashHandle } from
 import { AutomaticContinuationControl } from '../components/AutomaticContinuationControl';
 import { COORDINATOR_QUICK_ACTION } from './coordinatorBriefing';
 import './CoordinatorPage.css';
+import { useConversationViewJourney } from '../hooks/useConversationViewJourney';
+import { decodedRouteReference, transcriptSelector } from '../transcriptReference';
 
-const ConversationPage = lazy(() =>
-  import('./ConversationPage').then((module) => ({ default: module.ConversationPage })),
+const ProductConversationPage = lazy(() =>
+  import('./ProductConversationPage').then((module) => ({ default: module.ProductConversationPage })),
 );
 
 interface CoordinatorPageFixtureData {
@@ -138,20 +140,28 @@ function GlobalLiveCommands({ onCount }: { onCount: (count: ActivityCount) => vo
 }
 
 export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPageFixtureData }) {
+  const journey = useConversationViewJourney('global');
   const navigate = useNavigate();
   const location = useLocation();
   const locationRef = useRef(location);
   locationRef.current = location;
-  const { slug } = useParams<{ slug: string }>();
-  const [error, setError] = useState<string | null>(null);
+  const { slug: routeSlug } = useParams<{ slug: string }>();
+  const slug = routeSlug === undefined ? undefined : decodedRouteReference(location.pathname);
+  const invalidRoute = routeSlug !== undefined && slug === undefined;
+  const sourceQuery = new URLSearchParams(location.search);
+  const sourceSelector = transcriptSelector(location.search);
+  const sourceSelectionKey = JSON.stringify([slug, invalidRoute, sourceSelector, sourceSelector.kind === 'absent' && sourceQuery.has('source_tool')]);
+  const [resolvedSourceSelectionKey, setResolvedSourceSelectionKey] = useState(sourceSelectionKey);
+  const [failure, setFailure] = useState<{ selectionKey: string; message: string } | null>(null);
+  const error = failure?.selectionKey === sourceSelectionKey ? failure.message : null;
   const [loading, setLoading] = useState(!fixtureData);
   const [resolvedCoordinatorId, setResolvedCoordinatorId] = useState<string | null>(fixtureData?.coordinatorId ?? null);
   const [topologyRevision, setTopologyRevision] = useState(0);
+  useEffect(() => { if (error) journey.finish('failed'); }, [error, journey]);
   const [watchCount, setWatchCount] = useState<ActivityCount>(null);
   const [runningCount, setRunningCount] = useState<ActivityCount>(null);
   const [automaticContinuationStatus, setAutomaticContinuationStatus] = useState('…');
   const [automaticContinuationNeedsAttention, setAutomaticContinuationNeedsAttention] = useState(false);
-  const consumedTopologyRevision = useRef(0);
 
   useEffect(() => {
     const refresh = () => setTopologyRevision((value) => value + 1);
@@ -162,26 +172,24 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
   useEffect(() => {
     if (fixtureData) return;
     setLoading(true);
-    setResolvedCoordinatorId(null);
     let cancelled = false;
-    setError(null);
+    setFailure(null);
     api.ensureGlobalCoordinator()
       .then(async (coordinator) => {
         if (cancelled) return;
         window.dispatchEvent(new CustomEvent('phoenix:coordinator-ready', {
           detail: { conversation: coordinator.conversation },
         }));
-        const topologyChanged = topologyRevision > consumedTopologyRevision.current;
-        consumedTopologyRevision.current = topologyRevision;
         const query = new URLSearchParams(locationRef.current.search);
         const pins = query.getAll('source_transcript');
         const pinnedSource = pins.length > 0 || query.has('source_tool');
-        if (pins.length > 0) {
-          const pin = pins[0];
-          if (pins.length !== 1 || !pin || pin.trim() !== pin) {
-            setError('Original source conversation unavailable');
-            return;
-          }
+        const selector = transcriptSelector(locationRef.current.search);
+        if (invalidRoute || selector.kind === 'invalid') {
+          setFailure({ selectionKey: sourceSelectionKey, message: 'Original source conversation unavailable' });
+          return;
+        }
+        if (selector.kind === 'transcript') {
+          const pin = selector.id;
           const [owner, selected, exact] = await Promise.all([
             api.resolveCoordinatorRoute(slug ?? coordinator.conversation.id),
             api.resolveCoordinatorRoute(pin),
@@ -189,45 +197,48 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
           ]);
           if (cancelled) return;
           if (exact.conversation.id !== pin || !owner.coordinator_id || owner.coordinator_id !== selected.coordinator_id) {
-            setError('Original source conversation unavailable');
+            setFailure({ selectionKey: sourceSelectionKey, message: 'Original source conversation unavailable' });
             return;
           }
-          setResolvedCoordinatorId(pin);
-          if (slug !== pin) navigate(`/global/${pin}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
+          setResolvedSourceSelectionKey(sourceSelectionKey);
+          if (resolvedCoordinatorId === null) {
+            setResolvedCoordinatorId(pin);
+            if (slug !== undefined && slug !== pin) navigate({ pathname: '/global', search: locationRef.current.search, hash: locationRef.current.hash }, { replace: true, state: locationRef.current.state });
+          }
           return;
         }
-        if (topologyChanged && !pinnedSource && slug !== coordinator.conversation.id) {
-          navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
-        } else if (!slug || slug === coordinator.conversation.id) {
-          setResolvedCoordinatorId(coordinator.conversation.id);
-          if (!slug) navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
+        if (!slug || slug === coordinator.conversation.id) {
+          setResolvedSourceSelectionKey(sourceSelectionKey);
+          setResolvedCoordinatorId(current => current ?? coordinator.conversation.id);
+          if (!slug) navigate(`/global/${encodeURIComponent(coordinator.conversation.id)}${locationRef.current.search}${locationRef.current.hash}`, { replace: true, state: locationRef.current.state });
         } else {
           api.resolveCoordinatorRoute(slug)
             .then(({ coordinator_id }) => {
               if (cancelled) return;
               if (coordinator_id) {
-                setResolvedCoordinatorId(slug);
+                setResolvedSourceSelectionKey(sourceSelectionKey);
+                setResolvedCoordinatorId(current => current ?? slug);
               } else if (pinnedSource) {
-                setError("Original source conversation unavailable");
+                setFailure({ selectionKey: sourceSelectionKey, message: "Original source conversation unavailable" });
               } else {
-                navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
+                navigate(`/global/${encodeURIComponent(coordinator.conversation.id)}${locationRef.current.search}${locationRef.current.hash}`, { replace: true, state: locationRef.current.state });
               }
             })
             .catch(() => {
-              if (!cancelled && pinnedSource) setError("Original source conversation unavailable");
-              else if (!cancelled) navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
+              if (!cancelled && pinnedSource) setFailure({ selectionKey: sourceSelectionKey, message: "Original source conversation unavailable" });
+              else if (!cancelled) navigate(`/global/${encodeURIComponent(coordinator.conversation.id)}${locationRef.current.search}${locationRef.current.hash}`, { replace: true, state: locationRef.current.state });
             });
         }
-        setError(null);
+        setFailure(null);
       })
       .catch((e) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+        if (!cancelled) setFailure({ selectionKey: sourceSelectionKey, message: e instanceof Error ? e.message : String(e) });
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [fixtureData, navigate, slug, topologyRevision, location.search]);
+  }, [fixtureData, navigate, slug, invalidRoute, sourceSelectionKey, topologyRevision, location.search, resolvedCoordinatorId]);
 
   const handleAutomaticContinuationStatus = useCallback((status: string, requiresAttention: boolean) => {
     setAutomaticContinuationStatus(status);
@@ -256,16 +267,16 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
   };
 
   return (
-    <main className="coordinator-page">
+    <main className="coordinator-page" ref={journey.attach}>
       {error && <div className="coordinator-error coordinator-page-status">{error}</div>}
       {loading ? <div className="coordinator-muted coordinator-page-status">Loading…</div> : null}
 
 
 
-      <section className="coordinator-conversation" aria-label="Coordinator conversation">
-        {slug === resolvedCoordinatorId ? fixtureData?.conversation ?? (
+      <section className="coordinator-conversation" aria-label="Coordinator conversation" hidden={!!error || resolvedSourceSelectionKey !== sourceSelectionKey}>
+        {resolvedCoordinatorId !== null ? fixtureData?.conversation ?? (
           <Suspense fallback={<div className="coordinator-muted">Loading Coordinator conversation…</div>}>
-            <ConversationPage routePrefix="/global" composerQuickAction={COORDINATOR_QUICK_ACTION} stateBarExtension={stateBarExtension} />
+            <ProductConversationPage journey={journey} productId={resolvedCoordinatorId ?? undefined} globalShell={{ composerQuickAction: COORDINATOR_QUICK_ACTION, stateBarExtension }} />
           </Suspense>
         ) : null}
       </section>

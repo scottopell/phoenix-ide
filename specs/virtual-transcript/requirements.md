@@ -72,6 +72,8 @@ WHEN navigation targets a renderable message identifier
 THE SYSTEM SHALL resolve it to its physical render unit and position that unit according to the requested alignment
 AND SHALL acknowledge the command only after the target is physically present at the requested position.
 
+For web semantic start alignment, the physical executor SHALL read back the applied native scroll position. If that position exceeds the clamped desired start ceiling by at most one CSS pixel, the executor SHALL issue at most one conservative correction, requesting one CSS pixel below that ceiling, clamped at zero. It SHALL record the final native position in viewport and active-anchor accounting, and associate an own-write echo only with an actual viewport write. Fractional positions accepted without overshoot SHALL NOT trigger a correction. Hidden positioning SHALL retain intent until visible execution under the same authority. This directional correction SHALL NOT apply to end alignment, tail following, or prefix-expansion continuity restoration; restoration retains its captured viewport offset and continuity tolerance. No arbitrary native quantization or device-pixel-ratio guarantee is implied. The physical anchor SHALL retain directional-start intent across measurement-driven repositioning only while the same semantic anchor remains active under its command ownership or an explicitly settled successful-anchor ownership. Measurement-driven writes for that anchor SHALL use the same bounded correction and retain its final applied offset. Generic anchor capture, user interruption, cancellation, supersession, and tail positioning SHALL NOT inherit directional intent.
+
 WHEN no render unit owns the identifier
 THE SYSTEM SHALL report the target as missing.
 
@@ -94,6 +96,8 @@ WHEN the view identity changes
 THE SYSTEM SHALL reset the terminal identity set for that view.
 
 Each command shall finish exactly once within a view as applied, target missing, or superseded.
+
+Before notifying the parent of an `applied` result, the physical executor SHALL explicitly settle the matching, authorized command's geometric anchor. Settling SHALL end active command ownership and discard unresolved target intent without reissuing positioning work. The settled anchor MAY preserve its directional-start geometry after the parent's same-view transition to idle; this SHALL NOT preserve command capability or emit another terminal result. User interruption, explicit cancellation, replacement command authority, history-view identity changes, tail positioning, and executor detach SHALL retire settled directional ownership. User takeover SHALL retire that ownership even when no native scroll event follows. A mismatched or stale completion SHALL NOT settle or resurrect an anchor. Superseded and missing-target results SHALL NOT create settled ownership.
 
 ### REQ-VT-008: Durable Tail Following
 

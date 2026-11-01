@@ -30,6 +30,7 @@ use phoenix_core::domain::mode_context::ModeContext;
 use phoenix_core::domain::retry_policy::{
     AutoRetryPolicy, GENERIC_MAX_ATTEMPTS, OVERLOAD_MAX_ATTEMPTS,
 };
+use phoenix_core::domain::tool_round::ToolRoundAssembly;
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
@@ -259,6 +260,9 @@ fn error_kind_to_attempt_reason(kind: &ErrorKind) -> LlmAttemptReason {
         | ErrorKind::Cancelled
         | ErrorKind::SubAgentError
         | ErrorKind::ContextExhausted
+        | ErrorKind::ContextCapacityConflict
+        | ErrorKind::PlannedContextPressure
+        | ErrorKind::OutputTokensExhausted
         | ErrorKind::TurnLimitExhausted
         | ErrorKind::ContentFilter => {
             tracing::error!(
@@ -1178,11 +1182,13 @@ fn handle_core_tool_complete(
             && remaining_tools.is_empty()
             && pending_sub_agents.is_empty() =>
         {
-            let mut all_results = completed_results.clone();
-            all_results.push(result);
-
-            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
-                .expect("tool_use/tool_result count mismatch in last-tool transition");
+            let checkpoint = ToolRoundAssembly::new(
+                assistant_message.clone(),
+                completed_results.clone(),
+                std::iter::once(result),
+            )
+            .map(CheckpointData::ToolRound)
+            .expect("tool_use/tool_result count mismatch in last-tool transition");
 
             Ok(
                 CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
@@ -1201,13 +1207,13 @@ fn handle_core_tool_complete(
             && remaining_tools.is_empty()
             && !pending_sub_agents.is_empty() =>
         {
-            let mut all_results = completed_results.clone();
-            all_results.push(result);
-
-            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
-                .expect(
-                    "tool_use/tool_result count mismatch in last-tool-with-subagents transition",
-                );
+            let checkpoint = ToolRoundAssembly::new(
+                assistant_message.clone(),
+                completed_results.clone(),
+                std::iter::once(result),
+            )
+            .map(CheckpointData::ToolRound)
+            .expect("tool_use/tool_result count mismatch in last-tool-with-subagents transition");
 
             Ok(CoreTransitionResult::new(CoreState::AwaitingSubAgents {
                 pending: pending_sub_agents.clone(),
@@ -1255,12 +1261,14 @@ fn handle_core_tool_complete(
             let mut all_pending = pending_sub_agents.clone();
             all_pending.extend(spawned);
 
-            let mut all_results = completed_results.clone();
             let spawn_id = result.tool_use_id.clone();
-            all_results.push(result);
-
-            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
-                .expect("tool_use/tool_result count mismatch in spawn-agents-last transition");
+            let checkpoint = ToolRoundAssembly::new(
+                assistant_message.clone(),
+                completed_results.clone(),
+                std::iter::once(result),
+            )
+            .map(CheckpointData::ToolRound)
+            .expect("tool_use/tool_result count mismatch in spawn-agents-last transition");
 
             Ok(CoreTransitionResult::new(CoreState::AwaitingSubAgents {
                 pending: all_pending.clone(),
@@ -1383,15 +1391,16 @@ fn handle_core_cancellation(
                 tool_use_id: aborted_id,
             },
         ) if *tool_use_id == aborted_id => {
-            let all_results = build_cancellation_results(
-                completed_results,
-                tool_use_id,
-                "Cancelled by user",
-                skipped_tools,
-            );
+            let cancellation_results =
+                build_cancellation_results(tool_use_id, "Cancelled by user", skipped_tools);
 
-            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
-                .expect("tool_use/tool_result count mismatch in cancellation transition");
+            let checkpoint = ToolRoundAssembly::new(
+                assistant_message.clone(),
+                completed_results.clone(),
+                cancellation_results,
+            )
+            .map(CheckpointData::ToolRound)
+            .expect("tool_use/tool_result count mismatch in cancellation transition");
 
             if pending_sub_agents.is_empty() {
                 Ok(CoreTransitionResult::new(CoreState::Idle)
@@ -1425,15 +1434,16 @@ fn handle_core_cancellation(
                 result: _,
             },
         ) if *tool_use_id == completed_id => {
-            let all_results = build_cancellation_results(
-                completed_results,
-                tool_use_id,
-                "Cancelled by user",
-                skipped_tools,
-            );
+            let cancellation_results =
+                build_cancellation_results(tool_use_id, "Cancelled by user", skipped_tools);
 
-            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
-                .expect("tool_use/tool_result count mismatch in cancellation-complete transition");
+            let checkpoint = ToolRoundAssembly::new(
+                assistant_message.clone(),
+                completed_results.clone(),
+                cancellation_results,
+            )
+            .map(CheckpointData::ToolRound)
+            .expect("tool_use/tool_result count mismatch in cancellation-complete transition");
 
             if pending_sub_agents.is_empty() {
                 Ok(CoreTransitionResult::new(CoreState::Idle)
@@ -1490,16 +1500,14 @@ fn handle_core_cancellation(
 /// Builds the tool results list for cancellation transitions, including the
 /// cancelled current tool and skipped remaining tools.
 fn build_cancellation_results(
-    completed_results: &[ToolResult],
     cancelled_tool_id: &str,
     cancel_reason: &str,
     skipped_tools: &[ToolCall],
 ) -> Vec<ToolResult> {
-    let mut all_results = completed_results.to_vec();
-    all_results.push(ToolResult::cancelled(
+    let mut all_results = vec![ToolResult::cancelled(
         cancelled_tool_id.to_string(),
         cancel_reason,
-    ));
+    )];
     for tool in skipped_tools {
         all_results.push(ToolResult::cancelled(
             tool.id.clone(),
@@ -2164,8 +2172,21 @@ fn handle_core_error_retry(
     }
 }
 
-/// Handles continuation-related events: `LlmError`/`RetryTimeout` during
-/// `AwaitingContinuation`, and `UserTriggerContinuation` from Idle.
+/// Build the durable transition for an explicitly admitted changed-model replan.
+#[must_use]
+pub fn replan_continuation_failure(
+    failure: &RecoverableContinuationFailure,
+) -> CoreTransitionResult {
+    let mut request = failure.request.clone();
+    request.attempt += 1;
+    CoreTransitionResult::new(CoreState::AwaitingContinuation {
+        request: request.clone(),
+    })
+    .with_effect(Effect::PersistState)
+    .with_effect(Effect::notify_state_change())
+    .with_effect(Effect::RequestContinuation { request })
+}
+
 fn handle_core_continuation(
     state: &CoreState,
     context: &ConvContext,
@@ -2230,7 +2251,9 @@ fn handle_core_continuation(
         (
             CoreState::RecoverableContinuationFailure { failure },
             CoreEvent::UserTriggerContinuation { operation_id },
-        ) if failure.request.operation_id == operation_id => {
+        ) if failure.request.operation_id == operation_id
+            && failure.error_kind != ErrorKind::ContextCapacityConflict =>
+        {
             let mut request = failure.request.clone();
             request.attempt += 1;
             Ok(CoreTransitionResult::new(CoreState::AwaitingContinuation {
@@ -2245,7 +2268,7 @@ fn handle_core_continuation(
             CoreState::RecoverableContinuationFailure { .. },
             CoreEvent::UserTriggerContinuation { operation_id },
         ) => {
-            tracing::debug!(%operation_id, "Absorbing stale UserTriggerContinuation for continuation failure");
+            tracing::debug!(%operation_id, "Absorbing stale continuation trigger for continuation failure");
             Ok(CoreTransitionResult::new(state.clone()))
         }
 
@@ -2465,6 +2488,7 @@ pub fn transition_parent(
                     idempotent: false,
                 })
                 .with_effect(Effect::PersistUserInputMessage {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
                     content: phoenix_core::domain::db_schema::MessageContent::user(annotations),
                     message_id: uuid::Uuid::new_v4().to_string(),
                 })
@@ -2526,6 +2550,7 @@ pub fn transition_parent(
                 ..
             },
             ParentEvent::Parent(ParentOnlyEvent::UserQuestionResponse {
+                source,
                 request_id,
                 answers,
                 annotations,
@@ -2568,7 +2593,14 @@ pub fn transition_parent(
                 }))
                 .with_effect(Effect::PersistUserInputMessage {
                     content: phoenix_core::domain::db_schema::MessageContent::user(user_text),
-                    message_id: uuid::Uuid::new_v4().to_string(),
+                    message_id: source.as_ref().map_or_else(
+                        || uuid::Uuid::new_v4().to_string(),
+                        |s| s.message_id.clone(),
+                    ),
+                    origin: source
+                        .map_or(phoenix_core::domain::db_schema::InputOrigin::UserApi, |s| {
+                            s.origin
+                        }),
                 })
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_state_change())
@@ -2776,6 +2808,25 @@ pub fn transition_parent(
                 CoreEvent::UserMessage { .. } | CoreEvent::AuthoritativeUserMessage { .. },
             ),
         ) => Err(TransitionError::ContextExhausted),
+
+        (
+            ParentState::ContextExhausted { .. },
+            ParentEvent::Core(CoreEvent::UserTriggerContinuation { operation_id }),
+        ) => {
+            let request = ContinuationSummaryRequest {
+                operation_id,
+                rejected_tool_calls: vec![],
+                attempt: 1,
+            };
+            Ok(
+                ParentTransitionResult::new(ParentState::Core(CoreState::AwaitingContinuation {
+                    request: request.clone(),
+                }))
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change())
+                .with_effect(Effect::RequestContinuation { request }),
+            )
+        }
 
         (state @ ParentState::ContextExhausted { .. }, _event) => {
             Ok(ParentTransitionResult::new(state.clone()))
@@ -3006,11 +3057,7 @@ pub fn transition_parent(
                     .with_effect(Effect::RequestLlm));
                 }
 
-                if should_trigger_continuation(
-                    &usage_data,
-                    context.context_window,
-                    context.effective_effort.level(),
-                ) {
+                if should_trigger_continuation(&usage_data, context.context_window) {
                     let tr = handle_context_exhaustion(
                         context,
                         content,
@@ -3228,11 +3275,7 @@ pub fn transition_parent(
             }
 
             // REQ-BED-019: Context exhaustion check (after propose_task/ask_user_question)
-            if should_trigger_continuation(
-                &usage_data,
-                context.context_window,
-                context.effective_effort.level(),
-            ) {
+            if should_trigger_continuation(&usage_data, context.context_window) {
                 let tr = handle_context_exhaustion(
                     context,
                     content,
@@ -3307,34 +3350,34 @@ pub fn transition_parent(
             .with_effect(Effect::notify_state_change()))
         }
 
-        // Intercepted before core delegation — spec rule
-        // BackendRejectsContextExhausted (bedrock.allium).
         (
-            ParentState::Core(CoreState::LlmRequesting { .. }),
+            pressure_state,
             ParentEvent::Core(CoreEvent::LlmError {
                 message,
-                error_kind: ErrorKind::ContextExhausted,
+                error_kind: ErrorKind::ContextExhausted | ErrorKind::PlannedContextPressure,
                 ..
             }),
-        ) => {
-            // Stable, human-oriented summary — the raw backend message can
-            // carry provider-specific strings and is persisted for the UI
-            // banner / clipboard / seed-draft, so it is logged separately
-            // rather than interpolated into user-facing text.
-            tracing::warn!(
-                backend_message = %message,
-                "backend rejected request with context_length_exceeded; \
-                converging parent to ContextExhausted"
-            );
-            let summary = "Context limit reached before the turn could complete. \
-                Continue to compact and resume, or start a new conversation."
-                .to_string();
-            Ok(ParentTransitionResult::new(ParentState::ContextExhausted {
-                summary: summary.clone(),
-            })
-            .with_effect(Effect::persist_continuation_message(&summary))
-            .with_effect(Effect::PersistState)
-            .with_effect(Effect::NotifyContextExhausted { summary }))
+        ) if matches!(
+            pressure_state,
+            ParentState::Core(CoreState::LlmRequesting { .. })
+        ) || matches!(pressure_state, ParentState::Core(CoreState::ServerOverloadRetrying { retry })
+                if matches!(retry.target, ServerOverloadTarget::Ordinary)
+                    && matches!(retry.phase, ServerOverloadPhase::InFlight)) =>
+        {
+            tracing::warn!(detail = %message, "request context pressure requires durable compaction");
+            let request = ContinuationSummaryRequest {
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                rejected_tool_calls: vec![],
+                attempt: 1,
+            };
+            Ok(
+                ParentTransitionResult::new(ParentState::Core(CoreState::AwaitingContinuation {
+                    request: request.clone(),
+                }))
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change())
+                .with_effect(Effect::RequestContinuation { request }),
+            )
         }
 
         // ============================================================
@@ -3826,11 +3869,7 @@ pub fn transition_sub_agent(
         ) => {
             let final_attempt = *attempt;
             // Context exhaustion check first (sub-agent fails immediately)
-            if should_trigger_continuation(
-                &usage_data,
-                context.context_window,
-                context.effective_effort.level(),
-            ) {
+            if should_trigger_continuation(&usage_data, context.context_window) {
                 let tr = handle_context_exhaustion(
                     context,
                     content,
@@ -4214,6 +4253,17 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 resets_at: None,
             }
         }
+        LlmOutcome::OutputTokensExhausted { message } => {
+            let attempt = current_attempt(state);
+            Event::LlmError {
+                message,
+                error_kind: ErrorKind::OutputTokensExhausted,
+                attempt,
+                recovery_in_progress: false,
+                observed_at,
+                resets_at: None,
+            }
+        }
         LlmOutcome::Cancelled => {
             let attempt = current_attempt(state);
             Event::LlmError {
@@ -4294,28 +4344,23 @@ fn current_attempt(state: &ConvState) -> u32 {
 /// Threshold as fraction of context window for triggering continuation (REQ-BED-019)
 const CONTINUATION_THRESHOLD: f64 = 0.90;
 
-/// Check if context usage has exceeded the continuation threshold (REQ-BED-019)
+/// Check if context usage has exceeded the continuation threshold (REQ-BED-019).
+///
+/// This is the sole trigger for a *completed* response (text-only, or a
+/// terminal `submit_result`/`submit_error`/`propose_task`/`ask_user_question`
+/// tool call): REQ-BED-019 is independent of the model's output-token
+/// budget. A declared output budget is reserved before *dispatch* — see
+/// `ConvContext::output_budget` and REQ-LLM-004f in `specs/llm/requirements.md`
+/// — not by lowering this post-response threshold, which would otherwise
+/// fail a successful response whose own usage is far below 90%.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation
 )]
-fn should_trigger_continuation(
-    usage: &UsageData,
-    context_window: usize,
-    effort: Option<phoenix_core::domain::llm_types::ModelEffort>,
-) -> bool {
+fn should_trigger_continuation(usage: &UsageData, context_window: usize) -> bool {
     let used = usage.context_window_used();
-    let proportional_threshold = (context_window as f64 * CONTINUATION_THRESHOLD) as u64;
-    let threshold = if effort
-        .is_some_and(phoenix_core::domain::llm_types::ModelEffort::needs_extended_output_headroom)
-    {
-        let reservation_threshold =
-            u64::try_from(context_window.saturating_sub(64_000 + 4_096)).unwrap_or(u64::MAX);
-        proportional_threshold.min(reservation_threshold)
-    } else {
-        proportional_threshold
-    };
+    let threshold = (context_window as f64 * CONTINUATION_THRESHOLD) as u64;
     used >= threshold
 }
 
@@ -4513,6 +4558,9 @@ pub fn llm_error_to_db_error(
         phoenix_core::domain::llm_error_kind::LlmErrorKind::ContextWindowExceeded => {
             ErrorKind::ContextExhausted
         }
+        phoenix_core::domain::llm_error_kind::LlmErrorKind::OutputTokensExhausted => {
+            ErrorKind::OutputTokensExhausted
+        }
     }
 }
 
@@ -4524,7 +4572,13 @@ mod tests {
     use std::path::PathBuf;
 
     fn test_context() -> ConvContext {
-        ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)
+        ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        )
     }
 
     #[test]
@@ -6315,46 +6369,40 @@ mod tests {
         ));
     }
 
-    // Bug class (task 60008): a parent that exhausts context must never
-    // land in ConvState::Error — the /continue recovery precondition
-    // (db.rs) gates on ConvState::ContextExhausted, so an Error landing
-    // strands the conversation with no recovery path. Both the
-    // internal-threshold path and the backend-rejection path
-    // (LlmErrorKind::ContextWindowExceeded → ErrorKind::ContextExhausted)
-    // must converge on ContextExhausted.
     #[test]
-    fn parent_context_exhausted_llm_error_routes_to_context_exhausted() {
-        let result = transition(
-            &ConvState::LlmRequesting { attempt: 1 },
-            &test_context(),
-            Event::LlmError {
-                message: "context_length_exceeded".to_string(),
-                error_kind: ErrorKind::ContextExhausted,
-                attempt: 1,
-                recovery_in_progress: false,
-                observed_at: chrono::Utc::now(),
-                resets_at: None,
-            },
-        )
-        .unwrap();
-
-        // reason: only ContextExhausted is expected; every other ConvState variant is a
-        // failure, so an explicit list of the ~16 remaining variants would obscure intent.
-        #[allow(clippy::wildcard_enum_match_arm)]
-        match &result.new_state {
-            ConvState::ContextExhausted { summary } => {
-                // Stable summary — the raw backend message must NOT leak
-                // into user-facing persisted text.
-                assert!(summary.contains("Context limit reached"));
-                assert!(!summary.contains("context_length_exceeded"));
-            }
-            other => panic!("expected ContextExhausted, got {other:?}"),
+    fn parent_context_exhausted_llm_error_requests_real_handoff_without_fake_message() {
+        for (message, error_kind) in [
+            ("context_length_exceeded", ErrorKind::ContextExhausted),
+            ("local planned pressure", ErrorKind::PlannedContextPressure),
+        ] {
+            let result = transition(
+                &ConvState::LlmRequesting { attempt: 1 },
+                &test_context(),
+                Event::LlmError {
+                    message: message.to_string(),
+                    error_kind,
+                    attempt: 1,
+                    recovery_in_progress: false,
+                    observed_at: chrono::Utc::now(),
+                    resets_at: None,
+                },
+            )
+            .unwrap();
+            let ConvState::AwaitingContinuation { request } = &result.new_state else {
+                panic!("context pressure must enter durable summary generation");
+            };
+            assert_eq!(request.attempt, 1);
+            assert!(request.rejected_tool_calls.is_empty());
+            assert!(matches!(result.effects.first(), Some(Effect::PersistState)));
+            assert!(result.effects.iter().any(|effect| matches!(effect, Effect::RequestContinuation { request: dispatched } if dispatched == request)));
+            assert!(!result.effects.iter().any(|effect| matches!(
+                effect,
+                Effect::PersistMessage { .. }
+                    | Effect::ContinuationCommit { .. }
+                    | Effect::NotifyContextExhausted { .. }
+                    | Effect::ScheduleRetry { .. }
+            )));
         }
-        // The resulting state must satisfy the /continue precondition.
-        assert!(matches!(
-            result.new_state,
-            ConvState::ContextExhausted { .. }
-        ));
     }
 
     // The interception is scoped to ContextExhausted only — other
@@ -6389,6 +6437,74 @@ mod tests {
     // non-retryable; assert the attempt counter is irrelevant (any attempt
     // value still converges on ContextExhausted, never Error).
     #[test]
+    fn exhausted_parent_regenerates_summary_without_committing_a_notice() {
+        let result = transition(
+            &ConvState::ContextExhausted {
+                summary: "legacy notice".to_string(),
+            },
+            &test_context(),
+            Event::UserTriggerContinuation {
+                operation_id: "recovery".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(result.new_state, ConvState::AwaitingContinuation { request } if request.operation_id == "recovery")
+        );
+        assert!(result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestContinuation { .. })));
+        assert!(!result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ContinuationCommit { .. })));
+    }
+
+    #[test]
+    fn unchanged_capacity_conflict_cannot_retry_compaction() {
+        let state = ConvState::RecoverableContinuationFailure {
+            failure: RecoverableContinuationFailure {
+                request: ContinuationSummaryRequest {
+                    operation_id: "fixed-conflict".to_string(),
+                    rejected_tool_calls: vec![],
+                    attempt: 1,
+                },
+                error_kind: ErrorKind::ContextCapacityConflict,
+                message: "Required input cannot fit".to_string(),
+            },
+        };
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::UserTriggerContinuation {
+                operation_id: "fixed-conflict".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(result.new_state, state);
+        assert!(result.effects.is_empty());
+    }
+
+    #[test]
+    fn authorized_model_replan_preserves_operation_and_advances_attempt() {
+        let failure = RecoverableContinuationFailure {
+            request: ContinuationSummaryRequest {
+                operation_id: "fixed".to_string(),
+                rejected_tool_calls: vec![],
+                attempt: 2,
+            },
+            error_kind: ErrorKind::ContextCapacityConflict,
+            message: "cannot fit".to_string(),
+        };
+        let result = replan_continuation_failure(&failure);
+        assert!(
+            matches!(result.new_state, CoreState::AwaitingContinuation { request } if request.operation_id == "fixed" && request.attempt == 3)
+        );
+        assert!(result.effects.iter().any(|effect| matches!(effect, Effect::RequestContinuation { request } if request.operation_id == "fixed" && request.attempt == 3)));
+    }
+
+    #[test]
     fn parent_context_exhausted_converges_regardless_of_attempt() {
         for attempt in 1..=MAX_RETRY_ATTEMPTS {
             let result = transition(
@@ -6405,8 +6521,8 @@ mod tests {
             )
             .unwrap();
             assert!(
-                matches!(result.new_state, ConvState::ContextExhausted { .. }),
-                "attempt {attempt} should converge on ContextExhausted"
+                matches!(result.new_state, ConvState::AwaitingContinuation { .. }),
+                "attempt {attempt} should enter real handoff generation"
             );
         }
     }
@@ -6850,26 +6966,29 @@ mod tests {
             cache_creation_tokens: 0,
         };
         assert!(
-            !should_trigger_continuation(&usage, 100_000, None),
+            !should_trigger_continuation(&usage, 100_000),
             "89.9% should not trigger continuation"
         );
     }
 
     #[test]
-    fn context_threshold_reserves_extended_effort_output_headroom() {
+    fn context_threshold_ignores_output_budget_for_completed_response() {
+        // PR #972 review finding 4363009774: a Codex-routed built-in with a
+        // 272k context and 128k output budget must not fail a successful,
+        // far-below-90% response as context-exhausted. REQ-BED-019's 90%
+        // threshold is independent of the output budget; 144k of usage here
+        // is ~53% of the 272k window — nowhere near the 90% bound — even
+        // though `context_window - output_budget` (144k) would have
+        // incorrectly fired under the superseded reservation-based check.
         let usage = UsageData {
-            input_tokens: 336_000,
+            input_tokens: 144_000,
             output_tokens: 0,
             reasoning_tokens: None,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
         };
 
-        assert!(should_trigger_continuation(
-            &usage,
-            400_000,
-            Some(phoenix_core::domain::llm_types::ModelEffort::Xhigh),
-        ));
+        assert!(!should_trigger_continuation(&usage, 272_000));
     }
 
     #[test]
@@ -6883,7 +7002,7 @@ mod tests {
             cache_creation_tokens: 0,
         };
         assert!(
-            should_trigger_continuation(&usage, 100_000, None),
+            should_trigger_continuation(&usage, 100_000),
             "90% should trigger continuation"
         );
     }
@@ -6899,7 +7018,7 @@ mod tests {
             cache_creation_tokens: 0,
         };
         assert!(
-            should_trigger_continuation(&usage, 100_000, None),
+            should_trigger_continuation(&usage, 100_000),
             "90.1% should trigger continuation"
         );
     }
@@ -6915,7 +7034,7 @@ mod tests {
             cache_creation_tokens: 0,
         };
         assert!(
-            should_trigger_continuation(&usage, 100_000, None),
+            should_trigger_continuation(&usage, 100_000),
             "Combined tokens should count toward threshold"
         );
     }
@@ -6941,6 +7060,7 @@ mod tests {
             service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             is_sub_agent: true,
             context_window: 100_000,
+            output_budget: 16_384,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -7022,6 +7142,7 @@ mod tests {
             service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             is_sub_agent: true,
             context_window: 100_000,
+            output_budget: 16_384,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -7370,6 +7491,7 @@ mod tests {
             service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             is_sub_agent: true,
             context_window: 200_000,
+            output_budget: 16_384,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -7434,7 +7556,7 @@ mod tests {
     fn coordinator_text_only_response_persists_without_filesystem() {
         use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
-        let context = ConvContext::coordinator("coordinator", "test-model", 200_000);
+        let context = ConvContext::coordinator("coordinator", "test-model", 200_000, 16_384);
         let result = transition(
             &ConvState::LlmRequesting { attempt: 1 },
             &context,
@@ -7462,7 +7584,7 @@ mod tests {
     fn coordinator_tool_response_checkpoints_without_filesystem() {
         use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
-        let context = ConvContext::coordinator("coordinator", "test-model", 200_000);
+        let context = ConvContext::coordinator("coordinator", "test-model", 200_000, 16_384);
         let result = transition(
             &ConvState::LlmRequesting { attempt: 1 },
             &context,
@@ -7489,7 +7611,7 @@ mod tests {
         use crate::state::{ProposeTaskInput, ToolInput};
         use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
-        let context = ConvContext::coordinator("coordinator", "test-model", 200_000);
+        let context = ConvContext::coordinator("coordinator", "test-model", 200_000, 16_384);
         let result = transition(
             &ConvState::LlmRequesting { attempt: 1 },
             &context,
@@ -7572,6 +7694,7 @@ mod tests {
             service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             is_sub_agent: true,
             context_window: 200_000,
+            output_budget: 16_384,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -7638,6 +7761,7 @@ mod tests {
             service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             is_sub_agent: true,
             context_window: 200_000,
+            output_budget: 16_384,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -7712,6 +7836,7 @@ mod tests {
             service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             is_sub_agent: true,
             context_window: 200_000,
+            output_budget: 16_384,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -7782,7 +7907,8 @@ mod tests {
                 }
             })
             .expect("should persist a tool-round checkpoint with the rejection");
-        let CheckpointData::ToolRound { tool_results, .. } = checkpoint;
+        let CheckpointData::ToolRound(round) = checkpoint;
+        let tool_results = round.results();
         assert_eq!(tool_results.len(), 1);
         match &tool_results[0].outcome {
             ToolOutcome::Error { output, .. } => {
@@ -7835,6 +7961,45 @@ mod tests {
             .effects
             .iter()
             .any(|effect| matches!(effect, Effect::PersistMessage { .. })));
+    }
+
+    #[test]
+    fn output_exhaustion_stops_first_attempt_but_malformed_responses_retry() {
+        for (kind, retries) in [
+            (ErrorKind::OutputTokensExhausted, false),
+            (ErrorKind::InvalidResponse, true),
+        ] {
+            let result = transition(
+                &ConvState::LlmRequesting { attempt: 1 },
+                &test_context(),
+                Event::LlmError {
+                    message: "provider stopped".into(),
+                    error_kind: kind,
+                    attempt: 1,
+                    recovery_in_progress: false,
+                    observed_at: chrono::Utc::now(),
+                    resets_at: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                result
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::ScheduleRetry { .. })),
+                retries
+            );
+            if !retries {
+                assert!(matches!(
+                    result.new_state,
+                    ConvState::Error {
+                        error_kind: ErrorKind::OutputTokensExhausted,
+                        ..
+                    }
+                ));
+                assert!(ErrorKind::OutputTokensExhausted.is_user_resumable());
+            }
+        }
     }
 
     #[test]
@@ -7989,6 +8154,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Exercise successive question identities and stale responses together.
     fn question_request_identity_is_fresh_and_rejects_stale_actions() {
         use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
@@ -8043,6 +8209,7 @@ mod tests {
                 &q2,
                 &test_context(),
                 Event::UserQuestionResponse {
+                    source: None,
                     request_id: Some(q1_id.clone()),
                     answers: answers.clone(),
                     annotations: None,
@@ -8064,12 +8231,19 @@ mod tests {
             &q2,
             &test_context(),
             Event::UserQuestionResponse {
+                source: Some(phoenix_core::domain::sm_event::QuestionAnswerSource {
+                    message_id: "slack-answer-input".into(),
+                    origin: phoenix_core::domain::db_schema::InputOrigin::SlackGateway {
+                        request_id: "slack-answer-request".into(),
+                    },
+                }),
                 request_id: Some(q2_id.clone()),
                 answers,
                 annotations: None,
             },
         )
         .unwrap();
+        assert!(answered.effects.iter().any(|effect|matches!(effect,Effect::PersistUserInputMessage {message_id,origin:phoenix_core::domain::db_schema::InputOrigin::SlackGateway {request_id},..} if message_id=="slack-answer-input" && request_id=="slack-answer-request")));
         assert!(matches!(
             answered.new_state,
             ConvState::LlmRequesting { attempt: 1 }
@@ -8086,6 +8260,7 @@ mod tests {
             &q2,
             &test_context(),
             Event::UserQuestionResponse {
+                source: None,
                 request_id: None,
                 answers: std::collections::HashMap::new(),
                 annotations: None,
@@ -8383,6 +8558,7 @@ mod tests {
             &state,
             &test_context(),
             Event::UserQuestionResponse {
+                source: None,
                 request_id: Some(request_id),
                 answers,
                 annotations: None,
@@ -9145,6 +9321,7 @@ mod tests {
                 tmp.path().to_path_buf(),
                 "test-model",
                 200_000,
+                16_384,
             );
             ctx.mode = mode;
             ctx.mode_context = mode_context;
@@ -9341,7 +9518,8 @@ mod tests {
                     }
                 })
                 .expect("Direct rejection must persist a tool result");
-            let CheckpointData::ToolRound { tool_results, .. } = checkpoint;
+            let CheckpointData::ToolRound(round) = checkpoint;
+            let tool_results = round.results();
             assert!(matches!(
                 &tool_results[0].outcome,
                 ToolOutcome::Error { output, .. }
@@ -9674,7 +9852,13 @@ mod teardown_tests {
     use std::path::PathBuf;
 
     fn test_context() -> super::ConvContext {
-        super::ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)
+        super::ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        )
     }
 
     fn pending(id: &str) -> PendingSubAgent {

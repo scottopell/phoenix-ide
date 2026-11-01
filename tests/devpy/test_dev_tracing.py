@@ -176,11 +176,12 @@ class DevTracingTests(unittest.TestCase):
         self.assertIs(parent, tracing.started[0][3])
 
     def test_profile_command_cpu_finalization_is_idempotent(self):
-        profile = self.dev.CheckWorkProfile.start()
-        first = profile.finalize_cpu()
-        for _ in range(10000):
-            pass
-        second = profile.finalize_cpu()
+        with tempfile.TemporaryDirectory() as directory:
+            profile = self.dev.CheckWorkProfile.start(Path(directory))
+            first = profile.finalize_cpu()
+            for _ in range(10000):
+                pass
+            second = profile.finalize_cpu()
 
         self.assertIs(first, second)
         self.assertEqual(first["cpu.total_ms"], second["cpu.total_ms"])
@@ -246,9 +247,17 @@ class DevTracingTests(unittest.TestCase):
         self.assertFalse(tracing.finished[0][2])
 
     def test_profile_start_captures_wall_and_monotonic_boundaries(self):
-        profile = self.dev.CheckWorkProfile.start()
-        self.assertGreater(profile.started_wall_ns, 0)
-        self.assertGreater(profile.started_monotonic_ns, 0)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            with (
+                mock.patch.object(self.dev, "ROOT", root),
+                mock.patch.object(self.dev.subprocess, "run", return_value=mock.Mock(stdout="")),
+            ):
+                profile = self.dev.CheckWorkProfile.start()
+            self.assertEqual(root / "target" / "check-profile", profile.artifact_dir.parent)
+            self.assertTrue(profile.artifact_dir.is_dir())
+            self.assertGreater(profile.started_wall_ns, 0)
+            self.assertGreater(profile.started_monotonic_ns, 0)
 
     def test_profile_rejects_nonempty_explicit_artifact_directory(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -455,6 +464,7 @@ class DevTracingTests(unittest.TestCase):
             mock.patch.object(self.dev.time, "time_ns", return_value=1_700_000_000_000_000_000),
             mock.patch.object(self.dev, "_measure_dir_size_bytes", return_value=4096) as dir_size,
             mock.patch.object(Path, "exists", return_value=True),
+            mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": str(ROOT / "target")}),
             mock.patch("builtins.print"),
         ):
             self.dev._run_cargo_build(["cargo", "build", "--release"], ROOT, "release")

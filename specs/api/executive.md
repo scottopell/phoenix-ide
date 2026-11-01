@@ -20,6 +20,7 @@ REST/JSON plus SSE. The conversation SSE stream is specified to carry root-keyed
 | **REQ-API-002:** Conversation Creation | Slug: day-time-word-word format | Implemented; durable creation cutover incomplete |
 | **REQ-API-003:** Message Retrieval | GET with `after_sequence` param | Implemented |
 | **REQ-API-004:** User Actions | POST chat, cancel endpoints | Implemented |
+| **REQ-API-031:** Explicit Public Literal Chat | `/chat` opt-in, closed policy, known receiver, policy-proven replay | Authored; offline qualification only, Rust/E2E execution pending |
 | **REQ-API-005:** Real-time Streaming | SSE with init, token events (`request_id` for correlation), replay-backed reconnection | Implemented |
 | **REQ-API-006:** Conversation Lifecycle | Archive, delete, rename | Partially implemented against current norms: archive/delete/rename ship, but unified Close/Open/History lifecycle does not |
 | **REQ-API-007:** Slug Resolution | GET /api/conversation-by-slug/{slug} | Implemented |
@@ -28,6 +29,19 @@ REST/JSON plus SSE. The conversation SSE stream is specified to carry root-keyed
 | **REQ-API-010:** Static Assets | UI assets served from the binary (embedded), with a filesystem fallback | Implemented |
 | **REQ-API-013:** One-Shot Command Suggestion | POST /api/suggest | Implemented |
 
+## Public literal chat
+
+REQ-API-031 is authored in `ChatExpansionPolicy` and the shared `SendChatApplicationService`. Existing `/chat` keeps its expanding default and accepts explicit `literal_text`; no extra route or version flag is added. ADR-124 records the known-receiver verification and harmless retained-ID smoke recipe. Transcript-only replay remains default-policy-only unless durable receipts prove policy.
+
+Router regressions cover literal idle/direct and running/steering admission, exact replay and changed-policy conflict, expanding default/unknown policy, pending manual-opening identity, closed/history refusal, authentication and attachment validation. The mock-provider E2E scenario `public_literal_chat` checks compiled-HEAD identity, a harmless retained-ID smoke, both routing states with causal queue observation, materialization and replay. Rust and real-binary E2E tests remain unexecuted locally under the no-build constraint. Eight offline guidance tests and 35 harness self-tests pass, including missing/malformed/mismatched receiver zero-POST checks and version rechecking before retry. No deployed behavior or live API acceptance is claimed.
+
 ## Verification Notes
 
 Reconciled against `crates/phoenix-ide/src/api/handlers.rs`, `crates/phoenix-ide/src/api/lifecycle_handlers.rs`, `crates/phoenix-ide/src/api/chains.rs`, and `crates/phoenix-ide/src/api/sse.rs`.
+
+
+## Continuous History API Qualification
+
+REQ-API-030 is implemented in the dedicated Coordinator history read and shared aggregate paging projection. Its wire type intentionally has no ordinary lifecycle, Close, or work-action fields. Ordinary reads retain their existing domain gate. The web selects `boundary_representation=original_messages`: navigation metadata covers all persisted boundaries, message pages carry original continuation records, and history segments contain no parallel handoff summary. The default `handoff_metadata` representation remains available to existing consumers, including Swift, without changing their implementation. Pending successor openings do not advertise write readiness. The content-free boundary roster also identifies the exact represented successor opening, so live hydration and outgoing-member retention cannot restore that duplicate. Coordinator route membership returns an immutable root identity rather than a moving leaf identity. The pre-review source f8859137415063557bb21b4f236992f699b8ba4c passed genuine regeneration and focused execution of32 API tests and15 aggregate database tests (one existing ignored) using verified binaries under the host's compiler-free envelope. Those binary results do not qualify the later opening-authority repair. Actual exact eb6f33adb6 hosted run38328590822 subsequently completed successfully, including current-source Cargo test compilation/execution and all seven applicable jobs; unchanged Rust source may carry that execution proof, not the predecessor binary credit.
+
+Genuine `./dev.py codegen` runs generated the Coordinator/boundary TypeScript types, including a guarded same-owner warm regeneration for the exact represented-opening identity. Independent cumulative static review passed its bounded source checks. Hosted CI passed all jobs for a47c02d1d, whose completed review found opening-authority, accessible-label and telemetry defects; those were repaired in eb6f33adb6. Hosted eb6 review5497631977 found a represented-opening bookmark regression and stale executive qualification wording. Those findings require successor UI/doc qualification and final-head review; exact-head live-server reader-anchor acceptance remains a separate resource-gated source journey. Physical user acceptance is a separate release gate. This source is not a production deployment record.

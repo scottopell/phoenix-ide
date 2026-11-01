@@ -24,6 +24,8 @@ import type { ChainSseWireEvent } from './generated/ChainSseWireEvent';
 // required fields are present and typed correctly.
 
 import * as v from 'valibot';
+import { ContinuationOpeningSchema } from './conversation/opening';
+import type { EventPresentation } from './generated/EventPresentation';
 import type { ErrorKind as WireErrorKind } from './generated/sse';
 import type { Conversation, InputOrigin, Message, QueuedSteeringMessage } from './api';
 // Generated wire types — aliased so we can reuse the short `Sse*Data`
@@ -116,12 +118,42 @@ export const InputOriginSchema: v.GenericSchema<unknown, InputOrigin> = v.varian
   v.looseObject({ kind: v.literal('unknown_historical') }),
   v.looseObject({ kind: v.literal('user_api') }),
   v.looseObject({ kind: v.literal('system_generated') }),
+  v.looseObject({ kind: v.literal('slack_gateway'), request_id: v.string() }),
   v.looseObject({ kind: v.literal('subscription_event'), event_id: v.string() }),
   v.looseObject({
     kind: v.literal('internal_conversation'),
     product_conversation_id: v.string(),
     transcript_id: v.string(),
     source_call: v.optional(v.nullable(v.object({ message_id: v.string(), tool_use_id: v.string() })), null),
+  }),
+]);
+
+export const EventPresentationSchema: v.GenericSchema<unknown, EventPresentation> = v.variant('status', [
+  v.looseObject({
+    status: v.literal('available'),
+    event_id: v.string(),
+    product_conversation_id: v.string(),
+    display_name: v.nullable(v.string()),
+    source_transcript_id: v.string(),
+    source_occurrence_kind: v.string(),
+    source_occurrence_id: v.string(),
+    source_generation: v.number(),
+    occurred_at_us: v.number(),
+    provenance: v.picklist(['subscription', 'mandatory_close_failure']),
+    outcome: v.variant('kind', [
+      v.looseObject({ kind: v.literal('turn_finished') }),
+      v.looseObject({ kind: v.literal('failed'), reason: v.string() }),
+      v.looseObject({ kind: v.literal('cleanup_failed'), reason: v.string() }),
+      v.looseObject({ kind: v.literal('cancelled') }),
+      v.looseObject({ kind: v.literal('awaiting_user_response') }),
+      v.looseObject({ kind: v.literal('awaiting_task_approval') }),
+      v.looseObject({ kind: v.literal('goal_changed') }),
+    ]),
+  }),
+  v.looseObject({
+    status: v.literal('unavailable'),
+    event_id: v.string(),
+    reason: v.picklist(['missing', 'lookup_failed', 'redacted']),
   }),
 ]);
 
@@ -140,6 +172,7 @@ const MessageSchema = v.pipe(
     conversation_id: v.string(),
     message_type: v.picklist(MESSAGE_TYPE_OPTIONS),
     origin: InputOriginSchema,
+    event_presentation: v.nullable(EventPresentationSchema),
     content: v.unknown(),
     display_data: v.optional(v.unknown()),
     usage_data: v.optional(v.unknown()),
@@ -197,6 +230,7 @@ export const QueuedSteeringMessageSchema = v.pipe(
  *  02677 tightened this field from the previously-optional schema shape
  *  after the generated type surfaced the actual wire contract. */
 export const SseInitDataSchema = v.looseObject({
+  opening: v.nullable(ContinuationOpeningSchema),
   sequence_id: v.number(),
   conversation: ConversationSchema,
   transcript_generation: v.number(),
@@ -233,6 +267,7 @@ export const SseInitDataSchema = v.looseObject({
  *  in `src/runtime.rs`). The reducer uses the envelope id for ordering and
  *  the message id for identity-based defense-in-depth dedup. */
 export const SseMessageDataSchema = v.looseObject({
+  opening: v.nullable(ContinuationOpeningSchema),
   sequence_id: v.number(),
   message: MessageSchema,
 }) satisfies v.GenericSchema<unknown, WireMessageData>;
@@ -244,6 +279,7 @@ export const SseMessageDataSchema = v.looseObject({
  *  all other paths. `sequence_id` is the envelope id; the persisted
  *  `message.sequence_id` is immutable and not repeated here. */
 export const SseMessageUpdatedDataSchema = v.looseObject({
+  opening: v.nullable(ContinuationOpeningSchema),
   sequence_id: v.number(),
   message_id: v.string(),
   transcript_generation: v.nullable(v.number()),
@@ -288,6 +324,9 @@ const ERROR_KIND_OPTIONS = [
   'cancelled',
   'sub_agent_error',
   'context_exhausted',
+  'context_capacity_conflict',
+  'planned_context_pressure',
+  'output_tokens_exhausted',
   'turn_limit_exhausted',
   'content_filter',
 ] as const satisfies readonly WireErrorKind[];
@@ -679,6 +718,31 @@ const BashRunTombstonePayloadSchema = (status: 'exited' | 'killed') =>
     ...BashRingWindowFieldsSchema,
   });
 
+const BashUnregisteredRunFields = {
+  cmd: v.string(),
+  label: v.nullable(v.string()),
+  launch_error: v.picklist(['identity_unavailable', 'registration_failed']),
+  descendants: v.literal('unverified'),
+  output_complete: v.boolean(),
+  duration_ms: v.number(),
+  ...BashRingWindowFieldsSchema,
+};
+
+const BashUnregisteredTerminalSchema = (status: 'unregistered_exited' | 'unregistered_killed') =>
+  v.looseObject({
+    status: v.literal(status),
+    ...BashUnregisteredRunFields,
+    exit_code: v.nullable(v.number()),
+    signal_number: v.nullable(v.number()),
+  });
+
+const BashOutcomeUnknownSchema = v.looseObject({
+  status: v.literal('outcome_unknown'),
+  ...BashUnregisteredRunFields,
+  error: v.string(),
+  error_message: v.string(),
+});
+
 const BashWaiterPanickedPayloadSchema = v.looseObject({
   status: v.literal('waiter_panicked'),
   handle: v.string(),
@@ -697,6 +761,9 @@ export const BashResponseSchema = v.variant('status', [
   BashTombstonedPayloadSchema,
   BashRunTombstonePayloadSchema('exited'),
   BashRunTombstonePayloadSchema('killed'),
+  BashUnregisteredTerminalSchema('unregistered_exited'),
+  BashUnregisteredTerminalSchema('unregistered_killed'),
+  BashOutcomeUnknownSchema,
   BashWaiterPanickedPayloadSchema,
 ]) satisfies v.GenericSchema<unknown, WireBashResponse>;
 
@@ -737,6 +804,11 @@ export const BashErrorResponseSchema = v.variant('error', [
   v.looseObject({
     error: v.literal('spawn_failed'),
     error_message: v.string(),
+  }),
+  v.looseObject({
+    error: v.literal('launch_release_unknown'),
+    error_message: v.string(),
+    handle: v.string(),
   }),
   v.looseObject({
     error: v.literal('mutually_exclusive_modes'),

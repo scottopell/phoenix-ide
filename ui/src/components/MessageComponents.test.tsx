@@ -1,3 +1,4 @@
+import { bashLaunchOutcomes, bashLaunchReleaseUnknown } from '../testFixtures/bashLaunchOutcomes';
 import { SvgArtifactAccessContext } from '../contexts/SvgArtifactAccessContext';
 import mermaid from 'mermaid';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
@@ -13,7 +14,26 @@ import { ForkProposalsProvider, useForkProposals } from '../contexts/ForkProposa
 import { ForkProposalReview } from './ForkProposalReview';
 import { createInitialAtom } from '../conversation/atom';
 import { buildRenderUnits } from '../conversation/renderUnits';
-import { buildReadFileOutputProjection } from './viewer-find/searchProjections';
+import { buildAgentTextFragments, buildReadFileOutputProjection } from './viewer-find/searchProjections';
+
+describe('subscription event UserMessage branch', () => {
+  it('keeps original message identity and diagnostic text while rendering a compact fallback', () => {
+    const message: Message = {
+      message_id: 'event-message', sequence_id: 401, conversation_id: 'global', message_type: 'user',
+      origin: { kind: 'subscription_event', event_id: 'event-401' }, event_presentation: null,
+      content: { text: 'Original provider diagnostic: task complete is only text.' }, created_at: '2026-10-12T00:00:00Z',
+    };
+    const { container, rerender } = render(<MemoryRouter><UserMessage message={message} /></MemoryRouter>);
+    expect(container.querySelector('#message-event-message')).toHaveAttribute('data-sequence-id', '401');
+    expect(screen.getByText('Details unavailable')).toBeVisible();
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+    expect(container.querySelector('[data-fragment-id="message-text"]')!.textContent).toBe('Original provider diagnostic: task complete is only text.');
+    expect(container.querySelector('details')).not.toHaveAttribute('open');
+    rerender(<MemoryRouter><UserMessage message={message} activeHighlight={{ owner: 'message-text', fragmentId: 'message-text', start: 0, end: 8 }} /></MemoryRouter>);
+    expect(container.querySelector('details')).toHaveAttribute('open');
+    expect(container.querySelector('mark')).toHaveTextContent('Original');
+  });
+});
 
 describe('Global coordinator tool results', () => {
   it('renders queued delivery truthfully with recipient navigation', () => {
@@ -65,6 +85,7 @@ describe('Global coordinator tool results', () => {
         <ToolUseBlock
           block={{ type: 'tool_use', id: 'bash-owner', name: 'bash', input: { cmd: 'pwd', wait_seconds: 1 } }}
           result={{
+            event_presentation: null,
             message_id: 'result-owner', sequence_id: 2, conversation_id: 'coordinator', message_type: 'tool', created_at: new Date().toISOString(),
             content: { tool_use_id: 'bash-owner', result: JSON.stringify({ command: 'pwd', output: '/repo', status: 'completed' }) },
             display_data: { coordinator_environment: {
@@ -145,6 +166,7 @@ afterEach(() => {
 
 function agentMessage(messageId: string, blocks: unknown[], sequenceId = 1): Message {
   return {
+    event_presentation: null,
     message_id: messageId,
     sequence_id: sequenceId,
     conversation_id: 'agent-1',
@@ -157,6 +179,7 @@ function agentMessage(messageId: string, blocks: unknown[], sequenceId = 1): Mes
 
 function toolMessage(toolUseId: string, content: string, sequenceId = 2, displayData?: Record<string, unknown>): Message {
   return {
+    event_presentation: null,
     message_id: `tool-${toolUseId}`,
     sequence_id: sequenceId,
     conversation_id: 'agent-1',
@@ -169,6 +192,7 @@ function toolMessage(toolUseId: string, content: string, sequenceId = 2, display
 
 function systemMessage(messageId: string, text: string, sequenceId = 2): Message {
   return {
+    event_presentation: null,
     message_id: messageId,
     sequence_id: sequenceId,
     conversation_id: 'agent-1',
@@ -181,6 +205,7 @@ function systemMessage(messageId: string, text: string, sequenceId = 2): Message
 
 function userMessage(messageId: string, text: string, options: { sequenceId?: number; isMeta?: boolean; displayData?: Record<string, unknown> | null; origin?: InputOrigin } = {}): Message {
   return {
+    event_presentation: null,
     message_id: messageId,
     sequence_id: options.sequenceId ?? 2,
     conversation_id: 'agent-1',
@@ -240,7 +265,7 @@ function emitInit(
   conversation: unknown = baseConversation,
   replay: { anchor: number; tip: number } = { anchor: 100, tip: 100 },
 ) {
-  source.emit('init', {
+  source.emit('init', { opening: null,
     type: 'init',
     sequence_id: 100,
     transcript_generation: 1,
@@ -261,23 +286,19 @@ function emitInit(
 }
 
 describe('user message provenance rendering', () => {
-  it('renders wake meta messages as background task observations instead of authored user bubbles', () => {
+  it('renders meta messages as observations instead of authored user bubbles', () => {
     render(
       <MemoryRouter>
         <UserMessage
-          message={userMessage('wake-meta', 'Wake completed while you were away.', {
+          message={userMessage('meta', 'Background task completed while you were away.', {
             isMeta: true,
-            displayData: { type: 'wake_result' },
           })}
         />
       </MemoryRouter>,
     );
 
-    const observation = screen.getByLabelText('Background task observation');
-    expect(observation).toHaveClass('message', 'meta', 'user-meta-observation');
-    expect(screen.getByText('Background task observation')).toBeInTheDocument();
+    expect(screen.getByText('Background task completed while you were away.').closest('.message')).toHaveClass('meta');
     expect(screen.queryByText('You')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Copy system observation' })).toBeInTheDocument();
   });
 
   it('does not attribute historical or unattributed input to the user', () => {
@@ -1142,6 +1163,7 @@ describe('inline tool timers', () => {
     const completed = toolMessage('tool-ok', 'done', 2);
     completed.display_data = { duration_ms: 800 };
     const failed: Message = {
+      event_presentation: null,
       message_id: 'tool-tool-fail',
       sequence_id: 3,
       conversation_id: 'agent-1',
@@ -1183,6 +1205,7 @@ describe('message copy affordances', () => {
     render(
       <UserMessage
         message={{
+          event_presentation: null,
           message_id: 'user-copy',
           origin: { kind: 'user_api' },
           sequence_id: 1,
@@ -1206,6 +1229,7 @@ describe('message copy affordances', () => {
     const { container } = render(
       <UserMessage
         message={{
+          event_presentation: null,
           message_id: 'user-layout',
           sequence_id: 1,
           conversation_id: 'agent-1',
@@ -1255,6 +1279,7 @@ describe('message copy affordances', () => {
       <MemoryRouter>
         <UserMessage
           message={{
+            event_presentation: null,
             message_id: 'user-attachment-only',
             sequence_id: 1,
             conversation_id: 'agent-1',
@@ -1296,7 +1321,7 @@ describe('message copy affordances', () => {
     );
 
     expect(screen.getByRole('button', { name: 'Copy Phoenix message' })).toBeInTheDocument();
-    expect(container.querySelector('.message-mobile-copy-row')).toBeInTheDocument();
+    expect(container.querySelector('.assistant-message-toolbar--continuation')).toBeInTheDocument();
     expect(container.querySelector('.message-mobile-copy-floating')).not.toBeInTheDocument();
   });
 
@@ -1575,6 +1600,7 @@ describe('skill command rendering', () => {
     render(
       <UserMessage
         message={{
+          event_presentation: null,
           message_id: 'user-skill',
           sequence_id: 1,
           conversation_id: 'agent-1',
@@ -2994,6 +3020,62 @@ describe('SubAgentStatus inline activity', () => {
     (api.getConversationSlug as ReturnType<typeof vi.fn>).mockResolvedValue('agent-1-slug');
   });
 
+  it.each([false, true])('keeps exact delegated task and actual child metadata lazy for a completed=%s card', async (completed) => {
+    const task = `  Inspect every file\n\n<script>alert("task")</script>\n\t${'longtask'.repeat(220)}\nKeep trailing whitespace  `;
+    const child = { ...baseConversation, id: 'agent-task', model: 'unknown/custom-child-route', ...(completed ? {} : { effort: null }) };
+    const state: ConversationState = {
+      type: 'awaiting_sub_agents',
+      pending: completed ? [] : [{ agent_id: 'agent-task', task }],
+      completed_results: completed ? [{ agent_id: 'agent-task', task, outcome: { type: 'success', result: 'Child outcome' } }] : [],
+    };
+    let resolveSnapshot!: (value: unknown) => void;
+    (api.getConversation as ReturnType<typeof vi.fn>).mockReturnValueOnce(new Promise((resolve) => { resolveSnapshot = resolve; }));
+    const { container } = render(<MemoryRouter><SubAgentStatus stateData={state} /></MemoryRouter>);
+    expect(api.getConversation).not.toHaveBeenCalled();
+    expect(container.querySelector('.subagent-task-details')).toBeNull();
+    expect(container.querySelector('.subagent-label')?.textContent).toBe(task.slice(0, 71) + '…');
+    const expand = container.querySelector('.subagent-expand-button')!;
+    fireEvent.click(expand);
+    expect(screen.getByText('Model: Loading…')).toBeInTheDocument();
+    expect(screen.queryByText(`Model: ${baseConversation.model}`)).not.toBeInTheDocument();
+    expect(container.querySelectorAll('.subagent-task-details')).toHaveLength(1);
+    const details = container.querySelector('details')!;
+    expect(details).not.toHaveAttribute('open');
+    fireEvent.click(screen.getByText('Delegated task'));
+    expect(details).toHaveAttribute('open');
+    expect(container.querySelector('.subagent-delegated-task-text')?.textContent).toBe(task);
+    expect(container.querySelector('script')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Copy delegated task' }));
+    await waitFor(() => expect(copyToClipboard).toHaveBeenCalledExactlyOnceWith(task));
+    expect(expand).toHaveAttribute('aria-expanded', 'true');
+    expect(api.getConversation).toHaveBeenCalledExactlyOnceWith('agent-task');
+    await act(async () => resolveSnapshot({ conversation: child, messages: [], agent_working: !completed, presentation_mode: completed ? 'idle' : 'working', context_window_size: 0 }));
+    expect(await screen.findByText('Model: unknown/custom-child-route')).toBeInTheDocument();
+    expect(screen.getByText(`Effort: ${completed ? 'not reported' : 'model default'}`)).toBeInTheDocument();
+    expect(screen.queryByText(`Model: ${baseConversation.model}`)).not.toBeInTheDocument();
+    expect(container.querySelectorAll('.subagent-task-details')).toHaveLength(1);
+    expect(details).toHaveAttribute('open');
+    fireEvent.click(expand);
+    expect(container.querySelector('.subagent-task-details')).toBeNull();
+    expect(api.getConversation).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the delegated task inspectable when child loading fails without substituting a parent model', async () => {
+    const task = 'Task still available\n  even if the child cannot be loaded';
+    (api.getConversation as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('Child snapshot unavailable'));
+    const state: ConversationState = {
+      type: 'awaiting_sub_agents', pending: [{ agent_id: 'agent-error', task }], completed_results: [],
+    };
+    const { container } = render(<MemoryRouter><SubAgentStatus stateData={state} /></MemoryRouter>);
+    fireEvent.click(container.querySelector('.subagent-expand-button')!);
+    expect(await screen.findByText('Model: Unavailable')).toBeInTheDocument();
+    expect(screen.getByText('Effort: not reported')).toBeInTheDocument();
+    expect(screen.queryByText(`Model: ${baseConversation.model}`)).not.toBeInTheDocument();
+    expect(screen.getByText('Child snapshot unavailable')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('Delegated task'));
+    expect(container.querySelector('.subagent-delegated-task-text')?.textContent).toBe(task);
+  });
+
   it('shows compact status plus lazy-loaded child tool timeline', async () => {
     const childMessages = [
       agentMessage('agent-msg-1', [
@@ -3121,9 +3203,10 @@ describe('SubAgentStatus inline activity', () => {
     await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
     act(() => {
       emitInit(FakeEventSource.instances[0]!, [], [], childConversation);
-      FakeEventSource.instances[0]!.emit('message', {
+      FakeEventSource.instances[0]!.emit('message', { opening: null,
         sequence_id: 101,
         message: {
+          event_presentation: null,
           message_id: 'child-live-message',
           origin: { kind: 'unknown_historical' },
           conversation_id: childConversation.id,
@@ -3171,7 +3254,7 @@ describe('SubAgentStatus inline activity', () => {
 
     fireEvent.click(screen.getByText(/Review telescope config/));
     await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
-    act(() => emitInit(FakeEventSource.instances[0]!, [{ ...initialMessage, origin: { kind: 'unknown_historical' } }], [{
+    act(() => emitInit(FakeEventSource.instances[0]!, [{ ...initialMessage, origin: { kind: 'unknown_historical' } }], [{ opening: null,
       type: 'message',
       sequence_id: pendingTool.sequence_id,
       message: { ...pendingTool, origin: { kind: 'unknown_historical' } },
@@ -3204,7 +3287,7 @@ describe('SubAgentStatus inline activity', () => {
 
     fireEvent.click(screen.getByText(/Review telescope config/));
     await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
-    act(() => FakeEventSource.instances[0]!.emit('error', {
+    act(() => FakeEventSource.instances[0]!.emit('error', { opening: null,
       type: 'error',
       sequence_id: 2,
       message: 'Child auth expired',
@@ -3331,6 +3414,9 @@ describe('SubAgentStatus inline activity', () => {
 
     fireEvent.click(screen.getByText(/Review telescope config/));
     await waitFor(() => expect(screen.getByRole('button', { expanded: true })).toBeInTheDocument());
+    fireEvent.click(screen.getByText('Delegated task'));
+    const taskDetails = screen.getByText('Delegated task').closest('details');
+    expect(taskDetails).toHaveAttribute('open');
 
     rerender(
       <MemoryRouter>
@@ -3341,6 +3427,9 @@ describe('SubAgentStatus inline activity', () => {
     expect(screen.getByRole('button', { expanded: true })).toBeInTheDocument();
     expect(await screen.findByText('final outcome')).toBeInTheDocument();
     expect(screen.getByText(/Done without collapsing/)).toBeInTheDocument();
+    expect(screen.getAllByText('Delegated task')).toHaveLength(1);
+    expect(screen.getByText('Delegated task').closest('details')).toBe(taskDetails);
+    expect(taskDetails).toHaveAttribute('open');
   });
 
   it('renders implicit completion as successful with its exact result', () => {
@@ -3421,6 +3510,7 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
 
   function forkToolResult(proposalId: string): Message {
     return {
+      event_presentation: null,
       message_id: 'tool-fork',
       sequence_id: 2,
       conversation_id: 'agent-1',
@@ -3892,6 +3982,102 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
 });
 
 
+describe('conversation disclosure integration', () => {
+  const source = '<details><summary>**Title**</summary>\n\nHidden target\n\n</details>\n\nOutside';
+
+  it('renders a native summary and opens only for a body find match', () => {
+    const message = agentMessage('details-find', [{ type: 'text', text: source }]);
+    const renderMessage = (start: number, end: number) => <MemoryRouter><AgentMessage message={message} toolResults={new Map()} activeHighlight={{ owner: 'agent-text', fragmentId: 'agent-text-0', start, end }} /></MemoryRouter>;
+    const { container, rerender } = render(renderMessage(0, 5));
+    const details = container.querySelector('details')!;
+    expect(details.open).toBe(false);
+    expect(details.firstElementChild?.tagName).toBe('SUMMARY');
+    const summary = details.querySelector('summary')!;
+    summary.focus();
+    expect(document.activeElement).toBe(summary);
+    expect(summary).not.toHaveAttribute('role');
+    expect(summary).not.toHaveAttribute('tabindex');
+    rerender(renderMessage(13, 19));
+    expect(details.open).toBe(true);
+    expect(details.querySelector('mark')?.textContent).toBe('target');
+    details.open = false;
+    rerender(renderMessage(13, 19));
+    expect(details.open).toBe(false);
+    rerender(renderMessage(0, 5));
+    expect(details.open).toBe(false);
+    rerender(renderMessage(13, 19));
+    expect(details.open).toBe(true);
+    rerender(renderMessage(20, 27));
+    expect(details.open).toBe(true);
+  });
+
+  it('reveals only the active Mermaid disclosure and preserves a manual close on updates', () => {
+    const disclosure = (title: string, language: string) => `<details><summary>${title}</summary>\n\n\`\`\`${language}\ngraph TD; A[target] --> B[target]\n\`\`\`\n\n</details>`;
+    const text = [disclosure('First target', 'mermaid'), disclosure('Second', 'mermaid'), disclosure('Ordinary', 'ts')].join('\n\n');
+    const blocks: ContentBlock[] = [{ type: 'text', text }, { type: 'text', text }];
+    const message = agentMessage('details-mermaid-find', blocks);
+    const projection = buildAgentTextFragments(blocks, 'full', { forSearch: true })[0]!.semanticText;
+    const start = projection.indexOf('target', projection.indexOf('graph'));
+    const view = (offset?: number, fragmentId = 'agent-text-0') => <MemoryRouter><AgentMessage message={message} toolResults={new Map()} activeHighlight={offset === undefined ? null : { owner: 'agent-text', fragmentId, start: offset, end: offset + 6 }} /></MemoryRouter>;
+    const { container, rerender } = render(view());
+    const details = [...container.querySelectorAll('details')];
+    expect(details).toHaveLength(6);
+    expect(details.every(node => !node.open)).toBe(true);
+    rerender(view(projection.indexOf('target')));
+    expect(details[0]!.querySelector('summary mark')).toHaveTextContent('target');
+    expect(details.every(node => !node.open)).toBe(true);
+    rerender(view(start));
+    expect(details.map(node => node.open)).toEqual([true, false, false, false, false, false]);
+    const wrapper = details[0]!.querySelector('[data-viewer-find-active-target]')!;
+    expect(wrapper).not.toBeNull();
+    expect(wrapper.closest('details')).toHaveAttribute('open');
+    expect(wrapper).toBeVisible();
+    expect(wrapper.querySelector('[data-testid="mermaid-diagram"]')).not.toBeNull();
+    expect(wrapper.textContent).not.toContain('[object Object]');
+    details[0]!.open = false;
+    rerender(view(start));
+    expect(details.every(node => !node.open)).toBe(true);
+    rerender(view(projection.indexOf('target', start + 6)));
+    expect(details[0]!.open).toBe(true);
+    details[0]!.open = false;
+    rerender(view(start, 'agent-text-1'));
+    expect(details.map(node => node.open)).toEqual([false, false, false, true, false, false]);
+    expect(details[2]!.querySelector('[data-viewer-find-active-target]')).toBeNull();
+    expect(details[2]).toHaveTextContent('graph TD; A[target] --> B[target]');
+    details[3]!.open = false;
+    rerender(view());
+    expect(details.every(node => !node.open)).toBe(true);
+    expect(container.querySelector('[data-viewer-find-active-target]')).toBeNull();
+    rerender(view(start, 'agent-text-1'));
+    expect(details[3]!.open).toBe(true);
+  });
+
+  it('promotes the complete streaming envelope once and preserves it across tail tokens', async () => {
+    const view = (text: string) => <MemoryRouter><StreamingMessageView buffer={{ text, lastSequence: 1, startedAt: 0, requestId: 'disclosure' }} /></MemoryRouter>;
+    const partial = '<details><summary>Title</summary>\n\nBody\n';
+    const { container, rerender } = render(view(partial));
+    await waitFor(() => expect(container.textContent).toContain('Body'));
+    expect(container.querySelector('details')).toBeNull();
+    const complete = partial + '\n```ts\nconst answer = 42;\n```\n\n</details>\n\n```js\n1\n```\n\nTail';
+    rerender(view(complete));
+    await waitFor(() => expect(container.querySelectorAll('details')).toHaveLength(1));
+    const details = container.querySelector('details')!;
+    expect(details.textContent).toContain('const answer = 42;');
+    details.open = true;
+    rerender(view(complete + ' grows'));
+    await waitFor(() => expect(container.textContent).toContain('Tail grows'));
+    expect(container.querySelector('details')).toBe(details);
+    expect(details.open).toBe(true);
+  });
+
+  it('resolves ordinary forward references globally across streaming code chunks', async () => {
+    const text = '[first][ref]\n\n```js\n1\n```\n\n[second][ref]\n\n[ref]: https://example.com';
+    render(<MemoryRouter><StreamingMessageView buffer={{ text, lastSequence: 1, startedAt: 0, requestId: 'refs' }} /></MemoryRouter>);
+    await waitFor(() => expect(screen.getByRole('link', { name: 'first' })).toHaveAttribute('href', 'https://example.com'));
+    expect(screen.getByRole('link', { name: 'second' })).toHaveAttribute('href', 'https://example.com');
+  });
+});
+
 describe('AgentMessage compact find reveal', () => {
   it('marks the exact occurrence in fully visible compact commentary', async () => {
     mockDensity = 'compact';
@@ -4005,4 +4191,36 @@ describe('tool result ownership across repeated provider IDs', () => {
     render(transcript(messages));
     assertArtifacts();
   });
+});
+
+it('renders launch-release-unknown with its retained handle and retry warning', () => {
+  const { container } = render(<MemoryRouter><ToolUseBlock
+    block={{ type: 'tool_use', id: 'release-unknown', name: 'bash', input: { cmd: 'side-effecting-command' } }}
+    result={{ event_presentation: null, message_id: 'release-unknown-result', sequence_id: 2, conversation_id: 'c1', message_type: 'tool', created_at: '', content: { tool_use_id: 'release-unknown', result: JSON.stringify(bashLaunchReleaseUnknown), is_error: true } }}
+    onOpenFile={undefined}
+  /></MemoryRouter>);
+  expect(container).toHaveTextContent('The command outcome is uncertain. Do not automatically retry.');
+  expect(container).toHaveTextContent('bash-handle-42');
+});
+
+it.each(bashLaunchOutcomes)('renders full no-handle outcome $status / $launch_error', (response) => {
+  const { container } = render(<MemoryRouter><ToolUseBlock
+    block={{ type: 'tool_use', id: 'launch', name: 'bash', input: { cmd: response.cmd } }}
+    result={{
+      event_presentation: null, message_id: 'launch-result', sequence_id: 2,
+      conversation_id: 'c1', message_type: 'tool', created_at: '',
+      content: { tool_use_id: 'launch', result: JSON.stringify(response), is_error: response.status === 'outcome_unknown' },
+    }}
+    onOpenFile={undefined}
+  /></MemoryRouter>);
+  expect(container.querySelector('.bash-response')).not.toBeNull();
+  expect(container.querySelector('.bash-status')).toHaveTextContent('no handle');
+  expect(container).toHaveTextContent('No controllable handle; descendants unverified. Output capture incomplete.');
+  expect(container).toHaveTextContent('retained-tail');
+  expect(container.querySelector('.bash-handle')).toBeNull();
+  if (response.status === 'outcome_unknown') {
+    expect(container).toHaveTextContent('Do not automatically retry.');
+    expect(container.querySelector('.bash-exit-code')).toBeNull();
+    expect(container.querySelector('.bash-signal-number')).toBeNull();
+  }
 });

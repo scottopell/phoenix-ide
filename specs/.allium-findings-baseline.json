@@ -5,6 +5,13 @@
   "findings": [
     {
       "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "AdmittedContinuationModelChanged",
+      "listening_rules": [
+        "ChangedModelReplansCapacityFailure"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
       "trigger": "AutoContinuationSettingChanged",
       "listening_rules": [
         "ProspectiveAutoContinuationSettingChanged"
@@ -190,6 +197,13 @@
       "trigger": "ProtectedContinuationHandoffBudgetExceeded",
       "listening_rules": [
         "ProtectedContinuationHandoffDoesNotFit"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "ReducibleRequestPressure",
+      "listening_rules": [
+        "PlannedCapacityPressureRequiresCompaction"
       ]
     },
     {

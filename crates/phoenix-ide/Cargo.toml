@@ -1,6 +1,6 @@
 [package]
 name = "phoenix_ide"
-version = "0.13.0-rc.3"
+version = "0.13.1"
 edition = "2021"
 rust-version = "1.95"
 
@@ -47,6 +47,7 @@ phoenix-skills = { path = "../phoenix-skills" }
 # Named-agent discovery (.claude/agents, .agents/agents) for the spawn-time
 # agent_type resolution and persona composition.
 phoenix-agents = { path = "../phoenix-agents" }
+phoenix-browser = { path = "../phoenix-browser" }
 
 # Tool implementations (bash, patch, browser, tmux, search, …). The Tool
 # trait, ToolContext, and ToolRegistry live here. The axum/HTTP glue that
@@ -101,6 +102,7 @@ mime_guess = "2"
 
 # Utilities
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
+chrono-tz = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 flate2 = "1"
 thiserror = "2"
@@ -178,10 +180,13 @@ phoenix-terminal = { path = "../phoenix-terminal", features = ["test-support"] }
 # explore-mode test wrapper is visible to this crate's tests. Dev-only.
 phoenix-db = { path = "../phoenix-db", features = ["test-support"] }
 opentelemetry_sdk = { version = "0.31", features = ["testing"] }
+opentelemetry-proto = { version = "=0.31.0", default-features = false, features = ["gen-tonic-messages", "trace"] }
+prost = "=0.14.4"
 # Re-declared with test-support so runtime tests can drive the in-memory
 # tmux backend (`phoenix_tools::tmux::fake_backend`).
 phoenix-tools = { path = "../phoenix-tools", features = ["test-support"] }
 proptest = "1"
+rcgen = "0.14"
 # `test-util` enables `tokio::time::pause`/`advance`, used by the
 # bounded-shutdown drain tests to exercise the SHUTDOWN_GRACE timeout
 # without waiting the full real-time deadline. `full` does not include it.
