@@ -81,10 +81,15 @@ Goals. Paging does not freeze history; later mutations can appear in later pages
 ## Create a Goal
 
 Before creating or replacing a Goal, explicitly enable **automatic continuation**
-for that target conversation. Admission checks the persisted preference in the
-Goal-write transaction; OFF returns HTTP409 `goal_requires_auto_continue` without
-changing the Goal or enabling the preference. These examples do not change that
-setting.
+for that target conversation. Open that ordinary conversation's page, expand
+**Auto-continue Off**, and select **Automatically accept future generated handoffs
+and continue**. Wait for **Saved** and **Auto-continue On** before creating the
+Goal. If saving fails, inspect the error rather than assuming the preference is
+ON. This is the target conversation's control, not the Coordinator's setting.
+
+Admission checks the persisted preference in the Goal-write transaction; OFF
+returns HTTP409 `goal_requires_auto_continue` without changing the Goal or
+enabling the preference. The console examples do not change that setting.
 
 Disabling automatic continuation later preserves the existing Goal and history.
 Reads, progress/status updates on an active Goal, explicit Complete/Suspend/
@@ -133,8 +138,11 @@ console.log(await readHistory());
 
 Disposition JSON is `"Underway"`, `{"Blocked":"reason"}`,
 `{"Suspended":"reason"}`, `{"Complete":"reason"}`, or
-`{"Exhausted":"reason"}`. Non-Underway reasons must be nonempty. **Suspended,
-Complete, and Exhausted are terminal**; a state-change request cannot reopen them,
+`{"Exhausted":"reason"}`. Non-Underway reasons must be nonempty. Use `"Underway"`
+only to unblock a **Blocked** Goal. An already-Underway Goal cannot transition to
+Underway again: that same-state request is refused as inapplicable, not accepted
+as a progress update. **Suspended, Complete, and Exhausted are terminal**; a
+state-change request cannot reopen them,
 even by setting `Underway`. Reactivating that work requires an explicit new Goal
 identity, with automatic continuation ON; the previous identity and history are
 retained.
