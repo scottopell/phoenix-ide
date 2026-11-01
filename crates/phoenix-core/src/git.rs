@@ -146,10 +146,10 @@ pub fn command_with_config(config: &[(&str, &str)]) -> std::process::Command {
 }
 
 /// Construct a noninteractive Git subprocess isolated from inherited repository
-/// routing and Git configuration environment variables.
+/// routing and injected Git configuration, with empty global/system sources.
 ///
 /// Explicit environment entries added to the returned command take precedence
-/// over these removals, so callers can configure a deliberate test repository.
+/// over these defaults, so callers can configure a deliberate test repository.
 #[cfg(any(test, feature = "test-support"))]
 #[must_use]
 pub fn test_command(config: &[(&str, &str)]) -> std::process::Command {
@@ -179,6 +179,12 @@ pub fn test_command(config: &[(&str, &str)]) -> std::process::Command {
             command.env_remove(name);
         }
     }
+    command.env_remove("GIT_CONFIG_COUNT");
+    command.env_remove("GIT_CONFIG_PARAMETERS");
+    let null_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    command.env("GIT_CONFIG_GLOBAL", null_config);
+    command.env("GIT_CONFIG_SYSTEM", null_config);
+    command.env("GIT_CONFIG_NOSYSTEM", "1");
     command
 }
 
@@ -452,6 +458,16 @@ mod command_tests {
                 .chain(noninteractive_config_args())
                 .collect::<Vec<std::ffi::OsString>>()
         );
+        let null_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        assert!(command_sets_env(&command, "GIT_CONFIG_GLOBAL", null_config));
+        assert!(command_sets_env(&command, "GIT_CONFIG_SYSTEM", null_config));
+        assert!(command_sets_env(&command, "GIT_CONFIG_NOSYSTEM", "1"));
+        command.env("GIT_CONFIG_GLOBAL", "explicit-fixture-config");
+        assert!(command_sets_env(
+            &command,
+            "GIT_CONFIG_GLOBAL",
+            "explicit-fixture-config"
+        ));
         command.env("GIT_INDEX_FILE", "explicit-fixture-index");
         assert!(command_sets_env(
             &command,

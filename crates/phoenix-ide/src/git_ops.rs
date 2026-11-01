@@ -1203,8 +1203,34 @@ pub(crate) fn ensure_local_exclude_has_phoenix(dir: &Path) -> Result<(), String>
 
 #[cfg(test)]
 mod tests {
+    use super::run_git_for_test as run_git;
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn fixture_commands_ignore_inherited_git_environment() {
+        let temp = TempDir::new().unwrap();
+        let repo = std::env::var_os("PHOENIX_API_GIT_FIXTURE_CHILD")
+            .map_or_else(|| temp.path().join("fixture"), std::path::PathBuf::from);
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        run_git(&repo, &["branch", "fixture-branch", "main"]).unwrap();
+        run_git(&repo, &["config", "fixture.local", "isolated"]).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(run_git(&repo, &["rev-parse", "--show-toplevel"]).unwrap())
+                .unwrap(),
+            std::fs::canonicalize(&repo).unwrap()
+        );
+        assert_eq!(
+            run_git(&repo, &["branch", "--list", "fixture-branch"]).unwrap(),
+            "fixture-branch"
+        );
+        assert_eq!(
+            run_git(&repo, &["config", "fixture.local"]).unwrap(),
+            "isolated"
+        );
+        assert!(run_git(&repo, &["config", "--global", "--get", "fixture.hostleak"]).is_err());
+    }
 
     /// Initialize an empty repo with a single commit on `main`.
     fn init_repo(dir: &Path) {

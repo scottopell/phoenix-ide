@@ -2543,10 +2543,16 @@ mod tests {
         let environment = std::env::vars_os().collect::<std::collections::BTreeMap<_, _>>();
         let command = phoenix_core::git::test_command(&[]);
         assert_eq!(environment, std::env::vars_os().collect());
-        for name in environment
-            .keys()
-            .filter(|name| name.as_encoded_bytes().starts_with(b"GIT_CONFIG_"))
-        {
+        for name in environment.keys().filter(|name| {
+            name.as_encoded_bytes().starts_with(b"GIT_CONFIG_")
+                && ![
+                    "GIT_CONFIG_GLOBAL",
+                    "GIT_CONFIG_SYSTEM",
+                    "GIT_CONFIG_NOSYSTEM",
+                ]
+                .iter()
+                .any(|retained| name.as_os_str() == std::ffi::OsStr::new(retained))
+        }) {
             assert!(
                 command
                     .get_envs()
@@ -2566,6 +2572,24 @@ mod tests {
             run_git(&repo, &["rev-list", "--count", "HEAD"]).unwrap(),
             "2"
         );
+        assert!(run_git(&repo, &["config", "--global", "--get", "fixture.hostleak"]).is_err());
+        let mut control = phoenix_core::git::test_command(&[]);
+        control
+            .current_dir(&repo)
+            .args(["config", "--global", "--get", "fixture.hostleak"])
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".gitconfig"),
+            );
+        assert_eq!(
+            crate::git_ops::run_git_test_command(
+                control,
+                &["host-config-control"],
+                std::time::Duration::from_secs(30),
+            )
+            .unwrap(),
+            "poison"
+        );
         let clone = tempfile::tempdir().unwrap();
         clone_repo(&repo, clone.path());
         assert_eq!(
@@ -2580,14 +2604,15 @@ mod tests {
         git_dir: &Path,
         linked: &Path,
         common: &Path,
+        test_filter: &str,
     ) -> std::process::Command {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap());
-        child.args([
-            "--exact",
-            "api::git_handlers::tests::repository_fixtures_ignore_inherited_git_environment",
-            "--nocapture",
-        ]);
+        child.args(["--exact", test_filter, "--nocapture"]);
         child.env(FIXTURE_CHILD_ENV, fixture);
+        let home = common.parent().unwrap().parent().unwrap().join("host-home");
+        child
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join("xdg"));
         match case {
             "routing" => {
                 child
@@ -2635,6 +2660,33 @@ mod tests {
         child
     }
 
+    fn assert_routing_negative_control(temp: &Path, parent: &Path, git_dir: &Path) {
+        let parent_before = snapshot(parent);
+        let negative = temp.join("negative-control");
+        std::fs::create_dir(&negative).unwrap();
+        let mut command = phoenix_core::git::test_command(&[]);
+        command
+            .args(["init", "--quiet"])
+            .current_dir(&negative)
+            .env("GIT_DIR", git_dir)
+            .env("GIT_WORK_TREE", &negative);
+        crate::git_ops::run_git_test_command(
+            command,
+            &["init", "--quiet"],
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_ne!(
+            parent_before.get(Path::new(".git/config")),
+            snapshot(parent).get(Path::new(".git/config")),
+            "negative control did not reproduce shared config mutation"
+        );
+        assert!(
+            !negative.join(".git").exists(),
+            "negative control unexpectedly created an independent repo"
+        );
+    }
+
     #[test]
     fn repository_fixtures_ignore_inherited_git_environment() {
         if let Some(path) = std::env::var_os(FIXTURE_CHILD_ENV) {
@@ -2664,6 +2716,12 @@ mod tests {
             run_git(&linked, &["rev-parse", "--absolute-git-dir"]).unwrap(),
         );
         let common = std::fs::canonicalize(parent.join(".git")).unwrap();
+        let home = temp.path().join("host-home");
+        std::fs::create_dir_all(home.join("xdg/git")).unwrap();
+        let host_config =
+            "[fixture]\n\thostleak = poison\n[core]\n\thooksPath = /missing-fixture-hooks\n";
+        std::fs::write(home.join(".gitconfig"), host_config).unwrap();
+        std::fs::write(home.join("xdg/git/config"), host_config).unwrap();
         let parent_before = snapshot(&parent);
         let linked_before = snapshot(&linked);
 
@@ -2673,51 +2731,38 @@ mod tests {
             "malformed-config",
             "config-files",
         ] {
-            let fixture = temp.path().join(case);
-            std::fs::create_dir(&fixture).unwrap();
-            let child = poisoned_fixture_child(case, &fixture, &git_dir, &linked, &common);
-            let output = crate::git_ops::run_git_test_command(
-                child,
-                &[case],
-                std::time::Duration::from_secs(120),
-            )
-            .unwrap_or_else(|error| panic!("{case}: {error}"));
-            assert!(output.contains("1 passed"), "child filter selected no test");
-            assert!(
-                fixture.join(".git").is_dir(),
-                "fixture did not get an independent repository"
-            );
-            assert_eq!(parent_before, snapshot(&parent), "parent changed in {case}");
-            assert_eq!(
-                linked_before,
-                snapshot(&linked),
-                "linked worktree changed in {case}"
-            );
+            for (index, test_filter) in [
+                "api::git_handlers::tests::repository_fixtures_ignore_inherited_git_environment",
+                "git_ops::tests::fixture_commands_ignore_inherited_git_environment",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let fixture = temp.path().join(format!("{case}-{index}"));
+                std::fs::create_dir(&fixture).unwrap();
+                let child =
+                    poisoned_fixture_child(case, &fixture, &git_dir, &linked, &common, test_filter);
+                let output = crate::git_ops::run_git_test_command(
+                    child,
+                    &[case],
+                    std::time::Duration::from_secs(120),
+                )
+                .unwrap_or_else(|error| panic!("{case}/{test_filter}: {error}"));
+                assert!(output.contains("1 passed"), "child filter selected no test");
+                assert!(
+                    fixture.join(".git").is_dir(),
+                    "fixture did not get an independent repository"
+                );
+                assert_eq!(parent_before, snapshot(&parent), "parent changed in {case}");
+                assert_eq!(
+                    linked_before,
+                    snapshot(&linked),
+                    "linked worktree changed in {case}"
+                );
+            }
         }
 
-        let negative = temp.path().join("negative-control");
-        std::fs::create_dir(&negative).unwrap();
-        let mut command = phoenix_core::git::test_command(&[]);
-        command
-            .args(["init", "--quiet"])
-            .current_dir(&negative)
-            .env("GIT_DIR", &git_dir)
-            .env("GIT_WORK_TREE", &negative);
-        crate::git_ops::run_git_test_command(
-            command,
-            &["init", "--quiet"],
-            std::time::Duration::from_secs(30),
-        )
-        .unwrap();
-        assert_ne!(
-            parent_before.get(Path::new(".git/config")),
-            snapshot(&parent).get(Path::new(".git/config")),
-            "negative control did not reproduce shared config mutation"
-        );
-        assert!(
-            !negative.join(".git").exists(),
-            "negative control unexpectedly created an independent repo"
-        );
+        assert_routing_negative_control(temp.path(), &parent, &git_dir);
     }
 
     fn commit_file(dir: &std::path::Path, name: &str, content: &str, message: &str) {
