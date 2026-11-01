@@ -1323,6 +1323,13 @@ fn validate_remote_goal_response(
             "goal response changed the wait request".to_string(),
         ));
     }
+    validate_remote_goal_history(response, request)
+}
+
+fn validate_remote_goal_history(
+    response: &RemoteReadGoalResponse,
+    request: &RemoteReadGoalRequest,
+) -> Result<(), FederationClientError> {
     if response.history.len() > MAX_REMOTE_GOAL_HISTORY_ENTRIES {
         return Err(FederationClientError::ProvenanceMismatch(
             "goal response exceeded the history page bound".to_string(),
@@ -1402,6 +1409,13 @@ fn validate_remote_goal_response(
         }
     }
 
+    validate_remote_goal_wait_status(response, request)
+}
+
+fn validate_remote_goal_wait_status(
+    response: &RemoteReadGoalResponse,
+    request: &RemoteReadGoalRequest,
+) -> Result<(), FederationClientError> {
     match (&request.wait, response.wait_status) {
         (None, RemoteGoalWaitStatus::Immediate) => Ok(()),
         (None, _) | (Some(_), RemoteGoalWaitStatus::Immediate) => {
@@ -1824,7 +1838,7 @@ async fn read_goal_with_limits(
 
 fn goal_read_error_response(error: GoalDbError) -> Response {
     match error {
-        GoalDbError::Invalid(message) => federation_error(StatusCode::BAD_REQUEST, &message),
+        GoalDbError::Invalid(message) => federation_error(StatusCode::BAD_REQUEST, message),
         GoalDbError::Admission(phoenix_db::DbError::FederationSendAuthorityInactive) => {
             federation_error(
                 StatusCode::FORBIDDEN,

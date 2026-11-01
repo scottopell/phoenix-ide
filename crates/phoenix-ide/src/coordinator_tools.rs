@@ -5,7 +5,7 @@ use crate::api::global_read::{
 
 mod goals;
 
-pub(crate) fn goal_tools(runtime: Arc<crate::runtime::RuntimeManager>) -> Vec<Arc<dyn Tool>> {
+pub(crate) fn goal_tools(runtime: &Arc<crate::runtime::RuntimeManager>) -> Vec<Arc<dyn Tool>> {
     goals::tools(runtime)
 }
 
