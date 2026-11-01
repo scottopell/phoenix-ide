@@ -1,4 +1,4 @@
-# ADR-208: Original-target touch routing follows contact ownership
+# ADR-210: Original-target touch routing follows contact ownership
 
 - **Status:** Accepted
 - **Date:** 2026-10-23
