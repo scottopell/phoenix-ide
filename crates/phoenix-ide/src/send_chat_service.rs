@@ -21,6 +21,46 @@ use phoenix_workflow::{
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+struct DirectTurnAcceptancePass {
+    owner: Option<crate::runtime::AdmittedOperation>,
+}
+
+impl DirectTurnAcceptancePass {
+    fn new(runtime: &RuntimeManager) -> Result<Self, SendChatServiceError> {
+        let owner = runtime.acquire_local_authority_pass().map_err(|()| {
+            SendChatServiceError::Internal(
+                "runtime admission closed after fatal local authority loss".to_string(),
+            )
+        })?;
+        Ok(Self { owner: Some(owner) })
+    }
+
+    fn complete<T>(
+        mut self,
+        result: phoenix_db::workflow::LocalAuthorityResult<T>,
+    ) -> Result<T, SendChatServiceError> {
+        match result {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(value) => {
+                self.owner.take();
+                Ok(value)
+            }
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                Err(SendChatServiceError::Internal(
+                    "direct-turn acceptance durability is unclassified".to_string(),
+                ))
+            }
+        }
+    }
+}
+
+impl Drop for DirectTurnAcceptancePass {
+    fn drop(&mut self) {
+        if let Some(owner) = self.owner.as_ref() {
+            owner.close("direct_turn_acceptance_unclassified");
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MessageExpansionPolicy {
     ExpandReferences,
@@ -778,23 +818,27 @@ impl SendChatApplicationService {
             disposition: AcceptedDisposition::Runtime,
             accepted_at: now_timestamp(),
         };
-        let acceptance = self
-            .runtime
-            .run_local_authority_pass(async {
-                match authority {
-                    Some(authority) => {
-                        repo.accept_federated_authoritative_turn(&input, authority)
-                            .await
-                    }
-                    None => repo.accept_authoritative_turn(&input).await,
+        let pass = DirectTurnAcceptancePass::new(&self.runtime)?;
+        let acceptance_repo = self.db.workflow_repository();
+        let authority = authority.cloned();
+        let acceptance = tokio::spawn(async move {
+            let result = match authority.as_ref() {
+                Some(authority) => {
+                    acceptance_repo
+                        .accept_federated_authoritative_turn(&input, authority)
+                        .await
                 }
-            })
-            .await
-            .map_err(|()| {
-                SendChatServiceError::Internal(
-                    "runtime admission closed after fatal local authority loss".to_string(),
-                )
-            })?;
+                None => acceptance_repo.accept_authoritative_turn(&input).await,
+            };
+            let result = pass.complete(result);
+            (result, acceptance_guard)
+        });
+        let (acceptance, acceptance_guard) = acceptance.await.map_err(|error| {
+            self.runtime
+                .signal_fatal_local_authority("direct_turn_acceptance_worker");
+            SendChatServiceError::Internal(error.to_string())
+        })?;
+        let acceptance = acceptance?;
         let step = match acceptance {
             Ok(step) => step,
             Err(crate::db::DbError::DirectTurnConflict(
@@ -1582,6 +1626,7 @@ fn transition_code(err: &TransitionError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::DirectTurnAcceptancePass;
     use super::{
         accepts_user_message_direct_or_steering, active_turn_fences_direct_acceptance,
         close_admission_fenced_outcome, expand_message, generated_predecessor_context_projection,
@@ -1594,6 +1639,7 @@ mod tests {
     };
     use crate::api::{FileAttachment, ImageAttachment};
     use crate::db::SteeringAcceptanceFingerprint;
+    use crate::runtime::RuntimeManager;
     use phoenix_core::domain::db_schema::SkillContent;
     use phoenix_core::domain::sm_event::{
         PreparedDirectTurnDelivery, PreparedDirectTurnPayload, SubmittedDirectTurnExpansionPolicy,
@@ -1606,6 +1652,151 @@ mod tests {
         AcceptedDisposition, ClientTurnKey, ConversationAuthority, LeaseExpiry, PreparedTurn,
         ProcessIncarnation, Timestamp, TurnAuthorityId, TurnConflict, TurnOutcome,
     };
+    use std::sync::Arc;
+
+    async fn acceptance_pass_runtime() -> Arc<RuntimeManager> {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let registry = phoenix_llm::ModelRegistry::new_empty();
+        Arc::new(RuntimeManager::new(
+            db,
+            Arc::new(registry),
+            crate::platform::PlatformCapability::None {
+                details: "acceptance-pass test fixture".into(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        ))
+    }
+
+    #[tokio::test]
+    async fn direct_turn_acceptance_pass_established_success_and_error_release_owner() {
+        for result in [
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok::<_, &str>(42)),
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err::<i32, _>(
+                "known",
+            )),
+        ] {
+            let runtime = acceptance_pass_runtime().await;
+            let pass = DirectTurnAcceptancePass::new(&runtime).unwrap();
+            let classified = pass.complete(result);
+            assert!(!runtime.fatal_local_authority_is_latched());
+            assert!(runtime.acquire_local_authority_pass().is_ok());
+            match classified.unwrap() {
+                Ok(42) | Err("known") => {}
+                other => panic!("unexpected classified result: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_turn_acceptance_pass_unclassified_closes_fence_and_refuses_new_owner() {
+        let runtime = acceptance_pass_runtime().await;
+        let pass = DirectTurnAcceptancePass::new(&runtime).unwrap();
+        let error = pass
+            .complete::<()>(phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified)
+            .unwrap_err();
+
+        assert!(matches!(error, SendChatServiceError::Internal(_)));
+        assert!(runtime.fatal_local_authority_is_latched());
+        assert!(runtime.acquire_local_authority_pass().is_err());
+        assert_eq!(runtime.fatal_authority_owners_at_first_close(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn dropping_armed_direct_turn_acceptance_pass_closes_fence() {
+        let runtime = acceptance_pass_runtime().await;
+        drop(DirectTurnAcceptancePass::new(&runtime).unwrap());
+
+        assert!(runtime.fatal_local_authority_is_latched());
+        assert!(runtime.acquire_local_authority_pass().is_err());
+        assert_eq!(runtime.fatal_authority_owners_at_first_close(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn detached_acceptance_worker_closes_after_requester_drops_handle_and_holds_mutex_until_classified(
+    ) {
+        let runtime = acceptance_pass_runtime().await;
+        let conversation_id = "acceptance-pass-test-conversation";
+        let acceptance_guard = runtime.lock_message_acceptance(conversation_id).await;
+        let pass = DirectTurnAcceptancePass::new(&runtime).unwrap();
+        let mut fatal_rx = runtime.fatal_local_authority_receiver();
+        let (classify_tx, classify_rx) = tokio::sync::oneshot::channel();
+        let (classified_tx, classified_rx) = tokio::sync::oneshot::channel();
+
+        let worker_runtime = Arc::clone(&runtime);
+        let worker = tokio::spawn(async move {
+            let classified = {
+                let _acceptance_guard = acceptance_guard;
+                let pass = pass;
+                classify_rx.await.expect("requester signals classification");
+                pass.complete::<()>(
+                    phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified,
+                )
+                .is_err()
+            };
+            classified_tx.send(classified).unwrap();
+        });
+        drop(worker);
+
+        assert!(worker_runtime
+            .try_lock_message_acceptance(conversation_id)
+            .await
+            .is_none());
+        classify_tx.send(()).unwrap();
+        assert!(classified_rx.await.unwrap());
+        fatal_rx
+            .changed()
+            .await
+            .expect("fatal fence watch is latched");
+        assert!(runtime.fatal_local_authority_is_latched());
+        assert!(runtime.acquire_local_authority_pass().is_err());
+        assert!(runtime
+            .try_lock_message_acceptance(conversation_id)
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelling_task_with_armed_direct_turn_acceptance_pass_closes_fence() {
+        let runtime = acceptance_pass_runtime().await;
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let (_hold_tx, hold_rx) = tokio::sync::oneshot::channel::<()>();
+        let task_runtime = Arc::clone(&runtime);
+        let task = tokio::spawn(async move {
+            let _pass = DirectTurnAcceptancePass::new(&task_runtime).unwrap();
+            armed_tx.send(()).unwrap();
+            let _ = hold_rx.await;
+        });
+        armed_rx.await.unwrap();
+        task.abort();
+        let _ = task.await;
+
+        assert!(runtime.fatal_local_authority_is_latched());
+        assert!(runtime.acquire_local_authority_pass().is_err());
+        assert_eq!(runtime.fatal_authority_owners_at_first_close(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn direct_turn_acceptance_owner_drain_waits_for_open_pass_then_completes() {
+        let runtime = acceptance_pass_runtime().await;
+        let pass = DirectTurnAcceptancePass::new(&runtime).unwrap();
+        let mut fatal_rx = runtime.fatal_local_authority_receiver();
+        let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
+        let draining_runtime = Arc::clone(&runtime);
+        let drain = tokio::spawn(async move {
+            draining_runtime.fence_fatal_local_authority().await;
+            drained_tx.send(()).unwrap();
+        });
+        fatal_rx.changed().await.expect("drain closes fatal fence");
+        assert_eq!(runtime.fatal_authority_owners_at_first_close(), Some(1));
+        drop(pass);
+        drained_rx
+            .await
+            .expect("owner drain completes after pass drop");
+        drain.await.unwrap();
+        assert!(runtime.fatal_local_authority_is_latched());
+        assert!(runtime.acquire_local_authority_pass().is_err());
+    }
 
     #[test]
     fn federated_steering_duplicate_maps_to_durable_replay() {
@@ -2152,6 +2343,8 @@ mod tests {
                 accepted_at: Timestamp(1),
             })
             .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = turn.outcome else {
             panic!("expected created turn")
@@ -2225,6 +2418,8 @@ mod tests {
                 accepted_at: Timestamp(1),
             })
             .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = turn.outcome else {
             panic!("expected created turn")
@@ -2261,6 +2456,8 @@ mod tests {
             accepted_at: Timestamp(1),
         })
         .await
+        .established()
+        .expect("acceptance durability is established")
         .unwrap();
         db.set_legacy_conversation_archived(&req.conversation_id)
             .await

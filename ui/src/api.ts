@@ -18,6 +18,9 @@ import type { FileViewerKind } from './generated/FileViewerKind';
 import type { UsageOverview } from './generated/UsageOverview';
 import type { ConversationUsageDetail } from './generated/ConversationUsageDetail';
 import type { QuotaDetails } from './generated/QuotaDetails';
+import type { CodexResetCredits } from './generated/CodexResetCredits';
+import type { CodexResetRedeemRequest } from './generated/CodexResetRedeemRequest';
+import type { CodexResetRedeemResponse } from './generated/CodexResetRedeemResponse';
 // Phoenix API Client
 
 export class ApiResponseError extends Error {
@@ -1384,6 +1387,17 @@ function exactReadRequest(reference: string): RequestInit {
   };
 }
 
+export type CodexResetCreditsResult =
+  | { type: 'ok'; credits: CodexResetCredits }
+  | { type: 'signed_out' }
+  | { type: 'unavailable' };
+
+export type CodexRedeemResult =
+  | { type: 'ok'; response: CodexResetRedeemResponse }
+  | { type: 'signed_out' }
+  | { type: 'account_changed' }
+  | { type: 'failed' };
+
 export const api = {
   async authStatus(): Promise<AuthStatus> {
     const resp = await fetch('/api/auth/status');
@@ -1592,6 +1606,47 @@ export const api = {
     const resp = await fetch('/api/codex/quota');
     if (!resp.ok) throw new Error('Failed to load Codex quota');
     return resp.json();
+  },
+
+  // REQ-CRR-001: signed-out and unavailable are distinct from zero resets.
+  async codexResetCredits(): Promise<CodexResetCreditsResult> {
+    let resp: Response;
+    try {
+      resp = await fetch('/api/codex/rate-limit-resets');
+    } catch {
+      return { type: 'unavailable' };
+    }
+    if (resp.status === 409) return { type: 'signed_out' };
+    if (!resp.ok) return { type: 'unavailable' };
+    try {
+      return { type: 'ok', credits: await resp.json() as CodexResetCredits };
+    } catch {
+      return { type: 'unavailable' };
+    }
+  },
+
+  // REQ-CRR-002/010. Never throws: every failure is a typed result.
+  async codexRedeemReset(request: CodexResetRedeemRequest): Promise<CodexRedeemResult> {
+    let resp: Response;
+    try {
+      resp = await fetch('/api/codex/rate-limit-resets/consume', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(request),
+      });
+    } catch {
+      return { type: 'failed' };
+    }
+    if (resp.status === 409) {
+      const err = await resp.json().catch(() => ({})) as { error_type?: string };
+      return err.error_type === 'codex_account_changed' ? { type: 'account_changed' } : { type: 'signed_out' };
+    }
+    if (!resp.ok) return { type: 'failed' };
+    try {
+      return { type: 'ok', response: await resp.json() as CodexResetRedeemResponse };
+    } catch {
+      return { type: 'failed' };
+    }
   },
 
   async codexPkceStart(): Promise<CodexPkceStartResponse> {

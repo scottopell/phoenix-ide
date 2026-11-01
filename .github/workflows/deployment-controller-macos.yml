@@ -67,14 +67,14 @@ permissions:
 jobs:
   native-controller:
     name: native controller (macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 45
     env:
       CARGO_TERM_COLOR: always
     steps:
       - name: Verify ARM64 runner
         run: test "$(uname -m)" = arm64
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
@@ -85,7 +85,7 @@ jobs:
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - name: Set up isolated validation Python
         if: github.event_name == 'workflow_dispatch' && inputs.validate_prepared_source114
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Download exact prepared Source114 artifact by ID

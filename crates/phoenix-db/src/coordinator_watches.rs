@@ -656,6 +656,8 @@ mod tests {
                 accepted_at: Timestamp(1),
             })
             .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = result.outcome else {
             panic!("turn was not created")

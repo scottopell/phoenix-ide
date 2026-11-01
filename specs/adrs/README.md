@@ -17,6 +17,8 @@ Controlled-functional build isolation is governed by [ADR-119](119_separate-cont
 
 Creation terminal evidence and image delivery lifetime are governed by [ADR-207](207_creation-receipt-evidence-and-image-payload-lifetime.md), affecting REQ-CCR-013–015.
 
+Codex reset-credit visibility and manual redemption, including resuming the stopped conversation after a redemption from its quota error, are governed by [ADR-208](208_codex-reset-credits-are-manual-and-resume-the-stopped-conversation.md), affecting REQ-CRR-001–010.
+
 ## Numbering and validation
 
 ADRs use unique three-digit numeric IDs in `NNN_<slug>.md` filenames. The
@@ -34,6 +36,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [208](208_codex-reset-credits-are-manual-and-resume-the-stopped-conversation.md) | Codex reset credits are redeemed manually through a Phoenix proxy, and a redemption from the quota error resumes that conversation | Accepted | REQ-CRR-001–010 |
 | [207](207_creation-receipt-evidence-and-image-payload-lifetime.md) | Retain creation evidence and replay identity, retire delivery images at product deletion | Accepted | REQ-CCR-013, REQ-CCR-014, REQ-CCR-015 |
 | [000](000_adopt-spears-v2.md) | Phoenix adopts spEARS v2 for new specification work | Accepted | methodology-level |
 | [001](001_bash-first-class-handles.md) | Bash handles are first-class process-local entities with wait windows | Accepted | REQ-BASH-001, REQ-BASH-002, REQ-BASH-003, REQ-BASH-005, REQ-BASH-009, REQ-BASH-014, REQ-BASH-WS-001, REQ-BASH-WS-002 |
@@ -184,6 +187,8 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [144](144_output-budget-is-declared-model-maximum-and-exhaustion-is-terminal.md) | Output budget is the declared model maximum, and output exhaustion is a distinct terminal error | Accepted | REQ-LLM-003, REQ-LLM-004f, REQ-LLM-006c |
 | [190](190_generic-ordinary-forward-proof-begins-after-quiescence.md) | Generic ordinary forward proof begins after quiescence | Accepted | REQ-COMP-013/019, REQ-LDD-023/028 |
 | [191](191_native-create-and-rename-use-shared-application-actions.md) | Native create and rename use shared application actions | Accepted | REQ-GR-007, REQ-CCR-013, REQ-CID-007 |
+| [211](211_native-continue-reuses-generated-handoff-admission.md) | Native Continue reuses generated handoff admission | Accepted | REQ-GR-007/019, REQ-BED-020/021/020b/030 |
+| [209](209_native-automatic-continuation-is-preference-only.md) | Native automatic continuation is preference-only | Accepted | REQ-GR-007/020, REQ-BED-020, REQ-API-029 |
 | [192](192_goal-admission-requires-explicit-auto-continue.md) | Goal admission requires explicit automatic continuation | Accepted | REQ-GOAL-AC-001–004 |
 | [149](149_selective-coordinator-checkins.md) | Selective coordinator check-ins and attention-first briefings | Accepted | REQ-GR-011 |
 | [150](150_concrete-coordinator-reporting-and-blocker-recovery.md) | Concrete Coordinator reporting and blocked-work recovery | Accepted | REQ-GR-011 |
@@ -198,6 +203,9 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [154](154_slack-clarifications-hand-off-to-phoenix.md) | Slack clarifications hand off to Phoenix | Question-text publication superseded by ADR-155 | REQ-SG-012/013 |
 | [155](155_slack-signals-are-best-effort-and-questions-stay-native.md) | Slack signals are best effort and questions stay native | Prototype compatibility superseded by ADR-188 | REQ-SG-005/006/012/013/014/015/016/017 |
 | [188](188_slack-gateway-supports-only-its-final-public-schema.md) | Slack gateway supports only its final public schema | Accepted | REQ-SG-005/011/012/015/017; REQ-COMP-002/020 |
+| [210](210_original-target-touch-routing-follows-contact-ownership.md) | Original-target touch routing follows contact ownership | Accepted | REQ-MLRU-014, REQ-MLRU-017 |
+| [212](212_outcome-delegation-with-owner-method-autonomy.md) | Outcome delegation with owner method autonomy | Proposed | REQ-GR-011 |
+| [213](213_macos-bash-launch-qualification-is-the-only-hosted-launch-ci.md) | macOS Bash launch qualification is the only separate hosted launch CI | Accepted | REQ-BASH-017 |
 
 ## For agents: which decisions bind your task
 
@@ -208,6 +216,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Changing navigation console attribution or CDP context ownership | 110/111, superseding 109, with 107/108 |
 | Changing conversation Markdown disclosures, their source ranges, streaming selection, or find interpretation | 099 |
 | Changing Codex model discovery, availability, or account-bound routing | 062, then 052 and 034 |
+| Changing Codex reset-credit listing, redemption, or post-redemption resume | 208, then 062 and 085 |
 | Configuring named workers, tiers, or sub-agent model routes | 052, within 034's compatibility scope |
 | Selecting or qualifying development compiler-cache defaults | 079, then 078 and 034 |
 | Changing pending-question identity compatibility or legacy tokenless settlement | 082, then 034 |
