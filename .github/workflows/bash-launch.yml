@@ -62,8 +62,7 @@ jobs:
         run: |
           cargo build -p phoenix_ide --bin phoenix_ide
           test -x "$PHOENIX_BASH_LAUNCH_TEST_EXE"
-      # One invocation, one compile: the build scripts embed git dirty state,
-      # and a second cargo run after tests dirty the checkout recompiles.
+      # One invocation: a second one recompiled phoenix-db and phoenix_ide.
       - name: Launch and identity fault regressions
         run: |
           cat > "$RUNNER_TEMP/nextest.toml" <<'TOML'
@@ -86,6 +85,3 @@ jobs:
                 or test(coordinator_bash_executes_owned_home_with_zero_ordinary_conversations)
                 or test(real_bash_wait_zero_and_normal_bounds_preserve_child_without_replay)
                 or test(conversation_runtime_dispatches_real_zero_and_normal_bash_waits)))'
-      - name: Report checkout files left by tests
-        if: always()
-        run: git status --porcelain --untracked-files=normal

@@ -18,7 +18,7 @@ macOS-only code (`process_start_time` via `proc_pidinfo`, platform helpers, laun
 
 ## Decision
 
-Option 3. The workflow runs one macOS job. Its regressions run as one nextest invocation, so the compile happens once (a second cargo invocation recompiles, because the build scripts embed git dirty state that the tests change); a nextest test group keeps the runtime cases serial. It triggers on pull requests and main pushes touching `process_identity.rs`, `platform.rs`, `phoenix-tools` Bash sources, `phoenix-ide` `main.rs`, `runtime/close_retirement.rs`, or the workflow. Linux coverage of the same regressions is provided by required CI.
+Option 3. The workflow runs one macOS job. Its regressions run as one nextest invocation, so the compile happens once (a second invocation was observed to recompile `phoenix-db` and `phoenix_ide`, whose build scripts rerun on every cargo invocation); a nextest test group keeps the runtime cases serial. It triggers on pull requests and main pushes touching `process_identity.rs`, `platform.rs`, `phoenix-tools` Bash sources, `phoenix-ide` `main.rs`, `runtime/close_retirement.rs`, or the workflow. Linux coverage of the same regressions is provided by required CI.
 
 ## Consequences
 
