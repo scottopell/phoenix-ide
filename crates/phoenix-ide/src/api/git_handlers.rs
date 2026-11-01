@@ -2579,7 +2579,7 @@ mod tests {
             .args(["config", "--global", "--get", "fixture.hostleak"])
             .env(
                 "GIT_CONFIG_GLOBAL",
-                std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".gitconfig"),
+                std::env::var_os("PHOENIX_API_GIT_FIXTURE_HOST_CONFIG").unwrap(),
             );
         assert_eq!(
             crate::git_ops::run_git_test_command(
@@ -2612,7 +2612,11 @@ mod tests {
         let home = common.parent().unwrap().parent().unwrap().join("host-home");
         child
             .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", home.join("xdg"));
+            .env("XDG_CONFIG_HOME", home.join("xdg"))
+            .env(
+                "PHOENIX_API_GIT_FIXTURE_HOST_CONFIG",
+                home.join(".gitconfig"),
+            );
         match case {
             "routing" => {
                 child
