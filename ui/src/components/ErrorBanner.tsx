@@ -1,13 +1,19 @@
 import { AlertCircle } from 'lucide-react';
-import type { ReactNode } from 'react';
+import { useRef, type ReactNode } from 'react';
 import type { ErrorKind } from '../generated/ErrorKind';
 import type { ErrorPresentation } from '../errorPresentation';
+import { CodexResetAction } from './CodexResetAction';
 
 interface ErrorBannerProps {
   message: string;
   error?: ErrorPresentation | undefined;
   onRetry?: (() => void) | undefined;
   onDismiss?: (() => void) | undefined;
+  /** Identity of the errored conversation; scopes the reset action to it. */
+  conversationId?: string | undefined;
+  /** Counts user sends/dismissals on this conversation; any change since this
+   * banner mounted means the user already acted, so a redemption must not resume. */
+  userActionSeq?: { readonly current: number } | undefined;
 }
 
 /**
@@ -125,9 +131,25 @@ function linkify(text: string): ReactNode[] {
   return out;
 }
 
-export function ErrorBanner({ message, error, onRetry, onDismiss }: ErrorBannerProps) {
+export function ErrorBanner({ message, error, onRetry, onDismiss, conversationId, userActionSeq }: ErrorBannerProps) {
   const errorKind = error?.kind;
   const canUserResume = (error?.can_user_resume ?? false) && !!onRetry && !!onDismiss;
+  const actedRef = useRef(false);
+  const actionSeqAtMountRef = useRef(userActionSeq?.current ?? 0);
+  const handleRetry = () => {
+    actedRef.current = true;
+    onRetry?.();
+  };
+  const handleDismiss = () => {
+    actedRef.current = true;
+    onDismiss?.();
+  };
+  const resumeAfterRedemption = () => {
+    if (actedRef.current) return;
+    if (userActionSeq && userActionSeq.current !== actionSeqAtMountRef.current) return;
+    actedRef.current = true;
+    onRetry?.();
+  };
 
   const { title, details } = humanizeError(message, errorKind);
   const displayTitle = title;
@@ -142,6 +164,9 @@ export function ErrorBanner({ message, error, onRetry, onDismiss }: ErrorBannerP
         <div className="error-body-content">
           <div className="error-body-title">{displayTitle}</div>
           {details && <div className="error-body-details">{linkify(details)}</div>}
+          {canUserResume && errorKind === 'usage_limit_reached' && (
+            <CodexResetAction key={conversationId} surface="error" onRedeemed={resumeAfterRedemption} />
+          )}
         </div>
       </div>
 
@@ -149,13 +174,13 @@ export function ErrorBanner({ message, error, onRetry, onDismiss }: ErrorBannerP
       <div className="error-action-bar">
         {canUserResume ? (
           <>
-            <button className="error-retry-btn" onClick={onRetry}>
+            <button className="error-retry-btn" onClick={handleRetry}>
               ↺ Retry — sends &ldquo;continue&rdquo;
             </button>
             {/* Dismiss returns the conversation to Idle. Offered only for
                 resumable errors: a non-resumable error is a dead end (no Idle
                 to return to), and the server rejects DismissError for it. */}
-            <button className="error-dismiss-btn" onClick={onDismiss} title="Dismiss error">
+            <button className="error-dismiss-btn" onClick={handleDismiss} title="Dismiss error">
               Dismiss
             </button>
           </>

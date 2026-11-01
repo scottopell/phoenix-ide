@@ -2,6 +2,8 @@ import { useSyncExternalStore } from 'react';
 import type { QuotaDetails } from './sseSchemas';
 
 let snapshot: QuotaDetails | null = null;
+// Bumped by every clear so a refresh started before the clear is discarded.
+let generation = 0;
 const listeners = new Set<() => void>();
 
 function notify(): void {
@@ -13,7 +15,12 @@ export function setCodexQuota(next: QuotaDetails): void {
   notify();
 }
 
+export function getCodexQuotaGeneration(): number {
+  return generation;
+}
+
 export function clearCodexQuota(): void {
+  generation++;
   if (snapshot === null) return;
   snapshot = null;
   notify();

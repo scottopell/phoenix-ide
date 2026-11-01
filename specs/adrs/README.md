@@ -17,6 +17,8 @@ Controlled-functional build isolation is governed by [ADR-119](119_separate-cont
 
 Creation terminal evidence and image delivery lifetime are governed by [ADR-207](207_creation-receipt-evidence-and-image-payload-lifetime.md), affecting REQ-CCR-013–015.
 
+Codex reset-credit visibility and manual redemption, including resuming the stopped conversation after a redemption from its quota error, are governed by [ADR-208](208_codex-reset-credits-are-manual-and-resume-the-stopped-conversation.md), affecting REQ-CRR-001–010.
+
 ## Numbering and validation
 
 ADRs use unique three-digit numeric IDs in `NNN_<slug>.md` filenames. The
@@ -34,6 +36,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [208](208_codex-reset-credits-are-manual-and-resume-the-stopped-conversation.md) | Codex reset credits are redeemed manually through a Phoenix proxy, and a redemption from the quota error resumes that conversation | Accepted | REQ-CRR-001–010 |
 | [207](207_creation-receipt-evidence-and-image-payload-lifetime.md) | Retain creation evidence and replay identity, retire delivery images at product deletion | Accepted | REQ-CCR-013, REQ-CCR-014, REQ-CCR-015 |
 | [000](000_adopt-spears-v2.md) | Phoenix adopts spEARS v2 for new specification work | Accepted | methodology-level |
 | [001](001_bash-first-class-handles.md) | Bash handles are first-class process-local entities with wait windows | Accepted | REQ-BASH-001, REQ-BASH-002, REQ-BASH-003, REQ-BASH-005, REQ-BASH-009, REQ-BASH-014, REQ-BASH-WS-001, REQ-BASH-WS-002 |
@@ -200,6 +203,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [154](154_slack-clarifications-hand-off-to-phoenix.md) | Slack clarifications hand off to Phoenix | Question-text publication superseded by ADR-155 | REQ-SG-012/013 |
 | [155](155_slack-signals-are-best-effort-and-questions-stay-native.md) | Slack signals are best effort and questions stay native | Prototype compatibility superseded by ADR-188 | REQ-SG-005/006/012/013/014/015/016/017 |
 | [188](188_slack-gateway-supports-only-its-final-public-schema.md) | Slack gateway supports only its final public schema | Accepted | REQ-SG-005/011/012/015/017; REQ-COMP-002/020 |
+| [210](210_original-target-touch-routing-follows-contact-ownership.md) | Original-target touch routing follows contact ownership | Accepted | REQ-MLRU-014, REQ-MLRU-017 |
 
 ## For agents: which decisions bind your task
 
@@ -210,6 +214,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Changing navigation console attribution or CDP context ownership | 110/111, superseding 109, with 107/108 |
 | Changing conversation Markdown disclosures, their source ranges, streaming selection, or find interpretation | 099 |
 | Changing Codex model discovery, availability, or account-bound routing | 062, then 052 and 034 |
+| Changing Codex reset-credit listing, redemption, or post-redemption resume | 208, then 062 and 085 |
 | Configuring named workers, tiers, or sub-agent model routes | 052, within 034's compatibility scope |
 | Selecting or qualifying development compiler-cache defaults | 079, then 078 and 034 |
 | Changing pending-question identity compatibility or legacy tokenless settlement | 082, then 034 |

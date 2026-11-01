@@ -7,6 +7,10 @@ vi.mock('../codexQuota', () => ({
   useCodexQuota: () => null,
 }));
 
+vi.mock('../api', () => ({
+  api: { codexResetCredits: async () => ({ type: 'signed_out' }) },
+}));
+
 describe('ErrorBanner', () => {
   it('shows retry/continue affordance for auth errors', () => {
     const onRetry = vi.fn();
