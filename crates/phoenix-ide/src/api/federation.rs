@@ -1358,7 +1358,7 @@ fn validate_remote_goal_response(
     }
 
     let mut previous_version = request.after_version;
-    let mut previous_entry = None;
+    let mut previous_entry: Option<GoalHistoryEntry> = None;
     for entry in &response.history {
         let expected_version = previous_version.get().checked_add(1).ok_or_else(|| {
             FederationClientError::ProvenanceMismatch(
