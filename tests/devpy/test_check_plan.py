@@ -423,6 +423,95 @@ def workflow_order(group):
     }[group]
 
 
+class RustSplitTests(unittest.TestCase):
+    def setUp(self):
+        self.dev = load_devpy()
+
+    def test_partition_parse_accepts_only_in_range_k_of_n(self):
+        self.assertEqual("hash:2/4", self.dev.RustPartition.parse("2/4").nextest_arg())
+        for raw in ("0/4", "5/4", "2", "a/b", "1/0", " 1/4", "-1/4"):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                self.dev.RustPartition.parse(raw)
+
+    def test_partition_only_applies_to_test_phase(self):
+        partition = self.dev.RustPartition(1, 4)
+        for phase in (self.dev.RustPhase.BUILD, self.dev.RustPhase.CODEGEN):
+            with self.subTest(phase=phase), self.assertRaises(ValueError):
+                self.dev.RustSplit(phase, partition)
+        self.dev.RustSplit(self.dev.RustPhase.TEST, partition)
+
+    def test_build_phase_archives_the_unsplit_compile_scope(self):
+        cmds = self.dev._rust_split_commands(
+            self.dev.RustSplit(self.dev.RustPhase.BUILD), ["-p", "a", "-p", "exports"],
+            ["a"], 3, [],
+        )
+        self.assertEqual(["cargo test compile"], list(cmds))
+        self.assertEqual(
+            ["cargo", "nextest", "archive", "-p", "a", "-p", "exports",
+             "--archive-file", str(self.dev.RUST_SPLIT_ARCHIVE)],
+            cmds["cargo test compile"],
+        )
+
+    def test_test_phase_runs_scoped_partition_from_archive(self):
+        profile = ["--config-file", "profile.toml", "--profile", "phoenix-cpu"]
+        cmds = self.dev._rust_split_commands(
+            self.dev.RustSplit(self.dev.RustPhase.TEST, self.dev.RustPartition(2, 4)),
+            ["-p", "a", "-p", "exports"], ["a", "b"], 3, profile,
+        )
+        self.assertEqual(["extract test archive", "cargo test"], list(cmds))
+        self.assertEqual(["tar", "--zstd", "-xf", str(self.dev.RUST_SPLIT_ARCHIVE),
+                          "-C", str(self.dev.ROOT)], cmds["extract test archive"])
+        test = cmds["cargo test"]
+        self.assertEqual(["cargo", "nextest", *profile, "run"], test[:7])
+        self.assertNotIn("-p", test)
+        self.assertIn("--binaries-metadata", test)
+        self.assertIn("--cargo-metadata", test)
+        self.assertEqual(
+            "(not test(/export_bindings/)) and (package(=a) or package(=b))",
+            test[test.index("-E") + 1],
+        )
+        self.assertEqual("3", test[test.index("--test-threads") + 1])
+        self.assertEqual("hash:2/4", test[test.index("--partition") + 1])
+        self.assertIn("--no-tests=warn", test)
+
+    def test_unpartitioned_full_workspace_test_phase_requires_tests(self):
+        test = self.dev._rust_split_commands(
+            self.dev.RustSplit(self.dev.RustPhase.TEST), [], None, 3, [],
+        )["cargo test"]
+        self.assertEqual("not test(/export_bindings/)", test[test.index("-E") + 1])
+        self.assertNotIn("--partition", test)
+        self.assertNotIn("--no-tests=warn", test)
+
+    def test_codegen_phase_runs_only_export_tests_from_archive(self):
+        cmds = self.dev._rust_split_commands(
+            self.dev.RustSplit(self.dev.RustPhase.CODEGEN), [], ["a"], 3, [],
+        )
+        self.assertEqual(["extract test archive", "codegen"], list(cmds))
+        codegen = cmds["codegen"]
+        self.assertEqual("test(/export_bindings/)", codegen[codegen.index("-E") + 1])
+        self.assertIn("--binaries-metadata", codegen)
+
+    def test_scope_round_trips_and_missing_scope_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "split" / "scope.json"
+            with self.assertRaises(SystemExit):
+                self.dev._read_rust_split_scope(path)
+            for scope in (None, ["phoenix-db", "phoenix_ide"]):
+                with self.subTest(scope=scope):
+                    self.dev._write_rust_split_scope(scope, path)
+                    self.assertEqual(scope, self.dev._read_rust_split_scope(path))
+            path.write_text('{"rust_scope": []}')
+            with self.assertRaises(SystemExit):
+                self.dev._read_rust_split_scope(path)
+
+    def test_workflow_runs_every_split_phase_and_partition(self):
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        self.assertIn("--rust-phase build", workflow)
+        self.assertIn("phase: codegen", workflow)
+        for index in range(1, 5):
+            self.assertIn(f"partition: {index}/4", workflow)
+
+
 class CargoTestTimeoutTests(unittest.TestCase):
     def setUp(self):
         self.dev = load_devpy()

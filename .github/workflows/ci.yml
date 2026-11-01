@@ -63,30 +63,23 @@ jobs:
           cat check-plan.env
           cat check-plan.env >> "$GITHUB_OUTPUT"
 
-  check-rust:
-    name: check (rust)
+  check-rust-build:
+    name: check (rust build)
     needs: plan_check
     if: ${{ needs.plan_check.outputs.rust == 'true' }}
     runs-on: ubuntu-latest
-    # 15 setup/browser + 20 native + 112 check + 10 musl + 2 evidence + 4 post-actions.
-    # Setup/network and musl are planning estimates, not completion guarantees.
-    # Check: 100.5 Rust watchdog (2x600 s compile/codegen + 4800 s cargo test + 30)
-    # + 10 normal fmt + 1.5 probes/teardown/report.
-    timeout-minutes: 163
+    # 10 setup + 20 native + 20 check (15 archive + fmt) + 5 uploads.
+    timeout-minutes: 55
     env:
       PYTHONUNBUFFERED: "1"
       PHOENIX_DEV_TRACE_ENDPOINT: "off"
-      RUST_EVIDENCE_DIR: ${{ github.workspace }}/target/ci-rust-evidence/${{ github.run_id }}-${{ github.run_attempt }}
+      RUST_EVIDENCE_DIR: ${{ github.workspace }}/target/ci-rust-evidence/${{ github.run_id }}-${{ github.run_attempt }}-build
       CARGO_TERM_COLOR: always
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
       SCCACHE_IDLE_TIMEOUT: "0"
       PHOENIX_CHECK_ALL: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '1' || '' }}
       PHOENIX_CHECK_BASE: ${{ github.event_name == 'pull_request' && 'origin/main' || '' }}
-      # Slow hosted runners run every test ~1.9x slower; 3000 s timed out there.
-      PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS: "4800"
-      PHOENIX_BASH_LAUNCH_TEST_EXE: ${{ github.workspace }}/target/debug/phoenix_ide
-      PHOENIX_BASH_LAUNCH_TEST_REQUIRED: '1'
     steps:
       - uses: actions/checkout@v6
         with:
@@ -103,7 +96,6 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
-          target: x86_64-unknown-linux-musl
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
@@ -124,18 +116,99 @@ jobs:
         run: |
           git config --global user.email "ci@phoenix-ide.invalid"
           git config --global user.name "Phoenix CI"
-      - name: Install musl compiler
+      - name: Build native bash launcher fixture
+        timeout-minutes: 20
+        run: |
+          python3 scripts/check_profile_command.py --output-dir "$RUST_EVIDENCE_DIR/native" \
+            --identity step:ci:native-launcher -- cargo build -p phoenix_ide --bin phoenix_ide
+          test -x target/debug/phoenix_ide
+      - name: ./dev.py check (rust,cargo-fmt) build phase
+        timeout-minutes: 20
+        run: ./dev.py check --lanes rust,cargo-fmt --rust-phase build --profile-work --profile-work-dir "$RUST_EVIDENCE_DIR/check"
+      - name: Upload test archive
         timeout-minutes: 5
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        uses: actions/upload-artifact@v6
+        with:
+          name: rust-test-archive-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/rust-split/
+            target/debug/phoenix_ide
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+      - name: Upload Rust evidence
+        if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v6
+        with:
+          name: rust-evidence-${{ github.run_id }}-${{ github.run_attempt }}-build
+          path: ${{ env.RUST_EVIDENCE_DIR }}
+          if-no-files-found: warn
+
+  check-rust-split:
+    name: check (rust ${{ matrix.part }})
+    needs: [plan_check, check-rust-build]
+    if: ${{ needs.plan_check.outputs.rust == 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { part: "test 1-4", phase: test, partition: 1/4 }
+          - { part: "test 2-4", phase: test, partition: 2/4 }
+          - { part: "test 3-4", phase: test, partition: 3/4 }
+          - { part: "test 4-4", phase: test, partition: 4/4 }
+          - { part: codegen, phase: codegen, partition: "" }
+    # 10 setup/browser + 5 download + 35 check (1800 s cargo test + extract) + 2 evidence.
+    timeout-minutes: 52
+    env:
+      PYTHONUNBUFFERED: "1"
+      PHOENIX_DEV_TRACE_ENDPOINT: "off"
+      RUST_EVIDENCE_DIR: ${{ github.workspace }}/target/ci-rust-evidence/${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.phase }}-${{ strategy.job-index }}
+      CARGO_TERM_COLOR: always
+      PHOENIX_CHECK_ALL: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '1' || '' }}
+      PHOENIX_CHECK_BASE: ${{ github.event_name == 'pull_request' && 'origin/main' || '' }}
+      PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS: "1800"
+      PHOENIX_BASH_LAUNCH_TEST_EXE: ${{ github.workspace }}/target/debug/phoenix_ide
+      PHOENIX_BASH_LAUNCH_TEST_REQUIRED: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Initialize Rust evidence
+        timeout-minutes: 1
+        run: |
+          mkdir -p "$RUST_EVIDENCE_DIR"
+          # The check profile directory must remain empty until dev.py claims it.
+          printf 'run=%s attempt=%s sha=%s job=%s part=%s started=%s\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA" "$GITHUB_JOB" "${{ matrix.part }}" \
+            "$(date -u +%FT%TZ)" | tee "$RUST_EVIDENCE_DIR/receipt.txt"
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@phoenix-ide.invalid"
+          git config --global user.name "Phoenix CI"
       - uses: pnpm/action-setup@v5
+        if: ${{ matrix.phase == 'test' }}
         with:
           package_json_file: ui/package.json
       - uses: actions/setup-node@v6
+        if: ${{ matrix.phase == 'test' }}
         with:
           node-version: 26
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
       - name: Prepare pinned Chromium for native browser tests
+        if: ${{ matrix.phase == 'test' }}
         timeout-minutes: 10
         working-directory: ui
         run: |
@@ -145,30 +218,78 @@ jobs:
           test -x "$chromium_path"
           "$chromium_path" --version
           printf 'PHOENIX_CHROME_EXECUTABLE=%s\n' "$chromium_path" >> "$GITHUB_ENV"
-      - name: Build native bash launcher fixture
-        timeout-minutes: 20
+      - name: Download test archive
+        timeout-minutes: 5
+        uses: actions/download-artifact@v7
+        with:
+          name: rust-test-archive-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/
+      - name: Restore native launcher mode
         run: |
-          python3 scripts/check_profile_command.py --output-dir "$RUST_EVIDENCE_DIR/native" \
-            --identity step:ci:native-launcher -- cargo build -p phoenix_ide --bin phoenix_ide
-          test -x "$PHOENIX_BASH_LAUNCH_TEST_EXE"
-      - name: ./dev.py check (rust,cargo-fmt)
-        timeout-minutes: 112
-        run: ./dev.py check --lanes rust,cargo-fmt --profile-work --profile-work-dir "$RUST_EVIDENCE_DIR/check"
-      - name: Check production feature on musl
-        timeout-minutes: 10
-        env:
-          CARGO_INCREMENTAL: "0"
-        run: |
-          python3 scripts/check_profile_command.py --output-dir "$RUST_EVIDENCE_DIR/musl" \
-            --identity step:ci:musl -- cargo check --target x86_64-unknown-linux-musl --features phoenix_ide/datadog-tracing
+          # Artifacts drop the executable bit.
+          chmod +x "$PHOENIX_BASH_LAUNCH_TEST_EXE"
+          ls -l target/rust-split/
+      - name: ./dev.py check (rust) ${{ matrix.part }}
+        timeout-minutes: 35
+        run: ./dev.py check --lanes rust --rust-phase ${{ matrix.phase }} ${{ matrix.partition && format('--rust-partition {0}', matrix.partition) || '' }} --profile-work --profile-work-dir "$RUST_EVIDENCE_DIR/check"
       - name: Upload Rust evidence
         if: always()
         timeout-minutes: 2
         uses: actions/upload-artifact@v6
         with:
-          name: rust-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          name: rust-evidence-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.phase }}-${{ strategy.job-index }}
           path: ${{ env.RUST_EVIDENCE_DIR }}
           if-no-files-found: warn
+
+  check-rust-musl:
+    name: check (rust musl)
+    needs: plan_check
+    if: ${{ needs.plan_check.outputs.rust == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_IDLE_TIMEOUT: "0"
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+          target: x86_64-unknown-linux-musl
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check-musl
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          prefix-key: v1-rust
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Install musl compiler
+        timeout-minutes: 5
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Check production feature on musl
+        timeout-minutes: 20
+        run: cargo check --target x86_64-unknown-linux-musl --features phoenix_ide/datadog-tracing
+
+  check-rust:
+    name: check (rust)
+    needs: [plan_check, check-rust-build, check-rust-split, check-rust-musl]
+    if: ${{ always() && needs.plan_check.outputs.rust == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every rust slice to pass
+        env:
+          RESULTS: ${{ needs.check-rust-build.result }} ${{ needs.check-rust-split.result }} ${{ needs.check-rust-musl.result }}
+        run: |
+          echo "build split musl: $RESULTS"
+          for result in $RESULTS; do
+            test "$result" = success
+          done
 
   check-clippy:
     name: check (clippy)
