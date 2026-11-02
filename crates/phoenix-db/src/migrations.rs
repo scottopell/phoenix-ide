@@ -20021,6 +20021,7 @@ with tempfile.TemporaryDirectory() as directory:
                 (148, "product_creation_initial_execution_receipts"),
                 (149, "product_creation_image_retirement"),
                 (150, "federated_subscription_terminal_cancellation"),
+                (151, "user_level_plugin_registry"),
             ]
         );
         let goal = MIGRATIONS

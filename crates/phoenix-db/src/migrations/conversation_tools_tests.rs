@@ -493,7 +493,8 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
                     (147, "retain_product_creation_receipts"),
                     (148, "product_creation_initial_execution_receipts"),
                     (149, "product_creation_image_retirement"),
-                    (150, "federated_subscription_terminal_cancellation")
+                    (150, "federated_subscription_terminal_cancellation"),
+                    (151, "user_level_plugin_registry")
                 ]
             );
             drop(conn);
