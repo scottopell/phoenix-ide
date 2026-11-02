@@ -112,24 +112,29 @@ fn accepted_report_result() -> ToolResult {
 
 async fn report_fixture() -> (Database, ProductConversationId, ReportRound) {
     let db = fixture().await;
-    let (transcript, owner) = ordinary(&db, "checkpoint-owner").await;
+    let (owner, round) = report_fixture_in(&db, "checkpoint").await;
+    (db, owner, round)
+}
+
+async fn report_fixture_in(db: &Database, name: &str) -> (ProductConversationId, ReportRound) {
+    let (transcript, owner) = ordinary(db, &format!("{name}-owner")).await;
     db.watch_product_conversation(&owner).await.unwrap();
     db.apply_conversation_goal(
         &create(
             &owner,
             GoalVersion::INITIAL,
-            "checkpoint-goal",
-            "checkpoint-create",
+            &format!("{name}-goal"),
+            &format!("{name}-create"),
         ),
         &transcript,
         at(),
     )
     .await
     .unwrap();
-    release(&db, &owner).await;
+    release(db, &owner).await;
     let execution = accept_execution(
         &db.workflow_repository(),
-        &runtime_input(&transcript, "checkpoint-turn"),
+        &runtime_input(&transcript, &format!("{name}-turn")),
     )
     .await;
     let binding = db
@@ -139,7 +144,7 @@ async fn report_fixture() -> (Database, ProductConversationId, ReportRound) {
         .unwrap();
     let outcome = GoalReportOutcome::Complete(GoalText::parse("verified done").unwrap());
     let assistant = Message {
-        message_id: "checkpoint-assistant".into(),
+        message_id: format!("{name}-assistant"),
         conversation_id: transcript.clone(),
         sequence_id: 10,
         message_type: MessageType::Agent,
@@ -172,7 +177,7 @@ async fn report_fixture() -> (Database, ProductConversationId, ReportRound) {
         state: ConvState::LlmRequesting { attempt: 1 },
         timestamp: Utc::now() + Duration::seconds(10),
     };
-    (db, owner, round)
+    (owner, round)
 }
 
 async fn evidence(
