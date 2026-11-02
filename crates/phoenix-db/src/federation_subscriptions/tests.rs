@@ -698,6 +698,7 @@ async fn source_close_ends_subscription_and_suppresses_unadmitted_payloads() {
 #[tokio::test]
 async fn classification_fanout_consumes_cancellation_once_and_drops_nonterminal_categories() {
     let f = Fixture::new().await;
+    assert!(facts(f.replay(0, Utc::now().timestamp_micros()).await).is_empty());
     f.db.watch_product_conversation(&f.source.product_conversation_id)
         .await
         .unwrap();
@@ -1094,7 +1095,7 @@ async fn shorter_next_pull_preserves_previously_staged_fact_and_exact_next_curso
 }
 
 #[tokio::test]
-async fn ended_replay_suppresses_only_unrequested_unaccepted_facts() {
+async fn ended_replay_suppresses_every_unaccepted_fact() {
     let db = Database::open_in_memory().await.unwrap();
     let remote = remote_fixture(&db).await;
     let SubscriptionReplay::Facts { mut events } = single_fact() else {
@@ -1125,14 +1126,11 @@ async fn ended_replay_suppresses_only_unrequested_unaccepted_facts() {
         .await
         .unwrap();
     assert_eq!(history.len(), 2);
-    assert!(matches!(
-        history[0].disposition,
-        RemoteNotificationDisposition::Authorizing
-    ));
-    assert!(matches!(
-        history[1].disposition,
-        RemoteNotificationDisposition::Suppressed { .. }
-    ));
+    assert!(history.iter().all(|note| matches!(
+        &note.disposition,
+        RemoteNotificationDisposition::Suppressed { reason }
+            if reason == &RemoteSuppressionReason::SubscriptionEnded
+    )));
     let ended = db
         .remote_subscription_by_id(remote.reference.instance_id, remote.subscription_id)
         .await
@@ -2244,6 +2242,7 @@ async fn pre_enrollment_production_terminal_is_not_a_future_fact() {
 #[allow(clippy::too_many_lines)]
 async fn real_history_close_preserves_accepted_and_suppresses_every_unadmitted_fact() {
     let f = Fixture::new().await;
+    assert!(facts(f.replay(0, Utc::now().timestamp_micros()).await).is_empty());
     for n in 0..3 {
         f.emit(
             &format!("close-{n}"),
@@ -2266,25 +2265,24 @@ async fn real_history_close_preserves_accepted_and_suppresses_every_unadmitted_f
         a.request_remote_notification_authorization(&remote, &note.admission_id)
             .await
             .unwrap();
-        let receipt = authorize_source(&f, &note.content).await;
-        if note.admission_id == pending[0].admission_id {
-            let SubscriptionAuthorization::Authorized { authorization_id } = receipt else {
-                panic!("authorization required")
-            };
-            let (stable, source) = fixture_navigation(&a, &remote, &note.admission_id).await;
-            a.confirm_remote_authorization(
-                &remote,
-                &note.admission_id,
-                authorization_id,
-                &stable,
-                &source,
-            )
-            .await
-            .unwrap();
-            steer(&a, &target, &note.admission_id).await.unwrap();
-        }
-        // The second response is lost: only the source has its committed authorization.
     }
+    let first = &pending[0];
+    let SubscriptionAuthorization::Authorized { authorization_id } =
+        authorize_source(&f, &first.content).await
+    else {
+        panic!("authorization required")
+    };
+    let (stable, source) = fixture_navigation(&a, &remote, &first.admission_id).await;
+    a.confirm_remote_authorization(
+        &remote,
+        &first.admission_id,
+        authorization_id,
+        &stable,
+        &source,
+    )
+    .await
+    .unwrap();
+    steer(&a, &target, &first.admission_id).await.unwrap();
     close_to_history(&f).await;
     assert_eq!(
         f.replay(1, NOW + 3).await,
@@ -2585,11 +2583,11 @@ async fn unsubscribe_identity_is_durable_retryable_and_never_reenrolls() {
 }
 
 #[tokio::test]
-async fn authorization_refresh_replaces_an_expired_attempt_without_ending_or_advancing() {
+async fn authorization_in_flight_before_failed_gap_remains_eligible() {
     let f = Fixture::new().await;
-    f.emit("expires-before-authorize", TerminalFactOutcome::Failed, NOW)
+    f.emit("failed-gap-prefix", TerminalFactOutcome::Failed, NOW)
         .await;
-    let (a, remote, _) = consumer_for_source(&f).await;
+    let (a, remote, target) = consumer_for_source(&f).await;
     a.stage_remote_replay(&remote, &f.replay(0, NOW).await)
         .await
         .unwrap();
@@ -2601,30 +2599,67 @@ async fn authorization_refresh_replaces_an_expired_attempt_without_ending_or_adv
     a.request_remote_notification_authorization(&remote, &note.admission_id)
         .await
         .unwrap();
-    let fresh = f.replay(0, NOW + MAX_DISCONNECTED_AGE_US).await;
-    assert_eq!(
-        authorize_source(&f, &note.content).await,
-        SubscriptionAuthorization::Refresh
-    );
-    a.suppress_remote_notification(
-        &remote,
-        &note.admission_id,
-        RemoteSuppressionReason::AuthorizationDenied,
+
+    let disconnected_at = NOW + MAX_DISCONNECTED_AGE_US;
+    let terminal_replay = f.replay(0, disconnected_at).await;
+    assert!(matches!(terminal_replay, SubscriptionReplay::Gap { .. }));
+    a.stage_remote_replay(&remote, &terminal_replay)
+        .await
+        .unwrap();
+    let attempts: i64 = sqlx::query_scalar(
+        "SELECT terminal_settlement_attempts
+         FROM federation_remote_admissions
+         WHERE admission_id = ?1",
     )
+    .bind(&note.admission_id)
+    .fetch_one(a.pool())
     .await
     .unwrap();
-    let unchanged = a
+    assert_eq!(attempts, 1);
+    let failed = a
         .remote_subscription_by_id(remote.reference.instance_id, remote.subscription_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(unchanged.admitted_cursor, SubscriptionCursor::START);
-    assert_eq!(unchanged.state, SubscriptionState::Active);
-    a.stage_remote_replay(&unchanged, &fresh).await.unwrap();
-    let replacement = a.pending_remote_notifications(&unchanged).await.unwrap();
-    assert_eq!(replacement.len(), 1);
+    assert_eq!(failed.state, SubscriptionState::FailedGap);
+    assert_eq!(failed.admitted_cursor, SubscriptionCursor::START);
+
+    let SubscriptionAuthorization::Authorized { authorization_id } =
+        authorize_source_at(&f, &note.content, disconnected_at).await
+    else {
+        panic!("frozen prefix authorization required")
+    };
+    let (stable, source) = fixture_navigation(&a, &failed, &note.admission_id).await;
+    a.confirm_remote_authorization(
+        &failed,
+        &note.admission_id,
+        authorization_id,
+        &stable,
+        &source,
+    )
+    .await
+    .unwrap();
+    let pending = a.pending_remote_notifications(&failed).await.unwrap();
+    assert_eq!(pending.len(), 1);
     assert!(matches!(
-        replacement[0].content,
+        &pending[0].disposition,
+        RemoteNotificationDisposition::Authorized {
+            authorization_id: actual,
+        } if actual == &authorization_id
+    ));
+    steer(&a, &target, &note.admission_id).await.unwrap();
+
+    let settled = a
+        .remote_subscription_by_id(remote.reference.instance_id, remote.subscription_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.state, SubscriptionState::FailedGap);
+    assert_eq!(settled.admitted_cursor.get(), 1);
+    let pending = a.pending_remote_notifications(&settled).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(matches!(
+        pending[0].content,
         SubscriptionDelivery::Gap { .. }
     ));
 }
@@ -2821,12 +2856,13 @@ async fn failure_gap_snapshots_follow_real_projection_not_terminal_kind_whitelis
     ];
     for (state, outcome) in states {
         let f = Fixture::new().await;
-        f.emit(
-            "expired",
-            TerminalFactOutcome::Completed,
-            NOW - MAX_DISCONNECTED_AGE_US - 1,
-        )
-        .await;
+        f.emit("expired", TerminalFactOutcome::Completed, NOW).await;
+        sqlx::query("UPDATE federation_subscriptions SET last_contact_at_us = ?1 WHERE id = ?2")
+            .bind(NOW - MAX_DISCONNECTED_AGE_US)
+            .bind(f.subscription.to_string())
+            .execute(f.db.pool())
+            .await
+            .unwrap();
         f.db.update_conversation_state(&f.source.id, &state)
             .await
             .unwrap();
@@ -2837,7 +2873,7 @@ async fn failure_gap_snapshots_follow_real_projection_not_terminal_kind_whitelis
             gap.snapshot.state,
             SubscriptionCurrentState::Terminal { outcome }
         );
-        f.db.update_conversation_state(&f.source.id, &ConvState::Idle)
+        f.db.update_conversation_state(&f.source.id, &ConvState::LlmRequesting { attempt: 1 })
             .await
             .unwrap();
         let SubscriptionReplay::Gap { gap } = f.replay(0, NOW).await else {
@@ -2845,10 +2881,26 @@ async fn failure_gap_snapshots_follow_real_projection_not_terminal_kind_whitelis
         };
         assert_eq!(
             gap.snapshot.state,
-            SubscriptionCurrentState::Nonterminal,
-            "resuming clears the stale terminal classification"
+            SubscriptionCurrentState::Terminal { outcome },
+            "the first gap snapshot is immutable"
         );
     }
+
+    let f = Fixture::new().await;
+    f.emit("expired", TerminalFactOutcome::Completed, NOW).await;
+    sqlx::query("UPDATE federation_subscriptions SET last_contact_at_us = ?1 WHERE id = ?2")
+        .bind(NOW - MAX_DISCONNECTED_AGE_US)
+        .bind(f.subscription.to_string())
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    f.db.update_conversation_state(&f.source.id, &ConvState::LlmRequesting { attempt: 1 })
+        .await
+        .unwrap();
+    let SubscriptionReplay::Gap { gap } = f.replay(0, NOW).await else {
+        panic!("expired payload requires gap")
+    };
+    assert_eq!(gap.snapshot.state, SubscriptionCurrentState::Nonterminal);
 }
 
 #[tokio::test]
@@ -3112,6 +3164,7 @@ async fn local_unsubscribe_serializes_with_accepted_admission_in_both_barrier_or
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn drain_1025_with_gap_and_authorization_keeps_other_subscription_independent() {
     let f = Fixture::new().await;
     let other_caller = InstanceId::new();
@@ -3130,7 +3183,7 @@ async fn drain_1025_with_gap_and_authorization_keeps_other_subscription_independ
     .await
     .unwrap();
     let mut tx = f.db.pool.begin().await.unwrap();
-    for n in 0..1025 {
+    for n in 0..1024 {
         append_terminal_tx(
             &mut tx,
             ClassifiedTerminal {
@@ -3147,42 +3200,96 @@ async fn drain_1025_with_gap_and_authorization_keeps_other_subscription_independ
         .unwrap();
     }
     tx.commit().await.unwrap();
-    let (a, mut remote, target) = consumer_for_source(&f).await;
-    let mut admitted_rows = 0;
-    while remote.admitted_cursor.get() < 1025 {
-        let replay = f.replay(remote.admitted_cursor.get(), NOW + 1025).await;
-        a.stage_remote_replay(&remote, &replay).await.unwrap();
-        let notes = a.pending_remote_notifications(&remote).await.unwrap();
-        assert!(!notes.is_empty());
-        for note in notes {
-            a.request_remote_notification_authorization(&remote, &note.admission_id)
-                .await
-                .unwrap();
-            let SubscriptionAuthorization::Authorized { authorization_id } =
-                authorize_source(&f, &note.content).await
-            else {
-                panic!("active source authorizes retained bytes")
-            };
-            let (stable, source) = fixture_navigation(&a, &remote, &note.admission_id).await;
-            a.confirm_remote_authorization(
-                &remote,
-                &note.admission_id,
-                authorization_id,
-                &stable,
-                &source,
-            )
-            .await
-            .unwrap();
-            steer(&a, &target, &note.admission_id).await.unwrap();
-            admitted_rows += 1;
-        }
-        remote = a
-            .remote_subscription_by_id(remote.reference.instance_id, remote.subscription_id)
+
+    let (a, remote, target) = consumer_for_source(&f).await;
+    let staged_prefix = f.replay(0, NOW + 1024).await;
+    assert!(matches!(
+        &staged_prefix,
+        SubscriptionReplay::Facts { events } if events.len() == REPLAY_BATCH
+    ));
+    a.stage_remote_replay(&remote, &staged_prefix)
+        .await
+        .unwrap();
+    assert_eq!(
+        a.remote_subscription_by_id(remote.reference.instance_id, remote.subscription_id)
             .await
             .unwrap()
+            .unwrap()
+            .admitted_cursor,
+        SubscriptionCursor::START
+    );
+
+    f.emit("drain-1024", TerminalFactOutcome::Completed, NOW + 1024)
+        .await;
+    let terminal_replay = f.replay(0, NOW + 1025).await;
+    let SubscriptionReplay::Gap { gap } = &terminal_replay else {
+        panic!("the 1025th source event must freeze a terminal gap")
+    };
+    assert_eq!(gap.last_acknowledged, SubscriptionCursor::START);
+    assert_eq!(gap.last_produced.get(), 1025);
+    a.stage_remote_replay(&remote, &terminal_replay)
+        .await
+        .unwrap();
+
+    for expected_sequence in 1..=REPLAY_BATCH {
+        let pending = a.pending_remote_notifications(&remote).await.unwrap();
+        assert_eq!(pending.len(), REPLAY_BATCH + 1 - expected_sequence);
+        assert!(pending
+            .iter()
+            .all(|note| matches!(&note.content, SubscriptionDelivery::Fact { .. })));
+        let note = &pending[0];
+        let SubscriptionDelivery::Fact { fact } = &note.content else {
+            panic!("the frozen fact prefix must settle before the gap")
+        };
+        assert_eq!(
+            fact.sequence.get(),
+            i64::try_from(expected_sequence).unwrap()
+        );
+        a.request_remote_notification_authorization(&remote, &note.admission_id)
+            .await
             .unwrap();
+        let SubscriptionAuthorization::Authorized { authorization_id } =
+            authorize_source_at(&f, &note.content, NOW + 1026).await
+        else {
+            panic!("failed-gap source must authorize each staged prefix fact")
+        };
+        let (stable, source) = fixture_navigation(&a, &remote, &note.admission_id).await;
+        a.confirm_remote_authorization(
+            &remote,
+            &note.admission_id,
+            authorization_id,
+            &stable,
+            &source,
+        )
+        .await
+        .unwrap();
+        steer(&a, &target, &note.admission_id).await.unwrap();
     }
-    assert_eq!(admitted_rows, 1025);
+
+    let pending_gap = a.pending_remote_notifications(&remote).await.unwrap();
+    assert_eq!(pending_gap.len(), 1);
+    assert!(matches!(
+        &pending_gap[0].content,
+        SubscriptionDelivery::Gap { .. }
+    ));
+    steer(&a, &target, &pending_gap[0].admission_id)
+        .await
+        .unwrap();
+    let settled = a
+        .remote_subscription_by_id(remote.reference.instance_id, remote.subscription_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        settled.admitted_cursor.get(),
+        i64::try_from(REPLAY_BATCH).unwrap()
+    );
+    assert!(a
+        .pending_remote_notifications(&settled)
+        .await
+        .unwrap()
+        .is_empty());
+
     let other =
         f.db.replay_federation_subscription(
             &other_authority,
@@ -3193,8 +3300,12 @@ async fn drain_1025_with_gap_and_authorization_keeps_other_subscription_independ
         )
         .await
         .unwrap();
-    assert!(matches!(other,SubscriptionReplay::Gap { gap } if gap.last_produced.get() == 1025));
-    let progress: (i64,i64) = sqlx::query_as("SELECT acknowledged_through,(SELECT COUNT(*) FROM federation_delivery_authorizations WHERE subscription_id = ?1) FROM federation_subscriptions WHERE id = ?1").bind(other_subscription.to_string()).fetch_one(f.db.pool()).await.unwrap();
+    assert!(matches!(other, SubscriptionReplay::Gap { gap } if gap.last_produced.get() == 1025));
+    let progress: (i64, i64) = sqlx::query_as("SELECT acknowledged_through,(SELECT COUNT(*) FROM federation_delivery_authorizations WHERE subscription_id = ?1) FROM federation_subscriptions WHERE id = ?1")
+        .bind(other_subscription.to_string())
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
     assert_eq!(progress, (0, 0));
 }
 
@@ -3412,6 +3523,7 @@ async fn production_creation_completion_failure_and_cancellation_fanout_are_atom
 async fn recovered_steering_installs_terminal_projection_before_atomic_fanout() {
     use phoenix_core::domain::{db_schema::MessageContent, sm_state::ConvState};
     let f = Fixture::new().await;
+    assert!(facts(f.replay(0, Utc::now().timestamp_micros()).await).is_empty());
     f.db.add_message(
         "recovery-steering",
         &f.source.id,
@@ -3464,6 +3576,174 @@ async fn recovered_steering_installs_terminal_projection_before_atomic_fanout() 
     let events = facts(f.replay(0, chrono::Utc::now().timestamp_micros()).await);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].outcome, TerminalFactOutcome::Completed);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM steering_execution_occurrences
+             WHERE conversation_id = ?1 AND message_id = 'recovery-steering'",
+        )
+        .bind(&f.source.id)
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap(),
+        0
+    );
+    assert!(!f
+        .db
+        .settle_execution_occurrence(
+            &f.source.id,
+            "recovery-steering",
+            &crate::ExecutionOccurrenceTerminal::Completed,
+            &ConvState::Idle
+        )
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn settlement_crossing_retention_limit_snapshots_after_occurrence_cleanup() {
+    use phoenix_core::domain::{db_schema::MessageContent, sm_state::ConvState};
+    let f = Fixture::new().await;
+    let mut tx = f.db.pool.begin().await.unwrap();
+    for n in 0..MAX_UNACKNOWLEDGED_EVENTS {
+        append_terminal_tx(
+            &mut tx,
+            ClassifiedTerminal {
+                occurrence_kind: "direct_turn",
+                occurrence_id: &format!("retained-{n}"),
+                generation: 0,
+                transcript_id: &f.source.id,
+                outcome: TerminalFactOutcome::Completed,
+                context_exhausted: false,
+                occurred_at_us: NOW + i64::try_from(n).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    f.db.add_message(
+        "retention-boundary-steering",
+        &f.source.id,
+        &MessageContent::user("steering"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO steering_execution_occurrences(conversation_id,message_id,source_kind)
+         VALUES (?1,'retention-boundary-steering','steering')",
+    )
+    .bind(&f.source.id)
+    .execute(f.db.pool())
+    .await
+    .unwrap();
+    f.db.update_conversation_state(&f.source.id, &ConvState::LlmRequesting { attempt: 1 })
+        .await
+        .unwrap();
+
+    assert!(f
+        .db
+        .settle_execution_occurrence(
+            &f.source.id,
+            "retention-boundary-steering",
+            &crate::ExecutionOccurrenceTerminal::Completed,
+            &ConvState::Idle,
+        )
+        .await
+        .unwrap());
+    let SubscriptionReplay::Gap { gap } = f.replay(0, chrono::Utc::now().timestamp_micros()).await
+    else {
+        panic!("the settlement event must cross the retention limit")
+    };
+    assert_eq!(gap.reason, GapReason::EventCount);
+    assert_eq!(gap.last_produced.get(), 1025);
+    assert_eq!(
+        gap.snapshot.state,
+        SubscriptionCurrentState::Terminal {
+            outcome: TerminalFactOutcome::Completed,
+        }
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM steering_execution_occurrences
+             WHERE conversation_id = ?1 AND message_id = 'retention-boundary-steering'",
+        )
+        .bind(&f.source.id)
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn recovered_steering_loses_to_newer_active_turn_without_fanout() {
+    use phoenix_core::domain::{db_schema::MessageContent, sm_state::ConvState};
+    let f = Fixture::new().await;
+    assert!(facts(f.replay(0, Utc::now().timestamp_micros()).await).is_empty());
+    for (message_id, text) in [
+        ("stale-recovery-steering", "stale steering"),
+        ("newer-active-owner", "new owner"),
+    ] {
+        f.db.add_message(
+            message_id,
+            &f.source.id,
+            &MessageContent::user(text),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO steering_execution_occurrences(conversation_id,message_id,source_kind)
+         VALUES (?1,'stale-recovery-steering','steering')",
+    )
+    .bind(&f.source.id)
+    .execute(f.db.pool())
+    .await
+    .unwrap();
+    f.db.update_conversation_state(&f.source.id, &ConvState::LlmRequesting { attempt: 1 })
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO workflows(workflow_id,profile_kind,profile_version,runtime_acceptance_enabled,external_acceptance_enabled,version,generation,status,snapshot_codec_family,snapshot_codec_version,snapshot_payload,created_at,updated_at) VALUES (1,'direct_turn',1,0,1,1,0,'Active','direct_turn.snapshot',1,X'01',1,1)")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO durable_turns(turn_id,workflow_id,conversation_id,client_turn_key,prepared_fingerprint,prepared_payload,disposition,generation,owns_conversation,origin_kind,canonical_message_id,materialized) VALUES (1,1,?1,'newer-owner','newer-owner',X'01','Runtime',0,1,'user_api','newer-active-owner',1)")
+        .bind(&f.source.id)
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+
+    assert!(f
+        .db
+        .settle_execution_occurrence(
+            &f.source.id,
+            "stale-recovery-steering",
+            &crate::ExecutionOccurrenceTerminal::Completed,
+            &ConvState::Idle
+        )
+        .await
+        .unwrap());
+    assert!(matches!(
+        f.db.get_conversation(&f.source.id).await.unwrap().state,
+        ConvState::LlmRequesting { .. }
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM steering_execution_occurrences
+             WHERE conversation_id = ?1 AND message_id = 'stale-recovery-steering'",
+        )
+        .bind(&f.source.id)
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap(),
+        0
+    );
+    assert!(facts(f.replay(0, Utc::now().timestamp_micros()).await).is_empty());
 }
 
 #[tokio::test]
