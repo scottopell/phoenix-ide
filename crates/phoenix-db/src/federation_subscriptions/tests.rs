@@ -2406,21 +2406,23 @@ async fn revoke_and_unsubscribe_serialize_against_authorization_in_both_orders()
                 .await
                 .unwrap();
             }
-            let after = authorize_source(&f, &delivery).await;
             if let Some(before) = before {
-                assert_eq!(after, before);
-            } else {
-                assert_eq!(
-                    after,
-                    SubscriptionAuthorization::Rejected {
-                        reason: if revoke {
-                            SubscriptionEnd::Revoked
-                        } else {
-                            SubscriptionEnd::Unsubscribed
-                        }
-                    }
-                );
+                assert!(matches!(
+                    before,
+                    SubscriptionAuthorization::Authorized { .. }
+                ));
             }
+            let after = authorize_source(&f, &delivery).await;
+            assert_eq!(
+                after,
+                SubscriptionAuthorization::Rejected {
+                    reason: if revoke {
+                        SubscriptionEnd::Revoked
+                    } else {
+                        SubscriptionEnd::Unsubscribed
+                    }
+                }
+            );
             assert_eq!(
                 sqlx::query_scalar::<_, i64>(
                     "SELECT COUNT(*) FROM federation_delivery_authorizations"
@@ -2428,7 +2430,7 @@ async fn revoke_and_unsubscribe_serialize_against_authorization_in_both_orders()
                 .fetch_one(f.db.pool())
                 .await
                 .unwrap(),
-                i64::from(authorization_first)
+                0
             );
         }
     }
