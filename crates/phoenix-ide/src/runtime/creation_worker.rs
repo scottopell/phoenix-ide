@@ -485,7 +485,6 @@ async fn expand_product_creation_objective(
         &conversation.cwd,
         objective,
         policy,
-        crate::send_chat_service::MessageExpansionPolicy::ExpandReferences,
         &manager.skill_discovery(),
     )
     .await

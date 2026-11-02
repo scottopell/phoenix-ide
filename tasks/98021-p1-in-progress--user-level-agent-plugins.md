@@ -1,5 +1,14 @@
 # User-Level Agent Plugins (Agent Plugins Spec 1.1.0)
 
+## Rebase — 2026-11-02
+
+Rebased onto `origin/main` at `9441cd282`. Plugin registry migration is 150
+because main owns 143–149. Plugin ADRs are 216/217 because main owns 191/192.
+Preserve main's agent-origin literal-text policy while injecting plugin skill
+discovery; keep both initial-plugin and literal-objective regressions.
+This rebase does not clear the review hold or authorize leaving draft.
+Earlier validation counts below describe the pre-rebase checkpoint.
+
 ## Review remediation — 2026-11-02
 
 Draft PR: https://github.com/scottopell/phoenix-ide/pull/1017

@@ -2215,6 +2215,7 @@ mod tests {
                 MessageExpansionPolicy::RemoteLiteralText {
                     target_fingerprint: [7; 32],
                 },
+                &phoenix_skills::SkillDiscovery::default(),
             )
             .await
             .unwrap();

@@ -1,4 +1,4 @@
-# ADR-192: Plugin lifecycle separates installation ownership from activation
+# ADR-217: Plugin lifecycle separates installation ownership from activation
 
 Date: 2026-11-02
 Status: Accepted
@@ -9,7 +9,7 @@ Adversarial review of the user-level plugin implementation found that a
 canonical package path was also used as an uninstall target. Registry errors
 could enable disabled plugins. Removing the registry row made retained data
 invisible, and unchecked copy publication could modify an existing entry.
-ADR-191 established scope and naming but did not settle these boundaries.
+ADR-216 established scope and naming but did not settle these boundaries.
 
 ## Decision
 

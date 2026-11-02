@@ -7,9 +7,9 @@ Phoenix consumes Agent Plugins 1.1.0 bundles from user-level entries under
 `plugin.server` keys after user configuration. The reserved `data/` subtree
 holds retained state. A plugin named `data` uses a separate install entry.
 
-[ADR-191](../adrs/191_agent-plugins-are-user-level-shared-root-namespaced-bundles.md)
+[ADR-216](../adrs/216_agent-plugins-are-user-level-shared-root-namespaced-bundles.md)
 records scope and naming.
-[ADR-192](../adrs/192_plugin-lifecycle-separates-installation-ownership-from-activation.md)
+[ADR-217](../adrs/217_plugin-lifecycle-separates-installation-ownership-from-activation.md)
 records ownership, activation, publication, and failure boundaries.
 
 ## Status
