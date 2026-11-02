@@ -898,11 +898,11 @@ rule SubAgentResultDuringCancellation {
 
 -- REQ-BED-005a: Bounded cancellation liveness — forced teardown backstop.
 --
--- cancelling_tool's only cooperative exits (ToolAbortConfirmed,
--- ToolCompletesDuringCancellation) both require the tool task to return. A tool
--- that never observes its cancellation token and never returns would otherwise
--- wedge the conversation here forever. The deadline backstop forces the
--- cancellation to completion without waiting for the task.
+-- Cooperative outcomes or an already-queued denial settle through
+-- ToolAbortConfirmed / ToolCompletesDuringCancellation. The deadline requests
+-- synchronous runtime-slot retirement even when an intercepted call has no
+-- ordinary tool task. Its acknowledgement admits settlement without waiting
+-- for task cooperation or resource cleanup.
 rule CancellingToolDeadlineFires {
     when: CancellationDeadlineExpires(conversation)
     requires: conversation.core_status = cancelling_tool

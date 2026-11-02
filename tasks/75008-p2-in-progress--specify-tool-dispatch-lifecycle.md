@@ -22,6 +22,14 @@ Acceptance: explicit queue advancement and current-tool identity; a bounded disp
 - Default check plan selects only `allium`, `spec-anchors`, `spec-shape`, and `task` for this spec/task-only change. Runtime/UI suites are not selected or claimed rerun.
 - Independent adversarial review is pending on the immutable implementation commit.
 
+## Review corrections
+
+- The initial isolated model reviews found disconnected event aliases and incomplete new-field exit obligations. The dispatcher now consumes Bedrock's actual start/cancel events and emits disjoint Bedrock completion/abort events. Wait/cancellation deadline retirement is acknowledged before synthetic settlement and any next dispatch; the new active/cancelling identity fields clear on generic restart exits.
+- A subsequent model review found the cancellation-retirement acknowledgement depended on an ordinary invocation even for an intercepted selected call. Retirement now operates on the generic runtime slot, invalidates its generation and aborts any retained handle even when no ordinary invocation exists. Matching ordinary projections retire if present. The acknowledgement never waits for task cooperation.
+- Manual composition traces cover wait A generation 1 → retirement generation 2 → one Failed settlement → queued B generation 3; an old generation-1 receiver is stale. A selected intercepted spawn → user cancellation → deadline has the same unconditional slot-retirement acknowledgement, then exactly one cancellation checkpoint, without inventing an ordinary tool task.
+- `allium analyse` reports two additional local unreachable-trigger diagnostics for Bedrock's retirement acknowledgements. Their producers are explicit dispatcher rules in the importing sibling module. They are a cross-module reachability-analysis limitation, not missing runtime or spec producers; no fake emitters were added to silence them. The 41 pre-existing Bedrock findings were independently reproduced on the clean base.
+- The first default local check passed all five executed steps (task, Allium, spec shape, managed-Python dev.py tests, spec anchors), with nine source-gated steps skipped. Its static spec scan preceded later review corrections; current direct Allium checks cover those corrections, and a fresh default check will qualify the final semantic snapshot.
+
 ## Out-of-scope observation
 
 Permissions Allium still includes the normative denial-count/escalation target while its executive marks that behavior unimplemented. The new reusable checked-call contract deliberately excludes that separate requirement; no escalation work is commissioned here.

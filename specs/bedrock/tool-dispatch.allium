@@ -257,17 +257,22 @@ rule CooperativeCancellationPreservesGeneration {
 
 rule CancellationBackstopRetiresGeneration {
     when: bedrock/ToolCancellationRetirementRequested(conversation)
-    requires: has_active_ordinary_invocation(conversation)
-    let invocation = active_invocation_for(conversation)
-    requires: invocation.phase = cancelling
-    requires: invocation.runtime.authority_open
-    requires: invocation.runtime.conversation.core_status = cancelling_tool
-    ensures: invocation.phase = retired
-    ensures: invocation.runtime.generation = invocation.runtime.generation + 1
-    ensures: RetainedToolTaskAborted(invocation)
+    let runtime = runtime_for(conversation)
+    requires: runtime.authority_open
+    requires: conversation.core_status = cancelling_tool
+    ensures: runtime.generation = runtime.generation + 1
+    ensures: RetainedToolTaskAbortRequested(runtime)
+    ensures:
+        for invocation in ToolInvocations:
+            if invocation.runtime = runtime
+                and invocation.phase in { preparing, denied, launched, cancelling }:
+                invocation.phase = retired
     ensures: bedrock/ToolCancellationRetired(conversation)
 
     @guidance
+        -- The runtime slot is retired even if no ordinary invocation or task
+        -- exists, including a reducer-selected intercepted call. A retained
+        -- handle is aborted if present; acknowledgement does not wait for it.
         -- Bedrock owns synthetic current/queued results and any remaining child
         -- cancellation. A sender-loss outcome from this abort carries the retired
         -- generation and cannot settle a later call, including reused tool IDs.
@@ -279,7 +284,7 @@ rule RuntimeTeardownRetiresGeneration {
     ensures: invocation.phase = retired
     ensures: invocation.runtime.generation = invocation.runtime.generation + 1
     ensures: CancellationTokenSignalled(invocation)
-    ensures: RetainedToolTaskAborted(invocation)
+    ensures: RetainedToolTaskAbortRequested(invocation.runtime)
 
     @guidance
         -- Fatal local-authority loss follows REQ-BED-033: suppress admission and
@@ -312,7 +317,7 @@ rule BashWaitFallbackRetiresTaskOutcome {
     requires: bedrock/is_bash_wait(invocation.call)
     ensures: invocation.phase = retired
     ensures: invocation.runtime.generation = invocation.runtime.generation + 1
-    ensures: RetainedToolTaskAborted(invocation)
+    ensures: RetainedToolTaskAbortRequested(invocation.runtime)
     ensures: bedrock/ToolTaskRetired(conversation, call)
 
     @guidance
@@ -389,6 +394,12 @@ surface InvocationBoundaryObservations {
         -- after retirement. The two observations are mutually exclusive. Denial
         -- uses its separate immediate error forwarder and starts no tool task.
 }
+
+-- Operation marker RetainedToolTaskAbortRequested(runtime):
+--   invoke the slot's task-only abort;
+--   abort its retained handle if present and do nothing to a missing handle.
+--   This operation does not assert that an invocation launched a task or that
+--   aborted resources have finished cleanup before the caller continues.
 
 -- Helpers (pure observations; none mints execution authority)
 -- runtime_for(conversation: bedrock/Conversation) -> ToolRuntime: the live owned
