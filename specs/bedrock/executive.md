@@ -49,7 +49,9 @@ for unknown cleanup-write authority. The required cancellation-time handoff must
 retain ownership, classify cleanup, and reconcile every admitted child into parent
 pending membership with terminal cancellation evidence before acknowledging the
 tool abort. The parent must then accept every outcome before ordinary settlement.
-Those response/classification/fan-in seams are not implemented by this spec change.
+Those response/classification/fan-in seams, including once/join ownership when
+both cancellation and the admission response signal reconciliation, are not
+implemented by this spec change.
 
 Normal terminal acceptance is likewise distinct from dispatch. The transport and
 buffer paths leave delivery owed. `update_state_and_accept_sub_agent` commits the

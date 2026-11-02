@@ -119,6 +119,18 @@ entity SubAgentAdmission {
 contract SpawnParentAdoption {
     UnactivatedSpawnBatchClosureRequested: (invocation: SpawnInvocation) -> NativeSpawnClosureResult
 
+    @invariant OneReconciliationPerExactInvocation
+        -- The existing response/activation owner admits at most one native
+        -- reconciliation operation for the exact invocation and batch identity.
+        -- Cancellation and a later admission response are notifications to that
+        -- same owner: the first atomically claims the operation and later signals
+        -- join it. They do not start another cleanup transaction or create a
+        -- second classified lifecycle-reply obligation. The shared operation
+        -- publishes its established classification exactly once; releasing the
+        -- cancelling parent after that receipt cannot strand a second operation.
+        -- Joined signals do not reinterpret failure as success, replay effects,
+        -- or create another durable owner or restart authority.
+
     @invariant AdmissionDoesNotActivateChildren
         -- Atomic admission reserves exact batch/child identities. Initial child
         -- work additionally requires the activation receiver released only after
@@ -499,6 +511,11 @@ rule CancelSpawnBeforeParentAdoption {
     when: SpawnBatchCancellationRequested(invocation)
     ensures: SpawnActivationWithheld(invocation)
     ensures: UnactivatedSpawnBatchClosureRequested(invocation)
+
+    @guidance
+        -- This requests or joins the one operation in SpawnParentAdoption.
+        -- The pre-response abort and post-admission cancellation notifications
+        -- can both reach this rule; they cannot launch two closure operations.
 }
 
 rule ReconciledUnactivatedBatchRetainsEveryAdmittedChild {
@@ -727,9 +744,11 @@ surface NativeSpawnAdoptionBoundary {
         -- reconciliation can mint Reconciled; a cleanup write alone cannot.
         -- Cancellation suppresses activation while retaining that ownership.
         -- No request retry, second durable store, or new restart policy is implied.
-        -- A call of UnactivatedSpawnBatchClosureRequested is consumed by this
-        -- fulfilled native operation and returns exactly one Reconciled, Failed, or
-        -- Unclassified observation above, preserving any error diagnostics.
+        -- Calls of UnactivatedSpawnBatchClosureRequested for this exact invocation
+        -- atomically start or join ONE fulfilled native operation. Only that
+        -- operation publishes one Reconciled, Failed, or Unclassified lifecycle
+        -- observation, preserving its diagnostics. Joining signals require no
+        -- second publication after the first receipt retires parent ownership.
 
     @guidance
         -- The required native response owns terminalization and reconciliation;

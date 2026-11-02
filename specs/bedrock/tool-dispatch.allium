@@ -239,6 +239,8 @@ rule AdmittedSpawnReturnsToItsCancellingOrigin {
         -- response/activation owner, withhold activation, and reconcile every
         -- admitted child into pending with terminal cancellation evidence before
         -- acknowledging the tool abort. Parent cancellation still waits for fan-in.
+        -- If ToolAbortRequested already requested reconciliation, join that same
+        -- exact invocation's operation; do not initiate another native cleanup.
 }
 
 rule RejectedSpawnReturnsToItsCancellingOrigin {
