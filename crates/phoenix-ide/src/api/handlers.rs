@@ -9522,7 +9522,7 @@ async fn resolve_plugin_source(
             "source must be a local directory or a git URL".to_string(),
         ));
     }
-    let output = tokio::process::Command::new("git")
+    let output = tokio::process::Command::from(phoenix_core::git::command())
         .args(["clone", "--depth", "1", "--", source])
         .arg(&clone_target)
         .output()
