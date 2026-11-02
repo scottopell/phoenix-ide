@@ -14,7 +14,7 @@ Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance c
 | REQ-FED-008 | Partial | Remote message and Goal-read results identify the stable ProductConversation and exact admitted transcript; remote watch results remain. |
 | REQ-FED-009–016 | Partial | Durable subscription schema and local Coordinator notification admission are groundwork only; remote watch creation, delivery, replay, bounds, close/gap recovery, unsubscribe, and revocation behavior remain. |
 | REQ-FED-017–018 | Defined | Complexity boundaries and non-goals are normative in `requirements.md`. |
-| REQ-FED-019 | Implemented; qualification in progress | Enrollment and peer-connection writes require a validated `PeerDisplayName`; input rejects blank names and case/whitespace variants of local before mutation. Constructor/JSON and HTTP rejection-without-replacement tests are authored. |
+| REQ-FED-019 | Implemented | Enrollment and peer-connection writes require a validated `PeerDisplayName`; constructor/JSON and HTTP tests pass for blank names and case/whitespace variants of local, including rejection without replacing credentials or connections. |
 
 ## Existing foundations
 
