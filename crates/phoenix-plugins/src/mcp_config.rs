@@ -246,34 +246,31 @@ fn validate_http(name: &str, fields: &serde_json::Map<String, Value>) -> ServerV
 /// Absolute HTTP(S) URL, no userinfo, no fragment, and HTTPS unless the
 /// host is exactly `localhost` or a loopback IP literal (REQ-AP-004).
 fn http_url_is_allowed(url: &str) -> bool {
-    let Some(rest) = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-    else {
+    let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
-    if url.starts_with("http://") && !loopback_host(rest) {
+    let has_userinfo = url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+        .is_some_and(|authority| authority.contains('@'));
+    if has_userinfo {
         return false;
     }
-    let authority = rest.split('/').next().unwrap_or_default();
-    if authority.is_empty() {
+    if !parsed.username().is_empty() || parsed.password().is_some() || parsed.fragment().is_some() {
         return false;
     }
-    if authority.contains('@') || authority.contains('#') || url.contains('#') {
+    let Some(host) = parsed.host() else {
         return false;
+    };
+    match parsed.scheme() {
+        "https" => true,
+        "http" => match host {
+            url::Host::Domain(name) => name == "localhost",
+            url::Host::Ipv4(ip) => ip.is_loopback(),
+            url::Host::Ipv6(ip) => ip.is_loopback(),
+        },
+        _ => false,
     }
-    true
-}
-
-fn loopback_host(authority_and_path: &str) -> bool {
-    let host = authority_and_path
-        .split('/')
-        .next()
-        .unwrap_or_default()
-        .split(':')
-        .next()
-        .unwrap_or_default();
-    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
 }
 
 /// `cwd` well-formedness before expansion (REQ-AP-006): `./`-relative or
@@ -481,6 +478,42 @@ mod tests {
             r#"{"$schema": "https://agent-plugins.org/schemas/1.1.0/mcp.schema.json", "mcpServers": {"good": {"type": "streamable-http", "url": "https://example.com/mcp"}}}"#,
         );
         assert_eq!(servers.len(), 1);
+    }
+
+    #[test]
+    fn http_loopback_hosts_use_parsed_ip_classification() {
+        for endpoint in [
+            "http://[::1]:9700/mcp",
+            "http://127.0.0.2:9700/mcp",
+            "http://127.255.255.254:9700/mcp",
+            "http://localhost:9700/mcp",
+        ] {
+            let document = serde_json::json!({
+                "$schema": MCP_SCHEMA_URL,
+                "mcpServers": {"probe": {"type": "streamable-http", "url": endpoint}}
+            });
+            let parsed =
+                McpDocument::parse(&document.to_string(), crate::manifest::MANIFEST_SCHEMA_URL)
+                    .unwrap();
+            assert!(
+                matches!(&parsed.validate_servers()[0].1, ServerValidation::Valid(_)),
+                "{endpoint}"
+            );
+        }
+        for endpoint in [
+            "http://[::2]:9700/mcp",
+            "http://128.0.0.1:9700/mcp",
+            "http://localhost.evil/mcp",
+            "http://[::1]:bad/mcp",
+            "https://example.com:bad/mcp",
+            "http://user@localhost/mcp",
+            "http://@localhost/mcp",
+            "https://@example.com/mcp",
+            "http://[::1]/mcp#fragment",
+            "file:///mcp",
+        ] {
+            assert!(!http_url_is_allowed(endpoint), "{endpoint}");
+        }
     }
 
     #[test]

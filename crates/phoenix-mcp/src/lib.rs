@@ -3322,9 +3322,7 @@ impl McpClientManager {
     pub fn start_background_discovery(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            let _ = manager
-                .reload_from_actor_configs(manager.all_configs_with_plugins())
-                .await;
+            let _ = manager.reload().await;
             let handles: Vec<SupervisorHandle> =
                 manager.servers.read().await.values().cloned().collect();
             let settles =
@@ -4293,7 +4291,7 @@ impl McpClientManager {
     }
 
     pub async fn reload(&self) -> McpReloadResult {
-        self.reload_from_actor_configs(self.all_configs_with_plugins())
+        self.reload_with_config_capture(|| self.all_configs_with_plugins())
             .await
     }
 
@@ -4417,12 +4415,21 @@ impl McpClientManager {
         })
     }
 
+    async fn reload_with_config_capture(
+        &self,
+        capture: impl FnOnce() -> Vec<(String, McpServerConfig)>,
+    ) -> McpReloadResult {
+        let serial = self.reload_serial.lock().await;
+        let configs = capture();
+        self.reconcile_actor_configs(configs, &serial).await
+    }
+
     #[allow(clippy::too_many_lines)]
-    async fn reload_from_actor_configs(
+    async fn reconcile_actor_configs(
         &self,
         configs: Vec<(String, McpServerConfig)>,
+        _serial: &tokio::sync::MutexGuard<'_, ()>,
     ) -> McpReloadResult {
-        let _serial = self.reload_serial.lock().await;
         let desired: HashMap<String, McpServerConfig> = configs.into_iter().collect();
         let removed_names: Vec<String> = self
             .servers
@@ -4720,7 +4727,7 @@ impl McpClientManager {
         &self,
         configs: Vec<(String, McpServerConfig)>,
     ) -> McpReloadResult {
-        self.reload_from_actor_configs(configs).await
+        self.reload_with_config_capture(|| configs).await
     }
 
     async fn remove_current_handle(&self, name: &str, removed: &SupervisorHandle) {
@@ -5607,6 +5614,71 @@ mod tests {
                 cwd: cwd.map(std::path::PathBuf::from),
                 tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
             }
+        }
+
+        #[tokio::test]
+        async fn queued_reload_captures_activation_only_after_its_serialization_turn() {
+            let root = plugin_root();
+            write(
+                &root.path().join("demo/plugin.json"),
+                &serde_json::json!({
+                    "$schema": phoenix_plugins::manifest::MANIFEST_SCHEMA_URL, "name": "demo"
+                })
+                .to_string(),
+            );
+            write(
+                &root.path().join("demo/mcp.json"),
+                &serde_json::json!({
+                    "$schema": phoenix_plugins::mcp_config::MCP_SCHEMA_URL,
+                    "mcpServers": {"probe": {"type": "stdio", "command": "sh",
+                        "args": ["-c", "echo should-not-run; exit 1"]}}
+                })
+                .to_string(),
+            );
+            let manager = McpClientManager::new();
+            manager.plugin_activation().publish(HashSet::new());
+            let captured = std::sync::atomic::AtomicBool::new(false);
+            assert_eq!(
+                plugin_server_configs_under_activation(
+                    root.path(),
+                    &manager.plugin_activation().snapshot()
+                )
+                .len(),
+                1
+            );
+            let serial = manager.reload_serial.lock().await;
+            let reload = manager.reload_with_config_capture(|| {
+                captured.store(true, std::sync::atomic::Ordering::SeqCst);
+                plugin_server_configs_under_activation(
+                    root.path(),
+                    &manager.plugin_activation().snapshot(),
+                )
+            });
+            tokio::pin!(reload);
+            assert!(futures::poll!(&mut reload).is_pending());
+            assert!(
+                !captured.load(std::sync::atomic::Ordering::SeqCst),
+                "queued reload must not prepare enabled configs"
+            );
+            manager
+                .plugin_activation()
+                .publish(HashSet::from(["demo".into()]));
+            let disabled = plugin_server_configs_under_activation(
+                root.path(),
+                &manager.plugin_activation().snapshot(),
+            );
+            assert!(disabled.is_empty());
+            let disabled_result = manager.reconcile_actor_configs(disabled, &serial).await;
+            assert!(disabled_result.failed.is_empty());
+            drop(serial);
+            let result = reload.await;
+            assert!(captured.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(result.added.is_empty());
+            assert!(result.failed.is_empty());
+            assert!(
+                manager.servers.read().await.is_empty(),
+                "no subprocess supervisor can be admitted after disable"
+            );
         }
 
         #[cfg(unix)]
