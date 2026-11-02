@@ -59,7 +59,7 @@ async fn terminal_goal_report_wakes_federated_waiter_after_commit() {
     let obligation = obligation(&db, &round).await;
     let caller = InstanceId::new();
     let verifier = FederationCredentialVerifier::from_bearer(b"terminal-goal-waiter");
-    db.replace_federation_enrollment(caller, "terminal goal waiter", &verifier)
+    db.replace_federation_enrollment(caller, &"terminal goal waiter".parse().unwrap(), &verifier)
         .await
         .unwrap();
     let authority = crate::FederationSendAuthority::new(caller, verifier);

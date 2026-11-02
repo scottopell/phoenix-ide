@@ -19375,7 +19375,7 @@ mod tests {
 
         db.replace_federation_enrollment(
             InstanceId::new(),
-            "peer",
+            &"peer".parse().unwrap(),
             &phoenix_core::domain::instance_identity::FederationCredentialVerifier::from_bearer(
                 b"peer-secret",
             ),

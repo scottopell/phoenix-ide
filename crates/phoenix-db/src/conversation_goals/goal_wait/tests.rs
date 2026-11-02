@@ -198,7 +198,7 @@ async fn federated_goal_read_rechecks_saved_authority() {
     let (_, owner) = ordinary(&db, "owner-federated-authority").await;
     let caller = InstanceId::new();
     let verifier = FederationCredentialVerifier::from_bearer(b"goal-wait-federated-authority");
-    db.replace_federation_enrollment(caller, "goal reader", &verifier)
+    db.replace_federation_enrollment(caller, &"goal reader".parse().unwrap(), &verifier)
         .await
         .unwrap();
     let authority = crate::FederationSendAuthority::new(caller, verifier);

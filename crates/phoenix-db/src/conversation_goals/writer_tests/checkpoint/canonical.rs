@@ -15,7 +15,7 @@ async fn canonical_goal_report_wakes_federated_waiter_after_commit() {
     let (db, owner, round) = report_fixture().await;
     let caller = InstanceId::new();
     let verifier = FederationCredentialVerifier::from_bearer(b"canonical-goal-waiter");
-    db.replace_federation_enrollment(caller, "canonical goal waiter", &verifier)
+    db.replace_federation_enrollment(caller, &"canonical goal waiter".parse().unwrap(), &verifier)
         .await
         .unwrap();
     let authority = crate::FederationSendAuthority::new(caller, verifier);

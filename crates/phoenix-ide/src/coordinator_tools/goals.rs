@@ -14,6 +14,8 @@ use crate::api::GoalCommandService;
 use crate::runtime::RuntimeManager;
 use crate::tools::{Tool, ToolContext, ToolOutput};
 
+use super::instance::InstanceSelector;
+
 #[derive(Clone, Copy)]
 enum Operation {
     Read,
@@ -47,8 +49,8 @@ struct ReadInput {
     target: String,
     #[serde(default)]
     after_version: Option<i64>,
-    #[serde(default)]
-    instance: Option<String>,
+    #[serde(default, deserialize_with = "InstanceSelector::deserialize_nullable")]
+    instance: InstanceSelector,
     #[serde(default)]
     wait: Option<GoalWaitInput>,
 }
@@ -108,7 +110,7 @@ impl Tool for GoalTool {
     }
     fn description(&self) -> String {
         match self.operation {
-            Operation::Read => "Read an ordinary conversation's saved Goal and up to 100 ordered history entries. Coordinator only. Uses stable @conv targets and follows the current transcript. after_version is only a history cursor. Omit instance for this instance; an explicit saved-peer ID or unique display name reads exactly that peer and never falls back locally. Optional wait blocks for minimum_version for 1-25 seconds and returns an authoritative satisfied or timed_out snapshot. Goal disposition is not active-execution state; this never dispatches work.",
+            Operation::Read => "Read an ordinary conversation's saved Goal and up to 100 ordered history entries. Coordinator only. Uses stable @conv targets and follows the current transcript. after_version is only a history cursor. Omit instance or set it to exact \"local\" for this instance; otherwise a saved-peer ID or unique display name reads exactly that peer and never falls back locally. Optional wait blocks for minimum_version for 1-25 seconds and returns an authoritative satisfied or timed_out snapshot. Goal disposition is not active-execution state; this never dispatches work.",
             Operation::Prepare => "Prepare an immutable Goal action against the observed saved Goal. Coordinator only. create refuses an existing Goal; replace is an explicit new Goal identity retaining old history; state updates disposition. Applying create/replace requires the target's persisted autoContinue preference to be explicitly enabled; preparation does not enable it. Returns a server-created action_reference and frozen expected version/Goal identity. Review this observation, then pass only action_reference to apply_goal. Never invent UUIDs or versions. A conflict requires deliberate reconsideration, NOT reread-and-overwrite/reprepare. No automatic scheduling, Start/Stop, Suspended disposition, or Suspended reactivation.",
             Operation::Apply => "Apply or reconcile a previously prepared Goal action by its server-issued action_reference. Coordinator only. Never accepts target, version, authority, or replacement content. Exact retries replay the immutable accepted or refused receipt, including across restart/Coordinator continuation. New create/replace requires the target's persisted autoContinue preference to be explicitly enabled; refusal does not enable it or dispatch work. On conflict or busy refusal do NOT blindly prepare another action; read Goal/history and reconsider explicitly. Does not dispatch or schedule work, Start/Stop, or reactivate Suspended Goals.",
         }.to_owned()
@@ -116,7 +118,7 @@ impl Tool for GoalTool {
     fn input_schema(&self) -> Value {
         match self.operation {
             Operation::Read => {
-                json!({"type":"object","properties":{"target":target_schema(),"after_version":{"type":"integer","minimum":0,"description":"History cursor only; entries at or before this Goal version are omitted."},"instance":{"type":"string","minLength":1,"description":"Exact saved-peer instance ID or unique saved display name. Explicit peer selection never falls back to the local instance."},"wait":{"type":"object","properties":{"minimum_version":{"type":"integer","minimum":0},"timeout_seconds":{"type":"integer","minimum":1,"maximum":25}},"required":["minimum_version","timeout_seconds"],"additionalProperties":false}},"required":["target"],"additionalProperties":false})
+                json!({"type":"object","properties":{"target":target_schema(),"after_version":{"type":"integer","minimum":0,"description":"History cursor only; entries at or before this Goal version are omitted."},"instance":InstanceSelector::schema(),"wait":{"type":"object","properties":{"minimum_version":{"type":"integer","minimum":0},"timeout_seconds":{"type":"integer","minimum":1,"maximum":25}},"required":["minimum_version","timeout_seconds"],"additionalProperties":false}},"required":["target"],"additionalProperties":false})
             }
             Operation::Apply => {
                 json!({"type":"object","properties":{"action_reference":{"type":"string","format":"uuid","description":"Copy the opaque reference returned by prepare_goal; do not generate one."}},"required":["action_reference"],"additionalProperties":false})
@@ -167,7 +169,7 @@ impl GoalTool {
         let after = GoalVersion::parse(args.after_version.unwrap_or(0))
             .map_err(|error| error.to_string())?;
         match (args.instance, args.wait) {
-            (None, None) => {
+            (InstanceSelector::Local, None) => {
                 let (current, history) = self
                     .service
                     .read_coordinator(&ctx.conversation_id, &owner, after)
@@ -177,7 +179,7 @@ impl GoalTool {
                     json!({"target":args.target,"current":current,"history":history,"history_page_size":100,"execution_state_included":false}),
                 )
             }
-            (None, Some(wait)) => {
+            (InstanceSelector::Local, Some(wait)) => {
                 let wait = wait.into_request()?;
                 let result = self
                     .service
@@ -188,11 +190,11 @@ impl GoalTool {
                     json!({"target":args.target,"exact_transcript_id":result.destination_transcript_id(),"current":result.current(),"history":result.history(),"history_page_size":100,"execution_state_included":false,"wait_status":result.status()}),
                 )
             }
-            (Some(instance), wait) => {
+            (InstanceSelector::Remote(instance), wait) => {
                 let wait = wait.map(GoalWaitInput::into_request).transpose()?;
                 let response = crate::api::federation::read_remote_goal(
                     self.runtime.db(),
-                    &instance,
+                    instance.as_str(),
                     &owner,
                     after,
                     wait,

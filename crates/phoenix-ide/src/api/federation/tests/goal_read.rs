@@ -271,7 +271,7 @@ async fn peer_goal_read_is_immediate_and_rechecks_revoked_authority() {
         .db
         .replace_federation_enrollment(
             caller,
-            "goal reader",
+            &"goal reader".parse().unwrap(),
             &FederationCredentialVerifier::from_bearer(bearer),
         )
         .await
