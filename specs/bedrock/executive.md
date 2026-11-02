@@ -32,6 +32,13 @@ the imported sub-agent rules; stale or duplicate returns cannot borrow the ID of
 a newer selected call. The cancellation spec carries an owed forced notice until
 the final child settles, while ordinary cooperative cancellation owes no notice.
 
+Child delivery is distinct from parent acceptance. The executor buffers raw
+terminal results during ordinary tool execution/cancellation and replays the
+matching pending children only after entering the fan-in state. Bedrock therefore
+keeps a buffered child pending until it atomically records the completed outcome.
+The final-spawn transition snapshots the union of prior admitted children and the
+new batch before changing state, matching the runtime's `all_pending` construction.
+
 ### Cancellation implementation gaps
 
 REQ-BED-005 is partial: the owned executor awaits originating-policy/scope reads

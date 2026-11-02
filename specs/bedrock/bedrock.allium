@@ -781,11 +781,12 @@ rule LastToolCompletesWithSubAgents {
     requires: conversation.tool_queue.count = 0
     requires: conversation.accumulated_sub_agents.count > 0
     requires: result.tool_use_id = conversation.current_tool.tool_use_id
+    let pending_children = conversation.accumulated_sub_agents
     ensures: conversation.tool_results.add(result)
     ensures: conversation.core_status = awaiting_sub_agents
     ensures: conversation.current_tool = null
     ensures: conversation.tool_queue = null
-    ensures: conversation.sub_agents_pending = conversation.accumulated_sub_agents
+    ensures: conversation.sub_agents_pending = pending_children
     ensures: conversation.sub_agents_completed = {}
     ensures: ToolRoundCheckpointed(conversation)
 }
@@ -812,16 +813,16 @@ rule SpawnAgentsCompletesAsLastTool {
     requires: conversation.core_status = executing_tools
     requires: conversation.tool_queue.count = 0
     requires: result.tool_use_id = conversation.current_tool.tool_use_id
+    let pending_children = conversation.accumulated_sub_agents + spawned_agents
     ensures: conversation.tool_results.add(result)
     ensures:
         for agent in spawned_agents:
-            conversation.accumulated_sub_agents.add(agent)
             agent.product_conversation = conversation.product_conversation
             agent.parent = conversation
     ensures: conversation.core_status = awaiting_sub_agents
     ensures: conversation.current_tool = null
     ensures: conversation.tool_queue = null
-    ensures: conversation.sub_agents_pending = conversation.accumulated_sub_agents
+    ensures: conversation.sub_agents_pending = pending_children
     ensures: conversation.sub_agents_completed = {}
     ensures: ToolRoundCheckpointed(conversation)
 }
@@ -913,13 +914,6 @@ rule LastSubAgentDuringCancellation {
         -- cancellation owes no degraded notice. Clearing the chain-scoped fact and
         -- leaving CancellingSubAgents prevent a late/duplicate child from emitting
         -- it again; the child deadline and cooperative drain are alternative exits.
-}
-
-rule SubAgentResultWhileCancellingTool {
-    when: SubAgentReportsResult(conversation, result)
-    requires: conversation.core_status = cancelling_tool
-    requires: result.agent_id in conversation.sub_agents_pending
-    ensures: conversation.sub_agents_pending.remove(result.agent_id)
 }
 
 rule SubAgentResultDuringCancellation {
@@ -3817,13 +3811,24 @@ surface RuntimeChildResultObservations {
     provides:
         SubAgentReportsResult(conversation, result)
             when executor_owns_conversation(runtime, conversation)
+                 and conversation.core_status in { awaiting_sub_agents, cancelling_sub_agents }
 
     @guarantee DurableParentAndChildCorrelation
         -- The delivered result retains the admitted child's exact identity and
         -- durable parent destination, under the sub-agent terminal-evidence and
-        -- delivery contracts. It may arrive while the tool itself is still
-        -- cancelling. Bedrock's pending/completed membership guards own
+        -- delivery contracts. Bedrock's pending/completed membership guards own
         -- acceptance and duplicate handling; delivery alone is not acceptance.
+
+    @guarantee EarlyChildResultsWaitForFanInReadiness
+        -- A transport arrival while the ordinary tool is executing or cancelling
+        -- is retained unchanged in the executor's existing result buffer. It
+        -- does not remove the child from parent pending or mark it parent-accepted.
+        -- On entering AwaitingSubAgents or CancellingSubAgents, redeliver each
+        -- buffered result belonging to that exact pending child set through
+        -- SubAgentReportsResult. Buffering may retain duplicates; the acceptance
+        -- guards then move each child pending -> completed once. Results from
+        -- another round are not reattributed to this round. The process-local
+        -- buffer is not independent durable delivery or restart authority.
 }
 
 surface UserConversation {

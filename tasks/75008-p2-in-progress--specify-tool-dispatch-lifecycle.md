@@ -51,6 +51,18 @@ Automated review of `5d111a010bcf49a245a34ca1fe591538a0e5616e` found four action
 - Corrected-target focused validation passes: direct Allium checks have zero errors; `PHOENIX_CHECK_BASE=9441cd2824324e53697df88f4e9db07f6de3980e ./dev.py check --lanes allium,spec-anchors,task` passed all three steps in 1.0 seconds. Log `/tmp/phoenix-dispatch-spec-review-correction-fast.log` is Codex harness-local. Declaring the actual runtime child-result observation boundary resolves one former Bedrock reachability finding; the remaining 40 findings are an accepted subset of the existing 41-finding baseline. No baseline file was edited. The new dispatcher file has zero warnings/findings when checked with imports.
 - No expensive default check is repeated until the semantic snapshot is frozen. Fresh independent adversarial review and automated review are required for the corrected head; this task remains in progress pending that qualification.
 
+## Fresh-review fan-in corrections
+
+Two isolated reviews of `1798815d4d8388dcc9f712fee1ffe187342bbb4c` found that the new cancellation-tool child-result rule removed a child from pending without retaining its outcome. The spec now follows the full runtime boundary instead: raw results received during ToolExecuting/CancellingTool remain losslessly buffered, pending is unchanged, and results/duplicates re-enter Bedrock only after AwaitingSubAgents/CancellingSubAgents readiness. The existing exact-child acceptance/idempotence rules then perform pending -> completed.
+
+Manual trace: admitted A/B -> cancel ordinary tool -> A arrives (buffer retains A, pending remains {A,B}) -> tool cancellation settles to CancellingSubAgents with pending {A,B}, completed {} -> replay A gives pending {B}, completed {A} -> a duplicate A changes neither collection -> B completes the fan-in. If A/B both arrive early, both remain pending until replay, preventing premature idle settlement. No new completed-result store or restart guarantee is introduced.
+
+The final-spawn rule also now binds old accumulated children + the returned spawn batch before its ensures. Empty-old + successful A enters AwaitingSubAgents with pending {A}; old {B} + new {A} enters with {A,B}. The Rust branch already constructs `all_pending` by cloning old pending and extending with spawned, so this is a pre-existing spec assignment bug exposed by composition, not a runtime regression.
+
+Bounded off-path observation: the standalone pure `handle_core_cancellation` CancellingTool + SubAgentResult branch removes an ID without carrying the outcome. Production `ConversationRuntime::process_event` first calls `can_handle_sub_agent_result`, which admits only AwaitingSubAgents/CancellingSubAgents and buffers the other states; `drain_buffer_for_round` then replays matching pending IDs. That upstream gate disproves a demonstrated live result-loss claim for this path. Base/head `transition.rs` blob is identical (`9dc5a1e4a83f27fe05726656fa98520e55db4450`). No production-loss follow-up is filed based only on the latent pure-reducer discrepancy; verified runtime tasks remain 75009 and 75010.
+
+The default check on semantic head `1798815d4d8388dcc9f712fee1ffe187342bbb4c` passed five executed steps in 121.7 seconds with explicit base/worker budget, but does not qualify these subsequent model edits. A new frozen-target review/validation pass is required.
+
 ## Out-of-scope observation
 
 Permissions Allium still includes the normative denial-count/escalation target while its executive marks that behavior unimplemented. The new reusable checked-call contract deliberately excludes that separate requirement; no escalation work is commissioned here.
