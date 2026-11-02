@@ -12,6 +12,24 @@ The implementation still retains legacy Project/mode and terminal compatibility 
 
 ## Technical Summary
 
+The serial dispatch boundary is specified in `tool-dispatch.allium`, composed
+with Bedrock's round admission, the LLM originating-request/schema contract,
+the narrow permission checked-call contract, and sub-agent admission rules.
+Bedrock represents one active call separately from its ordered remaining queue.
+The dispatcher spec distinguishes early unavailable results, side-effecting
+preparation, permission denial without a tool task, launch-time live admission,
+generation/state/identity completion guards, sender-loss settlement, cooperative
+cancellation, and forced task retirement. It describes the existing runtime;
+no dispatcher extraction or concurrent tool scheduling is implemented by this
+specification work. Permission counters/escalation remain outside this boundary.
+
+Source correspondence is `ConversationRuntime::dispatch_tool_execution`,
+`execute_tool_to_outcome`, `forward_tool_outcome`, the tool-outcome receive arm,
+`ToolExecutionSlot`, and `handle_core_tool_complete`/`handle_core_cancellation`.
+Existing `provider_tool_policy_tests`, `tool_generation_guard_tests`,
+`sender_drop_forwarder_tests`, and slot lifecycle tests exercise these seams.
+Specification consistency is checked separately from runtime test execution.
+
 Implements Elm Architecture with a typed-effect executor boundary. The SM has two pure entry points: `handle_user_event()` for API-initiated events and `handle_outcome()` for executor results. Effects carry oneshot channels typed to their expected outcome (`LlmOutcome`, `ToolOutcome`, `SubAgentOutcome`, `PersistOutcome`) — the compiler prevents invalid event/state combinations. Persistence uses `CheckpointData::ToolRound` which structurally requires matched `tool_use`/`tool_result` pairs. Error classification is exhaustive with no `Unknown` variant. Executor loop uses `StepResult::Terminal` to force explicit exit on terminal states. Token streaming uses fire-and-forget `StreamToken` effects routed to SSE without SM state transitions. Sub-agents have mandatory timeouts. The normative fan-in target removes each exact accepted child from pending, makes duplicate terminal acceptance idempotent, and prevents ordinary parent settlement while admitted children remain pending. On server restart, ordinary interrupted conversations resume from idle with full message history preserved. Interrupted `present_svg` invocations recover an already committed compact artifact reference by exact assistant/tool identity; invocations without a committed snapshot retain the interrupted error. A committed steering turn whose accepted user or skill message is still awaiting its first response preserves `LlmRequesting` from immutable receipt/transcript evidence; a synchronous recovery dispatch failure settles as a persisted typed error, and a failed error write retires the runtime for reconstruction. Durable continuation operations retain their operation identity and recovery state.
 
 ### Terminal startup acknowledgement

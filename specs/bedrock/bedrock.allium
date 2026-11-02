@@ -408,7 +408,9 @@ entity Conversation {
     -- Core state-dependent fields
     retry_attempt: Integer when core_status = llm_requesting | awaiting_continuation | recoverable_continuation_failure
     overload_retry: ServerOverloadIncident when core_status = server_overload_retrying
+    current_tool: ToolCall when core_status = executing_tools
     tool_queue: List<ToolCall> when core_status = executing_tools
+    cancelling_tool_use_id: String when core_status = cancelling_tool
     tool_results: List<ToolResult> when core_status = executing_tools | cancelling_tool
     accumulated_sub_agents: Set<Conversation> when core_status = executing_tools
     skipped_tools: List<ToolCall> when core_status = cancelling_tool
@@ -661,7 +663,8 @@ rule LlmRespondsWithTools {
     requires: not is_sole_intercepted_tool(tool_calls)
     requires: not conversation.context_at_threshold
     ensures: conversation.core_status = executing_tools
-    ensures: conversation.tool_queue = tool_calls
+    ensures: conversation.current_tool = tool_calls.first
+    ensures: conversation.tool_queue = remaining_tool_calls(tool_calls)
     ensures: conversation.tool_results = {}
     ensures: conversation.accumulated_sub_agents = {}
     ensures: conversation.context_usage_ratio = usage_ratio(usage, conversation)
@@ -694,12 +697,11 @@ rule BashWaitSettlementDeadlineFires {
     when: BashWaitSettlementDeadlineReached(conversation, tool_call)
     requires: conversation.core_status = executing_tools
     requires: tool_call = conversation.current_tool
-    requires: tool_call.name = "bash"
-    requires: tool_call.input.op = "wait"
+    requires: is_bash_wait(tool_call)
     ensures: ToolTaskAborted(conversation, tool_call)
     ensures: ToolCompletes(
         conversation,
-        error_result(tool_call.id, "bash wait exceeded its bounded settlement deadline")
+        error_result(tool_call.tool_use_id, "bash wait exceeded its bounded settlement deadline")
     )
     ensures: not CommandReexecuted(tool_call)
 
@@ -716,8 +718,7 @@ rule BashWaitSettlementPersistenceCutoffFires {
     when: BashWaitSettlementPersistenceCutoffReached(conversation, tool_call)
     requires: conversation.core_status = executing_tools
     requires: tool_call = conversation.current_tool
-    requires: tool_call.name = "bash"
-    requires: tool_call.input.op = "wait"
+    requires: is_bash_wait(tool_call)
     ensures: ProcessLocalAuthorityClosed(conversation)
     ensures: not PersistenceReceiptFabricated(tool_call)
     ensures: not AmbiguousPersistenceRetried(tool_call)
@@ -734,8 +735,12 @@ rule ToolCompletesWithMoreRemaining {
     when: ToolCompletes(conversation, result)
     requires: conversation.core_status = executing_tools
     requires: conversation.tool_queue.count > 0
+    requires: result.tool_use_id = conversation.current_tool.tool_use_id
+    let next_tool = conversation.tool_queue.first
     ensures: conversation.tool_results.add(result)
-    ensures: ToolExecutionStarted(conversation, conversation.tool_queue.first)
+    ensures: conversation.current_tool = next_tool
+    ensures: conversation.tool_queue = remaining_tool_calls(conversation.tool_queue)
+    ensures: ToolExecutionStarted(conversation, next_tool)
 }
 
 rule LastToolCompletesNoSubAgents {
@@ -743,8 +748,11 @@ rule LastToolCompletesNoSubAgents {
     requires: conversation.core_status = executing_tools
     requires: conversation.tool_queue.count = 0
     requires: conversation.accumulated_sub_agents.count = 0
+    requires: result.tool_use_id = conversation.current_tool.tool_use_id
     ensures: conversation.tool_results.add(result)
     ensures: conversation.core_status = llm_requesting
+    ensures: conversation.current_tool = null
+    ensures: conversation.tool_queue = null
     ensures: conversation.retry_attempt = 1
     ensures: ToolRoundCheckpointed(conversation)
     ensures: LlmRequestDispatched(conversation)
@@ -755,8 +763,11 @@ rule LastToolCompletesWithSubAgents {
     requires: conversation.core_status = executing_tools
     requires: conversation.tool_queue.count = 0
     requires: conversation.accumulated_sub_agents.count > 0
+    requires: result.tool_use_id = conversation.current_tool.tool_use_id
     ensures: conversation.tool_results.add(result)
     ensures: conversation.core_status = awaiting_sub_agents
+    ensures: conversation.current_tool = null
+    ensures: conversation.tool_queue = null
     ensures: conversation.sub_agents_pending = conversation.accumulated_sub_agents
     ensures: conversation.sub_agents_completed = {}
     ensures: ToolRoundCheckpointed(conversation)
@@ -766,19 +777,24 @@ rule SpawnAgentsCompletesWithMoreTools {
     when: SpawnAgentsCompletes(conversation, result, spawned_agents)
     requires: conversation.core_status = executing_tools
     requires: conversation.tool_queue.count > 0
+    requires: result.tool_use_id = conversation.current_tool.tool_use_id
+    let next_tool = conversation.tool_queue.first
     ensures: conversation.tool_results.add(result)
     ensures:
         for agent in spawned_agents:
             conversation.accumulated_sub_agents.add(agent)
             agent.product_conversation = conversation.product_conversation
             agent.parent = conversation
-    ensures: ToolExecutionStarted(conversation, conversation.tool_queue.first)
+    ensures: conversation.current_tool = next_tool
+    ensures: conversation.tool_queue = remaining_tool_calls(conversation.tool_queue)
+    ensures: ToolExecutionStarted(conversation, next_tool)
 }
 
 rule SpawnAgentsCompletesAsLastTool {
     when: SpawnAgentsCompletes(conversation, result, spawned_agents)
     requires: conversation.core_status = executing_tools
     requires: conversation.tool_queue.count = 0
+    requires: result.tool_use_id = conversation.current_tool.tool_use_id
     ensures: conversation.tool_results.add(result)
     ensures:
         for agent in spawned_agents:
@@ -786,6 +802,8 @@ rule SpawnAgentsCompletesAsLastTool {
             agent.product_conversation = conversation.product_conversation
             agent.parent = conversation
     ensures: conversation.core_status = awaiting_sub_agents
+    ensures: conversation.current_tool = null
+    ensures: conversation.tool_queue = null
     ensures: conversation.sub_agents_pending = conversation.accumulated_sub_agents
     ensures: conversation.sub_agents_completed = {}
     ensures: ToolRoundCheckpointed(conversation)
@@ -798,8 +816,13 @@ rule SpawnAgentsCompletesAsLastTool {
 rule CancelDuringToolExecution {
     when: UserCancels(conversation)
     requires: conversation.core_status = executing_tools
+    let active_id = conversation.current_tool.tool_use_id
+    let queued = conversation.tool_queue
     ensures: conversation.core_status = cancelling_tool
-    ensures: conversation.skipped_tools = conversation.tool_queue
+    ensures: conversation.cancelling_tool_use_id = active_id
+    ensures: conversation.current_tool = null
+    ensures: conversation.skipped_tools = queued
+    ensures: conversation.tool_queue = null
     ensures: ToolAbortRequested(conversation)
 }
 
@@ -807,6 +830,7 @@ rule ToolAbortConfirmed {
     when: ToolAborted(conversation)
     requires: conversation.core_status = cancelling_tool
     ensures: CancellationCheckpointed(conversation)
+    ensures: conversation.cancelling_tool_use_id = null
     ensures:
         if conversation.sub_agents_pending?.count = 0:
             conversation.core_status = idle
@@ -819,7 +843,9 @@ rule ToolAbortConfirmed {
 rule ToolCompletesDuringCancellation {
     when: ToolCompletes(conversation, result)
     requires: conversation.core_status = cancelling_tool
+    requires: result.tool_use_id = conversation.cancelling_tool_use_id
     ensures: CancellationCheckpointed(conversation)
+    ensures: conversation.cancelling_tool_use_id = null
     ensures:
         if conversation.sub_agents_pending?.count = 0:
             conversation.core_status = idle
@@ -867,6 +893,7 @@ rule CancellingToolDeadlineFires {
     when: CancellationDeadlineExpires(conversation)
     requires: conversation.core_status = cancelling_tool
     ensures: CancellationCheckpointed(conversation)
+    ensures: conversation.cancelling_tool_use_id = null
     ensures: CancellationDeadlineExceeded(conversation)
     ensures: SystemMessageInjected(conversation,
         "Cancellation completed. Aborted work may still be reclaiming resources in the background.")
@@ -3013,6 +3040,14 @@ rule ModeChangeNotification {
 -- Helpers (pure predicates referenced by rules)
 ------------------------------------------------------------
 
+--   remaining_tool_calls(calls: List<ToolCall>) -> List<ToolCall>
+--       The ordered tail after removing exactly the first call. Requires a
+--       nonempty input. The active call is not part of tool_queue; completed
+--       calls move to tool_results and are never started again by advancement.
+--   is_bash_wait(call: ToolCall) -> Boolean
+--       True exactly when call.name is bash and its serialized input represents
+--       a supported Bash wait invocation. Input is opaque outside this predicate.
+
 --   valid_tool_identities(content: Content, tool_calls: List<ToolCall>) -> Boolean
 --       True exactly when Phoenix-managed tool-use identities in content and
 --       executable call identities are unique and correspond one-to-one.
@@ -3708,12 +3743,10 @@ surface UserConversation {
                  }
         BashWaitSettlementDeadlineReached(conversation, conversation.current_tool)
             when conversation.core_status = executing_tools
-             and conversation.current_tool.name = "bash"
-             and conversation.current_tool.input.op = "wait"
+             and is_bash_wait(conversation.current_tool)
         BashWaitSettlementPersistenceCutoffReached(conversation, conversation.current_tool)
             when conversation.core_status = executing_tools
-             and conversation.current_tool.name = "bash"
-             and conversation.current_tool.input.op = "wait"
+             and is_bash_wait(conversation.current_tool)
         TaskApprovalDecided(conversation, decision)
             when conversation.parent_status = awaiting_task_approval
         UserAnswersQuestion(conversation, request_id?, answers, annotations?)

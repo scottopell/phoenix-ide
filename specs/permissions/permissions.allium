@@ -53,6 +53,22 @@ value Denial {
 }
 
 ------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract CheckedToolExecution {
+    check: (name: String, input: String) -> CheckedToolCall | Denial
+
+    @invariant ExactPayloadAuthority
+        -- REQ-PERM-001 through REQ-PERM-005: registry and live-MCP execution
+        -- require the checked name and payload minted by the deny gate. Denial
+        -- starts no tool task and returns an ordinary error result. This
+        -- contract covers the gate decision and checked payload only; it does
+        -- not include DenialTracker or REQ-PERM-006 escalation. Reducer- and
+        -- runtime-intercepted calls remain governed by REQ-PERM-007.
+}
+
+------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
 
@@ -228,6 +244,9 @@ surface AgentToolGate {
     facing agent: LlmAgent
 
     context conversation: bedrock/Conversation
+
+    contracts:
+        fulfils CheckedToolExecution
 
     exposes:
         DenialTracker.status
