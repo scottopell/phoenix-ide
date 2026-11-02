@@ -12503,39 +12503,6 @@ impl Database {
         Ok(())
     }
 
-    /// Materialize the assistant message and completed tool results that an
-    /// in-flight `ToolExecuting` or `CancellingTool` round carries only in its
-    /// `ConvState` JSON, so they survive the startup reset that overwrites the
-    /// state with idle.
-    ///
-    /// Both states bundle the un-persisted round for atomic end-of-round
-    /// persistence and hold the same recoverable data, differing only in how
-    /// the unfinished tools are named:
-    ///   - `assistant_message`: the LLM turn (with one `tool_use` block per
-    ///     dispatched tool) — broadcast over SSE and seen by the user, but not
-    ///     yet in `messages`;
-    ///   - `completed_results`: real outputs of tools that already finished;
-    ///   - the unfinished tools: `ToolExecuting` carries the running tool as
-    ///     `current_tool` (a `ToolCall`) plus `remaining_tools`; `CancellingTool`
-    ///     carries the tool being aborted as `tool_use_id` (just the id) plus
-    ///     `skipped_tools`. Both are normalized to a flat list of interrupted
-    ///     `tool_use` ids — that's all the builder needs to pair a synthetic
-    ///     result.
-    ///
-    /// Each `tool_use` needs exactly one paired `tool_result` or the next LLM
-    /// request 400s. We write the assistant message, then one result per
-    /// `tool_use`: completed tools contribute their real result, and every
-    /// unfinished tool gets a synthetic interrupted error. The whole round
-    /// commits atomically via [`Database::persist_tool_round`].
-    ///
-    /// The pairing count is checked before any write: if the materialized
-    /// results don't match the assistant's `tool_use` count, we skip this
-    /// conversation rather than persist a mis-paired chain — the subsequent
-    /// reset + `repair_orphaned_tool_use` then handles it the legacy way.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`DbError`] if the underlying database operation fails.
     /// Resolve the real terminal outcome of each pending sub-agent by reading
     /// its child conversation row (created with `id == agent_id`). A sub-agent
     /// that reached `Completed`/`Failed` before the restart is returned with its
@@ -12543,6 +12510,10 @@ impl Database {
     /// missing or non-terminal) is omitted, so the caller falls back to the
     /// "interrupted by server restart" synthetic outcome. Query and decode
     /// failures remain errors because they cannot prove the child nonterminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] when a child query or state decoding fails.
     async fn resolve_pending_sub_agent_outcomes(
         &self,
         pending: &[phoenix_core::domain::sm_state::PendingSubAgent],
