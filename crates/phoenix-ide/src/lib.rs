@@ -26,6 +26,8 @@ pub(crate) mod git_start;
 mod mcp_oauth_store;
 mod message_expander;
 mod phx_cli;
+mod plugin_activation;
+mod plugin_lifecycle;
 mod project_opportunistic_build_warm;
 mod resolution_root;
 mod resource_authority;
@@ -845,19 +847,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     }
     mcp_manager.set_disabled_servers(disabled).await;
 
-    // Seed the shared plugin filter from the persisted plugin registry so
-    // skill discovery and the MCP merge observe the same enabled set
-    // (specs/plugins/ REQ-AP-008) before any turn starts.
-    let disabled_plugins: std::collections::HashSet<String> = db
-        .get_plugins()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|record| !record.enabled)
-        .map(|record| record.name)
-        .collect();
-    phoenix_plugins::filter::set_disabled(disabled_plugins.clone());
-    mcp_manager.set_disabled_plugins(disabled_plugins).await;
+    plugin_activation::refresh(&db, mcp_manager.plugin_activation()).await?;
 
     // Read optional auth password (REQ-AUTH-001)
     let password = std::env::var("PHOENIX_PASSWORD")

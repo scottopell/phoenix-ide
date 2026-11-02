@@ -345,6 +345,7 @@ pub struct ToolContext {
     direct_turn_id: Option<phoenix_core::domain::sm_event::DirectTurnTurnId>,
     svg_assistant_message_id: Option<String>,
     svg_artifact_store: Option<Arc<dyn present_svg::SvgArtifactStore>>,
+    skill_discovery: phoenix_skills::SkillDiscovery,
 }
 
 impl ToolContext {
@@ -439,6 +440,7 @@ impl ToolContext {
             direct_turn_id: None,
             svg_assistant_message_id: None,
             svg_artifact_store: None,
+            skill_discovery: phoenix_skills::SkillDiscovery::default(),
             llm_metrics_tx: None,
         }
     }
@@ -497,7 +499,19 @@ impl ToolContext {
             direct_turn_id: None,
             svg_assistant_message_id: None,
             svg_artifact_store: None,
+            skill_discovery: phoenix_skills::SkillDiscovery::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_skill_discovery(mut self, discovery: phoenix_skills::SkillDiscovery) -> Self {
+        self.skill_discovery = discovery;
+        self
+    }
+
+    #[must_use]
+    pub fn skill_discovery(&self) -> &phoenix_skills::SkillDiscovery {
+        &self.skill_discovery
     }
 
     #[must_use]

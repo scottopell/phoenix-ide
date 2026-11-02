@@ -14,7 +14,7 @@ use serde_json::Value;
 /// The canonical 1.1.0 MCP schema identifier (REQ-AP-012).
 pub const MCP_SCHEMA_URL: &str = "https://agent-plugins.org/schemas/1.1.0/mcp.schema.json";
 
-/// One validated server entry: exactly one closed variant, placeholders
+/// One parsed server candidate: runtime paths are not yet resolved, placeholders
 /// not yet expanded. The deprecated `sse` transport never reaches this
 /// type (it is a skip with a diagnostic, per REQ-AP-004 / REQ-MCP-019).
 #[derive(Debug, Clone, PartialEq)]

@@ -361,6 +361,120 @@ fn collect_builtin_skills_from_dir(
     }
 }
 
+/// Catalog entries and the plugin admission decisions from the same discovery pass.
+#[derive(Debug)]
+pub struct SkillCatalog {
+    pub skills: Vec<SkillMetadata>,
+    pub plugin_outcomes: std::collections::HashMap<String, Vec<PluginSkillOutcome>>,
+}
+
+#[derive(Debug)]
+pub struct PluginSkillOutcome {
+    pub name: String,
+    pub admission: Result<(), String>,
+}
+
+/// Instance-scoped skill discovery, including registry-authorized plugins.
+#[derive(Clone, Debug, Default)]
+pub struct SkillDiscovery {
+    activation: phoenix_core::plugin_activation::PluginActivation,
+    home: Option<PathBuf>,
+}
+
+impl SkillDiscovery {
+    #[must_use]
+    pub fn new(activation: phoenix_core::plugin_activation::PluginActivation) -> Self {
+        Self {
+            activation,
+            home: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_home(mut self, home: PathBuf) -> Self {
+        self.home = Some(home);
+        self
+    }
+
+    #[must_use]
+    pub fn discover(&self, working_dir: &Path) -> Vec<SkillMetadata> {
+        self.discover_for_audience(working_dir, SkillAudience::Conversation)
+    }
+
+    #[must_use]
+    pub fn discover_for_audience(
+        &self,
+        working_dir: &Path,
+        audience: SkillAudience,
+    ) -> Vec<SkillMetadata> {
+        match audience {
+            SkillAudience::Conversation => {
+                let builtin_dir = builtin::default_extract_dir();
+                self.discover_for_audience_with_options(
+                    working_dir,
+                    None,
+                    builtin_dir.as_deref(),
+                    audience,
+                )
+            }
+            SkillAudience::GlobalCoordinator => Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn discover_with_options(
+        &self,
+        working_dir: &Path,
+        home_override: Option<&Path>,
+        builtin_dir: Option<&Path>,
+    ) -> Vec<SkillMetadata> {
+        self.discover_for_audience_with_options(
+            working_dir,
+            home_override,
+            builtin_dir,
+            SkillAudience::Conversation,
+        )
+    }
+
+    #[must_use]
+    pub fn discover_for_audience_with_options(
+        &self,
+        working_dir: &Path,
+        home_override: Option<&Path>,
+        builtin_dir: Option<&Path>,
+        audience: SkillAudience,
+    ) -> Vec<SkillMetadata> {
+        discover_all_skills_with_options(
+            working_dir,
+            home_override.or(self.home.as_deref()),
+            builtin_dir,
+            &self.activation.snapshot(),
+        )
+        .skills
+        .into_iter()
+        .filter(|skill| skill.audience == audience)
+        .collect()
+    }
+
+    /// Discover against an already scanned plugin set, retaining admission outcomes.
+    #[must_use]
+    pub fn catalog_with_plugins(
+        &self,
+        working_dir: &Path,
+        home: &Path,
+        builtin_dir: Option<&Path>,
+        plugins: &[phoenix_plugins::ParsedPlugin],
+    ) -> SkillCatalog {
+        discover_catalog_with_plugins(
+            working_dir,
+            Some(home),
+            builtin_dir,
+            &self.activation.snapshot(),
+            plugins,
+        )
+    }
+}
+
 /// Discover skills by walking from `working_dir` up to the filesystem root.
 ///
 /// At each level, scans `SKILL_DIRS` (`.claude/skills/` and `.agents/skills/`)
@@ -377,6 +491,7 @@ fn collect_builtin_skills_from_dir(
 /// (useful for testing without mutating process-global env vars).
 ///
 /// Returns skills sorted by name for deterministic output.
+/// Without an injected registry snapshot, plugin contributions are excluded.
 #[must_use]
 pub fn discover_skills(working_dir: &Path) -> Vec<SkillMetadata> {
     let builtin_dir = builtin::default_extract_dir();
@@ -414,10 +529,12 @@ pub fn discover_skills_for_audience_with_options(
     builtin_dir: Option<&Path>,
     audience: SkillAudience,
 ) -> Vec<SkillMetadata> {
-    discover_all_skills_with_options(working_dir, home_override, builtin_dir)
-        .into_iter()
-        .filter(|skill| skill.audience == audience)
-        .collect()
+    SkillDiscovery::default().discover_for_audience_with_options(
+        working_dir,
+        home_override,
+        builtin_dir,
+        audience,
+    )
 }
 
 /// Discover built-ins admitted to one audience without scanning a filesystem tree.
@@ -473,7 +590,31 @@ fn discover_all_skills_with_options(
     working_dir: &Path,
     home_override: Option<&Path>,
     builtin_dir: Option<&Path>,
-) -> Vec<SkillMetadata> {
+    activation: &phoenix_core::plugin_activation::PluginActivationSnapshot,
+) -> SkillCatalog {
+    let home = home_override.map(Path::to_path_buf).unwrap_or_else(|| {
+        phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()
+            .home()
+            .to_path_buf()
+    });
+    let plugins = phoenix_plugins::scan_plugins_root(&phoenix_plugins::default_plugins_root(&home));
+    discover_catalog_with_plugins(
+        working_dir,
+        home_override,
+        builtin_dir,
+        activation,
+        &plugins,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn discover_catalog_with_plugins(
+    working_dir: &Path,
+    home_override: Option<&Path>,
+    builtin_dir: Option<&Path>,
+    activation: &phoenix_core::plugin_activation::PluginActivationSnapshot,
+    plugins: &[phoenix_plugins::ParsedPlugin],
+) -> SkillCatalog {
     let mut skills: Vec<SkillMetadata> = Vec::new();
     let mut seen_names: HashSet<String> = HashSet::new();
     let mut seen_paths: HashSet<PathBuf> = HashSet::new(); // canonical paths for symlink dedup
@@ -585,106 +726,119 @@ fn discover_all_skills_with_options(
         }
     }
 
-    // Scan user-level plugins last: plugin skills rank below every user
-    // skill source and built-ins, surface under the namespaced name
-    // `plugin:skill`, and load only from enabled plugins (specs/plugins/
-    // REQ-AP-005). Non-plugin directories keep the recursive sub-skill
-    // extension; plugin trees are non-recursive by the 1.1.0 loading rule.
-    let resolved_plugin_home = match home_override {
-        Some(h) => h.to_path_buf(),
-        None => phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()
-            .home()
-            .to_path_buf(),
-    };
-    let plugins_root = phoenix_plugins::default_plugins_root(&resolved_plugin_home);
-    for plugin in phoenix_plugins::scan_enabled_plugins(&plugins_root) {
-        for skill_dir in &plugin.skills {
-            collect_plugin_skill(
-                plugin.manifest.name.clone(),
-                skill_dir,
-                &mut skills,
-                &mut seen_names,
-                &mut seen_paths,
-                &mut seen_content,
-            );
-        }
+    let mut plugin_outcomes = std::collections::HashMap::new();
+    for plugin in plugins {
+        let enabled = activation.is_enabled(&plugin.manifest.name);
+        let outcomes = plugin
+            .skills
+            .iter()
+            .map(|candidate| {
+                let admission = if enabled {
+                    collect_plugin_skill(
+                        &plugin.manifest.name,
+                        candidate,
+                        &mut skills,
+                        &mut seen_names,
+                        &mut seen_paths,
+                        &mut seen_content,
+                    )
+                } else {
+                    validate_plugin_skill(&plugin.manifest.name, candidate).map(|_| ())
+                };
+                PluginSkillOutcome {
+                    name: candidate.name(),
+                    admission,
+                }
+            })
+            .collect();
+        plugin_outcomes.insert(plugin.manifest.name.clone(), outcomes);
     }
-
     skills.sort_by(|a, b| a.name.cmp(&b.name));
-    skills
+    SkillCatalog {
+        skills,
+        plugin_outcomes,
+    }
 }
 
-/// Collect one plugin skill under its namespaced name (REQ-AP-005):
-/// `<plugin>:<skill>`, derived at discovery and never written into the
-/// skill's frontmatter. Plugin skills are conversation-audience only — a
-/// plugin cannot grant itself Global Coordinator visibility (REQ-SK-008).
-/// The frontmatter `name` must match the parent directory (Agent Skills
-/// format); a mismatch skips the skill rather than surfacing an ambiguous
-/// name.
+/// A plugin skill accepted by the owning semantic validator.
+#[derive(Debug)]
+pub struct ValidatedPluginSkill {
+    pub metadata: SkillMetadata,
+    canonical_path: PathBuf,
+    content_hash: u64,
+}
+
+/// Validate the same skill candidate used by catalog admission and plugin status.
+///
+/// # Errors
+/// Returns the read, frontmatter, name, or audience rejection for this skill only.
+pub fn validate_plugin_skill(
+    plugin_name: &str,
+    skill_dir: &phoenix_plugins::SkillCandidate,
+) -> Result<ValidatedPluginSkill, String> {
+    let skill_md = &skill_dir.skill_md;
+    let content =
+        std::fs::read_to_string(skill_md).map_err(|e| format!("SKILL.md unreadable: {e}"))?;
+    let fm = parse_skill_frontmatter(&content)
+        .ok_or_else(|| "invalid SKILL.md frontmatter".to_string())?;
+    if fm.name != skill_dir.name() {
+        return Err("frontmatter name does not match skill directory".into());
+    }
+    if fm.audience.unwrap_or_default() != SkillAudience::Conversation {
+        return Err("plugin skill audience must be conversation".into());
+    }
+    let mut hasher = std::hash::DefaultHasher::new();
+    content.hash(&mut hasher);
+    Ok(ValidatedPluginSkill {
+        canonical_path: std::fs::canonicalize(skill_md).unwrap_or_else(|_| skill_md.clone()),
+        content_hash: hasher.finish(),
+        metadata: SkillMetadata {
+            name: format!("{plugin_name}:{}", fm.name),
+            description: fm.description,
+            argument_hint: fm.argument_hint,
+            audience: SkillAudience::Conversation,
+            source: SkillSource::Plugin {
+                path: skill_md.clone(),
+                plugin_name: plugin_name.to_string(),
+            },
+        },
+    })
+}
+
 fn collect_plugin_skill(
-    plugin_name: String,
-    skill_dir: &phoenix_plugins::SkillDir,
+    plugin_name: &str,
+    skill_dir: &phoenix_plugins::SkillCandidate,
     skills: &mut Vec<SkillMetadata>,
     seen_names: &mut HashSet<String>,
     seen_paths: &mut HashSet<PathBuf>,
     seen_content: &mut HashSet<u64>,
-) {
-    let skill_md = &skill_dir.skill_md;
-    // Symlink dedup: a skill file reachable through two roots counts once.
-    let canonical = std::fs::canonicalize(skill_md).unwrap_or_else(|_| skill_md.clone());
-    if !seen_paths.insert(canonical) {
-        return;
-    }
-    let Ok(content) = std::fs::read_to_string(skill_md) else {
-        return;
+) -> Result<(), String> {
+    let validated = match validate_plugin_skill(plugin_name, skill_dir) {
+        Ok(skill) => skill,
+        Err(reason) => {
+            tracing::warn!(plugin = %plugin_name, skill = %skill_dir.name(), %reason,
+                "skipping plugin skill");
+            return Err(reason);
+        }
     };
-    let content_hash = {
-        let mut hasher = std::hash::DefaultHasher::new();
-        content.hash(&mut hasher);
-        hasher.finish()
+    let reason = if seen_paths.contains(&validated.canonical_path) {
+        Some("duplicate skill path")
+    } else if seen_content.contains(&validated.content_hash) {
+        Some("duplicate skill content")
+    } else if seen_names.contains(&validated.metadata.name) {
+        Some("skill name shadowed by higher-priority source")
+    } else {
+        None
     };
-    if !seen_content.insert(content_hash) {
-        return;
+    if let Some(reason) = reason {
+        tracing::debug!(plugin = %plugin_name, skill = %skill_dir.name(), reason, "skipping plugin skill");
+        return Err(reason.into());
     }
-    let Some(fm) = parse_skill_frontmatter(&content) else {
-        tracing::debug!(
-            plugin = %plugin_name,
-            skill = %skill_dir.dir.display(),
-            "invalid plugin SKILL.md frontmatter; skipping"
-        );
-        return;
-    };
-    if fm.name != skill_dir.name() {
-        tracing::debug!(
-            plugin = %plugin_name,
-            skill = %skill_dir.name(),
-            frontmatter_name = %fm.name,
-            "plugin skill frontmatter name does not match its directory; skipping"
-        );
-        return;
-    }
-    if fm.audience.unwrap_or_default() != SkillAudience::Conversation {
-        tracing::debug!(
-            plugin = %plugin_name,
-            skill = %fm.name,
-            "plugin skill claims a non-conversation audience; skipping"
-        );
-        return;
-    }
-    let namespaced = format!("{plugin_name}:{}", fm.name);
-    if !seen_names.insert(namespaced.clone()) {
-        return;
-    }
-    skills.push(SkillMetadata {
-        name: namespaced,
-        description: fm.description,
-        argument_hint: fm.argument_hint,
-        audience: SkillAudience::Conversation,
-        source: SkillSource::Plugin {
-            path: skill_md.clone(),
-            plugin_name,
-        },
-    });
+    seen_paths.insert(validated.canonical_path);
+    seen_content.insert(validated.content_hash);
+    seen_names.insert(validated.metadata.name.clone());
+    skills.push(validated.metadata);
+    Ok(())
 }
 
 fn format_skill_expansion(skill_dir: &str, raw_content: &str, arguments: Option<&str>) -> String {
@@ -1786,7 +1940,6 @@ mod tests {
 
     mod plugin_skills {
         use super::*;
-        use phoenix_plugins::filter;
 
         fn write(path: &std::path::Path, content: &str) {
             if let Some(parent) = path.parent() {
@@ -1795,36 +1948,140 @@ mod tests {
             fs::write(path, content).unwrap();
         }
 
-        /// The plugin filter is process-global state; these tests
-        /// serialize so one test's disabled set cannot bleed into
-        /// another's discovery.
-        static SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
         struct PluginRootGuard {
-            _lock: std::sync::MutexGuard<'static, ()>,
             dir: tempfile::TempDir,
+            activation: phoenix_core::plugin_activation::PluginActivation,
         }
 
         impl PluginRootGuard {
             fn new() -> Self {
-                let lock = SERIALIZE
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                filter::reset_for_tests();
+                let activation = phoenix_core::plugin_activation::PluginActivation::default();
+                activation.publish(HashSet::new());
                 Self {
-                    _lock: lock,
                     dir: tempfile::tempdir().unwrap(),
+                    activation,
                 }
             }
 
             fn path(&self) -> &std::path::Path {
                 self.dir.path()
             }
+
+            fn discover(&self, work: &Path) -> Vec<SkillMetadata> {
+                SkillDiscovery::new(self.activation.clone()).discover_with_options(
+                    work,
+                    Some(self.path()),
+                    None,
+                )
+            }
         }
 
-        impl Drop for PluginRootGuard {
-            fn drop(&mut self) {
-                filter::reset_for_tests();
+        #[test]
+        fn catalog_outcomes_match_content_path_and_name_deduplication() {
+            let guard = PluginRootGuard::new();
+            let home = guard.path();
+            for name in ["first", "second"] {
+                let root = home.join(format!(".agents/plugins/{name}"));
+                write(
+                    &root.join("plugin.json"),
+                    &format!(
+                        r#"{{"$schema":"https://agent-plugins.org/schemas/1.1.0/plugin.schema.json","name":"{name}"}}"#
+                    ),
+                );
+                write(
+                    &root.join("skills/shared/SKILL.md"),
+                    "---\nname: shared\ndescription: Shared.\n---\nSame body.",
+                );
+            }
+            let first = phoenix_plugins::load_plugin(&home.join(".agents/plugins/first")).unwrap();
+            let second =
+                phoenix_plugins::load_plugin(&home.join(".agents/plugins/second")).unwrap();
+            let plugins = vec![first, second];
+            let discovery = SkillDiscovery::new(guard.activation.clone());
+            let catalog = discovery.catalog_with_plugins(home, home, None, &plugins);
+            assert_eq!(catalog.skills.len(), 1);
+            assert_eq!(catalog.skills[0].name, "first:shared");
+            assert!(catalog.plugin_outcomes["first"][0].admission.is_ok());
+            assert!(catalog.plugin_outcomes["second"][0]
+                .admission
+                .as_ref()
+                .unwrap_err()
+                .contains("content"));
+
+            write(
+                &home.join(".agents/skills/override/SKILL.md"),
+                "---\nname: first:shared\ndescription: Override.\n---\nUser body.",
+            );
+            let catalog = discovery.catalog_with_plugins(home, home, None, &plugins);
+            assert!(catalog.plugin_outcomes["first"][0]
+                .admission
+                .as_ref()
+                .unwrap_err()
+                .contains("name"));
+            assert!(
+                catalog.plugin_outcomes["second"][0].admission.is_ok(),
+                "a rejected candidate must not consume the content hash"
+            );
+            assert_eq!(catalog.skills.len(), 2);
+
+            #[cfg(unix)]
+            {
+                std::fs::remove_file(home.join(".agents/skills/override/SKILL.md")).unwrap();
+                std::os::unix::fs::symlink(
+                    &plugins[0].skills[0].skill_md,
+                    home.join(".agents/skills/override/SKILL.md"),
+                )
+                .unwrap();
+                let catalog = discovery.catalog_with_plugins(home, home, None, &plugins);
+                assert!(catalog.plugin_outcomes["first"][0]
+                    .admission
+                    .as_ref()
+                    .unwrap_err()
+                    .contains("path"));
+            }
+        }
+
+        #[test]
+        fn plugin_validation_reasons_match_catalog_admission() {
+            let temp = tempfile::tempdir().unwrap();
+            for (name, content, reason) in [
+                ("bad", "missing frontmatter", "frontmatter"),
+                (
+                    "renamed",
+                    "---\nname: other\ndescription: Wrong.\n---\n",
+                    "name does not match",
+                ),
+                (
+                    "hidden",
+                    "---\nname: hidden\ndescription: Hidden.\naudience: global-coordinator\n---\n",
+                    "audience",
+                ),
+                ("valid", "---\nname: valid\ndescription: Valid.\n---\n", ""),
+            ] {
+                let dir = temp.path().join(name);
+                std::fs::create_dir_all(&dir).unwrap();
+                let skill_md = dir.join("SKILL.md");
+                std::fs::write(&skill_md, content).unwrap();
+                let candidate = phoenix_plugins::SkillCandidate { dir, skill_md };
+                let outcome = validate_plugin_skill("demo", &candidate);
+                let mut skills = vec![];
+                let admitted = collect_plugin_skill(
+                    "demo",
+                    &candidate,
+                    &mut skills,
+                    &mut HashSet::new(),
+                    &mut HashSet::new(),
+                    &mut HashSet::new(),
+                );
+                if reason.is_empty() {
+                    assert_eq!(outcome.unwrap().metadata.name, "demo:valid");
+                    assert_eq!(skills.len(), 1);
+                    assert!(admitted.is_ok());
+                } else {
+                    assert!(admitted.unwrap_err().contains(reason));
+                    assert!(outcome.unwrap_err().contains(reason));
+                    assert!(skills.is_empty());
+                }
             }
         }
 
@@ -1846,7 +2103,7 @@ mod tests {
                 "---\nname: deploy\ndescription: Deploys.\n---\nBody.",
             );
 
-            let skills = discover_skills_with_options(work.path(), Some(home), None);
+            let skills = guard.discover(work.path());
             let plugin_skill = skills
                 .iter()
                 .find(|s| s.name == "devtools:deploy")
@@ -1886,7 +2143,7 @@ mod tests {
                 "---\nname: inner\ndescription: Nested.\n---\nBody.",
             );
 
-            let skills = discover_skills_with_options(work.path(), Some(home), None);
+            let skills = guard.discover(work.path());
             assert!(skills
                 .iter()
                 .any(|s| s.name == "deploy" && s.description == "User deploys."));
@@ -1914,9 +2171,21 @@ mod tests {
                 "---\nname: deploy\ndescription: Deploys.\n---\nBody.",
             );
 
-            filter::set_disabled(["devtools".to_string()]);
-            let skills = discover_skills_with_options(work.path(), Some(home), None);
+            guard
+                .activation
+                .publish(HashSet::from(["devtools".to_string()]));
+            let skills = guard.discover(work.path());
             assert!(!skills.iter().any(|s| s.name == "devtools:deploy"));
+            let discovery = SkillDiscovery::new(guard.activation.clone());
+            guard.activation.publish(HashSet::new());
+            assert!(discovery
+                .discover_with_options(work.path(), Some(home), None)
+                .iter()
+                .any(|s| s.name == "devtools:deploy"));
+            assert!(!SkillDiscovery::default()
+                .discover_with_options(work.path(), Some(home), None)
+                .iter()
+                .any(|s| s.name == "devtools:deploy"));
         }
 
         /// Plugin skills are conversation-audience only: frontmatter claiming
@@ -1936,7 +2205,7 @@ mod tests {
                 "---\nname: hidden\ndescription: Claims coordinator.\naudience: global-coordinator\n---\nBody.",
             );
 
-            let skills = discover_skills_with_options(work.path(), Some(home), None);
+            let skills = guard.discover(work.path());
             assert!(!skills.iter().any(|s| s.name.contains("hidden")));
         }
 
@@ -1958,7 +2227,7 @@ mod tests {
                 "---\nname: not-renamed\ndescription: Mismatched.\n---\nBody.",
             );
 
-            let skills = discover_skills_with_options(work.path(), Some(home), None);
+            let skills = guard.discover(work.path());
             assert!(!skills.iter().any(|s| s.name.contains("renamed")));
         }
 
@@ -1980,7 +2249,7 @@ mod tests {
                 "---\nname: deploy\ndescription: Deploys.\n---\nDeploy $ARGUMENTS now.",
             );
 
-            let skills = discover_skills_with_options(work.path(), Some(home), None);
+            let skills = guard.discover(work.path());
             let invocation = invoke_skill(
                 "devtools:deploy",
                 "staging",

@@ -1907,6 +1907,7 @@ pub struct PluginRecord {
     pub name: String,
     pub provenance: PluginProvenance,
     pub enabled: bool,
+    pub install_entry: Option<String>,
 }
 
 /// How a plugin directory came to exist (REQ-AP-009).
@@ -3722,11 +3723,6 @@ impl Database {
             .execute(&self.pool)
             .await;
 
-        // Create plugins table (specs/plugins/, idempotent via IF NOT EXISTS)
-        let _ = sqlx::raw_sql(ddl::MIGRATION_CREATE_PLUGINS)
-            .execute(&self.pool)
-            .await;
-
         // Create share_tokens table (REQ-AUTH-008, idempotent via IF NOT EXISTS)
         let _ = sqlx::raw_sql(ddl::MIGRATION_CREATE_SHARE_TOKENS)
             .execute(&self.pool)
@@ -3976,13 +3972,13 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_plugins(&self) -> DbResult<Vec<PluginRecord>> {
-        let rows: Vec<(String, String, i64)> =
-            sqlx::query_as("SELECT name, provenance, enabled FROM plugins")
+        let rows: Vec<(String, String, i64, Option<String>)> =
+            sqlx::query_as("SELECT name, provenance, enabled, install_entry FROM plugins")
                 .fetch_all(&self.pool)
                 .await?;
         Ok(rows
             .into_iter()
-            .map(|(name, provenance, enabled)| PluginRecord {
+            .map(|(name, provenance, enabled, install_entry)| PluginRecord {
                 name,
                 provenance: if provenance == "managed" {
                     PluginProvenance::Managed
@@ -3990,6 +3986,7 @@ impl Database {
                     PluginProvenance::Unmanaged
                 },
                 enabled: enabled != 0,
+                install_entry,
             })
             .collect())
     }
@@ -4005,8 +4002,8 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn set_plugin_enabled(&self, name: &str, enabled: bool) -> DbResult<()> {
         sqlx::query(
-            "INSERT INTO plugins (name, provenance, enabled, installed_at) \
-             VALUES (?1, 'unmanaged', ?2, datetime('now')) \
+            "INSERT INTO plugins (name, provenance, enabled) \
+             VALUES (?1, 'unmanaged', ?2) \
              ON CONFLICT(name) DO UPDATE SET enabled = ?2",
         )
         .bind(name)
@@ -4022,20 +4019,44 @@ impl Database {
     /// # Errors
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
-    pub async fn register_plugin(&self, name: &str) -> DbResult<()> {
+    pub async fn register_plugin(&self, name: &str, entry: &std::path::Path) -> DbResult<()> {
         sqlx::query(
-            "INSERT INTO plugins (name, provenance, enabled, installed_at) \
-             VALUES (?1, 'managed', 1, datetime('now')) \
-             ON CONFLICT(name) DO UPDATE SET provenance = 'managed', enabled = 1",
+            "INSERT INTO plugins (name, provenance, enabled, install_entry) \
+             VALUES (?1, 'managed', 1, ?2) \
+             ON CONFLICT(name) DO UPDATE SET provenance = 'managed', enabled = 1, install_entry = ?2",
         )
         .bind(name)
+        .bind(entry.to_string_lossy().as_ref())
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    /// Remove a plugin's registry row (its data directory survives; purge
-    /// is a separate explicit action) (REQ-AP-009).
+    /// Record an observed installation entry and enabled state, preserving provenance.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn record_plugin_entry(
+        &self,
+        name: &str,
+        entry: &std::path::Path,
+        enabled: bool,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "INSERT INTO plugins (name, provenance, enabled, install_entry) \
+             VALUES (?1, 'unmanaged', ?2, ?3) \
+             ON CONFLICT(name) DO UPDATE SET enabled = ?2, install_entry = ?3",
+        )
+        .bind(name)
+        .bind(i64::from(enabled))
+        .bind(entry.to_string_lossy().as_ref())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Forget a plugin after its retained data has been purged (REQ-AP-009).
     ///
     /// # Errors
     ///
@@ -33108,6 +33129,64 @@ mod tests {
     // ==================== Plugin registry (specs/plugins/) ====================
 
     #[tokio::test]
+    async fn plugin_registry_upgrades_existing_database_and_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plugins.sqlite");
+        let path = path.to_str().unwrap();
+        let db = Database::open(path).await.unwrap();
+        migrations::run_pending_migrations(db.pool()).await.unwrap();
+        let instance_id = db.instance_id().await.unwrap();
+
+        // Reconstruct the schema and ledger immediately before plugin support.
+        sqlx::raw_sql("DROP TABLE plugins; DELETE FROM _migrations WHERE version = 150;")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.pool().close().await;
+
+        let db = Database::open(path).await.unwrap();
+        assert!(db.get_plugins().await.is_err());
+        assert_eq!(
+            migrations::run_pending_migrations(db.pool()).await.unwrap(),
+            1
+        );
+        assert_eq!(db.instance_id().await.unwrap(), instance_id);
+        assert!(db.get_plugins().await.unwrap().is_empty());
+        let migration_name: String =
+            sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 150")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(migration_name, "user_level_plugin_registry");
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('plugins') ORDER BY cid")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(columns, ["name", "provenance", "enabled", "install_entry"]);
+
+        db.register_plugin("devtools", std::path::Path::new("/plugins/devtools"))
+            .await
+            .unwrap();
+        db.set_plugin_enabled("devtools", false).await.unwrap();
+        db.set_plugin_enabled("other-harness", false).await.unwrap();
+        let mut expected = db.get_plugins().await.unwrap();
+        expected.sort_by(|a, b| a.name.cmp(&b.name));
+        db.pool().close().await;
+
+        let reopened = Database::open(path).await.unwrap();
+        assert_eq!(
+            migrations::run_pending_migrations(reopened.pool())
+                .await
+                .unwrap(),
+            0
+        );
+        let mut actual = reopened.get_plugins().await.unwrap();
+        actual.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
     async fn plugin_registry_defaults_and_upserts() {
         let db = Database::open_in_memory().await.unwrap();
 
@@ -33116,7 +33195,9 @@ mod tests {
         assert!(db.get_plugins().await.unwrap().is_empty());
 
         // Register a Phoenix-installed plugin (managed, enabled).
-        db.register_plugin("devtools").await.unwrap();
+        db.register_plugin("devtools", std::path::Path::new("/plugins/devtools"))
+            .await
+            .unwrap();
         let rows = db.get_plugins().await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "devtools");
@@ -33155,7 +33236,9 @@ mod tests {
         assert!(other.enabled);
 
         // Registering again after disable restores managed + enabled.
-        db.register_plugin("devtools").await.unwrap();
+        db.register_plugin("devtools", std::path::Path::new("/plugins/devtools"))
+            .await
+            .unwrap();
         let devtools = db
             .get_plugins()
             .await
@@ -33168,9 +33251,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plugin_entry_is_retained_across_enablement_and_removal_records() {
+        let db = Database::open_in_memory().await.unwrap();
+        let first = std::path::Path::new("/plugins/entry-one");
+        let second = std::path::Path::new("/plugins/entry-two");
+        db.set_plugin_enabled("demo", true).await.unwrap();
+        assert_eq!(db.get_plugins().await.unwrap()[0].install_entry, None);
+        db.record_plugin_entry("demo", first, false).await.unwrap();
+        let row = &db.get_plugins().await.unwrap()[0];
+        assert_eq!(row.install_entry.as_deref(), first.to_str());
+        assert_eq!(row.provenance, PluginProvenance::Unmanaged);
+        assert!(!row.enabled);
+        db.register_plugin("demo", second).await.unwrap();
+        db.set_plugin_enabled("demo", false).await.unwrap();
+        let row = &db.get_plugins().await.unwrap()[0];
+        assert_eq!(row.install_entry.as_deref(), second.to_str());
+        assert_eq!(row.provenance, PluginProvenance::Managed);
+        db.record_plugin_entry("demo", first, false).await.unwrap();
+        let row = &db.get_plugins().await.unwrap()[0];
+        assert_eq!(row.install_entry.as_deref(), first.to_str());
+        assert_eq!(row.provenance, PluginProvenance::Managed);
+        assert!(!row.enabled);
+        assert!(sqlx::query("UPDATE plugins SET install_entry = ''")
+            .execute(db.pool())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn plugin_unregister_removes_the_row() {
         let db = Database::open_in_memory().await.unwrap();
-        db.register_plugin("devtools").await.unwrap();
+        db.register_plugin("devtools", std::path::Path::new("/plugins/devtools"))
+            .await
+            .unwrap();
         db.unregister_plugin("devtools").await.unwrap();
         assert!(db.get_plugins().await.unwrap().is_empty());
         // Unregistering an absent name is a no-op.

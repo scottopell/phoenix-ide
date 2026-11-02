@@ -17,8 +17,6 @@ pub mod manifest;
 pub mod mcp_config;
 pub mod resolve;
 
-pub mod filter;
-
 pub use manifest::Manifest;
 pub use mcp_config::{McpDocument, ServerSpec, ServerValidation};
 pub use resolve::{expand_placeholders, resolved_environment, within_boundary};
@@ -39,30 +37,43 @@ pub fn data_dir_for(plugins_root: &Path, plugin_name: &str) -> PathBuf {
     plugins_root.join("data").join(plugin_name)
 }
 
-/// A loaded plugin: the validated manifest plus per-component outcomes.
+/// A parsed plugin package. Skill semantics and server execution eligibility
+/// are validated by the skills and MCP adapters, respectively.
 #[derive(Debug, Clone, PartialEq)]
-pub struct LoadedPlugin {
+pub struct ParsedPlugin {
     pub manifest: Manifest,
+    /// Directory entry through which the plugin was discovered.
+    pub entry_dir: PathBuf,
     /// Resolved plugin root directory (symlinks followed).
     pub root: PathBuf,
-    /// Skill directories that loaded (each contains a valid SKILL.md).
-    pub skills: Vec<SkillDir>,
-    /// Servers that validated, in document order.
+    /// Contained skill-file candidates; frontmatter is not yet validated.
+    pub skills: Vec<SkillCandidate>,
+    /// Parsed server candidates; runtime paths and data access are not yet validated.
     pub servers: Vec<ServerSpec>,
+    pub skipped_servers: Vec<mcp_config::ServerFailure>,
+    pub skipped_skills: Vec<SkillFailure>,
+    pub skills_disabled_reason: Option<String>,
     /// Why the MCP component type is absent despite a present location.
     pub mcp_disabled_reason: Option<String>,
 }
 
-/// A loaded plugin skill: the directory and its SKILL.md file.
+/// A contained skill-file candidate, not a semantically validated skill.
 #[derive(Debug, Clone, PartialEq)]
-pub struct SkillDir {
+pub struct SkillCandidate {
     /// Absolute directory path containing SKILL.md.
     pub dir: PathBuf,
     /// Absolute SKILL.md path.
     pub skill_md: PathBuf,
 }
 
-impl SkillDir {
+/// A skill rejected during filesystem discovery.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkillFailure {
+    pub skill: String,
+    pub reason: String,
+}
+
+impl SkillCandidate {
     /// Skill name for namespacing: the parent directory name, which the
     /// Agent Skills specification requires to match frontmatter `name`
     /// (REQ-AP-005).
@@ -79,22 +90,8 @@ impl SkillDir {
 /// manifest loads; invalid siblings produce diagnostics and continue
 /// (REQ-AP-002). No recursion.
 #[must_use]
-pub fn scan_plugins_root(root: &Path) -> Vec<LoadedPlugin> {
-    scan_plugins_root_filtered(root, &[])
-}
-
-/// [`scan_plugins_root`] restricted to enabled plugins: names in the
-/// process-wide disabled filter are omitted entirely (REQ-AP-008).
-#[must_use]
-pub fn scan_enabled_plugins(root: &Path) -> Vec<LoadedPlugin> {
-    let disabled: Vec<String> = filter::disabled_set().into_iter().collect();
-    scan_plugins_root_filtered(root, &disabled)
-}
-
-/// The scan core: `disabled` names plugin roots omitted entirely.
-#[must_use]
-pub fn scan_plugins_root_filtered(root: &Path, disabled: &[String]) -> Vec<LoadedPlugin> {
-    let mut plugins: Vec<LoadedPlugin> = Vec::new();
+pub fn scan_plugins_root(root: &Path) -> Vec<ParsedPlugin> {
+    let mut plugins: Vec<ParsedPlugin> = Vec::new();
     let mut seen_names: Vec<String> = Vec::new();
 
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -112,16 +109,6 @@ pub fn scan_plugins_root_filtered(root: &Path, disabled: &[String]) -> Vec<Loade
         // `data` holds PLUGIN_DATA directories, not plugins.
         if candidate.file_name().is_some_and(|n| n == "data") {
             continue;
-        }
-        if let Some(name) = plugin_name_if_valid(&candidate) {
-            if disabled.iter().any(|d| d == &name) {
-                tracing::debug!(
-                    plugin = %name,
-                    path = %candidate.display(),
-                    "plugin disabled; contributing nothing"
-                );
-                continue;
-            }
         }
         match load_plugin(&candidate) {
             Ok(plugin) => {
@@ -148,32 +135,32 @@ pub fn scan_plugins_root_filtered(root: &Path, disabled: &[String]) -> Vec<Loade
     plugins
 }
 
-/// The manifest name of a candidate root, when its manifest is valid.
-fn plugin_name_if_valid(root: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(root.join("plugin.json")).ok()?;
-    Manifest::parse(&content).ok().map(|m| m.name)
-}
-
 /// Load one plugin root: validate the manifest, then load both component
 /// types under the scoped failure boundaries (REQ-AP-003, REQ-AP-004).
 ///
 /// # Errors
 /// Returns a rejection when the manifest is missing or invalid — the only
 /// condition that rejects the whole plugin.
-pub fn load_plugin(root: &Path) -> Result<LoadedPlugin, String> {
-    let manifest_path = root.join("plugin.json");
+pub fn load_plugin(root: &Path) -> Result<ParsedPlugin, String> {
+    let resolved_root =
+        std::fs::canonicalize(root).map_err(|e| format!("plugin root unreadable: {e}"))?;
+    let manifest_path = resolved_root.join("plugin.json");
+    if !within_boundary(&manifest_path, &resolved_root) {
+        return Err("plugin.json escapes plugin root".into());
+    }
     let content = std::fs::read_to_string(&manifest_path)
         .map_err(|e| format!("plugin.json unreadable: {e}"))?;
     let manifest = Manifest::parse(&content)?;
 
-    // Resolve the real root so containment checks share one boundary.
-    let resolved_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-
-    let mut loaded = LoadedPlugin {
+    let mut loaded = ParsedPlugin {
         manifest,
+        entry_dir: root.to_path_buf(),
         root: resolved_root,
         skills: Vec::new(),
         servers: Vec::new(),
+        skipped_servers: Vec::new(),
+        skipped_skills: Vec::new(),
+        skills_disabled_reason: None,
         mcp_disabled_reason: None,
     };
 
@@ -185,9 +172,15 @@ pub fn load_plugin(root: &Path) -> Result<LoadedPlugin, String> {
 /// Skills component: immediate children of `skills/` with a regular
 /// `SKILL.md`, non-recursively (REQ-AP-004, REQ-AP-005). A present regular
 /// file named `skills` invalidates the component type only.
-fn load_skills(loaded: &mut LoadedPlugin) {
+fn load_skills(loaded: &mut ParsedPlugin) {
     let skills_path = loaded.root.join("skills");
+    if !within_boundary(&skills_path, &loaded.root) {
+        loaded.skills_disabled_reason = Some("skills location escapes plugin root".into());
+        tracing::warn!(plugin = %loaded.manifest.name, "skills location escapes plugin root");
+        return;
+    }
     if skills_path.is_file() {
+        loaded.skills_disabled_reason = Some("skills location is not a directory".into());
         tracing::warn!(
             plugin = %loaded.manifest.name,
             "skills location is a regular file; invalidating skills component"
@@ -198,6 +191,7 @@ fn load_skills(loaded: &mut LoadedPlugin) {
         return; // absent: valid
     }
     let Ok(entries) = std::fs::read_dir(&skills_path) else {
+        loaded.skills_disabled_reason = Some("skills location unreadable".into());
         tracing::warn!(
             plugin = %loaded.manifest.name,
             "skills location unreadable; skipping"
@@ -217,10 +211,16 @@ fn load_skills(loaded: &mut LoadedPlugin) {
         if !skill_md.is_file() {
             continue; // no SKILL.md: not a skill; nested trees are ignored (REQ-AP-005)
         }
-        // Containment: SKILL.md must resolve inside the plugin root
-        // (REQ-AP-007).
         let resolved = std::fs::canonicalize(&skill_md).unwrap_or_else(|_| skill_md.clone());
         if !within_boundary(&resolved, &loaded.root) {
+            loaded.skipped_skills.push(SkillFailure {
+                skill: dir
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                reason: "SKILL.md escapes plugin root".into(),
+            });
             tracing::warn!(
                 plugin = %loaded.manifest.name,
                 skill = %dir.display(),
@@ -228,7 +228,7 @@ fn load_skills(loaded: &mut LoadedPlugin) {
             );
             continue;
         }
-        loaded.skills.push(SkillDir {
+        loaded.skills.push(SkillCandidate {
             dir: dir.clone(),
             skill_md: resolved,
         });
@@ -237,8 +237,14 @@ fn load_skills(loaded: &mut LoadedPlugin) {
 
 /// MCP component: `mcp.json`, disabled wholesale on document-level failure;
 /// per-server failures skip that server only (REQ-AP-004, REQ-AP-012).
-fn load_mcp(loaded: &mut LoadedPlugin) {
+fn load_mcp(loaded: &mut ParsedPlugin) {
     let mcp_path = loaded.root.join("mcp.json");
+    if !within_boundary(&mcp_path, &loaded.root) {
+        let reason = "mcp.json escapes plugin root".to_string();
+        tracing::warn!(plugin = %loaded.manifest.name, "{reason}");
+        loaded.mcp_disabled_reason = Some(reason);
+        return;
+    }
     if mcp_path.is_dir() {
         loaded.mcp_disabled_reason = Some("mcp.json location is a directory".to_string());
         tracing::warn!(
@@ -280,6 +286,7 @@ fn load_mcp(loaded: &mut LoadedPlugin) {
                     reason = %failure.reason,
                     "skipping plugin MCP server"
                 );
+                loaded.skipped_servers.push(failure);
             }
         }
     }

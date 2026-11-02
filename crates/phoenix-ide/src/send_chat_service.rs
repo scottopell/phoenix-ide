@@ -296,6 +296,7 @@ impl SendChatApplicationService {
             &conversation.cwd,
             text,
             expansion_policy,
+            &self.runtime.skill_discovery(),
         )
         .await?;
         let submitted = SubmittedDirectTurnIdentity {
@@ -630,7 +631,13 @@ impl SendChatApplicationService {
         }
 
         let validated_files = validate_files(&req).await?;
-        let expanded = expand_request(&self.db, &conversation, &req).await?;
+        let expanded = expand_request(
+            &self.db,
+            &conversation,
+            &req,
+            &self.runtime.skill_discovery(),
+        )
+        .await?;
         let acceptance_state = self
             .effective_state(&conversation.id, &conversation.state)
             .await?;
@@ -1004,6 +1011,7 @@ async fn expand_request(
     db: &crate::db::Database,
     conversation: &crate::db::Conversation,
     req: &SendChatRequest,
+    discovery: &phoenix_skills::SkillDiscovery,
 ) -> Result<ExpandedDispatchMessage, SendChatServiceError> {
     expand_message(
         db,
@@ -1011,6 +1019,7 @@ async fn expand_request(
         &conversation.cwd,
         &req.text,
         req.expansion_policy,
+        discovery,
     )
     .await
 }
@@ -1031,6 +1040,7 @@ pub(crate) async fn expand_message(
     cwd: &str,
     text: &str,
     policy: MessageExpansionPolicy,
+    discovery: &phoenix_skills::SkillDiscovery,
 ) -> Result<ExpandedDispatchMessage, SendChatServiceError> {
     let expanded = if policy == MessageExpansionPolicy::GeneratedPredecessorContext {
         crate::message_expander::ExpandedMessage {
@@ -1053,13 +1063,13 @@ pub(crate) async fn expand_message(
         }
     } else {
         let resolution_root = crate::resolution_root::ResolutionRoot::working_dir(cwd);
-        crate::message_expander::expand(text, &resolution_root).map_err(|error| {
-            SendChatServiceError::Expansion {
+        crate::message_expander::expand_with_discovery(text, &resolution_root, discovery).map_err(
+            |error| SendChatServiceError::Expansion {
                 message: error.to_string(),
                 error_type: error.error_type(),
                 reference: error.reference(),
-            }
-        })?
+            },
+        )?
     };
     let llm_text = (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
     Ok(ExpandedDispatchMessage {
@@ -2169,6 +2179,7 @@ mod tests {
             "/tmp",
             exact,
             MessageExpansionPolicy::GeneratedPredecessorContext,
+            &phoenix_skills::SkillDiscovery::default(),
         )
         .await
         .unwrap();

@@ -9767,10 +9767,11 @@ where
             )
         } else {
             let turn_context = self.ordinary_turn_context.get_or_insert_with(|| {
-                OrdinaryTurnContext::discover(
+                OrdinaryTurnContext::discover_with_discovery(
                     working_dir
                         .as_deref()
                         .expect("filesystem conversation has cwd"),
+                    &tool_executor.skill_discovery(),
                 )
             });
             build_system_prompt_with_turn_context(

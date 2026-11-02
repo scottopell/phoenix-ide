@@ -787,6 +787,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "federated_subscription_terminal_cancellation",
         sql: include_str!("migrations/federated_subscription_terminal_cancellation.sql"),
     },
+    Migration {
+        version: 151,
+        name: "user_level_plugin_registry",
+        sql: include_str!("migrations/plugin_registry.sql"),
+    },
 ];
 
 const MIGRATION_138: &str = concat!(
@@ -15762,6 +15767,7 @@ with tempfile.TemporaryDirectory() as directory:
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (151, "user_level_plugin_registry"),
             (150, "federated_subscription_terminal_cancellation"),
             (149, "product_creation_image_retirement"),
             (148, "product_creation_initial_execution_receipts"),

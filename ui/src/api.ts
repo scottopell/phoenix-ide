@@ -1112,6 +1112,11 @@ export interface McpServerStatus {
   auth_redirect_warning?: string;
 }
 
+/** Offline component admission, not connection health. */
+export type PluginComponentStatus =
+  | { name: string; status: 'loaded' }
+  | { name: string; status: 'skipped' | 'disabled'; reason: string };
+
 export interface PluginStatus {
   name: string;
   version?: string;
@@ -1122,8 +1127,10 @@ export interface PluginStatus {
   /** True when a registry row exists but the plugin directory is absent
    * (a shared-root harness removed it) — specs/plugins/ REQ-AP-010. */
   missing?: boolean;
-  skills?: string[];
-  mcp_servers?: string[];
+  load_error?: string | null;
+  skills?: PluginComponentStatus[];
+  mcp_servers?: PluginComponentStatus[];
+  skills_disabled_reason?: string | null;
   /** Why the MCP component type is absent despite a present location. */
   mcp_disabled_reason?: string | null;
 }

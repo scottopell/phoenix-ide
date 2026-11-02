@@ -24,7 +24,9 @@ use phoenix_core::domain::sm_state::ExploreBashCapability;
 // them at their historical `crate::system_prompt::…` paths so existing call
 // sites (`api::handlers`, `tools::skill`, `message_expander`) resolve unchanged
 // (move-down, re-export-up).
-pub use crate::skills::{discover_skills, discover_skills_with_options, SkillSource};
+pub use crate::skills::SkillSource;
+#[cfg(test)]
+pub use crate::skills::{discover_skills, discover_skills_with_options};
 
 /// A discovered guidance file with its path and content
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,27 +176,58 @@ pub(crate) struct OrdinaryTurnContext {
 }
 
 impl OrdinaryTurnContext {
+    #[cfg(test)]
     pub fn discover(working_dir: &Path) -> Self {
+        Self::discover_with_discovery(working_dir, &phoenix_skills::SkillDiscovery::default())
+    }
+
+    pub fn discover_with_discovery(
+        working_dir: &Path,
+        discovery: &phoenix_skills::SkillDiscovery,
+    ) -> Self {
         Self {
-            catalog: OrdinarySkillCatalog::discover(working_dir),
+            catalog: OrdinarySkillCatalog::discover_with_discovery(working_dir, discovery),
             guidance_files: discover_guidance_files(working_dir),
         }
     }
 }
 
 impl OrdinarySkillCatalog {
-    pub fn discover(working_dir: &Path) -> Self {
+    pub fn discover_with_discovery(
+        working_dir: &Path,
+        discovery: &phoenix_skills::SkillDiscovery,
+    ) -> Self {
         let builtin_dir = crate::skills::builtin::default_extract_dir();
-        Self::discover_with_options(working_dir, None, builtin_dir.as_deref())
+        Self::discover_with_discovery_and_options(
+            working_dir,
+            None,
+            builtin_dir.as_deref(),
+            discovery,
+        )
     }
 
+    #[cfg(test)]
     fn discover_with_options(
         working_dir: &Path,
         home_override: Option<&Path>,
         builtin_dir: Option<&Path>,
     ) -> Self {
+        Self::discover_with_discovery_and_options(
+            working_dir,
+            home_override,
+            builtin_dir,
+            &phoenix_skills::SkillDiscovery::default(),
+        )
+    }
+
+    fn discover_with_discovery_and_options(
+        working_dir: &Path,
+        home_override: Option<&Path>,
+        builtin_dir: Option<&Path>,
+        discovery: &phoenix_skills::SkillDiscovery,
+    ) -> Self {
         let mut prompt = String::new();
-        let skills = discover_skills_with_options(working_dir, home_override, builtin_dir);
+        let skills = discovery.discover_with_options(working_dir, home_override, builtin_dir);
         if !skills.is_empty() {
             prompt.push_str("\n\n<available_skills>\n");
             prompt.push_str("The following skills are available. Invoke them with the `skill` tool (e.g. skill(skill_name=\"build\")). Do not cat SKILL.md files directly.\n");
@@ -212,35 +245,9 @@ impl OrdinarySkillCatalog {
     }
 }
 
-/// Build the complete system prompt for a conversation.
-pub fn build_system_prompt(
-    working_dir: &Path,
-    tasks_dir_name: &str,
-    is_sub_agent: bool,
-    mode: Option<&ModeContext>,
-    language: LlmLanguage,
-    persona: Option<&str>,
-    explore_bash: impl Into<phoenix_core::llm_language::ExploreBashPromptCapability>,
-) -> String {
-    let builtin_dir = crate::skills::builtin::default_extract_dir();
-    build_system_prompt_with_options(
-        working_dir,
-        tasks_dir_name,
-        is_sub_agent,
-        mode,
-        None,
-        builtin_dir.as_deref(),
-        language,
-        persona,
-        explore_bash.into(),
-    )
-}
-
-/// System prompt build with explicit overrides for both `$HOME` and the
-/// built-in extract directory. Tests pass `None` for `builtin_dir` to assert
-/// filesystem-only behavior; production callers go through
-/// [`build_system_prompt`] which uses the live extract location.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // One match arm per ModeContext variant; splitting hurts readability
+/// Build a filesystem-only prompt with explicit home and built-in roots for tests.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub fn build_system_prompt_with_options(
     working_dir: &Path,
     tasks_dir_name: &str,
@@ -481,6 +488,47 @@ pub(crate) fn build_coordinator_system_prompt_with_options(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plugin_catalog_uses_shared_instance_activation_and_retains_turn_snapshot() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let plugin = home.path().join(".agents/plugins/catalog-demo");
+        std::fs::create_dir_all(plugin.join("skills/deploy")).unwrap();
+        std::fs::write(
+            plugin.join("plugin.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/1.1.0/plugin.schema.json","name":"catalog-demo"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            plugin.join("skills/deploy/SKILL.md"),
+            "---\nname: deploy\ndescription: Catalog activation probe.\n---\nDeploy body.",
+        )
+        .unwrap();
+        let activation = phoenix_core::plugin_activation::PluginActivation::default();
+        let discovery = phoenix_skills::SkillDiscovery::new(activation.clone());
+        let capture = |discovery: &phoenix_skills::SkillDiscovery| {
+            OrdinarySkillCatalog::discover_with_discovery_and_options(
+                cwd.path(),
+                Some(home.path()),
+                None,
+                discovery,
+            )
+        };
+        assert!(!capture(&discovery).0.contains("catalog-demo:deploy"));
+        activation.publish(HashSet::new());
+        let enabled = capture(&discovery);
+        assert!(enabled.0.contains("catalog-demo:deploy"));
+        assert!(enabled.0.contains("(plugin: catalog-demo)"));
+        assert!(!capture(&phoenix_skills::SkillDiscovery::default())
+            .0
+            .contains("catalog-demo:deploy"));
+        activation.publish(HashSet::from(["catalog-demo".to_string()]));
+        assert!(!capture(&discovery).0.contains("catalog-demo:deploy"));
+        assert!(enabled.0.contains("catalog-demo:deploy"));
+        activation.publish(HashSet::new());
+        assert_eq!(enabled, capture(&discovery));
+    }
+
     use super::*;
     use std::fs;
     use tempfile::TempDir;

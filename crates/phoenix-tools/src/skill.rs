@@ -110,7 +110,7 @@ impl Tool for SkillTool {
 
         let result = match self.audience {
             phoenix_skills::SkillAudience::Conversation => {
-                let skills = phoenix_skills::discover_skills_for_audience(
+                let skills = ctx.skill_discovery().discover_for_audience(
                     ctx.working_dir(),
                     phoenix_skills::SkillAudience::Conversation,
                 );

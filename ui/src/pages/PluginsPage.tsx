@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useState } from 'react';
-import { api, type PluginStatus } from '../api';
+import { api, type PluginStatus, type PluginComponentStatus } from '../api';
 import './PluginsPage.css';
 
-/**
- * User-level agent plugins (specs/plugins/): list with lifecycle controls.
- * Information-dense per the UI philosophy — status, provenance, and
- * component counts inline; actions progressive-disclosed per row.
- */
+function ComponentFailures({ label, outcomes }: { label: string; outcomes: PluginComponentStatus[] | undefined }) {
+  return outcomes?.filter((item) => item.status !== 'loaded').map((item) => (
+    <p key={item.name} className="plugins-page__mcp-disabled">
+      {label} {item.name}: {item.status} — {'reason' in item ? item.reason : ''}
+    </p>
+  ));
+}
 export function PluginsPage() {
   const [plugins, setPlugins] = useState<PluginStatus[]>([]);
   const [root, setRoot] = useState('');
@@ -134,7 +136,7 @@ export function PluginsPage() {
             <li key={plugin.name} className="plugins-page__row">
               <div className="plugins-page__row-main">
                 <span className="plugins-page__status">
-                  {plugin.missing ? '✗' : plugin.enabled ? '✓' : '⏸'}
+                  {plugin.missing || plugin.load_error ? '✗' : plugin.enabled ? '✓' : '⏸'}
                 </span>
                 <span className="plugins-page__name">{plugin.name}</span>
                 {plugin.version ? <span className="plugins-page__version">{plugin.version}</span> : null}
@@ -143,12 +145,18 @@ export function PluginsPage() {
                 </span>
                 {!plugin.missing && (
                   <span className="plugins-page__counts">
-                    {plugin.skills?.length ?? 0} skills · {plugin.mcp_servers?.length ?? 0} servers
+                    {plugin.skills?.filter((s) => s.status === 'loaded').length ?? 0} skills · {plugin.mcp_servers?.filter((s) => s.status === 'loaded').length ?? 0} servers
                   </span>
                 )}
               </div>
               {plugin.description ? (
                 <p className="plugins-page__description">{plugin.description}</p>
+              ) : null}
+              {plugin.load_error ? <p className="plugins-page__mcp-disabled">Load failed: {plugin.load_error}</p> : null}
+              <ComponentFailures label="Skill" outcomes={plugin.skills} />
+              <ComponentFailures label="MCP" outcomes={plugin.mcp_servers} />
+              {plugin.skills_disabled_reason ? (
+                <p className="plugins-page__mcp-disabled">Skills disabled: {plugin.skills_disabled_reason}</p>
               ) : null}
               {plugin.mcp_disabled_reason ? (
                 <p className="plugins-page__mcp-disabled">MCP disabled: {plugin.mcp_disabled_reason}</p>

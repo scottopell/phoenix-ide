@@ -7779,6 +7779,11 @@ impl RuntimeManager {
         admission
     }
 
+    pub(crate) fn skill_discovery(&self) -> phoenix_skills::SkillDiscovery {
+        phoenix_skills::SkillDiscovery::new(self.mcp_manager.plugin_activation().clone())
+            .with_home(self.runtime_home.clone())
+    }
+
     pub fn db(&self) -> &Database {
         &self.db
     }

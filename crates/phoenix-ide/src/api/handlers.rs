@@ -5048,7 +5048,11 @@ async fn get_system_prompt(
         let tasks_dir_name = taskmd_core::discover::discover_or_default(&cwd)
             .to_string_lossy()
             .into_owned();
-        crate::system_prompt::build_system_prompt(
+        let catalog = crate::system_prompt::OrdinarySkillCatalog::discover_with_discovery(
+            &cwd,
+            &phoenix_skills::SkillDiscovery::new(state.mcp_manager.plugin_activation().clone()),
+        );
+        crate::system_prompt::build_system_prompt_with_catalog(
             &cwd,
             &tasks_dir_name,
             is_sub_agent,
@@ -5056,6 +5060,7 @@ async fn get_system_prompt(
             conversation.llm_language,
             persona.as_deref(),
             explore_bash,
+            &catalog,
         )
     };
 
@@ -8051,6 +8056,19 @@ async fn preview_root_allowlist(state: &AppState) -> Vec<PathBuf> {
             roots.push(dir);
         }
     }
+    let discovery =
+        phoenix_skills::SkillDiscovery::new(state.mcp_manager.plugin_activation().clone());
+    for skill in discovery.discover_with_options(
+        state.runtime_env.home(),
+        Some(state.runtime_env.home()),
+        None,
+    ) {
+        if let phoenix_skills::SkillSource::Plugin { path, .. } = skill.source {
+            if let Some(dir) = path.parent().and_then(|dir| fs::canonicalize(dir).ok()) {
+                roots.push(dir);
+            }
+        }
+    }
 
     roots
 }
@@ -8724,7 +8742,11 @@ async fn list_conversation_skills(
 
     let cwd = std::path::PathBuf::from(&conversation.cwd);
     Ok(Json(SkillsResponse {
-        skills: skill_entries_from_dir(&cwd, None),
+        skills: skill_entries_from_dir(
+            &cwd,
+            None,
+            &phoenix_skills::SkillDiscovery::new(state.mcp_manager.plugin_activation().clone()),
+        ),
     }))
 }
 
@@ -8734,6 +8756,7 @@ async fn list_conversation_skills(
 /// conversation's `cwd`, so the composer on the `/new` page — which has no
 /// conversation yet — can offer the same `/skill` autocomplete.
 async fn list_project_skills(
+    State(state): State<AppState>,
     Query(query): Query<ProjectSkillsQuery>,
 ) -> Result<Json<SkillsResponse>, AppError> {
     let cwd = std::path::PathBuf::from(&query.cwd);
@@ -8754,7 +8777,11 @@ async fn list_project_skills(
         crate::resolution_root::ResolutionRoot::WorkingDir(_) => None,
     };
     Ok(Json(SkillsResponse {
-        skills: skill_entries_from_dir(&view.dir, strip),
+        skills: skill_entries_from_dir(
+            &view.dir,
+            strip,
+            &phoenix_skills::SkillDiscovery::new(state.mcp_manager.plugin_activation().clone()),
+        ),
     }))
 }
 
@@ -8770,8 +8797,10 @@ async fn list_project_skills(
 fn skill_entries_from_dir(
     dir: &std::path::Path,
     strip_prefix: Option<&std::path::Path>,
+    discovery: &phoenix_skills::SkillDiscovery,
 ) -> Vec<SkillEntry> {
-    crate::system_prompt::discover_skills(dir)
+    discovery
+        .discover(dir)
         .into_iter()
         .map(|s| {
             let (source, mut path) = match &s.source {
@@ -9261,33 +9290,32 @@ async fn enable_mcp_server(
 // User-level agent plugins (specs/plugins/)
 // ============================================================
 
-/// The plugins root for this server, derived from the user's home.
-fn plugins_root() -> std::path::PathBuf {
-    use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
-    let home = PhoenixRuntimeEnvironment::detect().home().to_path_buf();
-    phoenix_plugins::default_plugins_root(&home)
-}
-
 /// List installed plugins with per-component load outcomes and lifecycle
 /// state (REQ-AP-002, REQ-AP-010): every plugin in the shared root (enabled
 /// or disabled) plus registered-but-missing roots, joined with the persisted
 /// registry rows for provenance.
-async fn plugins_list(State(state): State<AppState>) -> impl IntoResponse {
-    let root = plugins_root();
+async fn plugins_list(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
+    let root = phoenix_plugins::default_plugins_root(state.runtime_env.home());
     let registry: std::collections::HashMap<String, phoenix_db::PluginRecord> = state
         .db
         .get_plugins()
         .await
-        .unwrap_or_default()
+        .map_err(|error| AppError::Internal(error.to_string()))?
         .into_iter()
         .map(|r| (r.name.clone(), r))
         .collect();
 
     // Unfiltered scan: disabled plugins still appear in the list (they are
     // installed, just not contributing).
-    let entries = plugin_list_entries(phoenix_plugins::scan_plugins_root(&root), &registry);
+    let entries = plugin_list_entries_with_home(
+        phoenix_plugins::scan_plugins_root(&root),
+        &registry,
+        state.runtime_env.home(),
+    );
 
-    Json(serde_json::json!({ "plugins": entries, "root": root }))
+    Ok(Json(
+        serde_json::json!({ "plugins": entries, "root": root }),
+    ))
 }
 
 /// Join scanned plugins with persisted registry rows into status entries
@@ -9295,10 +9323,58 @@ async fn plugins_list(State(state): State<AppState>) -> impl IntoResponse {
 /// enabled or disabled — plus registered-but-missing roots (another
 /// harness sharing the root may have removed the directory, REQ-AP-009).
 /// Absent registry row = unmanaged + enabled.
+/// Package admission status, not remote server connection health.
+#[derive(serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum PluginComponentStatus {
+    Loaded { name: String },
+    Skipped { name: String, reason: String },
+    Disabled { name: String, reason: String },
+}
+
+impl PluginComponentStatus {
+    fn from_validation(name: String, result: Result<(), String>, enabled: bool) -> Self {
+        match result {
+            Err(reason) => Self::Skipped { name, reason },
+            Ok(()) if enabled => Self::Loaded { name },
+            Ok(()) => Self::Disabled {
+                name,
+                reason: "plugin disabled".into(),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
 fn plugin_list_entries(
-    plugins: Vec<phoenix_plugins::LoadedPlugin>,
+    plugins: Vec<phoenix_plugins::ParsedPlugin>,
     registry: &std::collections::HashMap<String, phoenix_db::PluginRecord>,
 ) -> Vec<serde_json::Value> {
+    let home = tempfile::tempdir().expect("isolated status home");
+    plugin_list_entries_with_home(plugins, registry, home.path())
+}
+
+#[allow(clippy::too_many_lines)]
+fn plugin_list_entries_with_home(
+    plugins: Vec<phoenix_plugins::ParsedPlugin>,
+    registry: &std::collections::HashMap<String, phoenix_db::PluginRecord>,
+    home: &std::path::Path,
+) -> Vec<serde_json::Value> {
+    let activation = phoenix_core::plugin_activation::PluginActivation::default();
+    activation.publish(
+        registry
+            .values()
+            .filter(|record| !record.enabled)
+            .map(|record| record.name.clone())
+            .collect(),
+    );
+    let builtin_dir = phoenix_skills::builtin::default_extract_dir();
+    let mut catalog = phoenix_skills::SkillDiscovery::new(activation).catalog_with_plugins(
+        home,
+        home,
+        builtin_dir.as_deref(),
+        &plugins,
+    );
     let mut entries = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::default();
 
@@ -9306,7 +9382,55 @@ fn plugin_list_entries(
         seen.insert(plugin.manifest.name.clone());
         let record = registry.get(&plugin.manifest.name);
         let managed = record.is_some_and(|r| r.provenance == phoenix_db::PluginProvenance::Managed);
-        let enabled = record.map_or(true, |r| r.enabled);
+        let enabled = record.is_none_or(|r| r.enabled);
+        let mut skills: Vec<_> = plugin
+            .skipped_skills
+            .iter()
+            .map(|failure| PluginComponentStatus::Skipped {
+                name: failure.skill.clone(),
+                reason: failure.reason.clone(),
+            })
+            .collect();
+        skills.extend(
+            catalog
+                .plugin_outcomes
+                .remove(&plugin.manifest.name)
+                .expect("each scanned plugin has catalog admission outcomes")
+                .into_iter()
+                .map(|outcome| {
+                    PluginComponentStatus::from_validation(outcome.name, outcome.admission, enabled)
+                }),
+        );
+        let mcp_servers: Vec<_> = if enabled {
+            let plugins_root = plugin
+                .entry_dir
+                .parent()
+                .expect("plugin directory has a parent");
+            crate::tools::mcp::McpClientManager::plugin_server_outcomes(&plugin, plugins_root)
+                .into_iter()
+                .map(|(name, outcome)| {
+                    PluginComponentStatus::from_validation(name, outcome.map(|_| ()), true)
+                })
+                .collect()
+        } else {
+            plugin
+                .skipped_servers
+                .iter()
+                .map(|failure| PluginComponentStatus::Skipped {
+                    name: failure.server.clone(),
+                    reason: failure.reason.clone(),
+                })
+                .chain(
+                    plugin
+                        .servers
+                        .iter()
+                        .map(|server| PluginComponentStatus::Disabled {
+                            name: server.server().to_string(),
+                            reason: "plugin disabled".into(),
+                        }),
+                )
+                .collect()
+        };
         entries.push(serde_json::json!({
             "name": plugin.manifest.name,
             "version": plugin.manifest.version,
@@ -9315,8 +9439,9 @@ fn plugin_list_entries(
             "enabled": enabled,
             "provenance": if managed { "managed" } else { "unmanaged" },
             "missing": false,
-            "skills": plugin.skills.iter().map(phoenix_plugins::SkillDir::name).collect::<Vec<_>>(),
-            "mcp_servers": plugin.servers.iter().map(|s| s.server().to_string()).collect::<Vec<_>>(),
+            "skills": skills,
+            "skills_disabled_reason": plugin.skills_disabled_reason,
+            "mcp_servers": mcp_servers,
             "mcp_disabled_reason": plugin.mcp_disabled_reason,
         }));
     }
@@ -9327,7 +9452,18 @@ fn plugin_list_entries(
                 "name": record.name,
                 "enabled": record.enabled,
                 "provenance": if record.provenance == phoenix_db::PluginProvenance::Managed { "managed" } else { "unmanaged" },
-                "missing": true,
+                "missing": record.install_entry.as_deref().is_some_and(|entry| {
+                    std::fs::symlink_metadata(entry)
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                }),
+                "root": record.install_entry,
+                "load_error": match record.install_entry.as_deref() {
+                    Some(entry) => match phoenix_plugins::load_plugin(std::path::Path::new(entry)) {
+                        Ok(_) => Some("installation entry no longer declares this plugin identity".to_string()),
+                        Err(error) => Some(error),
+                    },
+                    None => Some("installation entry is unknown; plugin absence is not established".to_string()),
+                },
             }));
         }
     }
@@ -9336,8 +9472,7 @@ fn plugin_list_entries(
 }
 
 /// Add a plugin from a local path or a git URL (REQ-AP-009): validate the
-/// source's manifest, refuse a name collision with an already-loaded
-/// plugin, install under the shared root as `<manifest-name>`, and register
+/// source's manifest, publish an exclusive installation entry, and register
 /// managed provenance.
 #[derive(serde::Deserialize)]
 struct PluginAddParams {
@@ -9349,87 +9484,22 @@ async fn plugin_add(
     State(state): State<AppState>,
     Json(params): Json<PluginAddParams>,
 ) -> Response {
-    let root = plugins_root();
     let staging = match tempfile::tempdir() {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response()
+        Ok(staging) => staging,
+        Err(error) => {
+            return plugin_error(crate::plugin_lifecycle::LifecycleError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: error.to_string(),
+            })
         }
     };
-    let source_dir = match resolve_plugin_source(&params.source, staging.path().join("clone")).await
-    {
-        Ok(dir) => dir,
-        Err((code, message)) => {
-            return (code, Json(serde_json::json!({"error": message}))).into_response()
+    let source = match resolve_plugin_source(&params.source, staging.path().join("clone")).await {
+        Ok(source) => source,
+        Err((status, message)) => {
+            return plugin_error(crate::plugin_lifecycle::LifecycleError { status, message })
         }
     };
-
-    // Validate the source manifest before installing anything.
-    let plugin = match phoenix_plugins::load_plugin(&source_dir) {
-        Ok(p) => p,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("invalid plugin source: {e}")})),
-            )
-                .into_response();
-        }
-    };
-    let name = plugin.manifest.name;
-
-    // Collision: an already-loaded plugin with the same manifest name wins
-    // (REQ-AP-009).
-    let existing = phoenix_plugins::scan_plugins_root(&root)
-        .into_iter()
-        .any(|p| p.manifest.name == name);
-    if existing {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": format!("plugin '{name}' is already installed")})),
-        )
-            .into_response();
-    }
-
-    // Install: copy the source directory under the plugins root as
-    // `<manifest-name>` (the spec's own layout convention).
-    let destination = root.join(&name);
-    let output = tokio::process::Command::new("cp")
-        .arg("-a")
-        .arg(&source_dir)
-        .arg(&destination)
-        .output()
-        .await;
-    match output {
-        Ok(out) if out.status.success() => {}
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("copy failed: {stderr}")})),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("copy failed: {e}")})),
-            )
-                .into_response();
-        }
-    }
-
-    if let Err(e) = state.db.register_plugin(&name).await {
-        tracing::warn!(plugin = %name, error = %e, "Failed to persist plugin registration");
-    }
-    tracing::info!(plugin = %name, "Plugin added");
-
-    // Reload so its MCP servers connect (skills refresh next turn).
-    let _ = state.mcp_manager.reload().await;
-    Json(serde_json::json!({"ok": true, "name": name})).into_response()
+    plugin_mutation_response(&state, crate::plugin_lifecycle::Mutation::Add(&source)).await
 }
 
 /// Resolve an add-source to a local plugin directory: an existing local
@@ -9453,7 +9523,7 @@ async fn resolve_plugin_source(
         ));
     }
     let output = tokio::process::Command::new("git")
-        .args(["clone", "--depth", "1", source])
+        .args(["clone", "--depth", "1", "--", source])
         .arg(&clone_target)
         .output()
         .await;
@@ -9473,112 +9543,51 @@ async fn resolve_plugin_source(
     }
 }
 
-/// The installed plugin directory for a registry name, when its manifest
-/// name matches (identity is the manifest name, not the path).
-fn plugin_dir_for(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
-    phoenix_plugins::scan_plugins_root(root)
-        .into_iter()
-        .find(|p| p.manifest.name == name)
-        .map(|p| p.root)
+fn plugin_error(error: crate::plugin_lifecycle::LifecycleError) -> Response {
+    (
+        error.status,
+        Json(std::collections::HashMap::from([("error", error.message)])),
+    )
+        .into_response()
 }
 
-/// Shared tail for the lifecycle mutations: persist the registry change,
-/// update the process-wide filter, reconcile MCP, respond.
-async fn plugin_lifecycle_response(
+async fn plugin_mutation_response(
     state: &AppState,
-    name: &str,
-    outcome: Result<(), String>,
-    action: &str,
+    operation: crate::plugin_lifecycle::Mutation<'_>,
 ) -> Response {
-    match outcome {
-        Ok(()) => {
-            // Refresh the shared filter from the persisted registry so skill
-            // discovery and the MCP merge observe the same set (REQ-AP-008).
-            let disabled: std::collections::HashSet<String> = state
-                .db
-                .get_plugins()
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|r| !r.enabled)
-                .map(|r| r.name)
-                .collect();
-            phoenix_plugins::filter::set_disabled(disabled.clone());
-            state.mcp_manager.set_disabled_plugins(disabled).await;
-            let _ = state.mcp_manager.reload().await;
-            tracing::info!(plugin = %name, "Plugin {action}");
-            Json(serde_json::json!({"ok": true})).into_response()
-        }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": e})),
-        )
-            .into_response(),
+    let root = phoenix_plugins::default_plugins_root(state.runtime_env.home());
+    match state
+        .plugin_lifecycle
+        .run(&state.db, &state.mcp_manager, &root, operation)
+        .await
+    {
+        Ok(name) => Json(serde_json::json!({"ok": true, "name": name})).into_response(),
+        Err(error) => plugin_error(error),
     }
 }
 
-/// Disable a plugin: none of its components load; its MCP connections are
-/// removed on reconciliation (REQ-AP-008).
 async fn plugin_disable(State(state): State<AppState>, Path(name): Path<String>) -> Response {
-    let outcome = match state.db.set_plugin_enabled(&name, false).await {
-        Ok(()) => Ok(()),
-        Err(e) => Err(e.to_string()),
-    };
-    plugin_lifecycle_response(&state, &name, outcome, "disabled").await
+    plugin_mutation_response(
+        &state,
+        crate::plugin_lifecycle::Mutation::SetEnabled(&name, false),
+    )
+    .await
 }
 
-/// Enable a plugin (REQ-AP-008).
 async fn plugin_enable(State(state): State<AppState>, Path(name): Path<String>) -> Response {
-    let outcome = match state.db.set_plugin_enabled(&name, true).await {
-        Ok(()) => Ok(()),
-        Err(e) => Err(e.to_string()),
-    };
-    plugin_lifecycle_response(&state, &name, outcome, "enabled").await
+    plugin_mutation_response(
+        &state,
+        crate::plugin_lifecycle::Mutation::SetEnabled(&name, true),
+    )
+    .await
 }
 
-/// Remove a plugin: delete its directory, drop its registry row, retain its
-/// data directory (purge is separate) (REQ-AP-009).
 async fn plugin_remove(State(state): State<AppState>, Path(name): Path<String>) -> Response {
-    let root = plugins_root();
-    let outcome = async {
-        let dir = plugin_dir_for(&root, &name)
-            .ok_or_else(|| format!("plugin '{name}' is not installed"))?;
-        tokio::fs::remove_dir_all(&dir)
-            .await
-            .map_err(|e| format!("remove failed: {e}"))?;
-        state
-            .db
-            .unregister_plugin(&name)
-            .await
-            .map_err(|e| format!("registry update failed: {e}"))?;
-        Ok(())
-    }
-    .await;
-    plugin_lifecycle_response(&state, &name, outcome, "removed").await
+    plugin_mutation_response(&state, crate::plugin_lifecycle::Mutation::Remove(&name)).await
 }
 
-/// Purge a removed (or missing) plugin's data directory — the separate
-/// explicit action that destroys plugin state (REQ-AP-009).
 async fn plugin_purge_data(State(state): State<AppState>, Path(name): Path<String>) -> Response {
-    let root = plugins_root();
-    let outcome = async {
-        // Purge is available only when the plugin no longer contributes:
-        // its root is absent (removed or already missing).
-        if plugin_dir_for(&root, &name).is_some() {
-            return Err(format!(
-                "plugin '{name}' is still installed; remove it before purging data"
-            ));
-        }
-        let data_dir = phoenix_plugins::data_dir_for(&root, &name);
-        if data_dir.is_dir() {
-            tokio::fs::remove_dir_all(&data_dir)
-                .await
-                .map_err(|e| format!("purge failed: {e}"))?;
-        }
-        Ok(())
-    }
-    .await;
-    plugin_lifecycle_response(&state, &name, outcome, "purged").await
+    plugin_mutation_response(&state, crate::plugin_lifecycle::Mutation::Purge(&name)).await
 }
 
 // ============================================================
@@ -10876,6 +10885,7 @@ pub(crate) mod hard_delete_cascade_tests {
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
             slack_gateway_access: crate::slack_gateway::access_gate(),
+            plugin_lifecycle: Arc::default(),
             runtime,
             llm_registry,
             db,
@@ -17388,6 +17398,7 @@ mod regenerate_conversation_name_tests {
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
             slack_gateway_access: crate::slack_gateway::access_gate(),
+            plugin_lifecycle: Arc::default(),
             runtime,
             llm_registry,
             db,
@@ -17847,6 +17858,7 @@ mod upgrade_model_state_guard_tests {
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
             slack_gateway_access: crate::slack_gateway::access_gate(),
+            plugin_lifecycle: Arc::default(),
             runtime,
             llm_registry,
             db,
@@ -18325,6 +18337,7 @@ mod file_read_tests {
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
             slack_gateway_access: crate::slack_gateway::access_gate(),
+            plugin_lifecycle: Arc::default(),
             runtime,
             llm_registry,
             db,
@@ -19116,6 +19129,7 @@ mod chat_authority_tests {
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
             slack_gateway_access: crate::slack_gateway::access_gate(),
+            plugin_lifecycle: Arc::default(),
             runtime,
             llm_registry,
             db,
@@ -19903,6 +19917,7 @@ mod lifecycle_handler_tests {
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
             slack_gateway_access: crate::slack_gateway::access_gate(),
+            plugin_lifecycle: Arc::default(),
             runtime,
             llm_registry,
             db,
@@ -22197,7 +22212,7 @@ mod detached_task_worktree_tests {
 mod plugin_api_tests {
     use super::plugin_list_entries;
     use phoenix_db::{PluginProvenance, PluginRecord};
-    use phoenix_plugins::{LoadedPlugin, Manifest, ServerSpec, SkillDir};
+    use phoenix_plugins::{Manifest, ParsedPlugin, ServerSpec, SkillCandidate};
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -22210,13 +22225,14 @@ mod plugin_api_tests {
         .unwrap()
     }
 
-    fn plugin(name: &str, skills: &[&str]) -> LoadedPlugin {
-        LoadedPlugin {
+    fn plugin(name: &str, skills: &[&str]) -> ParsedPlugin {
+        ParsedPlugin {
             manifest: manifest(name),
             root: PathBuf::from(format!("/plugins/{name}")),
+            entry_dir: PathBuf::from(format!("/plugins/{name}")),
             skills: skills
                 .iter()
-                .map(|s| SkillDir {
+                .map(|s| SkillCandidate {
                     dir: PathBuf::from(format!("/plugins/{name}/skills/{s}")),
                     skill_md: PathBuf::from(format!("/plugins/{name}/skills/{s}/SKILL.md")),
                 })
@@ -22227,6 +22243,9 @@ mod plugin_api_tests {
                 headers: std::collections::BTreeMap::default(),
             }],
             mcp_disabled_reason: None,
+            skipped_skills: vec![],
+            skipped_servers: vec![],
+            skills_disabled_reason: None,
         }
     }
 
@@ -22239,7 +22258,163 @@ mod plugin_api_tests {
                 PluginProvenance::Unmanaged
             },
             enabled,
+            install_entry: Some(format!("/plugins/{name}")),
         }
+    }
+
+    fn write(path: &std::path::Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn plugin_status_reports_catalog_deduplication_not_just_validation() {
+        let home = tempfile::tempdir().unwrap();
+        let mut plugins = vec![];
+        for name in ["first", "second"] {
+            let root = home.path().join(format!(".agents/plugins/{name}"));
+            write(
+                &root.join("plugin.json"),
+                &format!(
+                    r#"{{"$schema":"https://agent-plugins.org/schemas/1.1.0/plugin.schema.json","name":"{name}"}}"#
+                ),
+            );
+            write(
+                &root.join("skills/shared/SKILL.md"),
+                "---\nname: shared\ndescription: Shared.\n---\nSame body.",
+            );
+            plugins.push(phoenix_plugins::load_plugin(&root).unwrap());
+        }
+        let entries =
+            super::plugin_list_entries_with_home(plugins.clone(), &HashMap::new(), home.path());
+        assert_eq!(entries[0]["skills"][0]["status"], "loaded");
+        assert_eq!(entries[1]["skills"][0]["status"], "skipped");
+        assert!(entries[1]["skills"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("content"));
+        write(
+            &home.path().join(".agents/skills/override/SKILL.md"),
+            "---\nname: first:shared\ndescription: Override.\n---\nDifferent body.",
+        );
+        let entries = super::plugin_list_entries_with_home(plugins, &HashMap::new(), home.path());
+        assert_eq!(entries[0]["skills"][0]["status"], "skipped");
+        assert!(entries[0]["skills"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("name"));
+        assert_eq!(entries[1]["skills"][0]["status"], "loaded");
+    }
+
+    #[test]
+    fn component_status_uses_owning_validators_and_preserves_failure_scopes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("plugins");
+        let bundle = root.join("demo");
+        write(
+            &bundle.join("plugin.json"),
+            &serde_json::json!({
+                "$schema": phoenix_plugins::manifest::MANIFEST_SCHEMA_URL, "name": "demo"
+            })
+            .to_string(),
+        );
+        for (name, content) in [
+            ("good", "---\nname: good\ndescription: Good.\n---\nBody."),
+            ("bad-frontmatter", "not frontmatter"),
+            ("bad-name", "---\nname: wrong\ndescription: Wrong.\n---\nBody."),
+            ("bad-audience", "---\nname: bad-audience\ndescription: Hidden.\naudience: global-coordinator\n---\nBody."),
+        ] {
+            write(&bundle.join(format!("skills/{name}/SKILL.md")), content);
+        }
+        write(
+            &bundle.join("mcp.json"),
+            &serde_json::json!({
+                "$schema": phoenix_plugins::mcp_config::MCP_SCHEMA_URL,
+                "mcpServers": {
+                    "good": {"type": "streamable-http", "url": "https://example.com/mcp"},
+                    "invalid": {"type": "stdio", "command": 42},
+                    "escape": {"type": "stdio", "command": "test", "cwd": "./../../outside"}
+                }
+            })
+            .to_string(),
+        );
+        let entries =
+            plugin_list_entries(phoenix_plugins::scan_plugins_root(&root), &HashMap::new());
+        let entry = &entries[0];
+        let skills = entry["skills"].as_array().unwrap();
+        assert_eq!(skills.len(), 4);
+        assert_eq!(skills.iter().filter(|s| s["status"] == "loaded").count(), 1);
+        for (name, expected) in [
+            ("bad-frontmatter", "frontmatter"),
+            ("bad-name", "name does not match"),
+            ("bad-audience", "audience"),
+        ] {
+            let outcome = skills.iter().find(|s| s["name"] == name).unwrap();
+            assert_eq!(outcome["status"], "skipped");
+            assert!(outcome["reason"].as_str().unwrap().contains(expected));
+        }
+        let servers = entry["mcp_servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 3);
+        assert_eq!(
+            servers.iter().filter(|s| s["status"] == "loaded").count(),
+            1
+        );
+        for name in ["invalid", "escape"] {
+            let outcome = servers.iter().find(|s| s["name"] == name).unwrap();
+            assert_eq!(outcome["status"], "skipped");
+            assert!(!outcome["reason"].as_str().unwrap().is_empty());
+        }
+        assert!(entry["mcp_disabled_reason"].is_null());
+        let mut registry = HashMap::new();
+        registry.insert("demo".into(), record("demo", true, false));
+        let disabled = plugin_list_entries(phoenix_plugins::scan_plugins_root(&root), &registry);
+        let good = disabled[0]["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "good")
+            .unwrap();
+        assert_eq!(good["status"], "disabled");
+        assert!(
+            !root.join("data").exists(),
+            "disabled status must not create data"
+        );
+    }
+
+    #[test]
+    fn component_status_reports_data_creation_failure_without_disabling_http() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("plugins");
+        let bundle = root.join("demo");
+        write(
+            &bundle.join("plugin.json"),
+            &serde_json::json!({
+                "$schema": phoenix_plugins::manifest::MANIFEST_SCHEMA_URL, "name": "demo"
+            })
+            .to_string(),
+        );
+        write(
+            &bundle.join("mcp.json"),
+            &serde_json::json!({
+                "$schema": phoenix_plugins::mcp_config::MCP_SCHEMA_URL,
+                "mcpServers": {
+                    "stdio": {"type": "stdio", "command": "test"},
+                    "http": {"type": "streamable-http", "url": "https://example.com/mcp"}
+                }
+            })
+            .to_string(),
+        );
+        write(&root.join("data"), "not a directory");
+        let entries =
+            plugin_list_entries(phoenix_plugins::scan_plugins_root(&root), &HashMap::new());
+        let servers = entries[0]["mcp_servers"].as_array().unwrap();
+        assert_eq!(
+            servers.iter().find(|s| s["name"] == "http").unwrap()["status"],
+            "loaded"
+        );
+        let stdio = servers.iter().find(|s| s["name"] == "stdio").unwrap();
+        assert_eq!(stdio["status"], "skipped");
+        assert!(stdio["reason"].as_str().unwrap().contains("data"));
     }
 
     /// Absent registry row = unmanaged + enabled (REQ-AP-008): a plugin
@@ -22252,8 +22427,12 @@ mod plugin_api_tests {
         assert_eq!(entries[0]["provenance"], "unmanaged");
         assert_eq!(entries[0]["enabled"], true);
         assert_eq!(entries[0]["missing"], false);
-        assert_eq!(entries[0]["skills"], serde_json::json!(["deploy"]));
-        assert_eq!(entries[0]["mcp_servers"], serde_json::json!(["api"]));
+        assert_eq!(entries[0]["skills"][0]["name"], "deploy");
+        assert_eq!(entries[0]["skills"][0]["status"], "skipped");
+        assert_eq!(
+            entries[0]["mcp_servers"],
+            serde_json::json!([{"name": "api", "status": "loaded"}])
+        );
     }
 
     /// Registry rows override default enabled state and mark managed
@@ -22268,6 +22447,28 @@ mod plugin_api_tests {
         assert_eq!(entries[0]["provenance"], "managed");
     }
 
+    #[test]
+    fn invalid_manifest_and_unknown_entry_do_not_surface_as_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let entry = temp.path().join("entry");
+        write(&entry.join("plugin.json"), "malformed update");
+        let mut row = record("demo", true, true);
+        row.install_entry = Some(entry.to_string_lossy().into_owned());
+        let mut registry = HashMap::from([("demo".to_string(), row)]);
+        let entries = plugin_list_entries(vec![], &registry);
+        assert_eq!(entries[0]["missing"], false);
+        assert!(entries[0]["load_error"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()));
+        registry.get_mut("demo").unwrap().install_entry = None;
+        let entries = plugin_list_entries(vec![], &registry);
+        assert_eq!(entries[0]["missing"], false);
+        assert!(entries[0]["load_error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown"));
+    }
+
     /// Registered-but-absent roots surface as missing (REQ-AP-009,
     /// REQ-AP-010).
     #[test]
@@ -22278,5 +22479,136 @@ mod plugin_api_tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["name"], "vanished");
         assert_eq!(entries[0]["missing"], true);
+    }
+}
+
+#[cfg(test)]
+mod plugin_lifecycle_route_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    async fn isolated_state(home: &std::path::Path) -> AppState {
+        let mut state = hard_delete_cascade_tests::make_test_state().await;
+        state.runtime_env =
+            Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::with_root(home));
+        state
+    }
+
+    #[tokio::test]
+    async fn encoded_absolute_purge_and_invalid_mutations_are_rejected_by_real_routes() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let witness = outside.path().join("witness");
+        std::fs::write(&witness, "preserve").unwrap();
+        let state = isolated_state(home.path()).await;
+        let router = Router::new()
+            .route("/api/plugins/:name/purge-data", post(plugin_purge_data))
+            .route("/api/plugins/:name/remove", post(plugin_remove))
+            .route("/api/plugins/:name/enable", post(plugin_enable))
+            .route("/api/plugins/:name/disable", post(plugin_disable))
+            .with_state(state.clone());
+        let encoded = percent_encode_query_value(outside.path().to_str().unwrap());
+        for action in ["purge-data", "remove", "enable", "disable"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/plugins/{encoded}/{action}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{action}");
+        }
+        assert!(witness.is_file());
+        assert!(state.db.get_plugins().await.unwrap().is_empty());
+        assert!(!home.path().join(".agents/plugins").exists());
+    }
+
+    #[tokio::test]
+    async fn list_route_propagates_registry_read_failure() {
+        let home = tempfile::tempdir().unwrap();
+        let state = isolated_state(home.path()).await;
+        sqlx::query("DROP TABLE plugins")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        let response = Router::new()
+            .route("/api/plugins", get(plugins_list))
+            .with_state(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/plugins")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn list_route_exposes_retained_data_identity() {
+        let home = tempfile::tempdir().unwrap();
+        let state = isolated_state(home.path()).await;
+        let data = phoenix_plugins::default_plugins_root(home.path()).join("data/demo");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("state"), "retained").unwrap();
+        state
+            .db
+            .register_plugin(
+                "demo",
+                &phoenix_plugins::default_plugins_root(home.path()).join("demo"),
+            )
+            .await
+            .unwrap();
+        let response = Router::new()
+            .route("/api/plugins", get(plugins_list))
+            .with_state(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/plugins")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["plugins"][0]["name"], "demo");
+        assert_eq!(body["plugins"][0]["missing"], true);
+        assert!(data.join("state").is_file());
+    }
+
+    #[tokio::test]
+    async fn plugin_skill_preview_uses_the_validated_enabled_catalog_not_package_root() {
+        let home = tempfile::tempdir().unwrap();
+        let state = isolated_state(home.path()).await;
+        let package = phoenix_plugins::default_plugins_root(home.path()).join("demo");
+        let skill = package.join("skills/check");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(package.join("plugin.json"), r#"{"$schema":"https://agent-plugins.org/schemas/1.1.0/plugin.schema.json","name":"demo"}"#).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: check\ndescription: Check a thing\n---\nDo the check.\n",
+        )
+        .unwrap();
+        crate::plugin_activation::refresh(&state.db, state.mcp_manager.plugin_activation())
+            .await
+            .unwrap();
+        let roots = preview_root_allowlist(&state).await;
+        assert!(roots.contains(&skill.canonicalize().unwrap()));
+        assert!(!roots.contains(&package.canonicalize().unwrap()));
+        state.db.set_plugin_enabled("demo", false).await.unwrap();
+        crate::plugin_activation::refresh(&state.db, state.mcp_manager.plugin_activation())
+            .await
+            .unwrap();
+        let roots = preview_root_allowlist(&state).await;
+        assert!(!roots.contains(&skill.canonicalize().unwrap()));
     }
 }

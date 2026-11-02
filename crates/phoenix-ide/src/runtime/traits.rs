@@ -765,6 +765,10 @@ pub trait ToolExecutor: Send + Sync {
         std::collections::HashSet::new()
     }
 
+    fn skill_discovery(&self) -> phoenix_skills::SkillDiscovery {
+        phoenix_skills::SkillDiscovery::default()
+    }
+
     fn coordinator_skill_catalog(
         &self,
     ) -> Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog> {
@@ -1568,6 +1572,10 @@ impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
 
     fn clearable_tool_names(&self) -> std::collections::HashSet<String> {
         (**self).clearable_tool_names()
+    }
+
+    fn skill_discovery(&self) -> phoenix_skills::SkillDiscovery {
+        (**self).skill_discovery()
     }
 
     fn coordinator_skill_catalog(
@@ -3119,6 +3127,7 @@ impl ToolRegistryExecutor {
 #[async_trait]
 impl ToolExecutor for ToolRegistryExecutor {
     async fn execute(&self, call: CheckedToolCall, ctx: ToolContext) -> Option<ToolOutput> {
+        let ctx = ctx.with_skill_discovery(self.skill_discovery());
         let (name, input, expected_schema) = call.into_bound_parts();
         // Look up the tool while holding the read lock, then drop the guard
         // before the async .run() call (RwLockReadGuard is !Send).
@@ -3159,6 +3168,14 @@ impl ToolExecutor for ToolRegistryExecutor {
                 "EUNAVAIL: tool is unavailable or its input schema changed before execution",
             )
         })
+    }
+
+    fn skill_discovery(&self) -> phoenix_skills::SkillDiscovery {
+        self.mcp_manager
+            .as_ref()
+            .map_or_else(phoenix_skills::SkillDiscovery::default, |manager| {
+                phoenix_skills::SkillDiscovery::new(manager.plugin_activation().clone())
+            })
     }
 
     fn coordinator_skill_catalog(
@@ -3256,6 +3273,103 @@ mod tool_registry_executor_tests {
     use crate::tools::{Tool, ToolContext, ToolOutput};
     use async_trait::async_trait;
     use serde_json::{json, Value};
+
+    struct SkillActivationProbe(std::path::PathBuf);
+
+    #[async_trait]
+    impl Tool for SkillActivationProbe {
+        fn name(&self) -> &'static str {
+            "skill_activation_probe"
+        }
+
+        fn description(&self) -> String {
+            "Inspect injected skill discovery".to_string()
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        async fn run(&self, _input: Value, ctx: ToolContext) -> ToolOutput {
+            let names = ctx
+                .skill_discovery()
+                .discover_with_options(ctx.working_dir(), Some(&self.0), None)
+                .into_iter()
+                .map(|skill| skill.name)
+                .collect::<Vec<_>>();
+            ToolOutput::success(names.join(","))
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_injects_shared_plugin_activation_into_tool_context() {
+        let home = tempfile::tempdir().unwrap();
+        let plugin = home.path().join(".agents/plugins/runtime-probe");
+        std::fs::create_dir_all(plugin.join("skills/check")).unwrap();
+        std::fs::write(
+            plugin.join("plugin.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/1.1.0/plugin.schema.json","name":"runtime-probe"}"#,
+        ).unwrap();
+        std::fs::write(
+            plugin.join("skills/check/SKILL.md"),
+            "---\nname: check\ndescription: Runtime activation probe.\n---\nProbe body.",
+        )
+        .unwrap();
+        let manager = Arc::new(crate::tools::mcp::McpClientManager::new());
+        let registry = ToolRegistry::direct(Vec::new())
+            .try_with_host_bound_tool(Arc::new(SkillActivationProbe(home.path().to_path_buf())))
+            .unwrap();
+        let executor = Arc::new(ToolRegistryExecutor::with_mcp(
+            registry,
+            manager.clone(),
+            Arc::from(Vec::new()),
+        ));
+        let discovery = executor.skill_discovery();
+        let inspect = || async {
+            let ctx = ToolContext::new(
+                tokio_util::sync::CancellationToken::new(),
+                "activation-probe".to_string(),
+                home.path().to_path_buf(),
+                Arc::new(crate::tools::BrowserSessionManager::default()),
+                Arc::new(crate::tools::BashHandleRegistry::new()),
+                Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+                crate::terminal::ActiveTerminals::new(),
+                Arc::new(crate::tools::TmuxRegistry::new()),
+                None,
+                phoenix_core::work_scope::WorkScopeId::parse("activation-probe").unwrap(),
+            );
+            let call = crate::runtime::deny_gate::DenyGate::check(
+                "skill_activation_probe".to_string(),
+                json!({}),
+            )
+            .unwrap();
+            executor
+                .execute(call, ctx)
+                .await
+                .unwrap()
+                .output()
+                .to_string()
+        };
+        assert!(!inspect().await.contains("runtime-probe:check"));
+        manager
+            .plugin_activation()
+            .publish(std::collections::HashSet::new());
+        assert!(inspect().await.contains("runtime-probe:check"));
+        assert!(discovery
+            .discover_with_options(home.path(), Some(home.path()), None)
+            .iter()
+            .any(|skill| skill.name == "runtime-probe:check"));
+        manager
+            .plugin_activation()
+            .publish(std::collections::HashSet::from([
+                "runtime-probe".to_string()
+            ]));
+        assert!(!inspect().await.contains("runtime-probe:check"));
+        manager
+            .plugin_activation()
+            .publish(std::collections::HashSet::new());
+        assert!(inspect().await.contains("runtime-probe:check"));
+    }
 
     struct NamedMarker(&'static str);
 

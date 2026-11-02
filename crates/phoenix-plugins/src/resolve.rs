@@ -11,19 +11,69 @@ use std::path::{Component, Path, PathBuf};
 use crate::mcp_config::ServerSpec;
 
 /// Single-pass `${PLUGIN_ROOT}` / `${PLUGIN_DATA}` replacement (REQ-AP-006).
-/// Exactly the two exact placeholders, one textual pass, no recursion:
-/// replacement text is never rescanned, and other placeholder-like text
-/// stays literal.
+/// One scan of the original input; replacement text is never rescanned,
+/// so a root or data directory that itself contains a placeholder spelling
+/// cannot be re-expanded. Other placeholder-like text stays literal.
 #[must_use]
 pub fn expand_placeholders(text: &str, plugin_root: &Path, data_dir: &Path) -> String {
-    text.replace("${PLUGIN_ROOT}", &plugin_root.to_string_lossy())
-        .replace("${PLUGIN_DATA}", &data_dir.to_string_lossy())
+    const ROOT_TOKEN: &str = "${PLUGIN_ROOT}";
+    const DATA_TOKEN: &str = "${PLUGIN_DATA}";
+    let root_value = plugin_root.to_string_lossy();
+    let data_value = data_dir.to_string_lossy();
+
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(hit) = find_first(rest, ROOT_TOKEN, DATA_TOKEN) {
+        let (before, token_and_after) = rest.split_at(hit.offset);
+        out.push_str(before);
+        out.push_str(if hit.token == ROOT_TOKEN {
+            root_value.as_ref()
+        } else {
+            data_value.as_ref()
+        });
+        rest = token_and_after.split_at(hit.token.len()).1;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The earliest occurrence of either placeholder token in `text`.
+struct TokenHit {
+    offset: usize,
+    token: &'static str,
+}
+
+fn find_first(text: &str, a: &'static str, b: &'static str) -> Option<TokenHit> {
+    let hit_a = text.find(a).map(|offset| TokenHit { offset, token: a });
+    let hit_b = text.find(b).map(|offset| TokenHit { offset, token: b });
+    match (hit_a, hit_b) {
+        (Some(x), Some(y)) => Some(if x.offset <= y.offset { x } else { y }),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
+/// Executable lookup is either PATH-based or an already checked package path.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResolvedCommand {
+    PathLookup(String),
+    PackagePath(PathBuf),
+}
+
+impl ResolvedCommand {
+    #[must_use]
+    pub fn into_spawn_command(self) -> String {
+        match self {
+            Self::PathLookup(name) => name,
+            Self::PackagePath(path) => path.to_string_lossy().into_owned(),
+        }
+    }
 }
 
 /// The fully resolved stdio spawn configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedStdio {
-    pub command: String,
+    pub command: ResolvedCommand,
     pub args: Vec<String>,
     /// The complete environment: base, configured overlay, client-owned
     /// `PLUGIN_ROOT`/`PLUGIN_DATA` set last.
@@ -86,21 +136,32 @@ pub fn resolved_environment(
     );
 
     // Working directory: default plugin root; explicit values must resolve
-    // inside their anchor boundary (REQ-AP-006, REQ-AP-007).
+    // inside the anchor their FORM selects — `./` and `${PLUGIN_ROOT}` anchor
+    // to the plugin root alone, `${PLUGIN_DATA}` to the data directory alone
+    // (REQ-AP-006, REQ-AP-007). The expanded placeholder form is already an
+    // absolute path and is used directly, never re-joined (an absolute
+    // remainder must not be able to replace the anchor).
     let resolved_cwd = match cwd {
         None => plugin_root.to_path_buf(),
         Some(value) => {
-            let expanded = expand_placeholders(value, plugin_root, data_dir);
-            let candidate: PathBuf =
+            let (anchor, candidate): (&Path, PathBuf) =
                 if value == "${PLUGIN_ROOT}" || value.starts_with("${PLUGIN_ROOT}/") {
-                    plugin_root.join(trim_anchor(&expanded, plugin_root))
+                    (
+                        plugin_root,
+                        PathBuf::from(expand_placeholders(value, plugin_root, data_dir)),
+                    )
                 } else if value == "${PLUGIN_DATA}" || value.starts_with("${PLUGIN_DATA}/") {
-                    data_dir.join(trim_anchor(&expanded, data_dir))
+                    (
+                        data_dir,
+                        PathBuf::from(expand_placeholders(value, plugin_root, data_dir)),
+                    )
                 } else {
-                    // `./`-relative: joined onto the plugin root.
-                    plugin_root.join(expanded.strip_prefix("./").unwrap_or(expanded.as_str()))
+                    // `./`-relative: anchored to the plugin root.
+                    let expanded = expand_placeholders(value, plugin_root, data_dir);
+                    let relative = expanded.strip_prefix("./").unwrap_or(expanded.as_str());
+                    (plugin_root, plugin_root.join(relative))
                 };
-            if !within_boundary(&candidate, plugin_root) && !within_boundary(&candidate, data_dir) {
+            if !within_boundary(&candidate, anchor) {
                 return Err(format!(
                     "{server}: cwd {value} resolves outside its anchor boundary"
                 ));
@@ -109,22 +170,30 @@ pub fn resolved_environment(
         }
     };
 
+    // Executable resolution (REQ-AP-007): a plugin-relative `./` command is
+    // resolved against the package root here — never left relative, which
+    // would make a custom cwd the resolution base — and must resolve inside
+    // the root. Bare executable names keep their PATH lookup.
+    let resolved_command = if command.starts_with("./") {
+        let candidate = plugin_root.join(command.strip_prefix("./").unwrap_or(command));
+        if !within_boundary(&candidate, plugin_root) {
+            return Err(format!(
+                "{server}: command {command} resolves outside the plugin root"
+            ));
+        }
+        let checked = resolve_existing_ancestors(&candidate)
+            .ok_or_else(|| format!("{server}: command cannot be resolved"))?;
+        ResolvedCommand::PackagePath(checked)
+    } else {
+        ResolvedCommand::PathLookup(command.clone())
+    };
+
     Ok(ResolvedStdio {
-        command: command.clone(),
+        command: resolved_command,
         args: expanded_args,
         env: expanded_env,
         cwd: resolved_cwd,
     })
-}
-
-/// Strip the anchor prefix from an already-expanded placeholder path so the
-/// remainder can be re-joined onto the resolved anchor (the expansion used
-/// the same string, so this is a pure prefix trim).
-fn trim_anchor<'a>(expanded: &'a str, anchor: &Path) -> &'a str {
-    let anchor_str = anchor.to_string_lossy();
-    expanded
-        .strip_prefix(anchor_str.as_ref())
-        .unwrap_or(expanded)
 }
 
 /// Resolved-path containment (REQ-AP-007): `path` must stay inside
@@ -132,44 +201,38 @@ fn trim_anchor<'a>(expanded: &'a str, anchor: &Path) -> &'a str {
 /// allowed; links escaping it are rejected. Lexical `..` above the anchor
 /// also escapes.
 ///
-/// Both sides use the same resolution mode: when either fails to
-/// canonicalize (not yet on disk), both fall back to lexical
-/// normalization, so a symlinked temp root can never make a plain
-/// inside-path comparison spuriously fail.
+/// Existing ancestors are resolved even when a descendant does not yet exist.
 #[must_use]
 pub fn within_boundary(path: &Path, boundary: &Path) -> bool {
-    if let (Ok(resolved_path), Ok(resolved_boundary)) =
-        (std::fs::canonicalize(path), std::fs::canonicalize(boundary))
-    {
-        resolved_path.starts_with(&resolved_boundary)
-    } else {
-        let resolved_path = normalize_lexically(path);
-        let resolved_boundary = normalize_lexically(boundary);
-        resolved_path.starts_with(&resolved_boundary)
+    match (
+        resolve_existing_ancestors(path),
+        resolve_existing_ancestors(boundary),
+    ) {
+        (Some(path), Some(boundary)) => path.starts_with(boundary),
+        _ => false,
     }
 }
 
-/// Lexical normalization when canonicalize fails (path not yet on disk):
-/// resolve `.` and `..` components without touching the filesystem.
-fn normalize_lexically(path: &Path) -> PathBuf {
-    let mut out: Vec<Component> = Vec::new();
-    for component in path.components() {
+fn resolve_existing_ancestors(path: &Path) -> Option<PathBuf> {
+    let absolute = std::path::absolute(path).ok()?;
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                match out.last() {
-                    Some(Component::Normal(_)) => {
-                        out.pop();
-                    }
-                    _ => out.push(component), // leading .. or above root: keep
-                }
+                resolved.pop();
             }
             other @ (Component::Prefix(_) | Component::RootDir | Component::Normal(_)) => {
-                out.push(other);
+                resolved.push(other.as_os_str());
+                match std::fs::symlink_metadata(&resolved) {
+                    Ok(_) => resolved = std::fs::canonicalize(&resolved).ok()?,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return None,
+                }
             }
         }
     }
-    out.iter().collect()
+    Some(resolved)
 }
 
 #[cfg(test)]
@@ -270,6 +333,109 @@ mod tests {
         assert_eq!(resolved.cwd, Path::new("/root"));
     }
 
+    /// Regression: a `PLUGIN_ROOT` whose path itself contains the literal
+    /// `${PLUGIN_DATA}` spelling must not be re-expanded (the old chained
+    /// `replace` pass corrupted the output; the scanner must consume the
+    /// matched token and never rescan inserted text).
+    #[test]
+    fn expansion_never_rescans_replacement_text() {
+        let expanded = expand_placeholders(
+            "${PLUGIN_ROOT}",
+            Path::new("/home/${PLUGIN_DATA}/probe"),
+            Path::new("/state"),
+        );
+        assert_eq!(expanded, "/home/${PLUGIN_DATA}/probe");
+
+        // Mixed tokens, earliest-first, consumed in one scan.
+        let expanded = expand_placeholders(
+            "a${PLUGIN_ROOT}b${PLUGIN_DATA}c",
+            Path::new("/r"),
+            Path::new("/d"),
+        );
+        assert_eq!(expanded, "a/rb/dc");
+    }
+
+    /// Regression: `${PLUGIN_ROOT}/work` previously trimmed to `/work` and
+    /// the absolute join REPLACED the root entirely. The expanded absolute
+    /// path is used directly, so a real subdirectory resolves inside the
+    /// root.
+    #[test]
+    fn placeholder_cwd_subdirectory_stays_inside_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("plugin");
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(root.join("work")).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+
+        let spec = stdio_spec(vec![], &[], Some("${PLUGIN_ROOT}/work"));
+        let resolved = resolved_environment(&spec, &root, &data, &base_env()).unwrap();
+        assert_eq!(resolved.cwd, root.join("work"));
+    }
+
+    /// Regression: a `./`-relative cwd crossing into the data directory was
+    /// previously accepted because containment in EITHER boundary sufficed;
+    /// the form's anchor is the plugin root alone.
+    #[test]
+    fn dot_relative_cwd_cannot_cross_into_the_data_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("plugin");
+        let data = dir.path().join("data").join("plugin");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+
+        let spec = stdio_spec(vec![], &[], Some("./../data/plugin"));
+        assert!(resolved_environment(&spec, &root, &data, &base_env()).is_err());
+    }
+
+    /// A `${PLUGIN_DATA}`-anchored cwd is valid inside the data boundary.
+    #[test]
+    fn data_anchored_cwd_is_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("plugin");
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(data.join("work")).unwrap();
+
+        let spec = stdio_spec(vec![], &[], Some("${PLUGIN_DATA}/work"));
+        let resolved = resolved_environment(&spec, &root, &data, &base_env()).unwrap();
+        assert_eq!(resolved.cwd, data.join("work"));
+    }
+
+    /// Regression: a `./`-prefixed command escaping the root passed
+    /// validation; resolution now rejects it. Package-relative commands
+    /// resolve to an absolute path inside the root, independent of cwd.
+    #[test]
+    fn package_relative_command_resolves_inside_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("plugin");
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+
+        // Escaping form rejected.
+        let mut escaping = stdio_spec(vec![], &[], None);
+        if let ServerSpec::Stdio { command, .. } = &mut escaping {
+            *command = "./../outside".to_string();
+        }
+        assert!(
+            resolved_environment(&escaping, &root, &data, &base_env()).is_err(),
+            "escaping ./ command must be rejected"
+        );
+
+        // Valid package-relative command resolves absolutely against the
+        // root even with a custom (data-anchored) cwd.
+        let mut spec = stdio_spec(vec![], &[], Some("${PLUGIN_DATA}/work"));
+        if let ServerSpec::Stdio { command, .. } = &mut spec {
+            *command = "./bin/server".to_string();
+        }
+        let resolved = resolved_environment(&spec, &root, &data, &base_env()).unwrap();
+        let ResolvedCommand::PackagePath(command) = resolved.command else {
+            panic!("expected resolved package command");
+        };
+        assert!(command.ends_with("plugin/bin/server"));
+        assert!(command.is_absolute());
+    }
+
     #[test]
     fn anchored_cwd_must_resolve_inside_its_boundary() {
         let data_escape = stdio_spec(vec![], &[], Some("${PLUGIN_DATA}/../.."));
@@ -298,6 +464,20 @@ mod tests {
             &base_env(),
         )
         .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_descendant_does_not_hide_an_escaping_ancestor() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("plugin");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        assert!(!within_boundary(&root.join("link/not-created"), &root));
+        assert!(!within_boundary(&root.join("link/../not-created"), &root));
+        assert!(within_boundary(&root.join("new/child"), &root));
     }
 
     #[test]
@@ -456,6 +636,37 @@ mod scan_tests {
         let plugins = scan_plugins_root(&root);
         assert_eq!(plugins.len(), 1);
         assert!(plugins[0].root.ends_with("a-copy"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_metadata_symlinks_cannot_escape_but_install_entry_can() {
+        let temp = tempfile::tempdir().unwrap();
+        let package = temp.path().join("source");
+        let entry = temp.path().join("installed");
+        write(&package.join("plugin.json"), MANIFEST);
+        std::os::unix::fs::symlink(&package, &entry).unwrap();
+        let loaded = crate::load_plugin(&entry).unwrap();
+        assert_eq!(loaded.entry_dir, entry);
+        assert_eq!(loaded.root, std::fs::canonicalize(&package).unwrap());
+
+        let outside = temp.path().join("outside-manifest");
+        write(&outside, MANIFEST);
+        std::fs::remove_file(package.join("plugin.json")).unwrap();
+        std::os::unix::fs::symlink(&outside, package.join("plugin.json")).unwrap();
+        assert!(crate::load_plugin(&entry).is_err());
+
+        std::fs::remove_file(package.join("plugin.json")).unwrap();
+        write(&package.join("plugin.json"), MANIFEST);
+        let outside_mcp = temp.path().join("outside-mcp");
+        write(
+            &outside_mcp,
+            r#"{"$schema":"https://agent-plugins.org/schemas/1.1.0/mcp.schema.json","mcpServers":{"evil":{"type":"stdio","command":"sh"}}}"#,
+        );
+        std::os::unix::fs::symlink(&outside_mcp, package.join("mcp.json")).unwrap();
+        let loaded = crate::load_plugin(&entry).unwrap();
+        assert!(loaded.servers.is_empty());
+        assert!(loaded.mcp_disabled_reason.unwrap().contains("escapes"));
     }
 
     /// An escaping SKILL.md symlink is skipped; siblings continue
