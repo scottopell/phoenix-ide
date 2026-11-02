@@ -148,6 +148,16 @@ contract ToolRoundAdmission {
         -- mutation, including a parent's settlement of pending child state.
 }
 
+contract ParentTerminalAcceptance {
+    @invariant AcceptanceIsOneEstablishedCommit
+        -- REQ-BED-008 / REQ-SA-004: adopting the exact pending child into
+        -- completed and its normal parent-acceptance marker is one established
+        -- native transaction. SubAgentParentAcceptanceCommitted observes that
+        -- transaction; it is not emitted by raw transport, buffering, or merely
+        -- evaluating a pure reducer proposal. Failed establishment leaves
+        -- delivery owed; unclassified local authority follows REQ-BED-033.
+}
+
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
@@ -1123,6 +1133,20 @@ rule UserDismissesError {
 -- ===========================================================
 -- CORE 6. SUB-AGENT FAN-IN (REQ-BED-008)
 -- ===========================================================
+
+rule ReadyParentReceivesTerminalTransport {
+    when: ParentTerminalTransportArrived(conversation, result)
+    requires: live_runtime_authority_open(conversation)
+    requires: conversation.core_status in { awaiting_sub_agents, cancelling_sub_agents }
+    ensures: SubAgentReportsResult(conversation, result)
+}
+
+rule UnreadyParentRetainsTerminalTransport {
+    when: ParentTerminalTransportArrived(conversation, result)
+    requires: live_runtime_authority_open(conversation)
+    requires: conversation.core_status not in { awaiting_sub_agents, cancelling_sub_agents }
+    ensures: TerminalTransportBuffered(conversation, result)
+}
 
 rule SubAgentReportsResultMorePending {
     when: SubAgentReportsResult(conversation, result)
@@ -3094,6 +3118,20 @@ rule ModeChangeNotification {
 -- Helpers (pure predicates referenced by rules)
 ------------------------------------------------------------
 
+--   admitted_sub_agent_count(conversation: Conversation) -> Integer
+--       The exact children adopted into this parent's fan-in round, including
+--       those already accepted. A classified unadopted-batch cancellation consumes
+--       its children at the spawn boundary; it does not add them to parent fan-in.
+
+--   live_runtime_authority_open(conversation: Conversation) -> Boolean
+--       The conversation's executor has current admission under the shared
+--       process-wide local-authority fence; this is not another stored flag.
+--   exact_parent_child_commit_established(conversation: Conversation, result: SubAgentResult) -> Boolean
+--       The owning native operation established the transaction containing this
+--       exact parent pending -> completed transition and child acceptance marker.
+--       A proposed transition, buffered event, or administrative unadopted-batch
+--       suppression is not this receipt.
+
 --   executor_owns_conversation(executor: RuntimeExecutor, conversation: Conversation) -> Boolean
 --       The acknowledgement comes from the live executor owning this exact
 --       conversation. A runtime for another conversation cannot retire its slot.
@@ -3757,11 +3795,12 @@ invariant ContinuationBoundarySummaryLivesOnHandedOffPredecessor {
 -- deadline-driven terminal-direction settlement that does not depend on the
 -- running task or a pending sub-agent ever returning. The tool deadline invokes
 -- synchronous slot retirement, whose acknowledgement admits the checkpoint;
--- it does not wait for task completion. The time from a cancellation request to a
--- terminal-direction state is bounded by config.cancellation_deadline regardless
--- of tool cooperation. Enforced by construction: the deadline rules' `when:`
--- (CancellationDeadlineExpires) invokes teardown for every cancellation state;
--- absence of an ordinary tool task cannot suppress its retirement acknowledgement.
+-- it does not wait for task completion. An intercepted spawn also requires its
+-- exact native admission/closure classification; a known failure takes the
+-- executor-error boundary and indeterminate local authority takes REQ-BED-033,
+-- rather than acknowledging successful cancellation. The time to this classified
+-- terminal direction is bounded by config.cancellation_deadline regardless of
+-- tool cooperation. Absence of an ordinary task cannot suppress slot retirement.
 
 ------------------------------------------------------------
 -- Actor Declarations
@@ -3808,10 +3847,15 @@ surface RuntimeChildResultObservations {
     facing runtime: RuntimeExecutor
     context conversation: Conversation
 
+    contracts:
+        fulfils ParentTerminalAcceptance
+
     provides:
-        SubAgentReportsResult(conversation, result)
+        ParentTerminalTransportArrived(conversation, result)
             when executor_owns_conversation(runtime, conversation)
-                 and conversation.core_status in { awaiting_sub_agents, cancelling_sub_agents }
+        SubAgentParentAcceptanceCommitted(conversation, result)
+            when executor_owns_conversation(runtime, conversation)
+                 and exact_parent_child_commit_established(conversation, result)
 
     @guarantee DurableParentAndChildCorrelation
         -- The delivered result retains the admitted child's exact identity and
@@ -3819,13 +3863,21 @@ surface RuntimeChildResultObservations {
         -- delivery contracts. Bedrock's pending/completed membership guards own
         -- acceptance and duplicate handling; delivery alone is not acceptance.
 
+    @guarantee NativeCommitIsTheOnlyAcceptanceReceiptProducer
+        -- The ready event evaluates a fan-in transition, but does not itself
+        -- acknowledge delivery. Only the established native transaction adopting
+        -- that exact parent state together with the child's acceptance marker
+        -- provides SubAgentParentAcceptanceCommitted. A failed write keeps the
+        -- raw result owed/buffered; an unclassified write follows REQ-BED-033.
+        -- A pure transition proposal remains private until this establishment.
+
     @guarantee EarlyChildResultsWaitForFanInReadiness
         -- A transport arrival while the ordinary tool is executing or cancelling
         -- is retained unchanged in the executor's existing result buffer. It
         -- does not remove the child from parent pending or mark it parent-accepted.
         -- On entering AwaitingSubAgents or CancellingSubAgents, redeliver each
         -- buffered result belonging to that exact pending child set through
-        -- SubAgentReportsResult. Buffering may retain duplicates; the acceptance
+        -- ParentTerminalTransportArrived. Buffering may retain duplicates; the acceptance
         -- guards then move each child pending -> completed once. Results from
         -- another round are not reattributed to this round. The process-local
         -- buffer is not independent durable delivery or restart authority.

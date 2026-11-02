@@ -41,6 +41,7 @@ external entity InvocationOutcome {
 
 contract SerialToolDispatch {
     forward: (invocation: ToolInvocation, outcome: InvocationOutcome) -> InvocationOutcome
+    spawn_cancellation_resolution: (conversation: bedrock/Conversation) -> SpawnCancellationResolution
 
     @invariant SerialOwnership
         -- Bedrock owns the active call and remaining queue. The ordinary
@@ -72,6 +73,8 @@ contract SerialToolDispatch {
         -- authority must still be established under REQ-BED-033 before semantic
         -- settlement or publication; cancellation never fabricates a write result.
 }
+
+enum SpawnCancellationResolution { established | failed | indeterminate }
 
 entity ToolInvocation {
     runtime: ToolRuntime
@@ -144,7 +147,8 @@ rule RouteSpawnToItsAdmissionBoundary {
     let invocation = subagents/SpawnInvocation{
         parent: conversation,
         assistant_message_id: held_assistant_message_id(conversation),
-        tool_use_id: call.tool_use_id
+        tool_use_id: call.tool_use_id,
+        batch_id: new_spawn_batch_id()
     }
     ensures: subagents/SpawnAgentsToolInvoked(invocation, decoded_spawn_tasks(call))
     ensures: not OrdinaryGenerationOpened(runtime, call)
@@ -214,6 +218,63 @@ rule SpawnAdmissionReturnsToItsExactCall {
         -- Preserve that same origin correlation through reducer admission.
         -- Receiving an admission response is not permission to use another
         -- current call or another assistant round that reused the provider ID.
+}
+
+rule CancelTheOwnedSpawnHandoff {
+    when: bedrock/ToolAbortRequested(conversation)
+    requires: has_owned_spawn_handoff_for_cancellation(conversation)
+    let invocation = owned_spawn_handoff_for_cancellation(conversation)
+    requires: process_authority.open
+    ensures: subagents/SpawnBatchCancellationRequested(invocation)
+}
+
+rule AdmittedSpawnReturnsToItsCancellingOrigin {
+    when: subagents/SpawnAgentsCompletes(invocation, spawned_agents)
+    requires: process_authority.open
+    requires: spawn_invocation_is_cancelling(invocation)
+    ensures: subagents/SpawnBatchCancellationRequested(invocation)
+
+    @guidance
+        -- Cancellation does not make this admission receipt stale. Keep its
+        -- response/activation owner, withhold activation, and close the exact
+        -- unadopted batch before acknowledging parent cancellation.
+}
+
+rule RejectedSpawnReturnsToItsCancellingOrigin {
+    when: subagents/SpawnAgentsRejected(invocation, reason)
+    requires: process_authority.open
+    requires: spawn_invocation_is_cancelling(invocation)
+    requires: spawn_cancellation_resolution(invocation.parent) = established
+    ensures: bedrock/ToolCompletes(invocation.parent, spawn_rejection_result(invocation, reason))
+}
+
+rule UnadoptableSpawnReceiptStillClosesItsOwnedBatch {
+    when: subagents/SpawnAgentsCompletes(invocation, spawned_agents)
+    requires: process_authority.open
+    requires: not spawn_invocation_is_current(invocation)
+    requires: not spawn_invocation_is_cancelling(invocation)
+    requires: activation_is_unreleased_and_membership_unadopted(invocation)
+    ensures: subagents/UnactivatedSpawnBatchClosureRequested(invocation)
+}
+
+rule ClassifiedSpawnClosureAllowsCancellationSettlement {
+    when: subagents/UnactivatedSpawnBatchClosed(invocation)
+    requires: process_authority.open
+    requires: spawn_invocation_is_cancelling(invocation)
+    requires: spawn_cancellation_resolution(invocation.parent) = established
+    ensures: bedrock/ToolAborted(invocation.parent)
+}
+
+rule FailedSpawnClosureDoesNotClaimCancellationSuccess {
+    when: subagents/SpawnBatchClosureFailed(invocation, reason)
+    requires: process_authority.open
+    ensures: ExecutorErrorReturned(runtime_for(invocation.parent), originating_spawn_call(invocation))
+    ensures: not bedrock/ToolAborted(invocation.parent)
+}
+
+rule UnclassifiedSpawnAuthorityClosesTheProcessFence {
+    when: subagents/SpawnBatchAuthorityUnclassified(invocation)
+    ensures: FatalLocalAuthorityLost()
 }
 
 rule BeginOrdinaryPreparation {
@@ -373,6 +434,7 @@ rule CancellationBackstopRetiresGeneration {
         and phase in { preparing, denied, launched, cancelling }
     requires: process_authority.open
     requires: conversation.core_status = cancelling_tool
+    requires: spawn_cancellation_resolution(conversation) = established
     ensures: owner.generation = owner.generation + 1
     ensures: RetainedToolTaskAbortRequested(owner)
     ensures:
@@ -387,6 +449,29 @@ rule CancellationBackstopRetiresGeneration {
         -- Bedrock owns synthetic current/queued results and any remaining child
         -- cancellation. A sender-loss outcome from this abort carries the retired
         -- generation and cannot settle a later call, including reused tool IDs.
+}
+
+rule CancellationBackstopCannotInventASpawnResolution {
+    when: bedrock/ToolCancellationRetirementRequested(conversation)
+    requires: process_authority.open
+    requires: conversation.core_status = cancelling_tool
+    requires: spawn_cancellation_resolution(conversation) = indeterminate
+    ensures: FatalLocalAuthorityLost()
+
+    @guidance
+        -- The required local admission/closure fact was not established by the
+        -- owning bounded operation. Apply REQ-BED-033; do not infer no children
+        -- from a missing callback or race a still-running admission with a query.
+}
+
+rule CancellationBackstopReportsKnownSpawnFailure {
+    when: bedrock/ToolCancellationRetirementRequested(conversation)
+    requires: process_authority.open
+    requires: conversation.core_status = cancelling_tool
+    requires: spawn_cancellation_resolution(conversation) = failed
+    let invocation = owned_spawn_handoff_for_cancellation(conversation)
+    ensures: ExecutorErrorReturned(runtime_for(conversation), originating_spawn_call(invocation))
+    ensures: not bedrock/ToolCancellationRetired(conversation)
 }
 
 rule RuntimeTeardownRetiresGeneration {
@@ -408,7 +493,7 @@ rule RuntimeTeardownRetiresGeneration {
 }
 
 rule FatalLocalAuthorityClosesAdmission {
-    when: FatalLocalAuthorityLost(runtime)
+    when: FatalLocalAuthorityLost()
     let owners = ToolRuntimes
     ensures: process_authority.open = false
     ensures:
@@ -423,9 +508,8 @@ rule FatalLocalAuthorityClosesAdmission {
 }
 
 rule BedrockAuthorityCutoffClosesRuntimeFence {
-    when: bedrock/ProcessLocalAuthorityClosed(conversation)
-    let runtime = runtime_for(conversation)
-    ensures: FatalLocalAuthorityLost(runtime)
+    when: bedrock/ProcessLocalAuthorityClosed(_)
+    ensures: FatalLocalAuthorityLost()
 }
 
 rule BashWaitFallbackRetiresTaskOutcome {
@@ -465,6 +549,8 @@ surface OrdinaryToolDispatch {
         demands llm/ToolHistoryIntegrity
         demands permissions/CheckedToolExecution
         demands bedrock/ToolRoundAdmission
+        demands bedrock/ParentTerminalAcceptance
+        demands subagents/SpawnParentAdoption
         fulfils SerialToolDispatch
 
     provides:
@@ -529,7 +615,7 @@ surface RuntimeAuthorityObservations {
 
     provides:
         RuntimeToolTeardown(runtime)
-        FatalLocalAuthorityLost(runtime)
+        FatalLocalAuthorityLost()
 
     @guarantee FenceClosureDoesNotRequireAnActiveInvocation
         -- Fatal authority loss is a process/runtime fact, including while an
@@ -560,6 +646,8 @@ surface RuntimeAuthorityObservations {
 --   surface. Absence, withdrawal, and terminal-surface restrictions deny it.
 -- held_assistant_message_id(conversation) -> String: the immutable message ID of
 --   the assistant round holding the selected call; never the latest durable row.
+-- new_spawn_batch_id() -> String: the native request's fresh opaque batch identity,
+--   captured once with the original call and reused by its admission/closure owner.
 -- spawn_catalog_matches_originating_schema(runtime, call) -> Boolean: spawn is
 --   still advertised and its resolved schema equals the authentic request schema,
 --   under llm/ToolHistoryIntegrity. This does not evaluate sub-agent admission.
@@ -575,6 +663,30 @@ surface RuntimeAuthorityObservations {
 --   assistant_message_id, and that call's ID equals the captured tool_use_id.
 --   Recheck at reducer admission in the same owned step; stale, cancelled, or
 --   duplicate returns cannot settle another call or a later assistant round.
+-- spawn_invocation_is_cancelling(invocation) -> Boolean: the exact held assistant
+--   and cancelling tool ID still identify this invocation in CancellingTool.
+--   Cancellation is not evidence that its native admission response is stale.
+-- has_owned_spawn_handoff_for_cancellation(conversation) -> Boolean: the original
+--   selected spawn's native response/activation owner exists for this exact
+--   cancelling assistant/tool identity. It is not another runtime or durable store.
+-- owned_spawn_handoff_for_cancellation(conversation) -> subagents/SpawnInvocation:
+--   that retained origin, including the existing native batch ID.
+-- activation_is_unreleased_and_membership_unadopted(invocation) -> Boolean:
+--   the native handoff proves neither activation nor parent membership adoption
+--   occurred for this exact batch. A later active selection or absent current
+--   membership alone cannot establish it; an already-adopted duplicate is not
+--   authority to abandon running children.
+-- originating_spawn_call(invocation) -> bedrock/ToolCall: the actual call retained
+--   by that native owner, not a reconstructed/latest call with a reused ID.
+-- spawn_cancellation_resolution(conversation) -> SpawnCancellationResolution:
+--   established only if the exact owner proves no admission command was issued,
+--   its finished command classified a rejection without children, or the admitted
+--   unadopted batch has a classified terminalization receipt. An outstanding
+--   command/closure cannot be classified by racing it with an absence query.
+--   failed is a classified concrete native error, not cancellation success;
+--   indeterminate means the authority needed at the bounded settlement cutoff
+--   cannot be established and selects REQ-BED-033. No outstanding spawn defaults
+--   to established only from the owned operation's proof, never missing memory.
 -- spawn_rejection_result(invocation, reason) -> bedrock/ToolResult: preserve the
 --   rejection reason and use invocation.tool_use_id, never a newly selected ID.
 -- spawn_success_result(invocation, spawned_agents) -> bedrock/ToolResult: preserve

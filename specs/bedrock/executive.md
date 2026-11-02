@@ -39,6 +39,23 @@ keeps a buffered child pending until it atomically records the completed outcome
 The final-spawn transition snapshots the union of prior admitted children and the
 new batch before changing state, matching the runtime's `all_pending` construction.
 
+The spawn bridge also preserves the native batch identity and separates admission
+from activation. `RuntimeManager::handle_spawn_request` waits on `activation_rx`;
+`persist_state_effect` verifies exact child membership and signals only after
+parent-state persistence. Dropped response/activation receivers close the
+unactivated batch. A cancellation-time admission receipt therefore remains owned:
+it is classified and its unadopted children are terminalized before cancellation
+is reported settled. The cancellation-priority gap below does not authorize
+discarding that receipt when a future responsive-preparation fix is made.
+
+Normal terminal acceptance is likewise distinct from dispatch. The transport and
+buffer paths leave delivery owed. `update_state_and_accept_sub_agent` commits the
+parent projection and child acceptance marker together; only that established
+receipt acknowledges normal fan-in acceptance. Administrative closure of an
+unadopted batch is a separate disjoint disposition and creates no normal completed
+result. This describes the existing native barriers and their normative use;
+it does not deliver a new cancellation implementation or recovery mechanism.
+
 ### Cancellation implementation gaps
 
 REQ-BED-005 is partial: the owned executor awaits originating-policy/scope reads

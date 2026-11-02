@@ -63,13 +63,25 @@ Bounded off-path observation: the standalone pure `handle_core_cancellation` Can
 
 The default check on semantic head `1798815d4d8388dcc9f712fee1ffe187342bbb4c` passed five executed steps in 121.7 seconds with explicit base/worker budget, but does not qualify these subsequent model edits. A new frozen-target review/validation pass is required.
 
-## Final reviewed semantic acceptance
+## Prior reviewed semantic acceptance (superseded by automated review)
 
 - Frozen semantic target: `9441cd2824324e53697df88f4e9db07f6de3980e..6c481844365288e6f27fa5601dcee8a313fef5b0`; specs tree `4c5308266f963355ac383cc4a8fbbadfa4a4d769`.
 - Both fresh isolated contract/source and model reviewers sealed clean full-range verdicts for that target. The buffering gate was traced upstream before classifying the standalone reducer branch; no unproven live child-result-loss claim is retained.
 - `PHOENIX_CHECK_BASE=9441cd2824324e53697df88f4e9db07f6de3980e PHOENIX_CHECK_WORKERS=4 ./dev.py check` passed at that frozen semantic head in 110.4 seconds. All five executed steps passed: task validation, Allium accepted-baseline gate, spec shape, managed-Python dev.py unit tests (109.6 seconds), and spec anchors. Nine unrelated source-gated steps were skipped; no full Rust/UI suite rerun is claimed. Log: `/tmp/phoenix-dispatch-fanin-default.log` (Codex harness-local).
 - The follow-up acceptance commit changes task status/evidence only. Specification source remains frozen; hosted checks, exact-head automated review, and human merge readiness are tracked on PR #1023 separately.
 - Requirements and implementation status remain distinct: runtime follow-ups 75009 and 75010 are ready, uncommissioned work. No runtime scheduling, dispatcher extraction, recovery guarantee, or cancellation implementation is delivered by this specification task.
+
+## Native spawn adoption and terminal-acceptance corrections
+
+Automated review of `37e4e9e6ff7cea3e9fee16a4323342a572593d3b` found two further composed-model defects. The prior clean verdicts and checks do not qualify the corrected target; this task is reopened pending fresh review.
+
+- An admitted spawn response is not stale merely because its exact parent call is cancelling. `SpawnInvocation` retains the native batch ID as well as the original parent/assistant/tool identity. Cancellation withholds activation and retains its native response owner; settlement requires authoritative no-admission or complete unadopted-batch closure, never a missing callback or an absence query racing admission. Known failure uses the executor-error boundary; indeterminate local authority closes the shared process fence under REQ-BED-033. Already-adopted duplicate receipts cannot close a running batch.
+- This follows existing producer/consumer seams: `RuntimeManager::handle_spawn_request` waits for `activation_rx`; `persist_state_effect` validates exact child membership, persists that parent state, then signals activation. Dropped admission/activation receivers close the unactivated batch. The spec does not add a new activation store or restart policy. Making that path cancellation-responsive remains unimplemented runtime task 75010; no live orphan-child bug is asserted from the current blocking handler.
+- A terminal transport arrival, early buffer insertion, or pure reducer proposal no longer acknowledges normal parent acceptance. Only an established native transaction committing the exact pending-to-completed parent state together with the child acceptance marker emits the acceptance observation. This mirrors `update_state_and_accept_sub_agent`; definite failure retains delivery owed and unknown write authority follows REQ-BED-033.
+- Administrative suppression of a closed unadopted batch is disjoint from normal fan-in acceptance. The model uses one terminal disposition (`owed`, `fan_in_accepted`, or `closed_without_parent_adoption`), not redundant authoritative booleans. Unadopted closure fabricates neither a completed parent result nor an activation release, even though the native schema uses an acceptance timestamp to suppress both delivery classes.
+- Manual traces cover: admit A then cancel before adoption (withhold activation, classify original batch closure, acknowledge only after proof); admission still unresolved at the bounded cutoff (process fence, no false Idle); already-adopted duplicate (no administrative closure); raw A during tool cancellation (buffered and owed); ready A (one atomic acceptance); replay/duplicate A (no new completion/resume); native parent-write failure (still owed); unadopted closed A (no fan-in result or initial work).
+- The executor and transition source blobs remain identical to clean base `9441cd2824324e53697df88f4e9db07f6de3980e`. These findings correct the normative model; no runtime changes, timing measurements, source regression tests, new durable store, or new recovery guarantee are included.
+- Focused `PHOENIX_CHECK_BASE=9441cd2824324e53697df88f4e9db07f6de3980e PHOENIX_CHECK_WORKERS=4 ./dev.py check --lanes allium,spec-anchors,task` passes all three lanes for the corrected candidate. Log `/tmp/phoenix-dispatch-spawn-acceptance-final-fast.log` is Codex harness-local. No expensive default run is repeated before semantic freeze.
 
 ## Out-of-scope observation
 
