@@ -10,8 +10,10 @@ Source commit: `75abc99ef52ea701ed71ef7a42044d303625e5e8` (base `b32b50e13240407
 
 - Focused Vitest: 8 files, 553 tests passed, covering MessageList, MessageComponents, StateBar, atom/reconnect, token/heartbeat isolation, and fixture scenarios, plus uncovered name/queue fallback and malformed active-ID edges.
 - `./dev.py check --lanes tsc,ui-lint`: TypeScript, ESLint, and Stylelint passed.
-- `./dev.py check --lanes vitest,ast-grep,spec-anchors,task,pkglock`: full Vitest suite, spec anchors, task validation, and lockfile checks passed. Local ast-grep was skipped because the executable is not installed; this is a verification gap, not a structural-lint pass.
+- `./dev.py check --lanes vitest,ast-grep,spec-anchors,task,pkglock`: full Vitest suite, spec anchors, task validation, and lockfile checks passed. This invocation initially skipped ast-grep because the executable was not installed.
+- `npm exec --yes --package=@ast-grep/cli -- ./dev.py check --lanes ast-grep`: structural lint, manual SQL transaction validation, and Rust-test-timing validation all passed using a temporary CLI package; no global installation.
+- Default `./dev.py check-plan` requires exactly ast-grep, pkglock, spec-anchors, task, tsc, ui-lint, and vitest; every applicable lane passed. Allium/spec-shape are excluded for no spec changes, and E2E is excluded for no Rust/E2E changes.
 - `LADLE_PORT=61129 ./dev.py qa tool-results`: all 14 stories at desktop/mobile (28 Chromium captures) passed. Inspected full desktop and compact mobile shell fixtures: active timer remains distinct from finalized results. No production interaction.
 - An initial unbudgeted full-suite invocation had one streaming-disclosure timeout in MessageComponents. The owning module passed in the focused run, and the budget-four full-suite rerun passed. The timeout did not reproduce; its cause is not established.
 
-Harness-local logs and screenshots: `.phoenix/tool-activity/`. Independent source review and PR publication are owned by the parent chat; no merge or deployment is part of this task.
+Harness-local logs and screenshots: `.phoenix/tool-activity/`. The isolated rendered-fixture runner exited successfully and its Ladle server on port 61129 stopped; no agent-browser session was created. Independent source review found no actionable issues for base-to-source commit. PR publication is owned by the parent chat; no merge or deployment is part of this task.
