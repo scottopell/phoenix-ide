@@ -397,6 +397,9 @@ THE SYSTEM SHALL reject startup before resetting that buffered state
 AND SHALL retain its persisted assistant and completed-result evidence unchanged
 AND SHALL NOT replay its in-flight or unknown-effect tools.
 
+THE SYSTEM SHALL decode and validate all selected buffered tool rounds before recovery mutates any selected round or its pending-child state
+AND SHALL NOT overwrite an invalid child's buffered evidence while settling its parent.
+
 WHEN a conversation runtime successfully settles startup in a terminal state
 THE SYSTEM SHALL acknowledge startup settlement before the runtime exits so recovery of other conversations can continue
 AND the acknowledgement SHALL mean startup settlement, not completion of an LLM request

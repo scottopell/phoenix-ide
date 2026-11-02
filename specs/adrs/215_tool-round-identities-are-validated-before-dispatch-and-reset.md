@@ -20,6 +20,8 @@ Choose option 2. A shared identity validator establishes uniqueness and one-to-o
 
 Startup materialization returns an error for an undecodable or invalid held round before orphan repair and global reset. The persisted buffer remains unchanged, and the server does not admit execution from it. This is a refusal policy, not an automatic repair or a new cross-version compatibility promise. Arbitrary manually corrupted live state does not gain a quarantine or recovery workflow.
 
+All selected rounds are read and validated into write plans before any recovery mutation begins. Per-row validation followed immediately by commit is insufficient: settling a valid parent can overwrite a later selected child's malformed buffer before that child's validation runs. The scoped materializer still ignores buffers outside its selected conversation set.
+
 ## Consequences
 
 - **Positive:** Both live admission and restart assembly use the same identity rule, and valid supplied order, metadata, and trusted-skill receipts are preserved.

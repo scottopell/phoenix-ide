@@ -144,6 +144,8 @@ contract ToolRoundAdmission {
         -- round prevents startup admission before its persisted state is reset.
         -- Its held assistant and completed results remain unchanged; unknown-effect
         -- tools are not replayed and malformed data is not silently repaired.
+        -- Every selected held round is decoded and paired before any recovery
+        -- mutation, including a parent's settlement of pending child state.
 }
 
 ------------------------------------------------------------

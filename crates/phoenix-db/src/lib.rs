@@ -12632,7 +12632,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        let mut materialized = std::collections::HashSet::new();
+        let mut plans = Vec::new();
         for (conv_id, state_json, state_updated_at) in conv_rows {
             if only_conversations.is_some_and(|ids| !ids.contains(&conv_id)) {
                 continue;
@@ -12720,6 +12720,25 @@ impl Database {
                 ))
             })?;
 
+            plans.push(RestartToolRoundPlan {
+                assistant: agent_msg,
+                results: tool_msgs,
+                pending_sub_agents,
+                sub_agent_outcomes,
+                completed_count: completed_results.len(),
+            });
+        }
+
+        let mut materialized = std::collections::HashSet::new();
+        for RestartToolRoundPlan {
+            assistant: agent_msg,
+            results: tool_msgs,
+            pending_sub_agents,
+            sub_agent_outcomes,
+            completed_count,
+        } in plans
+        {
+            let conv_id = agent_msg.conversation_id.clone();
             let interrupted = ConvState::Failed {
                 error: "Sub-agent interrupted by server restart".to_string(),
                 error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
@@ -12804,8 +12823,8 @@ impl Database {
 
             tracing::info!(
                 conv_id = %conv_id,
-                completed = completed_results.len(),
-                interrupted = tool_msgs.len() - completed_results.len(),
+                completed = completed_count,
+                interrupted = tool_msgs.len() - completed_count,
                 "materialized in-flight tool round on restart",
             );
         }
@@ -15927,6 +15946,15 @@ struct NormalizedRound {
     completed_results: Vec<ToolResult>,
     interrupted_tool_ids: Vec<String>,
     pending_sub_agents: Vec<phoenix_core::domain::sm_state::PendingSubAgent>,
+}
+
+struct RestartToolRoundPlan {
+    assistant: Message,
+    results: Vec<Message>,
+    pending_sub_agents: Vec<phoenix_core::domain::sm_state::PendingSubAgent>,
+    sub_agent_outcomes:
+        std::collections::HashMap<String, phoenix_core::domain::sm_state::SubAgentOutcome>,
+    completed_count: usize,
 }
 
 /// Normalize a recovered in-flight tool round (`ToolExecuting` or
