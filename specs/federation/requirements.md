@@ -6,7 +6,7 @@ A Coordinator operating one trusted Phoenix instance needs to use supported coor
 
 ## Scope and related contracts
 
-This specification covers the existing `send_conversation_message` and `read_goal` tools, each extended with an optional `instance` selector, and durable remote conversation watches. Goal mutations (including creation), settings, Continue, conversation creation, and rename are outside this contract.
+This specification covers optional `instance` selection on `send_conversation_message`, `read_conversation`, `resolve_reference`, and `read_goal`, and durable remote conversation watches. Goal mutations (including creation), settings, Continue, conversation creation, and rename are outside this contract.
 
 Related contracts remain authoritative for their domains:
 
@@ -23,11 +23,15 @@ Related contracts remain authoritative for their domains:
 
 **REQ-FED-001 — Optional destination selection**
 
-When `send_conversation_message` or `read_goal` receives an `instance` selector, the system shall execute that existing tool operation against the uniquely selected saved peer; when the selector is absent, the system shall preserve the tool's local behavior.
+When `send_conversation_message`, federated `read_conversation`, `resolve_reference`, or `read_goal` receives the exact, case-sensitive `instance` string `"local"` or omits the selector, the system shall execute the local operation with the same authority checks, validation, result shape, provenance, pagination, waits, and message retry identity.
+
+When one of these tools receives another string selector, the system shall select the remote destination through saved-peer UUID or unambiguous display-name resolution. Recognizing the local selector shall not trim whitespace or fold case. The literal `"local"` shall be reserved for the instance executing the tool.
+
+An explicit `null` selector shall select local routing on the read tools; `send_conversation_message` shall reject an explicit `null`. Tools without an optional `instance` parameter, including remote-only SQL using a required `instance_id` UUID, shall retain their own input and authority contracts.
 
 **REQ-FED-002 — No destination fallback**
 
-If peer selection, authentication, identity verification, transport, or remote execution fails after an instance was selected, the system shall report that failure and shall not execute the operation locally or against another peer.
+If peer selection, authentication, identity verification, transport, or remote execution fails after a remote selector was supplied, the system shall report that failure and shall not execute the operation locally or against another peer.
 
 **REQ-FED-003 — Destination-owned admission**
 
@@ -98,6 +102,14 @@ The system shall use each domain operation's sufficient durable identity and jou
 **REQ-FED-018 — No global remote-control lease**
 
 The system shall resolve concurrent local and remote operations through destination-owned domain transactions and preconditions rather than an exclusive global remote-control lock.
+
+### Peer naming
+
+**REQ-FED-019 — Reserve local as a peer name**
+
+When a peer enrollment or saved peer connection is created or replaced, the system shall trim the display name and reject a blank name or a name equal to `local` ignoring ASCII case. Rejection shall provide a clear input error before replacing a credential or changing the saved connection.
+
+Tool destination selection shall not rename saved peers, change their trust, or rewrite persisted display names.
 
 ## Non-goals
 

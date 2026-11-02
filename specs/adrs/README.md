@@ -208,6 +208,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [213](213_macos-bash-launch-qualification-is-the-only-hosted-launch-ci.md) | macOS Bash launch qualification is the only separate hosted launch CI | Accepted | REQ-BASH-017 |
 | [214](214_coordinator-speaks-as-ember.md) | The Coordinator speaks as Ember, the phoenix on the user's shoulder | Accepted | REQ-GR-021, REQ-GR-011 |
 | [215](215_tool-round-identities-are-validated-before-dispatch-and-reset.md) | Tool-round identities are validated before dispatch and reset | Accepted | REQ-BED-004, REQ-BED-007 |
+| [216](216_explicit-local-tool-selector-reuses-local-admission.md) | Explicit local tool selection reuses local admission | Accepted | REQ-FED-001, REQ-FED-002, REQ-FED-019 |
 
 ## For agents: which decisions bind your task
 

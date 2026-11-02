@@ -37,6 +37,8 @@ variant RemoteCoordinatorProvenance : RemoteMessageProvenance {
 enum ToolKind {
     send_conversation_message
     | read_goal
+    | read_conversation
+    | resolve_reference
 }
 
 enum SubscriptionState {
@@ -163,8 +165,12 @@ config {
     max_disconnected_age: Duration
 }
 
--- saved_peer(instance) resolves exactly one saved peer or fails. The selected
--- peer must be authenticated and destination identity-verified before dispatch.
+-- saved_peer(instance) resolves exactly one saved peer by UUID or display name
+-- or fails. The exact string "local" is reserved before peer resolution; it is
+-- case-sensitive and is not trimmed. Peer-name creation and replacement reject
+-- the reserved name local under REQ-FED-019 in requirements.md.
+-- ToolSelection.instance is the normalized selector: null means local.
+-- A selected peer must be authenticated and destination identity-verified before dispatch.
 -- destination_send and destination_read_goal use the destination's ordinary
 -- domain admission and read services, respectively; they are not new tools.
 -- stable_destination_for(target: MessageTarget) -> String and
@@ -179,20 +185,20 @@ config {
 
 rule SelectLocalTool {
     when: SelectTool(tool, instance)
-    requires: instance = null
-    ensures: ToolSelection.created(tool: tool, instance: instance, destination: null, failed: false)
+    requires: instance = null or instance = "local"
+    ensures: ToolSelection.created(tool: tool, instance: null, destination: null, failed: false)
 }
 
 rule SelectRemoteTool {
     when: SelectTool(tool, instance)
-    requires: instance != null
+    requires: instance != null and instance != "local"
     requires: exists saved_peer(instance)
     ensures: ToolSelection.created(tool: tool, instance: instance, destination: saved_peer(instance), failed: false)
 }
 
 rule RemoteSelectionFails {
     when: SelectTool(tool, instance)
-    requires: instance != null
+    requires: instance != null and instance != "local"
     requires: not exists saved_peer(instance)
     ensures: ToolSelection.created(tool: tool, instance: instance, destination: null, failed: true)
     ensures: SelectionError(tool, instance)
