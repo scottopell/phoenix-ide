@@ -5,8 +5,8 @@
 -- Scope: the ordinary tool-executor boundary between Bedrock's selection of
 -- one active call and submission of its outcome to the reducer. ToolInvocation
 -- describes process-local ownership, not another conversation state or durable
--- schedule. Preparation includes reads, a start-time broadcast, context assembly,
--- and metrics-writer setup; it is not a side-effect-free planning operation.
+-- schedule. Layer 0 precedes call-resource admission. Cleared preparation then
+-- includes the start-time broadcast, context and metrics setup; it is not pure.
 --
 -- spawn_agents uses the sub-agent admission/materialization rules instead of
 -- this ordinary invocation lifecycle. Reducer-intercepted approval, question,
@@ -88,15 +88,11 @@ entity ToolInvocation {
     runtime: ToolRuntime
     call: bedrock/ToolCall
     generation: Integer
-    phase: preparing | denied | launched | cancelling | settled | retired
+    phase: preparing | launched | cancelling | settled | retired
 
     transitions phase {
-        preparing -> denied
         preparing -> launched
         preparing -> retired
-        denied -> cancelling
-        denied -> settled
-        denied -> retired
         launched -> cancelling
         launched -> settled
         launched -> retired
@@ -340,7 +336,7 @@ rule UnclassifiedSpawnAuthorityClosesTheProcessFence {
     ensures: FatalLocalAuthorityLost()
 }
 
-rule BeginOrdinaryPreparation {
+rule RequestOrdinaryPermissionBeforeResources {
     when: bedrock/ToolExecutionStarted(conversation, call)
     let runtime = runtime_for(conversation)
     requires: conversation.core_status = executing_tools
@@ -350,39 +346,75 @@ rule BeginOrdinaryPreparation {
     requires: originating_policy_allows(runtime, call)
     requires: call.name != "spawn_agents"
     requires: preparation_scope_read_succeeded(runtime, call)
+    let selection = DispatchSelection{
+        runtime: runtime,
+        assistant_message_id: held_assistant_message_id(conversation),
+        call: call
+    }
+    ensures: OrdinaryPermissionCheckRequested(selection)
+
+    @guidance
+        -- Evaluate the pure deterministic deny decision before ordinary dispatch
+        -- generation/token/channel, start publication, context or metrics-writer
+        -- allocation. Authority reads do not reserve tool execution resources.
+        -- No gate return can suspend cancellation priority under REQ-BED-005.
+}
+
+rule DeniedSelectionReturnsWithoutCallResources {
+    when: PermissionDenied(selection, denial)
+    requires: process_authority.open
+    requires: selection_is_current(selection)
+    ensures: bedrock/ToolCompletes(selection.runtime.conversation,
+        denied_selection_result(selection, denial))
+    ensures: not OrdinaryGenerationOpened(selection.runtime, selection.call)
+    ensures: not CallResourcesReserved(selection)
+    ensures: not ToolTaskLaunched(selection.runtime, selection.call)
+
+    @guidance
+        -- Return an ordinary error paired to the original selected call. No
+        -- invocation/generation or tool task is needed to deliver this denial.
+        -- Permission counting/escalation remains outside CheckedToolExecution.
+}
+
+rule StaleDeniedSelectionCannotCompleteLaterWork {
+    when: PermissionDenied(selection, denial)
+    requires: not process_authority.open or not selection_is_current(selection)
+    ensures: not ConversationMutation(selection.runtime.conversation)
+    ensures: not ToolTaskLaunched(selection.runtime, selection.call)
+}
+
+rule ClearedSelectionAdmitsOrdinaryPreparation {
+    when: PermissionCleared(selection, checked_call)
+    let runtime = selection.runtime
+    let call = selection.call
+    requires: process_authority.open
+    requires: selection_is_current(selection)
+    requires: not has_active_ordinary_invocation(runtime.conversation)
+    requires: checked_payload_matches(checked_call, call)
     let generation = runtime.generation + 1
     ensures: runtime.generation = generation
     ensures: ToolInvocation.created(
         runtime: runtime, call: call,
         generation: generation, phase: preparing
     )
+    ensures: OrdinaryPreparationRequested(runtime, call, generation, checked_call)
 
     @guidance
-        -- The owned runtime loop awaits request-policy and legacy-scope reads;
-        -- a failed read propagates before task launch. It broadcasts the tool
-        -- start timestamp, opens a generation with its cancellation token, and
-        -- builds the context and metrics sink before asking the deny gate.
-        -- These actions do not authorize tool execution. Preparation does not
-        -- suspend the cancellation priority or interruption bound in REQ-BED-005.
+        -- Only the cleared proof admits generation/token/channel, start-time
+        -- publication, context and metrics setup. Keep the original selection
+        -- and checked payload through preparation; cancellation may retire it.
 }
 
-rule GateDeniesPreparedCall {
-    when: PermissionDenied(invocation, denial)
-    requires: invocation.phase = preparing
-    requires: process_authority.open
-    ensures: invocation.phase = denied
-    ensures: OutcomeForwarded(invocation, denied_outcome(invocation, denial))
-    ensures: not ToolTaskLaunched(invocation.runtime, invocation.call)
-
-    @guidance
-        -- Forward a completed error through the ordinary generation-tagged
-        -- outcome channel. The dispatch generation is already open. Start-time
-        -- publication and metrics setup may have occurred; no tool task runs.
-        -- Denial counts and escalation are not part of CheckedToolExecution.
+rule StaleClearedSelectionCannotReserveCallResources {
+    when: PermissionCleared(selection, checked_call)
+    requires: not process_authority.open or not selection_is_current(selection)
+    ensures: not OrdinaryGenerationOpened(selection.runtime, selection.call)
+    ensures: not CallResourcesReserved(selection)
+    ensures: not ToolTaskLaunched(selection.runtime, selection.call)
 }
 
-rule GateClearsAndLaunchesCall {
-    when: PermissionCleared(invocation, checked_call)
+rule PreparedClearedCallLaunches {
+    when: OrdinaryPreparationCompleted(invocation, checked_call)
     requires: invocation.phase = preparing
     requires: process_authority.open
     requires: invocation.runtime.conversation.core_status = executing_tools
@@ -392,12 +424,11 @@ rule GateClearsAndLaunchesCall {
     ensures: ToolTaskLaunched(invocation.runtime, invocation.call)
 
     @guidance
-        -- Transfer the checked call and context into the retained tool task.
+        -- Transfer the same checked call and context into the retained tool task.
         -- Immediately before ToolExecutor::execute, recheck the live callable
         -- definition against the originating schema under ToolHistoryIntegrity.
         -- Revoked or changed admission returns Failed without running the tool.
-        -- Live-MCP resolution must consume the same checked name, payload, and
-        -- schema. A successful deny-gate decision is not sufficient authority.
+        -- Live-MCP resolution consumes the same checked name, payload and schema.
 }
 
 rule ForwardTaskOutcome {
@@ -460,7 +491,7 @@ rule CooperativeCancellationPreservesGeneration {
     when: bedrock/ToolAbortRequested(conversation)
     requires: has_active_ordinary_invocation(conversation)
     let invocation = active_invocation_for(conversation)
-    requires: invocation.phase in { denied, launched }
+    requires: invocation.phase = launched
     requires: process_authority.open
     requires: invocation.runtime.conversation.core_status = cancelling_tool
     ensures: invocation.phase = cancelling
@@ -469,7 +500,7 @@ rule CooperativeCancellationPreservesGeneration {
 
     @guidance
         -- Keep the retained task and generation so its cooperative outcome can
-        -- reach CancellingTool. A queued denial can settle that same state.
+        -- reach CancellingTool. A cancelled pre-gate selection starts no task.
 }
 
 rule CancellationDuringOrdinaryPreparationPreventsLaunch {
@@ -494,7 +525,7 @@ rule CancellationBackstopRetiresGeneration {
     when: bedrock/ToolCancellationRetirementRequested(conversation)
     let owner = runtime_for(conversation)
     let retiring = ToolInvocations where runtime = owner
-        and phase in { preparing, denied, launched, cancelling }
+        and phase in { preparing, launched, cancelling }
     requires: process_authority.open
     requires: conversation.core_status = cancelling_tool
     requires: spawn_cancellation_resolution(conversation) = established
@@ -540,7 +571,7 @@ rule CancellationBackstopReportsKnownSpawnFailure {
 rule RuntimeTeardownRetiresGeneration {
     when: RuntimeToolTeardown(runtime)
     let owner = runtime
-    let retiring = ToolInvocations where phase in { preparing, denied, launched, cancelling }
+    let retiring = ToolInvocations where phase in { preparing, launched, cancelling }
         and runtime = owner
     ensures: runtime.generation = runtime.generation + 1
     ensures: SlotCancellationTokenSignalledIfPresent(runtime)
@@ -601,7 +632,7 @@ rule BashWaitFallbackRetiresTaskOutcome {
 
 invariant ActiveInvocationUsesCurrentGeneration {
     for invocation in ToolInvocations:
-        invocation.phase in { preparing, denied, launched, cancelling }
+        invocation.phase in { preparing, launched, cancelling }
             implies invocation.generation = invocation.runtime.generation
 }
 
@@ -660,6 +691,28 @@ surface PreparationReadObservations {
         -- it closes the shared process fence even if its selection became stale.
 }
 
+surface PermissionBoundaryObservations {
+    facing runtime: ToolRuntime
+    context selection: DispatchSelection
+
+    contracts:
+        demands permissions/CheckedToolExecution
+
+    provides:
+        PermissionCleared(selection, checked_call)
+            when selection.runtime = runtime
+        PermissionDenied(selection, denial)
+            when selection.runtime = runtime
+
+    @guarantee ExactGateReturnPrecedesCallResourceAdmission
+        -- OrdinaryPermissionCheckRequested invokes the deterministic gate once
+        -- for the captured selection, before reserving any tool-call resources.
+        -- Return exactly one proof or denial with that same immutable origin.
+        -- Cleared carries the exact gate-minted name/input; Denied reserves no
+        -- generation/task/context/start/metrics resources. A late return cannot
+        -- borrow the latest selection. These returns do not fulfil escalation.
+}
+
 surface InvocationBoundaryObservations {
     facing runtime: ToolRuntime
     context invocation: ToolInvocation
@@ -668,9 +721,7 @@ surface InvocationBoundaryObservations {
         demands permissions/CheckedToolExecution
 
     provides:
-        PermissionCleared(invocation, checked_call)
-            when invocation.runtime = runtime and invocation.phase = preparing
-        PermissionDenied(invocation, denial)
+        OrdinaryPreparationCompleted(invocation, checked_call)
             when invocation.runtime = runtime and invocation.phase = preparing
         ToolReceiverResolved(invocation, outcome)
             when invocation.runtime = runtime
@@ -679,18 +730,17 @@ surface InvocationBoundaryObservations {
             when invocation.runtime = runtime
                  and invocation.phase in { launched, cancelling, retired }
 
-    @guarantee PreparationReturnsItsExactGateDecision
-        -- After ordinary preparation, the synchronous checked-call gate returns
-        -- exactly one of PermissionCleared or PermissionDenied for this invocation.
-        -- Cleared carries the proof minted for this exact name and payload;
-        -- Denied carries that check's denial. These observations do not evaluate
-        -- or fulfil the separate permission-count/escalation rules.
+    @guarantee PreparationRetainsTheClearedProof
+        -- OrdinaryPreparationRequested supplies the exact runtime/call/generation
+        -- identifying the newly created invocation and its gate-minted call.
+        -- Successful preparation returns that same proof for this exact owned
+        -- invocation; it does not mint a new payload or read the latest selection.
 
     @guarantee ReceiverObservationIsExclusive
         -- Only an invocation with a launched tool task has a receiver here.
         -- Its first outcome or sender loss resolves that receiver once, even
         -- after retirement. The two observations are mutually exclusive. Denial
-        -- uses its separate immediate error forwarder and starts no tool task.
+        -- is settled before an ordinary invocation exists and starts no tool task.
 }
 
 surface RuntimeAuthorityObservations {
@@ -719,7 +769,10 @@ surface RuntimeAuthorityObservations {
 -- runtime_for(conversation: bedrock/Conversation) -> ToolRuntime: the live owned
 --   executor for that conversation; this lookup does not create a runtime.
 -- has_active_ordinary_invocation(conversation: bedrock/Conversation) -> Boolean:
---   its runtime owns a preparing, denied, launched, or cancelling invocation.
+--   its runtime owns a preparing, launched, or cancelling invocation.
+-- CallResourcesReserved(selection): generation/token/channel, context,
+--   tool-start publication and metrics-writer resources admitted for that call.
+--   Immutable selection and authority reads are not execution-resource admission.
 -- active_invocation_for(conversation: bedrock/Conversation) -> ToolInvocation:
 --   that exact current-generation ordinary invocation. Requires the preceding
 --   presence predicate; intercepted sub-agent dispatch does not fabricate one.
@@ -790,7 +843,8 @@ surface RuntimeAuthorityObservations {
 --   assistant turn under llm/ToolHistoryIntegrity.
 -- checked_payload_matches(checked_call, call): the checked name and serialized
 --   input are exactly the active call's name and input, under CheckedToolExecution.
--- denied_outcome(invocation, denial): completed error for the owned call ID.
+-- denied_selection_result(selection, denial): ordinary error with the denial
+--   diagnostics and captured call ID, never a later selected provider ID.
 -- failed_outcome(invocation): failed outcome for the owned call ID on sender loss.
 -- owned_outcome(invocation, outcome): outcome when its ID matches; otherwise a
 --   Failed outcome for the expected ID that discards the foreign output.

@@ -62,10 +62,12 @@ contract CheckedToolExecution {
     @invariant ExactPayloadAuthority
         -- REQ-PERM-001 through REQ-PERM-005: registry and live-MCP execution
         -- require the checked name and payload minted by the deny gate. Denial
-        -- starts no tool task and returns an ordinary error result. This
+        -- reserves no call resources, starts no tool task and returns an ordinary
+        -- error result. Resource admission follows the cleared proof. This
         -- contract covers the gate decision and checked payload only; it does
         -- not include DenialTracker or REQ-PERM-006 escalation. Reducer- and
-        -- runtime-intercepted calls remain governed by REQ-PERM-007.
+        -- runtime-intercepted calls remain governed by REQ-PERM-007's exact
+        -- named typed-internal exception class, not an unrestricted bypass.
 }
 
 ------------------------------------------------------------
@@ -264,9 +266,10 @@ surface AgentToolGate {
         -- guarantee is scoped to that boundary: the lower-level Tool::run
         -- primitive is not itself sealed, but the registry exposes no ungated
         -- name+input execute shortcut, so the runtime reaches run only through
-        -- the gated executor. Reducer-intercepted calls (spawn_agents,
-        -- propose_task, ask_user_question, submit_result, submit_error) never
-        -- reach this boundary and are gated by their own typed transitions.
+        -- the gated executor. The named internal calls never reach this boundary
+        -- or arbitrary Tool::run: spawn_agents uses owned runtime admission,
+        -- while propose_task, ask_user_question, submit_result and submit_error
+        -- are reducer-intercepted. Each has its own typed validation contract.
 
     @guarantee DenyAndContinue
         -- A denial is delivered as an ordinary tool result with a reason, not a

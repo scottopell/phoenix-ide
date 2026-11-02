@@ -564,6 +564,20 @@ rule InitialWorkStartsIfNotCancelled {
     ensures: InitialWorkDispatched(child)
 }
 
+rule ReleasedBatchRequestsItsExactChildrenInitialWork {
+    when: SpawnActivationReleased(invocation)
+    let members = SubAgentAdmissions where batch_id = invocation.batch_id
+    ensures:
+        for admission in members:
+            SubAgentInitialWorkRequested(admission.child)
+
+    @guidance
+        -- The owning manager observed the one-shot release after committed exact
+        -- parent membership. Each child's initial-work claim still atomically
+        -- checks cancellation; a cancellation winner starts no work. Admission
+        -- response alone is not this release and cannot request initial work.
+}
+
 rule ConcurrentMaterializationJoinsByChildIdentity {
     when: SubAgentRuntimeRequested(child)
     ensures: JoinedSubAgentMaterialization(child)
@@ -741,6 +755,9 @@ surface NativeSpawnAdoptionBoundary {
         fulfils SpawnParentAdoption
 
     provides:
+        SpawnActivationReleased(invocation)
+            when owner_controls_batch(owner, invocation)
+                 and exact_batch_activation_release_established(invocation)
         UnactivatedSpawnBatchReconciled(invocation)
             when owner_controls_batch(owner, invocation)
                  and unactivated_batch_reconciliation_established(invocation)
@@ -762,6 +779,17 @@ surface NativeSpawnAdoptionBoundary {
         -- observation, preserving its diagnostics. Joining signals require no
         -- second publication after the first receipt retires parent ownership.
 
+    @guarantee SuccessfulParentCommitProducesOneActivationRelease
+        -- The exact normal spawn admission return remains bound to its native
+        -- response/activation owner across Bedrock's typed parent transition.
+        -- Validate every expected child in that parent's membership, establish
+        -- the parent-state commit, then release the one-shot activation sender.
+        -- The manager's successful receiver supplies SpawnActivationReleased
+        -- once for that same invocation/batch, producing each child's initial
+        -- work request above. Cancellation-before-adoption withholds this release;
+        -- cancellation racing a child claim is resolved atomically by the child
+        -- lifecycle, never by treating admission as permission to run.
+
     @guidance
         -- The required native response owns terminalization and reconciliation;
         -- these observations are established facts, not a free-standing trigger
@@ -775,6 +803,11 @@ surface NativeSpawnAdoptionBoundary {
 ------------------------------------------------------------
 -- owner_controls_batch(owner, invocation) -> Boolean: the native response and
 --   activation owner is bound to invocation.batch_id and its exact parent/call.
+-- exact_batch_activation_release_established(invocation) -> Boolean: the native
+--   owner verified all exact admitted child IDs in the captured parent's state,
+--   established that state commit and successfully released its one-shot receiver.
+--   This is the existing parent-persist sender -> manager activation_rx seam;
+--   admission alone, a later round or a dropped receiver supplies no such proof.
 -- unactivated_batch_reconciliation_established(invocation) -> Boolean: the owner
 --   established rejection/no admission, or complete terminal cancellation evidence
 --   for the exact admitted membership with no initial dispatch/activation release,

@@ -3191,6 +3191,9 @@ rule ModeChangeNotification {
 --   backstop_terminal_evidence_matches_owned_request(conversation, result) -> Boolean
 --       The native backstop captured this exact pending child in its current
 --       owned request and established terminal evidence before producing result.
+--       If the child was already terminal, result retains that exact persisted
+--       payload/cause; otherwise atomic cancellation establishment supplies it.
+--       Parent timeout presentation policy is distinct from this raw evidence.
 --   exact_requested_backstop_drain_committed(conversation) -> Boolean
 --       Every child captured by that same owned backstop request has an established
 --       parent-state/child-acceptance commit. Neither a later Idle state, partial
@@ -3973,8 +3976,13 @@ surface RuntimeCancellationBackstopObservations {
     @guarantee NativeBackstopDrainsThroughActualParentAcceptance
         -- SubAgentCancellationBackstopRequested invokes this owned native step,
         -- not an independent queue. Snapshot pending identities once; for each,
-        -- establish terminal evidence and process its typed outcome through the
-        -- existing parent acceptance transaction. Only after every target was
+        -- atomically classify terminal evidence: reuse an already established
+        -- authentic payload/cause, or establish cancellation only if nonterminal.
+        -- A racing terminal commit wins by that same atomic classification;
+        -- it cannot be replaced by a fabricated cancellation payload. Process
+        -- the selected raw outcome through the existing parent acceptance
+        -- transaction, preserving the owning parent's separate timeout policy.
+        -- Only after every target was
         -- accepted may that same step provide its one DrainCommitted observation.
         -- Earlier arrivals/duplicates may already have accepted a target; its
         -- exact durable acceptance still supplies proof, not another result.

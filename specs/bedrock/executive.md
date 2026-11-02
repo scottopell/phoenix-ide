@@ -16,13 +16,13 @@ The serial dispatch boundary is specified in `tool-dispatch.allium`, composed
 with Bedrock's round admission, the LLM originating-request/schema contract,
 the narrow permission checked-call contract, and sub-agent admission rules.
 Bedrock represents one active call separately from its ordered remaining queue.
-The dispatcher spec distinguishes early unavailable results, side-effecting
-preparation, permission denial without a tool task, launch-time live admission,
+The dispatcher spec distinguishes early unavailable results, Layer 0 denial
+before call-resource admission, cleared side-effecting preparation, launch-time admission,
 generation/state/identity completion guards, sender-loss settlement, cooperative
-cancellation, and forced task retirement. The ownership/admission paths describe
-implemented behavior; preparation responsiveness and the forced-notice carry
-through cooperative child drain are normative requirements with verified runtime gaps.
-no dispatcher extraction or concurrent tool scheduling is implemented by this
+cancellation, and forced task retirement. Launch/ownership barriers exist, while
+pre-denial resource ordering, preparation responsiveness and several cancellation
+classification/notice paths below remain normative targets with verified gaps.
+No dispatcher extraction or concurrent tool scheduling is implemented by this
 specification work. Permission counters/escalation remain outside this boundary.
 
 The dispatcher uses one shared process-wide authority fence, including when a
@@ -78,6 +78,14 @@ and task 75011 owns the required handoff classification/ownership plumbing.
 
 ### Cancellation implementation gaps
 
+REQ-PERM-004's no-resource denial is partial at the dispatcher: the existing code
+broadcasts the tool start, allocates a channel/token/generation and constructs a
+context/metrics writer before `DenyGate::check`. A denied call launches no tool
+task, but it has already reserved resources, so that ordering does not fulfill the
+whole requirement. The target gate operates on immutable selected-call identity
+before resource admission; only its exact cleared proof may open a generation.
+Task 75010 includes this preparation-boundary ordering correction.
+
 REQ-BED-005 is partial: the owned executor awaits originating-policy/scope reads
 and intercepted spawn admission before returning to its cancellation select.
 This can delay cancellation behind preparation, contrary to the immediate,
@@ -104,6 +112,15 @@ deadline is cleared, without rearming it or forwarding unknown cleanup-write
 authority to the fatal fence. The user-cancel notice can then be emitted after a
 partial drain. Task 75009 includes this classification/notice qualification; no
 production direct-to-Idle bypass is asserted and no runtime fix is delivered.
+
+An already-terminal child is another backstop qualification gap. The DB helper
+locks and refuses conflicting terminal evidence rather than overwriting it, but
+does not return that existing authentic payload for delivery; the executor logs
+the conflict and skips that child. The target atomically reuses established raw
+terminal payload/cause, or establishes cancellation only when nonterminal. Existing
+parent Timeout-to-TimedOut presentation policy is separate and remains intact.
+Task 75009 includes this race alongside classification/drain/notice qualification;
+no source overwrite or new runtime regression is claimed.
 
 The forced-retirement fact is scoped to the current live cancellation chain.
 Generic restart/error recovery interrupts or replaces that chain under
