@@ -1023,11 +1023,20 @@ rule BackstopTerminalEvidenceEntersNormalFanIn {
 
 rule BackstopCompletedNoticeFollowsAcceptedDrain {
     when: SubAgentBackstopDrainCommitted(conversation)
-    requires: conversation.core_status = idle
+    requires: exact_requested_backstop_drain_committed(conversation)
     requires: live_runtime_authority_open(conversation)
     requires: not forced_notice_already_published_for_owned_chain(conversation)
     ensures: SystemMessageInjected(conversation,
         "Cancellation completed. Aborted work may still be reclaiming resources in the background.")
+
+    @guidance
+        -- This is the completed chain captured by the still-owned native
+        -- backstop call, not a predicate over the latest conversation state.
+        -- Inline steering may enter LlmRequesting after the last child settles
+        -- and before this call returns; it cannot invalidate the old chain's
+        -- established drain proof or retarget this notice to the new turn.
+        -- The same owned chain's already-published forced-tool notice suppresses
+        -- a second publication. No durable notice store or replay is implied.
 }
 
 rule BackstopDefiniteWriteFailureCannotReportCompletion {
@@ -3186,6 +3195,9 @@ rule ModeChangeNotification {
 --       Every child captured by that same owned backstop request has an established
 --       parent-state/child-acceptance commit. Neither a later Idle state, partial
 --       drain, worker absence nor a failed write supplies this proof.
+--       The owned call retains its exact completed-chain binding even if inline
+--       steering advances the conversation before the call returns. Reading the
+--       latest state or borrowing a different cancellation chain is not proof.
 --   forced_notice_already_published_for_owned_chain(conversation) -> Boolean
 --       The same native operation observed the live forced-tool notice already
 --       durably published by the last-child transition. It does not infer receipt
