@@ -24,7 +24,10 @@ external entity ToolRuntime {
     authority_open: Boolean
 }
 
-value InvocationOutcome {
+-- The typed runtime outcome owns its complete payload; this boundary observes
+-- its identity and variant. Completed payloads and failure diagnostics remain
+-- lossless when converted to Bedrock results.
+external entity InvocationOutcome {
     tool_use_id: String
     kind: completed | failed | aborted
 }
@@ -80,7 +83,8 @@ entity ToolInvocation {
 -- ordinary dispatch ownership. Failure to read authority is an executor error,
 -- not a fabricated unavailable result or permission to execute.
 rule RejectUnavailableCallBeforeOwnership {
-    when: ToolDispatchRequested(runtime, call)
+    when: bedrock/ToolExecutionStarted(conversation, call)
+    let runtime = runtime_for(conversation)
     requires: runtime.authority_open
     requires: request_policy_read_succeeded(runtime)
     requires: not originating_policy_allows(runtime, call)
@@ -108,7 +112,8 @@ rule PreparationScopeReadFails {
 }
 
 rule RouteSpawnToItsAdmissionBoundary {
-    when: ToolDispatchRequested(runtime, call)
+    when: bedrock/ToolExecutionStarted(conversation, call)
+    let runtime = runtime_for(conversation)
     requires: runtime.authority_open
     requires: originating_policy_allows(runtime, call)
     requires: call.name = "spawn_agents"
@@ -124,7 +129,8 @@ rule RouteSpawnToItsAdmissionBoundary {
 }
 
 rule BeginOrdinaryPreparation {
-    when: ToolDispatchRequested(runtime, call)
+    when: bedrock/ToolExecutionStarted(conversation, call)
+    let runtime = runtime_for(conversation)
     requires: runtime.authority_open
     requires: originating_policy_allows(runtime, call)
     requires: call.name != "spawn_agents"
@@ -193,24 +199,36 @@ rule DiscardStaleOrFencedOutcome {
     when: OutcomeForwarded(invocation, outcome)
     requires: not invocation.runtime.authority_open
         or invocation.generation != invocation.runtime.generation
-    ensures: not OutcomeSubmittedToReducer(invocation, outcome)
     ensures: not ConversationMutatedByOutcome(invocation, outcome)
 }
 
-rule SubmitOwnedOutcome {
+rule SubmitOwnedCompletionOrFailure {
     when: OutcomeForwarded(invocation, outcome)
     requires: invocation.runtime.authority_open
     requires: invocation.generation = invocation.runtime.generation
+    requires: outcome.kind in { completed, failed }
     requires: reducer_accepts(invocation, outcome)
     ensures: invocation.phase = settled
-    ensures: OutcomeSubmittedToReducer(invocation, outcome)
+    ensures: bedrock/ToolCompletes(
+        invocation.runtime.conversation, tool_result_for(invocation, outcome)
+    )
 
     @guidance
-        -- Completed and Failed become the expected call's ToolComplete; Aborted
-        -- is accepted only in CancellingTool. Bedrock's cancellation rules
+        -- Completed and Failed become the expected call's ToolComplete.
+        -- Bedrock's cancellation rules
         -- checkpoint synthetic results rather than adopting a late real result.
         -- Reducer rejection leaves conversation state unchanged; it does not
         -- convert a current generation into permission to use another state.
+}
+
+rule SubmitOwnedAbortDuringCancellation {
+    when: OutcomeForwarded(invocation, outcome)
+    requires: invocation.runtime.authority_open
+    requires: invocation.generation = invocation.runtime.generation
+    requires: outcome.kind = aborted
+    requires: reducer_accepts(invocation, outcome)
+    ensures: invocation.phase = settled
+    ensures: bedrock/ToolAborted(invocation.runtime.conversation)
 }
 
 rule RejectCurrentOutcomeOutsideReducerState {
@@ -222,7 +240,9 @@ rule RejectCurrentOutcomeOutsideReducerState {
 }
 
 rule CooperativeCancellationPreservesGeneration {
-    when: ToolCancellationRequested(invocation)
+    when: bedrock/ToolAbortRequested(conversation)
+    requires: has_active_ordinary_invocation(conversation)
+    let invocation = active_invocation_for(conversation)
     requires: invocation.phase in { denied, launched }
     requires: invocation.runtime.authority_open
     requires: invocation.runtime.conversation.core_status = cancelling_tool
@@ -236,14 +256,16 @@ rule CooperativeCancellationPreservesGeneration {
 }
 
 rule CancellationBackstopRetiresGeneration {
-    when: CancellationBackstopReached(invocation)
+    when: bedrock/ToolCancellationRetirementRequested(conversation)
+    requires: has_active_ordinary_invocation(conversation)
+    let invocation = active_invocation_for(conversation)
     requires: invocation.phase = cancelling
     requires: invocation.runtime.authority_open
     requires: invocation.runtime.conversation.core_status = cancelling_tool
     ensures: invocation.phase = retired
     ensures: invocation.runtime.generation = invocation.runtime.generation + 1
     ensures: RetainedToolTaskAborted(invocation)
-    ensures: bedrock/ToolAborted(invocation.runtime.conversation)
+    ensures: bedrock/ToolCancellationRetired(conversation)
 
     @guidance
         -- Bedrock owns synthetic current/queued results and any remaining child
@@ -279,20 +301,24 @@ rule FatalLocalAuthorityClosesAdmission {
 }
 
 rule BashWaitFallbackRetiresTaskOutcome {
-    when: BashWaitTaskRetirementRequested(invocation)
+    when: bedrock/ToolTaskRetirementRequested(conversation, call)
+    requires: has_active_ordinary_invocation(conversation)
+    let invocation = active_invocation_for(conversation)
     requires: invocation.phase = launched
     requires: invocation.runtime.authority_open
     requires: invocation.runtime.conversation.core_status = executing_tools
     requires: invocation.call = invocation.runtime.conversation.current_tool
+    requires: invocation.call = call
     requires: bedrock/is_bash_wait(invocation.call)
     ensures: invocation.phase = retired
     ensures: invocation.runtime.generation = invocation.runtime.generation + 1
     ensures: RetainedToolTaskAborted(invocation)
+    ensures: bedrock/ToolTaskRetired(conversation, call)
 
     @guidance
-        -- This is the task-retirement step of Bedrock's
-        -- BashWaitSettlementDeadlineFires, which supplies one synthetic
-        -- Failed outcome directly for the expected call. Only the wait task is
+        -- Bedrock's BashWaitRetiredTaskSettles acknowledges this completed
+        -- retirement with one synthetic Failed outcome for the expected call.
+        -- Only the wait task is
         -- aborted; its token/process handle is not cancelled by this fallback.
         -- The original receiver's later outcome carries the retired generation.
         -- The absolute persistence cutoff remains governed by REQ-BED-033.
@@ -314,7 +340,7 @@ surface OrdinaryToolDispatch {
         fulfils SerialToolDispatch
 
     provides:
-        ToolDispatchRequested(runtime, runtime.conversation.current_tool)
+        bedrock/ToolExecutionStarted(runtime.conversation, runtime.conversation.current_tool)
             when runtime.conversation.core_status = executing_tools
 
     @guarantee NoImplicitReplay
@@ -323,7 +349,55 @@ surface OrdinaryToolDispatch {
         -- an interrupted task's unknown external effects are not repeated.
 }
 
+-- These are observations of the synchronous gate return and one-shot receiver,
+-- not independent requests that may invent a verdict or complete another call.
+surface InvocationBoundaryObservations {
+    facing runtime: ToolRuntime
+    context invocation: ToolInvocation
+
+    contracts:
+        demands permissions/CheckedToolExecution
+
+    provides:
+        PermissionCleared(invocation, checked_call)
+            when invocation.runtime = runtime and invocation.phase = preparing
+        PermissionDenied(invocation, denial)
+            when invocation.runtime = runtime and invocation.phase = preparing
+        ToolReceiverResolved(invocation, outcome)
+            when invocation.runtime = runtime
+                 and invocation.phase in { launched, cancelling, retired }
+        ToolReceiverLostSender(invocation)
+            when invocation.runtime = runtime
+                 and invocation.phase in { launched, cancelling, retired }
+        RuntimeToolTeardown(invocation)
+            when invocation.runtime = runtime
+                 and invocation.phase in { preparing, denied, launched, cancelling }
+        FatalLocalAuthorityLost(invocation)
+            when invocation.runtime = runtime
+                 and invocation.phase in { preparing, denied, launched, cancelling }
+
+    @guarantee PreparationReturnsItsExactGateDecision
+        -- After ordinary preparation, the synchronous checked-call gate returns
+        -- exactly one of PermissionCleared or PermissionDenied for this invocation.
+        -- Cleared carries the proof minted for this exact name and payload;
+        -- Denied carries that check's denial. These observations do not evaluate
+        -- or fulfil the separate permission-count/escalation rules.
+
+    @guarantee ReceiverObservationIsExclusive
+        -- Only an invocation with a launched tool task has a receiver here.
+        -- Its first outcome or sender loss resolves that receiver once, even
+        -- after retirement. The two observations are mutually exclusive. Denial
+        -- uses its separate immediate error forwarder and starts no tool task.
+}
+
 -- Helpers (pure observations; none mints execution authority)
+-- runtime_for(conversation: bedrock/Conversation) -> ToolRuntime: the live owned
+--   executor for that conversation; this lookup does not create a runtime.
+-- has_active_ordinary_invocation(conversation: bedrock/Conversation) -> Boolean:
+--   its runtime owns a preparing, denied, launched, or cancelling invocation.
+-- active_invocation_for(conversation: bedrock/Conversation) -> ToolInvocation:
+--   that exact current-generation ordinary invocation. Requires the preceding
+--   presence predicate; intercepted sub-agent dispatch does not fabricate one.
 -- request_policy_read_succeeded(runtime): the originating policy read returned.
 -- originating_policy_allows(runtime, call): the retained request policy declares
 --   this call callable with its authentic schema and permits its current tool
@@ -341,3 +415,6 @@ surface OrdinaryToolDispatch {
 -- reducer_accepts(invocation, outcome): the expected ID matches the active
 --   executing call for Completed/Failed, or the cancelling call for any outcome.
 --   A current generation alone does not satisfy these state and identity guards.
+-- tool_result_for(invocation, outcome) -> bedrock/ToolResult: preserve the entire
+--   completed result; for Failed, retain its error as a concrete error result.
+--   Both use the owned call ID. Aborted never enters this conversion.

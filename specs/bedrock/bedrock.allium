@@ -698,7 +698,21 @@ rule BashWaitSettlementDeadlineFires {
     requires: conversation.core_status = executing_tools
     requires: tool_call = conversation.current_tool
     requires: is_bash_wait(tool_call)
-    ensures: ToolTaskAborted(conversation, tool_call)
+    ensures: ToolTaskRetirementRequested(conversation, tool_call)
+    ensures: not CommandReexecuted(tool_call)
+
+    @guidance
+        -- The serial dispatcher invalidates and aborts the wait task before
+        -- acknowledging ToolTaskRetired. Only that acknowledgement admits the
+        -- synthetic completion, so a successor call cannot open before the
+        -- old receiver's generation has been retired.
+}
+
+rule BashWaitRetiredTaskSettles {
+    when: ToolTaskRetired(conversation, tool_call)
+    requires: conversation.core_status = executing_tools
+    requires: tool_call = conversation.current_tool
+    requires: is_bash_wait(tool_call)
     ensures: ToolCompletes(
         conversation,
         error_result(tool_call.tool_use_id, "bash wait exceeded its bounded settlement deadline")
@@ -892,11 +906,15 @@ rule SubAgentResultDuringCancellation {
 rule CancellingToolDeadlineFires {
     when: CancellationDeadlineExpires(conversation)
     requires: conversation.core_status = cancelling_tool
+    ensures: ToolCancellationRetirementRequested(conversation)
+    ensures: CancellationDeadlineExceeded(conversation)
+}
+
+rule RetiredToolCancellationSettles {
+    when: ToolCancellationRetired(conversation)
+    requires: conversation.core_status = cancelling_tool
     ensures: CancellationCheckpointed(conversation)
     ensures: conversation.cancelling_tool_use_id = null
-    ensures: CancellationDeadlineExceeded(conversation)
-    ensures: SystemMessageInjected(conversation,
-        "Cancellation completed. Aborted work may still be reclaiming resources in the background.")
     -- Mirror the conditional next-state of the cooperative ToolAbortConfirmed:
     -- if sub-agents were spawned earlier in this tool round they must still be
     -- cancelled, so the backstop drains into cancelling_sub_agents (which has
@@ -905,6 +923,8 @@ rule CancellingToolDeadlineFires {
         if conversation.sub_agents_pending?.count = 0:
             conversation.core_status = idle
             AgentDone(conversation)
+            SystemMessageInjected(conversation,
+                "Cancellation completed. Aborted work may still be reclaiming resources in the background.")
         else:
             conversation.core_status = cancelling_sub_agents
             SubAgentsCancelRequested(conversation)
@@ -3400,6 +3420,8 @@ rule ServerRestartOrdinaryConversation {
     requires: conversation.parent_status != awaiting_recovery
         or conversation.recovery_resume_target = conversation_turn
     ensures: conversation.core_status = idle
+    ensures: conversation.current_tool = null
+    ensures: conversation.cancelling_tool_use_id = null
 }
 
 rule ServerRestartOwedDirectTurn {
@@ -3428,6 +3450,8 @@ rule ServerRestartExhaustedDirectTurn {
     requires: not pending_approval_owns_next_transition(conversation)
     requires: restart_recovery_exhausted(conversation)
     ensures: conversation.core_status = error
+    ensures: conversation.current_tool = null
+    ensures: conversation.cancelling_tool_use_id = null
     ensures: not active_materialized_turn_owns_conversation(conversation)
 }
 
@@ -3438,6 +3462,8 @@ rule ServerRestartWithoutDurableOwner {
     requires: not durable_execution_occurrence_owns_first_response(conversation)
     requires: transcript_suggests_unfinished_work(conversation)
     ensures: conversation.core_status = idle
+    ensures: conversation.current_tool = null
+    ensures: conversation.cancelling_tool_use_id = null
 }
 
 rule ServerRestartCommittedSteeringTurn {
