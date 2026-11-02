@@ -79,3 +79,6 @@ opt-level = 3
 # Database (rarely debugged)
 [profile.dev.package.sqlx]
 opt-level = 3
+
+[profile.dev.package.libsqlite3-sys]
+opt-level = 2
