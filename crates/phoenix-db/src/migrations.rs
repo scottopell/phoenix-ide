@@ -19981,7 +19981,7 @@ with tempfile.TemporaryDirectory() as directory:
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 148);
+        assert_eq!(MIGRATIONS.len(), 149);
     }
 
     #[tokio::test]

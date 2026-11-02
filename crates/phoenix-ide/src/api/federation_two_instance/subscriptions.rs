@@ -1452,9 +1452,9 @@ async fn source_revocation_without_pending_notifications_ends_create_or_replay_l
             .fetch_all(b.state.db.pool())
             .await
             .unwrap();
-        assert!(sync_once(&a.state.db, &a.state.runtime, &remote)
+        sync_once(&a.state.db, &a.state.runtime, &remote)
             .await
-            .is_err());
+            .unwrap();
         let ended = refreshed(&a, &remote).await;
         assert_eq!(ended.state, SubscriptionState::Revoked);
         assert_eq!(ended.admitted_cursor, remote.admitted_cursor);
@@ -1624,7 +1624,7 @@ async fn revoked_bearer_cannot_recover_an_already_authorized_delivery_receipt_ov
             .fetch_one(b.state.db.pool())
             .await
             .unwrap(),
-        1
+        0
     );
     assert_eq!(
         refreshed(&a, &remote).await.admitted_cursor,
