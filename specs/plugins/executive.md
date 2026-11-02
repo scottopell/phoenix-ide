@@ -14,9 +14,11 @@ records ownership, activation, publication, and failure boundaries.
 
 ## Status
 
-Implementation is under adversarial-review remediation in draft PR #1017.
-The task is in progress. No merge, deployment, or complete qualification is
-claimed. The earlier completion table overstated lifecycle and status coverage.
+Implementation is in PR #1017. The task remains in progress. Follow-up
+review fixes cover serialized reload capture, same-origin HTTP redirects,
+and parsed loopback hosts. Review readiness is not merge, deployment, or
+complete runtime acceptance. The earlier completion table overstated
+lifecycle and status coverage.
 
 | Requirement | Implementation | Verification and limits |
 |---|---|---|
@@ -25,13 +27,27 @@ claimed. The earlier completion table overstated lifecycle and status coverage.
 | REQ-AP-003 | Offline manual manifest validator | Exact schema recognition, structural validation, report-and-ignore semantics have loader tests |
 | REQ-AP-004 | Parsed candidates with scoped failure reports | Filesystem, skill semantic/catalog, and MCP preparation failures remain separate |
 | REQ-AP-005 | Namespaced ordinary skills through instance-owned `SkillDiscovery` | Advertisement, slash expansion, and invocation receive shared activation; initial-message and dedup regressions added |
-| REQ-AP-006 | Shared MCP preparation adapter | Selected-anchor cwd, single-pass expansion, package command resolution, data creation, HTTP mapping; transport probe awaits a response rather than a sleep |
+| REQ-AP-006 | Shared MCP preparation adapter | Selected-anchor cwd, single-pass expansion, package command resolution, data creation; HTTP origin policy rejects cross-origin redirects and bounds same-origin redirects; parsed IPv4/IPv6 loopback classification |
 | REQ-AP-007 | Manifest/component/executable containment | Existing symlink ancestors are resolved even for nonexistent descendants; install entry and execution root remain distinct |
-| REQ-AP-008 | SQLite authority plus one instance-scoped `PluginActivation` | Initially unavailable excludes all plugins; failed refresh preserves last good snapshot; no process-global filter or duplicate manager set |
+| REQ-AP-008 | SQLite authority plus one instance-scoped `PluginActivation` | Initially unavailable excludes all plugins; failed refresh preserves last good snapshot; startup/reload capture and reconcile under one lock, with no pre-lock desired snapshot |
 | REQ-AP-009 | Exclusive staged add; entry-safe remove; retained disabled identity; guarded purge | Real filesystem/SQLite and Axum regressions exist. Cross-harness identity locking and automatic partial-failure rollback are not promised |
 | REQ-AP-010 | Tagged loaded/skipped/disabled item outcomes and reasons | Skill status uses catalog admission; MCP status uses offline preparation, not live connection health. Registered invalid/unknown entries expose `load_error`, not false missing status |
 | REQ-AP-011 | Extension namespaces inert | No extension execution path |
 | REQ-AP-012 | Exact 1.1.0 schema identifiers | Unsupported manifest version rejects; incompatible MCP document disables that component |
+
+## Follow-up review verification
+
+The follow-up adds a deterministic queued-reload regression, real-socket
+cross-origin rejection/same-origin preservation/redirect-limit regressions,
+and parsed IPv4/IPv6 loopback tests. Loader suite: 34 passed. MCP suite:
+205 passed. A separate read-only challenge found no remaining defect in
+these three fixes; its sandbox blocked socket execution, so socket-pass
+evidence comes from the main test run rather than that reviewer.
+
+[ADR-218](../adrs/218_mcp-redirects-preserve-origin-and-reload-capture-is-serialized.md)
+records the shared HTTP transport policy and reload boundary. The redirect
+restriction applies to non-plugin MCP servers too; configure the destination
+explicitly when an endpoint redirects to another origin.
 
 ## Verification boundaries
 

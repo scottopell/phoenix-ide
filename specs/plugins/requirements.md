@@ -227,6 +227,17 @@ Plugin server tools SHALL surface to conversations through the existing
 live-resolution tool exposure (`specs/mcp/` REQ-MCP-014) under the
 `{server}__{tool}` naming
 
+Plugin HTTP endpoints SHALL be absolute HTTP(S) URLs without userinfo or
+fragments. HTTP SHALL be permitted only for `localhost` or an IP literal
+classified as loopback, including IPv6 loopback and the IPv4 loopback range.
+THE SYSTEM SHALL parse URL hosts before IP classification, not split their
+authority on colons.
+
+Configured HTTP headers SHALL NOT be forwarded through a redirect to another
+origin without explicit authorization. Phoenix SHALL reject cross-origin
+MCP redirects; origin is scheme, host, and effective port. Same-origin
+redirects SHALL have a finite limit (`specs/mcp/` REQ-MCP-004).
+
 **Rationale:** Keying as `<plugin>.<server>` keeps tool names unambiguous
 without new machinery and gives user config a structural precedence over
 plugins. The environment and expansion contract is the 1.1.0 runtime
@@ -279,6 +290,9 @@ contribute. An absent row SHALL mean enabled only in a successfully loaded
 snapshot. A failed refresh SHALL NOT replace the last successful snapshot.
 Each discovery pass SHALL use one stable snapshot. Lifecycle mutations and
 snapshot publication SHALL be serialized within the instance.
+MCP configuration capture and reconciliation SHALL use one serialization
+boundary for startup and every reload, so a delayed enabled snapshot cannot
+be applied after disabling reconciliation completes.
 
 **Rationale:** Default-enabled matches how filesystem skills behave today:
 putting a directory in the discovery path is the act of installing. The

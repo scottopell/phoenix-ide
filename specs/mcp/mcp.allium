@@ -43,6 +43,23 @@ enum AuthScheme { none | static | oauth }
 -- Sub-lifecycle within auth_scheme = oauth.
 enum OAuthPhase { discovering | registering | awaiting_user | authorized | refreshing }
 
+contract ReconciliationPreparation {
+    @invariant ConfigCaptureSharesReconciliationOrder
+        -- Startup discovery and every reload capture configuration files and
+        -- plugin activation only after acquiring the reconciliation boundary.
+        -- Hold that boundary through application of the captured desired set.
+        -- A waiting reload cannot apply a pre-disable plugin snapshot after a
+        -- disabling reconciliation completes (REQ-MCP-015, plugins/REQ-AP-008).
+}
+
+contract HttpRedirectBoundary {
+    @invariant RedirectsRemainWithinConfiguredOrigin
+        -- Every MCP HTTP request, including POST, server-stream GET and session
+        -- DELETE, rejects redirects with a different scheme, host or effective
+        -- port. Same-origin requests follow at most ten redirects before failure.
+        -- Configured headers never cross that origin boundary (REQ-MCP-004).
+}
+
 ------------------------------------------------------------
 -- Entities
 ------------------------------------------------------------
@@ -125,6 +142,10 @@ actor Operator {}
 -- The operator's view of one server plus the controls they can drive.
 surface McpControl {
     facing: Operator
+
+    contracts:
+        fulfils ReconciliationPreparation
+        fulfils HttpRedirectBoundary
 
     context srv: McpServer
 

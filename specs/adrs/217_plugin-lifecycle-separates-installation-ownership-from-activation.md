@@ -1,7 +1,8 @@
 # ADR-217: Plugin lifecycle separates installation ownership from activation
 
-Date: 2026-11-02
-Status: Accepted
+- **Status:** Accepted
+- **Date:** 2026-11-02
+- **Affects:** REQ-AP-002, REQ-AP-007 through REQ-AP-010
 
 ## Context
 
@@ -32,7 +33,7 @@ ADR-216 established scope and naming but did not settle these boundaries.
 - Resolve the trusted user-level root before destructive data operations and
   reject symlinks below that data boundary. Root aliases remain usable.
 
-## Alternatives
+## Options considered
 
 A process-global disabled set plus an MCP-local set allowed divergent decisions
 and cross-instance interference. Using only a canonical package path erased

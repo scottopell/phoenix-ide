@@ -1,5 +1,47 @@
 # User-Level Agent Plugins (Agent Plugins Spec 1.1.0)
 
+## Follow-up review — 2026-11-02
+
+Review: https://github.com/scottopell/phoenix-ide/pull/1017#issuecomment-6587958396
+User requested addressing the findings and opening the PR for review.
+
+All three confirmed findings have fixes and regressions:
+- Startup and reload capture configuration/activation only under the existing
+  reconciliation lock; application requires the held guard. Deterministic
+  queued-reload test verifies capture waits and disabled plugins admit no
+  supervisor.
+- Shared MCP HTTP client rejects cross-origin redirects, permits at most ten
+  same-origin redirects, and keeps configured headers at their origin. Real
+  socket tests cover different-port rejection, same-origin POST/header/body
+  preservation, and redirect loops. Policy also covers non-plugin MCP servers;
+  ADR-218 records the scope choice.
+- Plugin URL validation uses parsed hosts and IP loopback predicates, accepting
+  IPv6 loopback and the full IPv4 loopback range while rejecting remote HTTP,
+  userinfo, fragments, and invalid ports.
+
+Validation: loader 34, MCP 205, and plugin runtime/API 32 tests pass;
+transport/loader all-target and IDE/DB lib/test strict clippy pass.
+Independent read-only challenge found no remaining
+code defect in these three fixes; socket execution was sandbox-blocked for
+that reviewer, not for the passing main test run. UI typecheck/lint/Vitest,
+Allium, spec anchors, formatting, ADR shape, and structural lint pass. The
+ADR-shape lane's separate dev.py unit-test step and broad Rust run are still
+running; no full-check pass is claimed.
+
+Also repaired CI integration gaps from the rebase: six migration-test failures
+came from stale tail/count expectations after migration 150; the full affected
+modules pass (24 tests). Rollback, preservation, FK and idempotence assertions
+remain intact. A full DB-library attempt timed out after 166 passes, not a
+suite pass. Plugin cloning now uses the shared Git command builder, and ADR
+217/218 use the required metadata/headings.
+
+Prior test totals and review holds below are historical evidence, not a
+substitute for this revision's verification or final acceptance.
+
+Ready-for-review is not a done transition, merge, or deployment. Success-path
+browser/MCP lifecycle acceptance and remaining broad-check classification stay
+explicit until qualified. No automatic prototype-DB conversion is added.
+
 ## Rebase — 2026-11-02
 
 Rebased onto `origin/main` at `9441cd282`. Plugin registry migration is 150
