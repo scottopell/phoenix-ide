@@ -2126,6 +2126,8 @@ async fn close_to_history(f: &Fixture) {
 async fn real_direct_terminal_projection_and_fanout_commit_or_rollback_together() {
     use phoenix_core::domain::sm_state::ConvState;
     let f = Fixture::new().await;
+    assert!(facts(f.replay(0, chrono::Utc::now().timestamp_micros()).await).is_empty());
+
     let turn = source_turn(&f.db, &f.source.id, "production-terminal").await;
     f.db.update_conversation_state(&f.source.id, &ConvState::LlmRequesting { attempt: 1 })
         .await
@@ -2302,7 +2304,7 @@ async fn real_history_close_preserves_accepted_and_suppresses_every_unadmitted_f
             .fetch_one(f.db.pool())
             .await
             .unwrap(),
-        1
+        0
     );
     for note in pending.iter().skip(1) {
         assert_eq!(
@@ -2366,7 +2368,7 @@ async fn real_history_close_preserves_accepted_and_suppresses_every_unadmitted_f
             .fetch_one(f.db.pool())
             .await
             .unwrap(),
-            1
+            0
         );
     }
     assert_eq!(
@@ -3431,6 +3433,7 @@ async fn production_creation_completion_failure_and_cancellation_fanout_are_atom
         TerminalFactOutcome::Cancelled,
     ] {
         let f = Fixture::new().await;
+        assert!(facts(f.replay(0, chrono::Utc::now().timestamp_micros()).await).is_empty());
         let claim = creation_claim_fixture(&f).await;
         sqlx::raw_sql("CREATE TRIGGER fail_creation_fanout BEFORE INSERT ON federation_terminal_payloads BEGIN SELECT RAISE(ABORT,'injected creation fanout failure'); END;").execute(f.db.pool()).await.unwrap();
         let first = match outcome {
@@ -3860,6 +3863,12 @@ async fn real_creation_wait_token_and_cancelled_cleanup_paths_never_add_terminal
     .unwrap();
     assert!(facts(f.replay(0, chrono::Utc::now().timestamp_micros()).await).is_empty());
     let cancelled = Fixture::new().await;
+    assert!(facts(
+        cancelled
+            .replay(0, chrono::Utc::now().timestamp_micros())
+            .await
+    )
+    .is_empty());
     creation_claim_fixture(&cancelled).await;
     cancelled
         .db
