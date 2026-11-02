@@ -32,8 +32,9 @@
 
 use "../bedrock/bedrock.allium" as bedrock
 
--- Full native database result, whose classification and diagnostics are owned
--- by the existing unactivated-batch operation; this module observes its outcome.
+-- Required classification and diagnostics of the native unactivated-batch
+-- boundary. A classified reconciliation receipt also establishes exact parent
+-- membership; a database cleanup return alone is insufficient.
 external entity NativeSpawnClosureResult {}
 
 ------------------------------------------------------------
@@ -133,20 +134,24 @@ contract SpawnParentAdoption {
         -- from a query that races an outstanding admission command.
 
     @invariant ClosureReceiptsAreEstablishedNativeFacts
-        -- UnactivatedSpawnBatchClosureRequested invokes the existing native
-        -- unactivated-batch terminalization boundary after admission resolves.
-        -- It returns one exact classified closed, known-failed, or unclassified
-        -- observation. Closed includes a classified rejection/no-admission fact;
-        -- it never means merely that a receiver or in-memory entry is absent.
+        -- UnactivatedSpawnBatchClosureRequested requires classification after
+        -- admission resolves. It returns one exact reconciled, known-failed, or
+        -- unclassified observation. Reconciled establishes either authoritative
+        -- rejection/no admission, or terminal cancellation evidence plus committed
+        -- exact parent pending membership for every admitted child. It never
+        -- means merely that a receiver or in-memory entry is absent.
         -- Unknown local write authority selects REQ-BED-033, not false success,
         -- speculative cleanup, or replay of an unknown-effect command.
 
-    @invariant ClosedUnadoptedChildrenHaveADistinctDisposition
-        -- The exact unadopted batch's cancellation receipt consumes its children
-        -- as closed_without_parent_adoption. They never enter the parent's fan-in
-        -- membership and never acquire a fabricated normal completed result.
-        -- Already-adopted children remain owned by the parent's existing fan-in
-        -- and cancellation rules; a stale response cannot abandon that membership.
+    @invariant AllAdmittedChildrenRemainOwedUntilParentAcceptance
+        -- REQ-SA-004 / REQ-SA-005: cancellation before activation prevents child
+        -- work, but never exempts an admitted child from parent fan-in. Every
+        -- admitted child remains owed/pending until its actual terminal outcome
+        -- is parent-accepted. Administrative delivery suppression is not that
+        -- acceptance and cannot substitute for a cancellation terminal result.
+        -- Reconciliation establishes exact admitted membership before a parent
+        -- tool-abort acknowledgement; cancellation then drains those outcomes.
+        -- Already-adopted children retain their existing fan-in owner.
 }
 
 ------------------------------------------------------------
@@ -155,7 +160,7 @@ contract SpawnParentAdoption {
 
 enum SubAgentExecutionAuthority { read_only | write_capable }
 enum ParentWorkScopeKind { unattached | attached }
-enum ParentTerminalDisposition { owed | fan_in_accepted | closed_without_parent_adoption }
+enum ParentTerminalDisposition { owed | fan_in_accepted }
 
 -- Tool registries selectable for a sub-agent. The registry shape itself
 -- lives in code (crates/phoenix-ide/src/tools.rs); the spec only names
@@ -496,20 +501,28 @@ rule CancelSpawnBeforeParentAdoption {
     ensures: UnactivatedSpawnBatchClosureRequested(invocation)
 }
 
-rule ClassifyUnactivatedBatchClosure {
-    when: UnactivatedSpawnBatchClosed(invocation)
+rule ReconciledUnactivatedBatchRetainsEveryAdmittedChild {
+    when: UnactivatedSpawnBatchReconciled(invocation)
     let members = SubAgentAdmissions where batch_id = invocation.batch_id
+    let parent = invocation.parent
+    let pending_children = parent.sub_agents_pending + children_of(members)
+    requires: parent_owns_cancelled_spawn(invocation)
+    ensures: parent.sub_agents_pending = pending_children
     ensures:
         for admission in members:
             admission.cancellation_requested = true
             admission.initial_work_dispatched = false
             admission.terminal_evidence_persisted = true
-            admission.parent_terminal_disposition = closed_without_parent_adoption
+            admission.parent_terminal_disposition = owed
+            ParentDeliveryOwed(parent.id, admission.child.id,
+                cancellation_terminal_result(admission.child))
 
     @guidance
-        -- This is the classified native administrative closure of an unadopted
-        -- batch. Its delivery suppression is not a fabricated normal parent
-        -- fan-in result or a normal fan_in_accepted acknowledgement.
+        -- The receipt observes established cancellation evidence and exact parent
+        -- membership reconciliation, not speculative state or administrative
+        -- acceptance. The later ToolAborted observes this complete pending set,
+        -- enters CancellingSubAgents and accepts these cancellation outcomes
+        -- through the ordinary atomic fan-in boundary. None is a success result.
 }
 
 rule InitialWorkStartsIfNotCancelled {
@@ -530,7 +543,6 @@ rule ConcurrentMaterializationJoinsByChildIdentity {
 
 rule TerminalEvidencePrecedesParentDelivery {
     when: SubAgentReachesTerminal(child, result)
-    requires: not closed_before_parent_adoption(child)
     ensures: SubAgentAdmission{child: child}.terminal_evidence_persisted = true
     ensures: ParentDeliveryOwed(
         SubAgentAdmission{child: child}.parent.id, child.id, result)
@@ -540,7 +552,6 @@ rule DurableParentIdentityDeliversTerminal {
     when: ParentDeliveryAttempted(child, result)
     requires: SubAgentAdmission{child: child}.terminal_evidence_persisted
     requires: SubAgentAdmission{child: child}.parent_terminal_disposition = owed
-    requires: not closed_before_parent_adoption(child)
     ensures: CurrentParentRuntimeResolved(SubAgentAdmission{child: child}.parent.id)
     ensures: bedrock/ParentTerminalTransportArrived(
         SubAgentAdmission{child: child}.parent, parent_terminal_result(child, result))
@@ -550,7 +561,6 @@ rule ActualParentAcceptanceAcknowledgesTerminal {
     when: bedrock/SubAgentParentAcceptanceCommitted(parent, result)
     let admission = admission_for_parent_result(parent, result)
     requires: admission.terminal_evidence_persisted
-    requires: not closed_before_parent_adoption(admission.child)
     ensures: admission.parent_terminal_disposition = fan_in_accepted
 
     @guidance
@@ -559,11 +569,6 @@ rule ActualParentAcceptanceAcknowledgesTerminal {
         -- Transport dispatch, buffering, and a pure reducer proposal cannot set it.
 }
 
-rule ClosedUnadoptedBatchConsumesItsDelivery {
-    when: ParentDeliveryAttempted(child, result)
-    requires: closed_before_parent_adoption(child)
-    ensures: DeliveryConsumedByBatchClosure(child)
-}
 
 rule DuplicateParentDeliveryIsIdempotent {
     when: ParentDeliveryAttempted(child, result)
@@ -665,12 +670,13 @@ invariant ParentAcceptsChildTerminalAtMostOnce {
         and ParentResumeCountForChild(admission.child) <= 1
 }
 
-invariant ClosedBeforeAdoptionNeverStartsChildWork {
-    for admission in SubAgentAdmissions where parent_terminal_disposition = closed_without_parent_adoption:
-        admission.cancellation_requested
-        and admission.terminal_evidence_persisted
-        and not admission.initial_work_dispatched
-        and ParentResultCount(admission.child) = 0
+invariant EveryAdmissionRemainsPendingOrParentAccepted {
+    for admission in SubAgentAdmissions:
+        ParentPendingCount(admission.child) + ParentResultCount(admission.child) = 1
+        and (admission.parent_terminal_disposition = owed
+            implies ParentPendingCount(admission.child) = 1)
+        and (admission.parent_terminal_disposition = fan_in_accepted
+            implies ParentResultCount(admission.child) = 1)
 }
 
 -- Work children start within the parent's worktree when it has one.
@@ -706,28 +712,31 @@ surface NativeSpawnAdoptionBoundary {
         fulfils SpawnParentAdoption
 
     provides:
-        UnactivatedSpawnBatchClosed(invocation)
+        UnactivatedSpawnBatchReconciled(invocation)
             when owner_controls_batch(owner, invocation)
-                 and unactivated_batch_closure_established(invocation)
+                 and unactivated_batch_reconciliation_established(invocation)
+                 and parent_owns_cancelled_spawn(invocation)
         SpawnBatchClosureFailed(invocation, reason)
             when owner_controls_batch(owner, invocation)
         SpawnBatchAuthorityUnclassified(invocation)
             when owner_controls_batch(owner, invocation)
 
     @guarantee OneClassifiedResponseForTheOwnedOperation
-        -- Observations come from the exact native response/activation owner and
-        -- its classified database operation. Cancellation cannot mint Closed;
-        -- it suppresses activation while retaining reconciliation ownership.
+        -- Observations must come from the exact native response/activation owner
+        -- classifying the operation. Only established terminalization and parent
+        -- reconciliation can mint Reconciled; a cleanup write alone cannot.
+        -- Cancellation suppresses activation while retaining that ownership.
         -- No request retry, second durable store, or new restart policy is implied.
         -- A call of UnactivatedSpawnBatchClosureRequested is consumed by this
-        -- fulfilled native operation and returns exactly one Closed, Failed, or
+        -- fulfilled native operation and returns exactly one Reconciled, Failed, or
         -- Unclassified observation above, preserving any error diagnostics.
 
     @guidance
-        -- The request invokes the owning native unactivated-batch operation;
-        -- these observations are its actual classified return, not a free-standing
-        -- trigger queue or another workflow. Native admission must finish before
-        -- absence or complete terminalization can be established for that batch.
+        -- The required native response owns terminalization and reconciliation;
+        -- these observations are established facts, not a free-standing trigger
+        -- queue. Native admission must finish before absence or complete admitted
+        -- membership can be established. No additional store or restart policy is
+        -- implied, and an unknown commit cannot be acknowledged as reconciled.
 }
 
 ------------------------------------------------------------
@@ -735,21 +744,25 @@ surface NativeSpawnAdoptionBoundary {
 ------------------------------------------------------------
 -- owner_controls_batch(owner, invocation) -> Boolean: the native response and
 --   activation owner is bound to invocation.batch_id and its exact parent/call.
--- unactivated_batch_closure_established(invocation) -> Boolean: the native owner
---   established rejection/no admission, or complete terminalization of the exact
---   expected unadopted membership with no initial dispatch or activation release.
---   An operation result detached from that membership/activation proof is not
---   this receipt, and an already-adopted batch cannot select this disposition.
+-- unactivated_batch_reconciliation_established(invocation) -> Boolean: the owner
+--   established rejection/no admission, or complete terminal cancellation evidence
+--   for the exact admitted membership with no initial dispatch/activation release,
+--   AND committed those children into this exact parent's pending membership.
+--   A cleanup-only return or administrative acceptance timestamp is not this
+--   receipt. An already-adopted batch retains its existing fan-in owner.
+-- parent_owns_cancelled_spawn(invocation) -> Boolean: the parent is CancellingTool
+--   with this exact held assistant round and cancelling provider tool identity.
+-- children_of(admissions) -> Set<bedrock/Conversation>: the exact durable children.
+-- cancellation_terminal_result(child): the authoritative pre-start cancellation
+--   payload preserving that child's identity and cancellation cause, not success.
+-- ParentPendingCount(child) -> Integer: one exactly while the durable admission
+--   still owes this parent its terminal outcome, including before the parent's
+--   ready fan-in projection is established; zero after exact parent acceptance.
+--   Pending ownership cannot be dropped merely by suppressing transport delivery.
 -- activation_released_after_exact_parent_membership(child) -> Boolean: the native
 --   activation receiver was released only after the parent state committed the
 --   complete exact admitted batch membership. Admission alone is false; an
 --   unadopted cancelled batch never receives this activation release.
--- closed_before_parent_adoption(child) -> Boolean: this admission's disjoint
---   parent_terminal_disposition is closed_without_parent_adoption. The exact
---   unactivated-batch receipt consumed its undelivered admission before
---   adoption. Its administrative delivery suppression is distinct from a normal
---   parent fan-in acceptance, even if the implementation uses the same timestamp
---   column for both dispositions. Do not infer this from initial-work absence.
 -- parent_terminal_result(child, result) -> bedrock/SubAgentResult: preserve the
 --   exact child identity and complete terminal payload for parent transport.
 -- admission_for_parent_result(parent, result) -> SubAgentAdmission: the admission

@@ -3119,9 +3119,9 @@ rule ModeChangeNotification {
 ------------------------------------------------------------
 
 --   admitted_sub_agent_count(conversation: Conversation) -> Integer
---       The exact children adopted into this parent's fan-in round, including
---       those already accepted. A classified unadopted-batch cancellation consumes
---       its children at the spawn boundary; it does not add them to parent fan-in.
+--       Every child admitted for this parent's fan-in round, including those
+--       already accepted and those cancelled before activation or parent adoption.
+--       No administrative cleanup disposition exempts an admitted child.
 
 --   live_runtime_authority_open(conversation: Conversation) -> Boolean
 --       The conversation's executor has current admission under the shared
@@ -3130,7 +3130,8 @@ rule ModeChangeNotification {
 --       The owning native operation established the transaction containing this
 --       exact parent pending -> completed transition and child acceptance marker.
 --       A proposed transition, buffered event, or administrative unadopted-batch
---       suppression is not this receipt.
+--       suppression is not this receipt; every admitted cancellation still owes
+--       its exact parent fan-in outcome.
 
 --   executor_owns_conversation(executor: RuntimeExecutor, conversation: Conversation) -> Boolean
 --       The acknowledgement comes from the live executor owning this exact

@@ -86,3 +86,19 @@ Automated review of `37e4e9e6ff7cea3e9fee16a4323342a572593d3b` found two further
 ## Out-of-scope observation
 
 Permissions Allium still includes the normative denial-count/escalation target while its executive marks that behavior unimplemented. The new reusable checked-call contract deliberately excludes that separate requirement; no escalation work is commissioned here.
+
+## All-admitted conservation and cleanup-classification correction
+
+Both fresh reviews of `2701735e4761f703a8ab55f3713cebf8d843e3bc` rejected the terminal exemption for an unactivated admitted child. REQ-SA-004/005 remain unchanged: administrative cleanup is not parent fan-in acceptance. The earlier native-closure section describes a superseded model and does not qualify the corrected target.
+
+The correction retains every admitted child as pending/owed until actual parent acceptance. A successful cancellation-handoff receipt now establishes authoritative pre-start cancellation evidence and exact parent pending membership before ToolAborted. Thus an admitted C makes ToolAbortConfirmed enter CancellingSubAgents with C pending; the cancellation result travels through the existing buffer/transport and native atomic acceptance boundary, and only then can the parent reach ordinary Idle. A rejected/no-admission batch adds no child. Already-adopted duplicates retain their existing fan-in owner. No fabricated success, admitted-to-adopted redefinition, requirement weakening, or new recovery policy is introduced.
+
+Source audit also disproved the earlier claim that the manager already returns classified closure observations. `RuntimeManager::abandon_unactivated_sub_agent_batch` returns unit and logs DB errors. The DB operation can report an unclassified cleanup commit, but this wrapper does not forward that failure to the fatal fence; it also marks parent acceptance administratively without corresponding parent completed outcomes. These are explicit implementation gaps, not existing fulfilled native returns. The target requires classified closure/parent reconciliation, while activation gating and normal atomic fan-in acceptance are existing barriers.
+
+Ready task75011 records that bounded runtime classification/reconciliation gap, independently of parent preparation responsiveness75010 and global materialization14004. Affected subagent executive rows are now Partial. No runtime code or source tests were changed; no live orphan-child failure reproduction is claimed. Base and current manager/database source blobs remain identical.
+
+Manual trace: native admission C -> user cancel -> withhold activation -> establish C's cancelled terminal evidence and exact parent pending membership -> owned ToolAborted -> CancellingSubAgents {C}, completed{} -> terminal transport -> one native parent-state/child-acceptance commit -> completed{cancelledC}, pending{} -> Idle. Duplicate/replayed C cannot add another result. A cleanup error is not Reconciled; unknown local authority closes the process fence under REQ-BED-033 rather than acknowledging cancellation.
+
+The prior default check passed on2701735 in117.3s but does not qualify this subsequent correction. Focused checks and fresh full-range review must qualify the new frozen candidate before acceptance; task75008 remains in progress.
+
+Corrected-candidate focused Allium/spec-anchor/task lanes pass (`/tmp/phoenix-dispatch-admitted-conservation-fast.log`, Codex harness-local). Full analysis has zero errors in all five modules, zero findings in dispatcher/subagents/LLM/permissions, and the unchanged 40-finding accepted subset in Bedrock. The two previously recorded nonblocking warning types remain qualified; no accepted baseline was changed.

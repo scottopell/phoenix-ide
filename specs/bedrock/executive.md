@@ -42,19 +42,25 @@ new batch before changing state, matching the runtime's `all_pending` constructi
 The spawn bridge also preserves the native batch identity and separates admission
 from activation. `RuntimeManager::handle_spawn_request` waits on `activation_rx`;
 `persist_state_effect` verifies exact child membership and signals only after
-parent-state persistence. Dropped response/activation receivers close the
-unactivated batch. A cancellation-time admission receipt therefore remains owned:
-it is classified and its unadopted children are terminalized before cancellation
-is reported settled. The cancellation-priority gap below does not authorize
-discarding that receipt when a future responsive-preparation fix is made.
+parent-state persistence. Dropped response/activation receivers invoke native
+unactivated-batch cleanup. That manager helper returns unit and only logs database
+errors; it does not provide a classified reconciliation receipt or fatal forwarding
+for unknown cleanup-write authority. The required cancellation-time handoff must
+retain ownership, classify cleanup, and reconcile every admitted child into parent
+pending membership with terminal cancellation evidence before acknowledging the
+tool abort. The parent must then accept every outcome before ordinary settlement.
+Those response/classification/fan-in seams are not implemented by this spec change.
 
 Normal terminal acceptance is likewise distinct from dispatch. The transport and
 buffer paths leave delivery owed. `update_state_and_accept_sub_agent` commits the
 parent projection and child acceptance marker together; only that established
-receipt acknowledges normal fan-in acceptance. Administrative closure of an
-unadopted batch is a separate disjoint disposition and creates no normal completed
-result. This describes the existing native barriers and their normative use;
-it does not deliver a new cancellation implementation or recovery mechanism.
+receipt acknowledges normal fan-in acceptance. Native unactivated cleanup instead
+sets the child's acceptance timestamp administratively without a matching parent
+completed result. That suppression does not satisfy REQ-SA-004/005 and is not a
+normative exemption: every admitted child still owes parent fan-in, including a
+pre-start cancellation. Task 75011 tracks classified cleanup and exact parent
+reconciliation. The activation and normal atomic-acceptance barriers exist, while
+this cancellation handoff remains a target; no new recovery mechanism is delivered.
 
 ### Cancellation implementation gaps
 
@@ -106,7 +112,7 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-005a:** Bounded Cancellation Liveness | 🚧 Partial | Forced tool/sub-agent backstops are implemented. Forced-tool notice carry through a later cooperative child drain is missing; task 75009 tracks exact-once ordered notice delivery. The Allium obligation is normative, not a claim of implemented behavior |
 | **REQ-BED-006:** Error Recovery | ✅ Complete | Retry logic with exponential backoff and typed user-resume admission by ErrorKind |
 | **REQ-BED-007:** State Persistence | ✅ Complete | Database persistence; all selected executing/cancelling buffers are validated before any recovery mutation. File-backed reopen coverage includes malformed standalone and parent-first child buffers retaining exact raw state and producing no partial messages; scoped recovery excludes unrelated malformed buffers. Provider-only interruptions resume from idle, active materialized turns with persisted tool results proactively resume under bounded exact-turn ownership, committed steering retains first-response recovery ownership, and durable continuations retain recovery state |
-| **REQ-BED-008:** Sub-Agent Spawning | 🚧 Partial | Existing spawning/fan-in is live; atomic admission, exact pending removal, idempotent duplicate acceptance, and complete-fan-in settlement remain to be implemented |
+| **REQ-BED-008:** Sub-Agent Spawning | 🚧 Partial | Atomic admission and normal exact-child fan-in/duplicate acceptance are live. Unactivated-batch cleanup still suppresses parent delivery administratively; classified all-admitted cancellation reconciliation remains incomplete (task 75011). |
 | **REQ-BED-009:** Sub-Agent Isolation | ✅ Complete | Tool set restriction defined |
 | **REQ-BED-010:** Fixed Working Directory | ✅ Complete | Set at creation, passed to tools |
 | **REQ-BED-011:** Real-time Event Streaming | ✅ Complete | SSE with broadcast channels |

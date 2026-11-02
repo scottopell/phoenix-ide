@@ -236,8 +236,9 @@ rule AdmittedSpawnReturnsToItsCancellingOrigin {
 
     @guidance
         -- Cancellation does not make this admission receipt stale. Keep its
-        -- response/activation owner, withhold activation, and close the exact
-        -- unadopted batch before acknowledging parent cancellation.
+        -- response/activation owner, withhold activation, and reconcile every
+        -- admitted child into pending with terminal cancellation evidence before
+        -- acknowledging the tool abort. Parent cancellation still waits for fan-in.
 }
 
 rule RejectedSpawnReturnsToItsCancellingOrigin {
@@ -257,8 +258,8 @@ rule UnadoptableSpawnReceiptStillClosesItsOwnedBatch {
     ensures: subagents/UnactivatedSpawnBatchClosureRequested(invocation)
 }
 
-rule ClassifiedSpawnClosureAllowsCancellationSettlement {
-    when: subagents/UnactivatedSpawnBatchClosed(invocation)
+rule ReconciledSpawnAllowsToolCancellationToDrain {
+    when: subagents/UnactivatedSpawnBatchReconciled(invocation)
     requires: process_authority.open
     requires: spawn_invocation_is_cancelling(invocation)
     requires: spawn_cancellation_resolution(invocation.parent) = established
@@ -681,7 +682,9 @@ surface RuntimeAuthorityObservations {
 -- spawn_cancellation_resolution(conversation) -> SpawnCancellationResolution:
 --   established only if the exact owner proves no admission command was issued,
 --   its finished command classified a rejection without children, or the admitted
---   unadopted batch has a classified terminalization receipt. An outstanding
+--   unadopted batch has classified cancellation terminal evidence and committed
+--   exact parent pending membership. All admitted children still require actual
+--   parent acceptance before ordinary settlement. An outstanding
 --   command/closure cannot be classified by racing it with an absence query.
 --   failed is a classified concrete native error, not cancellation success;
 --   indeterminate means the authority needed at the bounded settlement cutoff
