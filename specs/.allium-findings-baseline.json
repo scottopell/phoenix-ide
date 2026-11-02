@@ -130,6 +130,7 @@
         "ParentLlmRespondsTextOnly",
         "ProposeTaskIntercepted",
         "ProposeTaskInvalid",
+        "RejectMalformedToolResponse",
         "SubAgentContextExhausted",
         "SubAgentImplicitCompletion",
         "SubAgentProposeTaskRejected",

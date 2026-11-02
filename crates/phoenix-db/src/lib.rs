@@ -12503,46 +12503,12 @@ impl Database {
         Ok(())
     }
 
-    /// Materialize the assistant message and completed tool results that an
-    /// in-flight `ToolExecuting` or `CancellingTool` round carries only in its
-    /// `ConvState` JSON, so they survive the startup reset that overwrites the
-    /// state with idle.
-    ///
-    /// Both states bundle the un-persisted round for atomic end-of-round
-    /// persistence and hold the same recoverable data, differing only in how
-    /// the unfinished tools are named:
-    ///   - `assistant_message`: the LLM turn (with one `tool_use` block per
-    ///     dispatched tool) — broadcast over SSE and seen by the user, but not
-    ///     yet in `messages`;
-    ///   - `completed_results`: real outputs of tools that already finished;
-    ///   - the unfinished tools: `ToolExecuting` carries the running tool as
-    ///     `current_tool` (a `ToolCall`) plus `remaining_tools`; `CancellingTool`
-    ///     carries the tool being aborted as `tool_use_id` (just the id) plus
-    ///     `skipped_tools`. Both are normalized to a flat list of interrupted
-    ///     `tool_use` ids — that's all the builder needs to pair a synthetic
-    ///     result.
-    ///
-    /// Each `tool_use` needs exactly one paired `tool_result` or the next LLM
-    /// request 400s. We write the assistant message, then one result per
-    /// `tool_use`: completed tools contribute their real result, and every
-    /// unfinished tool gets a synthetic interrupted error. The whole round
-    /// commits atomically via [`Database::persist_tool_round`].
-    ///
-    /// The pairing count is checked before any write: if the materialized
-    /// results don't match the assistant's `tool_use` count, we skip this
-    /// conversation rather than persist a mis-paired chain — the subsequent
-    /// reset + `repair_orphaned_tool_use` then handles it the legacy way.
+    /// Read typed persisted terminal outcomes for pending child conversations.
+    /// Missing and nonterminal child rows are omitted.
     ///
     /// # Errors
     ///
-    /// Returns a [`DbError`] if the underlying database operation fails.
-    /// Resolve the real terminal outcome of each pending sub-agent by reading
-    /// its child conversation row (created with `id == agent_id`). A sub-agent
-    /// that reached `Completed`/`Failed` before the restart is returned with its
-    /// real `Success`/`Failure` outcome; one still running (or whose row is
-    /// missing or non-terminal) is omitted, so the caller falls back to the
-    /// "interrupted by server restart" synthetic outcome. Query and decode
-    /// failures remain errors because they cannot prove the child nonterminal.
+    /// Returns [`DbError`] when a child query or state decoding fails.
     async fn resolve_pending_sub_agent_outcomes(
         &self,
         pending: &[phoenix_core::domain::sm_state::PendingSubAgent],
@@ -12632,22 +12598,16 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        let mut materialized = std::collections::HashSet::new();
+        let mut plans = Vec::new();
         for (conv_id, state_json, state_updated_at) in conv_rows {
             if only_conversations.is_some_and(|ids| !ids.contains(&conv_id)) {
                 continue;
             }
-            let state: ConvState = match serde_json::from_str(&state_json) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(
-                        conv_id = %conv_id, error = %e,
-                        "could not parse in-flight tool round state for materialization; \
-                         leaving to reset + orphan repair",
-                    );
-                    continue;
-                }
-            };
+            let state: ConvState = serde_json::from_str(&state_json).map_err(|error| {
+                DbError::Serialization(format!(
+                    "cannot recover in-flight tool round for {conv_id}; persisted state retained: {error}"
+                ))
+            })?;
 
             // Normalize both states to the assistant message, completed
             // results, interrupted tool ids, and pending sub-agents. The
@@ -12662,7 +12622,9 @@ impl Database {
                 pending_sub_agents,
             }) = normalize_in_flight_round(state)
             else {
-                continue;
+                return Err(DbError::Serialization(format!(
+                    "in-flight tool round state kind differs for {conv_id}; persisted state retained"
+                )));
             };
 
             // A sub-agent can have reached its own terminal state (persisted in
@@ -12718,20 +12680,31 @@ impl Database {
                 &sub_agent_outcomes,
             );
 
-            let (agent_msg, tool_msgs) = match round {
-                Ok(messages) => messages,
-                Err(ToolRoundError::ResultCountMismatch { tool_uses, results }) => {
-                    tracing::warn!(
-                        conv_id = %conv_id,
-                        tool_uses,
-                        results,
-                        "in-flight tool round has mismatched tool_use/result counts; \
-                         skipping materialization, leaving to orphan repair",
-                    );
-                    continue;
-                }
-            };
+            let (agent_msg, tool_msgs) = round.map_err(|error| {
+                DbError::Serialization(format!(
+                    "cannot recover in-flight tool round for {conv_id}; persisted state retained: {error}"
+                ))
+            })?;
 
+            plans.push(RestartToolRoundPlan {
+                assistant: agent_msg,
+                results: tool_msgs,
+                pending_sub_agents,
+                sub_agent_outcomes,
+                completed_count: completed_results.len(),
+            });
+        }
+
+        let mut materialized = std::collections::HashSet::new();
+        for RestartToolRoundPlan {
+            assistant: agent_msg,
+            results: tool_msgs,
+            pending_sub_agents,
+            sub_agent_outcomes,
+            completed_count,
+        } in plans
+        {
+            let conv_id = agent_msg.conversation_id.clone();
             let interrupted = ConvState::Failed {
                 error: "Sub-agent interrupted by server restart".to_string(),
                 error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
@@ -12816,8 +12789,8 @@ impl Database {
 
             tracing::info!(
                 conv_id = %conv_id,
-                completed = completed_results.len(),
-                interrupted = tool_msgs.len() - completed_results.len(),
+                completed = completed_count,
+                interrupted = tool_msgs.len() - completed_count,
                 "materialized in-flight tool round on restart",
             );
         }
@@ -15939,6 +15912,15 @@ struct NormalizedRound {
     completed_results: Vec<ToolResult>,
     interrupted_tool_ids: Vec<String>,
     pending_sub_agents: Vec<phoenix_core::domain::sm_state::PendingSubAgent>,
+}
+
+struct RestartToolRoundPlan {
+    assistant: Message,
+    results: Vec<Message>,
+    pending_sub_agents: Vec<phoenix_core::domain::sm_state::PendingSubAgent>,
+    sub_agent_outcomes:
+        std::collections::HashMap<String, phoenix_core::domain::sm_state::SubAgentOutcome>,
+    completed_count: usize,
 }
 
 /// Normalize a recovered in-flight tool round (`ToolExecuting` or

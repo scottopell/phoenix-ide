@@ -238,6 +238,242 @@ fn trusted_prefix_state(cancelling: bool) -> (ConvState, AssistantMessage, ToolC
     (state, assistant, image)
 }
 
+#[tokio::test]
+async fn malformed_restart_rounds_retain_durable_state_and_write_no_messages() {
+    for cancelling in [false, true] {
+        for fault in [
+            "count",
+            "duplicate_result",
+            "unknown_result",
+            "duplicate_call",
+            "parse",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("rejected-round.db");
+            let path = path.to_str().unwrap();
+            let db = Database::open(path).await.unwrap();
+            migrations::run_pending_migrations(db.pool()).await.unwrap();
+            let conversation = db
+                .get_or_create_coordinator(
+                    Some("test-model"),
+                    phoenix_core::llm_language::LlmLanguage::default(),
+                )
+                .await
+                .unwrap();
+            let (mut state, _, _) = trusted_prefix_state(cancelling);
+            let (ConvState::ToolExecuting {
+                assistant_message: assistant,
+                completed_results: results,
+                ..
+            }
+            | ConvState::CancellingTool {
+                assistant_message: assistant,
+                completed_results: results,
+                ..
+            }) = &mut state
+            else {
+                unreachable!()
+            };
+            match fault {
+                "count" => {
+                    results.pop();
+                }
+                "duplicate_result" => results[1].tool_use_id = results[0].tool_use_id.clone(),
+                "unknown_result" => results[1].tool_use_id = "unknown".into(),
+                "duplicate_call" => {
+                    assistant.content[1] = assistant.content[0].clone();
+                }
+                "parse" => {}
+                _ => unreachable!(),
+            }
+            db.update_conversation_state(&conversation.id, &state)
+                .await
+                .unwrap();
+            if fault == "parse" {
+                sqlx::query("UPDATE conversations SET state = ?1 WHERE id = ?2")
+                    .bind(
+                        serde_json::json!({
+                            "type": if cancelling { "cancelling_tool" } else { "tool_executing" },
+                            "held": "cannot decode",
+                        })
+                        .to_string(),
+                    )
+                    .bind(&conversation.id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            let original: (String, String, String) = sqlx::query_as(
+                "SELECT state, state_kind, state_updated_at FROM conversations WHERE id = ?1",
+            )
+            .bind(&conversation.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            db.pool().close().await;
+            drop(db);
+            let db = Database::open(path).await.unwrap();
+            migrations::run_pending_migrations(db.pool()).await.unwrap();
+            for _ in 0..2 {
+                assert!(
+                    db.reset_all_to_idle().await.is_err(),
+                    "{fault}, cancelling={cancelling}"
+                );
+                let retained: (String, String, String) = sqlx::query_as(
+                    "SELECT state, state_kind, state_updated_at FROM conversations WHERE id = ?1",
+                )
+                .bind(&conversation.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                assert_eq!(retained, original);
+                assert!(db.get_messages(&conversation.id).await.unwrap().is_empty());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn malformed_child_round_is_validated_before_parent_recovery_mutates_it() {
+    async fn raw(db: &Database) -> Vec<(String, String, String, String)> {
+        sqlx::query_as::<_, (String, String, String, String)>(
+            "SELECT id, state, state_kind, state_updated_at FROM conversations WHERE id IN ('parent', '11111111-1111-4111-8111-111111111111') ORDER BY id",
+        ).fetch_all(db.pool()).await.unwrap()
+    }
+    for cancelling in [false, true] {
+        for duplicate in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("rejected-child.db");
+            let path = path.to_str().unwrap();
+            let mut db = Database::open(path).await.unwrap();
+            migrations::run_pending_migrations(db.pool()).await.unwrap();
+            let parent_id = "parent";
+            let child_id = "11111111-1111-4111-8111-111111111111";
+            db.create_conversation(parent_id, "parent", "/tmp", true, None, None)
+                .await
+                .unwrap();
+            db.create_conversation(child_id, "child", "/tmp", false, Some(parent_id), None)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO sub_agent_batches
+                     (batch_id, parent_conversation_id, parallel_work_qualified, admitted_at_unix_micros)
+                 VALUES ('retained-batch', ?1, 0, 1)",
+            ).bind(parent_id).execute(db.pool()).await.unwrap();
+            sqlx::query(
+                "INSERT INTO sub_agent_runs
+                     (child_conversation_id, batch_id, ordinal, execution_authority, max_turns, timeout_millis)
+                 VALUES (?1, 'retained-batch', 0, 'read_only', 10, 1000)",
+            ).bind(child_id).execute(db.pool()).await.unwrap();
+            let parent_assistant = assistant(&[("spawn", "spawn_agents"), ("wait", "think")]);
+            let pending = vec![PendingSubAgent {
+                agent_id: child_id.into(),
+                task: "retain child evidence".into(),
+                mode: SubAgentMode::Explore,
+            }];
+            let completed = vec![ToolResult::success("spawn".into(), "Spawning child".into())];
+            let parent = if cancelling {
+                ConvState::CancellingTool {
+                    tool_use_id: "wait".into(),
+                    cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
+                    skipped_tools: vec![],
+                    completed_results: completed,
+                    assistant_message: parent_assistant,
+                    pending_sub_agents: pending,
+                }
+            } else {
+                ConvState::ToolExecuting {
+                    current_tool: ToolCall::new(
+                        "wait",
+                        ToolInput::Think(ThinkInput {
+                            thoughts: "pending".into(),
+                        }),
+                    ),
+                    remaining_tools: vec![],
+                    completed_results: completed,
+                    assistant_message: parent_assistant,
+                    pending_sub_agents: pending,
+                }
+            };
+            let (mut child, _, _) = trusted_prefix_state(cancelling);
+            let (ConvState::ToolExecuting {
+                assistant_message,
+                completed_results,
+                ..
+            }
+            | ConvState::CancellingTool {
+                assistant_message,
+                completed_results,
+                ..
+            }) = &mut child
+            else {
+                unreachable!()
+            };
+            assistant_message.message_id = "child-round".into();
+            completed_results[1].tool_use_id = if duplicate { "trusted" } else { "unknown" }.into();
+            db.update_conversation_state(parent_id, &parent)
+                .await
+                .unwrap();
+            db.update_conversation_state(child_id, &child)
+                .await
+                .unwrap();
+            let original = raw(&db).await;
+            db.pool().close().await;
+            drop(db);
+            db = Database::open(path).await.unwrap();
+            migrations::run_pending_migrations(db.pool()).await.unwrap();
+            for _ in 0..2 {
+                assert!(db.reset_all_to_idle().await.is_err());
+                assert_eq!(
+                    raw(&db).await,
+                    original,
+                    "parent recovery overwrote malformed child evidence"
+                );
+                assert!(db.get_messages(parent_id).await.unwrap().is_empty());
+                assert!(db.get_messages(child_id).await.unwrap().is_empty());
+                db.pool().close().await;
+                drop(db);
+                db = Database::open(path).await.unwrap();
+                migrations::run_pending_migrations(db.pool()).await.unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn scoped_materialization_ignores_unselected_malformed_buffers() {
+    let db = Database::open_in_memory().await.unwrap();
+    for id in ["selected", "unselected"] {
+        db.create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let (state, _, _) = trusted_prefix_state(false);
+        db.update_conversation_state(id, &state).await.unwrap();
+    }
+    let malformed = "{\"type\":\"tool_executing\",\"held\":\"outside selected scope\"}";
+    sqlx::query("UPDATE conversations SET state = ?1 WHERE id = 'unselected'")
+        .bind(malformed)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let selected = std::collections::HashSet::from(["selected".to_owned()]);
+    assert_eq!(
+        db.materialize_in_flight_tool_rounds(&Utc::now(), Some(&selected))
+            .await
+            .unwrap(),
+        selected
+    );
+    assert_eq!(db.get_messages("selected").await.unwrap().len(), 5);
+    assert!(db.get_messages("unselected").await.unwrap().is_empty());
+    let retained: String =
+        sqlx::query_scalar("SELECT state FROM conversations WHERE id = 'unselected'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(retained, malformed);
+}
+
 async fn assert_restart_persists_trusted_receipt(cancelling: bool) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("trusted-recovery.db");

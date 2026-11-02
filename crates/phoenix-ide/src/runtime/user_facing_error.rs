@@ -167,7 +167,9 @@ pub fn from_transition_error(err: &TransitionError) -> UserFacingError {
         // operators. We still surface only a generic `internal()` to end
         // users because "invalid transition" means something *we* got
         // wrong: it's not useful for the user to debug themselves.
-        TransitionError::InvalidTransition { .. } => UserFacingError::internal(),
+        TransitionError::InvalidTransition { .. } | TransitionError::InvalidToolRound(_) => {
+            UserFacingError::internal()
+        }
     }
 }
 

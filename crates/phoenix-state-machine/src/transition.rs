@@ -30,7 +30,9 @@ use phoenix_core::domain::mode_context::ModeContext;
 use phoenix_core::domain::retry_policy::{
     AutoRetryPolicy, GENERIC_MAX_ATTEMPTS, OVERLOAD_MAX_ATTEMPTS,
 };
-use phoenix_core::domain::tool_round::ToolRoundAssembly;
+use phoenix_core::domain::tool_round::{
+    result_for_invocation, validate_response_tool_calls, ToolRoundAssembly, ToolRoundError,
+};
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
@@ -333,6 +335,8 @@ impl TransitionResult {
 /// `ConvState` or `Event`, and never embeds payload data.
 #[derive(Debug, Error)]
 pub enum TransitionError {
+    #[error("Invalid tool round: {0}")]
+    InvalidToolRound(#[from] ToolRoundError),
     #[error("Agent is busy, cannot accept message (cancel current operation first)")]
     AgentBusy,
     #[error("Cancellation in progress")]
@@ -454,6 +458,33 @@ pub fn transition(
     context: &ConvContext,
     event: Event,
 ) -> Result<TransitionResult, TransitionError> {
+    if let Event::LlmResponse {
+        content,
+        tool_calls,
+        ..
+    } = &event
+    {
+        validate_response_tool_calls(content, tool_calls)?;
+    }
+    let event = match event {
+        Event::ToolComplete {
+            tool_use_id,
+            result,
+        } => Event::ToolComplete {
+            result: result_for_invocation(result, &tool_use_id),
+            tool_use_id,
+        },
+        Event::SpawnAgentsComplete {
+            tool_use_id,
+            result,
+            spawned,
+        } => Event::SpawnAgentsComplete {
+            result: result_for_invocation(result, &tool_use_id),
+            tool_use_id,
+            spawned,
+        },
+        event => event,
+    };
     if matches!(
         &event,
         Event::LlmError {
@@ -1187,8 +1218,7 @@ fn handle_core_tool_complete(
                 completed_results.clone(),
                 std::iter::once(result),
             )
-            .map(CheckpointData::ToolRound)
-            .expect("tool_use/tool_result count mismatch in last-tool transition");
+            .map(CheckpointData::ToolRound)?;
 
             Ok(
                 CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
@@ -1212,8 +1242,7 @@ fn handle_core_tool_complete(
                 completed_results.clone(),
                 std::iter::once(result),
             )
-            .map(CheckpointData::ToolRound)
-            .expect("tool_use/tool_result count mismatch in last-tool-with-subagents transition");
+            .map(CheckpointData::ToolRound)?;
 
             Ok(CoreTransitionResult::new(CoreState::AwaitingSubAgents {
                 pending: pending_sub_agents.clone(),
@@ -1267,8 +1296,7 @@ fn handle_core_tool_complete(
                 completed_results.clone(),
                 std::iter::once(result),
             )
-            .map(CheckpointData::ToolRound)
-            .expect("tool_use/tool_result count mismatch in spawn-agents-last transition");
+            .map(CheckpointData::ToolRound)?;
 
             Ok(CoreTransitionResult::new(CoreState::AwaitingSubAgents {
                 pending: all_pending.clone(),
@@ -1399,8 +1427,7 @@ fn handle_core_cancellation(
                 completed_results.clone(),
                 cancellation_results,
             )
-            .map(CheckpointData::ToolRound)
-            .expect("tool_use/tool_result count mismatch in cancellation transition");
+            .map(CheckpointData::ToolRound)?;
 
             if pending_sub_agents.is_empty() {
                 Ok(CoreTransitionResult::new(CoreState::Idle)
@@ -1442,8 +1469,7 @@ fn handle_core_cancellation(
                 completed_results.clone(),
                 cancellation_results,
             )
-            .map(CheckpointData::ToolRound)
-            .expect("tool_use/tool_result count mismatch in cancellation-complete transition");
+            .map(CheckpointData::ToolRound)?;
 
             if pending_sub_agents.is_empty() {
                 Ok(CoreTransitionResult::new(CoreState::Idle)
@@ -2945,8 +2971,7 @@ pub fn transition_parent(
                         .iter()
                         .map(|t| ToolResult::error(t.id.clone(), msg.clone()))
                         .collect();
-                    let checkpoint = CheckpointData::tool_round(assistant_message, error_results)
-                        .expect("error_results.len() == tool_calls.len()");
+                    let checkpoint = CheckpointData::tool_round(assistant_message, error_results)?;
                     return Ok(ParentTransitionResult::new(ParentState::Core(
                         CoreState::LlmRequesting { attempt: 1 },
                     ))
@@ -2978,10 +3003,7 @@ pub fn transition_parent(
                         );
                         let tool_result = ToolResult::error(tool.id.clone(), err_msg);
                         let checkpoint =
-                            CheckpointData::tool_round(assistant_message, vec![tool_result])
-                                .expect(
-                                    "propose_task produces exactly one tool_use and one result",
-                                );
+                            CheckpointData::tool_round(assistant_message, vec![tool_result])?;
                         return Ok(ParentTransitionResult::new(ParentState::Core(
                             CoreState::LlmRequesting { attempt: 1 },
                         ))
@@ -3011,10 +3033,7 @@ pub fn transition_parent(
                         );
                         let tool_result = ToolResult::error(tool.id.clone(), err_msg);
                         let checkpoint =
-                            CheckpointData::tool_round(assistant_message, vec![tool_result])
-                                .expect(
-                                    "propose_task produces exactly one tool_use and one result",
-                                );
+                            CheckpointData::tool_round(assistant_message, vec![tool_result])?;
                         return Ok(ParentTransitionResult::new(ParentState::Core(
                             CoreState::LlmRequesting { attempt: 1 },
                         ))
@@ -3046,8 +3065,7 @@ pub fn transition_parent(
                     );
                     let tool_result = ToolResult::error(tool.id.clone(), err_msg);
                     let checkpoint =
-                        CheckpointData::tool_round(assistant_message, vec![tool_result])
-                            .expect("propose_task produces exactly one tool_use and one result");
+                        CheckpointData::tool_round(assistant_message, vec![tool_result])?;
                     return Ok(ParentTransitionResult::new(ParentState::Core(
                         CoreState::LlmRequesting { attempt: 1 },
                     ))
@@ -3090,8 +3108,7 @@ pub fn transition_parent(
                         display_data,
                     );
                     let checkpoint =
-                        CheckpointData::tool_round(assistant_message, vec![tool_result])
-                            .expect("propose_task produces exactly one tool_use and one result");
+                        CheckpointData::tool_round(assistant_message, vec![tool_result])?;
 
                     return Ok(
                         ParentTransitionResult::new(ParentState::AwaitingTaskApproval {
@@ -3125,8 +3142,7 @@ pub fn transition_parent(
                     Some(usage_data),
                     display_data,
                 );
-                let checkpoint = CheckpointData::tool_round(assistant_message, vec![tool_result])
-                    .expect("propose_task produces exactly one tool_use and one result");
+                let checkpoint = CheckpointData::tool_round(assistant_message, vec![tool_result])?;
 
                 // The conversation continues: LlmRequesting, parent_status
                 // untouched. One atomic persist (checkpoint + proposal row) via
@@ -3184,8 +3200,7 @@ pub fn transition_parent(
                         .iter()
                         .map(|t| ToolResult::error(t.id.clone(), msg.clone()))
                         .collect();
-                    let checkpoint = CheckpointData::tool_round(assistant_message, error_results)
-                        .expect("error_results.len() == tool_calls.len()");
+                    let checkpoint = CheckpointData::tool_round(assistant_message, error_results)?;
                     return Ok(ParentTransitionResult::new(ParentState::Core(
                         CoreState::LlmRequesting { attempt: 1 },
                     ))
@@ -3211,10 +3226,7 @@ pub fn transition_parent(
                         );
                         let tool_result = ToolResult::error(tool.id.clone(), err_msg);
                         let checkpoint =
-                            CheckpointData::tool_round(assistant_message, vec![tool_result])
-                                .expect(
-                                "ask_user_question produces exactly one tool_use and one result",
-                            );
+                            CheckpointData::tool_round(assistant_message, vec![tool_result])?;
                         return Ok(ParentTransitionResult::new(ParentState::Core(
                             CoreState::LlmRequesting { attempt: 1 },
                         ))
@@ -3235,9 +3247,7 @@ pub fn transition_parent(
                     );
                     let tool_result = ToolResult::error(tool.id.clone(), err);
                     let checkpoint =
-                        CheckpointData::tool_round(assistant_message, vec![tool_result]).expect(
-                            "ask_user_question produces exactly one tool_use and one result",
-                        );
+                        CheckpointData::tool_round(assistant_message, vec![tool_result])?;
                     return Ok(ParentTransitionResult::new(ParentState::Core(
                         CoreState::LlmRequesting { attempt: 1 },
                     ))
@@ -3258,8 +3268,7 @@ pub fn transition_parent(
                     Some(usage_data),
                     display_data,
                 );
-                let checkpoint = CheckpointData::tool_round(assistant_message, vec![tool_result])
-                    .expect("ask_user_question produces exactly one tool_use and one result");
+                let checkpoint = CheckpointData::tool_round(assistant_message, vec![tool_result])?;
 
                 return Ok(
                     ParentTransitionResult::new(ParentState::AwaitingUserResponse {
@@ -3927,8 +3936,7 @@ pub fn transition_sub_agent(
                         .iter()
                         .map(|t| ToolResult::error(t.id.clone(), msg.clone()))
                         .collect();
-                    let checkpoint = CheckpointData::tool_round(assistant_message, error_results)
-                        .expect("error_results.len() == tool_calls.len()");
+                    let checkpoint = CheckpointData::tool_round(assistant_message, error_results)?;
                     return Ok(SubAgentTransitionResult::new(SubAgentState::Core(
                         CoreState::LlmRequesting { attempt: 1 },
                     ))
@@ -4015,8 +4023,7 @@ pub fn transition_sub_agent(
                     display_data,
                 );
                 let tool_result = ToolResult::error(tool_calls[0].id.clone(), err_msg);
-                let checkpoint = CheckpointData::tool_round(assistant_message, vec![tool_result])
-                    .expect("propose_task produces exactly one tool_use and one result");
+                let checkpoint = CheckpointData::tool_round(assistant_message, vec![tool_result])?;
                 return Ok(SubAgentTransitionResult::new(SubAgentState::Core(
                     CoreState::LlmRequesting { attempt: 1 },
                 ))
@@ -4073,7 +4080,7 @@ pub fn handle_outcome(
     outcome: EffectOutcome,
 ) -> Result<TransitionResult, InvalidOutcome> {
     let event = match outcome {
-        EffectOutcome::Llm(llm) => llm_outcome_to_event(llm, state),
+        EffectOutcome::Llm(llm) => llm_outcome_to_event(llm.reject_invalid_tool_calls(), state),
         EffectOutcome::Tool(tool) => tool_outcome_to_event(tool),
         EffectOutcome::SubAgent { agent_id, outcome } => {
             Event::SubAgentResult { agent_id, outcome }
@@ -4569,6 +4576,7 @@ pub fn llm_error_to_db_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use phoenix_core::domain::llm_types::ContentBlock;
     use std::path::PathBuf;
 
     fn test_context() -> ConvContext {
@@ -4579,6 +4587,148 @@ mod tests {
             200_000,
             16_384,
         )
+    }
+
+    #[test]
+    fn malformed_response_identities_fail_before_parent_and_terminal_interceptions() {
+        use crate::state::{ProposeTaskInput, SubmitResultInput};
+        let cases = [
+            (
+                false,
+                ToolInput::ProposeTask(ProposeTaskInput {
+                    task_file: "tasks/example.md".into(),
+                }),
+            ),
+            (false, make_ask_user_question_tool_call("call").input),
+            (
+                true,
+                ToolInput::SubmitResult(SubmitResultInput {
+                    result: "must not be accepted".into(),
+                }),
+            ),
+        ];
+        for (is_sub_agent, input) in cases {
+            for fault in ["duplicate", "unknown", "content_only", "schedule_only"] {
+                let mut ctx = test_context();
+                ctx.is_sub_agent = is_sub_agent;
+                let call = ToolCall::new("call", input.clone());
+                let mut content = vec![ContentBlock::tool_use(
+                    "call",
+                    call.name(),
+                    serde_json::json!({}),
+                )];
+                let mut tool_calls = vec![call.clone()];
+                match fault {
+                    "duplicate" => {
+                        content.push(content[0].clone());
+                        tool_calls.push(call);
+                    }
+                    "unknown" => tool_calls[0].id = "unknown".into(),
+                    "content_only" => tool_calls.clear(),
+                    "schedule_only" => content.clear(),
+                    _ => unreachable!(),
+                }
+                let outcome = || {
+                    EffectOutcome::Llm(LlmOutcome::Response {
+                        content: content.clone(),
+                        tool_calls: tool_calls.clone(),
+                        provider_replay: None,
+                        end_turn: false,
+                        usage: UsageData::default(),
+                        request_id: "malformed".into(),
+                    })
+                };
+                let retry =
+                    handle_outcome(&ConvState::LlmRequesting { attempt: 1 }, &ctx, outcome())
+                        .unwrap();
+                assert!(matches!(
+                    retry.new_state,
+                    ConvState::LlmRequesting { attempt: 2 }
+                ));
+                assert!(retry
+                    .effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::ScheduleRetry { .. })));
+                let terminal = handle_outcome(
+                    &ConvState::LlmRequesting {
+                        attempt: GENERIC_MAX_ATTEMPTS,
+                    },
+                    &ctx,
+                    outcome(),
+                )
+                .unwrap();
+                assert!(matches!(
+                    terminal.new_state,
+                    ConvState::Error {
+                        error_kind: ErrorKind::InvalidResponse,
+                        ..
+                    } | ConvState::Failed {
+                        error_kind: ErrorKind::InvalidResponse,
+                        ..
+                    }
+                ));
+                assert!(terminal.effects.iter().all(|effect| !matches!(
+                    effect,
+                    Effect::ExecuteTool { .. }
+                        | Effect::PersistCheckpoint { .. }
+                        | Effect::BroadcastAssistantMessage { .. }
+                        | Effect::RequestLlm
+                )));
+            }
+        }
+    }
+
+    #[test]
+    fn mismatched_completion_result_becomes_error_for_the_expected_invocation() {
+        let state = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "expected",
+                ToolInput::Think(crate::state::ThinkInput {
+                    thoughts: "reason".into(),
+                }),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: AssistantMessage::new(
+                "round".into(),
+                vec![ContentBlock::tool_use(
+                    "expected",
+                    "think",
+                    serde_json::json!({}),
+                )],
+                None,
+                None,
+            ),
+        };
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::ToolComplete {
+                tool_use_id: "expected".into(),
+                result: ToolResult::success("wrong".into(), "unowned output".into()),
+            },
+        )
+        .unwrap();
+        let round = result
+            .effects
+            .iter()
+            .find_map(|effect| {
+                if let Effect::PersistCheckpoint {
+                    data: CheckpointData::ToolRound(round),
+                } = effect
+                {
+                    Some(round)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(round.results()[0].tool_use_id, "expected");
+        assert!(round.results()[0].is_error());
+        assert!(round.results()[0].output().contains("different invocation"));
+        assert!(!round.results()[0].output().contains("unowned"));
+        assert!(matches!(result.new_state, ConvState::LlmRequesting { .. }));
     }
 
     #[test]
@@ -4953,9 +5103,10 @@ mod tests {
             },
             &test_context(),
             Event::LlmResponse {
-                content: vec![phoenix_core::domain::llm_types::ContentBlock::text(
-                    "near limit",
-                )],
+                content: vec![
+                    ContentBlock::text("near limit"),
+                    ContentBlock::tool_use("rejected", "think", serde_json::json!({})),
+                ],
                 tool_calls: vec![test_tool_call("rejected")],
                 end_turn: true,
                 usage: phoenix_core::domain::llm_types::Usage {
@@ -7589,7 +7740,10 @@ mod tests {
             &ConvState::LlmRequesting { attempt: 1 },
             &context,
             Event::LlmResponse {
-                content: vec![ContentBlock::text("I will inspect globally")],
+                content: vec![
+                    ContentBlock::text("I will inspect globally"),
+                    ContentBlock::tool_use("think-1", "think", serde_json::json!({})),
+                ],
                 tool_calls: vec![test_tool_call("think-1")],
                 end_turn: false,
                 usage: Usage::default(),
@@ -7616,7 +7770,14 @@ mod tests {
             &ConvState::LlmRequesting { attempt: 1 },
             &context,
             Event::LlmResponse {
-                content: vec![ContentBlock::text("stale tool call")],
+                content: vec![
+                    ContentBlock::text("stale tool call"),
+                    ContentBlock::tool_use(
+                        "propose-1",
+                        "propose_task",
+                        serde_json::json!({"task_file": "tasks/12345-p1-ready--stale.md"}),
+                    ),
+                ],
                 tool_calls: vec![ToolCall::new(
                     "propose-1",
                     ToolInput::ProposeTask(ProposeTaskInput {

@@ -16,3 +16,11 @@ Acceptance:
 Relevant boundaries: phoenix-core domain/tool_round.rs; phoenix-state-machine CheckpointData and completion/cancellation transitions; phoenix-db build_materialized_tool_round, startup reset/orphan repair, and persist_finalized_round_tx; phoenix-ide runtime transition/effect failure handling.
 
 This is separate from the no-visible-impact assembly extraction because rejection and failure settlement must be designed as one coherent behavior change. No production occurrence or executed corruption reproduction is claimed.
+
+## Completion
+
+Shared identity validation now admits assembly, finalized persistence, pending Goal rounds, and provider response schedules. Provider validation precedes parent/child special-tool interception and keeps the existing bounded InvalidResponse policy. Typed invocation channels and legacy completion events reject misidentified outputs with a concrete error for their expected invocation. Assembly errors propagate rather than panic.
+
+Startup validates every selected executing/cancelling buffer into a write plan before any recovery mutation, orphan repair, or reset. File-backed reopen cases cover count mismatch, duplicate results, unknown results, duplicate assistant calls, and undecodable held state; parent-first fixtures also prove a valid parent's child settlement cannot erase a malformed child's buffer. Repeated rejection retains identical raw state/state-kind/timestamp and writes no messages. Scoped materialization continues to exclude unrelated malformed buffers. This does not add an automatic repair/quarantine workflow for arbitrary corrupted live state. ADR-215 records that scope decision.
+
+Focused validation: affected core/state-machine/database/IDE all-target compilation; five core round cases; all 208 state-machine cases; eight recovery/materialization cases; both runtime response entry points; four outcome-forwarder cases; formatting, task, Allium, and spec-anchor checks. Equal-count identity mismatch, reset-with-malformed-buffer, and parent-before-child buffer loss regressions were observed failing before their fixes. Broader and hosted validation are recorded on the PR.
