@@ -189,3 +189,20 @@ Run logs warn that `actions/checkout@v4`, `actions/upload-artifact@v4`, `astral-
 1. Which macOS workflows must block merge, and which can be post-merge or on demand? (Affects P2-2.)
 2. Is any part of CI required to run on every PR push, or can heavy lanes wait for the fast lanes and the latest push? (Affects P2-1.)
 3. Target for PR feedback latency (for example, rust lane ≤ 25 min)? This decides how far to take sharding.
+
+## Local fixture work reduction (2026-11-02)
+
+The exact-schema Python recovery classes use a deterministic shared capacity pool while dedicated APFS/shared-pool/independent-filesystem tests retain their topology assertions. Their executable Python fixtures use the active managed interpreter. A plain fixture mixin removes four accidentally inherited candidate-gate tests while retaining the original four and all seven distinct Linux cases.
+
+The canonical-prefix admission test initializes prefix129 once and advances through every registered prefix, preserving each schema and non-mutation assertion. The Goal-report guard matrix initializes one database for all 20 entrypoint/outcome combinations, retains both attempts and global evidence checks, gives each case distinct durable identities, and verifies that later cases leave earlier scoped evidence unchanged.
+
+Representative local samples on the same Mac (single before/after runs with some shared-host activity, not a full-suite estimate):
+
+| Scope | Before | After |
+| --- | ---: | ---: |
+| Same 45 exact-schema Python tests | 145.265 s | 8.408 s |
+| Canonical-prefix admission | 16.79 s | 1.99 s |
+| Goal-report guard matrix | 19.38 s | 1.59 s |
+| Candidate/Linux gate classes | 15 cases / 14.696 s | 11 cases / 10.678 s |
+
+All 53 lineage/checkpoint tests and all 271 tests in the two affected Python modules pass. Focused fixture-cleanup/topology coverage also passes. These changes avoid a cross-process database-template cache; genuine migration, reopen, and topology coverage remains in its owning tests. Local logs are retained under `target/fixture-work-20261102/` in the Codex checkout. The broader CI handoff remains in progress.
