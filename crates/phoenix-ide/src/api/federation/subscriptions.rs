@@ -794,16 +794,7 @@ async fn drain_notifications(
                 .map_err(|error| error.to_string())?;
                 return Ok(());
             }
-            SubscriptionAuthorization::Refresh => {
-                db.suppress_remote_notification(
-                    remote,
-                    &notification.admission_id,
-                    RemoteSuppressionReason::AuthorizationDenied,
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-                return Ok(());
-            }
+            SubscriptionAuthorization::Refresh => return Ok(()),
             SubscriptionAuthorization::Rejected { reason } => {
                 let suppression_reason = match reason {
                     SubscriptionEnd::Revoked => RemoteSuppressionReason::TrustRevoked,
