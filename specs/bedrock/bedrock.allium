@@ -404,6 +404,7 @@ entity Conversation {
         awaiting_sub_agents -> llm_requesting
         awaiting_sub_agents -> cancelling_sub_agents
         cancelling_sub_agents -> idle
+        cancelling_sub_agents -> error
         idle -> awaiting_continuation
         awaiting_continuation -> recoverable_continuation_failure
         recoverable_continuation_failure -> awaiting_continuation
@@ -1039,13 +1040,15 @@ rule BackstopDefiniteWriteFailureCannotReportCompletion {
     ensures: conversation.sub_agents_completed = null
     ensures: conversation.error_message = message
     ensures: conversation.error_class = non_retryable
-    ensures: conversation.error_kind = server_error
+    ensures: conversation.error_kind = sub_agent_error
     ensures: not AgentDone(conversation)
 
     @guidance
         -- Retain existing durable admission/terminal evidence; this interrupts
         -- the cancellation chain without claiming that pending children were
-        -- accepted. No automatic replay or recovery promise follows this error.
+        -- accepted. The existing non-user-resumable sub_agent_error prevents
+        -- send/dismiss from bypassing that unresolved admission evidence.
+        -- No automatic replay or recovery promise follows this error.
 }
 
 rule BackstopUnknownWriteAuthorityClosesTheFence {
