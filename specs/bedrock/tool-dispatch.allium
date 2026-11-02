@@ -503,6 +503,32 @@ rule CooperativeCancellationPreservesGeneration {
         -- reach CancellingTool. A cancelled pre-gate selection starts no task.
 }
 
+rule CancellationBeforeCallEffectsSettlesTheOwnedSelection {
+    when: bedrock/ToolAbortRequested(conversation)
+    requires: process_authority.open
+    requires: conversation.core_status = cancelling_tool
+    requires: not has_active_ordinary_invocation(conversation)
+    requires: not has_owned_spawn_handoff_for_cancellation(conversation)
+    let selection = retained_selection_for_cancellation(conversation)
+    requires: selection_is_cancelling(selection)
+    requires: selection_has_issued_no_call_effects(selection)
+    ensures: bedrock/ToolAborted(conversation)
+    ensures: not OrdinaryGenerationOpened(selection.runtime, selection.call)
+    ensures: not CallResourcesReserved(selection)
+    ensures: not ToolTaskLaunched(selection.runtime, selection.call)
+
+    @guidance
+        -- A policy/scope read or pure gate decision need not return before
+        -- acknowledging this no-effects cancellation. Bedrock checkpoints its
+        -- synthetic results immediately through the normal cancellation path.
+        -- This also covers a spawn-named selection BEFORE any native admission
+        -- command was issued. A missing handoff alone proves nothing: the exact
+        -- retained selection must establish that no admission/effect was issued.
+        -- Once a spawn command was issued, its classified ownership/reconciliation
+        -- path applies instead. Late classified read/clear/deny returns remain
+        -- stale; actual unknown local authority still closes the shared fence.
+}
+
 rule CancellationDuringOrdinaryPreparationPreventsLaunch {
     when: bedrock/ToolAbortRequested(conversation)
     requires: has_active_ordinary_invocation(conversation)
@@ -787,6 +813,15 @@ surface RuntimeAuthorityObservations {
 --   captured exact call. Cancellation, round replacement, another selection or a
 --   later round reusing a provider ID is false. This check and error acceptance
 --   are one owned step; no ordinary generation is required before preparation.
+-- retained_selection_for_cancellation(conversation) -> DispatchSelection: the
+--   immutable origin retained by the native policy/scope/gate preparation owner,
+--   not a reconstruction from the latest call or an absent invocation lookup.
+-- selection_is_cancelling(selection) -> Boolean: the same runtime/held assistant
+--   and CancellingTool tool ID still identify this exact captured selection.
+-- selection_has_issued_no_call_effects(selection) -> Boolean: that exact retained
+--   preparation owner establishes no native admission command, ordinary resource
+--   admission/generation or tool-task request was issued. Mere in-memory absence,
+--   a missing reply or a query racing a spawn command is not this disposition.
 -- new_spawn_batch_id() -> String: the native request's fresh opaque batch identity,
 --   captured once with the original call and reused by its admission/closure owner.
 -- spawn_catalog_matches_originating_schema(runtime, call) -> Boolean: spawn is
