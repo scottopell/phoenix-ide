@@ -259,6 +259,24 @@ async fn release_terminal_evidence_tx(
     Ok(())
 }
 
+async fn replay_failed_gap_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    subscription: Uuid,
+    after: SubscriptionCursor,
+    now: i64,
+) -> DbResult<SubscriptionGap> {
+    let gap = gap_tx(tx, &subscription.to_string()).await?;
+    if after < gap.last_acknowledged || after > gap.last_produced {
+        return Err(invalid(
+            "terminal gap replay cursor is outside the frozen prefix",
+        ));
+    }
+    if now >= gap.terminal_evidence_expires_at_us {
+        release_terminal_evidence_tx(tx, subscription).await?;
+    }
+    Ok(gap)
+}
+
 async fn snapshot_tx(
     tx: &mut Transaction<'_, Sqlite>,
     product: &ProductConversationId,
@@ -349,15 +367,7 @@ impl Database {
         let state: String = row.try_get("state")?;
         let id = subscription.to_string();
         if state == "failed_gap" {
-            let gap = gap_tx(&mut tx, &id).await?;
-            if after < gap.last_acknowledged || after > gap.last_produced {
-                return Err(invalid(
-                    "terminal gap replay cursor is outside the frozen prefix",
-                ));
-            }
-            if now >= gap.terminal_evidence_expires_at_us {
-                release_terminal_evidence_tx(&mut tx, subscription).await?;
-            }
+            let gap = replay_failed_gap_tx(&mut tx, subscription, after, now).await?;
             tx.commit().await?;
             return Ok(SubscriptionReplay::Gap { gap });
         }
@@ -377,15 +387,7 @@ impl Database {
         let state: String = row.try_get("state")?;
         let mut acknowledged: i64 = row.try_get("acknowledged_through")?;
         if state == "failed_gap" {
-            let gap = gap_tx(&mut tx, &id).await?;
-            if after < gap.last_acknowledged || after > gap.last_produced {
-                return Err(invalid(
-                    "terminal gap replay cursor is outside the frozen prefix",
-                ));
-            }
-            if now >= gap.terminal_evidence_expires_at_us {
-                release_terminal_evidence_tx(&mut tx, subscription).await?;
-            }
+            let gap = replay_failed_gap_tx(&mut tx, subscription, after, now).await?;
             tx.commit().await?;
             return Ok(SubscriptionReplay::Gap { gap });
         }

@@ -107,10 +107,11 @@ impl Database {
                         || fact.source_transcript_id.as_str().len() > 1024
                         || fact.occurrence.id.is_empty()
                         || fact.occurrence.id.len() > 1024
-                        || fact.occurrence.generation > i64::MAX as u64
                     {
                         return Err(invalid("invalid fact order or bounds"));
                     }
+                    let generation = i64::try_from(fact.occurrence.generation)
+                        .map_err(|_| invalid("invalid fact order or bounds"))?;
                     let admission_id = format!(
                         "federation:{}:fact:{}",
                         remote.reference.instance_id, fact.event_id
@@ -125,13 +126,12 @@ impl Database {
                     )
                     .await?;
                     sqlx::query("INSERT INTO federation_received_facts(admission_id,destination_instance_id,event_id,occurrence_kind,occurrence_id,occurrence_generation,source_transcript_id,outcome,occurred_at_us) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(admission_id) DO NOTHING")
-                        .bind(&admission_id).bind(remote.reference.instance_id.to_string()).bind(fact.event_id.to_string()).bind(fact.occurrence.kind.as_str()).bind(&fact.occurrence.id).bind(fact.occurrence.generation as i64).bind(fact.source_transcript_id.as_str()).bind(fact.outcome.as_str()).bind(fact.occurred_at_us).execute(&mut *tx).await?;
+                        .bind(&admission_id).bind(remote.reference.instance_id.to_string()).bind(fact.event_id.to_string()).bind(fact.occurrence.kind.as_str()).bind(&fact.occurrence.id).bind(generation).bind(fact.source_transcript_id.as_str()).bind(fact.outcome.as_str()).bind(fact.occurred_at_us).execute(&mut *tx).await?;
                     let stored = sqlx::query("SELECT occurrence_kind,occurrence_id,occurrence_generation,source_transcript_id,outcome,occurred_at_us FROM federation_received_facts WHERE admission_id = ?1").bind(admission_id).fetch_one(&mut *tx).await?;
                     if stored.try_get::<String, _>("occurrence_kind")?
                         != fact.occurrence.kind.as_str()
                         || stored.try_get::<String, _>("occurrence_id")? != fact.occurrence.id
-                        || stored.try_get::<i64, _>("occurrence_generation")?
-                            != fact.occurrence.generation as i64
+                        || stored.try_get::<i64, _>("occurrence_generation")? != generation
                         || stored.try_get::<String, _>("source_transcript_id")?
                             != fact.source_transcript_id.as_str()
                         || stored.try_get::<String, _>("outcome")? != fact.outcome.as_str()

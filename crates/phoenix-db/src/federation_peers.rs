@@ -140,6 +140,11 @@ impl Database {
         .transpose()
     }
 
+    /// Resolve one caller-side peer connection by instance ID or exact display-name alias.
+    ///
+    /// # Errors
+    /// Returns an error when no peer matches, an alias is ambiguous, the query fails, or
+    /// persisted peer data cannot be decoded.
     pub async fn resolve_federation_peer(
         &self,
         selector: &InstanceSelector,

@@ -21,6 +21,7 @@ impl Database {
     ///
     /// # Errors
     /// Returns an error for changed identities, invalid ranges, or failed persistence.
+    #[allow(clippy::too_many_lines)]
     pub async fn authorize_federation_delivery(
         &self,
         authority: &FederationSendAuthority,

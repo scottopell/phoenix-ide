@@ -15249,7 +15249,7 @@ with tempfile.TemporaryDirectory() as directory:
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
     async fn migration_150_preserves_populated_graphs_and_terminal_delivery_rules() {
         let (db, source_product) = migration_150_fixture(false).await;
         let coordinator = db
@@ -15319,7 +15319,7 @@ with tempfile.TemporaryDirectory() as directory:
                     "completed".into(),
                     0,
                     3,
-                    ("transcript-é".len() + "completed".len() + 96) as i64
+                    i64::try_from("transcript-é".len() + "completed".len() + 96).unwrap()
                 ),
                 (
                     "event-two".into(),
@@ -15327,7 +15327,7 @@ with tempfile.TemporaryDirectory() as directory:
                     "failed".into(),
                     1,
                     4,
-                    ("transcript-二".len() + "failed".len() + 96) as i64
+                    i64::try_from("transcript-二".len() + "failed".len() + 96).unwrap()
                 ),
             ]
         );

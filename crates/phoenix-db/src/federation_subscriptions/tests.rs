@@ -1204,6 +1204,7 @@ async fn ordinary_durable_turn_admission_advances_cursor_in_accept_transaction()
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn gap_is_not_a_fact_and_cursor_moves_only_when_notification_is_accepted() {
     let db = Database::open_in_memory().await.unwrap();
     let target = coordinator(&db).await;
@@ -1364,6 +1365,7 @@ async fn gap_is_not_a_fact_and_cursor_moves_only_when_notification_is_accepted()
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn failed_gap_authorization_attempts_survive_restart_and_exhaust_into_suppression() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory
@@ -1813,6 +1815,7 @@ async fn authorize_source(
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn terminal_evidence_expires_at_the_immutable_deadline_and_leaves_the_gap_tombstone() {
     let f = Fixture::new().await;
     f.emit(
