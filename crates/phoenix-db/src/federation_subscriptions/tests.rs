@@ -698,7 +698,7 @@ async fn source_close_ends_subscription_and_suppresses_unadmitted_payloads() {
 #[tokio::test]
 async fn classification_fanout_consumes_cancellation_once_and_drops_nonterminal_categories() {
     let f = Fixture::new().await;
-    assert!(facts(f.replay(0, Utc::now().timestamp_micros()).await).is_empty());
+    assert!(facts(f.replay(0, chrono::Utc::now().timestamp_micros()).await).is_empty());
     f.db.watch_product_conversation(&f.source.product_conversation_id)
         .await
         .unwrap();
@@ -2242,7 +2242,7 @@ async fn pre_enrollment_production_terminal_is_not_a_future_fact() {
 #[allow(clippy::too_many_lines)]
 async fn real_history_close_preserves_accepted_and_suppresses_every_unadmitted_fact() {
     let f = Fixture::new().await;
-    assert!(facts(f.replay(0, Utc::now().timestamp_micros()).await).is_empty());
+    assert!(facts(f.replay(0, chrono::Utc::now().timestamp_micros()).await).is_empty());
     for n in 0..3 {
         f.emit(
             &format!("close-{n}"),
@@ -3523,7 +3523,7 @@ async fn production_creation_completion_failure_and_cancellation_fanout_are_atom
 async fn recovered_steering_installs_terminal_projection_before_atomic_fanout() {
     use phoenix_core::domain::{db_schema::MessageContent, sm_state::ConvState};
     let f = Fixture::new().await;
-    assert!(facts(f.replay(0, Utc::now().timestamp_micros()).await).is_empty());
+    assert!(facts(f.replay(0, chrono::Utc::now().timestamp_micros()).await).is_empty());
     f.db.add_message(
         "recovery-steering",
         &f.source.id,
@@ -3682,7 +3682,7 @@ async fn settlement_crossing_retention_limit_snapshots_after_occurrence_cleanup(
 async fn recovered_steering_loses_to_newer_active_turn_without_fanout() {
     use phoenix_core::domain::{db_schema::MessageContent, sm_state::ConvState};
     let f = Fixture::new().await;
-    assert!(facts(f.replay(0, Utc::now().timestamp_micros()).await).is_empty());
+    assert!(facts(f.replay(0, chrono::Utc::now().timestamp_micros()).await).is_empty());
     for (message_id, text) in [
         ("stale-recovery-steering", "stale steering"),
         ("newer-active-owner", "new owner"),
@@ -3743,7 +3743,7 @@ async fn recovered_steering_loses_to_newer_active_turn_without_fanout() {
         .unwrap(),
         0
     );
-    assert!(facts(f.replay(0, Utc::now().timestamp_micros()).await).is_empty());
+    assert!(facts(f.replay(0, chrono::Utc::now().timestamp_micros()).await).is_empty());
 }
 
 #[tokio::test]
