@@ -2412,17 +2412,22 @@ async fn revoke_and_unsubscribe_serialize_against_authorization_in_both_orders()
                     SubscriptionAuthorization::Authorized { .. }
                 ));
             }
-            let after = authorize_source(&f, &delivery).await;
-            assert_eq!(
-                after,
-                SubscriptionAuthorization::Rejected {
-                    reason: if revoke {
-                        SubscriptionEnd::Revoked
-                    } else {
-                        SubscriptionEnd::Unsubscribed
+            if revoke {
+                let after =
+                    f.db.authorize_federation_delivery(&f.authority, &delivery, NOW + 3)
+                        .await;
+                assert!(matches!(
+                    after,
+                    Err(crate::DbError::FederationSendAuthorityInactive)
+                ));
+            } else {
+                assert_eq!(
+                    authorize_source(&f, &delivery).await,
+                    SubscriptionAuthorization::Rejected {
+                        reason: SubscriptionEnd::Unsubscribed
                     }
-                }
-            );
+                );
+            }
             assert_eq!(
                 sqlx::query_scalar::<_, i64>(
                     "SELECT COUNT(*) FROM federation_delivery_authorizations"

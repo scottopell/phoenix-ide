@@ -454,9 +454,12 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
             let pool = fixture(prefix, populated).await;
             run_through_for_test(&pool, 142).await.unwrap();
             let before = snapshot(&mut pool.acquire().await.unwrap()).await;
-            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 8);
+            assert_eq!(run_through_for_test(&pool, 149).await.unwrap(), 7);
             let mut conn = pool.acquire().await.unwrap();
             preserved(&mut conn, &before).await;
+            drop(conn);
+            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+            let mut conn = pool.acquire().await.unwrap();
             let live_images: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_job_images")
                     .fetch_one(&mut *conn)
@@ -530,9 +533,12 @@ async fn registered_body_faults_rollback_and_same_connection_retry() {
             .await
             .unwrap();
         drop(conn);
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 8);
+        assert_eq!(run_through_for_test(&pool, 149).await.unwrap(), 7);
         let mut conn = pool.acquire().await.unwrap();
         preserved(&mut conn, &before).await;
+        drop(conn);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        let mut conn = pool.acquire().await.unwrap();
         clean(&mut conn).await;
     }
 }

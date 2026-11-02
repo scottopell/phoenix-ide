@@ -294,7 +294,7 @@ async fn real_145_provenance_and_tools_retention_survive_upgrade_delete_and_reop
         crate::migrations::run_pending_migrations(db.pool())
             .await
             .unwrap(),
-        4
+        5
     );
     sqlx::query("INSERT INTO product_creation_initial_execution_receipts(request_id,terminal_kind,failure_reason) VALUES ('joint-create','Completed',NULL)")
         .execute(db.pool()).await.unwrap();
