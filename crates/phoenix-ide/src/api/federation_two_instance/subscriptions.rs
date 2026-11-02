@@ -1704,11 +1704,19 @@ async fn source_unsubscribe_or_revoke_before_authorization_suppresses_staged_adm
             .await
             .unwrap();
         assert_eq!(history.len(), 1);
-        let actual_reason = match history[0].disposition {
+        let actual_reason = match &history[0].disposition {
             phoenix_db::federation_subscriptions::RemoteNotificationDisposition::Suppressed {
                 reason,
-            } => reason,
-            ref disposition => panic!("{state:?} produced {disposition:?}"),
+            } => *reason,
+            disposition
+            @ (phoenix_db::federation_subscriptions::RemoteNotificationDisposition::Pending
+            | phoenix_db::federation_subscriptions::RemoteNotificationDisposition::Authorizing
+            | phoenix_db::federation_subscriptions::RemoteNotificationDisposition::Authorized {
+                ..
+            }
+            | phoenix_db::federation_subscriptions::RemoteNotificationDisposition::Accepted {
+                ..
+            }) => panic!("{state:?} produced {disposition:?}"),
         };
         assert_eq!(actual_reason, expected_reason, "state {state:?}");
         assert_eq!(

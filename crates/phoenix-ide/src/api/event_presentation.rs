@@ -309,7 +309,7 @@ fn federated_navigation(
 
 fn federated_presentation(
     notification: RemoteNotification,
-    paths: Option<(String, String)>,
+    paths: Option<&(String, String)>,
     origin: Option<&PeerBaseUrl>,
 ) -> Result<EventPresentation, DbError> {
     let RemoteNotification {
@@ -342,7 +342,7 @@ fn federated_presentation(
                 outcome: federated_outcome(fact.outcome),
                 occurred_at_us: fact.occurred_at_us,
                 disposition,
-                navigation: federated_navigation(paths.as_ref(), origin),
+                navigation: federated_navigation(paths, origin),
             })
         }
         SubscriptionDelivery::Gap { gap } => {
@@ -391,7 +391,7 @@ async fn load_federated_presentations(
             let origin = origins
                 .get(&notification.reference.instance_id)
                 .and_then(Option::as_ref);
-            federated_presentation(notification, paths, origin)
+            federated_presentation(notification, paths.as_ref(), origin)
                 .map(|presentation| (id, presentation))
         })
         .collect()

@@ -168,7 +168,9 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
             clock,
             process_incarnation,
             watch_delivery: None,
-            subscription_sync: Arc::new(Mutex::new(Default::default())),
+            subscription_sync: Arc::new(Mutex::new(
+                crate::api::federation::subscriptions::SubscriptionSync::default(),
+            )),
             #[cfg(test)]
             pre_dispatch_hook: None,
         }

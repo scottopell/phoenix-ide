@@ -174,10 +174,7 @@ impl TestInstance {
     }
 }
 
-pub(super) async fn materialize_received(
-    instance: &TestInstance,
-    transcript: &str,
-) -> crate::db::Message {
+async fn materialize_received(instance: &TestInstance, transcript: &str) -> crate::db::Message {
     use phoenix_db::workflow::{
         ClaimAuthoritativeTurnInput, MaterializeAuthoritativeTurnInput,
         MaterializeAuthoritativeTurnOutcome,

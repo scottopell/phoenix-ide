@@ -262,7 +262,7 @@ fn valid_delivery(delivery: &SubscriptionDelivery) -> bool {
                 && fact.occurred_at_us >= 0
                 && !fact.occurrence.id.is_empty()
                 && fact.occurrence.id.len() <= 1024
-                && fact.occurrence.generation <= i64::MAX as u64
+                && i64::try_from(fact.occurrence.generation).is_ok()
         }
         SubscriptionDelivery::Gap { gap } => valid_gap(gap),
     }
@@ -318,14 +318,17 @@ fn validate_response(
                 {
                     Ok(())
                 }
-                (SubscriptionAuthorization::Authorized { .. }, None)
+                (
+                    SubscriptionAuthorization::Authorized { .. }
+                    | SubscriptionAuthorization::EvidenceExpired,
+                    None,
+                )
                 | (
                     SubscriptionAuthorization::Rejected { .. }
                     | SubscriptionAuthorization::Refresh
                     | SubscriptionAuthorization::EvidenceExpired,
                     Some(_),
-                )
-                | (SubscriptionAuthorization::EvidenceExpired, None) => Err(mismatch()),
+                ) => Err(mismatch()),
             }
         }
         (SubscriptionOperation::Unsubscribe, SubscriptionResult::Unsubscribed) => Ok(()),

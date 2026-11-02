@@ -283,6 +283,7 @@ fn gap_requires_loss_after_the_exact_acknowledged_cursor() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn authorization_response_validates_delivery_bounds_and_navigation() {
     let mut req = request();
     req.operation = SubscriptionOperation::Authorize {
