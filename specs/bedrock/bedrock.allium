@@ -3060,6 +3060,10 @@ rule ModeChangeNotification {
 -- Helpers (pure predicates referenced by rules)
 ------------------------------------------------------------
 
+--   executor_owns_conversation(executor: RuntimeExecutor, conversation: Conversation) -> Boolean
+--       The acknowledgement comes from the live executor owning this exact
+--       conversation. A runtime for another conversation cannot retire its slot.
+
 --   remaining_tool_calls(calls: List<ToolCall>) -> List<ToolCall>
 --       The ordered tail after removing exactly the first call. Requires a
 --       nonempty input. The active call is not part of tool_queue; completed
@@ -3713,13 +3717,14 @@ invariant ContinuationBoundarySummaryLivesOnHandedOffPredecessor {
 
 -- REQ-BED-005a: Bounded cancellation liveness.
 -- cancelling_tool and cancelling_sub_agents are never livelocks: each has a
--- deadline-driven exit to idle (CancellingToolDeadlineFires,
--- CancellingSubAgentsDeadlineFires) that does not depend on the running task or
--- a pending sub-agent ever returning. The time from a cancellation request to a
+-- deadline-driven terminal-direction settlement that does not depend on the
+-- running task or a pending sub-agent ever returning. The tool deadline invokes
+-- synchronous slot retirement, whose acknowledgement admits the checkpoint;
+-- it does not wait for task completion. The time from a cancellation request to a
 -- terminal-direction state is bounded by config.cancellation_deadline regardless
 -- of tool cooperation. Enforced by construction: the deadline rules' `when:`
--- (CancellationDeadlineExpires) fires unconditionally on every conversation in a
--- cancellation status, so neither status can persist past the deadline.
+-- (CancellationDeadlineExpires) invokes teardown for every cancellation state;
+-- absence of an ordinary tool task cannot suppress its retirement acknowledgement.
 
 ------------------------------------------------------------
 -- Actor Declarations
@@ -3729,9 +3734,38 @@ actor User {
     identified_by: Parent
 }
 
+actor RuntimeExecutor {
+    identified_by: Conversation
+}
+
 ------------------------------------------------------------
 -- Surfaces
 ------------------------------------------------------------
+
+-- Internal synchronous acknowledgements from the conversation's owned executor.
+-- These are lifecycle steps, not a new public API or independent retry queue.
+surface ToolRetirementAcknowledgements {
+    facing runtime: RuntimeExecutor
+    context conversation: Conversation
+
+    provides:
+        ToolTaskRetired(conversation, tool_call)
+            when executor_owns_conversation(runtime, conversation)
+                 and conversation.core_status = executing_tools
+                 and tool_call = conversation.current_tool
+                 and is_bash_wait(tool_call)
+        ToolCancellationRetired(conversation)
+            when executor_owns_conversation(runtime, conversation)
+                 and conversation.core_status = cancelling_tool
+
+    @guarantee RetirementPrecedesSettlement
+        -- Each acknowledgement answers the matching retirement request from
+        -- this same owned execution step, after dispatch-generation invalidation
+        -- and abort of the retained task handle if present. It is emitted without
+        -- waiting for task/resource cleanup and before synthetic settlement can
+        -- advance the conversation. No ordinary task or invocation is required
+        -- to acknowledge cancellation-slot retirement.
+}
 
 surface UserConversation {
     facing user: User

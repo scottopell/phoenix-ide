@@ -85,6 +85,9 @@ entity ToolInvocation {
 rule RejectUnavailableCallBeforeOwnership {
     when: bedrock/ToolExecutionStarted(conversation, call)
     let runtime = runtime_for(conversation)
+    requires: conversation.core_status = executing_tools
+    requires: call = conversation.current_tool
+    requires: not has_active_ordinary_invocation(conversation)
     requires: runtime.authority_open
     requires: request_policy_read_succeeded(runtime)
     requires: not originating_policy_allows(runtime, call)
@@ -114,6 +117,9 @@ rule PreparationScopeReadFails {
 rule RouteSpawnToItsAdmissionBoundary {
     when: bedrock/ToolExecutionStarted(conversation, call)
     let runtime = runtime_for(conversation)
+    requires: conversation.core_status = executing_tools
+    requires: call = conversation.current_tool
+    requires: not has_active_ordinary_invocation(conversation)
     requires: runtime.authority_open
     requires: originating_policy_allows(runtime, call)
     requires: call.name = "spawn_agents"
@@ -131,6 +137,9 @@ rule RouteSpawnToItsAdmissionBoundary {
 rule BeginOrdinaryPreparation {
     when: bedrock/ToolExecutionStarted(conversation, call)
     let runtime = runtime_for(conversation)
+    requires: conversation.core_status = executing_tools
+    requires: call = conversation.current_tool
+    requires: not has_active_ordinary_invocation(conversation)
     requires: runtime.authority_open
     requires: originating_policy_allows(runtime, call)
     requires: call.name != "spawn_agents"
@@ -347,6 +356,14 @@ surface OrdinaryToolDispatch {
     provides:
         bedrock/ToolExecutionStarted(runtime.conversation, runtime.conversation.current_tool)
             when runtime.conversation.core_status = executing_tools
+                 and not has_active_ordinary_invocation(runtime.conversation)
+
+    @guarantee SelectionOwnsOneStartEffect
+        -- ToolExecutionStarted is Bedrock's one effect when selecting an active
+        -- call or advancing to its successor, not a repeatable dispatch API.
+        -- The owned loop consumes that effect once before processing another
+        -- transition. It cannot open a second generation for a still-active
+        -- ordinary invocation or start a call other than Bedrock's current call.
 
     @guarantee NoImplicitReplay
         -- Recreating this runtime does not recreate process-local invocations.
