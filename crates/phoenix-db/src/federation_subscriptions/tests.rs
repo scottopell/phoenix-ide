@@ -86,13 +86,23 @@ impl Fixture {
         }
     }
     async fn emit(&self, occurrence: &str, outcome: TerminalFactOutcome, now: i64) {
+        self.emit_generation(occurrence, 0, outcome, now).await;
+    }
+
+    async fn emit_generation(
+        &self,
+        occurrence: &str,
+        generation: i64,
+        outcome: TerminalFactOutcome,
+        now: i64,
+    ) {
         let mut tx = self.db.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
         append_terminal_tx(
             &mut tx,
             ClassifiedTerminal {
                 occurrence_kind: "creation",
                 occurrence_id: occurrence,
-                generation: 0,
+                generation,
                 transcript_id: &self.source.id,
                 outcome,
                 context_exhausted: false,
@@ -127,6 +137,71 @@ fn facts(replay: SubscriptionReplay) -> Vec<FederatedTerminalFact> {
 
 fn occurrence(id: &str) -> TerminalFactOccurrence {
     TerminalFactOccurrence::new(TerminalFactOccurrenceKind::Creation, id, 0).unwrap()
+}
+
+#[tokio::test]
+async fn reused_occurrence_id_is_joined_by_kind_id_and_generation() {
+    let f = Fixture::new().await;
+    f.emit_generation("reused-occurrence", 0, TerminalFactOutcome::Completed, NOW)
+        .await;
+    f.emit_generation("reused-occurrence", 1, TerminalFactOutcome::Failed, NOW + 1)
+        .await;
+
+    let replayed = facts(f.replay(0, NOW + 1).await);
+    assert_eq!(replayed.len(), 2);
+    assert_ne!(replayed[0].event_id, replayed[1].event_id);
+    assert_eq!(
+        replayed[0].occurrence,
+        TerminalFactOccurrence::new(TerminalFactOccurrenceKind::Creation, "reused-occurrence", 0,)
+            .unwrap()
+    );
+    assert_eq!(replayed[0].outcome, TerminalFactOutcome::Completed);
+    assert_eq!(replayed[0].occurred_at_us, NOW);
+    assert_eq!(
+        replayed[1].occurrence,
+        TerminalFactOccurrence::new(TerminalFactOccurrenceKind::Creation, "reused-occurrence", 1,)
+            .unwrap()
+    );
+    assert_eq!(replayed[1].outcome, TerminalFactOutcome::Failed);
+    assert_eq!(replayed[1].occurred_at_us, NOW + 1);
+
+    assert!(matches!(
+        authorize_source(
+            &f,
+            &SubscriptionDelivery::Fact {
+                fact: replayed[0].clone(),
+            },
+        )
+        .await,
+        SubscriptionAuthorization::Authorized { .. }
+    ));
+
+    let mut forged = replayed[0].clone();
+    forged.occurrence.generation = replayed[1].occurrence.generation;
+    let forged_result =
+        f.db.authorize_federation_delivery(
+            &f.authority,
+            f.subscription,
+            &f.source.product_conversation_id,
+            &SubscriptionDelivery::Fact { fact: forged },
+            NOW + 1,
+        )
+        .await;
+    assert!(
+        forged_result.is_err(),
+        "authorized fact accepted another occurrence generation: {forged_result:?}"
+    );
+
+    assert!(matches!(
+        authorize_source(
+            &f,
+            &SubscriptionDelivery::Fact {
+                fact: replayed[1].clone(),
+            },
+        )
+        .await,
+        SubscriptionAuthorization::Authorized { .. }
+    ));
 }
 
 #[tokio::test]
@@ -1754,9 +1829,27 @@ async fn terminal_evidence_expires_at_the_immutable_deadline_and_leaves_the_gap_
     assert_eq!(expiry, gap.failed_at_us + TERMINAL_EVIDENCE_LIFETIME_US);
     let delivery = SubscriptionDelivery::Fact { fact };
 
+    assert!(matches!(
+        authorize_source_at(&f, &delivery, expiry - 1).await,
+        SubscriptionAuthorization::Authorized { .. }
+    ));
+    assert!(matches!(
+        f.replay(0, expiry - 1).await,
+        SubscriptionReplay::Gap { gap: replayed } if replayed == gap
+    ));
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM federation_terminal_payloads WHERE event_id IN (SELECT event_id FROM federation_terminal_identities WHERE subscription_id = ?1)"
+        )
+        .bind(f.subscription.to_string())
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM federation_delivery_authorizations WHERE subscription_id = ?1"
         )
         .bind(f.subscription.to_string())
         .fetch_one(f.db.pool())
@@ -1774,8 +1867,8 @@ async fn terminal_evidence_expires_at_the_immutable_deadline_and_leaves_the_gap_
     assert_eq!(release_reason, None);
 
     assert!(matches!(
-        authorize_source_at(&f, &delivery, expiry - 1).await,
-        SubscriptionAuthorization::Authorized { .. }
+        f.replay(0, expiry).await,
+        SubscriptionReplay::Gap { gap: replayed } if replayed == gap
     ));
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -1785,19 +1878,65 @@ async fn terminal_evidence_expires_at_the_immutable_deadline_and_leaves_the_gap_
         .fetch_one(f.db.pool())
         .await
         .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM federation_delivery_authorizations WHERE subscription_id = ?1"
+        )
+        .bind(f.subscription.to_string())
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM federation_terminal_identities WHERE subscription_id = ?1 AND evidence_release_reason = 'expired'"
+        )
+        .bind(f.subscription.to_string())
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap(),
         1
     );
-    let release_reason: Option<String> = sqlx::query_scalar(
-        "SELECT evidence_release_reason FROM federation_terminal_identities WHERE subscription_id = ?1 LIMIT 1",
-    )
-    .bind(f.subscription.to_string())
-    .fetch_one(f.db.pool())
-    .await
-    .unwrap();
-    assert_eq!(release_reason, None);
+    let snapshot_outcome = match gap.snapshot.state {
+        SubscriptionCurrentState::Nonterminal => None,
+        SubscriptionCurrentState::Terminal { outcome } => Some(outcome.as_str()),
+    };
     assert_eq!(
-        authorize_source_at(&f, &delivery, expiry).await,
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM federation_subscription_gaps WHERE subscription_id = ?1 AND last_acknowledged = ?2 AND last_produced = ?3 AND reason = ?4 AND failed_at_us = ?5 AND terminal_evidence_expires_at_us = ?6 AND snapshot_transcript_id = ?7 AND snapshot_outcome IS ?8"
+        )
+        .bind(f.subscription.to_string())
+        .bind(gap.last_acknowledged.get())
+        .bind(gap.last_produced.get())
+        .bind(gap.reason.as_str())
+        .bind(gap.failed_at_us)
+        .bind(expiry)
+        .bind(gap.snapshot.transcript_id.as_str())
+        .bind(snapshot_outcome)
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap(),
+        1
+    );
+
+    assert!(matches!(
+        f.replay(0, expiry + 1).await,
+        SubscriptionReplay::Gap { gap: replayed } if replayed == gap
+    ));
+    assert!(matches!(
+        f.replay(0, expiry - 1).await,
+        SubscriptionReplay::Gap { gap: replayed } if replayed == gap
+    ));
+    assert_eq!(
+        authorize_source_at(&f, &delivery, expiry + 1).await,
         SubscriptionAuthorization::EvidenceExpired
+    );
+    assert_eq!(
+        authorize_source_at(&f, &delivery, expiry - 1).await,
+        SubscriptionAuthorization::Refresh
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -1809,14 +1948,16 @@ async fn terminal_evidence_expires_at_the_immutable_deadline_and_leaves_the_gap_
         .unwrap(),
         0
     );
-    let stored_expiry: i64 = sqlx::query_scalar(
-        "SELECT terminal_evidence_expires_at_us FROM federation_subscription_gaps WHERE subscription_id = ?1",
-    )
-    .bind(f.subscription.to_string())
-    .fetch_one(f.db.pool())
-    .await
-    .unwrap();
-    assert_eq!(stored_expiry, expiry);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM federation_delivery_authorizations WHERE subscription_id = ?1"
+        )
+        .bind(f.subscription.to_string())
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap(),
+        0
+    );
     let release_reason: Option<String> = sqlx::query_scalar(
         "SELECT evidence_release_reason FROM federation_terminal_identities WHERE subscription_id = ?1 LIMIT 1",
     )
@@ -1825,14 +1966,6 @@ async fn terminal_evidence_expires_at_the_immutable_deadline_and_leaves_the_gap_
     .await
     .unwrap();
     assert_eq!(release_reason.as_deref(), Some("expired"));
-    assert!(matches!(
-        f.replay(0, expiry + 1).await,
-        SubscriptionReplay::Gap { gap: replayed } if replayed == gap
-    ));
-    assert_eq!(
-        authorize_source_at(&f, &delivery, expiry + 1).await,
-        SubscriptionAuthorization::EvidenceExpired
-    );
 }
 
 #[tokio::test]

@@ -719,4 +719,3 @@ DROP TABLE _m150_remote_subscriptions;
 DROP TABLE _m150_pending_unsubscribes;
 DROP TABLE _m150_remote_admissions;
 DROP TABLE _m150_remote_navigation;
-

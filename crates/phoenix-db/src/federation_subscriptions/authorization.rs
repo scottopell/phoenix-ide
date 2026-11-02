@@ -1,8 +1,9 @@
 use super::{
-    end, federation_send_enrollment_id_tx, invalid, uuid, Database, DbResult,
-    FederatedTerminalFact, FederationSendAuthority, ProductConversationId, RemoteSubscription, Row,
-    Sqlite, SubscriptionAuthorization, SubscriptionCurrentState, SubscriptionDelivery,
-    SubscriptionEnd, SubscriptionGap, SubscriptionReference, Transaction, Uuid,
+    end, federation_send_enrollment_id_tx, invalid, release_terminal_evidence_tx, uuid, Database,
+    DbResult, FederatedTerminalFact, FederationSendAuthority, ProductConversationId,
+    RemoteSubscription, Row, Sqlite, SubscriptionAuthorization, SubscriptionCurrentState,
+    SubscriptionDelivery, SubscriptionEnd, SubscriptionGap, SubscriptionReference, Transaction,
+    Uuid,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -363,7 +364,7 @@ async fn validate_fact_tx(
 ) -> DbResult<bool> {
     let generation = i64::try_from(fact.occurrence.generation)
         .map_err(|_| invalid("terminal fact occurrence generation overflow"))?;
-    let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM federation_terminal_identities i JOIN federation_terminal_payloads p USING(event_id) JOIN federation_terminal_occurrences o ON o.occurrence_id = i.occurrence_id WHERE i.subscription_id = ?1 AND i.event_id = ?2 AND i.sequence = ?3 AND i.continuation_state = 'none' AND p.source_transcript_id = ?4 AND p.outcome = ?5 AND p.occurred_at_us = ?6 AND o.occurrence_kind = ?7 AND o.occurrence_id = ?8 AND o.generation = ?9)")
+    let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM federation_terminal_identities i JOIN federation_terminal_payloads p USING(event_id) JOIN federation_terminal_occurrences o ON o.occurrence_kind = i.occurrence_kind AND o.occurrence_id = i.occurrence_id AND o.generation = i.generation WHERE i.subscription_id = ?1 AND i.event_id = ?2 AND i.sequence = ?3 AND i.continuation_state = 'none' AND p.source_transcript_id = ?4 AND p.outcome = ?5 AND p.occurred_at_us = ?6 AND o.occurrence_kind = ?7 AND o.occurrence_id = ?8 AND o.generation = ?9)")
         .bind(subscription.to_string())
         .bind(fact.event_id.to_string())
         .bind(fact.sequence.get())
@@ -376,34 +377,4 @@ async fn validate_fact_tx(
         .fetch_one(&mut **tx)
         .await?;
     Ok(valid)
-}
-
-async fn release_terminal_evidence_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    subscription: Uuid,
-) -> DbResult<()> {
-    sqlx::query("DELETE FROM federation_delivery_authorizations WHERE subscription_id = ?1")
-        .bind(subscription.to_string())
-        .execute(&mut **tx)
-        .await?;
-    sqlx::query(
-        "UPDATE federation_terminal_identities
-         SET evidence_release_reason = 'expired'
-         WHERE subscription_id = ?1
-           AND evidence_release_reason IS NULL
-           AND event_id IN (SELECT event_id FROM federation_terminal_payloads)",
-    )
-    .bind(subscription.to_string())
-    .execute(&mut **tx)
-    .await?;
-    sqlx::query(
-        "DELETE FROM federation_terminal_payloads
-         WHERE event_id IN (
-             SELECT event_id FROM federation_terminal_identities WHERE subscription_id = ?1
-         )",
-    )
-    .bind(subscription.to_string())
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
 }

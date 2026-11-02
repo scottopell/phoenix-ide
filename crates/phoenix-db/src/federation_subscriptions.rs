@@ -204,6 +204,61 @@ async fn gap_tx(tx: &mut Transaction<'_, Sqlite>, subscription: &str) -> DbResul
     })
 }
 
+async fn release_terminal_evidence_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    subscription: Uuid,
+) -> DbResult<()> {
+    sqlx::query(
+        "DELETE FROM federation_delivery_authorizations
+         WHERE subscription_id = ?1
+           AND kind = 'fact'
+           AND event_id IN (
+               SELECT i.event_id
+               FROM federation_terminal_identities i
+               JOIN federation_subscription_gaps g ON g.subscription_id = i.subscription_id
+               WHERE i.subscription_id = ?1
+                 AND i.sequence > g.last_acknowledged
+                 AND i.sequence <= g.last_produced
+           )",
+    )
+    .bind(subscription.to_string())
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE federation_terminal_identities
+         SET evidence_release_reason = 'expired'
+         WHERE subscription_id = ?1
+           AND evidence_release_reason IS NULL
+           AND event_id IN (SELECT event_id FROM federation_terminal_payloads)
+           AND sequence > (
+               SELECT last_acknowledged FROM federation_subscription_gaps
+               WHERE subscription_id = ?1
+           )
+           AND sequence <= (
+               SELECT last_produced FROM federation_subscription_gaps
+               WHERE subscription_id = ?1
+           )",
+    )
+    .bind(subscription.to_string())
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM federation_terminal_payloads
+         WHERE event_id IN (
+             SELECT i.event_id
+             FROM federation_terminal_identities i
+             JOIN federation_subscription_gaps g ON g.subscription_id = i.subscription_id
+             WHERE i.subscription_id = ?1
+               AND i.sequence > g.last_acknowledged
+               AND i.sequence <= g.last_produced
+         )",
+    )
+    .bind(subscription.to_string())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 async fn snapshot_tx(
     tx: &mut Transaction<'_, Sqlite>,
     product: &ProductConversationId,
@@ -300,6 +355,9 @@ impl Database {
                     "terminal gap replay cursor is outside the frozen prefix",
                 ));
             }
+            if now >= gap.terminal_evidence_expires_at_us {
+                release_terminal_evidence_tx(&mut tx, subscription).await?;
+            }
             tx.commit().await?;
             return Ok(SubscriptionReplay::Gap { gap });
         }
@@ -324,6 +382,9 @@ impl Database {
                 return Err(invalid(
                     "terminal gap replay cursor is outside the frozen prefix",
                 ));
+            }
+            if now >= gap.terminal_evidence_expires_at_us {
+                release_terminal_evidence_tx(&mut tx, subscription).await?;
             }
             tx.commit().await?;
             return Ok(SubscriptionReplay::Gap { gap });
@@ -357,7 +418,7 @@ impl Database {
             .bind(now)
             .execute(&mut *tx)
             .await?;
-        let rows = sqlx::query("SELECT i.event_id, i.sequence, o.occurrence_kind, o.occurrence_id, o.generation AS occurrence_generation, p.source_transcript_id,p.outcome,p.occurred_at_us FROM federation_terminal_identities i JOIN federation_terminal_occurrences o ON o.occurrence_id = i.occurrence_id JOIN federation_terminal_payloads p ON p.event_id = i.event_id WHERE i.subscription_id = ?1 AND i.sequence > ?2 AND i.continuation_state = 'none' AND i.sequence < COALESCE((SELECT MIN(blocked.sequence) FROM federation_terminal_identities blocked JOIN federation_terminal_payloads blocked_payload USING(event_id) WHERE blocked.subscription_id = i.subscription_id AND blocked.continuation_state = 'awaiting'), 9223372036854775807) AND NOT EXISTS (SELECT 1 FROM federation_subscriptions s JOIN close_obligations o ON o.product_conversation_id = s.product_id WHERE s.id = i.subscription_id AND o.phase != 'completed') ORDER BY i.sequence LIMIT ?3")
+        let rows = sqlx::query("SELECT i.event_id, i.sequence, o.occurrence_kind, o.occurrence_id, o.generation AS occurrence_generation, p.source_transcript_id,p.outcome,p.occurred_at_us FROM federation_terminal_identities i JOIN federation_terminal_occurrences o ON o.occurrence_kind = i.occurrence_kind AND o.occurrence_id = i.occurrence_id AND o.generation = i.generation JOIN federation_terminal_payloads p ON p.event_id = i.event_id WHERE i.subscription_id = ?1 AND i.sequence > ?2 AND i.continuation_state = 'none' AND i.sequence < COALESCE((SELECT MIN(blocked.sequence) FROM federation_terminal_identities blocked JOIN federation_terminal_payloads blocked_payload USING(event_id) WHERE blocked.subscription_id = i.subscription_id AND blocked.continuation_state = 'awaiting'), 9223372036854775807) AND NOT EXISTS (SELECT 1 FROM federation_subscriptions s JOIN close_obligations o ON o.product_conversation_id = s.product_id WHERE s.id = i.subscription_id AND o.phase != 'completed') ORDER BY i.sequence LIMIT ?3")
             .bind(&id).bind(acknowledged).bind(replay_batch_sql()?).fetch_all(&mut *tx).await?;
         let events = rows
             .iter()
