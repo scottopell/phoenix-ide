@@ -9283,17 +9283,29 @@ async fn plugins_list(State(state): State<AppState>) -> impl IntoResponse {
         .map(|r| (r.name.clone(), r))
         .collect();
 
-    let mut entries: Vec<serde_json::Value> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = Default::default();
-
     // Unfiltered scan: disabled plugins still appear in the list (they are
     // installed, just not contributing).
-    for plugin in phoenix_plugins::scan_plugins_root(&root) {
+    let entries = plugin_list_entries(phoenix_plugins::scan_plugins_root(&root), &registry);
+
+    Json(serde_json::json!({ "plugins": entries, "root": root }))
+}
+
+/// Join scanned plugins with persisted registry rows into status entries
+/// (REQ-AP-002, REQ-AP-010). Every plugin in the shared root appears —
+/// enabled or disabled — plus registered-but-missing roots (another
+/// harness sharing the root may have removed the directory, REQ-AP-009).
+/// Absent registry row = unmanaged + enabled.
+fn plugin_list_entries(
+    plugins: Vec<phoenix_plugins::LoadedPlugin>,
+    registry: &std::collections::HashMap<String, phoenix_db::PluginRecord>,
+) -> Vec<serde_json::Value> {
+    let mut entries = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::default();
+
+    for plugin in plugins {
         seen.insert(plugin.manifest.name.clone());
         let record = registry.get(&plugin.manifest.name);
-        let managed = record.is_some_and(|r| {
-            r.provenance == phoenix_db::PluginProvenance::Managed
-        });
+        let managed = record.is_some_and(|r| r.provenance == phoenix_db::PluginProvenance::Managed);
         let enabled = record.map_or(true, |r| r.enabled);
         entries.push(serde_json::json!({
             "name": plugin.manifest.name,
@@ -9303,14 +9315,12 @@ async fn plugins_list(State(state): State<AppState>) -> impl IntoResponse {
             "enabled": enabled,
             "provenance": if managed { "managed" } else { "unmanaged" },
             "missing": false,
-            "skills": plugin.skills.iter().map(|s| s.name()).collect::<Vec<_>>(),
+            "skills": plugin.skills.iter().map(phoenix_plugins::SkillDir::name).collect::<Vec<_>>(),
             "mcp_servers": plugin.servers.iter().map(|s| s.server().to_string()).collect::<Vec<_>>(),
             "mcp_disabled_reason": plugin.mcp_disabled_reason,
         }));
     }
 
-    // Registered-but-absent roots: another harness sharing the root may have
-    // removed the directory (REQ-AP-009).
     for record in registry.values() {
         if !seen.contains(&record.name) {
             entries.push(serde_json::json!({
@@ -9322,7 +9332,7 @@ async fn plugins_list(State(state): State<AppState>) -> impl IntoResponse {
         }
     }
 
-    Json(serde_json::json!({ "plugins": entries, "root": root }))
+    entries
 }
 
 /// Add a plugin from a local path or a git URL (REQ-AP-009): validate the
@@ -9340,55 +9350,22 @@ async fn plugin_add(
     Json(params): Json<PluginAddParams>,
 ) -> Response {
     let root = plugins_root();
-    let source = std::path::Path::new(&params.source);
-
-    // Resolve the source to a local directory first: a git URL is cloned
-    // shallowly into a tempdir, a local path is validated in place.
-    let staging = tempfile::tempdir().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    });
-    let staging = match staging {
+    let staging = match tempfile::tempdir() {
         Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let source_dir = match resolve_plugin_source(&params.source, staging.path().join("clone")).await
+    {
+        Ok(dir) => dir,
         Err((code, message)) => {
             return (code, Json(serde_json::json!({"error": message}))).into_response()
         }
-    };
-    let source_dir: std::path::PathBuf = if source.is_dir() {
-        source.to_path_buf()
-    } else if params.source.starts_with("http://")
-        || params.source.starts_with("https://")
-        || params.source.ends_with(".git")
-    {
-        let target = staging.path().join("clone");
-        let output = tokio::process::Command::new("git")
-            .args(["clone", "--depth", "1", &params.source])
-            .arg(&target)
-            .output()
-            .await;
-        match output {
-            Ok(out) if out.status.success() => target,
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": format!("git clone failed: {stderr}")})),
-                )
-                    .into_response();
-            }
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("git clone failed: {e}")})),
-                )
-                    .into_response();
-            }
-        }
-    } else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "source must be a local directory or a git URL"})),
-        )
-            .into_response();
     };
 
     // Validate the source manifest before installing anything.
@@ -9455,6 +9432,47 @@ async fn plugin_add(
     Json(serde_json::json!({"ok": true, "name": name})).into_response()
 }
 
+/// Resolve an add-source to a local plugin directory: an existing local
+/// directory passes through; an http(s)/`.git` source clones shallowly into
+/// `clone_target`; anything else is a bad request.
+async fn resolve_plugin_source(
+    source: &str,
+    clone_target: std::path::PathBuf,
+) -> Result<std::path::PathBuf, (StatusCode, String)> {
+    let source_path = std::path::Path::new(source);
+    if source_path.is_dir() {
+        return Ok(source_path.to_path_buf());
+    }
+    let looks_like_git = source.starts_with("http://")
+        || source.starts_with("https://")
+        || source.to_ascii_lowercase().ends_with(".git");
+    if !looks_like_git {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "source must be a local directory or a git URL".to_string(),
+        ));
+    }
+    let output = tokio::process::Command::new("git")
+        .args(["clone", "--depth", "1", source])
+        .arg(&clone_target)
+        .output()
+        .await;
+    match output {
+        Ok(out) if out.status.success() => Ok(clone_target),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            Err((
+                StatusCode::BAD_REQUEST,
+                format!("git clone failed: {stderr}"),
+            ))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("git clone failed: {e}"),
+        )),
+    }
+}
+
 /// The installed plugin directory for a registry name, when its manifest
 /// name matches (identity is the manifest name, not the path).
 fn plugin_dir_for(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
@@ -9501,10 +9519,7 @@ async fn plugin_lifecycle_response(
 
 /// Disable a plugin: none of its components load; its MCP connections are
 /// removed on reconciliation (REQ-AP-008).
-async fn plugin_disable(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> Response {
+async fn plugin_disable(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     let outcome = match state.db.set_plugin_enabled(&name, false).await {
         Ok(()) => Ok(()),
         Err(e) => Err(e.to_string()),
@@ -9513,10 +9528,7 @@ async fn plugin_disable(
 }
 
 /// Enable a plugin (REQ-AP-008).
-async fn plugin_enable(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> Response {
+async fn plugin_enable(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     let outcome = match state.db.set_plugin_enabled(&name, true).await {
         Ok(()) => Ok(()),
         Err(e) => Err(e.to_string()),
@@ -9526,10 +9538,7 @@ async fn plugin_enable(
 
 /// Remove a plugin: delete its directory, drop its registry row, retain its
 /// data directory (purge is separate) (REQ-AP-009).
-async fn plugin_remove(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> Response {
+async fn plugin_remove(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     let root = plugins_root();
     let outcome = async {
         let dir = plugin_dir_for(&root, &name)
@@ -9550,10 +9559,7 @@ async fn plugin_remove(
 
 /// Purge a removed (or missing) plugin's data directory — the separate
 /// explicit action that destroys plugin state (REQ-AP-009).
-async fn plugin_purge_data(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> Response {
+async fn plugin_purge_data(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     let root = plugins_root();
     let outcome = async {
         // Purge is available only when the plugin no longer contributes:
@@ -22184,5 +22190,93 @@ mod detached_task_worktree_tests {
             git(repo.path(), &["rev-parse", "--verify", "task-approved"]).trim(),
             moved_oid
         );
+    }
+}
+
+#[cfg(test)]
+mod plugin_api_tests {
+    use super::plugin_list_entries;
+    use phoenix_db::{PluginProvenance, PluginRecord};
+    use phoenix_plugins::{LoadedPlugin, Manifest, ServerSpec, SkillDir};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn manifest(name: &str) -> Manifest {
+        Manifest::parse(
+            &format!(
+                "{{\"$schema\": \"https://agent-plugins.org/schemas/1.1.0/plugin.schema.json\", \"name\": \"{name}\"}}"
+            ),
+        )
+        .unwrap()
+    }
+
+    fn plugin(name: &str, skills: &[&str]) -> LoadedPlugin {
+        LoadedPlugin {
+            manifest: manifest(name),
+            root: PathBuf::from(format!("/plugins/{name}")),
+            skills: skills
+                .iter()
+                .map(|s| SkillDir {
+                    dir: PathBuf::from(format!("/plugins/{name}/skills/{s}")),
+                    skill_md: PathBuf::from(format!("/plugins/{name}/skills/{s}/SKILL.md")),
+                })
+                .collect(),
+            servers: vec![ServerSpec::StreamableHttp {
+                server: "api".to_string(),
+                url: "https://api.example.com/mcp".to_string(),
+                headers: std::collections::BTreeMap::default(),
+            }],
+            mcp_disabled_reason: None,
+        }
+    }
+
+    fn record(name: &str, managed: bool, enabled: bool) -> PluginRecord {
+        PluginRecord {
+            name: name.to_string(),
+            provenance: if managed {
+                PluginProvenance::Managed
+            } else {
+                PluginProvenance::Unmanaged
+            },
+            enabled,
+        }
+    }
+
+    /// Absent registry row = unmanaged + enabled (REQ-AP-008): a plugin
+    /// discovered in the shared root without a row lists as enabled.
+    #[test]
+    fn absent_registry_row_lists_unmanaged_enabled() {
+        let entries = plugin_list_entries(vec![plugin("devtools", &["deploy"])], &HashMap::new());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"], "devtools");
+        assert_eq!(entries[0]["provenance"], "unmanaged");
+        assert_eq!(entries[0]["enabled"], true);
+        assert_eq!(entries[0]["missing"], false);
+        assert_eq!(entries[0]["skills"], serde_json::json!(["deploy"]));
+        assert_eq!(entries[0]["mcp_servers"], serde_json::json!(["api"]));
+    }
+
+    /// Registry rows override default enabled state and mark managed
+    /// provenance; disabled plugins still list (installed, not
+    /// contributing).
+    #[test]
+    fn registry_rows_drive_enabled_and_provenance() {
+        let mut registry = HashMap::new();
+        registry.insert("devtools".to_string(), record("devtools", true, false));
+        let entries = plugin_list_entries(vec![plugin("devtools", &[])], &registry);
+        assert_eq!(entries[0]["enabled"], false);
+        assert_eq!(entries[0]["provenance"], "managed");
+    }
+
+    /// Registered-but-absent roots surface as missing (REQ-AP-009,
+    /// REQ-AP-010).
+    #[test]
+    fn absent_root_surfaces_missing() {
+        let mut registry = HashMap::new();
+        registry.insert("vanished".to_string(), record("vanished", true, true));
+        let entries = plugin_list_entries(vec![], &registry);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"], "vanished");
+        assert_eq!(entries[0]["missing"], true);
     }
 }

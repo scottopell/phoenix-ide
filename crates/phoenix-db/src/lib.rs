@@ -33104,4 +33104,77 @@ mod tests {
         assert_eq!(ordinals, [0, 1]);
         assert_eq!(db.get_messages("candidate-parent").await.unwrap().len(), 1);
     }
+
+    // ==================== Plugin registry (specs/plugins/) ====================
+
+    #[tokio::test]
+    async fn plugin_registry_defaults_and_upserts() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        // Absent row = unmanaged + enabled: the empty registry lists nothing
+        // and every plugin is enabled (REQ-AP-008).
+        assert!(db.get_plugins().await.unwrap().is_empty());
+
+        // Register a Phoenix-installed plugin (managed, enabled).
+        db.register_plugin("devtools").await.unwrap();
+        let rows = db.get_plugins().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "devtools");
+        assert_eq!(rows[0].provenance, PluginProvenance::Managed);
+        assert!(rows[0].enabled);
+
+        // Disabling an unmanaged plugin upserts without claiming install
+        // ownership (REQ-AP-009).
+        db.set_plugin_enabled("other-harness-plugin", false)
+            .await
+            .unwrap();
+        let rows = db.get_plugins().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        let other = rows
+            .iter()
+            .find(|r| r.name == "other-harness-plugin")
+            .unwrap();
+        assert_eq!(other.provenance, PluginProvenance::Unmanaged);
+        assert!(!other.enabled);
+
+        // Re-enabling preserves provenance; disabling a managed plugin
+        // preserves its managed provenance.
+        db.set_plugin_enabled("devtools", false).await.unwrap();
+        db.set_plugin_enabled("other-harness-plugin", true)
+            .await
+            .unwrap();
+        let rows = db.get_plugins().await.unwrap();
+        let devtools = rows.iter().find(|r| r.name == "devtools").unwrap();
+        assert_eq!(devtools.provenance, PluginProvenance::Managed);
+        assert!(!devtools.enabled);
+        let other = rows
+            .iter()
+            .find(|r| r.name == "other-harness-plugin")
+            .unwrap();
+        assert_eq!(other.provenance, PluginProvenance::Unmanaged);
+        assert!(other.enabled);
+
+        // Registering again after disable restores managed + enabled.
+        db.register_plugin("devtools").await.unwrap();
+        let devtools = db
+            .get_plugins()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.name == "devtools")
+            .unwrap();
+        assert!(devtools.enabled);
+        assert_eq!(devtools.provenance, PluginProvenance::Managed);
+    }
+
+    #[tokio::test]
+    async fn plugin_unregister_removes_the_row() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.register_plugin("devtools").await.unwrap();
+        db.unregister_plugin("devtools").await.unwrap();
+        assert!(db.get_plugins().await.unwrap().is_empty());
+        // Unregistering an absent name is a no-op.
+        db.unregister_plugin("never-was").await.unwrap();
+        assert!(db.get_plugins().await.unwrap().is_empty());
+    }
 }
