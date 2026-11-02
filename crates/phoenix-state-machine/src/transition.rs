@@ -4609,8 +4609,8 @@ mod tests {
         ];
         for (is_sub_agent, input) in cases {
             for fault in ["duplicate", "unknown", "content_only", "schedule_only"] {
-                let mut context = test_context();
-                context.is_sub_agent = is_sub_agent;
+                let mut ctx = test_context();
+                ctx.is_sub_agent = is_sub_agent;
                 let call = ToolCall::new("call", input.clone());
                 let mut content = vec![ContentBlock::tool_use(
                     "call",
@@ -4638,12 +4638,9 @@ mod tests {
                         request_id: "malformed".into(),
                     })
                 };
-                let retry = handle_outcome(
-                    &ConvState::LlmRequesting { attempt: 1 },
-                    &context,
-                    outcome(),
-                )
-                .unwrap();
+                let retry =
+                    handle_outcome(&ConvState::LlmRequesting { attempt: 1 }, &ctx, outcome())
+                        .unwrap();
                 assert!(matches!(
                     retry.new_state,
                     ConvState::LlmRequesting { attempt: 2 }
@@ -4656,7 +4653,7 @@ mod tests {
                     &ConvState::LlmRequesting {
                         attempt: GENERIC_MAX_ATTEMPTS,
                     },
-                    &context,
+                    &ctx,
                     outcome(),
                 )
                 .unwrap();

@@ -261,18 +261,18 @@ async fn malformed_restart_rounds_retain_durable_state_and_write_no_messages() {
                 .await
                 .unwrap();
             let (mut state, _, _) = trusted_prefix_state(cancelling);
-            let (assistant, results) = match &mut state {
-                ConvState::ToolExecuting {
-                    assistant_message,
-                    completed_results,
-                    ..
-                }
-                | ConvState::CancellingTool {
-                    assistant_message,
-                    completed_results,
-                    ..
-                } => (assistant_message, completed_results),
-                _ => unreachable!(),
+            let (ConvState::ToolExecuting {
+                assistant_message: assistant,
+                completed_results: results,
+                ..
+            }
+            | ConvState::CancellingTool {
+                assistant_message: assistant,
+                completed_results: results,
+                ..
+            }) = &mut state
+            else {
+                unreachable!()
             };
             match fault {
                 "count" => {
@@ -397,23 +397,21 @@ async fn malformed_child_round_is_validated_before_parent_recovery_mutates_it() 
                 }
             };
             let (mut child, _, _) = trusted_prefix_state(cancelling);
-            match &mut child {
-                ConvState::ToolExecuting {
-                    assistant_message,
-                    completed_results,
-                    ..
-                }
-                | ConvState::CancellingTool {
-                    assistant_message,
-                    completed_results,
-                    ..
-                } => {
-                    assistant_message.message_id = "child-round".into();
-                    completed_results[1].tool_use_id =
-                        if duplicate { "trusted" } else { "unknown" }.into();
-                }
-                _ => unreachable!(),
+            let (ConvState::ToolExecuting {
+                assistant_message,
+                completed_results,
+                ..
             }
+            | ConvState::CancellingTool {
+                assistant_message,
+                completed_results,
+                ..
+            }) = &mut child
+            else {
+                unreachable!()
+            };
+            assistant_message.message_id = "child-round".into();
+            completed_results[1].tool_use_id = if duplicate { "trusted" } else { "unknown" }.into();
             db.update_conversation_state(parent_id, &parent)
                 .await
                 .unwrap();

@@ -324,7 +324,7 @@ mod tests {
             "type": "server_tool_use", "id": "server", "name": "web_search", "input": {}
         }))
         .unwrap();
-        assert!(validate_response_tool_calls(&[server.clone()], &[]).is_ok());
+        assert!(validate_response_tool_calls(std::slice::from_ref(&server), &[]).is_ok());
         assert!(validate_response_tool_calls(
             &[server, phoenix.clone()],
             std::slice::from_ref(&call)
