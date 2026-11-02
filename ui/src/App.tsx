@@ -56,6 +56,9 @@ const SlackGatewayPage = lazy(() => import('./pages/SlackGatewayPage').then(m =>
 const LlmLanguagePage = lazy(() =>
   import('./pages/LlmLanguagePage').then((m) => ({ default: m.LlmLanguagePage })),
 );
+const PluginsPage = lazy(() =>
+  import('./pages/PluginsPage').then((m) => ({ default: m.PluginsPage })),
+);
 const GroundingPanelFixturePage = import.meta.env.DEV
   ? lazy(() => import('./pages/GroundingPanelFixturePage').then((m) => ({ default: m.GroundingPanelFixturePage })))
   : null;
@@ -114,6 +117,7 @@ function AppRoutes() {
                 <Route path="/global/:slug" element={<CoordinatorPage />} />
                 <Route path="/settings/slack" element={<SlackGatewayPage />} />
                 <Route path="/settings/llm-language" element={<LlmLanguagePage />} />
+                <Route path="/settings/plugins" element={<PluginsPage />} />
               </Routes>
             </DesktopLayout>
           } />

@@ -1112,6 +1112,27 @@ export interface McpServerStatus {
   auth_redirect_warning?: string;
 }
 
+export interface PluginStatus {
+  name: string;
+  version?: string;
+  description?: string;
+  root?: string;
+  enabled: boolean;
+  provenance: 'managed' | 'unmanaged';
+  /** True when a registry row exists but the plugin directory is absent
+   * (a shared-root harness removed it) — specs/plugins/ REQ-AP-010. */
+  missing?: boolean;
+  skills?: string[];
+  mcp_servers?: string[];
+  /** Why the MCP component type is absent despite a present location. */
+  mcp_disabled_reason?: string | null;
+}
+
+export interface PluginsListResponse {
+  plugins: PluginStatus[];
+  root: string;
+}
+
 export interface McpReloadFailure {
   server: string;
   action: string;
@@ -2806,6 +2827,55 @@ export const api = {
     const resp = await fetch('/api/mcp/status');
     if (!resp.ok) throw new Error('Failed to get MCP status');
     return resp.json();
+  },
+
+  async getPlugins(): Promise<PluginsListResponse> {
+    const resp = await fetch('/api/plugins');
+    if (!resp.ok) throw new Error('Failed to get plugins');
+    return resp.json();
+  },
+
+  async addPlugin(source: string): Promise<{ ok: boolean; name: string }> {
+    const resp = await fetch('/api/plugins/add', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source }),
+    });
+    if (!resp.ok) {
+      const body = (await resp.json().catch(() => ({}))) as { error?: string };
+      throw new Error(body.error ?? `Failed to add plugin (${resp.status})`);
+    }
+    return resp.json();
+  },
+
+  async setPluginEnabled(name: string, enabled: boolean): Promise<void> {
+    const resp = await fetch(`/api/plugins/${encodeURIComponent(name)}/${enabled ? 'enable' : 'disable'}`, {
+      method: 'POST',
+    });
+    if (!resp.ok) {
+      const body = (await resp.json().catch(() => ({}))) as { error?: string };
+      throw new Error(body.error ?? `Failed to ${enabled ? 'enable' : 'disable'} plugin`);
+    }
+  },
+
+  async removePlugin(name: string): Promise<void> {
+    const resp = await fetch(`/api/plugins/${encodeURIComponent(name)}/remove`, {
+      method: 'POST',
+    });
+    if (!resp.ok) {
+      const body = (await resp.json().catch(() => ({}))) as { error?: string };
+      throw new Error(body.error ?? `Failed to remove plugin`);
+    }
+  },
+
+  async purgePluginData(name: string): Promise<void> {
+    const resp = await fetch(`/api/plugins/${encodeURIComponent(name)}/purge-data`, {
+      method: 'POST',
+    });
+    if (!resp.ok) {
+      const body = (await resp.json().catch(() => ({}))) as { error?: string };
+      throw new Error(body.error ?? `Failed to purge plugin data`);
+    }
   },
 
   async upgradeModel(
