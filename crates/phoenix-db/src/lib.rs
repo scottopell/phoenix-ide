@@ -12503,13 +12503,8 @@ impl Database {
         Ok(())
     }
 
-    /// Resolve the real terminal outcome of each pending sub-agent by reading
-    /// its child conversation row (created with `id == agent_id`). A sub-agent
-    /// that reached `Completed`/`Failed` before the restart is returned with its
-    /// real `Success`/`Failure` outcome; one still running (or whose row is
-    /// missing or non-terminal) is omitted, so the caller falls back to the
-    /// "interrupted by server restart" synthetic outcome. Query and decode
-    /// failures remain errors because they cannot prove the child nonterminal.
+    /// Read typed persisted terminal outcomes for pending child conversations.
+    /// Missing and nonterminal child rows are omitted.
     ///
     /// # Errors
     ///
