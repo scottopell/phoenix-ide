@@ -14955,7 +14955,10 @@ mod tests {
         }
     }
 
-    fn validate_current_schema_with_controller(database_path: &std::path::Path, migrated: bool) {
+    fn validate_current_schema_with_controller(
+        database_path: &std::path::Path,
+        through: u32,
+    ) -> Result<(), String> {
         let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -14965,21 +14968,48 @@ mod tests {
         let registry = repository.join("crates/phoenix-db/src/migrations.rs");
         let script = r#"
 import importlib.util
+import sqlite3
 import sys
 import tempfile
+from contextlib import closing
 from pathlib import Path
 
+database = Path(sys.argv[2])
+through = int(sys.argv[4])
+print(f"schema={through} python={sys.executable} python_version={sys.version} "
+      f"sqlite={sqlite3.sqlite_version} database={database}", file=sys.stderr)
+with database.open("rb") as fixture:
+    fixture.seek(18)
+    if fixture.read(2) != b"\x02\x02":
+        raise AssertionError("closed Rust fixture must retain WAL read/write format")
+
+def report_exception(kind, error, traceback):
+    cause = error
+    while cause is not None:
+        if isinstance(cause, sqlite3.Error):
+            print(f"sqlite_errorcode={getattr(cause, 'sqlite_errorcode', None)} "
+                  f"sqlite_errorname={getattr(cause, 'sqlite_errorname', None)}",
+                  file=sys.stderr)
+        cause = cause.__cause__
+    for path in (database, Path(str(database) + "-wal"), Path(str(database) + "-shm")):
+        print(f"{path}: size={path.stat().st_size if path.exists() else 'absent'}",
+              file=sys.stderr)
+    sys.__excepthook__(kind, error, traceback)
+
+sys.excepthook = report_exception
 spec = importlib.util.spec_from_file_location("migration_contract_helper", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 source = Path(sys.argv[3])
 ledger = module.migration_registry(source, qualified_current_target=False)
-assert ledger[-1][0] > 128
+if ledger[-1][0] <= 128:
+    raise AssertionError("fixture requires a registry newer than the qualified target")
 try:
     module.migration_registry(source)
 except module.ActivationError as error:
-    assert "newer than the qualified target" in str(error)
+    if "newer than the qualified target" not in str(error):
+        raise
 else:
     raise AssertionError("incident controller accepted an unqualified newer registry")
 with tempfile.TemporaryDirectory() as directory:
@@ -14987,35 +15017,47 @@ with tempfile.TemporaryDirectory() as directory:
     entries = "".join(f'    Migration {{ version: {version}, name: "{name}", sql: "" }},\n'
                       for version, name in ledger if version <= 128)
     registry.write_text("const MIGRATIONS: &[Migration] = &[\n" + entries + "];\n")
-    module.validate_current_schema_database(
-        Path(sys.argv[2]), registry, migrated=sys.argv[4] == "target"
-    )
+    expected = tuple(entry for entry in ledger if entry[0] <= through)
+    for migrated in ((False, True) if through == 128 else (False,)):
+        actual = module.validate_current_schema_database(database, registry, migrated=migrated)
+        if actual != expected:
+            raise AssertionError(f"schema={through} migrated={migrated}: "
+                                 f"expected ledger {expected!r}, got {actual!r}")
+    if through == 128:
+        with closing(sqlite3.connect(database)) as connection:
+            connection.execute("DROP TABLE product_conversation_sources")
+            connection.commit()
+        try:
+            module.validate_current_schema_database(database, registry, migrated=True)
+        except module.ActivationError as error:
+            expected_error = "ProductConversation schema: missing table(s) product_conversation_sources"
+            if expected_error not in str(error):
+                raise
+        else:
+            raise AssertionError("controller accepted a schema missing product_conversation_sources")
 "#;
-        let output = std::process::Command::new("python3")
-            .env("PYTHONDONTWRITEBYTECODE", "1")
-            .arg("-c")
+        let output = std::process::Command::new("uv")
+            .args(["run", "--no-project", "--managed-python"])
+            .args(["--python", "3.13", "python", "-I", "-B", "-c"])
             .arg(script)
             .arg(helper)
             .arg(database_path)
             .arg(registry)
-            .arg(if migrated { "target" } else { "baseline" })
+            .arg(through.to_string())
             .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "controller rejected compiled migration schema: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    async fn seal_current_schema_snapshot_fixture(path: &std::path::Path) {
-        let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(path)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete);
-        let connection = sqlx::SqliteConnection::connect_with(&options)
-            .await
-            .unwrap();
-        connection.close().await.unwrap();
+            .map_err(|error| {
+                format!("could not launch controller through uv for schema {through}: {error}")
+            })?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "controller rejected compiled schema {through} ({}):\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ))
+        }
     }
 
     #[tokio::test]
@@ -15050,15 +15092,18 @@ with tempfile.TemporaryDirectory() as directory:
         .await
         .unwrap();
         assert_eq!(fictional_members, 0);
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(db.pool())
+        let checkpoint: (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(db.pool())
             .await
             .unwrap();
+        assert_eq!(checkpoint, (0, 0, 0));
         db.pool().close().await;
         drop(db);
-        seal_current_schema_snapshot_fixture(&path).await;
 
-        validate_current_schema_with_controller(&path, false);
+        if let Err(error) = validate_current_schema_with_controller(&path, 123) {
+            let preserved = directory.keep();
+            panic!("{error}\nfixture retained at {}", preserved.display());
+        }
 
         let db = crate::Database::open(path_text).await.unwrap();
         let target_count = MIGRATIONS
@@ -15069,16 +15114,18 @@ with tempfile.TemporaryDirectory() as directory:
             run_through_for_test(db.pool(), 128).await.unwrap() as usize,
             target_count
         );
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(db.pool())
+        let checkpoint: (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(db.pool())
             .await
             .unwrap();
+        assert_eq!(checkpoint, (0, 0, 0));
         db.pool().close().await;
         drop(db);
-        seal_current_schema_snapshot_fixture(&path).await;
 
-        validate_current_schema_with_controller(&path, false);
-        validate_current_schema_with_controller(&path, true);
+        if let Err(error) = validate_current_schema_with_controller(&path, 128) {
+            let preserved = directory.keep();
+            panic!("{error}\nfixture retained at {}", preserved.display());
+        }
     }
 
     #[tokio::test]
@@ -20365,26 +20412,66 @@ with tempfile.TemporaryDirectory() as directory:
         );
     }
 
-    /// Migration 35: creates the durable async conversation-creation job table.
     #[tokio::test]
-    async fn migration_035_creates_conversation_creation_jobs_table() {
+    async fn creation_job_migrations_install_schema_and_claim_constraints() {
         let pool = test_pool().await;
         setup_conversations_table(&pool).await;
-
+        for parent in ["claim-valid-parent", "claim-invalid-parent"] {
+            sqlx::query(
+                "INSERT INTO conversations (id, conv_mode, state, cwd, user_initiated,
+                     state_updated_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, '/tmp',
+                         1, '2025-01-01', '2025-01-01', '2025-01-01')",
+            )
+            .bind(parent)
+            .bind(r#"{"mode":"Explore"}"#)
+            .bind(r#"{"type":"idle"}"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
         run_pending_migrations(&pool).await.unwrap();
 
-        let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversation_creation_jobs)")
-            .fetch_all(&pool)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|row| row.get::<String, _>("name"))
-            .collect();
-        assert!(
-            columns.iter().any(|c| c == "conversation_id"),
-            "Expected conversation_creation_jobs table to exist after migration 35; got {columns:?}"
-        );
-
+        for (table, expected) in [
+            (
+                "conversation_creation_jobs",
+                &[
+                    "conversation_id",
+                    "status",
+                    "stage",
+                    "attempt",
+                    "generation",
+                    "claim_worker_id",
+                    "claim_token",
+                    "lease_until",
+                    "next_attempt_at",
+                ][..],
+            ),
+            ("conversation_creation_job_files", &["stored_path"][..]),
+            ("conversation_creation_job_images", &["data"][..]),
+            (
+                "conversation_creation_resource_reservations",
+                &[
+                    "job_id",
+                    "generation",
+                    "repository_identity",
+                    "resource_identity",
+                    "status",
+                ][..],
+            ),
+        ] {
+            let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info(?1)")
+                .bind(table)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            for column in expected {
+                assert!(
+                    columns.iter().any(|actual| actual == column),
+                    "{table} missing {column}: {columns:?}"
+                );
+            }
+        }
         let due_index: Vec<String> = sqlx::query_scalar(
             "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_creation_jobs_due'",
         )
@@ -20392,114 +20479,40 @@ with tempfile.TemporaryDirectory() as directory:
         .await
         .unwrap();
         assert_eq!(due_index, vec!["idx_creation_jobs_due".to_string()]);
-    }
 
-    #[tokio::test]
-    async fn migration_036_creates_creation_job_files_table() {
-        let pool = test_pool().await;
-        setup_conversations_table(&pool).await;
-
-        run_pending_migrations(&pool).await.unwrap();
-
-        let columns: Vec<String> =
-            sqlx::query("PRAGMA table_info(conversation_creation_job_files)")
-                .fetch_all(&pool)
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|row| row.get::<String, _>("name"))
-                .collect();
-        assert!(
-            columns.iter().any(|c| c == "stored_path"),
-            "Expected conversation_creation_job_files table to exist after migration 36; got {columns:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn migration_037_creates_creation_job_images_table() {
-        let pool = test_pool().await;
-        setup_conversations_table(&pool).await;
-
-        run_pending_migrations(&pool).await.unwrap();
-
-        let columns: Vec<String> =
-            sqlx::query("PRAGMA table_info(conversation_creation_job_images)")
-                .fetch_all(&pool)
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|row| row.get::<String, _>("name"))
-                .collect();
-        assert!(
-            columns.iter().any(|c| c == "data"),
-            "Expected conversation_creation_job_images table to exist after migration 37; got {columns:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn migration_035_adds_fenced_creation_protocol_constraints() {
-        let pool = test_pool().await;
-        setup_conversations_table(&pool).await;
-        run_pending_migrations(&pool).await.unwrap();
-
-        let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversation_creation_jobs)")
-            .fetch_all(&pool)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|row| row.get::<String, _>("name"))
-            .collect();
-        for expected in [
-            "status",
-            "stage",
-            "attempt",
-            "generation",
-            "claim_worker_id",
-            "claim_token",
-            "lease_until",
-            "next_attempt_at",
-        ] {
-            assert!(columns.iter().any(|column| column == expected));
-        }
-
-        let invalid = sqlx::query(
+        sqlx::query(
             "INSERT INTO conversation_creation_jobs (
-                id, conversation_id, status, stage, attempt, generation,
-                intent_json, accepted_at, created_at, updated_at
-             ) VALUES ('job-invalid', 'missing-conversation', 'claimed',
-                       'validate_intent', 1, 1, '{}', 'now', 'now', 'now')",
+                 id, conversation_id, status, stage, attempt, generation,
+                 claim_worker_id, claim_token, lease_until, intent_json,
+                 accepted_at, created_at, updated_at)
+             VALUES ('job-valid', 'claim-valid-parent', 'claimed', 'validate_intent', 1, 1,
+                     'worker', 'token', 'now', '{}', 'now', 'now', 'now')",
         )
         .execute(&pool)
-        .await;
-        assert!(
-            invalid.is_err(),
-            "claimed row without authority must be rejected"
-        );
-    }
-
-    #[tokio::test]
-    async fn migration_036_adds_creation_resource_reservations() {
-        let pool = test_pool().await;
-        setup_conversations_table(&pool).await;
-        run_pending_migrations(&pool).await.unwrap();
-
-        let columns: Vec<String> =
-            sqlx::query("PRAGMA table_info(conversation_creation_resource_reservations)")
-                .fetch_all(&pool)
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|row| row.get::<String, _>("name"))
-                .collect();
-        for expected in [
-            "job_id",
-            "generation",
-            "repository_identity",
-            "resource_identity",
-            "status",
-        ] {
-            assert!(columns.iter().any(|column| column == expected));
-        }
+        .await
+        .expect("a claimed job with complete authority must be accepted");
+        let error = sqlx::query(
+            "INSERT INTO conversation_creation_jobs (
+                 id, conversation_id, status, stage, attempt, generation,
+                 intent_json, accepted_at, created_at, updated_at)
+             VALUES ('job-invalid', 'claim-invalid-parent', 'claimed', 'validate_intent',
+                     1, 1, '{}', 'now', 'now', 'now')",
+        )
+        .execute(&pool)
+        .await
+        .expect_err("claimed row without authority must be rejected");
+        let sqlx::Error::Database(error) = error else {
+            panic!("expected a SQLite CHECK failure, got {error:?}");
+        };
+        assert!(error.is_check_violation(), "{error}");
+        assert!(error.message().contains("claim_worker_id"), "{error}");
+        let persisted: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_creation_jobs WHERE id = 'job-invalid'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(persisted, 0);
     }
 
     /// Migration 003 (REQ-BED-030): adds a nullable `continued_in_conv_id`

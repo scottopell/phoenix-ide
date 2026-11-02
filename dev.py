@@ -1,9 +1,12 @@
 #!/usr/bin/env -S uv run
 # /// script
-# requires-python = ">=3.12"
+# requires-python = ">=3.13,<3.14"
 # dependencies = [
 #   "taskmd>=1.0,<2",
 # ]
+#
+# [tool.uv]
+# python-preference = "only-managed"
 # ///
 """Development tasks for phoenix-ide."""
 
@@ -517,7 +520,7 @@ def _bootstrap_dev_tracing(environ: dict[str, str] | None = None) -> None:
 
     probe = subprocess.run(
         [
-            "uv", "run", "--offline", *_dev_trace_uv_args(),
+            "uv", "run", "--offline", "--python", sys.executable, *_dev_trace_uv_args(),
             "python", "-c",
             "import opentelemetry.sdk; "
             "import opentelemetry.exporter.otlp.proto.http.trace_exporter",
@@ -6619,18 +6622,6 @@ def cmd_check(
     # Environment classification and Git subprocess safety only matter when a
     # cargo lane runs.
     if cargo_active:
-        # Classify browser availability before running the Rust suite.
-        #
-        # Contract for `./dev.py check`:
-        #   - Red == broken code. Never "your network is broken" or
-        #     "you don't have Chrome installed".
-        #   - The internal signal env vars (PHOENIX_CHROME_EXECUTABLE,
-        #     PHOENIX_SKIP_BROWSER_TESTS,
-        #     GIT_CONFIG_*) are MECHANISM — users never set them by hand.
-        #   - Probes print iff classification CHANGES test behavior:
-        #     auto-skipping a class, overriding a config, etc. Happy paths
-        #     (Chromium found, fetcher reachable, signing works, deps
-        #     present) stay silent so a normal-env run is clean.
         _classify_browser_env()
 
         # Tests create temporary commits and must never consult an interactive
