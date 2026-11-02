@@ -759,7 +759,7 @@ async fn forward_tool_outcome(
     tool_outcome_tx: mpsc::Sender<(u64, ToolExecOutcome)>,
 ) {
     let tool_outcome = match tool_rx.await {
-        Ok(tool_outcome) => tool_outcome,
+        Ok(tool_outcome) => tool_outcome.for_invocation(&tool_use_id),
         Err(_recv_error) => {
             tracing::warn!(
                 tool_use_id = %tool_use_id,
@@ -3392,6 +3392,12 @@ where
             return Err("runtime processing closed after fatal local authority loss".to_string());
         }
 
+        let outcome = if let EffectOutcome::Llm(llm) = outcome {
+            EffectOutcome::Llm(llm.reject_invalid_tool_calls())
+        } else {
+            outcome
+        };
+
         // A `RetryTimeout` reaching this point has already passed the
         // generation guard in the select loop (`retry_timeout_is_stale`), so it
         // is the live timer firing. Its task has run to completion, leaving the
@@ -3528,6 +3534,23 @@ where
             && !matches!(event, Event::Shutdown)
         {
             return Err("runtime processing closed after fatal local authority loss".to_string());
+        }
+        if let Event::LlmResponse {
+            content,
+            tool_calls,
+            ..
+        } = &event
+        {
+            if let Err(error) =
+                phoenix_core::domain::tool_round::validate_response_tool_calls(content, tool_calls)
+            {
+                return Box::pin(self.process_outcome(EffectOutcome::Llm(
+                    LlmOutcome::InvalidResponse {
+                        message: format!("Invalid provider tool identities: {error}"),
+                    },
+                )))
+                .await;
+            }
         }
         self.creation_settlement_disposition = CreationSettlementDisposition::Continue;
         let owes_parent_direct_turn_terminal = !self.context.is_sub_agent
@@ -21639,6 +21662,78 @@ mod steer_drain_detector_tests {
         (rt, storage)
     }
 
+    #[tokio::test]
+    async fn malformed_provider_tool_identities_settle_both_runtime_entry_points() {
+        use crate::runtime::traits::MessageStore;
+        use phoenix_core::domain::db_schema::UsageData;
+        use phoenix_core::domain::retry_policy::GENERIC_MAX_ATTEMPTS;
+        for typed_outcome in [false, true] {
+            let conversation_id = if typed_outcome {
+                "typed-invalid-round"
+            } else {
+                "event-invalid-round"
+            };
+            let (mut runtime, storage) = build_runtime_with_state_and_queue(
+                conversation_id,
+                ConvState::LlmRequesting {
+                    attempt: GENERIC_MAX_ATTEMPTS,
+                },
+                vec![],
+            );
+            let tool = ToolCall::new(
+                "duplicate",
+                ToolInput::Think(crate::state_machine::state::ThinkInput {
+                    thoughts: "must not run".into(),
+                }),
+            );
+            let content =
+                vec![ContentBlock::tool_use("duplicate", "think", serde_json::json!({})); 2];
+            let tool_calls = vec![tool.clone(), tool];
+            if typed_outcome {
+                runtime
+                    .process_outcome(EffectOutcome::Llm(LlmOutcome::Response {
+                        content,
+                        tool_calls,
+                        end_turn: false,
+                        usage: UsageData::default(),
+                        request_id: "rejected".into(),
+                        provider_replay: None,
+                    }))
+                    .await
+                    .unwrap();
+            } else {
+                runtime
+                    .process_event(Event::LlmResponse {
+                        content,
+                        tool_calls,
+                        end_turn: false,
+                        usage: UsageData::default(),
+                        request_id: "rejected".into(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            assert!(matches!(
+                runtime.state,
+                ConvState::Error {
+                    error_kind: crate::db::ErrorKind::InvalidResponse,
+                    ..
+                }
+            ));
+            assert_eq!(
+                storage.get_current_state(conversation_id),
+                Some(runtime.state.clone())
+            );
+            assert!(runtime.tool_executor.recorded_executions().is_empty());
+            assert!(storage
+                .get_messages(conversation_id)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(runtime.llm_client.recorded_requests().is_empty());
+        }
+    }
+
     /// Filter generated events down to `SteerDrainedUserMessages` payloads.
     fn extract_steer_drain_entries(events: &[Event]) -> Vec<Vec<SteerEntry>> {
         events
@@ -27433,7 +27528,7 @@ mod sender_drop_forwarder_tests {
             })
             .expect("send should succeed");
 
-        forward_tool_outcome(tool_rx, "forwarder-id".to_string(), 3, tool_outcome_tx).await;
+        forward_tool_outcome(tool_rx, "real-id".to_string(), 3, tool_outcome_tx).await;
 
         match tool_outcome_rx.try_recv() {
             Ok((generation, ToolExecOutcome::Failed { tool_use_id, error })) => {
@@ -27447,6 +27542,40 @@ mod sender_drop_forwarder_tests {
                 assert_eq!(error, "real error");
             }
             other => panic!("expected the real outcome forwarded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_channel_rejects_outcomes_for_a_different_invocation() {
+        use crate::state_machine::outcome::AbortReason;
+        use phoenix_core::domain::db_schema::ToolResult;
+
+        for outcome in [
+            ToolExecOutcome::Completed(ToolResult::success(
+                "wrong".into(),
+                "unowned output".into(),
+            )),
+            ToolExecOutcome::Failed {
+                tool_use_id: "wrong".into(),
+                error: "unowned error".into(),
+            },
+            ToolExecOutcome::Aborted {
+                tool_use_id: "wrong".into(),
+                reason: AbortReason::CancellationRequested,
+            },
+        ] {
+            let (tool_tx, tool_rx) = oneshot::channel();
+            let (outcome_tx, mut outcome_rx) = mpsc::channel(1);
+            tool_tx.send(outcome).unwrap();
+            forward_tool_outcome(tool_rx, "expected".into(), 7, outcome_tx).await;
+            let (generation, outcome) = outcome_rx.try_recv().unwrap();
+            assert_eq!(generation, 7);
+            let ToolExecOutcome::Failed { tool_use_id, error } = outcome else {
+                panic!("mismatched tool outcome was accepted");
+            };
+            assert_eq!(tool_use_id, "expected");
+            assert!(error.contains("different invocation"));
+            assert!(!error.contains("unowned"));
         }
     }
 

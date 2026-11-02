@@ -12637,17 +12637,11 @@ impl Database {
             if only_conversations.is_some_and(|ids| !ids.contains(&conv_id)) {
                 continue;
             }
-            let state: ConvState = match serde_json::from_str(&state_json) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(
-                        conv_id = %conv_id, error = %e,
-                        "could not parse in-flight tool round state for materialization; \
-                         leaving to reset + orphan repair",
-                    );
-                    continue;
-                }
-            };
+            let state: ConvState = serde_json::from_str(&state_json).map_err(|error| {
+                DbError::Serialization(format!(
+                    "cannot recover in-flight tool round for {conv_id}; persisted state retained: {error}"
+                ))
+            })?;
 
             // Normalize both states to the assistant message, completed
             // results, interrupted tool ids, and pending sub-agents. The
@@ -12662,7 +12656,9 @@ impl Database {
                 pending_sub_agents,
             }) = normalize_in_flight_round(state)
             else {
-                continue;
+                return Err(DbError::Serialization(format!(
+                    "in-flight tool round state kind differs for {conv_id}; persisted state retained"
+                )));
             };
 
             // A sub-agent can have reached its own terminal state (persisted in
@@ -12718,19 +12714,11 @@ impl Database {
                 &sub_agent_outcomes,
             );
 
-            let (agent_msg, tool_msgs) = match round {
-                Ok(messages) => messages,
-                Err(ToolRoundError::ResultCountMismatch { tool_uses, results }) => {
-                    tracing::warn!(
-                        conv_id = %conv_id,
-                        tool_uses,
-                        results,
-                        "in-flight tool round has mismatched tool_use/result counts; \
-                         skipping materialization, leaving to orphan repair",
-                    );
-                    continue;
-                }
-            };
+            let (agent_msg, tool_msgs) = round.map_err(|error| {
+                DbError::Serialization(format!(
+                    "cannot recover in-flight tool round for {conv_id}; persisted state retained: {error}"
+                ))
+            })?;
 
             let interrupted = ConvState::Failed {
                 error: "Sub-agent interrupted by server restart".to_string(),

@@ -228,6 +228,17 @@ THE SYSTEM SHALL bind each persisted tool-result identity to both its owning ass
 AND SHALL preserve that identity when materializing an interrupted tool round
 AND SHALL keep results from distinct assistant rounds separate when a provider reuses a tool ID.
 
+THE SYSTEM SHALL require unique Phoenix-managed call identities and a one-to-one correspondence between those calls and their results before admitting a completed tool round
+AND SHALL preserve the supplied valid result order.
+
+WHEN a provider response's Phoenix-managed tool blocks and executable call identities do not correspond one-to-one
+THE SYSTEM SHALL classify the response as invalid before executing or intercepting any of its calls
+AND SHALL apply the existing invalid-response retry and terminal-error policy.
+
+WHEN a tool invocation's completion carries another invocation's identity
+THE SYSTEM SHALL reject that output
+AND SHALL settle the expected invocation with an explicit tool error without executing the tool again.
+
 WHEN sub-agent fan-in updates an awaited spawn result
 THE SYSTEM SHALL update the latest matching durable result in the owning conversation
 AND SHALL preserve earlier rounds with the same provider tool ID
@@ -380,6 +391,11 @@ AND SHALL NOT infer automatic continuation from the transcript tail
 WHEN server restarts
 THE SYSTEM SHALL restore an ordinary interrupted provider request with no independently recoverable durable obligation to idle state
 AND preserve complete message history
+
+WHEN startup cannot decode or validate a buffered executing or cancelling tool round
+THE SYSTEM SHALL reject startup before resetting that buffered state
+AND SHALL retain its persisted assistant and completed-result evidence unchanged
+AND SHALL NOT replay its in-flight or unknown-effect tools.
 
 WHEN a conversation runtime successfully settles startup in a terminal state
 THE SYSTEM SHALL acknowledge startup settlement before the runtime exits so recovery of other conversations can continue

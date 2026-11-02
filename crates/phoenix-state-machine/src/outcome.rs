@@ -13,6 +13,7 @@ use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 use phoenix_core::domain::provider_replay::ProviderReplayUpdate;
 use phoenix_core::domain::quota_details::QuotaDetails;
 use phoenix_core::domain::sm_state::OverloadRetryGuidance;
+use phoenix_core::domain::tool_round::validate_response_tool_calls;
 use std::time::Duration;
 
 // ============================================================================
@@ -100,6 +101,27 @@ pub enum LlmOutcome {
     Cancelled,
 }
 
+impl LlmOutcome {
+    /// Turn a malformed tool schedule into the ordinary provider-response failure.
+    #[must_use]
+    pub fn reject_invalid_tool_calls(self) -> Self {
+        if let Self::Response {
+            content,
+            tool_calls,
+            ..
+        } = &self
+        {
+            if let Err(error) = validate_response_tool_calls(content, tool_calls) {
+                tracing::warn!(%error, "rejecting malformed provider tool identities");
+                return Self::InvalidResponse {
+                    message: format!("Invalid provider tool identities: {error}"),
+                };
+            }
+        }
+        self
+    }
+}
+
 // ============================================================================
 // Tool Outcome — returned by executor tool task via oneshot channel
 // ============================================================================
@@ -117,6 +139,30 @@ pub enum ToolExecOutcome {
     },
     /// Tool execution failed (e.g., unknown tool)
     Failed { tool_use_id: String, error: String },
+}
+
+impl ToolExecOutcome {
+    /// Bind a channel's outcome to the invocation that owns that channel.
+    #[must_use]
+    pub fn for_invocation(self, expected_id: &str) -> Self {
+        let actual_id = match &self {
+            Self::Completed(result) => &result.tool_use_id,
+            Self::Aborted { tool_use_id, .. } | Self::Failed { tool_use_id, .. } => tool_use_id,
+        };
+        if actual_id == expected_id {
+            self
+        } else {
+            tracing::warn!(
+                expected_id,
+                actual_id,
+                "rejecting outcome for a different tool invocation"
+            );
+            Self::Failed {
+                tool_use_id: expected_id.to_owned(),
+                error: "Tool returned an outcome for a different invocation".into(),
+            }
+        }
+    }
 }
 
 /// Why a tool was aborted. Set by the component requesting cancellation,

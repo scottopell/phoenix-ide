@@ -238,6 +238,101 @@ fn trusted_prefix_state(cancelling: bool) -> (ConvState, AssistantMessage, ToolC
     (state, assistant, image)
 }
 
+#[tokio::test]
+async fn malformed_restart_rounds_retain_durable_state_and_write_no_messages() {
+    for cancelling in [false, true] {
+        for fault in [
+            "count",
+            "duplicate_result",
+            "unknown_result",
+            "duplicate_call",
+            "parse",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("rejected-round.db");
+            let path = path.to_str().unwrap();
+            let db = Database::open(path).await.unwrap();
+            migrations::run_pending_migrations(db.pool()).await.unwrap();
+            let conversation = db
+                .get_or_create_coordinator(
+                    Some("test-model"),
+                    phoenix_core::llm_language::LlmLanguage::default(),
+                )
+                .await
+                .unwrap();
+            let (mut state, _, _) = trusted_prefix_state(cancelling);
+            let (assistant, results) = match &mut state {
+                ConvState::ToolExecuting {
+                    assistant_message,
+                    completed_results,
+                    ..
+                }
+                | ConvState::CancellingTool {
+                    assistant_message,
+                    completed_results,
+                    ..
+                } => (assistant_message, completed_results),
+                _ => unreachable!(),
+            };
+            match fault {
+                "count" => {
+                    results.pop();
+                }
+                "duplicate_result" => results[1].tool_use_id = results[0].tool_use_id.clone(),
+                "unknown_result" => results[1].tool_use_id = "unknown".into(),
+                "duplicate_call" => {
+                    assistant.content[1] = assistant.content[0].clone();
+                }
+                "parse" => {}
+                _ => unreachable!(),
+            }
+            db.update_conversation_state(&conversation.id, &state)
+                .await
+                .unwrap();
+            if fault == "parse" {
+                sqlx::query("UPDATE conversations SET state = ?1 WHERE id = ?2")
+                    .bind(
+                        serde_json::json!({
+                            "type": if cancelling { "cancelling_tool" } else { "tool_executing" },
+                            "held": "cannot decode",
+                        })
+                        .to_string(),
+                    )
+                    .bind(&conversation.id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            let original: (String, String, String) = sqlx::query_as(
+                "SELECT state, state_kind, state_updated_at FROM conversations WHERE id = ?1",
+            )
+            .bind(&conversation.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            db.pool().close().await;
+            drop(db);
+            let db = Database::open(path).await.unwrap();
+            migrations::run_pending_migrations(db.pool()).await.unwrap();
+            for _ in 0..2 {
+                assert!(
+                    db.reset_all_to_idle().await.is_err(),
+                    "{fault}, cancelling={cancelling}"
+                );
+                let retained: (String, String, String) = sqlx::query_as(
+                    "SELECT state, state_kind, state_updated_at FROM conversations WHERE id = ?1",
+                )
+                .bind(&conversation.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                assert_eq!(retained, original);
+                assert!(db.get_messages(&conversation.id).await.unwrap().is_empty());
+            }
+        }
+    }
+}
+
 async fn assert_restart_persists_trusted_receipt(cancelling: bool) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("trusted-recovery.db");

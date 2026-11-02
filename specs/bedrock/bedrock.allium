@@ -129,6 +129,23 @@ value ApprovedTaskWriteAuthority {
     objective: ApprovedTaskObjective
 }
 
+contract ToolRoundAdmission {
+    @invariant ToolRoundIdentityCorrespondence
+        -- REQ-BED-004: A checkpoint has unique Phoenix-managed call identities
+        -- paired one-to-one with result identities. Valid supplied result order
+        -- is preserved; identity matching does not require request-order sorting.
+        -- Malformed provider call identities select invalid-response handling
+        -- before ordinary execution, approval/question interception, or child completion.
+        -- A completion bearing another invocation's identity settles the expected
+        -- invocation as a concrete error without attributing the unowned output to it.
+
+    @invariant InvalidBufferedRoundPreservesEvidence
+        -- REQ-BED-007: An undecodable or invalid buffered executing/cancelling
+        -- round prevents startup admission before its persisted state is reset.
+        -- Its held assistant and completed results remain unchanged; unknown-effect
+        -- tools are not replayed and malformed data is not silently repaired.
+}
+
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
@@ -620,8 +637,23 @@ rule RejectMessageWhenRowDoesNotAcceptInput {
 -- CORE 2. LLM RESPONSE — TOOL DISPATCH (REQ-BED-003)
 -- ===========================================================
 
+rule RejectMalformedToolResponse {
+    when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: conversation.core_status = llm_requesting
+        or (conversation.core_status = server_overload_retrying
+            and conversation.overload_retry.target_kind = ordinary
+            and conversation.overload_retry.phase = in_flight)
+    requires: not valid_tool_identities(content, tool_calls)
+    ensures: LlmErrors(conversation, "Invalid provider tool identities", retryable, conversation.retry_attempt)
+
+    @guidance
+        -- Classify as invalid_response before ordinary or special-tool handling.
+        -- Existing bounded retry and parent/child terminal-error rules apply.
+}
+
 rule LlmRespondsWithTools {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count > 0
     requires: not is_sole_intercepted_tool(tool_calls)
@@ -637,6 +669,7 @@ rule LlmRespondsWithTools {
 -- Intercepted tool mixed with other tools -> error results fed back to LLM
 rule InterceptedToolNotSole {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count > 1
     requires: tool_calls.any(t => is_intercepted_tool(t.name))
@@ -1075,6 +1108,7 @@ rule RejectMessageContextExhausted {
 
 rule ParentLlmRespondsTextOnly {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count = 0
     ensures: conversation.core_status = idle
@@ -1088,6 +1122,7 @@ rule ParentLlmRespondsTextOnly {
 -- not split by mode, and writing-capable parents do not get a parallel non-blocking path.
 rule ProposeTaskIntercepted {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: conversation.kind = Parent
     requires: tool_calls.count = 1
@@ -1131,6 +1166,7 @@ rule ApprovalSnapshotMismatchRequiresRequestChanges {
 -- proposal-eligibility predicate.
 rule ProposeTaskInvalid {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: conversation.kind = Parent
     requires: tool_calls.count = 1
@@ -1154,6 +1190,7 @@ rule ProposeTaskInvalid {
 -- so without this arm a sub-agent's sole propose_task matches no rule.
 rule SubAgentProposeTaskRejected {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: conversation.kind = SubAgent
     requires: tool_calls.count = 1
@@ -1172,6 +1209,7 @@ rule SubAgentProposeTaskRejected {
 
 rule AskUserQuestionIntercepted {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count = 1
     requires: tool_calls.first.name = "ask_user_question"
@@ -1185,6 +1223,7 @@ rule AskUserQuestionIntercepted {
 -- REQ-BED-019: Context threshold reached (parent -> continuation)
 rule ContextThresholdReachedParent {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: conversation.context_at_threshold
     ensures: conversation.core_status = awaiting_continuation
@@ -2676,6 +2715,7 @@ rule UnsafeRetryRequiresConcreteProposal {
 
 rule SubAgentImplicitCompletion {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count = 0
     requires: content = null
@@ -2687,6 +2727,7 @@ rule SubAgentImplicitCompletion {
 -- Sub-agent text-only with content -> also implicit completion
 rule SubAgentTextOnlyCompletion {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count = 0
     requires: content != null
@@ -2701,6 +2742,7 @@ rule SubAgentTextOnlyCompletion {
 
 rule SubAgentSubmitsResult {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count = 1
     requires: tool_calls.first.name = "submit_result"
@@ -2711,6 +2753,7 @@ rule SubAgentSubmitsResult {
 
 rule SubAgentSubmitsError {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count = 1
     requires: tool_calls.first.name = "submit_error"
@@ -2751,6 +2794,7 @@ rule SubAgentLlmError {
 
 rule SubAgentContextExhausted {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: conversation.context_at_threshold
     ensures: conversation.sub_agent_status = failed
@@ -2966,6 +3010,12 @@ rule ModeChangeNotification {
 ------------------------------------------------------------
 -- Helpers (pure predicates referenced by rules)
 ------------------------------------------------------------
+
+--   valid_tool_identities(content: Content, tool_calls: List<ToolCall>) -> Boolean
+--       True exactly when Phoenix-managed tool-use identities in content and
+--       executable call identities are unique and correspond one-to-one.
+--       Provider-managed server tool blocks do not require Phoenix results.
+--       This predicate does not impose ordering on completed results.
 --
 -- Allium has no formal helper-function declaration; rules call these
 -- predicates by bare identifier. This block defines their complete semantics.
@@ -3415,9 +3465,6 @@ invariant GraceTurnOutcome {
 
 -- REQ-BED-001: Pure state transitions
 -- Enforced by construction: transitions are pure functions.
-
--- REQ-BED-004: Tool round atomicity
--- tool_use count = tool_result count at checkpoint time.
 
 -- REQ-BED-008: Sub-agent fan-in conservation. Every accepted result removes
 -- the same durable child identity from pending and adds one completed outcome;
