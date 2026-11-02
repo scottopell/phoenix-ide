@@ -36,6 +36,15 @@ use "../bedrock/bedrock.allium" as bedrock
 -- Value Types
 ------------------------------------------------------------
 
+-- One selected spawn call, correlated across admission and return. Provider
+-- tool IDs can repeat in another assistant round, so parent plus tool ID alone
+-- does not identify this invocation.
+value SpawnInvocation {
+    parent: bedrock/Conversation
+    assistant_message_id: String
+    tool_use_id: String
+}
+
 -- Per-task input from the `spawn_agents` tool. All fields except `task`
 -- are optional in the JSON wire form; this record captures the
 -- LLM-supplied shape *before* defaulting.
@@ -136,16 +145,18 @@ config {
 -- ===========================================================
 
 rule SpawnRejectedEmptyTasks {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: tasks.count = 0
-    ensures: SpawnAgentsRejected(parent,
+    ensures: SpawnAgentsRejected(invocation,
         reason: "At least one task is required")
 }
 
 rule SpawnRejectedTooManyTasks {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: tasks.count > config.max_sub_agents_per_spawn
-    ensures: SpawnAgentsRejected(parent,
+    ensures: SpawnAgentsRejected(invocation,
         reason: "Too many tasks in a single spawn_agents call")
 
     @guidance
@@ -159,10 +170,11 @@ rule SpawnRejectedTooManyTasks {
 -- ===========================================================
 
 rule WorkSubAgentRequiresWriteableParent {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: any_task_mode_is_work(tasks)
     requires: parent.execution_authority != write_capable
-    ensures: SpawnAgentsRejected(parent,
+    ensures: SpawnAgentsRejected(invocation,
         reason: "Work sub-agents require parent Work authority")
 }
 
@@ -170,24 +182,27 @@ rule WorkSubAgentRequiresWriteableParent {
 -- model. No Opus 5+ identifier exists in the supported catalog represented by
 -- this specification, so no Anthropic identifier is qualified.
 rule UnqualifiedParentRejectsMultipleWorkInBatch {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: not parallel_work_qualified(parent.resolved_model_id)
     requires: work_task_count(tasks) > 1
-    ensures: SpawnAgentsRejected(parent,
+    ensures: SpawnAgentsRejected(invocation,
         reason: "This parent model admits Work sub-agents sequentially")
 }
 
 rule UnqualifiedParentRejectsConcurrentWork {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: not parallel_work_qualified(parent.resolved_model_id)
     requires: work_task_count(tasks) > 0
     requires: pending_work_admissions(parent) > 0
-    ensures: SpawnAgentsRejected(parent,
+    ensures: SpawnAgentsRejected(invocation,
         reason: "A Work sub-agent is already pending for this parent")
 }
 
 rule QualifiedParentAllowsParallelWork {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: parent.mode = direct
     requires: parallel_work_qualified(parent.resolved_model_id)
     requires: work_task_count(tasks) > 1 or pending_work_admissions(parent) > 0
@@ -210,9 +225,10 @@ rule QualificationIgnoresChildChoices {
 -- names an unavailable tier/model/connection, requests unsupported explicit
 -- effort, or its default cannot resolve in the parent's request snapshot.
 rule SpawnRejectedInvalidExecution {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: any_task_has_invalid_execution(tasks, parent)
-    ensures: SpawnAgentsRejected(parent,
+    ensures: SpawnAgentsRejected(invocation,
         reason: "Execution selection is unavailable or invalid")
 
     @guidance
@@ -228,9 +244,10 @@ rule SpawnRejectedInvalidExecution {
 -- checks the LLM-supplied value. Mirrors SpawnRejectedInvalidExecution.
 -- (REQ-AG-007)
 rule SpawnRejectedUnknownAgentType {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: any_task_has_unknown_agent_type(tasks, parent)
-    ensures: SpawnAgentsRejected(parent,
+    ensures: SpawnAgentsRejected(invocation,
         reason: "Unknown agent_type in task spec")
 
     @guidance
@@ -250,10 +267,11 @@ rule SpawnRejectedUnknownAgentType {
 -- mode-independent: read-only tools can still consume unbounded resources
 -- when rooted at the filesystem root.
 rule SpawnRejectedSystemRootCwd {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: any_task_effective_cwd_resolves_to_system_root(
         tasks, parent.working_dir)
-    ensures: SpawnAgentsRejected(parent,
+    ensures: SpawnAgentsRejected(invocation,
         reason: "Sub-agent cwd must not resolve to the filesystem root")
 
     @guidance
@@ -266,10 +284,11 @@ rule SpawnRejectedSystemRootCwd {
 
 -- Starting-directory scoping assigns work; it does not confine filesystem writes.
 rule SpawnRejectedWorkCwdOutsideWorktree {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: parent.worktree_path != absent
     requires: any_work_task_has_cwd_outside_worktree(tasks, parent.worktree_path)
-    ensures: SpawnAgentsRejected(parent,
+    ensures: SpawnAgentsRejected(invocation,
         reason: "Work sub-agent cwd must be inside the parent's worktree")
 
     @guidance
@@ -322,16 +341,18 @@ rule SpawnedSubAgentCwdAssignment {
 -- `RuntimeManager::handle_spawn_request`. The bedrock-level
 -- `SpawnAgentsCompletes*` rule then drives the parent state transition.
 rule InvalidBatchAdmitsNoChildren {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: not batch_is_admissible(parent, tasks)
-    ensures: SpawnAgentsRejected(parent,
+    ensures: SpawnAgentsRejected(invocation,
         reason: "The complete sub-agent batch is not admissible")
     ensures: AdmittedChildCountForInvocation(parent, tasks)
         = previous(AdmittedChildCountForInvocation(parent, tasks))
 }
 
 rule SubAgentSpecsResolved {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: tasks.count >= 1
     requires: tasks.count <= config.max_sub_agents_per_spawn
     requires: parent.execution_authority = write_capable
@@ -355,7 +376,7 @@ rule SubAgentSpecsResolved {
             SubAgentAdmission{child: child}.parent = parent
             SubAgentAdmission{child: child}.parent_accepted_terminal = false
             child.spec.parent_conversation_id = parent.id
-    ensures: SpawnAgentsCompletes(parent,
+    ensures: SpawnAgentsCompletes(invocation,
         spawned_agents: pending_sub_agents_from(tasks))
     ensures: parallel_work_qualified(parent.resolved_model_id)
         and work_task_count(tasks) > 1

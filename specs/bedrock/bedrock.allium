@@ -415,9 +415,12 @@ entity Conversation {
     accumulated_sub_agents: Set<Conversation> when core_status = executing_tools
     skipped_tools: List<ToolCall> when core_status = cancelling_tool
     sub_agents_pending: Set<Conversation>
-        when core_status = awaiting_sub_agents | cancelling_sub_agents
+        when core_status = awaiting_sub_agents | cancelling_tool | cancelling_sub_agents
     sub_agents_completed: List<SubAgentResult>
         when core_status = awaiting_sub_agents | cancelling_sub_agents
+    -- A fact about this live cancellation chain, not an independent delivery
+    -- obligation that can attach to another chain after restart or error.
+    forced_tool_retirement_observed: Boolean when core_status = cancelling_sub_agents
     rejected_tool_calls: List<ToolCall> when core_status = awaiting_continuation | recoverable_continuation_failure
     continuation_operation_id: String when core_status = awaiting_continuation | recoverable_continuation_failure
     continuation_error_message: String when core_status = recoverable_continuation_failure
@@ -832,47 +835,59 @@ rule CancelDuringToolExecution {
     requires: conversation.core_status = executing_tools
     let active_id = conversation.current_tool.tool_use_id
     let queued = conversation.tool_queue
+    let pending_children = conversation.accumulated_sub_agents
     ensures: conversation.core_status = cancelling_tool
     ensures: conversation.cancelling_tool_use_id = active_id
     ensures: conversation.current_tool = null
     ensures: conversation.skipped_tools = queued
     ensures: conversation.tool_queue = null
+    ensures: conversation.sub_agents_pending = pending_children
     ensures: ToolAbortRequested(conversation)
+    ensures:
+        if pending_children.count > 0:
+            SubAgentsCancelRequested(conversation)
 }
 
 rule ToolAbortConfirmed {
     when: ToolAborted(conversation)
     requires: conversation.core_status = cancelling_tool
+    let pending_children = conversation.sub_agents_pending
     ensures: CancellationCheckpointed(conversation)
     ensures: conversation.cancelling_tool_use_id = null
     ensures:
-        if conversation.sub_agents_pending?.count = 0:
+        if pending_children.count = 0:
             conversation.core_status = idle
+            conversation.sub_agents_pending = null
             AgentDone(conversation)
         else:
             conversation.core_status = cancelling_sub_agents
-            SubAgentsCancelRequested(conversation)
+            conversation.sub_agents_completed = {}
+            conversation.forced_tool_retirement_observed = false
 }
 
 rule ToolCompletesDuringCancellation {
     when: ToolCompletes(conversation, result)
     requires: conversation.core_status = cancelling_tool
     requires: result.tool_use_id = conversation.cancelling_tool_use_id
+    let pending_children = conversation.sub_agents_pending
     ensures: CancellationCheckpointed(conversation)
     ensures: conversation.cancelling_tool_use_id = null
     ensures:
-        if conversation.sub_agents_pending?.count = 0:
+        if pending_children.count = 0:
             conversation.core_status = idle
+            conversation.sub_agents_pending = null
             AgentDone(conversation)
         else:
             conversation.core_status = cancelling_sub_agents
-            SubAgentsCancelRequested(conversation)
+            conversation.sub_agents_completed = {}
+            conversation.forced_tool_retirement_observed = false
 }
 
 rule CancelDuringSubAgentWait {
     when: UserCancels(conversation)
     requires: conversation.core_status = awaiting_sub_agents
     ensures: conversation.core_status = cancelling_sub_agents
+    ensures: conversation.forced_tool_retirement_observed = false
     ensures: SubAgentsCancelRequested(conversation)
 }
 
@@ -881,10 +896,30 @@ rule LastSubAgentDuringCancellation {
     requires: conversation.core_status = cancelling_sub_agents
     requires: result.agent_id in conversation.sub_agents_pending
     requires: conversation.sub_agents_pending.count = 1
+    let forced_tool_retired = conversation.forced_tool_retirement_observed
     ensures: conversation.sub_agents_pending.remove(result.agent_id)
     ensures: conversation.sub_agents_completed.add(result)
     ensures: conversation.core_status = idle
+    ensures: conversation.forced_tool_retirement_observed = null
     ensures: AgentDone(conversation)
+    ensures:
+        if forced_tool_retired:
+            SystemMessageInjected(conversation,
+                "Cancellation completed. Aborted work may still be reclaiming resources in the background.")
+
+    @guidance
+        -- Publish the one mandatory forced-tool notice only after the final child
+        -- result and settlement state are durably accepted. Ordinary cooperative
+        -- cancellation owes no degraded notice. Clearing the chain-scoped fact and
+        -- leaving CancellingSubAgents prevent a late/duplicate child from emitting
+        -- it again; the child deadline and cooperative drain are alternative exits.
+}
+
+rule SubAgentResultWhileCancellingTool {
+    when: SubAgentReportsResult(conversation, result)
+    requires: conversation.core_status = cancelling_tool
+    requires: result.agent_id in conversation.sub_agents_pending
+    ensures: conversation.sub_agents_pending.remove(result.agent_id)
 }
 
 rule SubAgentResultDuringCancellation {
@@ -894,6 +929,7 @@ rule SubAgentResultDuringCancellation {
     requires: conversation.sub_agents_pending.count > 1
     ensures: conversation.sub_agents_pending.remove(result.agent_id)
     ensures: conversation.sub_agents_completed.add(result)
+    ensures: conversation.forced_tool_retirement_observed = previous(conversation.forced_tool_retirement_observed)
 }
 
 -- REQ-BED-005a: Bounded cancellation liveness — forced teardown backstop.
@@ -913,6 +949,7 @@ rule CancellingToolDeadlineFires {
 rule RetiredToolCancellationSettles {
     when: ToolCancellationRetired(conversation)
     requires: conversation.core_status = cancelling_tool
+    let pending_children = conversation.sub_agents_pending
     ensures: CancellationCheckpointed(conversation)
     ensures: conversation.cancelling_tool_use_id = null
     -- Mirror the conditional next-state of the cooperative ToolAbortConfirmed:
@@ -920,14 +957,16 @@ rule RetiredToolCancellationSettles {
     -- cancelled, so the backstop drains into cancelling_sub_agents (which has
     -- its own deadline backstop) rather than skipping straight to idle.
     ensures:
-        if conversation.sub_agents_pending?.count = 0:
+        if pending_children.count = 0:
             conversation.core_status = idle
+            conversation.sub_agents_pending = null
             AgentDone(conversation)
             SystemMessageInjected(conversation,
                 "Cancellation completed. Aborted work may still be reclaiming resources in the background.")
         else:
             conversation.core_status = cancelling_sub_agents
-            SubAgentsCancelRequested(conversation)
+            conversation.sub_agents_completed = {}
+            conversation.forced_tool_retirement_observed = true
 
     @guidance
         -- Sequence on deadline expiry: abort the tool's executing task (do not
@@ -954,6 +993,7 @@ rule CancellingSubAgentsDeadlineFires {
     when: CancellationDeadlineExpires(conversation)
     requires: conversation.core_status = cancelling_sub_agents
     ensures: conversation.core_status = idle
+    ensures: conversation.forced_tool_retirement_observed = null
     ensures: AgentDone(conversation)
     ensures: CancellationDeadlineExceeded(conversation)
     ensures: SystemMessageInjected(conversation,
@@ -3426,6 +3466,7 @@ rule ServerRestartOrdinaryConversation {
     ensures: conversation.core_status = idle
     ensures: conversation.current_tool = null
     ensures: conversation.cancelling_tool_use_id = null
+    ensures: conversation.forced_tool_retirement_observed = null
 }
 
 rule ServerRestartOwedDirectTurn {
@@ -3456,6 +3497,7 @@ rule ServerRestartExhaustedDirectTurn {
     ensures: conversation.core_status = error
     ensures: conversation.current_tool = null
     ensures: conversation.cancelling_tool_use_id = null
+    ensures: conversation.forced_tool_retirement_observed = null
     ensures: not active_materialized_turn_owns_conversation(conversation)
 }
 
@@ -3468,6 +3510,7 @@ rule ServerRestartWithoutDurableOwner {
     ensures: conversation.core_status = idle
     ensures: conversation.current_tool = null
     ensures: conversation.cancelling_tool_use_id = null
+    ensures: conversation.forced_tool_retirement_observed = null
 }
 
 rule ServerRestartCommittedSteeringTurn {
@@ -3765,6 +3808,22 @@ surface ToolRetirementAcknowledgements {
         -- waiting for task/resource cleanup and before synthetic settlement can
         -- advance the conversation. No ordinary task or invocation is required
         -- to acknowledge cancellation-slot retirement.
+}
+
+surface RuntimeChildResultObservations {
+    facing runtime: RuntimeExecutor
+    context conversation: Conversation
+
+    provides:
+        SubAgentReportsResult(conversation, result)
+            when executor_owns_conversation(runtime, conversation)
+
+    @guarantee DurableParentAndChildCorrelation
+        -- The delivered result retains the admitted child's exact identity and
+        -- durable parent destination, under the sub-agent terminal-evidence and
+        -- delivery contracts. It may arrive while the tool itself is still
+        -- cancelling. Bedrock's pending/completed membership guards own
+        -- acceptance and duplicate handling; delivery alone is not acceptance.
 }
 
 surface UserConversation {

@@ -19,9 +19,43 @@ Bedrock represents one active call separately from its ordered remaining queue.
 The dispatcher spec distinguishes early unavailable results, side-effecting
 preparation, permission denial without a tool task, launch-time live admission,
 generation/state/identity completion guards, sender-loss settlement, cooperative
-cancellation, and forced task retirement. It describes the existing runtime;
+cancellation, and forced task retirement. The ownership/admission paths describe
+implemented behavior; preparation responsiveness and the forced-notice carry
+through cooperative child drain are normative requirements with verified runtime gaps.
 no dispatcher extraction or concurrent tool scheduling is implemented by this
 specification work. Permission counters/escalation remain outside this boundary.
+
+The dispatcher uses one shared process-wide authority fence, including when a
+wait invocation has already retired before its hard persistence cutoff. Spawn
+admission and return carry the exact parent/assistant-round/tool identity through
+the imported sub-agent rules; stale or duplicate returns cannot borrow the ID of
+a newer selected call. The cancellation spec carries an owed forced notice until
+the final child settles, while ordinary cooperative cancellation owes no notice.
+
+### Cancellation implementation gaps
+
+REQ-BED-005 is partial: the owned executor awaits originating-policy/scope reads
+and intercepted spawn admission before returning to its cancellation select.
+This can delay cancellation behind preparation, contrary to the immediate,
+100-ms interruption/nonqueued contract. Task 75010 tracks the separate runtime
+correction; task 14004 covers related global child-materialization races.
+
+REQ-BED-005a is partial: forced tool cancellation publishes its notice only on
+immediate Idle. If pending children instead drain cooperatively, the final result
+does not remember or publish the owed forced-tool notice. Task 75009 tracks that
+correction and exactly-once ordering qualification. These are source-confirmed
+gaps on the clean merged base as well as this spec branch: executor source blob
+`859dbd8dd4e690621c9a79decfd976404acdca7b` is identical. No timing or runtime
+regression test is claimed for these findings, and no implementation fix is
+included. Requirements are preserved; the normative spec does not authorize
+blocking cancellation or suppressing an owed notice.
+
+The forced-retirement fact is scoped to the current live cancellation chain.
+Generic restart/error recovery interrupts or replaces that chain under
+REQ-BED-007; it does not certify that cancellation completed. Notice handling
+across interruption/restart is unqualified and not implemented by this work.
+No conversation-wide delivery store, automatic notice recovery, or new recovery
+guarantee is introduced; compatibility requirements govern any separate change.
 
 Source correspondence is `ConversationRuntime::dispatch_tool_execution`,
 `execute_tool_to_outcome`, `forward_tool_outcome`, the tool-outcome receive arm,
@@ -44,7 +78,8 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-002:** User Message Handling | ✅ Complete | Rejects while busy, accepts from idle/error |
 | **REQ-BED-003:** LLM Response Processing | ✅ Complete | Handles text, tool use, end_turn |
 | **REQ-BED-004:** Tool Execution Coordination | ✅ Complete | Serial execution with state tracking; shared round admission requires unique call/result correspondence without sorting. Provider schedule validation precedes special-tool interception, and per-invocation channels reject misidentified outcomes as concrete errors. Focused coverage includes malformed approval/question/child-terminal responses and expected-invocation completion errors. Bash wait fallback preserves authentic bounded results, aborts only the wait task on healthy expiry, and closes the shared local-authority fence under REQ-BED-033 if authoritative settlement remains indeterminate at its non-renewing persistence cutoff |
-| **REQ-BED-005:** Cancellation Handling | ✅ Complete | Synthetic tool results for cancelled tools |
+| **REQ-BED-005:** Cancellation Handling | 🚧 Partial | Synthetic tool results are implemented; awaited policy/scope preparation and intercepted admission can delay cancellation behind the owned loop. Immediate/nonqueued cancellation remains required; task 75010 tracks the runtime gap |
+| **REQ-BED-005a:** Bounded Cancellation Liveness | 🚧 Partial | Forced tool/sub-agent backstops are implemented. Forced-tool notice carry through a later cooperative child drain is missing; task 75009 tracks exact-once ordered notice delivery. The Allium obligation is normative, not a claim of implemented behavior |
 | **REQ-BED-006:** Error Recovery | ✅ Complete | Retry logic with exponential backoff and typed user-resume admission by ErrorKind |
 | **REQ-BED-007:** State Persistence | ✅ Complete | Database persistence; all selected executing/cancelling buffers are validated before any recovery mutation. File-backed reopen coverage includes malformed standalone and parent-first child buffers retaining exact raw state and producing no partial messages; scoped recovery excludes unrelated malformed buffers. Provider-only interruptions resume from idle, active materialized turns with persisted tool results proactively resume under bounded exact-turn ownership, committed steering retains first-response recovery ownership, and durable continuations retain recovery state |
 | **REQ-BED-008:** Sub-Agent Spawning | 🚧 Partial | Existing spawning/fan-in is live; atomic admission, exact pending removal, idempotent duplicate acceptance, and complete-fan-in settlement remain to be implemented |

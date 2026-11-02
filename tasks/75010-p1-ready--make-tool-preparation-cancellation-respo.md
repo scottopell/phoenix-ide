@@ -1,0 +1,9 @@
+# Keep cancellation responsive during tool dispatch preparation
+
+REQ-BED-005 requires cancellation within 100 ms and forbids queueing it behind completion of the current operation. `dispatch_tool_execution` is awaited by the conversation's owned event loop while reading originating request policy and legacy scope. Its intercepted spawn handler also awaits admission response in that loop. A delayed read or admission response can therefore keep a queued user-cancel from being selected and can delay prevention of the planned tool launch.
+
+Source proof: base `9441cd2824324e53697df88f4e9db07f6de3980e` and the spec-only branch have identical executor.rs blob `859dbd8dd4e690621c9a79decfd976404acdca7b`. Trace `execute_authoritative_effect` -> awaited `dispatch_tool_execution` -> policy/scope awaits or `handle_spawn_agents_tool`/response_rx await, while user cancellation is received at the surrounding event loop's next select. This is a source-confirmed pre-existing gap; no timing reproduction has been executed in the spec-only task.
+
+Acceptance: hold a preparation read or spawn admission at an explicit deterministic barrier, request cancellation, and prove the owned cancellation boundary settles promptly and prevents any later launch from the cancelled preparation. Preserve originating-request/schema admission, exact result ownership, committed child-admission reconciliation, and local SQLite authority classification/fail-stop. Do not solve delayed cancellation by replaying unknown-effect tools or weakening the 100-ms/nonqueued contract.
+
+Related task 14004 addresses head-of-line blocking and races inside the global child materialization handler; this task owns the distinct parent-conversation dispatch/preparation wait. Coordinate those seams without duplicating lifecycle authorities. Runtime implementation is a separate, uncommissioned follow-up to spec work.
