@@ -12,6 +12,130 @@ The implementation still retains legacy Project/mode and terminal compatibility 
 
 ## Technical Summary
 
+The serial dispatch boundary is specified in `tool-dispatch.allium`, composed
+with Bedrock's round admission, the LLM originating-request/schema contract,
+the narrow permission checked-call contract, and sub-agent admission rules.
+Bedrock represents one active call separately from its ordered remaining queue.
+The dispatcher spec distinguishes early unavailable results, Layer 0 denial
+before call-resource admission, cleared side-effecting preparation, launch-time admission,
+generation/state/identity completion guards, sender-loss settlement, cooperative
+cancellation, and forced task retirement. Launch/ownership barriers exist, while
+pre-denial resource ordering, preparation responsiveness and several cancellation
+classification/notice paths below remain normative targets with verified gaps.
+No dispatcher extraction or concurrent tool scheduling is implemented by this
+specification work. Permission counters/escalation remain outside this boundary.
+
+The dispatcher uses one shared process-wide authority fence, including when a
+wait invocation has already retired before its hard persistence cutoff. Spawn
+admission and return carry the exact parent/assistant-round/tool identity through
+the imported sub-agent rules; stale or duplicate returns cannot borrow the ID of
+a newer selected call. The cancellation spec carries an owed forced notice until
+the final child settles, while ordinary cooperative cancellation owes no notice.
+
+Child delivery is distinct from parent acceptance. The executor buffers raw
+terminal results during ordinary tool execution/cancellation and replays the
+matching pending children only after entering the fan-in state. Bedrock therefore
+keeps a buffered child pending until it atomically records the completed outcome.
+The final-spawn transition snapshots the union of prior admitted children and the
+new batch before changing state, matching the runtime's `all_pending` construction.
+
+The spawn bridge also preserves the native batch identity and separates admission
+from activation. `RuntimeManager::handle_spawn_request` waits on `activation_rx`;
+`persist_state_effect` verifies exact child membership and signals only after
+parent-state persistence. Dropped response/activation receivers invoke native
+unactivated-batch cleanup. That manager helper returns unit and only logs database
+errors; it does not provide a classified reconciliation receipt or fatal forwarding
+for unknown cleanup-write authority. The required cancellation-time handoff must
+retain ownership, classify cleanup, and reconcile every admitted child into parent
+pending membership with terminal cancellation evidence before acknowledging the
+tool abort. The parent must then accept every outcome before ordinary settlement.
+Those response/classification/fan-in seams, including once/join ownership when
+both cancellation and the admission response signal reconciliation, are not
+implemented by this spec change.
+
+Normal terminal acceptance is likewise distinct from dispatch. The transport and
+buffer paths leave delivery owed. `update_state_and_accept_sub_agent` commits the
+parent projection and child acceptance marker together; only that established
+receipt acknowledges normal fan-in acceptance. Native unactivated cleanup instead
+sets the child's acceptance timestamp administratively without a matching parent
+completed result. That suppression does not satisfy REQ-SA-004/005 and is not a
+normative exemption: every admitted child still owes parent fan-in, including a
+pre-start cancellation. Task 75011 tracks classified cleanup and exact parent
+reconciliation. The activation and normal atomic-acceptance barriers exist, while
+this cancellation handoff remains a target; no new recovery mechanism is delivered.
+
+The live handoff target retains its original owner until admission/activation or
+classified cancellation reconciliation completes. It cannot normally advance to
+a later call while an unadopted admitted batch remains unresolved. An abnormal
+origin replacement preserves evidence and refuses activation/successor mutation;
+it does not promise historical-turn repair. Interrupted/restart ownership handling
+is unqualified. Missing in-memory ownership alone does not establish unknown
+SQLite authority or trigger the process fence. Early preparation errors likewise
+retain their original assistant/call identity; the responsive target discards a
+late classified error instead of failing a later selection. The existing awaited
+loop prevents those normal late interleavings, while task 75010 owns responsiveness
+and task 75011 owns the required handoff classification/ownership plumbing.
+
+### Cancellation implementation gaps
+
+REQ-PERM-004's no-resource denial is partial at the dispatcher: the existing code
+broadcasts the tool start, allocates a channel/token/generation and constructs a
+context/metrics writer before `DenyGate::check`. A denied call launches no tool
+task, but it has already reserved resources, so that ordering does not fulfill the
+whole requirement. The target gate operates on immutable selected-call identity
+before resource admission; only its exact cleared proof may open a generation.
+Task 75010 includes this preparation-boundary ordering correction.
+
+REQ-BED-005 is partial: the owned executor awaits originating-policy/scope reads
+and intercepted spawn admission before returning to its cancellation select.
+This can delay cancellation behind preparation, contrary to the immediate,
+100-ms interruption/nonqueued contract. Task 75010 tracks the separate runtime
+correction; task 14004 covers related global child-materialization races.
+
+REQ-BED-005a is partial: forced tool cancellation publishes its notice only on
+immediate Idle. If pending children instead drain cooperatively, the final result
+does not remember or publish the owed forced-tool notice. Task 75009 tracks that
+correction and exactly-once ordering qualification. These are source-confirmed
+gaps on the clean merged base as well as this spec branch: executor source blob
+`859dbd8dd4e690621c9a79decfd976404acdca7b` is identical. No timing or runtime
+regression test is claimed for these findings, and no implementation fix is
+included. Requirements are preserved; the normative spec does not authorize
+blocking cancellation or suppressing an owed notice.
+
+The successful child-deadline path already snapshots pending identities,
+terminalizes each child, and feeds its typed result through `process_event` and
+the normal atomic parent-acceptance transaction. It does not directly set Idle.
+The former Allium shortcut omitted those real steps; its corrected target now
+requires the complete accepted drain before the completed notice. Error handling
+is still incomplete: terminalization errors are logged and skipped after the
+deadline is cleared, without rearming it or forwarding unknown cleanup-write
+authority to the fatal fence. The user-cancel notice can then be emitted after a
+partial drain. Task 75009 includes this classification/notice qualification; no
+production direct-to-Idle bypass is asserted and no runtime fix is delivered.
+
+An already-terminal child is another backstop qualification gap. The DB helper
+locks and refuses conflicting terminal evidence rather than overwriting it, but
+does not return that existing authentic payload for delivery; the executor logs
+the conflict and skips that child. The target atomically reuses established raw
+terminal payload/cause, or establishes cancellation only when nonterminal. Existing
+parent Timeout-to-TimedOut presentation policy is separate and remains intact.
+Task 75009 includes this race alongside classification/drain/notice qualification;
+no source overwrite or new runtime regression is claimed.
+
+The forced-retirement fact is scoped to the current live cancellation chain.
+Generic restart/error recovery interrupts or replaces that chain under
+REQ-BED-007; it does not certify that cancellation completed. Notice handling
+across interruption/restart is unqualified and not implemented by this work.
+No conversation-wide delivery store, automatic notice recovery, or new recovery
+guarantee is introduced; compatibility requirements govern any separate change.
+
+Source correspondence is `ConversationRuntime::dispatch_tool_execution`,
+`execute_tool_to_outcome`, `forward_tool_outcome`, the tool-outcome receive arm,
+`ToolExecutionSlot`, and `handle_core_tool_complete`/`handle_core_cancellation`.
+Existing `provider_tool_policy_tests`, `tool_generation_guard_tests`,
+`sender_drop_forwarder_tests`, and slot lifecycle tests exercise these seams.
+Specification consistency is checked separately from runtime test execution.
+
 Implements Elm Architecture with a typed-effect executor boundary. The SM has two pure entry points: `handle_user_event()` for API-initiated events and `handle_outcome()` for executor results. Effects carry oneshot channels typed to their expected outcome (`LlmOutcome`, `ToolOutcome`, `SubAgentOutcome`, `PersistOutcome`) — the compiler prevents invalid event/state combinations. Persistence uses `CheckpointData::ToolRound` which structurally requires matched `tool_use`/`tool_result` pairs. Error classification is exhaustive with no `Unknown` variant. Executor loop uses `StepResult::Terminal` to force explicit exit on terminal states. Token streaming uses fire-and-forget `StreamToken` effects routed to SSE without SM state transitions. Sub-agents have mandatory timeouts. The normative fan-in target removes each exact accepted child from pending, makes duplicate terminal acceptance idempotent, and prevents ordinary parent settlement while admitted children remain pending. On server restart, ordinary interrupted conversations resume from idle with full message history preserved. Interrupted `present_svg` invocations recover an already committed compact artifact reference by exact assistant/tool identity; invocations without a committed snapshot retain the interrupted error. A committed steering turn whose accepted user or skill message is still awaiting its first response preserves `LlmRequesting` from immutable receipt/transcript evidence; a synchronous recovery dispatch failure settles as a persisted typed error, and a failed error write retires the runtime for reconstruction. Durable continuation operations retain their operation identity and recovery state.
 
 ### Terminal startup acknowledgement
@@ -26,10 +150,11 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-002:** User Message Handling | ✅ Complete | Rejects while busy, accepts from idle/error |
 | **REQ-BED-003:** LLM Response Processing | ✅ Complete | Handles text, tool use, end_turn |
 | **REQ-BED-004:** Tool Execution Coordination | ✅ Complete | Serial execution with state tracking; shared round admission requires unique call/result correspondence without sorting. Provider schedule validation precedes special-tool interception, and per-invocation channels reject misidentified outcomes as concrete errors. Focused coverage includes malformed approval/question/child-terminal responses and expected-invocation completion errors. Bash wait fallback preserves authentic bounded results, aborts only the wait task on healthy expiry, and closes the shared local-authority fence under REQ-BED-033 if authoritative settlement remains indeterminate at its non-renewing persistence cutoff |
-| **REQ-BED-005:** Cancellation Handling | ✅ Complete | Synthetic tool results for cancelled tools |
+| **REQ-BED-005:** Cancellation Handling | 🚧 Partial | Synthetic tool results are implemented; awaited policy/scope preparation and intercepted admission can delay cancellation behind the owned loop. Immediate/nonqueued cancellation remains required; task 75010 tracks the runtime gap |
+| **REQ-BED-005a:** Bounded Cancellation Liveness | 🚧 Partial | Forced tool/sub-agent backstops are implemented. Forced-tool notice carry through a later cooperative child drain is missing; task 75009 tracks exact-once ordered notice delivery. The Allium obligation is normative, not a claim of implemented behavior |
 | **REQ-BED-006:** Error Recovery | ✅ Complete | Retry logic with exponential backoff and typed user-resume admission by ErrorKind |
 | **REQ-BED-007:** State Persistence | ✅ Complete | Database persistence; all selected executing/cancelling buffers are validated before any recovery mutation. File-backed reopen coverage includes malformed standalone and parent-first child buffers retaining exact raw state and producing no partial messages; scoped recovery excludes unrelated malformed buffers. Provider-only interruptions resume from idle, active materialized turns with persisted tool results proactively resume under bounded exact-turn ownership, committed steering retains first-response recovery ownership, and durable continuations retain recovery state |
-| **REQ-BED-008:** Sub-Agent Spawning | 🚧 Partial | Existing spawning/fan-in is live; atomic admission, exact pending removal, idempotent duplicate acceptance, and complete-fan-in settlement remain to be implemented |
+| **REQ-BED-008:** Sub-Agent Spawning | 🚧 Partial | Atomic admission and normal exact-child fan-in/duplicate acceptance are live. Unactivated-batch cleanup still suppresses parent delivery administratively; classified all-admitted cancellation reconciliation remains incomplete (task 75011). |
 | **REQ-BED-009:** Sub-Agent Isolation | ✅ Complete | Tool set restriction defined |
 | **REQ-BED-010:** Fixed Working Directory | ✅ Complete | Set at creation, passed to tools |
 | **REQ-BED-011:** Real-time Event Streaming | ✅ Complete | SSE with broadcast channels |
