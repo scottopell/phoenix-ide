@@ -33,18 +33,28 @@ pub(crate) async fn require_federation_send_authority_tx(
     tx: &mut Transaction<'_, Sqlite>,
     authority: &FederationSendAuthority,
 ) -> DbResult<()> {
-    let active: i64 = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM federation_enrollments
-         WHERE caller_instance_id = ?1 AND credential_verifier = ?2 AND revoked_at_us IS NULL)",
+    federation_send_enrollment_id_tx(tx, authority)
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn federation_send_enrollment_id_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    authority: &FederationSendAuthority,
+) -> DbResult<uuid::Uuid> {
+    let enrollment_id: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM federation_enrollments
+         WHERE caller_instance_id = ?1 AND credential_verifier = ?2 AND revoked_at_us IS NULL",
     )
     .bind(authority.caller_instance_id.to_string())
     .bind(authority.credential_verifier.to_string())
-    .fetch_one(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
-    if active == 0 {
-        return Err(DbError::FederationSendAuthorityInactive);
-    }
-    Ok(())
+    enrollment_id
+        .ok_or(DbError::FederationSendAuthorityInactive)
+        .and_then(|id| {
+            uuid::Uuid::parse_str(&id).map_err(|error| DbError::Serialization(error.to_string()))
+        })
 }
 
 pub(crate) async fn require_federation_send_identity_owner_tx(

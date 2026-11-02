@@ -17,6 +17,24 @@ const available = {
   source_transcript_id: 'transcript-exact', source_occurrence_kind: 'turn', source_occurrence_id: 'occurrence-exact',
   source_generation: 7, occurred_at_us: 1791800000123456, provenance: 'subscription', outcome: { kind: 'turn_finished' },
 } satisfies EventPresentation;
+const federatedFact = {
+  status: 'federated_fact', event_id: 'admission-1', source_instance_id: 'remote-1',
+  source_product_conversation_id: 'product-remote', subscription_id: 'subscription-1',
+  source_event_id: 'source-event-1', sequence: 8, source_occurrence_kind: 'direct_turn',
+  source_occurrence_id: 'occurrence-remote', source_generation: 3, source_transcript_id: 'transcript-remote',
+  outcome: 'completed', occurred_at_us: 1791800000123456,
+  disposition: { state: 'accepted', transcript_id: 'global-transcript' },
+  navigation: { status: 'available', stable_url: 'https://remote.example/c/product-remote', source_url: 'https://remote.example/t/transcript-remote' },
+} as const satisfies EventPresentation;
+const federatedGap = {
+  status: 'federated_gap', event_id: 'admission-gap', source_instance_id: 'remote-1',
+  source_product_conversation_id: 'product-remote', subscription_id: 'subscription-1',
+  last_acknowledged: 8, last_produced: 14, reason: 'disconnected_age',
+  failed_at_us: 1791800000123456, terminal_evidence_expires_at_us: 1794392000123456,
+  source_transcript_id: 'transcript-remote', current: { kind: 'terminal', outcome: 'failed' },
+  disposition: { state: 'accepted', transcript_id: 'global-transcript' },
+  navigation: { status: 'unavailable' },
+} as const satisfies EventPresentation;
 const original = '[original provider text]\nTask complete is not inferred.';
 function Location() {
   const location = useLocation();
@@ -90,6 +108,31 @@ describe('compact conversation events', () => {
     expect(screen.getByTestId('location')).toHaveTextContent('"pathname":"/c/id%2F%3Fquery%23hash"');
     expect(screen.getByTestId('location')).toHaveTextContent('"conversationReturnOrigin":{"kind":"coordinator","href":"/global/coordinator?viewer=inspect#message-origin"}');
   });
+  it('links an available remote fact through the external stable URL with time and provenance', () => {
+    const { container } = mount(federatedFact);
+    expect(screen.getByRole('link', { name: 'Remote conversation · remote-1' })).toHaveAttribute('href', federatedFact.navigation.stable_url);
+    expect(screen.getByText('Remote completed')).toBeVisible();
+    expect(container.querySelector('time')).toHaveAttribute('datetime', new Date(federatedFact.occurred_at_us / 1000).toISOString());
+    fireEvent.click(screen.getByText('Event details'));
+    expect(screen.getByText(/Source event ID: source-event-1/)).toBeVisible();
+    expect(screen.getByText(/Transcript ID: transcript-remote/)).toBeVisible();
+    expect(screen.getByText(/Disposition: \{"state":"accepted"/)).toBeVisible();
+  });
+  it('does not link a remote fact whose navigation is unavailable', () => {
+    mount({ ...federatedFact, navigation: { status: 'unavailable' } });
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+  });
+  it('renders a gap as a non-navigable control notification even if navigation claims available', () => {
+    const { container } = mount({ ...federatedGap, navigation: federatedFact.navigation });
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+    expect(screen.getByText('Gap: disconnected age · Terminal (failed)')).toBeVisible();
+    expect(container.querySelector('.failure')).toBeVisible();
+    expect(container.querySelector('time')).toHaveAttribute('datetime', new Date(federatedGap.failed_at_us / 1000).toISOString());
+    fireEvent.click(screen.getByText('Event details'));
+    expect(screen.getByText(/Read current state and create a new subscription/)).toBeVisible();
+    expect(screen.getByText(/Terminal evidence expires \(microseconds\): 1794392000123456/)).toBeVisible();
+    expect(screen.getByText(/Last acknowledged: 8/)).toBeVisible();
+  });
   it('retains a long title without truncating its accessible text', () => {
     const title = 'Long title '.repeat(70);
     mount({ ...available, display_name: title });
@@ -118,6 +161,19 @@ describe('typed event wire retention', () => {
   it.each(['missing', 'lookup_failed', 'redacted'] as const)('retains %s fallback', (reason) => {
     const unavailable = { status: 'unavailable', event_id: 'event-exact', reason } as const;
     expect(v.parse(EventPresentationSchema, unavailable)).toEqual(unavailable);
+  });
+  it('retains federated facts and gaps through the message wire schema', () => {
+    for (const presentation of [federatedFact, federatedGap]) {
+      const payload = { sequence_id: 400, opening: null, message: message(presentation) } satisfies Omit<Extract<SseWireEvent, {type: 'message'}>, 'type'>;
+      expect(v.parse(SseMessageDataSchema, payload).message.event_presentation).toEqual(presentation);
+    }
+  });
+  it('validates federated nested variants and required provenance', () => {
+    expect(v.safeParse(EventPresentationSchema, { ...federatedFact, source_occurrence_kind: 'unknown' }).success).toBe(false);
+    expect(v.safeParse(EventPresentationSchema, { ...federatedFact, navigation: { status: 'available', source_url: 'https://remote.example/t/1' } }).success).toBe(false);
+    expect(v.safeParse(EventPresentationSchema, { ...federatedFact, disposition: { state: 'suppressed', reason: 'unknown' } }).success).toBe(false);
+    expect(v.safeParse(EventPresentationSchema, { ...federatedGap, current: { kind: 'terminal' } }).success).toBe(false);
+    expect(v.safeParse(EventPresentationSchema, { ...federatedGap, terminal_evidence_expires_at_us: null }).success).toBe(false);
   });
   it('requires an explicit nullable field and rejects malformed outcomes rather than stripping them', () => {
     const { event_presentation, ...without } = message(null);

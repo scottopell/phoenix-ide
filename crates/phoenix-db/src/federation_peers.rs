@@ -2,7 +2,8 @@ use std::str::FromStr;
 
 use chrono::Utc;
 use phoenix_core::domain::instance_identity::{
-    InstanceId, PeerBaseUrl, PeerBearerCredential, PeerCaCertificatePem, PeerHost, PeerTlsTrust,
+    InstanceId, InstanceSelector, PeerBaseUrl, PeerBearerCredential, PeerCaCertificatePem,
+    PeerHost, PeerTlsTrust,
 };
 use sqlx::Row;
 
@@ -139,6 +140,39 @@ impl Database {
         .transpose()
     }
 
+    pub async fn resolve_federation_peer(
+        &self,
+        selector: &InstanceSelector,
+    ) -> DbResult<FederationPeerConnection> {
+        let peer_instance_id = match selector {
+            InstanceSelector::Id(peer_instance_id) => *peer_instance_id,
+            InstanceSelector::Alias(alias) => {
+                let stored: Vec<String> = sqlx::query_scalar(
+                    "SELECT peer_instance_id
+                     FROM federation_peer_connections
+                     WHERE peer_display_name = ?1
+                     ORDER BY peer_instance_id
+                     LIMIT 2",
+                )
+                .bind(alias)
+                .fetch_all(&self.pool)
+                .await?;
+                let [stored] = stored.as_slice() else {
+                    return Err(if stored.is_empty() {
+                        DbError::FederationPeerNotFound
+                    } else {
+                        DbError::FederationPeerAmbiguous
+                    });
+                };
+                InstanceId::from_str(stored)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?
+            }
+        };
+        self.federation_peer_connection(peer_instance_id)
+            .await?
+            .ok_or(DbError::FederationPeerNotFound)
+    }
+
     /// Remove one caller-side directional peer connection.
     ///
     /// # Errors
@@ -205,6 +239,71 @@ mod tests {
                 "{host:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn peer_selector_resolves_exact_ids_and_rejects_ambiguous_names() {
+        let db = Database::open_in_memory().await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        let first_id = InstanceId::new();
+        let second_id = InstanceId::new();
+        let first_url = PeerBaseUrl::from_str("https://first-peer.example").unwrap();
+        let second_url = PeerBaseUrl::from_str("https://second-peer.example").unwrap();
+        let first_token =
+            PeerBearerCredential::parse(format!("phx_peer_{}", "a".repeat(43))).unwrap();
+        let second_token =
+            PeerBearerCredential::parse(format!("phx_peer_{}", "b".repeat(43))).unwrap();
+
+        db.save_federation_peer_connection(
+            first_id,
+            "Build Peer",
+            &first_url,
+            &first_token,
+            &PeerTlsTrust::PlatformRoots,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.resolve_federation_peer(&InstanceSelector::Id(first_id))
+                .await
+                .unwrap()
+                .peer_instance_id,
+            first_id
+        );
+        assert_eq!(
+            db.resolve_federation_peer(&InstanceSelector::parse(" Build Peer ").unwrap())
+                .await
+                .unwrap()
+                .peer_instance_id,
+            first_id
+        );
+        assert!(matches!(
+            db.resolve_federation_peer(&InstanceSelector::parse("build peer").unwrap())
+                .await,
+            Err(DbError::FederationPeerNotFound)
+        ));
+
+        db.save_federation_peer_connection(
+            second_id,
+            "Build Peer",
+            &second_url,
+            &second_token,
+            &PeerTlsTrust::PlatformRoots,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            db.resolve_federation_peer(&InstanceSelector::parse("Build Peer").unwrap())
+                .await,
+            Err(DbError::FederationPeerAmbiguous)
+        ));
+        assert!(matches!(
+            db.resolve_federation_peer(&InstanceSelector::Id(InstanceId::new()))
+                .await,
+            Err(DbError::FederationPeerNotFound)
+        ));
     }
 
     #[tokio::test]

@@ -67,6 +67,7 @@ phoenix-workflow = { path = "../phoenix-workflow" }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+schemars = { version = "0.8", features = ["uuid1"] }
 
 # Database
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
@@ -101,6 +102,7 @@ rust-embed = { version = "8", features = ["compression"] }
 mime_guess = "2"
 
 # Utilities
+percent-encoding = "2.3"
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 chrono-tz = "0.10"
 chrono = { version = "0.4", features = ["serde"] }

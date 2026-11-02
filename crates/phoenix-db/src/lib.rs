@@ -16,6 +16,7 @@ mod coordinator_work_scope;
 mod federation_enrollment;
 pub use federation_enrollment::FederationSendAuthority;
 mod federation_peers;
+pub mod federation_subscriptions;
 pub use coordinator_watches::{
     append_mandatory_close_failure_event_tx, CloseFailureStop, MandatoryCloseFailureSubject,
     PendingWatchEvent, WatchEventPresentation, WatchEventProvenance, WatchEventRoute, WatchOutcome,
@@ -395,6 +396,10 @@ pub enum DbError {
     FederationSendAuthorityInactive,
     #[error("federation send identity is already owned by another conversation")]
     FederationSendIdentityConflict,
+    #[error("saved federation peer not found")]
+    FederationPeerNotFound,
+    #[error("saved federation peer name is ambiguous")]
+    FederationPeerAmbiguous,
     #[error("federation steering send exactly replays a prior admission")]
     FederationSteeringDuplicate,
     #[error("steering queue is full")]

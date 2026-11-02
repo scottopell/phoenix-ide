@@ -259,6 +259,7 @@ fn registered_identity_order_and_exact_bodies() {
         (147, "retain_product_creation_receipts"),
         (148, "product_creation_initial_execution_receipts"),
         (149, "product_creation_image_retirement"),
+        (150, "federated_subscription_terminal_cancellation"),
     ];
     for (version, name) in identities {
         let entries = MIGRATIONS
@@ -279,6 +280,10 @@ fn registered_identity_order_and_exact_bodies() {
             148,
         ),
         (include_str!("product_creation_image_retirement.sql"), 149),
+        (
+            include_str!("federated_subscription_terminal_cancellation.sql"),
+            150,
+        ),
     ] {
         let entries = MIGRATIONS
             .iter()
@@ -484,7 +489,8 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
                     (146, "retain_product_conversation_rename_receipts"),
                     (147, "retain_product_creation_receipts"),
                     (148, "product_creation_initial_execution_receipts"),
-                    (149, "product_creation_image_retirement")
+                    (149, "product_creation_image_retirement"),
+                    (150, "federated_subscription_terminal_cancellation")
                 ]
             );
             drop(conn);

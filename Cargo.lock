@@ -2989,6 +2989,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pki-types",
+ "schemars",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3016,6 +3017,7 @@ dependencies = [
  "phoenix-tls",
  "phoenix-workflow",
  "rand 0.10.1",
+ "schemars",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3239,6 +3241,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry-proto",
  "opentelemetry_sdk",
+ "percent-encoding",
  "phoenix-agents",
  "phoenix-browser",
  "phoenix-core",
@@ -3260,6 +3263,7 @@ dependencies = [
  "rust-embed",
  "rustls",
  "rustls-pki-types",
+ "schemars",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -4086,6 +4090,7 @@ dependencies = [
  "schemars_derive",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
