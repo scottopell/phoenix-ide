@@ -14978,6 +14978,10 @@ database = Path(sys.argv[2])
 through = int(sys.argv[4])
 print(f"schema={through} python={sys.executable} python_version={sys.version} "
       f"sqlite={sqlite3.sqlite_version} database={database}", file=sys.stderr)
+with database.open("rb") as fixture:
+    fixture.seek(18)
+    if fixture.read(2) != b"\x02\x02":
+        raise AssertionError("closed Rust fixture must retain WAL read/write format")
 
 def report_exception(kind, error, traceback):
     cause = error
@@ -15056,16 +15060,6 @@ with tempfile.TemporaryDirectory() as directory:
         }
     }
 
-    async fn seal_current_schema_snapshot_fixture(path: &std::path::Path) {
-        let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(path)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete);
-        let connection = sqlx::SqliteConnection::connect_with(&options)
-            .await
-            .unwrap();
-        connection.close().await.unwrap();
-    }
-
     #[tokio::test]
     async fn current_schema_controller_accepts_compiled_123_and_128_shapes() {
         let directory = tempfile::tempdir().unwrap();
@@ -15105,7 +15099,6 @@ with tempfile.TemporaryDirectory() as directory:
         assert_eq!(checkpoint, (0, 0, 0));
         db.pool().close().await;
         drop(db);
-        seal_current_schema_snapshot_fixture(&path).await;
 
         if let Err(error) = validate_current_schema_with_controller(&path, 123) {
             let preserved = directory.keep();
@@ -15128,7 +15121,6 @@ with tempfile.TemporaryDirectory() as directory:
         assert_eq!(checkpoint, (0, 0, 0));
         db.pool().close().await;
         drop(db);
-        seal_current_schema_snapshot_fixture(&path).await;
 
         if let Err(error) = validate_current_schema_with_controller(&path, 128) {
             let preserved = directory.keep();

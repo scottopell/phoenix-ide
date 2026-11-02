@@ -93,18 +93,19 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         self.registry.write_text(
             source[:registry_match.start(2)] + historical_entries + source[registry_match.end(2):]
         )
-        # These synthetic registries are independent of qualified release bytes.
+        # Synthetic unit fixture: this registry models the historical v128
+        # candidate independently of the exact source-114 release artifact.
         self.prepared_registry_pin = helper.sha256(self.registry)
-        current_registry_pin = helper.sha256(self.current_registry)
-        for name, digest in (
-            ("PREPARED_SOURCE114_REGISTRY_SHA256", self.prepared_registry_pin),
-            ("CURRENT_REPAIR_REGISTRY_SHA256", self.prepared_registry_pin),
-            ("PREPARED_SOURCE128_REGISTRY_SHA256", current_registry_pin),
-            ("PREPARED_SCHEMA129_REGISTRY_SHA256", current_registry_pin),
-        ):
-            registry_pin = mock.patch.object(helper, name, digest)
-            registry_pin.start()
-            self.addCleanup(registry_pin.stop)
+        registry_pin = mock.patch.object(
+            helper, "PREPARED_SOURCE114_REGISTRY_SHA256", self.prepared_registry_pin,
+        )
+        registry_pin.start()
+        self.addCleanup(registry_pin.stop)
+        repair_pin = mock.patch.object(
+            helper, "CURRENT_REPAIR_REGISTRY_SHA256", self.prepared_registry_pin,
+        )
+        repair_pin.start()
+        self.addCleanup(repair_pin.stop)
         capacity = shutil.disk_usage(self.root)._replace(free=100 * 1024**3)
         disk_usage = mock.patch.object(helper.shutil, "disk_usage", return_value=capacity)
         disk_usage.start()
@@ -3710,6 +3711,7 @@ sys.exit({7 if failure else 0})
         return reservation
 
     def test_exact_source128_only_and_target129_only(self) -> None:
+        self.assertEqual(helper.PREPARED_SOURCE128_REGISTRY_SHA256, helper.sha256(self.current_registry))
         for through in range(113, 130):
             with self.subTest(through=through):
                 db = self.database(through=through)

@@ -47,3 +47,9 @@ User selected the uv-managed runtime approach: "this sounds portable since I alw
 The default Rust contract test now passes without environment overrides, including when PATH contains a failing `python3` shim. Direct `dev.py`, `uv run dev.py`, and a copied controller launched from `/tmp` select managed Python 3.13.14, whose built-in upstream SQLite is 3.53.1. Focused check-plan and tracing tests pass (38 and 41 cases respectively).
 
 Final validation: the SQLite contract, all 269 deployment-controller tests, Clippy, formatting, and task validation pass. The full check also passes E2E, UI tests/typechecking/linting, codegen, and spec checks. Its six Rust failures match the original profiling baseline; the two refresh-fixture errors and Clippy helper-length failure found by that full run were corrected and their owning checks rerun successfully. Refresh fixtures now use the immutable qualified registry rather than mutable HEAD bytes. Validation logs and baseline comparison are retained locally under `target/managed-python-validation-20261030/`.
+
+## Rebase integration (2026-11-02)
+
+Rebased onto main `5301a90ae4ccbe6634765bc820de9c478e0729af`. Retained main's version-bounded historical migration runner and compressed immutable registry fixtures; removed the source128/schema129 pin mocks made redundant by those fixtures. Main's historical fixture sealing workaround converted the database to rollback-journal mode before controller validation. Removed that workaround from the compiled-schema contract and asserted the WAL read/write header so the runtime regression remains exercised.
+
+The managed-runtime contract passes against the closed WAL fixture. A disposable `uv` shim substituting the original pyenv/Apple SQLite runtime makes the same test fail with `SQLITE_CANTOPEN` during integrity checking, with WAL/SHM absent. This demonstrates that the test still detects the original failure after integration, without touching any live database.
