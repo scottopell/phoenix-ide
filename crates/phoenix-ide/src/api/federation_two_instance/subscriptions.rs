@@ -1452,9 +1452,12 @@ async fn source_revocation_without_pending_notifications_ends_create_or_replay_l
             .fetch_all(b.state.db.pool())
             .await
             .unwrap();
-        sync_once(&a.state.db, &a.state.runtime, &remote)
-            .await
-            .unwrap();
+        let sync_result = sync_once(&a.state.db, &a.state.runtime, &remote).await;
+        if enrolled {
+            sync_result.unwrap();
+        } else {
+            assert!(sync_result.is_err());
+        }
         let ended = refreshed(&a, &remote).await;
         assert_eq!(ended.state, SubscriptionState::Revoked);
         assert_eq!(ended.admitted_cursor, remote.admitted_cursor);
