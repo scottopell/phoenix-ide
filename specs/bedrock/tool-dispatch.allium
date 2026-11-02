@@ -266,16 +266,16 @@ rule CooperativeCancellationPreservesGeneration {
 
 rule CancellationBackstopRetiresGeneration {
     when: bedrock/ToolCancellationRetirementRequested(conversation)
-    let runtime = runtime_for(conversation)
-    requires: runtime.authority_open
+    let owner = runtime_for(conversation)
+    let retiring = ToolInvocations where runtime = owner
+        and phase in { preparing, denied, launched, cancelling }
+    requires: owner.authority_open
     requires: conversation.core_status = cancelling_tool
-    ensures: runtime.generation = runtime.generation + 1
-    ensures: RetainedToolTaskAbortRequested(runtime)
+    ensures: owner.generation = owner.generation + 1
+    ensures: RetainedToolTaskAbortRequested(owner)
     ensures:
-        for invocation in ToolInvocations:
-            if invocation.runtime = runtime
-                and invocation.phase in { preparing, denied, launched, cancelling }:
-                invocation.phase = retired
+        for invocation in retiring:
+            invocation.phase = retired
     ensures: bedrock/ToolCancellationRetired(conversation)
 
     @guidance
