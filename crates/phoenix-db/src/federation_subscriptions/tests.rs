@@ -2414,8 +2414,14 @@ async fn revoke_and_unsubscribe_serialize_against_authorization_in_both_orders()
             }
             if revoke {
                 let after =
-                    f.db.authorize_federation_delivery(&f.authority, &delivery, NOW + 3)
-                        .await;
+                    f.db.authorize_federation_delivery(
+                        &f.authority,
+                        f.subscription,
+                        &f.source.product_conversation_id,
+                        &delivery,
+                        NOW + 3,
+                    )
+                    .await;
                 assert!(matches!(
                     after,
                     Err(crate::DbError::FederationSendAuthorityInactive)
