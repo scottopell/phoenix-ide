@@ -145,6 +145,18 @@ contract SpawnParentAdoption {
         -- A cancelled parent cannot report settlement from a missing receipt or
         -- from a query that races an outstanding admission command.
 
+    @invariant UnresolvedLiveHandoffCannotAdvanceOrdinarily
+        -- While a live admission/activation handoff is unresolved, retain its
+        -- exact parent/assistant/tool owner. Accepting cancellation does not
+        -- release it. No ordinary active-call advance, round completion, Idle
+        -- settlement or cancellation-backstop acknowledgement may replace that
+        -- owner before either committed membership/activation disposition or
+        -- classified cancellation reconciliation is established. An admitted
+        -- unadopted batch therefore cannot normally return to a later selection.
+        -- Error, process retirement or restart may interrupt the live chain;
+        -- those paths preserve evidence and do not claim ordinary cancellation
+        -- succeeded. This contract grants no automatic historical-turn repair.
+
     @invariant ClosureReceiptsAreEstablishedNativeFacts
         -- UnactivatedSpawnBatchClosureRequested requires classification after
         -- admission resolves. It returns one exact reconciled, known-failed, or

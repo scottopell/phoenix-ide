@@ -996,19 +996,63 @@ rule RetiredToolCancellationSettles {
 rule CancellingSubAgentsDeadlineFires {
     when: CancellationDeadlineExpires(conversation)
     requires: conversation.core_status = cancelling_sub_agents
-    ensures: conversation.core_status = idle
-    ensures: conversation.forced_tool_retirement_observed = null
-    ensures: AgentDone(conversation)
+    let pending_children = conversation.sub_agents_pending
     ensures: CancellationDeadlineExceeded(conversation)
-    ensures: SystemMessageInjected(conversation,
-        "Cancellation completed. Aborted work may still be reclaiming resources in the background.")
+    ensures: SubAgentCancellationBackstopRequested(conversation, pending_children)
 
     @guidance
         -- Mirror of CancellingToolDeadlineFires for the sub-agent fan-in:
-        -- abort still-pending sub-agents without waiting for them to report,
-        -- settle to idle, WARN via CancellationDeadlineExceeded, and inject the
-        -- user-visible message. Same liveness family as specs/subagents/
-        -- REQ-SA-006 (a wedged worker must not hold its supervisor indefinitely).
+        -- Snapshot exact pending children, establish terminal cancellation
+        -- evidence per child, then submit each established outcome through the
+        -- ordinary atomic parent-acceptance path. The final accepted child, not
+        -- deadline expiry by itself, settles to Idle. This does not wait for a
+        -- worker to cooperate and does not bypass admitted-child conservation.
+        -- A completed notice is owed only after the entire requested drain is
+        -- established. Definite failure is an error, not cancellation success;
+        -- unclassified local write authority selects REQ-BED-033.
+}
+
+rule BackstopTerminalEvidenceEntersNormalFanIn {
+    when: SubAgentBackstopTerminalEvidenceEstablished(conversation, result)
+    requires: live_runtime_authority_open(conversation)
+    requires: conversation.core_status = cancelling_sub_agents
+    requires: result.agent_id in conversation.sub_agents_pending
+    ensures: ParentTerminalTransportArrived(conversation, result)
+}
+
+rule BackstopCompletedNoticeFollowsAcceptedDrain {
+    when: SubAgentBackstopDrainCommitted(conversation)
+    requires: conversation.core_status = idle
+    requires: live_runtime_authority_open(conversation)
+    requires: not forced_notice_already_published_for_owned_chain(conversation)
+    ensures: SystemMessageInjected(conversation,
+        "Cancellation completed. Aborted work may still be reclaiming resources in the background.")
+}
+
+rule BackstopDefiniteWriteFailureCannotReportCompletion {
+    when: SubAgentBackstopWriteFailed(conversation, message)
+    requires: conversation.core_status = cancelling_sub_agents
+    requires: live_runtime_authority_open(conversation)
+    ensures: conversation.core_status = error
+    ensures: conversation.forced_tool_retirement_observed = null
+    ensures: conversation.sub_agents_pending = null
+    ensures: conversation.sub_agents_completed = null
+    ensures: conversation.error_message = message
+    ensures: conversation.error_class = non_retryable
+    ensures: conversation.error_kind = server_error
+    ensures: not AgentDone(conversation)
+
+    @guidance
+        -- Retain existing durable admission/terminal evidence; this interrupts
+        -- the cancellation chain without claiming that pending children were
+        -- accepted. No automatic replay or recovery promise follows this error.
+}
+
+rule BackstopUnknownWriteAuthorityClosesTheFence {
+    when: SubAgentBackstopWriteUnclassified(conversation)
+    ensures: ProcessLocalAuthorityClosed(conversation)
+    ensures: not FurtherWorkAdmitted(conversation)
+    ensures: not FurtherSemanticStatePublished(conversation)
 }
 
 -- ===========================================================
@@ -3132,6 +3176,17 @@ rule ModeChangeNotification {
 --       A proposed transition, buffered event, or administrative unadopted-batch
 --       suppression is not this receipt; every admitted cancellation still owes
 --       its exact parent fan-in outcome.
+--   backstop_terminal_evidence_matches_owned_request(conversation, result) -> Boolean
+--       The native backstop captured this exact pending child in its current
+--       owned request and established terminal evidence before producing result.
+--   exact_requested_backstop_drain_committed(conversation) -> Boolean
+--       Every child captured by that same owned backstop request has an established
+--       parent-state/child-acceptance commit. Neither a later Idle state, partial
+--       drain, worker absence nor a failed write supplies this proof.
+--   forced_notice_already_published_for_owned_chain(conversation) -> Boolean
+--       The same native operation observed the live forced-tool notice already
+--       durably published by the last-child transition. It does not infer receipt
+--       from Idle or an earlier cancellation chain and is not a new durable store.
 
 --   executor_owns_conversation(executor: RuntimeExecutor, conversation: Conversation) -> Boolean
 --       The acknowledgement comes from the live executor owning this exact
@@ -3882,6 +3937,40 @@ surface RuntimeChildResultObservations {
         -- guards then move each child pending -> completed once. Results from
         -- another round are not reattributed to this round. The process-local
         -- buffer is not independent durable delivery or restart authority.
+}
+
+surface RuntimeCancellationBackstopObservations {
+    facing runtime: RuntimeExecutor
+    context conversation: Conversation
+
+    provides:
+        SubAgentBackstopTerminalEvidenceEstablished(conversation, result)
+            when executor_owns_conversation(runtime, conversation)
+                 and backstop_terminal_evidence_matches_owned_request(conversation, result)
+        SubAgentBackstopDrainCommitted(conversation)
+            when executor_owns_conversation(runtime, conversation)
+                 and exact_requested_backstop_drain_committed(conversation)
+        SubAgentBackstopWriteFailed(conversation, message)
+            when executor_owns_conversation(runtime, conversation)
+        SubAgentBackstopWriteUnclassified(conversation)
+            when executor_owns_conversation(runtime, conversation)
+
+    @guarantee NativeBackstopDrainsThroughActualParentAcceptance
+        -- SubAgentCancellationBackstopRequested invokes this owned native step,
+        -- not an independent queue. Snapshot pending identities once; for each,
+        -- establish terminal evidence and process its typed outcome through the
+        -- existing parent acceptance transaction. Only after every target was
+        -- accepted may that same step provide its one DrainCommitted observation.
+        -- Earlier arrivals/duplicates may already have accepted a target; its
+        -- exact durable acceptance still supplies proof, not another result.
+
+    @guarantee FailureDoesNotMintCompletionOrRetryUnknownEffects
+        -- Stop the owned drain on definite failure and report its actual error;
+        -- do not emit DrainCommitted or a completed notice for a partial drain.
+        -- Unclassified local authority closes the shared process fence before
+        -- further semantic work. These observations retain their original owned
+        -- request and cannot be reattributed to a later cancellation chain.
+        -- No callback queue, worker-cooperation wait or restart policy is added.
 }
 
 surface UserConversation {

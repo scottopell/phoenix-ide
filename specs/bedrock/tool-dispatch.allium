@@ -39,6 +39,14 @@ external entity InvocationOutcome {
     kind: completed | failed | aborted
 }
 
+-- Captured before a preparation read; no ordinary generation need exist yet.
+-- This is the owned selection's origin, not another mutable activity store.
+value DispatchSelection {
+    runtime: ToolRuntime
+    assistant_message_id: String
+    call: bedrock/ToolCall
+}
+
 contract SerialToolDispatch {
     forward: (invocation: ToolInvocation, outcome: InvocationOutcome) -> InvocationOutcome
     spawn_cancellation_resolution: (conversation: bedrock/Conversation) -> SpawnCancellationResolution
@@ -116,21 +124,41 @@ rule RejectUnavailableCallBeforeOwnership {
 }
 
 rule RequestPolicyReadFails {
-    when: ToolRequestPolicyReadFailed(runtime, call)
+    when: ToolRequestPolicyReadFailed(selection)
+    let runtime = selection.runtime
+    let call = selection.call
     requires: process_authority.open
+    requires: selection_is_current(selection)
     ensures: ExecutorErrorReturned(runtime, call)
     ensures: not OrdinaryGenerationOpened(runtime, call)
     ensures: not ToolTaskLaunched(runtime, call)
 }
 
 rule PreparationScopeReadFails {
-    when: ToolPreparationScopeReadFailed(runtime, call)
+    when: ToolPreparationScopeReadFailed(selection)
+    let runtime = selection.runtime
+    let call = selection.call
     requires: process_authority.open
+    requires: selection_is_current(selection)
     requires: originating_policy_allows(runtime, call)
     requires: call.name != "spawn_agents"
     ensures: ExecutorErrorReturned(runtime, call)
     ensures: not OrdinaryGenerationOpened(runtime, call)
     ensures: not ToolTaskLaunched(runtime, call)
+}
+
+rule StaleRequestPolicyFailureCannotFailAnotherSelection {
+    when: ToolRequestPolicyReadFailed(selection)
+    requires: not process_authority.open or not selection_is_current(selection)
+    ensures: not ExecutorErrorReturned(selection.runtime, selection.call)
+    ensures: not ConversationMutation(selection.runtime.conversation)
+}
+
+rule StaleScopeFailureCannotFailAnotherSelection {
+    when: ToolPreparationScopeReadFailed(selection)
+    requires: not process_authority.open or not selection_is_current(selection)
+    ensures: not ExecutorErrorReturned(selection.runtime, selection.call)
+    ensures: not ConversationMutation(selection.runtime.conversation)
 }
 
 rule RouteSpawnToItsAdmissionBoundary {
@@ -251,13 +279,34 @@ rule RejectedSpawnReturnsToItsCancellingOrigin {
     ensures: bedrock/ToolCompletes(invocation.parent, spawn_rejection_result(invocation, reason))
 }
 
-rule UnadoptableSpawnReceiptStillClosesItsOwnedBatch {
+rule AbnormallyReplacedSpawnOriginCannotAffectSuccessor {
     when: subagents/SpawnAgentsCompletes(invocation, spawned_agents)
     requires: process_authority.open
     requires: not spawn_invocation_is_current(invocation)
     requires: not spawn_invocation_is_cancelling(invocation)
     requires: activation_is_unreleased_and_membership_unadopted(invocation)
-    ensures: subagents/UnactivatedSpawnBatchClosureRequested(invocation)
+    ensures: subagents/SpawnActivationWithheld(invocation)
+    ensures: OriginatingSpawnEvidenceRetained(invocation)
+    ensures: SpawnOriginInvariantViolationReported(invocation)
+    ensures: not ConversationMutation(invocation.parent)
+    ensures: not bedrock/ToolAborted(invocation.parent)
+
+    @guidance
+        -- The live retained-owner invariant excludes this shape from ordinary
+        -- advancement and settlement. An abnormal interruption is not permission
+        -- to rewrite a later round, invent historical fan-in or claim cleanup
+        -- success. Retain its durable admission/diagnostics and keep activation
+        -- withheld. This report alone is not unclassified SQLite authority;
+        -- only actual local-authority classification can close that global fence.
+}
+
+rule AdoptedSpawnDuplicateCannotAffectSuccessor {
+    when: subagents/SpawnAgentsCompletes(invocation, spawned_agents)
+    requires: not spawn_invocation_is_current(invocation)
+    requires: not spawn_invocation_is_cancelling(invocation)
+    requires: exact_batch_already_adopted(invocation)
+    ensures: not ConversationMutation(invocation.parent)
+    ensures: not subagents/UnactivatedSpawnBatchClosureRequested(invocation)
 }
 
 rule ReconciledSpawnAllowsToolCancellationToDrain {
@@ -271,8 +320,19 @@ rule ReconciledSpawnAllowsToolCancellationToDrain {
 rule FailedSpawnClosureDoesNotClaimCancellationSuccess {
     when: subagents/SpawnBatchClosureFailed(invocation, reason)
     requires: process_authority.open
+    requires: spawn_invocation_is_current(invocation)
+        or spawn_invocation_is_cancelling(invocation)
     ensures: ExecutorErrorReturned(runtime_for(invocation.parent), originating_spawn_call(invocation))
     ensures: not bedrock/ToolAborted(invocation.parent)
+}
+
+rule StaleSpawnClosureFailureCannotFailSuccessor {
+    when: subagents/SpawnBatchClosureFailed(invocation, reason)
+    requires: not spawn_invocation_is_current(invocation)
+        and not spawn_invocation_is_cancelling(invocation)
+    ensures: OriginatingSpawnEvidenceRetained(invocation)
+    ensures: SpawnOriginInvariantViolationReported(invocation)
+    ensures: not ConversationMutation(invocation.parent)
 }
 
 rule UnclassifiedSpawnAuthorityClosesTheProcessFence {
@@ -580,6 +640,26 @@ surface OrdinaryToolDispatch {
 
 -- These are observations of the synchronous gate return and one-shot receiver,
 -- not independent requests that may invent a verdict or complete another call.
+surface PreparationReadObservations {
+    facing runtime: ToolRuntime
+    context selection: DispatchSelection
+
+    provides:
+        ToolRequestPolicyReadFailed(selection)
+            when selection.runtime = runtime
+        ToolPreparationScopeReadFailed(selection)
+            when selection.runtime = runtime
+
+    @guarantee ClassifiedFailureKeepsItsReadOrigin
+        -- Capture the runtime, held assistant identity and selected call before
+        -- starting the read; carry that immutable origin through its classified
+        -- failed return and preserve the original diagnostics. Never reconstruct
+        -- it from the latest call or held round. A stale classified failure is
+        -- observational only and cannot fail or launch later work. Unclassified
+        -- local persistence authority is not one of these ordinary failures:
+        -- it closes the shared process fence even if its selection became stale.
+}
+
 surface InvocationBoundaryObservations {
     facing runtime: ToolRuntime
     context invocation: ToolInvocation
@@ -649,6 +729,11 @@ surface RuntimeAuthorityObservations {
 --   surface. Absence, withdrawal, and terminal-surface restrictions deny it.
 -- held_assistant_message_id(conversation) -> String: the immutable message ID of
 --   the assistant round holding the selected call; never the latest durable row.
+-- selection_is_current(selection) -> Boolean: the same runtime still holds the
+--   captured assistant message in ExecutingTools and its current tool equals the
+--   captured exact call. Cancellation, round replacement, another selection or a
+--   later round reusing a provider ID is false. This check and error acceptance
+--   are one owned step; no ordinary generation is required before preparation.
 -- new_spawn_batch_id() -> String: the native request's fresh opaque batch identity,
 --   captured once with the original call and reused by its admission/closure owner.
 -- spawn_catalog_matches_originating_schema(runtime, call) -> Boolean: spawn is
@@ -679,6 +764,9 @@ surface RuntimeAuthorityObservations {
 --   occurred for this exact batch. A later active selection or absent current
 --   membership alone cannot establish it; an already-adopted duplicate is not
 --   authority to abandon running children.
+-- exact_batch_already_adopted(invocation) -> Boolean: established native evidence
+--   proves exact admitted membership was committed to the captured parent round;
+--   neither a later selected call nor absence of an in-memory owner is proof.
 -- originating_spawn_call(invocation) -> bedrock/ToolCall: the actual call retained
 --   by that native owner, not a reconstructed/latest call with a reused ID.
 -- spawn_cancellation_resolution(conversation) -> SpawnCancellationResolution:

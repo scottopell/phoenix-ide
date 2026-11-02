@@ -64,6 +64,18 @@ pre-start cancellation. Task 75011 tracks classified cleanup and exact parent
 reconciliation. The activation and normal atomic-acceptance barriers exist, while
 this cancellation handoff remains a target; no new recovery mechanism is delivered.
 
+The live handoff target retains its original owner until admission/activation or
+classified cancellation reconciliation completes. It cannot normally advance to
+a later call while an unadopted admitted batch remains unresolved. An abnormal
+origin replacement preserves evidence and refuses activation/successor mutation;
+it does not promise historical-turn repair. Interrupted/restart ownership handling
+is unqualified. Missing in-memory ownership alone does not establish unknown
+SQLite authority or trigger the process fence. Early preparation errors likewise
+retain their original assistant/call identity; the responsive target discards a
+late classified error instead of failing a later selection. The existing awaited
+loop prevents those normal late interleavings, while task 75010 owns responsiveness
+and task 75011 owns the required handoff classification/ownership plumbing.
+
 ### Cancellation implementation gaps
 
 REQ-BED-005 is partial: the owned executor awaits originating-policy/scope reads
@@ -81,6 +93,17 @@ gaps on the clean merged base as well as this spec branch: executor source blob
 regression test is claimed for these findings, and no implementation fix is
 included. Requirements are preserved; the normative spec does not authorize
 blocking cancellation or suppressing an owed notice.
+
+The successful child-deadline path already snapshots pending identities,
+terminalizes each child, and feeds its typed result through `process_event` and
+the normal atomic parent-acceptance transaction. It does not directly set Idle.
+The former Allium shortcut omitted those real steps; its corrected target now
+requires the complete accepted drain before the completed notice. Error handling
+is still incomplete: terminalization errors are logged and skipped after the
+deadline is cleared, without rearming it or forwarding unknown cleanup-write
+authority to the fatal fence. The user-cancel notice can then be emitted after a
+partial drain. Task 75009 includes this classification/notice qualification; no
+production direct-to-Idle bypass is asserted and no runtime fix is delivered.
 
 The forced-retirement fact is scoped to the current live cancellation chain.
 Generic restart/error recovery interrupts or replaces that chain under
