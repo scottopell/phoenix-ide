@@ -63,6 +63,14 @@ Bounded off-path observation: the standalone pure `handle_core_cancellation` Can
 
 The default check on semantic head `1798815d4d8388dcc9f712fee1ffe187342bbb4c` passed five executed steps in 121.7 seconds with explicit base/worker budget, but does not qualify these subsequent model edits. A new frozen-target review/validation pass is required.
 
+## Final reviewed semantic acceptance
+
+- Frozen semantic target: `9441cd2824324e53697df88f4e9db07f6de3980e..6c481844365288e6f27fa5601dcee8a313fef5b0`; specs tree `4c5308266f963355ac383cc4a8fbbadfa4a4d769`.
+- Both fresh isolated contract/source and model reviewers sealed clean full-range verdicts for that target. The buffering gate was traced upstream before classifying the standalone reducer branch; no unproven live child-result-loss claim is retained.
+- `PHOENIX_CHECK_BASE=9441cd2824324e53697df88f4e9db07f6de3980e PHOENIX_CHECK_WORKERS=4 ./dev.py check` passed at that frozen semantic head in 110.4 seconds. All five executed steps passed: task validation, Allium accepted-baseline gate, spec shape, managed-Python dev.py unit tests (109.6 seconds), and spec anchors. Nine unrelated source-gated steps were skipped; no full Rust/UI suite rerun is claimed. Log: `/tmp/phoenix-dispatch-fanin-default.log` (Codex harness-local).
+- The follow-up acceptance commit changes task status/evidence only. Specification source remains frozen; hosted checks, exact-head automated review, and human merge readiness are tracked on PR #1023 separately.
+- Requirements and implementation status remain distinct: runtime follow-ups 75009 and 75010 are ready, uncommissioned work. No runtime scheduling, dispatcher extraction, recovery guarantee, or cancellation implementation is delivered by this specification task.
+
 ## Out-of-scope observation
 
 Permissions Allium still includes the normative denial-count/escalation target while its executive marks that behavior unimplemented. The new reusable checked-call contract deliberately excludes that separate requirement; no escalation work is commissioned here.
