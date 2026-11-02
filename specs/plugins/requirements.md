@@ -67,6 +67,12 @@ SYSTEM SHALL load the first discovered and SHALL report the duplicate at
 
 Plugin identity SHALL be the manifest `name`, not the directory name.
 
+Discovery SHALL exclude the reserved `data` entry. An installation entry MAY
+be a directory symlink; its canonical target is the package execution root.
+Discovery SHALL still require an immediate child entry under the user-level
+plugins root. Phoenix SHALL retain that entry separately from the execution
+root.
+
 **Rationale:** The spec's environment example puts plugin roots as immediate
 children of a shared root (`~/.agents/plugins/devtools`); one-level scanning
 matches that shape and keeps discovery bounded. The root is shared with other
@@ -202,9 +208,10 @@ A plugin stdio server SHALL run with:
 - `PLUGIN_ROOT` set to the resolved plugin root and `PLUGIN_DATA` set to the
   plugin's dedicated data directory, both client-owned and overriding any
   equivalent configured names last
-- a working directory defaulting to the plugin root, where any explicit
-  `cwd` is `./`-relative or `${PLUGIN_ROOT}`/`${PLUGIN_DATA}`-anchored and
-  resolves inside its anchor boundary
+- a working directory defaulting to the resolved plugin root. The original,
+  unexpanded form selects its sole boundary: `./` and `${PLUGIN_ROOT}` use
+  the plugin root; `${PLUGIN_DATA}` uses the data directory. An explicit
+  `cwd` must resolve inside that selected boundary
 - single-pass `${PLUGIN_ROOT}` and `${PLUGIN_DATA}` expansion applied to each
   `args` element, each `env` value, and `cwd`, and to nothing else
 - configured `env` values that do not declare `PLUGIN_ROOT` or `PLUGIN_DATA`
@@ -266,6 +273,13 @@ its servers SHALL be disconnected through the existing reload reconciliation
 THE SYSTEM SHALL treat a plugin discovered in the plugins root without a
 registry record as enabled by default
 
+Activation SHALL be scoped to one Phoenix instance and shared by skill and
+MCP discovery. Until a complete registry read succeeds, no plugin SHALL
+contribute. An absent row SHALL mean enabled only in a successfully loaded
+snapshot. A failed refresh SHALL NOT replace the last successful snapshot.
+Each discovery pass SHALL use one stable snapshot. Lifecycle mutations and
+snapshot publication SHALL be serialized within the instance.
+
 **Rationale:** Default-enabled matches how filesystem skills behave today:
 putting a directory in the discovery path is the act of installing. The
 registry only records deviations and lifecycle state, mirroring the
@@ -290,6 +304,30 @@ remove request naming it
 
 THE SYSTEM SHALL NOT delete a plugin's data directory on remove; data
 deletion is a separate explicit action
+
+Removal SHALL act on the installation entry, not its canonical target. A
+symlink entry SHALL be unlinked without deleting its target. Removal SHALL
+retain identity, installation-entry location, and provenance with
+enabled=false. Only successful add or explicit enable may reactivate that
+identity. Disabling SHALL precede entry deletion.
+
+Purge SHALL require a retained identity with a known absent installation
+entry and no installed package declaring that identity. An invalid manifest
+or unknown entry location SHALL NOT establish absence. Purge SHALL delete
+data before forgetting the identity, and SHALL retain the identity on failure.
+The trusted user-level root MAY be a symlink alias; data entries below its
+canonical target SHALL NOT traverse symlinks during destructive operations.
+
+Add SHALL stage outside discoverable candidate locations, validate the staged
+manifest identity, then publish the complete entry exclusively. It SHALL NOT
+replace, follow, or nest into an existing destination, including an invalid
+package or symlink. The valid manifest identity `data` SHALL use a different
+installation entry to avoid the reserved data subtree.
+
+THE SYSTEM SHALL NOT report add success when registration fails after file
+publication. It SHALL report the partial outcome without claiming rollback.
+A registry refresh failure after a committed mutation SHALL report failure
+and retain the last successful activation snapshot.
 
 WHERE an installed plugin's root is missing at discovery time THE SYSTEM
 SHALL report the plugin as missing, retain its registry record, and continue

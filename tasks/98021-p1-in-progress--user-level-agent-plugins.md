@@ -1,5 +1,56 @@
 # User-Level Agent Plugins (Agent Plugins Spec 1.1.0)
 
+## Review remediation — 2026-11-02
+
+Draft PR: https://github.com/scottopell/phoenix-ide/pull/1017
+Review hold: https://github.com/scottopell/phoenix-ide/pull/1017#issuecomment-6583976225
+
+The earlier done transition was premature. This task remains in progress.
+The 11 review findings have implementation changes and focused regressions;
+that is not review clearance, full qualification, merge, or deployment.
+
+Corrections cover validated deletion identity, install-entry ownership,
+fail-closed instance activation, package containment and cwd anchoring,
+exclusive staged publication, retained disabled identities, reinstall refresh,
+structured component admission outcomes, timestamp removal, and single-pass
+expansion. Follow-up review also found initial-message activation omission,
+invalid-manifest purge eligibility, root-alias purge failure, duplicate skill
+status mismatch, and removal falling through to a duplicate package. These
+have additional fixes and regressions.
+
+Verification must distinguish focused tests from real runtime acceptance:
+loader/MCP/skills library suites passed during remediation; UI typecheck,
+lint, Vitest, formatting and spec lanes passed. Final integrated runtime,
+strict clippy and registry tests pass at code checkpoint `c10f2bee5`:
+33 loader, 66 skills, 201 MCP, 32 plugin runtime/API, and four registry tests.
+The migration ledger, schema-138, and controller-schema tests also pass in
+focused reruns. These library totals include existing tests, not that many
+new plugin tests. No full `./dev.py check` pass is established. Lifecycle tests
+use disposable filesystem/SQLite and
+actual Axum error/list routes; success-path MCP reload and browser mutations
+still require acceptance. Broad-check failures must be classified, not hidden.
+
+The broad Rust run finished with 5709 passed, six failed, and 210 skipped.
+Three failures introduced by migration registration/format assertions were
+fixed and rerun: migration ledger, schema-138 latest-version assertion, and
+controller registry parsing. The three remaining failures are not classified
+as pre-existing:
+- `coordinator_bash_executes_owned_home_with_zero_ordinary_conversations`:
+  isolated rerun fails expected home in output.
+- `real_bash_wait_zero_and_normal_bounds_preserve_child_without_replay`:
+  isolated rerun sees tombstoned rather than still_running.
+- `conversation_runtime_dispatches_real_zero_and_normal_bash_waits`:
+  isolated rerun times out waiting for the Bash child readiness marker.
+
+TODO: classify those against baseline, qualify real MCP/browser mutations,
+and check settings navigation discoverability. Do not clear the review hold
+or mark this task done from focused test counts.
+
+Remaining gates: final exact-source validation, independent adversarial
+re-review, real runtime/browser mutation acceptance, and PR claims corrected
+to match that evidence. Preserve local databases created by the earlier
+unshipped prototype schema; no automatic conversion is promised.
+
 ## Goal
 
 Support a native, user-level-only (never project-level) add/remove path for

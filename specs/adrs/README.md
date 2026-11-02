@@ -191,6 +191,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [209](209_native-automatic-continuation-is-preference-only.md) | Native automatic continuation is preference-only | Accepted | REQ-GR-007/020, REQ-BED-020, REQ-API-029 |
 | [192](192_goal-admission-requires-explicit-auto-continue.md) | Goal admission requires explicit automatic continuation | Accepted | REQ-GOAL-AC-001–004 |
 | [191](191_agent-plugins-are-user-level-shared-root-namespaced-bundles.md) | Agent plugins are user-level-only, shared-root, namespaced bundles | Accepted | REQ-AP-001 through REQ-AP-012 |
+| [192](192_plugin-lifecycle-separates-installation-ownership-from-activation.md) | Plugin lifecycle separates installation ownership from activation | Accepted | REQ-AP-002, REQ-AP-007 through REQ-AP-010 |
 | [149](149_selective-coordinator-checkins.md) | Selective coordinator check-ins and attention-first briefings | Accepted | REQ-GR-011 |
 | [150](150_concrete-coordinator-reporting-and-blocker-recovery.md) | Concrete Coordinator reporting and blocked-work recovery | Accepted | REQ-GR-011 |
 | [148](148_qualify-exact-ordinary-launchd-source129-to-target131.md) | Qualify exact ordinary launchd source 129 to target 131 | Accepted | REQ-COMP-019, REQ-LDD-023/028 |

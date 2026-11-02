@@ -2,40 +2,65 @@
 
 ## Overview
 
-Plugins are user-level-only capability bundles following the Agent Plugins
-specification 1.1.0: a `plugin.json` manifest plus optional `skills/` and
-`mcp.json` components, installed under the shared root
-`~/.agents/plugins/<name>/`. Phoenix loads both component types through its
-existing skill discovery and MCP client machinery; plugins add a bundling
-and lifecycle layer (add/remove/enable/disable, containment, the stdio
-runtime environment contract), not a new execution path.
+Phoenix consumes Agent Plugins 1.1.0 bundles from user-level entries under
+`~/.agents/plugins/`. Skills use `plugin:skill` names; MCP servers use
+`plugin.server` keys after user configuration. The reserved `data/` subtree
+holds retained state. A plugin named `data` uses a separate install entry.
 
 [ADR-191](../adrs/191_agent-plugins-are-user-level-shared-root-namespaced-bundles.md)
-records the scope decision (user-level only, shared root), the naming scheme
-(`plugin:skill`, `<plugin>.<server>`), and the data-retention policy.
+records scope and naming.
+[ADR-192](../adrs/192_plugin-lifecycle-separates-installation-ownership-from-activation.md)
+records ownership, activation, publication, and failure boundaries.
 
 ## Status
 
-| Requirement | Title | Status | Notes |
-|---|---|---|---|
-| REQ-AP-001 | User-Level Install Scope | Complete | The only plugins root is the home-derived `~/.agents/plugins` (`default_plugins_root`); no working-directory or repository path is ever scanned |
-| REQ-AP-002 | Installed-Plugin Discovery | Complete | `scan_plugins_root` one-level scan with manifest-name identity and duplicate-name first-seen-wins (`phoenix-plugins`); wired into MCP config discovery and the `GET /api/plugins` list (registry join in `plugin_list_entries`) |
-| REQ-AP-003 | Manifest Validation | Complete | `Manifest::parse` (`phoenix-plugins`): exact 1.1.0 field set, unknown fields reported and ignored, non-object `extensions` ignored, unrecognized `$schema` rejects |
-| REQ-AP-004 | Component Loading with Scoped Failure Boundaries | Partial | `load_plugin` with per-skill, per-server, and per-component-type scopes (`phoenix-plugins`), regression-tested from the specification's own examples; status surfacing in phase 4 |
-| REQ-AP-005 | Plugin Skills | Complete | `SkillSource::Plugin` + `collect_plugin_skill` (`phoenix-skills`): `plugin:skill` namespacing derived at discovery, non-recursive trees, lowest precedence (scan after built-ins), conversation-audience only, frontmatter-name-matches-directory enforcement, `(plugin: name)` catalog provenance; invoked through the shared `invoke_skill` path |
-| REQ-AP-006 | Plugin MCP Servers | Complete | stdio servers resolve the full environment contract and join the MCP merge keyed `<plugin>.<server>` after user config (`plugin_server_configs_under`, `merge_plugin_configs` in `phoenix-mcp`); streamable-http maps to the HTTP transport; `PLUGIN_DATA` create-before-admission; both surfaces observe the shared enabled-plugin filter |
-| REQ-AP-007 | Containment | Complete | `within_boundary` (`phoenix-plugins`): realpath containment following symlinks, consistent lexical fallback for not-yet-existing paths, both plugin-root and data boundaries |
-| REQ-AP-008 | Enable and Disable | Complete | process-wide plugin filter (`phoenix-plugins::filter`) is the single authority shared by skill discovery and the MCP merge; persisted in the `plugins` table (absent row = enabled), seeded at startup, written through `/api/plugins/:name/enable|disable` |
-| REQ-AP-009 | Add and Remove Lifecycle | Complete | `POST /api/plugins/add` (local dir or shallow git clone, manifest validated before install, collision-refused, managed provenance registered); remove deletes the directory and drops the registry row retaining `PLUGIN_DATA`; purge-data is a separate action available for missing/removed roots; unmanaged directories load but are never modified without an explicit request |
-| REQ-AP-010 | Status Surfacing | Complete | `GET /api/plugins` carries per-component outcomes (skills list, MCP server list, `mcp_disabled_reason`) plus missing-root entries; PluginsPage renders status glyph, provenance badge, counts, and MCP-disabled reasons inline |
-| REQ-AP-011 | Extension Namespaces Reserved but Inert | Complete | All extension namespaces ignored without validation at manifest parse (`Manifest::parse` reports non-object `extensions` and ignores contents); `dev.scottopell.phoenix-ide/` reserved in ADR-191 |
-| REQ-AP-012 | Version Recognition | Complete | Exact canonical 1.1.0 identifiers in `MANIFEST_SCHEMA_URL`/`MCP_SCHEMA_URL`; mixed-version packages disable MCP contribution (`McpDocument::parse`) |
+Implementation is under adversarial-review remediation in draft PR #1017.
+The task is in progress. No merge, deployment, or complete qualification is
+claimed. The earlier completion table overstated lifecycle and status coverage.
 
-## Cross-Spec References
+| Requirement | Implementation | Verification and limits |
+|---|---|---|
+| REQ-AP-001 | Home-derived, user-level discovery only | Installation entries, not canonical symlink targets, define discovery scope |
+| REQ-AP-002 | One-level scan, manifest-name identity, first duplicate wins | Invalid/missing manifests do not establish installation-entry absence |
+| REQ-AP-003 | Offline manual manifest validator | Exact schema recognition, structural validation, report-and-ignore semantics have loader tests |
+| REQ-AP-004 | Parsed candidates with scoped failure reports | Filesystem, skill semantic/catalog, and MCP preparation failures remain separate |
+| REQ-AP-005 | Namespaced ordinary skills through instance-owned `SkillDiscovery` | Advertisement, slash expansion, and invocation receive shared activation; initial-message and dedup regressions added |
+| REQ-AP-006 | Shared MCP preparation adapter | Selected-anchor cwd, single-pass expansion, package command resolution, data creation, HTTP mapping; transport probe awaits a response rather than a sleep |
+| REQ-AP-007 | Manifest/component/executable containment | Existing symlink ancestors are resolved even for nonexistent descendants; install entry and execution root remain distinct |
+| REQ-AP-008 | SQLite authority plus one instance-scoped `PluginActivation` | Initially unavailable excludes all plugins; failed refresh preserves last good snapshot; no process-global filter or duplicate manager set |
+| REQ-AP-009 | Exclusive staged add; entry-safe remove; retained disabled identity; guarded purge | Real filesystem/SQLite and Axum regressions exist. Cross-harness identity locking and automatic partial-failure rollback are not promised |
+| REQ-AP-010 | Tagged loaded/skipped/disabled item outcomes and reasons | Skill status uses catalog admission; MCP status uses offline preparation, not live connection health. Registered invalid/unknown entries expose `load_error`, not false missing status |
+| REQ-AP-011 | Extension namespaces inert | No extension execution path |
+| REQ-AP-012 | Exact 1.1.0 schema identifiers | Unsupported manifest version rejects; incompatible MCP document disables that component |
 
-- `specs/skills/` — discovery precedence, turn-scoped catalog advertisement
-  (plugin skills ride REQ-SK-006 precedence and REQ-SK-009 refresh).
-- `specs/mcp/` — transport-tagged config discovery and first-seen-wins merge
-  (plugin servers extend REQ-MCP-001), live tool resolution (REQ-MCP-014),
-  reload reconciliation (REQ-MCP-015), enable/disable persistence precedent
-  (REQ-MCP-016).
+## Verification boundaries
+
+Focused loader, adapter, registry-upgrade, activation, lifecycle, API, and UI
+regressions are the relevant evidence. Existing unrelated MCP/skills tests are
+not plugin lifecycle end-to-end tests. Render-only UI tests do not prove real
+mutations. The remediation checkpoint passes loader (33), skills (66), MCP
+(201), plugin runtime/API (32), registry (4), and strict clippy checks. These
+suite totals include existing tests. UI and spec lanes also pass.
+
+The broad Rust run had six failures. Three migration-related failures were
+fixed and pass focused reruns. Three Bash/runtime failures reproduce alone
+and remain unclassified against baseline. There is no full-check pass or
+independent review clearance.
+
+The numbered registry migration covers fresh and supported pre-plugin databases.
+It does not convert local databases created by an earlier unshipped prototype
+schema. Installation timestamps were removed because they had no consumer.
+
+A failed filesystem removal can leave a disabled retained identity and an entry
+still on disk. A malformed installed manifest blocks purge; repair or manual
+entry removal is needed before purge can proceed. Do not interpret either case
+as successful uninstall. Full success-path runtime MCP reconciliation and browser
+mutation acceptance remain separate qualification steps.
+
+## Cross-spec references
+
+- `specs/skills/`: skill precedence, deduplication, expansion, invocation, and
+  turn-scoped advertisement.
+- `specs/mcp/`: configuration precedence, transport execution, live tool
+  resolution, and reload reconciliation.
+- `specs/compatibility/`: persistence and compatibility policy.

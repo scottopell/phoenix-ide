@@ -45,7 +45,7 @@ config {
 
 -- Per-plugin lifecycle state. Loading is a scan-time activity, not a
 -- lifecycle state: a plugin is discovered with its load outcome attached.
-enum PluginPhase { installed | removing }
+enum PluginPhase { installed | retained }
 
 -- Why the plugin directory exists: Phoenix installed it, or another
 -- harness did and Phoenix merely loads it (REQ-AP-009).
@@ -102,6 +102,7 @@ entity Plugin {
     phase: PluginPhase
     enabled: Boolean
     provenance: Provenance
+    entry_dir: String?
     root: String
 
     -- Per-component load outcome, retained until the next scan.
@@ -113,12 +114,18 @@ entity Plugin {
 
     -- True once removal (or a missing root) has made the plugin's data
     -- directory eligible for an explicit purge (REQ-AP-009).
-    purgeable: Boolean when phase = installed | removing
+    purgeable: Boolean
 
     transitions phase {
-        installed -> removing
-        terminal: removing
+        installed -> retained
+        retained -> installed
     }
+}
+
+-- One runtime-owned snapshot, scoped to a Phoenix instance (REQ-AP-008).
+entity Activation {
+    available: Boolean = false
+    disabled_names: Set<String>
 }
 
 -- The skills an enabled plugin contributes to the skill catalog, under
@@ -150,6 +157,7 @@ entity ResolvedPluginServer {
     args: List<String>
     env: Map<String, String>
     cwd: String
+    cwd_anchor: String
 }
 
 ------------------------------------------------------------
@@ -165,6 +173,12 @@ actor Operator {}
 ------------------------------------------------------------
 -- Surfaces
 ------------------------------------------------------------
+
+surface PluginInstallation {
+    facing: Operator
+    provides:
+        AddPlugin(source: String)
+}
 
 surface PluginControl {
     facing: Operator
@@ -220,8 +234,30 @@ surface PluginControl {
 --   covering both component types' scoped outcomes (REQ-AP-004).
 -- provenance_for(plugin_root): managed when Phoenix installed the
 --   directory, unmanaged when another harness did (REQ-AP-009).
--- registry_enabled(name): the persisted enabled/disabled registry state;
---   absent record means enabled (REQ-AP-008).
+-- registry_enabled(name): true only in an available, successfully loaded
+--   activation snapshot that does not disable name; absent row then means
+--   enabled. The snapshot is stable for one discovery pass (REQ-AP-008).
+-- canonical_root(entry): canonical directory target of the install entry.
+-- immediate_plugin_entry(entry, root): entry is an immediate child of root
+--   other than the reserved data entry; directory symlinks are permitted.
+-- cwd_anchor(cwd, root, data): the original unexpanded form selects root
+--   for null, ./ or ${PLUGIN_ROOT}, and data for ${PLUGIN_DATA}.
+-- cwd_valid(cwd, root, data): accepted form with cwd_resolved inside the
+--   sole boundary selected by cwd_anchor.
+-- command_resolved(command, root): bare PATH lookup name, or checked
+--   absolute package path for a ./ command, independent of cwd.
+-- command_valid(command, root): command_allowed and any package path stays
+--   within root after resolving existing symlink ancestors.
+-- expand_args(args, root, data): expand_placeholders on each argument.
+-- install_succeeded(source): complete exclusive publication and successful
+--   managed/enabled registry registration, not merely a successful copy.
+-- installed_plugin(source): identity, entry, root and version of that install.
+-- installation_entry_absent(plugin): known stored entry is absent by
+--   filesystem metadata, and no loaded sibling declares the same name;
+--   malformed manifests and unknown entry locations do not prove absence.
+-- retract_components(name): remove skill/server contributions for name and
+--   reconcile live MCP connections using the shared activation snapshot.
+-- registry_snapshot(): disabled names from a complete successful DB read.
 -- duplicate_name_loaded(name): another already-accepted scan candidate
 --   declared the same manifest name (REQ-AP-002).
 -- skill_namespaced(plugin_name, skill_name): "<plugin>:<skill>" (REQ-AP-005).
@@ -268,10 +304,75 @@ rule PluginDiscovered {
         phase: installed,
         enabled: registry_enabled(manifest.name),
         provenance: provenance_for(plugin_root),
-        root: plugin_root,
+        entry_dir: plugin_root,
+        root: canonical_root(plugin_root),
         missing: false,
         purgeable: false,
         load_report: [])
+}
+
+rule PluginAdded {
+    when: AddPlugin(source)
+    requires: install_succeeded(source)
+    let added = installed_plugin(source)
+    requires: not exists Plugin{name: added.name}
+    ensures: Plugin.created(
+        name: added.name,
+        version: added.version,
+        phase: installed,
+        enabled: true,
+        provenance: managed,
+        entry_dir: added.entry_dir,
+        root: added.root,
+        missing: false,
+        purgeable: false,
+        load_report: [])
+    @guidance
+        -- Serialize mutation, registry publication and MCP reload within
+        -- one instance. Validate source, stage beneath a manifest-free
+        -- candidate, validate staged identity, publish with no replacement,
+        -- then register and refresh activation before reload. Existing
+        -- invalid entries and symlinks also block destination publication.
+        -- Registration failure after publication reports installed files
+        -- without claiming success or automatic rollback. Reinstall updates
+        -- the retained identity to managed/enabled and preserves data.
+}
+
+rule PluginReinstalled {
+    when: AddPlugin(source)
+    requires: install_succeeded(source)
+    let added = installed_plugin(source)
+    let plugin = Plugin{name: added.name}
+    requires: plugin != null
+    ensures:
+        plugin.phase = installed
+        plugin.enabled = true
+        plugin.provenance = managed
+        plugin.entry_dir = added.entry_dir
+        plugin.root = added.root
+        plugin.version = added.version
+        plugin.purgeable = false
+        plugin.missing = false
+        plugin.load_report = load_components(plugin)
+}
+
+rule ActivationReadSucceeded {
+    when: RegistryReadSucceeded(activation)
+    ensures:
+        activation.available = true
+        activation.disabled_names = registry_snapshot()
+}
+
+rule ActivationReadFailed {
+    when: RegistryReadFailed(activation)
+    ensures:
+        activation.available = activation.available
+        activation.disabled_names = activation.disabled_names
+    @guidance
+        -- Keep the complete last-good snapshot unchanged. Initial read
+        -- failure aborts startup before plugin discovery or connections.
+        -- A mutation may commit before refresh fails; return an error,
+        -- never fabricate an empty all-enabled snapshot.
 }
 
 -- A duplicate manifest name in one scan: first discovered wins, later
@@ -323,7 +424,9 @@ rule PluginDisabled {
 
     requires: plugin.enabled and plugin.phase = installed
 
-    ensures: plugin.enabled = false
+    ensures:
+        plugin.enabled = false
+        retract_components(plugin.name)
 }
 
 rule PluginEnabled {
@@ -334,7 +437,7 @@ rule PluginEnabled {
     ensures: plugin.enabled = true
 }
 
--- Remove begins the removing phase: the plugin directory is deleted, its
+-- Removal retains disabled identity after entry deletion; its
 -- components stop contributing, and its registry record is retained for the
 -- data-purge decision. PLUGIN_DATA is never deleted here (REQ-AP-009).
 rule PluginRemovalRequested {
@@ -343,11 +446,19 @@ rule PluginRemovalRequested {
     requires: plugin.phase = installed
 
     ensures:
-        plugin.phase = removing
+        plugin.phase = retained
         plugin.enabled = false
         plugin.purgeable = true
         plugin.load_report = null
         plugin.missing = null
+        retract_components(plugin.name)
+    @guidance
+        -- Validate identity before path construction. Record the observed
+        -- entry, persist disabled state, refresh and reconcile MCP before
+        -- deletion. Reconciliation failure preserves the entry. Unlink a symlink
+        -- entry without deleting its canonical target. Preserve provenance
+        -- and data. A deletion failure retains disabled identity and reports
+        -- failure rather than treating the entry as absent.
 }
 
 -- Purge is a separate explicit action, available only after removal or for
@@ -358,8 +469,15 @@ rule PluginDataPurged {
     when: PurgePluginData(plugin)
 
     requires: plugin.purgeable
+    requires: installation_entry_absent(plugin)
 
     ensures: not exists plugin
+    @guidance
+        -- Delete only the owned data subtree below the canonical trusted
+        -- user root; reject symlinks below that boundary. Disable, refresh
+        -- and reconcile before destructive deletion. Delete data before
+        -- forgetting the registry identity. On either failure retain identity
+        -- and report failure; no crash recovery or rollback is promised.
 }
 
 -- A registered-but-absent root: report, retain the record, continue. Another
@@ -439,16 +557,15 @@ rule StdioEnvironmentContract {
 
     requires: contribution.spec.transport = stdio
     requires: command_allowed(contribution.spec.command)
-    requires: within_boundary(contribution.spec.cwd,
-        contribution.plugin_root)
-
     let data_dir = data_dir_for(contribution.plugin_name)
+    requires: command_valid(contribution.spec.command, contribution.plugin_root)
+    requires: cwd_valid(contribution.spec.cwd, contribution.plugin_root, data_dir)
 
     ensures: ResolvedPluginServer.created(
         server_key: contribution.server_key,
         plugin_root: contribution.plugin_root,
         data_dir: data_dir,
-        command: contribution.spec.command,
+        command: command_resolved(contribution.spec.command, contribution.plugin_root),
         args: expand_args(contribution.spec.args,
             contribution.plugin_root, data_dir),
         env: env_overlay(
@@ -457,6 +574,8 @@ rule StdioEnvironmentContract {
             contribution.plugin_root,
             data_dir),
         cwd: cwd_resolved(contribution.spec.cwd,
+            contribution.plugin_root, data_dir),
+        cwd_anchor: cwd_anchor(contribution.spec.cwd,
             contribution.plugin_root, data_dir))
 
     @guidance
@@ -476,9 +595,9 @@ rule StdioServerRejected {
     when: contribution: PluginServerContribution.created
 
     requires: contribution.spec.transport = stdio
-    requires: not command_allowed(contribution.spec.command)
-        or not within_boundary(contribution.spec.cwd,
-            contribution.plugin_root)
+    let data_dir = data_dir_for(contribution.plugin_name)
+    requires: not command_valid(contribution.spec.command, contribution.plugin_root)
+        or not cwd_valid(contribution.spec.cwd, contribution.plugin_root, data_dir)
 
     ensures: Diagnostic.created(
         plugin_name: contribution.plugin_name,
@@ -496,7 +615,7 @@ rule StdioServerRejected {
 -- (REQ-AP-001).
 invariant PluginsAreUserLevelOnly {
     for p in Plugins:
-        starts_with(p.root, config.plugins_root)
+        p.entry_dir != null implies immediate_plugin_entry(p.entry_dir, config.plugins_root)
 }
 
 -- A disabled plugin contributes neither component type (REQ-AP-008).
@@ -537,12 +656,12 @@ invariant DataDirKeyedByName {
 }
 
 -- Every resolved stdio path stays inside its boundary: the working
--- directory resolves within the plugin root, and the client-owned
+-- directory resolves within its selected anchor, and the client-owned
 -- environment variables name the real root and data directories
 -- (REQ-AP-007).
 invariant ResolvedPathsContained {
     for s in ResolvedPluginServers:
-        within_boundary(s.cwd, s.plugin_root)
+        within_boundary(s.cwd, s.cwd_anchor)
         and s.env["PLUGIN_ROOT"] = s.plugin_root
         and s.env["PLUGIN_DATA"] = s.data_dir
 }

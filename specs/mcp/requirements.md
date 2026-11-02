@@ -63,7 +63,8 @@ effect through config reload reconciliation like any other server config change.
 
 A stdio entry MAY set a working directory. A user-config entry carries none
 and inherits the manager's cwd; a plugin stdio server always carries its
-resolved plugin-root-anchored working directory (specs/plugins/ REQ-AP-006)
+resolved working directory validated against its selected plugin-root or
+plugin-data boundary (specs/plugins/ REQ-AP-006)
 through spawn and respawn unchanged.
 
 WHERE an entry declares neither a usable `command` nor an HTTP `url`
