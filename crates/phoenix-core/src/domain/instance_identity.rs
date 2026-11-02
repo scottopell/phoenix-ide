@@ -81,6 +81,10 @@ pub enum InstanceSelectorParseError {
 }
 
 impl InstanceSelector {
+    /// Parse an exact instance ID or a saved peer alias.
+    ///
+    /// # Errors
+    /// Returns an error when the selector is empty after trimming.
     pub fn parse(value: impl AsRef<str>) -> Result<Self, InstanceSelectorParseError> {
         value.as_ref().parse()
     }

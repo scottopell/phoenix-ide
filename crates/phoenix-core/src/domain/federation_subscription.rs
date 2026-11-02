@@ -290,6 +290,10 @@ pub struct TerminalFactOccurrence {
 }
 
 impl TerminalFactOccurrence {
+    /// Construct a terminal fact occurrence with its exact generation.
+    ///
+    /// # Errors
+    /// Returns an error when the occurrence ID is empty.
     pub fn new(
         kind: TerminalFactOccurrenceKind,
         id: impl Into<String>,
