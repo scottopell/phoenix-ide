@@ -46,11 +46,11 @@ review remain pending. Deployment and device acceptance are not claimed.
 | REQ-REM-008 visible reminder and provenance | Implemented; browser journey qualified | Scheduled provenance, canonical reminder API/cards, saved-zone management and global connected-browser notifications; focused component/policy tests and desktop/narrow browser QA |
 | REQ-REM-009 lifecycle boundary | Storage implemented | Existing ProductConversation admission; ordinary owner FKs; no Close participant |
 
-Focused storage validation passes 16 tests covering replay/conflict, owner and
+Focused storage validation passes 18 tests covering replay/conflict, owner and
 subagent boundaries, Coordinator ownership, revision/deadline replacement,
 cancellation/due arbitration, durable steering receipts, keyset discovery,
 file-backed restart, foreign-key cleanup, backward clock adjustment, full-call
-identity and scheduled origin round-trips. Focused runtime validation passes nine
+identity and scheduled origin round-trips. Focused application validation passes 19
 tests covering real standard admission, persistent steering cancellation,
 awaiting-user/approval refusal followed by readiness, continuation, Stop,
 model-independent due facts, create replay and management write classification/fail-stop.
@@ -114,7 +114,7 @@ and physical devices were not exercised. Full Rust/iOS test execution and
 independent adversarial review remain pending. No deployment was performed.
 
 Main integration preserves Federation's immutable migration 150 and appends
-reminders as migration 151. All 16 reminder DB tests, 14 application reminder
+reminders as migration 151. All 18 reminder DB tests, 19 application reminder
 tests, three predecessor-migration regressions and 17 migration/ledger/upgrade
 fixtures pass. The populated 151 test compares every original table and column,
 including provenance, Federation state and inert wake history, and verifies
@@ -135,3 +135,25 @@ with `openpty: Device not configured`. The two running tests received SIGINT;
 5,513 tests did not run. This is not a full Rust pass. Focused reminder/runtime
 and migration results above remain valid. Full Rust and iOS execution require
 hosted CI; the iOS app and all unit-test sources compile locally.
+
+## Adversarial repair qualification
+
+The isolated local review reproduced abandoned SQLite commit ownership and an
+aggregate-delete failure after delivery crossed a continuation. Reminder lifetime
+now belongs solely to ProductConversation; creating transcript/message/tool IDs
+remain validated immutable provenance. Permanent regressions cover source removal,
+materialized successor input and direct/queued successor acceptance followed by
+ordinary aggregate deletion.
+
+`ReminderWritePass` consumes typed command classification and closes local
+authority if create, reschedule, cancellation or clock promotion loses its result.
+Existing exact probes remain; creation preflight validation/read failures remain
+nonfatal. Promotion requires admission and an unclassified promotion error follows
+the existing process fail-stop contract. Deterministic SQLite commit-hook tests
+cover cancellation during all four writes, alongside closed-authority promotion
+and normal completed/conflicting mutations.
+
+Post-repair validation passes 18 DB tests, the populated migration-151 regression,
+19 application reminder tests, all-target Clippy, formatting/whitespace checks,
+46 harness self-tests and the isolated reminder E2E journey. Final independent
+review and hosted full Rust/iOS execution remain pending. No deployment occurred.

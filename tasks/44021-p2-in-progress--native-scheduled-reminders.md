@@ -140,3 +140,12 @@ interrupted after 598 passes because the host's pseudo-terminal pool was exhaust
 (independently reproduced with `script /usr/bin/true`); two running tests received
 SIGINT and 5,513 were unrun. No full Rust/iOS execution pass is claimed; hosted CI
 and independent review remain required. No server or deployment remains running.
+
+Isolated adversarial review of `64a6f23d..668ed05b` reproduced abandoned COMMIT
+ownership (P1) and aggregate deletion across reminder continuation (P2).
+`4ef5c156` keeps reminder lifetime with ProductConversation and preserves creating
+source provenance; `81221347` adds command-completion guards and fences promotion
+after authority closure. All old failures were reproduced before repair.
+Post-repair checks pass 18 DB tests, migration 151 preservation, 19 application
+tests, all-target Clippy, formatting, 46 harness self-tests and the reminder E2E
+journey. Final independent review and hosted full Rust/iOS execution remain open.
