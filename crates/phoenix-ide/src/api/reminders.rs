@@ -224,7 +224,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.status(), StatusCode::NOT_FOUND);
-        let stale = cancel(
+        let outdated = cancel(
             State(state.clone()),
             Path(("rem-owner".into(), reminder.id.clone())),
             Json(RevisionRequest {
@@ -233,7 +233,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        assert_eq!(outdated.status(), StatusCode::CONFLICT);
         state
             .db
             .promote_due_reminders(ReminderTimestampUs::parse(now + 61_000_000).unwrap(), 10)

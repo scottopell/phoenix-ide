@@ -249,7 +249,10 @@ mod tests {
         .unwrap();
         let next = match db.continue_conversation(&source.id).await.unwrap() {
             phoenix_db::ContinueOutcome::Created(next) => next,
-            other => panic!("{other:?}"),
+            other @ (phoenix_db::ContinueOutcome::AlreadyContinued(_)
+            | phoenix_db::ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("{other:?}")
+            }
         };
         deliver_pass(&manager(&db), time(30)).await;
         let target: String = sqlx::query_scalar(

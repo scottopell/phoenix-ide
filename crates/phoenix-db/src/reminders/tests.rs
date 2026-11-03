@@ -433,7 +433,7 @@ async fn reminders_real_sqlite_cancel_and_due_race_has_one_winner() {
     let path = dir.path().join("race.db");
     let path = path.to_str().unwrap();
     let observer = file_db(path).await;
-    let canceller = file_db(path).await;
+    let management_db = file_db(path).await;
     let owner = source(&observer, "reminder-race").await;
     let reminder = observer
         .create_reminder(&input(&owner.id, "race", 20))
@@ -441,7 +441,7 @@ async fn reminders_real_sqlite_cancel_and_due_race_has_one_winner() {
         .unwrap();
     let (due, cancelled) = tokio::join!(
         observer.promote_due_reminders(time(20), 100),
-        canceller.cancel_reminder(&owner.id, &reminder.id, reminder.revision, time(20)),
+        management_db.cancel_reminder(&owner.id, &reminder.id, reminder.revision, time(20)),
     );
     let due = due.unwrap();
     let cancelled = cancelled.unwrap();
@@ -605,7 +605,8 @@ async fn reminders_notification_feed_includes_accepted_due_and_follows_current_t
     .unwrap();
     let next = match db.continue_conversation(&owner.id).await.unwrap() {
         crate::ContinueOutcome::Created(next) => next,
-        other => panic!("{other:?}"),
+        other @ (crate::ContinueOutcome::AlreadyContinued(_)
+        | crate::ContinueOutcome::ParentNotContextExhausted { .. }) => panic!("{other:?}"),
     };
     let continued_feed = db
         .reminder_notification_feed(time(0), None, 10)

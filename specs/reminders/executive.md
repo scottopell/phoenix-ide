@@ -29,9 +29,10 @@ reminder data without granting new human authority.
 
 Upcoming/due HTTP and UI views and connected-browser notifications are implemented.
 The owner view and immutable due cards read saved state independently of model
-responses. The native/API restart journey and desktop/narrow browser journey pass;
-complete project checks and adversarial review remain pending. Deployment and
-device acceptance are not claimed.
+responses. The real tool/API restart journey and desktop/narrow browser journey
+pass. Local codegen, full test compilation, all-target Clippy, frontend,
+specification and E2E checks pass. Full Rust/iOS test execution and independent
+review remain pending. Deployment and device acceptance are not claimed.
 
 ## Coverage
 
@@ -63,8 +64,9 @@ Focused HTTP validation passes three API tests covering owner isolation, conflic
 mapping, durable due visibility and shared DST/reschedule validation. UI validation
 passes 131 tests across seven focused files, with TypeScript, ESLint and reminder
 CSS checks passing. Core, DB and application library Clippy checks also pass. The updated notification-feed continuation and file-backed
-settings persistence tests also pass. No full project-check pass is claimed;
-broader checks and independent adversarial review remain required before PR readiness. The management host helpers expose the same
+settings persistence tests also pass. The broad local qualification is recorded
+below; no full Rust test-execution pass is claimed. Independent adversarial
+review remains required. The management host helpers expose the same
 exact-probe/fail-stop behavior to API callers without requiring a tool-call identity.
 
 ## Authorities
@@ -86,7 +88,7 @@ link. Snapshot version 3 reads version-1/version-2 envelopes and fences older
 writers. The app and unit tests compile; simulator execution is blocked locally
 by host pseudo-terminal exhaustion and remains a hosted iOS CI qualification.
 
-Focused API, persistence, component, policy, navigation and stale-refresh regressions accompany this slice. Integrated API/browser journey validation passes; broad checks and adversarial review remain pending.
+Focused API, persistence, component, policy, navigation and stale-refresh regressions accompany this slice. Integrated API/browser journey validation passes; hosted Rust/iOS execution and independent review remain pending.
 
 ## API journey qualification
 
@@ -108,7 +110,7 @@ immutable due-card visibility, the scheduled input label and ordinary model
 follow-up. At 393×852 the panel was within the viewport (x=16, width=361,
 document width=393). Native date-field keyboard editing worked; earlier CLI
 fill/capture/resize attempts were inconclusive. Notification permission delivery
-and physical devices were not exercised. The complete project check and
+and physical devices were not exercised. Full Rust/iOS test execution and
 independent adversarial review remain pending. No deployment was performed.
 
 Main integration preserves Federation's immutable migration 150 and appends
@@ -116,5 +118,20 @@ reminders as migration 151. All 16 reminder DB tests, 14 application reminder
 tests, three predecessor-migration regressions and 17 migration/ledger/upgrade
 fixtures pass. The populated 151 test compares every original table and column,
 including provenance, Federation state and inert wake history, and verifies
-foreign keys and idempotent reentry. Full checks and the integrated mock journey
-remain assigned to parent QA; no post-integration full-check pass is claimed.
+foreign keys and idempotent reentry. The post-integration complete isolated E2E
+lane passes, including the reminder journey.
+
+## Broad local qualification
+
+`./dev.py check` passes codegen and its staleness guard, full Rust test compilation,
+TypeScript, ESLint, CSS lint, the full frontend suite, formatting, task validation,
+AST/transaction/timing checks, Allium, spec shape/anchors, development-harness tests,
+lockfile checks and all isolated E2E scenarios. All-target Clippy passes on rerun
+after correcting test binding names and exhaustive continuation matches.
+
+Broad Rust execution was deliberately interrupted after 598 passing tests because
+the host could not allocate a pseudo-terminal; even `script /usr/bin/true` failed
+with `openpty: Device not configured`. The two running tests received SIGINT;
+5,513 tests did not run. This is not a full Rust pass. Focused reminder/runtime
+and migration results above remain valid. Full Rust and iOS execution require
+hosted CI; the iOS app and all unit-test sources compile locally.

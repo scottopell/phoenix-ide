@@ -59,7 +59,7 @@ THE SYSTEM SHALL display an in-app toast with the failure reason, styled distinc
 WHEN the failure happens because of an external service Phoenix doesn't control (e.g., MCP server not responding)
 THE SYSTEM SHALL include enough context in the toast for the user to know which thing failed (server name, operation name)
 
-**Rationale:** A silently-failing button is the worst outcome — the user doesn't know whether to wait, retry, or work around. The error toast is the floor: it doesn't have to explain how to fix the problem, just confirm that one happened. The `console.error`-only path that PR #56 documented (REQ-TPANEL-009) is the anti-pattern: invisible to the user, only visible to people inspecting devtools.
+**Rationale:** A silently-failing button leaves the user unsure whether to wait, retry, or work around. The error toast confirms the failure even when it cannot explain a fix. Reporting a failure only through `console.error` leaves it invisible in the application.
 
 ---
 

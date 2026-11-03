@@ -131,3 +131,12 @@ app and unit-test target, including origin and cache regression sources. Test
 execution is unqualified because host pseudo-terminal exhaustion blocked the
 simulator runner; hosted iOS CI must execute these cases. Migration-fixture
 batches pass 9 and 8 tests after the merge. No deployment or phone alerts added.
+
+Broad local QA passes codegen/staleness, full Rust test compilation, the full
+frontend suite/type/lint checks, specification/static/format/task checks,
+development-harness tests and all E2E scenarios. All-target Clippy passes after
+test-only name/exhaustiveness corrections. Broad Rust execution was deliberately
+interrupted after 598 passes because the host's pseudo-terminal pool was exhausted
+(independently reproduced with `script /usr/bin/true`); two running tests received
+SIGINT and 5,513 were unrun. No full Rust/iOS execution pass is claimed; hosted CI
+and independent review remain required. No server or deployment remains running.
