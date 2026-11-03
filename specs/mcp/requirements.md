@@ -66,6 +66,10 @@ and inherits the manager's cwd; a plugin stdio server always carries its
 resolved working directory validated against its selected plugin-root or
 plugin-data boundary (specs/plugins/ REQ-AP-006)
 through spawn and respawn unchanged.
+Stdio executable, argument, and environment values SHALL retain native OS
+units from configuration admission through spawn, respawn, and reload
+comparison. Unicode replacement SHALL NOT change a package executable path
+or a client-owned path environment value.
 
 WHERE an entry declares neither a usable `command` nor an HTTP `url`
 THE SYSTEM SHALL skip it and record the reason at `debug` level.

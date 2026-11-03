@@ -139,6 +139,9 @@ THE SYSTEM SHALL load the two portable component types from a valid plugin:
 WHERE a component location exists with the wrong filesystem kind (a regular
 file named `skills`, a directory named `mcp.json`) THE SYSTEM SHALL invalidate
 that component type for that plugin and continue loading the other type
+Present special files (including FIFOs, sockets, and devices) at fixed
+component locations SHALL be reported as invalid filesystem kinds, not
+silently treated as absent components.
 
 WHERE a skill's `SKILL.md` is invalid or escapes the plugin root THE SYSTEM
 SHALL skip that skill, report at `warn` level, and continue sibling skills
@@ -228,6 +231,9 @@ A plugin stdio server SHALL run with:
   `cwd` must resolve inside that selected boundary
 - single-pass `${PLUGIN_ROOT}` and `${PLUGIN_DATA}` expansion applied to each
   `args` element, each `env` value, and `cwd`, and to nothing else
+- native OS executable, argument, and environment values after expansion,
+  without Unicode replacement in package paths or client-owned path values;
+  spawning and respawning SHALL preserve those same native values
 - configured `env` values that do not declare `PLUGIN_ROOT` or `PLUGIN_DATA`
 
 WHERE a configured `env` entry declares `PLUGIN_ROOT` or `PLUGIN_DATA` THE
@@ -315,6 +321,8 @@ be applied after disabling reconciliation completes.
 Enable and disable SHALL require a discovered or retained identity. A valid
 name alone SHALL NOT create registry state. Retained identities MAY be
 explicitly enabled or disabled without an installed package.
+Normal plugin-management UI controls SHALL offer these retained-identity
+activation actions independently of the missing-root purge action.
 
 **Rationale:** Default-enabled matches how filesystem skills behave today:
 putting a directory in the discovery path is the act of installing. The
@@ -375,6 +383,10 @@ canonical target SHALL NOT traverse symlinks during destructive operations.
 A genuinely absent shared plugins root SHALL count as already-absent data,
 without recreating the root. A dangling root or ancestor symlink SHALL NOT
 establish absence. Successful purge SHALL still forget retained identity.
+Purge SHALL repeat installation-entry and same-name package absence checks
+immediately after asynchronous reconciliation and before destructive data
+removal. A package restored during reconciliation SHALL retain its data and
+registry identity; the purge SHALL report failure.
 
 Add SHALL stage outside discoverable candidate locations, validate the staged
 manifest identity, then publish the complete entry exclusively. It SHALL NOT

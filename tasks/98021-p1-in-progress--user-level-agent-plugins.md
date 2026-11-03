@@ -1,5 +1,25 @@
 # User-Level Agent Plugins (Agent Plugins Spec 1.1.0)
 
+## Native process and late-purge review — 2026-11-03
+
+Hosted CI passed again on `0c13975fc`:
+https://github.com/scottopell/phoenix-ide/actions/runs/41673872053
+
+Four further threads arrived during that run. Fixes repeat purge absence checks
+after reconciliation, preserve native command/argument/env units through spawn
+and respawn, diagnose special fixed-component locations, and retain UI
+activation controls for missing identities. Native process types are threaded
+through configuration and supervisor comparison, not duplicated as strings.
+Tests restore a package at both its retained entry and another same-name entry
+during reconciliation and preserve its data. Linux has a raw-name bundled
+executable launch regression; Unix pure tests verify native placeholder units.
+
+Local validation: full workspace/all-target compilation; 40 loader, 210 MCP,
+44 macOS runtime/API tests; strict clippy; all ten UI/spec/structural lanes pass.
+Hosted CI must run on the subsequent head; earlier green checkpoints are not
+substitutes. Task stays in progress pending review/runtime acceptance, with no
+merge or deployment performed. ADR-220 records the process-value decision.
+
 ## Late review during green CI — 2026-11-03
 
 Exact-head hosted CI passed on `063f9fd22`:

@@ -58,6 +58,11 @@ enum ComponentType { skills | mcp }
 -- Value Types
 ------------------------------------------------------------
 
+-- Native code units after runtime expansion, not a Unicode wire string.
+value NativeProcessValue {
+    os_units: List<Integer>
+}
+
 -- One component load outcome within a plugin scan.
 value LoadEntry {
     component: ComponentType
@@ -153,9 +158,9 @@ entity ResolvedPluginServer {
     server_key: String
     plugin_root: String
     data_dir: String
-    command: String
-    args: List<String>
-    env: Map<String, String>
+    command: NativeProcessValue
+    args: List<NativeProcessValue>
+    env: Map<NativeProcessValue, NativeProcessValue>
     cwd: String
     cwd_anchor: String
 }
@@ -274,6 +279,9 @@ surface PluginControl {
 -- expand_placeholders(text, plugin_root, data_dir): single textual pass
 --   replacing ${PLUGIN_ROOT} and ${PLUGIN_DATA}; other placeholder-like
 --   text stays literal (REQ-AP-006).
+--   Runtime results preserve native OS units in inserted path values.
+-- native_value(value): exact native process value of text or a logical
+--   filesystem path, without replacement; os_units use the platform encoding.
 -- env_overlay(base_env, configured_env, plugin_root, data_dir): expand
 --   configured values, overlay them on the base environment, then set
 --   client-owned PLUGIN_ROOT and PLUGIN_DATA last, overriding equivalents
@@ -487,7 +495,9 @@ rule PluginDataPurged {
     @guidance
         -- Delete only the owned data subtree below the canonical trusted
         -- user root; reject symlinks below that boundary. Disable, refresh
-        -- and reconcile before destructive deletion. Delete data before
+        -- and reconcile before destructive deletion. Recheck entry and
+        -- same-name package absence after reconciliation; preserve restored
+        -- packages' data and registry identity on failure. Delete data before
         -- forgetting the registry identity. On either failure retain identity
         -- and report failure; no crash recovery or rollback is promised.
         -- A genuinely absent trusted root has no data to delete; do not
@@ -678,6 +688,6 @@ invariant DataDirKeyedByName {
 invariant ResolvedPathsContained {
     for s in ResolvedPluginServers:
         within_boundary(s.cwd, s.cwd_anchor)
-        and s.env["PLUGIN_ROOT"] = s.plugin_root
-        and s.env["PLUGIN_DATA"] = s.data_dir
+        and s.env[native_value("PLUGIN_ROOT")] = native_value(s.plugin_root)
+        and s.env[native_value("PLUGIN_DATA")] = native_value(s.data_dir)
 }

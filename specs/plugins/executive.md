@@ -35,6 +35,27 @@ lifecycle and status coverage.
 | REQ-AP-011 | Extension namespaces inert | No extension execution path |
 | REQ-AP-012 | Exact 1.1.0 schema identifiers | Unsupported manifest version rejects; incompatible MCP document disables that component |
 
+## Native process and late-purge checks
+
+The next review found a remaining lossy boundary at spawn and an absence check
+that preceded asynchronous purge reconciliation. MCP stdio command, arguments,
+and environment overlays now retain native OS strings through configuration,
+supervisor equality, spawn and respawn. Single-pass expansion appends native
+path units. Unix pure tests verify exact bytes; Linux additionally launches a
+bundled executable from a raw-name home and verifies its received values.
+
+Purge rechecks stored-entry and same-name package absence after reconciliation,
+preserving data and identity if another harness restores a package during the
+wait. Fixed component locations now distinguish present special files from
+absence. Missing identities retain activation controls alongside purge in the
+normal settings UI. [ADR-220](../adrs/220_plugin-process-values-remain-native-through-spawn.md)
+records the native-value and late-check decisions.
+
+Local validation passes: 40 loader, 210 MCP, 44 macOS runtime/API tests, strict
+clippy, workspace/all-target compile, and all UI/spec/structural lanes. These
+later edits need their own hosted verification; previous green checkpoints do
+not establish their Linux raw-name launch test.
+
 ## Late-review ownership and format checks
 
 A later review on the CI-green checkpoint found eight more gaps. Removal now
