@@ -41,9 +41,13 @@ receipts, including delivery across a continuation.
 
 `ReminderWritePass` consumes typed command classification and closes local
 authority if create, reschedule, cancellation or clock promotion loses its
-result. Existing exact probes remain. Create preflight validation/read failures
-remain nonfatal. Promotion requires admission; an unclassified promotion result
-uses the existing process fail-stop contract.
+result. Creation retains its exact invocation/fingerprint replay query; management
+does not infer command ownership from a matching snapshot. Normal typed write
+results and known validation/lifecycle refusals remain nonfatal. Management
+infrastructure errors, including SQLite or serialization failures, remain
+unclassified and use existing fail-stop authority. Create preflight validation/read
+failures remain nonfatal. Promotion requires admission and uses the same fail-stop
+contract for an unclassified result.
 
 ## Coverage
 
@@ -123,3 +127,4 @@ physical devices were not exercised. No production deployment is claimed.
 - ADR-217: standard input admission architecture.
 - ADR-218: reserved occurrence identity and existing receipt provenance.
 - ADR-219: canonical aliases, fresh opening validation and existing opening authority.
+- ADR-220: management infrastructure errors use existing fail-stop authority.

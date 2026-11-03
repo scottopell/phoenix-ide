@@ -283,64 +283,6 @@ impl ReminderService for HostReminderService {
     }
 }
 
-enum ReminderMutationProbe {
-    Established(phoenix_db::ReminderChange),
-    Unapplied,
-}
-
-fn cancelled_probe(
-    current: Option<Reminder>,
-    expected: phoenix_core::domain::reminder::ReminderRevision,
-    now_us: ReminderTimestampUs,
-) -> ReminderMutationProbe {
-    use phoenix_core::domain::reminder::ReminderState;
-    use phoenix_db::ReminderChange;
-    let Some(current) = current else {
-        return ReminderMutationProbe::Established(ReminderChange::NotFound);
-    };
-    let result = match current.state {
-        ReminderState::Cancelled { cancelled_at_us }
-            if current.revision == expected && cancelled_at_us == now_us =>
-        {
-            ReminderChange::Updated { reminder: current }
-        }
-        ReminderState::Cancelled { .. } => ReminderChange::AlreadyCancelled { current },
-        ReminderState::Due { .. } => ReminderChange::AlreadyDue { current },
-        ReminderState::Scheduled if current.revision != expected => {
-            ReminderChange::RevisionConflict { current }
-        }
-        ReminderState::Scheduled => return ReminderMutationProbe::Unapplied,
-    };
-    ReminderMutationProbe::Established(result)
-}
-
-fn rescheduled_probe(
-    current: Option<Reminder>,
-    input: &RescheduleReminderInput,
-) -> ReminderMutationProbe {
-    use phoenix_core::domain::reminder::ReminderState;
-    use phoenix_db::ReminderChange;
-    let Some(current) = current else {
-        return ReminderMutationProbe::Established(ReminderChange::NotFound);
-    };
-    let result = match current.state {
-        ReminderState::Due { .. } => ReminderChange::AlreadyDue { current },
-        ReminderState::Cancelled { .. } => ReminderChange::AlreadyCancelled { current },
-        ReminderState::Scheduled
-            if Some(current.revision.get()) == input.expected_revision.get().checked_add(1)
-                && current.due_at_us == input.due_at_us
-                && current.timezone == input.timezone =>
-        {
-            ReminderChange::Updated { reminder: current }
-        }
-        ReminderState::Scheduled if current.revision != input.expected_revision => {
-            ReminderChange::RevisionConflict { current }
-        }
-        ReminderState::Scheduled => return ReminderMutationProbe::Unapplied,
-    };
-    ReminderMutationProbe::Established(result)
-}
-
 pub(crate) async fn reschedule(
     runtime: &RuntimeManager,
     input: &RescheduleReminderInput,
@@ -350,40 +292,31 @@ pub(crate) async fn reschedule(
         .map_err(|()| phoenix_db::DbError::ReminderInvalid("local authority is closed".into()))?;
     let db = runtime.db();
     let command = ReminderWritePass::new(authority, "reminder_reschedule_unclassified");
-    let result = command.complete(reschedule_command(db, input).await)?;
+    let result = command.complete(classify_management_result(
+        db.reschedule_reminder(input).await,
+    ))?;
     if matches!(result, phoenix_db::ReminderChange::Updated { .. }) {
         runtime.kick_direct_turn_worker();
     }
     Ok(result)
 }
 
-async fn reschedule_command(
-    db: &phoenix_db::Database,
-    input: &RescheduleReminderInput,
+fn classify_management_result(
+    result: phoenix_db::DbResult<phoenix_db::ReminderChange>,
 ) -> LocalAuthorityResult<phoenix_db::DbResult<phoenix_db::ReminderChange>> {
-    let result = match db.reschedule_reminder(input).await {
-        Ok(change) => change,
-        Err(error @ phoenix_db::DbError::Sqlx(_)) => {
-            let current = match db
-                .get_reminder(&input.source_transcript_id, &input.reminder_id)
-                .await
-            {
-                Ok(current) => current,
-                Err(probe) => {
-                    tracing::error!(%error, %probe, "reminder reschedule commit could not be classified");
-                    return LocalAuthorityResult::DurableFactUnclassified;
-                }
-            };
-            match rescheduled_probe(current, input) {
-                ReminderMutationProbe::Established(change) => change,
-                ReminderMutationProbe::Unapplied => {
-                    return LocalAuthorityResult::DurableFactEstablished(Err(error))
-                }
-            }
+    match result {
+        Ok(change) => LocalAuthorityResult::DurableFactEstablished(Ok(change)),
+        Err(
+            error @ (phoenix_db::DbError::ReminderInvalid(_)
+            | phoenix_db::DbError::ConversationNotFound(_)
+            | phoenix_db::DbError::CloseAdmissionFenced(_)
+            | phoenix_db::DbError::ProductConversationUnavailable(_)),
+        ) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+        Err(error) => {
+            tracing::error!(%error, "reminder management returned no classified command result");
+            LocalAuthorityResult::DurableFactUnclassified
         }
-        Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error)),
-    };
-    LocalAuthorityResult::DurableFactEstablished(Ok(result))
+    }
 }
 
 pub(crate) async fn cancel(
@@ -398,45 +331,14 @@ pub(crate) async fn cancel(
         .map_err(|()| phoenix_db::DbError::ReminderInvalid("local authority is closed".into()))?;
     let db = runtime.db();
     let command = ReminderWritePass::new(authority, "reminder_cancel_unclassified");
-    let result = command.complete(
-        cancel_command(db, transcript_id, reminder_id, expected_revision, now_us).await,
-    )?;
+    let result = command.complete(classify_management_result(
+        db.cancel_reminder(transcript_id, reminder_id, expected_revision, now_us)
+            .await,
+    ))?;
     if matches!(result, phoenix_db::ReminderChange::Updated { .. }) {
         runtime.kick_direct_turn_worker();
     }
     Ok(result)
-}
-
-async fn cancel_command(
-    db: &phoenix_db::Database,
-    transcript_id: &str,
-    reminder_id: &phoenix_core::domain::reminder::ReminderId,
-    expected_revision: phoenix_core::domain::reminder::ReminderRevision,
-    now_us: ReminderTimestampUs,
-) -> LocalAuthorityResult<phoenix_db::DbResult<phoenix_db::ReminderChange>> {
-    let result = match db
-        .cancel_reminder(transcript_id, reminder_id, expected_revision, now_us)
-        .await
-    {
-        Ok(change) => change,
-        Err(error @ phoenix_db::DbError::Sqlx(_)) => {
-            let current = match db.get_reminder(transcript_id, reminder_id).await {
-                Ok(current) => current,
-                Err(probe) => {
-                    tracing::error!(%error, %probe, "reminder cancel commit could not be classified");
-                    return LocalAuthorityResult::DurableFactUnclassified;
-                }
-            };
-            match cancelled_probe(current, expected_revision, now_us) {
-                ReminderMutationProbe::Established(change) => change,
-                ReminderMutationProbe::Unapplied => {
-                    return LocalAuthorityResult::DurableFactEstablished(Err(error))
-                }
-            }
-        }
-        Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error)),
-    };
-    LocalAuthorityResult::DurableFactEstablished(Ok(result))
 }
 
 #[cfg(test)]
@@ -521,6 +423,16 @@ mod mutation_tests {
         ReminderId, ReminderRevision, ReminderText, ReminderTimezone,
     };
     use phoenix_db::ReminderChange;
+
+    #[test]
+    fn untyped_management_failure_is_unclassified() {
+        assert!(matches!(
+            classify_management_result(Err(phoenix_db::DbError::Serialization(
+                "incomplete stored shape".into()
+            ))),
+            LocalAuthorityResult::DurableFactUnclassified
+        ));
+    }
 
     #[tokio::test]
     async fn reminder_abandoned_mutation_commit_closes_local_authority() {
@@ -732,144 +644,83 @@ mod mutation_tests {
             ReminderChange::RevisionConflict { .. }
         ));
         assert!(runtime.acquire_local_authority_pass().is_ok());
-        assert!(matches!(
-            cancel(
-                &runtime,
-                "mutation-source",
-                &reminder.id,
-                reminder.revision,
-                time(12)
-            )
-            .await
-            .unwrap(),
-            ReminderChange::Updated { .. }
-        ));
-        assert!(runtime.acquire_local_authority_pass().is_ok());
-    }
-
-    #[tokio::test]
-    async fn cancel_probe_recovers_only_exact_committed_revision_and_time() {
-        let db = phoenix_db::Database::open_in_memory().await.unwrap();
-        let original = saved(&db).await;
-        let runtime = manager(&db);
-        cancel(
+        let ReminderChange::Updated {
+            reminder: cancelled,
+        } = cancel(
             &runtime,
             "mutation-source",
-            &original.id,
-            original.revision,
+            &reminder.id,
+            reminder.revision,
             time(12),
         )
         .await
-        .unwrap();
-        let current = db
-            .get_reminder("mutation-source", &original.id)
-            .await
-            .unwrap()
-            .unwrap();
+        .unwrap()
+        else {
+            panic!("cancel must commit")
+        };
+        assert!(runtime.acquire_local_authority_pass().is_ok());
         assert!(matches!(
-            cancelled_probe(Some(current.clone()), original.revision, time(12)),
-            ReminderMutationProbe::Established(ReminderChange::Updated { reminder }) if reminder == current
+            cancel(&runtime, "mutation-source", &reminder.id, reminder.revision, time(12)).await.unwrap(),
+            ReminderChange::AlreadyCancelled { current } if current == cancelled
         ));
-        assert!(matches!(
-            cancelled_probe(Some(current.clone()), original.revision, time(11)),
-            ReminderMutationProbe::Established(ReminderChange::AlreadyCancelled { current: returned }) if returned == current
-        ));
-        let competing = cancel(
-            &runtime,
-            "mutation-source",
-            &original.id,
-            original.revision,
-            time(11),
-        )
-        .await
-        .unwrap();
-        assert!(
-            matches!(competing, ReminderChange::AlreadyCancelled { current: returned } if returned == current)
-        );
         assert!(runtime.acquire_local_authority_pass().is_ok());
     }
 
     #[tokio::test]
-    async fn reminder_management_probes_classify_committed_unchanged_and_competing_mutations() {
+    async fn cancel_without_a_classified_result_fences_even_when_rows_remain_readable() {
+        unclassified_management_write_fences(false).await;
+    }
+
+    #[tokio::test]
+    async fn reschedule_without_a_classified_result_fences_even_when_rows_remain_readable() {
+        unclassified_management_write_fences(true).await;
+    }
+
+    async fn unclassified_management_write_fences(rescheduling: bool) {
         let db = phoenix_db::Database::open_in_memory().await.unwrap();
         let original = saved(&db).await;
-        let input = RescheduleReminderInput {
-            source_transcript_id: "mutation-source".into(),
-            reminder_id: original.id.clone(),
-            expected_revision: original.revision,
-            due_at_us: time(40),
-            timezone: original.timezone.clone(),
-            now_us: time(11),
-        };
-        assert!(matches!(
-            rescheduled_probe(Some(original.clone()), &input),
-            ReminderMutationProbe::Unapplied
-        ));
-        assert!(matches!(
-            cancelled_probe(Some(original.clone()), original.revision, time(11)),
-            ReminderMutationProbe::Unapplied
-        ));
-        db.reschedule_reminder(&input).await.unwrap();
-        let current = db
-            .get_reminder("mutation-source", &original.id)
+        let runtime = manager(&db);
+        {
+            let mut connection = db.pool().acquire().await.unwrap();
+            let mut handle = connection.lock_handle().await.unwrap();
+            let mut allow_commit = false;
+            handle.set_commit_hook(move || std::mem::replace(&mut allow_commit, true));
+        }
+        let result = if rescheduling {
+            reschedule(
+                &runtime,
+                &RescheduleReminderInput {
+                    source_transcript_id: "mutation-source".into(),
+                    reminder_id: original.id.clone(),
+                    expected_revision: original.revision,
+                    due_at_us: time(40),
+                    timezone: original.timezone.clone(),
+                    now_us: time(11),
+                },
+            )
             .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            rescheduled_probe(Some(current.clone()), &input),
-            ReminderMutationProbe::Established(ReminderChange::Updated { .. })
-        ));
-        assert!(matches!(
-            cancelled_probe(Some(current.clone()), original.revision, time(11)),
-            ReminderMutationProbe::Established(ReminderChange::RevisionConflict { .. })
-        ));
-        let different = RescheduleReminderInput {
-            due_at_us: time(50),
-            ..input
-        };
-        assert!(matches!(
-            rescheduled_probe(Some(current.clone()), &different),
-            ReminderMutationProbe::Established(ReminderChange::RevisionConflict { .. })
-        ));
-        db.cancel_reminder("mutation-source", &current.id, current.revision, time(12))
+        } else {
+            cancel(
+                &runtime,
+                "mutation-source",
+                &original.id,
+                original.revision,
+                time(11),
+            )
             .await
-            .unwrap();
-        let cancelled = db
-            .get_reminder("mutation-source", &original.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            cancelled_probe(Some(cancelled.clone()), original.revision, time(12)),
-            ReminderMutationProbe::Established(ReminderChange::AlreadyCancelled { .. })
-        ));
-        assert!(matches!(
-            rescheduled_probe(Some(cancelled), &different),
-            ReminderMutationProbe::Established(ReminderChange::AlreadyCancelled { .. })
-        ));
-        let mut due = current;
-        due.state = phoenix_core::domain::reminder::ReminderState::Due {
-            occurred_at_us: time(60),
         };
-        assert!(matches!(
-            rescheduled_probe(Some(due.clone()), &different),
-            ReminderMutationProbe::Established(ReminderChange::AlreadyDue { .. })
-        ));
-        assert!(matches!(
-            cancelled_probe(Some(due), original.revision, time(11)),
-            ReminderMutationProbe::Established(ReminderChange::AlreadyDue { .. })
-        ));
-        assert!(matches!(
-            rescheduled_probe(None, &different),
-            ReminderMutationProbe::Established(ReminderChange::NotFound)
-        ));
-        assert!(matches!(
-            cancelled_probe(None, original.revision, time(11)),
-            ReminderMutationProbe::Established(ReminderChange::NotFound)
-        ));
+        assert!(result.is_err());
+        assert!(runtime.acquire_local_authority_pass().is_err());
+        assert_eq!(
+            db.get_reminder("mutation-source", &original.id)
+                .await
+                .unwrap(),
+            Some(original)
+        );
     }
+
     #[tokio::test]
-    async fn reminder_management_closes_existing_authority_when_exact_probe_fails() {
+    async fn reminder_management_closes_authority_when_the_database_is_unavailable() {
         let db = phoenix_db::Database::open_in_memory().await.unwrap();
         let original = saved(&db).await;
         let cancel_runtime = manager(&db);
