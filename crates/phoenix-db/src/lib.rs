@@ -4032,7 +4032,7 @@ impl Database {
         Ok(())
     }
 
-    /// Record an observed installation entry and enabled state, preserving provenance.
+    /// Record an observed entry and enablement; preserve ownership only for the same entry.
     ///
     /// # Errors
     ///
@@ -4046,7 +4046,9 @@ impl Database {
         sqlx::query(
             "INSERT INTO plugins (name, provenance, enabled, install_entry) \
              VALUES (?1, 'unmanaged', ?2, ?3) \
-             ON CONFLICT(name) DO UPDATE SET enabled = ?2, install_entry = ?3",
+             ON CONFLICT(name) DO UPDATE SET enabled = ?2, \
+             provenance = CASE WHEN plugins.install_entry = ?3 THEN plugins.provenance ELSE 'unmanaged' END, \
+             install_entry = ?3",
         )
         .bind(name)
         .bind(i64::from(enabled))
@@ -33267,10 +33269,15 @@ mod tests {
         let row = &db.get_plugins().await.unwrap()[0];
         assert_eq!(row.install_entry.as_deref(), second.to_str());
         assert_eq!(row.provenance, PluginProvenance::Managed);
+        db.record_plugin_entry("demo", second, true).await.unwrap();
+        assert_eq!(
+            db.get_plugins().await.unwrap()[0].provenance,
+            PluginProvenance::Managed
+        );
         db.record_plugin_entry("demo", first, false).await.unwrap();
         let row = &db.get_plugins().await.unwrap()[0];
         assert_eq!(row.install_entry.as_deref(), first.to_str());
-        assert_eq!(row.provenance, PluginProvenance::Managed);
+        assert_eq!(row.provenance, PluginProvenance::Unmanaged);
         assert!(!row.enabled);
         assert!(sqlx::query("UPDATE plugins SET install_entry = ''")
             .execute(db.pool())

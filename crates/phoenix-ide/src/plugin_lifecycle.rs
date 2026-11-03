@@ -142,6 +142,15 @@ impl PluginLifecycle {
                         .await
                         .map_err(|error| LifecycleError::internal(&error))?;
                 } else {
+                    if !db
+                        .get_plugins()
+                        .await
+                        .map_err(|error| LifecycleError::internal(&error))?
+                        .iter()
+                        .any(|record| record.name == name.0)
+                    {
+                        return Err(LifecycleError::bad("unknown plugin identity"));
+                    }
                     db.set_plugin_enabled(name.0, enabled)
                         .await
                         .map_err(|error| LifecycleError::internal(&error))?;
@@ -150,18 +159,15 @@ impl PluginLifecycle {
             }
             Mutation::Remove(name) => {
                 let name = PluginName::parse(name)?;
-                let plugin = phoenix_plugins::scan_plugins_root(root)
-                    .into_iter()
-                    .find(|plugin| plugin.manifest.name == name.0)
-                    .ok_or_else(|| LifecycleError::bad("plugin is not installed"))?;
-                db.record_plugin_entry(name.0, &plugin.entry_dir, false)
+                let entry = removal_entry(db, root, &name).await?;
+                db.record_plugin_entry(name.0, &entry, false)
                     .await
                     .map_err(|error| LifecycleError::internal(&error))?;
                 crate::plugin_activation::refresh(db, activation)
                     .await
                     .map_err(|error| LifecycleError::internal(&error))?;
                 reconciliation.apply(name.0).await?;
-                remove_entry(&plugin.entry_dir)?;
+                remove_entry(&entry)?;
                 name.0.to_owned()
             }
             Mutation::Purge(name) => {
@@ -179,11 +185,12 @@ impl PluginLifecycle {
                         "installation entry is unknown; cannot prove plugin absence",
                     )
                 })?;
-                match std::fs::symlink_metadata(entry) {
+                let entry = validated_install_entry(root, Path::new(entry))?;
+                match std::fs::symlink_metadata(&entry) {
                     Ok(_) => {
                         return Err(LifecycleError::bad(
                             "installation entry still exists; remove it before purging data",
-                        ))
+                        ));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => return Err(LifecycleError::internal(&error)),
@@ -203,11 +210,12 @@ impl PluginLifecycle {
                     .await
                     .map_err(|error| LifecycleError::internal(&error))?;
                 reconciliation.apply(name.0).await?;
-                let data = owned_data_dir(root, &name)?;
-                match std::fs::remove_dir_all(&data) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(LifecycleError::internal(&error)),
+                if let Some(data) = owned_data_dir(root, &name)? {
+                    match std::fs::remove_dir_all(&data) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(LifecycleError::internal(&error)),
+                    }
                 }
                 db.unregister_plugin(name.0)
                     .await
@@ -223,6 +231,25 @@ impl PluginLifecycle {
     }
 }
 
+async fn removal_entry(db: &Database, root: &Path, name: &PluginName<'_>) -> Result<PathBuf> {
+    let entry = match phoenix_plugins::scan_plugins_root(root)
+        .into_iter()
+        .find(|plugin| plugin.manifest.name == name.0)
+    {
+        Some(plugin) => plugin.entry_dir,
+        None => db
+            .get_plugins()
+            .await
+            .map_err(|error| LifecycleError::internal(&error))?
+            .into_iter()
+            .find(|record| record.name == name.0)
+            .and_then(|record| record.install_entry)
+            .map(PathBuf::from)
+            .ok_or_else(|| LifecycleError::bad("plugin is not installed"))?,
+    };
+    validated_install_entry(root, &entry)
+}
+
 fn remove_entry(entry: &Path) -> Result<()> {
     let metadata =
         std::fs::symlink_metadata(entry).map_err(|error| LifecycleError::internal(&error))?;
@@ -234,24 +261,81 @@ fn remove_entry(entry: &Path) -> Result<()> {
     .map_err(|error| LifecycleError::internal(&error))
 }
 
-fn owned_data_dir(root: &Path, name: &PluginName<'_>) -> Result<PathBuf> {
-    let root = std::fs::canonicalize(root).map_err(|error| LifecycleError::internal(&error))?;
+fn canonical_plugins_root(root: &Path) -> Result<Option<PathBuf>> {
+    match std::fs::symlink_metadata(root) {
+        Ok(_) => std::fs::canonicalize(root)
+            .map(Some)
+            .map_err(|error| LifecycleError::internal(&error)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            for ancestor in root.ancestors().skip(1) {
+                match std::fs::symlink_metadata(ancestor) {
+                    Ok(_) => {
+                        std::fs::canonicalize(ancestor)
+                            .map_err(|error| LifecycleError::internal(&error))?;
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(LifecycleError::internal(&error)),
+                }
+            }
+            Ok(None)
+        }
+        Err(error) => Err(LifecycleError::internal(&error)),
+    }
+}
+
+fn validated_install_entry(root: &Path, entry: &Path) -> Result<PathBuf> {
+    let invalid = || {
+        LifecycleError::bad(
+            "installation entry is not an immediate plugin child of the trusted root",
+        )
+    };
+    if entry.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) {
+        return Err(invalid());
+    }
+    let name = entry
+        .file_name()
+        .filter(|name| *name != "data")
+        .ok_or_else(invalid)?;
+    let parent = entry.parent().ok_or_else(invalid)?;
+    match canonical_plugins_root(root)? {
+        Some(root) => {
+            let parent = std::fs::canonicalize(parent).map_err(|_| invalid())?;
+            if parent != root {
+                return Err(invalid());
+            }
+            Ok(entry.to_path_buf())
+        }
+        None if parent == root => Ok(root.join(name)),
+        None => Err(invalid()),
+    }
+}
+
+fn owned_data_dir(root: &Path, name: &PluginName<'_>) -> Result<Option<PathBuf>> {
+    let Some(root) = canonical_plugins_root(root)? else {
+        return Ok(None);
+    };
     let boundary = root.join("data");
     let data = boundary.join(name.0);
     for ancestor in [&boundary, &data] {
         match std::fs::symlink_metadata(ancestor) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(LifecycleError::bad("plugin data path contains a symlink"))
+                return Err(LifecycleError::bad("plugin data path contains a symlink"));
             }
             Ok(metadata) if !metadata.is_dir() => {
-                return Err(LifecycleError::bad("plugin data path is not a directory"))
+                return Err(LifecycleError::bad("plugin data path is not a directory"));
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(LifecycleError::internal(&error)),
         }
     }
-    Ok(data)
+    Ok(Some(data))
 }
 
 async fn install(db: &Database, root: &Path, source: &Path) -> Result<String> {
@@ -393,6 +477,243 @@ mod tests {
         assert!(!data.exists());
         assert!(db.get_plugins().await.unwrap().is_empty());
         assert!(source.join("witness").is_file());
+    }
+
+    #[tokio::test]
+    async fn purge_without_a_shared_root_forgets_identity_without_creating_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("plugins");
+        let source = temp.path().join("source");
+        bundle(&source, "demo");
+        let db = Database::open_in_memory().await.unwrap();
+        let activation = PluginActivation::default();
+        apply(&db, &activation, &root, Mutation::Add(&source))
+            .await
+            .unwrap();
+        apply(&db, &activation, &root, Mutation::Remove("demo"))
+            .await
+            .unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        apply(&db, &activation, &root, Mutation::Purge("demo"))
+            .await
+            .unwrap();
+        assert!(std::fs::symlink_metadata(&root).is_err());
+        assert!(db.get_plugins().await.unwrap().is_empty());
+        assert!(source.join("witness").is_file());
+    }
+
+    #[tokio::test]
+    async fn state_changes_reject_unknown_names_but_accept_retained_identities() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("plugins");
+        let db = Database::open_in_memory().await.unwrap();
+        let activation = PluginActivation::default();
+        for enabled in [true, false] {
+            let error = apply(
+                &db,
+                &activation,
+                &root,
+                Mutation::SetEnabled("unknown", enabled),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        }
+        assert!(db.get_plugins().await.unwrap().is_empty());
+        assert!(!root.exists());
+        db.record_plugin_entry("demo", &root.join("demo"), false)
+            .await
+            .unwrap();
+        for enabled in [true, false] {
+            apply(
+                &db,
+                &activation,
+                &root,
+                Mutation::SetEnabled("demo", enabled),
+            )
+            .await
+            .unwrap();
+            let rows = db.get_plugins().await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].enabled, enabled);
+            assert_eq!(rows[0].install_entry.as_deref(), root.join("demo").to_str());
+            assert_eq!(activation.snapshot().is_enabled("demo"), enabled);
+        }
+        assert!(!root.exists());
+    }
+
+    #[tokio::test]
+    async fn removal_uses_registered_entry_with_a_missing_or_invalid_manifest() {
+        for manifest in [None, Some("malformed update")] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("plugins");
+            let entry = root.join("renamed");
+            bundle(&entry, "demo");
+            let db = Database::open_in_memory().await.unwrap();
+            db.register_plugin("demo", &entry).await.unwrap();
+            match manifest {
+                None => std::fs::remove_file(entry.join("plugin.json")).unwrap(),
+                Some(contents) => std::fs::write(entry.join("plugin.json"), contents).unwrap(),
+            }
+            let data = root.join("data/demo");
+            std::fs::create_dir_all(&data).unwrap();
+            std::fs::write(data.join("state"), "retained").unwrap();
+            assert!(phoenix_plugins::scan_plugins_root(&root).is_empty());
+            let activation = PluginActivation::default();
+            let error = PluginLifecycle::mutate(
+                &db,
+                &activation,
+                &root,
+                Mutation::Remove("demo"),
+                &Reconciliation::Refuse,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.message.contains("reconciliation"));
+            assert!(entry.join("witness").is_file());
+            assert!(data.join("state").is_file());
+            apply(&db, &activation, &root, Mutation::Remove("demo"))
+                .await
+                .unwrap();
+            assert!(!entry.exists());
+            assert!(data.join("state").is_file());
+            let rows = db.get_plugins().await.unwrap();
+            assert_eq!(rows[0].install_entry.as_deref(), entry.to_str());
+            assert_eq!(rows[0].provenance, phoenix_db::PluginProvenance::Managed);
+            assert!(!rows[0].enabled);
+            assert!(!activation.snapshot().is_enabled("demo"));
+            apply(&db, &activation, &root, Mutation::Purge("demo"))
+                .await
+                .unwrap();
+            assert!(!data.exists());
+            assert!(db.get_plugins().await.unwrap().is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registered_symlink_removal_never_deletes_its_invalid_or_missing_target() {
+        for dangling in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("plugins");
+            std::fs::create_dir(&root).unwrap();
+            let target = temp.path().join("target");
+            if !dangling {
+                std::fs::create_dir(&target).unwrap();
+                std::fs::write(target.join("witness"), "safe").unwrap();
+            }
+            let entry = root.join("renamed");
+            std::os::unix::fs::symlink(&target, &entry).unwrap();
+            let db = Database::open_in_memory().await.unwrap();
+            db.register_plugin("demo", &entry).await.unwrap();
+            let activation = PluginActivation::default();
+            assert!(apply(&db, &activation, &root, Mutation::Purge("demo"))
+                .await
+                .is_err());
+            apply(&db, &activation, &root, Mutation::Remove("demo"))
+                .await
+                .unwrap();
+            assert!(std::fs::symlink_metadata(&entry).is_err());
+            assert_eq!(target.join("witness").is_file(), !dangling);
+            apply(&db, &activation, &root, Mutation::Purge("demo"))
+                .await
+                .unwrap();
+            assert!(db.get_plugins().await.unwrap().is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn purge_rejects_a_dangling_shared_root_and_retains_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("plugins");
+        std::os::unix::fs::symlink(temp.path().join("missing"), &root).unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        db.record_plugin_entry("demo", &root.join("demo"), false)
+            .await
+            .unwrap();
+        assert!(apply(
+            &db,
+            &PluginActivation::default(),
+            &root,
+            Mutation::Purge("demo")
+        )
+        .await
+        .is_err());
+        assert!(std::fs::symlink_metadata(&root)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(db.get_plugins().await.unwrap().len(), 1);
+        let nested_root = root.join("nested");
+        db.record_plugin_entry("demo", &nested_root.join("demo"), false)
+            .await
+            .unwrap();
+        assert!(apply(
+            &db,
+            &PluginActivation::default(),
+            &nested_root,
+            Mutation::Purge("demo")
+        )
+        .await
+        .is_err());
+        assert_eq!(db.get_plugins().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stored_paths_outside_immediate_plugin_children_cannot_authorize_removal_or_purge() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("plugins");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("witness"), "safe").unwrap();
+        let data = root.join("data/demo");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("state"), "retained").unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        for entry in [
+            outside.clone(),
+            outside.join("missing"),
+            root.clone(),
+            root.join("data"),
+            root.join("data/demo"),
+            root.join("../outside"),
+        ] {
+            db.register_plugin("demo", &entry).await.unwrap();
+            for operation in [Mutation::Remove("demo"), Mutation::Purge("demo")] {
+                let error = apply(&db, &PluginActivation::default(), &root, operation)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+                assert!(outside.join("witness").is_file());
+                assert!(data.join("state").is_file());
+                assert!(db.get_plugins().await.unwrap()[0].enabled);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn removal_prefers_the_selected_valid_entry_over_registered_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("plugins");
+        let selected = root.join("a-selected");
+        let registered = root.join("z-registered");
+        bundle(&selected, "demo");
+        bundle(&registered, "demo");
+        let db = Database::open_in_memory().await.unwrap();
+        db.register_plugin("demo", &registered).await.unwrap();
+        apply(
+            &db,
+            &PluginActivation::default(),
+            &root,
+            Mutation::Remove("demo"),
+        )
+        .await
+        .unwrap();
+        assert!(!selected.exists());
+        assert!(registered.join("witness").is_file());
+        assert!(!db.get_plugins().await.unwrap()[0].enabled);
     }
 
     #[tokio::test]

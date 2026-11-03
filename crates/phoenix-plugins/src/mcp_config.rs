@@ -142,7 +142,7 @@ fn validate_stdio(name: &str, fields: &serde_json::Map<String, Value>) -> Server
     };
     // One executable token: bare name or plugin-relative `./` path.
     // Shell command lines are structurally excluded (no spaces survive).
-    if command.contains(char::is_whitespace) {
+    if command.is_empty() || command.contains(char::is_whitespace) {
         return skip(name, "stdio command must be one executable token");
     }
     if command.contains('/') && !command.starts_with("./") {
@@ -478,6 +478,27 @@ mod tests {
             r#"{"$schema": "https://agent-plugins.org/schemas/1.1.0/mcp.schema.json", "mcpServers": {"good": {"type": "streamable-http", "url": "https://example.com/mcp"}}}"#,
         );
         assert_eq!(servers.len(), 1);
+    }
+
+    #[test]
+    fn empty_stdio_command_is_skipped_without_losing_valid_sibling() {
+        let document = McpDocument::parse(
+            &serde_json::json!({
+                "$schema": MCP_SCHEMA_URL,
+                "mcpServers": {
+                    "empty": {"type": "stdio", "command": ""},
+                    "valid": {"type": "stdio", "command": "sh"}
+                }
+            })
+            .to_string(),
+            crate::manifest::MANIFEST_SCHEMA_URL,
+        )
+        .unwrap();
+        let outcomes = document.validate_servers();
+        assert!(outcomes.iter().any(|(name, outcome)| name == "empty" && matches!(outcome, ServerValidation::Skipped(failure) if failure.reason.contains("executable token"))));
+        assert!(outcomes.iter().any(
+            |(name, outcome)| name == "valid" && matches!(outcome, ServerValidation::Valid(_))
+        ));
     }
 
     #[test]

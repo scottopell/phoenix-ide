@@ -188,7 +188,10 @@ export function SettingsDropdown({
           ) : null}
           <NotificationsSection />
           <LlmLanguageSection onCloseMenu={() => setOpen(false)} />
-          <section className="settings-section"><button type="button" className="settings-inline-btn" onClick={() => { setOpen(false); navigate('/settings/slack'); }}>Slack gateway →</button></section>
+          <section className="settings-section">
+            <button type="button" className="settings-inline-btn" onClick={() => { setOpen(false); navigate('/settings/plugins'); }}>Plugins →</button>
+            <button type="button" className="settings-inline-btn" onClick={() => { setOpen(false); navigate('/settings/slack'); }}>Slack gateway →</button>
+          </section>
           <section className="settings-section">
             <button
               type="button"

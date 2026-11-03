@@ -9351,7 +9351,12 @@ fn plugin_list_entries(
     registry: &std::collections::HashMap<String, phoenix_db::PluginRecord>,
 ) -> Vec<serde_json::Value> {
     let home = tempfile::tempdir().expect("isolated status home");
-    plugin_list_entries_with_home(plugins, registry, home.path())
+    plugin_list_entries_with_user_config_keys(
+        plugins,
+        registry,
+        home.path(),
+        &std::collections::HashSet::default(),
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -9359,6 +9364,17 @@ fn plugin_list_entries_with_home(
     plugins: Vec<phoenix_plugins::ParsedPlugin>,
     registry: &std::collections::HashMap<String, phoenix_db::PluginRecord>,
     home: &std::path::Path,
+) -> Vec<serde_json::Value> {
+    let user_config_keys = crate::tools::mcp::McpClientManager::user_config_keys();
+    plugin_list_entries_with_user_config_keys(plugins, registry, home, &user_config_keys)
+}
+
+#[allow(clippy::too_many_lines)]
+fn plugin_list_entries_with_user_config_keys(
+    plugins: Vec<phoenix_plugins::ParsedPlugin>,
+    registry: &std::collections::HashMap<String, phoenix_db::PluginRecord>,
+    home: &std::path::Path,
+    user_config_keys: &std::collections::HashSet<String>,
 ) -> Vec<serde_json::Value> {
     let activation = phoenix_core::plugin_activation::PluginActivation::default();
     activation.publish(
@@ -9381,7 +9397,12 @@ fn plugin_list_entries_with_home(
     for plugin in plugins {
         seen.insert(plugin.manifest.name.clone());
         let record = registry.get(&plugin.manifest.name);
-        let managed = record.is_some_and(|r| r.provenance == phoenix_db::PluginProvenance::Managed);
+        let managed = record.is_some_and(|r| {
+            r.provenance == phoenix_db::PluginProvenance::Managed
+                && r.install_entry
+                    .as_deref()
+                    .is_some_and(|entry| std::path::Path::new(entry) == plugin.entry_dir)
+        });
         let enabled = record.is_none_or(|r| r.enabled);
         let mut skills: Vec<_> = plugin
             .skipped_skills
@@ -9406,12 +9427,16 @@ fn plugin_list_entries_with_home(
                 .entry_dir
                 .parent()
                 .expect("plugin directory has a parent");
-            crate::tools::mcp::McpClientManager::plugin_server_outcomes(&plugin, plugins_root)
-                .into_iter()
-                .map(|(name, outcome)| {
-                    PluginComponentStatus::from_validation(name, outcome.map(|_| ()), true)
-                })
-                .collect()
+            crate::tools::mcp::McpClientManager::plugin_server_outcomes_with_user_config_keys(
+                &plugin,
+                plugins_root,
+                user_config_keys,
+            )
+            .into_iter()
+            .map(|(name, outcome)| {
+                PluginComponentStatus::from_validation(name, outcome.map(|_| ()), true)
+            })
+            .collect()
         } else {
             plugin
                 .skipped_servers
@@ -22265,6 +22290,49 @@ mod plugin_api_tests {
     fn write(path: &std::path::Path, text: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn selected_entry_provenance_and_user_server_collision_are_truthful() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".agents/plugins");
+        for entry in ["a-external", "z-managed"] {
+            write(
+                &root.join(entry).join("plugin.json"),
+                &serde_json::json!({
+                    "$schema": phoenix_plugins::manifest::MANIFEST_SCHEMA_URL, "name": "demo"
+                })
+                .to_string(),
+            );
+            write(&root.join(entry).join("mcp.json"), &serde_json::json!({
+                "$schema": phoenix_plugins::mcp_config::MCP_SCHEMA_URL,
+                "mcpServers": {"api": {"type": "streamable-http", "url": "https://example.com/mcp"}}
+            }).to_string());
+        }
+        let mut owned = record("demo", true, true);
+        owned.install_entry = Some(root.join("z-managed").to_string_lossy().into_owned());
+        let registry = HashMap::from([("demo".into(), owned)]);
+        let entries = super::plugin_list_entries_with_user_config_keys(
+            phoenix_plugins::scan_plugins_root(&root),
+            &registry,
+            home.path(),
+            &std::collections::HashSet::from(["demo.api".into()]),
+        );
+        assert_eq!(entries[0]["provenance"], "unmanaged");
+        assert_eq!(entries[0]["mcp_servers"][0]["status"], "skipped");
+        assert!(entries[0]["mcp_servers"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("shadowed"));
+        std::fs::remove_dir_all(root.join("a-external")).unwrap();
+        let entries = super::plugin_list_entries_with_user_config_keys(
+            phoenix_plugins::scan_plugins_root(&root),
+            &registry,
+            home.path(),
+            &std::collections::HashSet::default(),
+        );
+        assert_eq!(entries[0]["provenance"], "managed");
+        assert_eq!(entries[0]["mcp_servers"][0]["status"], "loaded");
     }
 
     #[test]
