@@ -142,6 +142,9 @@ that component type for that plugin and continue loading the other type
 Present special files (including FIFOs, sockets, and devices) at fixed
 component locations SHALL be reported as invalid filesystem kinds, not
 silently treated as absent components.
+The same distinction SHALL apply to an immediate skill's `SKILL.md`: a
+present non-regular or unreadable entry SHALL be reported as skipped, while
+only genuine absence means that the directory is not a skill.
 
 WHERE a skill's `SKILL.md` is invalid or escapes the plugin root THE SYSTEM
 SHALL skip that skill, report at `warn` level, and continue sibling skills
@@ -210,6 +213,11 @@ THE SYSTEM SHALL key each enabled plugin's MCP servers as
 `<plugin>.<server>` and merge them into the MCP configuration after every
 user configuration file, preserving the first-seen-wins merge so user
 configuration always wins a name collision
+Server identifiers containing the client's reserved `__` tool separator
+SHALL be skipped with a capability diagnostic before tool advertisement.
+Bare stdio commands SHALL NOT contain POSIX/Windows path separators or
+Windows drive/stream syntax. Such paths require the supported `./` form
+and plugin-root containment validation.
 When distinct plugin/server pairs produce the same qualified key, THE SYSTEM
 SHALL admit only the first eligible contribution in discovery order and
 report later contributions as skipped with a collision reason. Status and
@@ -393,6 +401,11 @@ or unknown entry location SHALL NOT establish absence. Purge SHALL delete
 data before forgetting the identity, and SHALL retain the identity on failure.
 The trusted user-level root MAY be a symlink alias; data entries below its
 canonical target SHALL NOT traverse symlinks during destructive operations.
+Purge deletion SHALL be relative to bound no-follow directory handles for
+the checked data root and target. Replacing a pathname with an intermediate
+symlink after validation SHALL NOT redirect recursive deletion. Descendant
+directory opens SHALL remain no-follow; child symlinks may be unlinked but
+SHALL NOT be traversed.
 A genuinely absent shared plugins root SHALL count as already-absent data,
 without recreating the root. A dangling root or ancestor symlink SHALL NOT
 establish absence. Successful purge SHALL still forget retained identity.

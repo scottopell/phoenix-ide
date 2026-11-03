@@ -268,6 +268,9 @@ surface PluginControl {
 --   within root after resolving existing symlink ancestors.
 --   cwd_resolved and command_resolved retain the exact resolved target that
 --   passed containment; they never return an unresolved symlink expression.
+--   Bare commands exclude Windows separators and drive/stream syntax.
+--   A server key containing the reserved __ tool delimiter is ineligible;
+--   it is reported as skipped rather than advertised under an ambiguous name.
 -- expand_args(args, root, data): expand_placeholders on each argument.
 -- install_succeeded(source): complete exclusive publication and successful
 --   managed/enabled registry registration, not merely a successful copy.
@@ -509,8 +512,11 @@ rule PluginDataPurged {
         -- user root; reject symlinks below that boundary. Disable, refresh
         -- and reconcile before destructive deletion. Recheck entry and
         -- same-name package absence after reconciliation; preserve restored
-        -- packages' data and registry identity on failure. Delete data before
-        -- forgetting the registry identity. On either failure retain identity
+        -- packages' data and registry identity on failure. Bind no-follow
+        -- directory handles for the checked data root and target; traversal
+        -- and unlinking stay relative to those handles, never a re-resolved
+        -- pathname. Child symlinks are unlinked, not followed. Delete data
+        -- before forgetting the registry identity. On either failure retain identity
         -- and report failure; no crash recovery or rollback is promised.
         -- A genuinely absent trusted root has no data to delete; do not
         -- recreate it. Dangling root or ancestor symlinks do not prove absence.

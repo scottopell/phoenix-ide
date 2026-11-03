@@ -196,6 +196,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [219](219_plugin-removal-revalidates-entry-identity-and-retains-native-paths.md) | Plugin removal revalidates entry identity and retains native paths | Accepted | REQ-AP-006/009/010 |
 | [220](220_plugin-process-values-remain-native-through-spawn.md) | Plugin process values remain native through spawn | Accepted | REQ-AP-006/009, REQ-MCP-003 |
 | [221](221_plugin-failures-and-status-use-explicit-source-scope.md) | Plugin failures and status use explicit source scope | Accepted | REQ-AP-006/009/010, REQ-MCP-015 |
+| [222](222_plugin-data-purge-uses-no-follow-directory-capabilities.md) | Plugin data purge uses no-follow directory capabilities | Accepted | REQ-AP-006/007/009/010 |
 | [149](149_selective-coordinator-checkins.md) | Selective coordinator check-ins and attention-first briefings | Accepted | REQ-GR-011 |
 | [150](150_concrete-coordinator-reporting-and-blocker-recovery.md) | Concrete Coordinator reporting and blocked-work recovery | Accepted | REQ-GR-011 |
 | [148](148_qualify-exact-ordinary-launchd-source129-to-target131.md) | Qualify exact ordinary launchd source 129 to target 131 | Accepted | REQ-COMP-019, REQ-LDD-023/028 |

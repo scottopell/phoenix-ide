@@ -23,7 +23,7 @@ and passing CI do not imply merge, deployment, or full browser/runtime acceptanc
 | REQ-AP-006 | Native OS command/argument/env values through spawn/respawn; one-pass expansion; approved resolved cwd; writable data probe; origin-confined HTTP redirects; unsupported plugin Authorization headers are skipped |
 | REQ-AP-007 | Existing symlink ancestors resolved even for missing descendants; package execution and client-owned data boundaries remain separate |
 | REQ-AP-008 | SQLite authority plus one instance activation snapshot; failed initial read excludes plugins, failed refresh preserves last-good state; serialized capture/reconciliation; exact failure owners, not dotted-prefix inference |
-| REQ-AP-009 | Exclusive staged add, Git-supported source forms, entry-safe remove, retained disabled identity, lossless native BLOB paths; identity/absence rechecks after teardown preserve replacements and restored packages |
+| REQ-AP-009 | Exclusive staged add, Git-supported source forms, entry-safe remove, retained disabled identity, lossless native BLOB paths; bound no-follow data handles and late identity/absence checks preserve outside data, replacements and restored packages |
 | REQ-AP-010 | Structured global admission outcomes; user/cross-plugin collision reasons; source-owned errors; target missingness separate from present/absent/unknown entry state; settings navigation and retained controls |
 | REQ-AP-011 | Extension namespaces remain inert |
 | REQ-AP-012 | Exact 1.1.0 schema recognition; incompatible MCP document disables only that component |
@@ -42,8 +42,11 @@ belongs to the selected installation entry, not every same-name sibling.
 
 The hosted CI workflow passed on `b67ec1d48` and earlier repair checkpoints.
 Later review edits require their own exact-head run; do not substitute those
-older green results. Current focused evidence: 41 loader, 212 MCP, 66 skills,
-46 macOS runtime/API and 17 Python client tests; strict clippy, workspace compile,
+older green results. The next hosted run failed one browser-CLI test: its TCP
+fixture did not establish an actual HTTP request. That fixture was corrected
+without extending budgets; three focused runs and the full 37-test local browser
+module pass. Current focused evidence includes 43 loader, 212 MCP, 66 skills,
+48 macOS runtime/API and 17 Python client tests; strict clippy, workspace compile,
 and UI/spec/structural checks. Suite totals include existing tests.
 
 Linux tests cover raw-name filesystem lifecycle and bundled executable launch;
@@ -71,8 +74,9 @@ ADRs [216](../adrs/216_agent-plugins-are-user-level-shared-root-namespaced-bundl
 [217](../adrs/217_plugin-lifecycle-separates-installation-ownership-from-activation.md),
 [218](../adrs/218_mcp-redirects-preserve-origin-and-reload-capture-is-serialized.md),
 [219](../adrs/219_plugin-removal-revalidates-entry-identity-and-retains-native-paths.md),
-[220](../adrs/220_plugin-process-values-remain-native-through-spawn.md), and
-[221](../adrs/221_plugin-failures-and-status-use-explicit-source-scope.md) record
-the decisions. Skill precedence/advertisement and MCP transport/reconciliation
+[220](../adrs/220_plugin-process-values-remain-native-through-spawn.md),
+[221](../adrs/221_plugin-failures-and-status-use-explicit-source-scope.md), and
+[222](../adrs/222_plugin-data-purge-uses-no-follow-directory-capabilities.md)
+record the decisions. Skill precedence/advertisement and MCP transport/reconciliation
 contracts remain in `specs/skills/` and `specs/mcp/`; compatibility policy remains
 in `specs/compatibility/`.

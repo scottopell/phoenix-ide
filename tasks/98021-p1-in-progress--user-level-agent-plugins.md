@@ -1,5 +1,28 @@
 # User-Level Agent Plugins (Agent Plugins Spec 1.1.0)
 
+## FD-bound purge and final CI fixture repair — 2026-11-03
+
+Run 41700513114 failed one real-browser CLI test at its 20-second socket read.
+The fixture considered bare TCP acceptance a navigation boundary and did not
+consume HTTP headers. It now waits for the actual complete root GET, deliberately
+includes an idle preconnection, and keeps all idle/operation budgets unchanged.
+Three focused real-Chrome runs and the full 37-test local integration module
+pass. The first local full-module attempt lacked PHOENIX_CHROME_EXECUTABLE;
+rerunning with the same explicit executable configuration as CI passed.
+
+Four newer review threads are fixed: purge now consumes a no-follow directory
+capability instead of re-resolving a checked pathname; bare commands reject
+Windows path syntax; server IDs containing the reserved __ tool delimiter are
+skipped; and present non-regular SKILL.md entries receive skipped diagnostics.
+Descriptor-relative traversal is iterative, unlinks but never follows child
+symlinks, and checks directory identity before unlinking. Controlled swaps of
+the data root and target preserve outside witnesses. ADR-222 records the bounds.
+
+Local verification: loader 43, macOS plugin runtime/API 48, browser CLI module 37;
+strict all-target clippy passes. Earlier MCP 212, skills 66, Python 17 and UI/spec
+results remain supporting evidence. The new head still needs hosted CI; the
+failed prior run is not called green or ignored. No merge or deployment occurs.
+
 ## Exact ownership and global-status review — 2026-11-03
 
 Hosted CI passed on `b67ec1d48`:
