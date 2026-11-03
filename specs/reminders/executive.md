@@ -29,8 +29,9 @@ reminder data without granting new human authority.
 
 Upcoming/due HTTP and UI views and connected-browser notifications are implemented.
 The owner view and immutable due cards read saved state independently of model
-responses. Integrated browser journey validation and adversarial review remain
-pending; deployment and device acceptance are not claimed.
+responses. The native/API restart journey and desktop/narrow browser journey pass;
+complete project checks and adversarial review remain pending. Deployment and
+device acceptance are not claimed.
 
 ## Coverage
 
@@ -41,7 +42,7 @@ pending; deployment and device acceptance are not claimed.
 | REQ-REM-004, REQ-REM-006 due commitment and management | Storage implemented | Atomic due/cancel/reschedule transactions; schema-enforced immutable terminal rows |
 | REQ-REM-005 ordinary input admission | Implemented | Existing worker and real Send Chat service; direct, steering, refusal/readiness, continuation, removed queue identity and stopped accepted-turn coverage |
 | REQ-REM-007 restart recovery | Storage implemented | File-backed reopen and late-discovery regression authored |
-| REQ-REM-008 visible reminder and provenance | Implemented; integrated QA pending | Scheduled provenance, canonical reminder API/cards, saved-zone management and global connected-browser notifications; focused component/policy tests |
+| REQ-REM-008 visible reminder and provenance | Implemented; browser journey qualified | Scheduled provenance, canonical reminder API/cards, saved-zone management and global connected-browser notifications; focused component/policy tests and desktop/narrow browser QA |
 | REQ-REM-009 lifecycle boundary | Storage implemented | Existing ProductConversation admission; ordinary owner FKs; no Close participant |
 
 Focused storage validation passes 16 tests covering replay/conflict, owner and
@@ -79,4 +80,27 @@ The authenticated HTTP surface provides `GET /api/conversations/:id/reminders`, 
 
 The conversation panel displays saved-zone exact times, immutable due cards and scheduled-only management. Editing retains the opening revision; validation exposes IANA zone and optional UTC offset, and conflicts reload current state. Abortable non-overlapping polling refreshes at five seconds and on visibility/focus/network return. Browser alerts use the existing notification store/policy, a server-persisted `notify_reminder` key defaulting enabled, an initially quiet baseline and independent per-reminder dedupe. This does not provide closed-app phone notifications.
 
-Focused API, persistence, component, policy, navigation and stale-refresh regressions accompany this slice. Parent integration QA, broad checks and adversarial review remain pending; this slice alone is not a complete user-journey acceptance claim.
+Focused API, persistence, component, policy, navigation and stale-refresh regressions accompany this slice. Integrated API/browser journey validation passes; broad checks and adversarial review remain pending.
+
+## API journey qualification
+
+The isolated real-binary `tests/e2e/run.py --scenario reminders` journey passes.
+An opt-in mock provider calls the native tool with production invocation identity;
+the test verifies the committed receipt and upcoming HTTP record, restarts the
+server before due, reschedules through HTTP, observes the due fact and a normal
+model follow-up with scheduled provenance, then reconnects and restarts after
+acceptance without creating another input. It also covers stale-revision and
+wrong-owner management failures and cancellation through the real routes.
+All 18 mock-provider tests, 46 E2E harness self-tests, seven panel tests, reminder
+CSS lint and the production frontend build pass.
+
+Chrome browser QA observed the upcoming card and reschedule form. Its desktop
+screenshot exposed native button styling; reminder controls now use the
+application's theme variables and focus styles. A parent-agent pass through the
+in-app browser verified real rescheduling with America/New_York, cancellation,
+immutable due-card visibility, the scheduled input label and ordinary model
+follow-up. At 393×852 the panel was within the viewport (x=16, width=361,
+document width=393). Native date-field keyboard editing worked; earlier CLI
+fill/capture/resize attempts were inconclusive. Notification permission delivery
+and physical devices were not exercised. The complete project check and
+independent adversarial review remain pending. No deployment was performed.
