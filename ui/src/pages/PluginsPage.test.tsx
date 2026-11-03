@@ -1,5 +1,5 @@
-import { render, screen, waitFor } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PluginStatus, PluginsListResponse } from '../api';
 
 const { apiMock } = vi.hoisted(() => ({
@@ -27,6 +27,23 @@ function listResponse(plugins: PluginStatus[]): PluginsListResponse {
 }
 
 describe('PluginsPage', () => {
+  beforeEach(() => vi.resetAllMocks());
+
+  it('enables and disables a retained missing identity while keeping purge available', async () => {
+    const missing: PluginStatus = { name: 'retained', enabled: false, provenance: 'managed', missing: true };
+    apiMock.getPlugins.mockResolvedValueOnce(listResponse([missing]))
+      .mockResolvedValueOnce(listResponse([{ ...missing, enabled: true }]))
+      .mockResolvedValueOnce(listResponse([missing]));
+    apiMock.setPluginEnabled.mockResolvedValue({ ok: true });
+    render(<PluginsPage />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Enable' }));
+    await waitFor(() => expect(apiMock.setPluginEnabled).toHaveBeenCalledWith('retained', true));
+    fireEvent.click(await screen.findByRole('button', { name: 'Disable' }));
+    await waitFor(() => expect(apiMock.setPluginEnabled).toHaveBeenCalledWith('retained', false));
+    await screen.findByRole('button', { name: 'Enable' });
+    expect(screen.getByRole('button', { name: 'Purge data' })).toBeInTheDocument();
+  });
+
   it('renders installed plugins with status, provenance, and counts', async () => {
     apiMock.getPlugins.mockResolvedValue(
       listResponse([
@@ -62,10 +79,10 @@ describe('PluginsPage', () => {
     expect(document.querySelectorAll('.plugins-page__provenance')).toHaveLength(3);
     expect(document.querySelector('.plugins-page__provenance--managed')).not.toBeNull();
     expect(document.querySelector('.plugins-page__provenance--unmanaged')).not.toBeNull();
-    // Missing roots offer only the purge action.
+    // Missing identities retain activation controls alongside purge.
     expect(screen.getByText('Purge data')).toBeInTheDocument();
     expect(screen.getByText('Disable')).toBeInTheDocument();
-    expect(screen.getByText('Enable')).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: 'Enable' })).toHaveLength(2);
   });
 
   it('counts only admitted components and shows skip and disable reasons', async () => {

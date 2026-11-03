@@ -184,16 +184,19 @@ fn load_skills(loaded: &mut ParsedPlugin) {
         tracing::warn!(plugin = %loaded.manifest.name, "skills location escapes plugin root");
         return;
     }
-    if skills_path.is_file() {
-        loaded.skills_disabled_reason = Some("skills location is not a directory".into());
-        tracing::warn!(
-            plugin = %loaded.manifest.name,
-            "skills location is a regular file; invalidating skills component"
-        );
-        return;
-    }
-    if !skills_path.is_dir() {
-        return; // absent: valid
+    match std::fs::metadata(&skills_path) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            loaded.skills_disabled_reason = Some("skills location is not a directory".into());
+            tracing::warn!(plugin = %loaded.manifest.name, "skills location has invalid filesystem kind");
+            return;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            loaded.skills_disabled_reason = Some(format!("skills metadata unreadable: {error}"));
+            tracing::warn!(plugin = %loaded.manifest.name, %error, "skills metadata unreadable");
+            return;
+        }
     }
     let Ok(entries) = std::fs::read_dir(&skills_path) else {
         loaded.skills_disabled_reason = Some("skills location unreadable".into());
@@ -250,16 +253,19 @@ fn load_mcp(loaded: &mut ParsedPlugin) {
         loaded.mcp_disabled_reason = Some(reason);
         return;
     }
-    if mcp_path.is_dir() {
-        loaded.mcp_disabled_reason = Some("mcp.json location is a directory".to_string());
-        tracing::warn!(
-            plugin = %loaded.manifest.name,
-            "mcp.json location is a directory; disabling plugin MCP"
-        );
-        return;
-    }
-    if !mcp_path.is_file() {
-        return; // absent: valid
+    match std::fs::metadata(&mcp_path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            loaded.mcp_disabled_reason = Some("mcp.json location is not a regular file".into());
+            tracing::warn!(plugin = %loaded.manifest.name, "mcp.json has invalid filesystem kind");
+            return;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            loaded.mcp_disabled_reason = Some(format!("mcp.json metadata unreadable: {error}"));
+            tracing::warn!(plugin = %loaded.manifest.name, %error, "mcp.json metadata unreadable");
+            return;
+        }
     }
 
     let content = match std::fs::read_to_string(&mcp_path) {
@@ -300,6 +306,41 @@ fn load_mcp(loaded: &mut ParsedPlugin) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn present_fifo_components_report_wrong_kind_instead_of_absence() {
+        for location in ["skills", "mcp.json"] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                temp.path().join("plugin.json"),
+                serde_json::json!({
+                    "$schema": manifest::MANIFEST_SCHEMA_URL, "name": "demo"
+                })
+                .to_string(),
+            )
+            .unwrap();
+            assert!(std::process::Command::new("mkfifo")
+                .arg(temp.path().join(location))
+                .status()
+                .unwrap()
+                .success());
+            let plugin = load_plugin(temp.path()).unwrap();
+            if location == "skills" {
+                assert!(plugin
+                    .skills_disabled_reason
+                    .unwrap()
+                    .contains("not a directory"));
+                assert!(plugin.mcp_disabled_reason.is_none());
+            } else {
+                assert!(plugin
+                    .mcp_disabled_reason
+                    .unwrap()
+                    .contains("not a regular file"));
+                assert!(plugin.skills_disabled_reason.is_none());
+            }
+        }
+    }
 
     #[test]
     #[cfg(unix)]

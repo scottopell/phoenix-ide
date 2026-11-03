@@ -1918,7 +1918,7 @@ mod epoch_tests {
 
     fn stdio_config() -> McpServerConfig {
         McpServerConfig::Stdio {
-            command: "test".to_string(),
+            command: "test".into(),
             args: Vec::new(),
             env: HashMap::new(),
             cwd: None,

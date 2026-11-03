@@ -65,6 +65,8 @@ enum Reconciliation<'a> {
     Refuse,
     #[cfg(test)]
     SwapEntry(&'a Path, &'a Path, &'a str),
+    #[cfg(test)]
+    RestoreEntry(&'a Path),
 }
 
 impl Reconciliation<'_> {
@@ -92,6 +94,18 @@ impl Reconciliation<'_> {
             Self::Offline => Ok(()),
             #[cfg(test)]
             Self::Refuse => Err(LifecycleError::internal(&"reconciliation refused")),
+            #[cfg(test)]
+            Self::RestoreEntry(entry) => {
+                std::fs::create_dir_all(entry).map_err(|error| LifecycleError::internal(&error))?;
+                std::fs::write(
+                    entry.join("plugin.json"),
+                    serde_json::json!({
+                        "$schema": phoenix_plugins::manifest::MANIFEST_SCHEMA_URL, "name": "demo"
+                    })
+                    .to_string(),
+                )
+                .map_err(|error| LifecycleError::internal(&error))
+            }
             #[cfg(test)]
             Self::SwapEntry(entry, backup, name) => {
                 std::fs::rename(entry, backup).map_err(|error| LifecycleError::internal(&error))?;
@@ -204,24 +218,7 @@ impl PluginLifecycle {
                         "installation entry is unknown; cannot prove plugin absence",
                     )
                 })?;
-                let entry = validated_install_entry(root, entry)?;
-                match std::fs::symlink_metadata(&entry) {
-                    Ok(_) => {
-                        return Err(LifecycleError::bad(
-                            "installation entry still exists; remove it before purging data",
-                        ));
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(LifecycleError::internal(&error)),
-                }
-                if phoenix_plugins::scan_plugins_root(root)
-                    .iter()
-                    .any(|plugin| plugin.manifest.name == name.0)
-                {
-                    return Err(LifecycleError::bad(
-                        "remove the installed plugin before purging data",
-                    ));
-                }
+                verify_purge_absence(root, entry, name.0)?;
                 db.set_plugin_enabled(name.0, false)
                     .await
                     .map_err(|error| LifecycleError::internal(&error))?;
@@ -229,6 +226,7 @@ impl PluginLifecycle {
                     .await
                     .map_err(|error| LifecycleError::internal(&error))?;
                 reconciliation.apply(name.0).await?;
+                verify_purge_absence(root, entry, name.0)?;
                 if let Some(data) = owned_data_dir(root, &name)? {
                     match std::fs::remove_dir_all(&data) {
                         Ok(()) => {}
@@ -266,6 +264,28 @@ async fn removal_entry(db: &Database, root: &Path, name: &PluginName<'_>) -> Res
             .ok_or_else(|| LifecycleError::bad("plugin is not installed"))?,
     };
     validated_install_entry(root, &entry)
+}
+
+fn verify_purge_absence(root: &Path, entry: &Path, name: &str) -> Result<()> {
+    let entry = validated_install_entry(root, entry)?;
+    match std::fs::symlink_metadata(&entry) {
+        Ok(_) => {
+            return Err(LifecycleError::bad(
+                "installation entry still exists; remove it before purging data",
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(LifecycleError::internal(&error)),
+    }
+    if phoenix_plugins::scan_plugins_root(root)
+        .iter()
+        .any(|plugin| plugin.manifest.name == name)
+    {
+        return Err(LifecycleError::bad(
+            "remove the installed plugin before purging data",
+        ));
+    }
+    Ok(())
 }
 
 struct ObservedRemoval {
@@ -557,6 +577,35 @@ mod tests {
         assert!(std::fs::symlink_metadata(&root).is_err());
         assert!(db.get_plugins().await.unwrap().is_empty());
         assert!(source.join("witness").is_file());
+    }
+
+    #[tokio::test]
+    async fn purge_preserves_data_when_a_package_is_restored_during_reconciliation() {
+        for restored in ["demo", "new-entry"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("plugins");
+            let entry = root.join("demo");
+            let data = root.join("data/demo");
+            std::fs::create_dir_all(&data).unwrap();
+            std::fs::write(data.join("witness"), "retain").unwrap();
+            let db = Database::open_in_memory().await.unwrap();
+            db.register_plugin("demo", &entry).await.unwrap();
+            let activation = PluginActivation::default();
+            let restored_entry = root.join(restored);
+            let error = PluginLifecycle::mutate(
+                &db,
+                &activation,
+                &root,
+                Mutation::Purge("demo"),
+                &Reconciliation::RestoreEntry(&restored_entry),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.message.contains("purging data"));
+            assert!(data.join("witness").is_file());
+            assert!(restored_entry.join("plugin.json").is_file());
+            assert_eq!(db.get_plugins().await.unwrap().len(), 1);
+        }
     }
 
     #[cfg(unix)]

@@ -40,9 +40,9 @@ impl StdioTransport {
     #[allow(clippy::unused_async)] // async block inside spawns a task; keeping async for API consistency
     pub async fn spawn(
         name: &str,
-        command: &str,
-        args: &[String],
-        env: &HashMap<String, String>,
+        command: impl AsRef<std::ffi::OsStr>,
+        args: &[std::ffi::OsString],
+        env: &HashMap<std::ffi::OsString, std::ffi::OsString>,
         cwd: Option<&Path>,
         pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
     ) -> Result<Self, String> {
@@ -365,7 +365,7 @@ mod tests {
         let transport = StdioTransport::spawn(
             "sleeping",
             "/bin/sh",
-            &["-c".to_string(), "sleep 30".to_string()],
+            &["-c".into(), "sleep 30".into()],
             &HashMap::new(),
             None,
             Arc::new(RwLock::new(HashMap::new())),

@@ -6,6 +6,7 @@
 //! configuration — or the reason the server must be skipped.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 use crate::mcp_config::ServerSpec;
@@ -15,25 +16,25 @@ use crate::mcp_config::ServerSpec;
 /// so a root or data directory that itself contains a placeholder spelling
 /// cannot be re-expanded. Other placeholder-like text stays literal.
 #[must_use]
-pub fn expand_placeholders(text: &str, plugin_root: &Path, data_dir: &Path) -> String {
+pub fn expand_placeholders(text: &str, plugin_root: &Path, data_dir: &Path) -> OsString {
     const ROOT_TOKEN: &str = "${PLUGIN_ROOT}";
     const DATA_TOKEN: &str = "${PLUGIN_DATA}";
-    let root_value = plugin_root.to_string_lossy();
-    let data_value = data_dir.to_string_lossy();
+    let root_value = plugin_root.as_os_str();
+    let data_value = data_dir.as_os_str();
 
-    let mut out = String::with_capacity(text.len());
+    let mut out = OsString::with_capacity(text.len());
     let mut rest = text;
     while let Some(hit) = find_first(rest, ROOT_TOKEN, DATA_TOKEN) {
         let (before, token_and_after) = rest.split_at(hit.offset);
-        out.push_str(before);
-        out.push_str(if hit.token == ROOT_TOKEN {
-            root_value.as_ref()
+        out.push(before);
+        out.push(if hit.token == ROOT_TOKEN {
+            root_value
         } else {
-            data_value.as_ref()
+            data_value
         });
         rest = token_and_after.split_at(hit.token.len()).1;
     }
-    out.push_str(rest);
+    out.push(rest);
     out
 }
 
@@ -62,10 +63,10 @@ pub enum ResolvedCommand {
 
 impl ResolvedCommand {
     #[must_use]
-    pub fn into_spawn_command(self) -> String {
+    pub fn into_spawn_command(self) -> OsString {
         match self {
-            Self::PathLookup(name) => name,
-            Self::PackagePath(path) => path.to_string_lossy().into_owned(),
+            Self::PathLookup(name) => name.into(),
+            Self::PackagePath(path) => path.into_os_string(),
         }
     }
 }
@@ -74,10 +75,10 @@ impl ResolvedCommand {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedStdio {
     pub command: ResolvedCommand,
-    pub args: Vec<String>,
+    pub args: Vec<OsString>,
     /// The complete environment: base, configured overlay, client-owned
     /// `PLUGIN_ROOT`/`PLUGIN_DATA` set last.
-    pub env: BTreeMap<String, String>,
+    pub env: BTreeMap<OsString, OsString>,
     /// Absolute working directory, guaranteed inside its boundary.
     pub cwd: PathBuf,
 }
@@ -111,28 +112,31 @@ pub fn resolved_environment(
 
     // Expansion applies to each args element, each env value, and cwd —
     // never to command or env keys.
-    let expanded_args: Vec<String> = args
+    let expanded_args: Vec<OsString> = args
         .iter()
         .map(|arg| expand_placeholders(arg, plugin_root, data_dir))
         .collect();
-    let mut expanded_env: BTreeMap<String, String> = base_env.clone();
+    let mut expanded_env: BTreeMap<OsString, OsString> = base_env
+        .iter()
+        .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+        .collect();
     for (key, value) in configured {
         // Overlay replaces equivalent names under platform naming rules;
         // BTreeMap keys are the canonical form here.
         expanded_env.insert(
-            key.clone(),
+            OsString::from(key),
             expand_placeholders(value, plugin_root, data_dir),
         );
     }
     // Client-owned variables are set last and override any equivalent
     // names (validation already rejected configured PLUGIN_* declarations).
     expanded_env.insert(
-        "PLUGIN_ROOT".to_string(),
-        plugin_root.to_string_lossy().into_owned(),
+        OsString::from("PLUGIN_ROOT"),
+        plugin_root.as_os_str().to_owned(),
     );
     expanded_env.insert(
-        "PLUGIN_DATA".to_string(),
-        data_dir.to_string_lossy().into_owned(),
+        OsString::from("PLUGIN_DATA"),
+        data_dir.as_os_str().to_owned(),
     );
 
     // Working directory: default plugin root; explicit values must resolve
@@ -157,9 +161,9 @@ pub fn resolved_environment(
                     )
                 } else {
                     // `./`-relative: anchored to the plugin root.
-                    let expanded = expand_placeholders(value, plugin_root, data_dir);
-                    let relative = expanded.strip_prefix("./").unwrap_or(expanded.as_str());
-                    (plugin_root, plugin_root.join(relative))
+                    let relative = value.strip_prefix("./").unwrap_or(value);
+                    let expanded = expand_placeholders(relative, plugin_root, data_dir);
+                    (plugin_root, plugin_root.join(PathBuf::from(expanded)))
                 };
             if !within_boundary(&candidate, anchor) {
                 return Err(format!(
@@ -269,21 +273,30 @@ mod tests {
         assert_eq!(
             resolved.args,
             vec![
-                "--config".to_string(),
-                "/plugins/database-plugin/config/db.json".to_string(),
+                OsString::from("--config"),
+                OsString::from("/plugins/database-plugin/config/db.json"),
             ]
         );
         assert_eq!(
-            resolved.env.get("DATA_DIR").map(String::as_str),
+            resolved
+                .env
+                .get(std::ffi::OsStr::new("DATA_DIR"))
+                .and_then(|value| value.to_str()),
             Some("/plugins/data/database-plugin/database")
         );
         assert_eq!(resolved.cwd, root);
         assert_eq!(
-            resolved.env.get("PLUGIN_ROOT").map(String::as_str),
+            resolved
+                .env
+                .get(std::ffi::OsStr::new("PLUGIN_ROOT"))
+                .and_then(|value| value.to_str()),
             Some("/plugins/database-plugin")
         );
         assert_eq!(
-            resolved.env.get("PLUGIN_DATA").map(String::as_str),
+            resolved
+                .env
+                .get(std::ffi::OsStr::new("PLUGIN_DATA"))
+                .and_then(|value| value.to_str()),
             Some("/plugins/data/database-plugin")
         );
     }
@@ -306,6 +319,47 @@ mod tests {
         assert_eq!(tricky, "/d/${PLUGIN_ROOT}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn native_paths_survive_command_args_and_environment_expansion() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let root = PathBuf::from(OsString::from_vec(b"/root-\xff".to_vec()));
+        let data = PathBuf::from(OsString::from_vec(b"/data-\xfe".to_vec()));
+        let spec = stdio_spec(
+            vec!["${PLUGIN_ROOT}/arg"],
+            &[("EXPANDED", "${PLUGIN_DATA}/env")],
+            None,
+        );
+        let resolved = resolved_environment(&spec, &root, &data, &BTreeMap::new()).unwrap();
+        assert_eq!(resolved.args[0].as_bytes(), b"/root-\xff/arg");
+        assert_eq!(
+            resolved
+                .env
+                .get(std::ffi::OsStr::new("PLUGIN_ROOT"))
+                .unwrap()
+                .as_bytes(),
+            root.as_os_str().as_bytes()
+        );
+        assert_eq!(
+            resolved
+                .env
+                .get(std::ffi::OsStr::new("PLUGIN_DATA"))
+                .unwrap()
+                .as_bytes(),
+            data.as_os_str().as_bytes()
+        );
+        assert_eq!(
+            resolved
+                .env
+                .get(std::ffi::OsStr::new("EXPANDED"))
+                .unwrap()
+                .as_bytes(),
+            b"/data-\xfe/env"
+        );
+        let command = ResolvedCommand::PackagePath(root.join("bin/server")).into_spawn_command();
+        assert_eq!(command.as_bytes(), b"/root-\xff/bin/server");
+    }
+
     #[test]
     fn client_owned_variables_override_last() {
         let spec = stdio_spec(vec![], &[("OTHER", "v")], None);
@@ -319,7 +373,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolved.env.get("PLUGIN_ROOT").map(String::as_str),
+            resolved
+                .env
+                .get(std::ffi::OsStr::new("PLUGIN_ROOT"))
+                .and_then(|value| value.to_str()),
             Some("/real/root")
         );
     }

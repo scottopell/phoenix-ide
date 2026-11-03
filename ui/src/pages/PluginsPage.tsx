@@ -162,6 +162,13 @@ export function PluginsPage() {
                 <p className="plugins-page__mcp-disabled">MCP disabled: {plugin.mcp_disabled_reason}</p>
               ) : null}
               <div className="plugins-page__actions">
+                <button
+                  type="button"
+                  onClick={() => void toggle(plugin)}
+                  disabled={busy === plugin.name}
+                >
+                  {plugin.enabled ? 'Disable' : 'Enable'}
+                </button>
                 {plugin.missing ? (
                   <button
                     type="button"
@@ -172,13 +179,6 @@ export function PluginsPage() {
                   </button>
                 ) : (
                   <>
-                    <button
-                      type="button"
-                      onClick={() => void toggle(plugin)}
-                      disabled={busy === plugin.name}
-                    >
-                      {plugin.enabled ? 'Disable' : 'Enable'}
-                    </button>
                     {confirmingRemove === plugin.name ? (
                       <>
                         <span className="plugins-page__confirm-label">remove? data retained</span>

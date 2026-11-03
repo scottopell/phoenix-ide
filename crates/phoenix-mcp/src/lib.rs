@@ -5140,20 +5140,23 @@ impl McpClientManager {
             return None;
         };
 
-        let args: Vec<String> = cfg
+        let args: Vec<std::ffi::OsString> = cfg
             .get("args")
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
+                    .filter_map(|v| v.as_str().map(std::ffi::OsString::from))
                     .collect()
             })
             .unwrap_or_default();
 
         Some(McpServerConfig::Stdio {
-            command: command.to_string(),
+            command: command.into(),
             args,
-            env: string_map(cfg.get("env")),
+            env: string_map(cfg.get("env"))
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
             cwd: None,
             tool_call_timeout,
         })
@@ -5553,9 +5556,9 @@ pub struct McpReloadFailure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpServerConfig {
     Stdio {
-        command: String,
-        args: Vec<String>,
-        env: HashMap<String, String>,
+        command: std::ffi::OsString,
+        args: Vec<std::ffi::OsString>,
+        env: HashMap<std::ffi::OsString, std::ffi::OsString>,
         /// Working directory for the spawned server. `None` inherits the
         /// manager's cwd (user-config servers); plugin servers always carry
         /// their resolved selected-anchor cwd (specs/plugins/
@@ -5847,7 +5850,7 @@ mod tests {
             // the canonical form (macOS tempdirs resolve through /private).
             let canonical_devtools = std::fs::canonicalize(root.path().join("devtools"))
                 .unwrap_or_else(|_| root.path().join("devtools"));
-            assert!(args.contains(&format!("{}/config.json", canonical_devtools.display())));
+            assert!(args.contains(&canonical_devtools.join("config.json").into_os_string()));
             // canonicalize may differ (macOS /private), compare semantically:
             let expected_data = root
                 .path()
@@ -5857,15 +5860,16 @@ mod tests {
                 .to_string_lossy()
                 .to_string();
             assert_eq!(
-                env.get("DATA").map(String::as_str),
+                env.get(std::ffi::OsStr::new("DATA"))
+                    .and_then(|value| value.to_str()),
                 Some(expected_data.as_str())
             );
             assert!(env
-                .get("PLUGIN_ROOT")
-                .is_some_and(|v| v.contains("devtools")));
+                .get(std::ffi::OsStr::new("PLUGIN_ROOT"))
+                .is_some_and(|v| v.to_str().is_some_and(|v| v.contains("devtools"))));
             assert!(env
-                .get("PLUGIN_DATA")
-                .is_some_and(|v| v.contains("data/devtools")));
+                .get(std::ffi::OsStr::new("PLUGIN_DATA"))
+                .is_some_and(|v| v.to_str().is_some_and(|v| v.contains("data/devtools"))));
             assert!(cwd.as_ref().is_some_and(|c| c.ends_with("devtools")));
             // Create-before-launch: the data directory exists after config
             // construction.
@@ -6110,6 +6114,84 @@ mod tests {
             }
         }
 
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn bundled_plugin_executable_under_non_unicode_home_receives_exact_native_values() {
+            use std::os::unix::ffi::{OsStrExt, OsStringExt};
+            use std::os::unix::fs::PermissionsExt;
+            struct Sink;
+            impl ServerMessageSink for Sink {
+                fn on_message(&self, _message: Value) {}
+            }
+            let temp = plugin_root();
+            let root = temp
+                .path()
+                .join(std::ffi::OsString::from_vec(b"home-\xff".to_vec()));
+            let package_root = root.join("demo");
+            write(
+                &package_root.join("plugin.json"),
+                &serde_json::json!({
+                    "$schema": phoenix_plugins::manifest::MANIFEST_SCHEMA_URL, "name": "demo"
+                })
+                .to_string(),
+            );
+            write(&package_root.join("mcp.json"), &serde_json::json!({
+                "$schema": phoenix_plugins::mcp_config::MCP_SCHEMA_URL,
+                "mcpServers": {"probe": {"type": "stdio", "command": "./bin/probe", "args": ["${PLUGIN_ROOT}/arg"], "env": {"EXPANDED": "${PLUGIN_DATA}/env"}}}
+            }).to_string());
+            let executable = package_root.join("bin/probe");
+            write(&executable, "#!/bin/sh\nprintf '%s' \"$PLUGIN_ROOT\" > \"$PLUGIN_DATA/root\"\nprintf '%s' \"$PLUGIN_DATA\" > \"$PLUGIN_DATA/data\"\nprintf '%s' \"$1\" > \"$PLUGIN_DATA/arg\"\nprintf '%s' \"$EXPANDED\" > \"$PLUGIN_DATA/expanded\"\nread -r request\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'\n");
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let package = phoenix_plugins::load_plugin(&package_root).unwrap();
+            let expected_root = package.root.clone();
+            let mut outcomes = McpClientManager::plugin_server_outcomes_with_user_config_keys(
+                &package,
+                &root,
+                &HashSet::new(),
+            );
+            let McpServerConfig::Stdio {
+                command,
+                args,
+                env,
+                cwd,
+                ..
+            } = outcomes.remove(0).1.unwrap()
+            else {
+                panic!("expected stdio");
+            };
+            let transport = StdioTransport::spawn(
+                "native-probe",
+                &command,
+                &args,
+                &env,
+                cwd.as_deref(),
+                Arc::default(),
+            )
+            .await
+            .unwrap();
+            transport
+                .request(
+                    "probe",
+                    serde_json::json!({}),
+                    Duration::from_secs(30),
+                    &Sink,
+                )
+                .await
+                .unwrap();
+            let data = root.join("data/demo");
+            for (file, expected) in [
+                ("root", expected_root.clone()),
+                ("data", data.clone()),
+                ("arg", expected_root.join("arg")),
+                ("expanded", data.join("env")),
+            ] {
+                assert_eq!(
+                    std::fs::read(data.join(file)).unwrap(),
+                    expected.as_os_str().as_bytes()
+                );
+            }
+        }
+
         #[cfg(unix)]
         #[test]
         fn plugin_stdio_inherits_non_unicode_environment() {
@@ -6181,8 +6263,12 @@ mod tests {
             else {
                 panic!("expected stdio");
             };
-            assert_eq!(env.get("OVERLAY").map(String::as_str), Some("configured"));
-            assert!(!env.contains_key("PHOENIX_PLUGIN_NONUNICODE"));
+            assert_eq!(
+                env.get(std::ffi::OsStr::new("OVERLAY"))
+                    .and_then(|value| value.to_str()),
+                Some("configured")
+            );
+            assert!(!env.contains_key(std::ffi::OsStr::new("PHOENIX_PLUGIN_NONUNICODE")));
             let transport = StdioTransport::spawn(
                 "demo.probe",
                 &command,
@@ -6223,7 +6309,7 @@ mod tests {
             std::fs::create_dir_all(&plugin_home).unwrap();
             std::fs::create_dir_all(&data_home).unwrap();
 
-            let env: HashMap<String, String> = [
+            let env: HashMap<std::ffi::OsString, std::ffi::OsString> = [
                 (
                     "T".to_string(),
                     marker_dir.path().to_string_lossy().to_string(),
@@ -6238,14 +6324,15 @@ mod tests {
                 ),
             ]
             .into_iter()
+            .map(|(key, value): (String, String)| (key.into(), value.into()))
             .collect();
             let transport = StdioTransport::spawn(
                 "plugin-test",
                 "sh",
                 &[
-                    "-c".to_string(),
+                    "-c".into(),
                     "pwd > \"$T/cwd.txt\"; printf '%s\\n' \"$PLUGIN_ROOT\" > \"$T/root.txt\"; printf '%s\\n' \"$PLUGIN_DATA\" > \"$T/data.txt\"; read -r request; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'"
-                        .to_string(),
+                        .into(),
                 ],
                 &env,
                 Some(&plugin_home),
@@ -6303,9 +6390,9 @@ mod tests {
         assert_eq!(
             config,
             McpServerConfig::Stdio {
-                command: "uvx".to_string(),
-                args: vec!["server".to_string()],
-                env: HashMap::from([("KEY".to_string(), "v".to_string())]),
+                command: "uvx".into(),
+                args: vec!["server".into()],
+                env: HashMap::from([("KEY".into(), "v".into())]),
                 cwd: None,
                 tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
             }
@@ -6731,7 +6818,7 @@ mod tests {
                 }),
                 tools: Arc::new(std::sync::RwLock::new(Vec::new())),
                 config: McpServerConfig::Stdio {
-                    command: "unused".to_string(),
+                    command: "unused".into(),
                     args: Vec::new(),
                     env: HashMap::new(),
                     cwd: None,
@@ -6841,7 +6928,7 @@ mod tests {
         fake_server_with_config(
             script,
             McpServerConfig::Stdio {
-                command: "unused".to_string(),
+                command: "unused".into(),
                 args: Vec::new(),
                 env: HashMap::new(),
                 cwd: None,
@@ -7156,7 +7243,7 @@ mod tests {
         let (server, requests, _) = fake_server_with_config(
             vec![exchange(Ok(serde_json::json!({"content": []})))],
             McpServerConfig::Stdio {
-                command: "unused".to_string(),
+                command: "unused".into(),
                 args: Vec::new(),
                 env: HashMap::new(),
                 cwd: None,
@@ -7175,7 +7262,7 @@ mod tests {
     #[test]
     fn timeout_change_participates_in_reload_comparison() {
         let base = McpServerConfig::Stdio {
-            command: "unused".to_string(),
+            command: "unused".into(),
             args: Vec::new(),
             env: HashMap::new(),
             cwd: None,
@@ -7813,7 +7900,7 @@ mod tests {
 
     fn stdio_test_config(command: &str) -> McpServerConfig {
         McpServerConfig::Stdio {
-            command: command.to_string(),
+            command: command.into(),
             args: Vec::new(),
             env: HashMap::new(),
             cwd: None,
@@ -8017,13 +8104,13 @@ for line in sys.stdin:
         env_value: &str,
     ) -> McpServerConfig {
         McpServerConfig::Stdio {
-            command: std::env::var("PYTHON").unwrap_or_else(|_| "python3".to_string()),
+            command: std::env::var_os("PYTHON").unwrap_or_else(|| "python3".into()),
             args: vec![
-                script.display().to_string(),
-                marker.display().to_string(),
-                label.to_string(),
+                script.as_os_str().to_owned(),
+                marker.as_os_str().to_owned(),
+                label.into(),
             ],
-            env: HashMap::from([("MCP_TEST_VALUE".to_string(), env_value.to_string())]),
+            env: HashMap::from([("MCP_TEST_VALUE".into(), env_value.into())]),
             cwd: None,
             tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         }
@@ -8032,7 +8119,11 @@ for line in sys.stdin:
     /// Mutable access to a config's stdio fields; panics on an Http config.
     fn as_stdio_mut(
         config: &mut McpServerConfig,
-    ) -> (&mut String, &mut Vec<String>, &mut HashMap<String, String>) {
+    ) -> (
+        &mut std::ffi::OsString,
+        &mut Vec<std::ffi::OsString>,
+        &mut HashMap<std::ffi::OsString, std::ffi::OsString>,
+    ) {
         match config {
             McpServerConfig::Stdio {
                 command, args, env, ..
@@ -8077,10 +8168,13 @@ for line in sys.stdin:
         std::fs::write(&crash, "crash").unwrap();
         let mut config = fixture_config(&script, &marker, "schema-bound", "env");
         let environment = as_stdio_mut(&mut config).2;
-        environment.insert("MCP_CRASH_ONCE_FILE".into(), crash.display().to_string());
-        environment.insert("MCP_TOOL_SCHEMA_FILE".into(), schema.display().to_string());
+        environment.insert("MCP_CRASH_ONCE_FILE".into(), crash.as_os_str().to_owned());
+        environment.insert("MCP_TOOL_SCHEMA_FILE".into(), schema.as_os_str().to_owned());
         let changed = serde_json::json!({"type":"object","required":["new"]});
-        environment.insert("MCP_TOOL_SCHEMA_AFTER_CRASH".into(), changed.to_string());
+        environment.insert(
+            "MCP_TOOL_SCHEMA_AFTER_CRASH".into(),
+            changed.to_string().into(),
+        );
         let manager = Arc::new(McpClientManager::new());
         connect_fixture(&manager, &config).await;
         let error = manager
@@ -8131,8 +8225,8 @@ for line in sys.stdin:
         let manager = Arc::new(McpClientManager::new());
         let mut config = fixture_config(&script, &marker, "v1", "env1");
         as_stdio_mut(&mut config).2.insert(
-            "MCP_BLOCK_ONCE_FILE".to_string(),
-            block_once.display().to_string(),
+            "MCP_BLOCK_ONCE_FILE".into(),
+            block_once.as_os_str().to_owned(),
         );
         connect_fixture(&manager, &config).await;
 
@@ -8200,8 +8294,8 @@ for line in sys.stdin:
         let manager = Arc::new(McpClientManager::new());
         let mut config = fixture_config(&script, &marker, "v1", "env1");
         as_stdio_mut(&mut config).2.insert(
-            "MCP_CRASH_THEN_BLOCK_FILE".to_string(),
-            crash_then_block.display().to_string(),
+            "MCP_CRASH_THEN_BLOCK_FILE".into(),
+            crash_then_block.as_os_str().to_owned(),
         );
         connect_fixture(&manager, &config).await;
 
@@ -8247,7 +8341,7 @@ for line in sys.stdin:
         let mut config = fixture_config(&script, &marker, "v1", "env1");
         as_stdio_mut(&mut config)
             .2
-            .insert("MCP_BLOCK_CALL".to_string(), "1".to_string());
+            .insert("MCP_BLOCK_CALL".into(), "1".into());
         connect_fixture(&manager, &config).await;
 
         let cancel = CancellationToken::new();
@@ -8368,7 +8462,7 @@ for line in sys.stdin:
         connect_fixture(&manager, &initial).await;
 
         let mut changed = fixture_config(&script, &marker, "v1", "env1");
-        *as_stdio_mut(&mut changed).0 = tmp.path().join("missing-command").display().to_string();
+        *as_stdio_mut(&mut changed).0 = tmp.path().join("missing-command").into_os_string();
         let result = manager
             .reload_from_configs(vec![("fixture".to_string(), changed)])
             .await;
@@ -8496,8 +8590,8 @@ for line in sys.stdin:
 
         let mut changed = fixture_config(&script, &marker, "v2", "env2");
         as_stdio_mut(&mut changed).2.insert(
-            "MCP_CRASH_ONCE_FILE".to_string(),
-            crash_once.display().to_string(),
+            "MCP_CRASH_ONCE_FILE".into(),
+            crash_once.as_os_str().to_owned(),
         );
         let result = manager
             .reload_from_configs(vec![("fixture".to_string(), changed)])
@@ -8529,7 +8623,7 @@ for line in sys.stdin:
         let mut config = fixture_config(&script, &marker, "v1", "env1");
         as_stdio_mut(&mut config)
             .2
-            .insert("MCP_EMIT_PING".to_string(), "1".to_string());
+            .insert("MCP_EMIT_PING".into(), "1".into());
         connect_fixture(&manager, &config).await;
 
         // The fixture emits a server-initiated `ping` request reusing the
