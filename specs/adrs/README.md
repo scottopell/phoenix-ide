@@ -190,7 +190,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [211](211_native-continue-reuses-generated-handoff-admission.md) | Native Continue reuses generated handoff admission | Accepted | REQ-GR-007/019, REQ-BED-020/021/020b/030 |
 | [209](209_native-automatic-continuation-is-preference-only.md) | Native automatic continuation is preference-only | Accepted | REQ-GR-007/020, REQ-BED-020, REQ-API-029 |
 | [192](192_goal-admission-requires-explicit-auto-continue.md) | Goal admission requires explicit automatic continuation | Accepted | REQ-GOAL-AC-001–004 |
-| [216](216_agent-plugins-are-user-level-shared-root-namespaced-bundles.md) | Agent plugins are user-level-only, shared-root, namespaced bundles | Accepted | REQ-AP-001 through REQ-AP-012 |
+| [223](223_agent-plugins-are-user-level-shared-root-namespaced-bundles.md) | Agent plugins are user-level-only, shared-root, namespaced bundles | Accepted | REQ-AP-001 through REQ-AP-012 |
 | [217](217_plugin-lifecycle-separates-installation-ownership-from-activation.md) | Plugin lifecycle separates installation ownership from activation | Accepted | REQ-AP-002, REQ-AP-007 through REQ-AP-010 |
 | [218](218_mcp-redirects-preserve-origin-and-reload-capture-is-serialized.md) | MCP redirects preserve origin and reload capture is serialized | Accepted | REQ-MCP-004/015, REQ-AP-006/008 |
 | [219](219_plugin-removal-revalidates-entry-identity-and-retains-native-paths.md) | Plugin removal revalidates entry identity and retains native paths | Accepted | REQ-AP-006/009/010 |
@@ -397,4 +397,4 @@ Goals schema extraction and refusal of unsupported migration lineages are govern
 
 Goal admission requires explicit automatic continuation without locking existing Goal management or the OFF gesture: [192](192_goal-admission-requires-explicit-auto-continue.md), implementing REQ-GOAL-AC-001–004.
 
-User-level agent plugins (Agent Plugins specification 1.1.0) are governed by [ADR-216](216_agent-plugins-are-user-level-shared-root-namespaced-bundles.md): user-level-only shared install root, `plugin:skill` / `<plugin>.<server>` namespacing, and data retention on uninstall.
+User-level agent plugins (Agent Plugins specification 1.1.0) are governed by [ADR-223](223_agent-plugins-are-user-level-shared-root-namespaced-bundles.md): user-level-only shared install root, `plugin:skill` / `<plugin>.<server>` namespacing, and data retention on uninstall.

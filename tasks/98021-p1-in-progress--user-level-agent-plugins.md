@@ -1,5 +1,19 @@
 # User-Level Agent Plugins (Agent Plugins Spec 1.1.0)
 
+## Rebase onto latest main — 2026-11-03
+
+Rebased onto `origin/main` `64a6f23d0`, retaining main's explicit-local routing
+and durable Federation changes. Main owns migration 150, so the plugin registry
+is migration 151. Main owns ADR-216, so the plugin scope ADR is now ADR-223;
+all live references are updated. Existing ADR-217 through ADR-222 keep their IDs.
+Migration tests retain main's staged upgrade assertions and account for both
+migration 150 and 151 in full upgrades. Historical checkpoint IDs and earlier
+migration/ADR numbers below describe their original source, not the rebased head.
+
+This rebase does not imply merge, deployment, or completed runtime acceptance.
+Focused migration/runtime seam tests and specification checks qualify the
+conflict resolution; new-head hosted CI remains separate evidence.
+
 ## FD-bound purge and final CI fixture repair — 2026-11-03
 
 Run 41700513114 failed one real-browser CLI test at its 20-second socket read.

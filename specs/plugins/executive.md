@@ -70,7 +70,7 @@ absent shared root has no data to delete and is not recreated by purge. A
 dangling root/ancestor is not proof of absence. Partial failures are reported;
 no automatic rollback or new crash-recovery guarantee is claimed.
 
-ADRs [216](../adrs/216_agent-plugins-are-user-level-shared-root-namespaced-bundles.md),
+ADRs [216](../adrs/223_agent-plugins-are-user-level-shared-root-namespaced-bundles.md),
 [217](../adrs/217_plugin-lifecycle-separates-installation-ownership-from-activation.md),
 [218](../adrs/218_mcp-redirects-preserve-origin-and-reload-capture-is-serialized.md),
 [219](../adrs/219_plugin-removal-revalidates-entry-identity-and-retains-native-paths.md),

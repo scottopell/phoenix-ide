@@ -23,7 +23,7 @@ pub use resolve::{expand_placeholders, resolved_environment, within_boundary};
 
 use std::path::{Path, PathBuf};
 
-/// The default user-level plugins root: `~/.agents/plugins` (ADR-216).
+/// The default user-level plugins root: `~/.agents/plugins` (ADR-223).
 /// Data directories live beside it as `~/.agents/plugins/data/<name>`.
 #[must_use]
 pub fn default_plugins_root(home: &Path) -> PathBuf {

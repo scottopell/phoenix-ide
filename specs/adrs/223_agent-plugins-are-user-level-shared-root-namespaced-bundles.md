@@ -1,4 +1,4 @@
-# ADR-216: Agent plugins are user-level-only, shared-root, namespaced bundles
+# ADR-223: Agent plugins are user-level-only, shared-root, namespaced bundles
 
 - **Status:** Accepted
 - **Date:** 2026-10-30

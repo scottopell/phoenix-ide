@@ -10,7 +10,7 @@ Adversarial review of the user-level plugin implementation found that a
 canonical package path was also used as an uninstall target. Registry errors
 could enable disabled plugins. Removing the registry row made retained data
 invisible, and unchecked copy publication could modify an existing entry.
-ADR-216 established scope and naming but did not settle these boundaries.
+ADR-223 established scope and naming but did not settle these boundaries.
 
 ## Decision
 

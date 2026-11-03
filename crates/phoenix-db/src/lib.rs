@@ -33181,7 +33181,7 @@ mod tests {
         let instance_id = db.instance_id().await.unwrap();
 
         // Reconstruct the schema and ledger immediately before plugin support.
-        sqlx::raw_sql("DROP TABLE plugins; DELETE FROM _migrations WHERE version = 150;")
+        sqlx::raw_sql("DROP TABLE plugins; DELETE FROM _migrations WHERE version = 151;")
             .execute(db.pool())
             .await
             .unwrap();
@@ -33196,7 +33196,7 @@ mod tests {
         assert_eq!(db.instance_id().await.unwrap(), instance_id);
         assert!(db.get_plugins().await.unwrap().is_empty());
         let migration_name: String =
-            sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 150")
+            sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 151")
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
