@@ -14,6 +14,44 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(phoenix_client)
 
 
+class PhoenixClientPluginPlatformTests(unittest.TestCase):
+    def invoke(self, args):
+        client = Mock(spec=phoenix_client.PhoenixClient)
+        client.get_version.return_value = {"version": "test"}
+        client.get_plugins.return_value = {"plugins": [], "root": "/plugins"}
+        client.get_usage_overview.return_value = {"total": 0}
+        client.add_plugin.return_value = {"name": "demo"}
+        with patch.object(phoenix_client, "PhoenixClient", return_value=client):
+            result = CliRunner().invoke(phoenix_client.main, args)
+        self.assertEqual(result.exit_code, 0, f"{result.output}\n{result.exception}")
+        client.get_conversation.assert_not_called()
+        return client, result
+
+    def test_plugins_and_usage_overview_both_run(self):
+        client, result = self.invoke(["--plugins", "--usage-overview"])
+        client.get_plugins.assert_called_once()
+        client.get_usage_overview.assert_called_once()
+        self.assertIn("USAGE OVERVIEW", result.output)
+
+    def test_version_does_not_skip_plugin_removal(self):
+        client, result = self.invoke(["--version", "--plugin-remove", "demo"])
+        client.get_version.assert_called_once()
+        client.ensure_authenticated.assert_called_once()
+        client.remove_plugin.assert_called_once_with("demo")
+        self.assertIn("VERSION", result.output)
+
+    def test_each_plugin_action_is_a_standalone_platform_action(self):
+        for args, method in [(["--plugins"], "get_plugins"),
+                             (["--plugin-add", "source"], "add_plugin"),
+                             (["--plugin-disable", "demo"], "set_plugin_enabled"),
+                             (["--plugin-enable", "demo"], "set_plugin_enabled"),
+                             (["--plugin-remove", "demo"], "remove_plugin"),
+                             (["--plugin-purge-data", "demo"], "purge_plugin_data")]:
+            with self.subTest(args=args):
+                client, _ = self.invoke(args)
+                getattr(client, method).assert_called_once()
+
+
 class PhoenixClientRemovedWakeTests(unittest.TestCase):
     def test_client_has_no_wake_methods(self):
         self.assertFalse(hasattr(phoenix_client.PhoenixClient, "get_wake_status"))

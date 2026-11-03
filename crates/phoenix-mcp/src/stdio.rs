@@ -5,6 +5,7 @@ use crate::{McpTransport, ServerMessageSink, TransportError};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,9 +40,10 @@ impl StdioTransport {
     #[allow(clippy::unused_async)] // async block inside spawns a task; keeping async for API consistency
     pub async fn spawn(
         name: &str,
-        command: &str,
-        args: &[String],
-        env: &HashMap<String, String>,
+        command: impl AsRef<std::ffi::OsStr>,
+        args: &[std::ffi::OsString],
+        env: &HashMap<std::ffi::OsString, std::ffi::OsString>,
+        cwd: Option<&Path>,
         pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
     ) -> Result<Self, String> {
         let mut cmd = Command::new(command);
@@ -51,6 +53,9 @@ impl StdioTransport {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
 
         let mut child = cmd
             .spawn()
@@ -360,8 +365,9 @@ mod tests {
         let transport = StdioTransport::spawn(
             "sleeping",
             "/bin/sh",
-            &["-c".to_string(), "sleep 30".to_string()],
+            &["-c".into(), "sleep 30".into()],
             &HashMap::new(),
+            None,
             Arc::new(RwLock::new(HashMap::new())),
         )
         .await

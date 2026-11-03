@@ -367,6 +367,40 @@ class PhoenixClient:
         resp.raise_for_status()
         return resp.json()
 
+    def get_plugins(self) -> dict:
+        """Installed user-level plugins with per-component load outcomes."""
+        resp = self.http.get(f"{self.base_url}/api/plugins")
+        resp.raise_for_status()
+        return resp.json()
+
+    def add_plugin(self, source: str) -> dict:
+        """Install a plugin from a local directory or git URL."""
+        resp = self.http.post(
+            f"{self.base_url}/api/plugins/add", json={"source": source}
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def set_plugin_enabled(self, name: str, enabled: bool) -> None:
+        """Enable or disable a plugin by manifest name."""
+        action = "enable" if enabled else "disable"
+        resp = self.http.post(
+            f"{self.base_url}/api/plugins/{name}/{action}"
+        )
+        resp.raise_for_status()
+
+    def remove_plugin(self, name: str) -> None:
+        """Uninstall a plugin (data directory retained)."""
+        resp = self.http.post(f"{self.base_url}/api/plugins/{name}/remove")
+        resp.raise_for_status()
+
+    def purge_plugin_data(self, name: str) -> None:
+        """Delete a removed plugin's data directory."""
+        resp = self.http.post(
+            f"{self.base_url}/api/plugins/{name}/purge-data"
+        )
+        resp.raise_for_status()
+
     def get_usage_overview(self) -> dict:
         """Aggregate token usage across all conversations."""
         resp = self.http.get(f"{self.base_url}/api/usage")
@@ -1007,6 +1041,18 @@ def parse_kv_pairs(pairs: tuple[str, ...]) -> dict[str, str]:
               help='Print server environment info and exit')
 @click.option('--mcp-status', is_flag=True,
               help='Print MCP server status and exit')
+@click.option('--plugins', is_flag=True,
+              help='Print installed user-level plugins and exit')
+@click.option('--plugin-add', 'plugin_add', default=None, metavar='SOURCE',
+              help='Install a plugin from a local directory or git URL and exit')
+@click.option('--plugin-disable', default=None, metavar='NAME',
+              help='Disable a plugin by manifest name and exit')
+@click.option('--plugin-enable', default=None, metavar='NAME',
+              help='Enable a plugin by manifest name and exit')
+@click.option('--plugin-remove', default=None, metavar='NAME',
+              help='Uninstall a plugin (data retained) and exit')
+@click.option('--plugin-purge-data', default=None, metavar='NAME',
+              help='Delete a removed plugin data directory and exit')
 @click.option('--usage-overview', is_flag=True,
               help='Print aggregate token usage across all conversations and exit')
 @click.option('--trajectory-export', is_flag=True,
@@ -1018,7 +1064,7 @@ def parse_kv_pairs(pairs: tuple[str, ...]) -> dict[str, str]:
 @click.option('--poll', is_flag=True, help='Use polling instead of SSE streaming')
 @click.option('--password', envvar='PHOENIX_PASSWORD', default=None,
               help='Password for authenticated access (or set PHOENIX_PASSWORD)')
-def main(message, conversation, directory, images, model, list_models, list_projects, suggest, list_conversations, search_conversations, search_limit, respond, respond_json, dismiss_question, dismiss_error, cancel_steer, continue_conv, diff, git_status, usage, system_prompt, tasks, proposals, show_version, deployment, show_env, mcp_status, usage_overview, trajectory_export, api_url, timeout, poll_interval, poll, password):
+def main(message, conversation, directory, images, model, list_models, list_projects, suggest, list_conversations, search_conversations, search_limit, respond, respond_json, dismiss_question, dismiss_error, cancel_steer, continue_conv, diff, git_status, usage, system_prompt, tasks, proposals, show_version, deployment, show_env, mcp_status, plugins, plugin_add, plugin_disable, plugin_enable, plugin_remove, plugin_purge_data, usage_overview, trajectory_export, api_url, timeout, poll_interval, poll, password):
     """Send a message to Phoenix IDE and wait for response.
 
     Uses SSE (Server-Sent Events) for real-time streaming by default.
@@ -1096,6 +1142,12 @@ def main(message, conversation, directory, images, model, list_models, list_proj
         ('--deployment', deployment),
         ('--env', show_env),
         ('--mcp-status', mcp_status),
+        ('--plugins', plugins),
+        ('--plugin-add', plugin_add is not None),
+        ('--plugin-disable', plugin_disable is not None),
+        ('--plugin-enable', plugin_enable is not None),
+        ('--plugin-remove', plugin_remove is not None),
+        ('--plugin-purge-data', plugin_purge_data is not None),
         ('--usage-overview', usage_overview),
         ('--trajectory-export', trajectory_export),
     ] if flag]
@@ -1179,7 +1231,7 @@ def main(message, conversation, directory, images, model, list_models, list_proj
     # must run after ensure_authenticated() so they can prompt for a password.
     # If --version is combined with other platform flags, print version then
     # continue to the authenticated projections (don't return early).
-    other_platform = deployment or show_env or mcp_status or usage_overview or trajectory_export
+    other_platform = any(flag != '--version' for flag in platform_selected)
     if show_version:
         click.echo("=== VERSION ===")
         _print_json(client.get_version())
@@ -1203,6 +1255,23 @@ def main(message, conversation, directory, images, model, list_models, list_proj
     if mcp_status:
         click.echo("=== MCP STATUS ===")
         _print_json(client.get_mcp_status())
+    if plugins:
+        click.echo("=== PLUGINS ===")
+        _print_json(client.get_plugins())
+    if plugin_add is not None:
+        _print_json(client.add_plugin(plugin_add))
+    if plugin_disable is not None:
+        client.set_plugin_enabled(plugin_disable, enabled=False)
+        click.echo(f"disabled {plugin_disable}")
+    if plugin_enable is not None:
+        client.set_plugin_enabled(plugin_enable, enabled=True)
+        click.echo(f"enabled {plugin_enable}")
+    if plugin_remove is not None:
+        client.remove_plugin(plugin_remove)
+        click.echo(f"removed {plugin_remove} (data retained)")
+    if plugin_purge_data is not None:
+        client.purge_plugin_data(plugin_purge_data)
+        click.echo(f"purged data for {plugin_purge_data}")
     if usage_overview:
         click.echo("=== USAGE OVERVIEW ===")
         _print_json(client.get_usage_overview())
@@ -1210,7 +1279,7 @@ def main(message, conversation, directory, images, model, list_models, list_proj
         conv = client.get_conversation(conversation)
         click.echo("=== TRAJECTORY EXPORT ===")
         _print_json(client.trajectory_export(conv['id']))
-    if deployment or show_env or mcp_status or usage_overview or trajectory_export:
+    if other_platform:
         return
 
     if list_models:

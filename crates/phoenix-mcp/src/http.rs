@@ -29,6 +29,8 @@ const ACCEPT_BOTH: &str = "application/json, text/event-stream";
 /// The lone framing the server-initiated GET stream may return (REQ-MCP-006).
 const ACCEPT_EVENT_STREAM: &str = "text/event-stream";
 
+const MAX_REDIRECTS: usize = 10;
+
 /// Streamable HTTP transport for one MCP server.
 pub struct HttpTransport {
     name: String,
@@ -109,6 +111,18 @@ impl HttpTransport {
         }
 
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                let Some(initial) = attempt.previous().first() else {
+                    return attempt.error("MCP redirect has no initial request");
+                };
+                if attempt.url().origin() != initial.origin() {
+                    return attempt.error("MCP cross-origin redirect rejected");
+                }
+                if attempt.previous().len() > MAX_REDIRECTS {
+                    return attempt.error("MCP redirect limit exceeded");
+                }
+                attempt.follow()
+            }))
             .build()
             .map_err(|e| format!("MCP server '{name}': failed to build HTTP client: {e}"))?;
 
@@ -660,7 +674,7 @@ impl ServerStream {
                     productive: false,
                     reason,
                     retry_after: None,
-                }
+                };
             }
         };
         if let Some(outcome) = self.classify_stream_status(response.status()) {
@@ -1381,6 +1395,7 @@ mod tests {
 
     fn http_config(url: &str, auth: HttpAuth) -> McpServerConfig {
         McpServerConfig::Http {
+            source: crate::McpConfigSource::User,
             url: url.to_string(),
             headers: HashMap::from([("x-org".to_string(), "acme".to_string())]),
             auth,
@@ -1419,6 +1434,129 @@ mod tests {
         )
         .await
         .map_err(|failure| failure.message)
+    }
+
+    fn plugin_http_config(url: &str) -> McpServerConfig {
+        let root = tempfile::tempdir().unwrap();
+        let package_root = root.path().join("demo");
+        std::fs::create_dir(&package_root).unwrap();
+        std::fs::write(
+            package_root.join("plugin.json"),
+            serde_json::json!({
+                "$schema": phoenix_plugins::manifest::MANIFEST_SCHEMA_URL,
+                "name": "demo"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            package_root.join("mcp.json"),
+            serde_json::json!({
+                "$schema": phoenix_plugins::mcp_config::MCP_SCHEMA_URL,
+                "mcpServers": {"remote": {
+                    "type": "streamable-http", "url": url,
+                    "headers": {"X-Tenant": "package-tenant"}
+                }}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let plugin = phoenix_plugins::load_plugin(&package_root).unwrap();
+        let mut outcomes = McpClientManager::plugin_server_outcomes(&plugin, root.path());
+        assert_eq!(outcomes.len(), 1);
+        let (name, config) = outcomes.pop().unwrap();
+        assert_eq!(name, "remote");
+        config.unwrap()
+    }
+
+    async fn connect_plugin_http(url: &str) -> Result<crate::McpServer, String> {
+        McpClientManager::connect_one(
+            "demo.remote",
+            &plugin_http_config(url),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::default(),
+            crate::OAuthHandshakeAction::Refresh,
+            None,
+        )
+        .await
+        .map_err(|failure| failure.message)
+    }
+
+    #[tokio::test]
+    async fn http_plugin_redirect_rejects_different_port_without_forwarding_headers() {
+        let destination = TestServer::start(handshake_responses("destination")).await;
+        let origin = TestServer::start(vec![status_response(
+            307,
+            &[("location", &destination.url)],
+        )])
+        .await;
+
+        connect_plugin_http(&origin.url)
+            .await
+            .expect_err("cross-origin redirect must fail");
+
+        let requests = origin.requests.lock().unwrap();
+        assert!(!requests.is_empty());
+        assert!(requests
+            .iter()
+            .all(|request| request.header("x-tenant") == Some("package-tenant")));
+        assert!(destination.requests.lock().unwrap().is_empty());
+        assert!(destination.get_requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_plugin_redirect_preserves_same_origin_headers_and_post() {
+        let server = TestServer::start(vec![]).await;
+        server.route("/mcp", status_response(307, &[("location", "/canonical")]));
+        server.route_seq("/canonical", handshake_responses("same-origin"));
+
+        let connected = connect_plugin_http(&server.url)
+            .await
+            .expect("same-origin redirected handshake");
+        assert_eq!(connected.tools().len(), 1);
+        let requests = server.requests.lock().unwrap();
+        let posts: Vec<_> = requests
+            .iter()
+            .filter(|request| request.http_method() == "POST")
+            .collect();
+        assert_eq!(posts.len(), 6);
+        for pair in posts.chunks_exact(2) {
+            assert_eq!(pair[0].path(), "/mcp");
+            assert_eq!(pair[1].path(), "/canonical");
+            assert_eq!(pair[0].body, pair[1].body);
+            assert_eq!(pair[1].header("x-tenant"), Some("package-tenant"));
+        }
+    }
+
+    #[tokio::test]
+    async fn http_plugin_redirect_limit_bounds_same_origin_loop() {
+        let server = TestServer::start(vec![]).await;
+        server.route("/mcp", status_response(307, &[("location", "/mcp")]));
+        let McpServerConfig::Http {
+            url, headers, auth, ..
+        } = plugin_http_config(&server.url)
+        else {
+            panic!("expected HTTP configuration");
+        };
+        let transport = HttpTransport::connect(
+            "redirect-loop",
+            &url,
+            &headers,
+            &auth,
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::new(NullSink),
+        )
+        .unwrap();
+        transport
+            .request(
+                "initialize",
+                serde_json::json!({}),
+                Duration::from_secs(10),
+                &NullSink,
+            )
+            .await
+            .expect_err("same-origin redirect loop must fail");
+        assert_eq!(server.requests.lock().unwrap().len(), MAX_REDIRECTS + 1);
     }
 
     #[tokio::test]
@@ -3536,7 +3674,10 @@ mod tests {
                 .await
         );
         let stale_config = http_config(&old.url, HttpAuth::None);
-        let stale_challenge = format!("Bearer error=\"insufficient_scope\", scope=\"mcp.old\", resource_metadata=\"{}/old-metadata\"", old.base());
+        let stale_challenge = format!(
+            "Bearer error=\"insufficient_scope\", scope=\"mcp.old\", resource_metadata=\"{}/old-metadata\"",
+            old.base()
+        );
         assert!(
             !handle
                 .retain_oauth_plan(
@@ -4409,7 +4550,10 @@ mod tests {
                 let mut rejected = json_doc(&serde_json::json!({"error":"invalid_grant"}));
                 rejected.status = 400;
                 server.route("/token", rejected);
-                let challenge = format!("Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource/mcp\", scope=\"mcp.write\"",server.base());
+                let challenge = format!(
+                    "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource/mcp\", scope=\"mcp.write\"",
+                    server.base()
+                );
                 server.push_responses(vec![status_response(
                     401,
                     &[("www-authenticate", &challenge)],
@@ -7524,6 +7668,7 @@ mod tests {
             .await
             .unwrap();
         let preconfigured = |client_id: &str| McpServerConfig::Http {
+            source: crate::McpConfigSource::User,
             url: server.url.clone(),
             headers: HashMap::new(),
             auth: HttpAuth::OAuth(crate::OAuthConfig {
@@ -7597,6 +7742,7 @@ mod tests {
             .await
             .unwrap();
         let configured = |scope: &str| McpServerConfig::Http {
+            source: crate::McpConfigSource::User,
             url: server.url.clone(),
             headers: HashMap::new(),
             auth: HttpAuth::OAuth(crate::OAuthConfig {
@@ -7724,6 +7870,7 @@ mod tests {
         server.push_responses(vec![delete_ack()]);
         server.push_responses(handshake_responses("sess-2"));
         let repointed = McpServerConfig::Http {
+            source: crate::McpConfigSource::User,
             url: format!("{}/v2", server.url),
             headers: HashMap::from([("x-org".to_string(), "acme".to_string())]),
             auth: HttpAuth::None,
@@ -7814,6 +7961,7 @@ mod tests {
         // (ReloadCancelsPendingAuth).
         server.push_responses(vec![unauthorized(&server)]);
         let changed = McpServerConfig::Http {
+            source: crate::McpConfigSource::User,
             url: server.url.clone(),
             headers: HashMap::from([("x-org".to_string(), "other".to_string())]),
             auth: HttpAuth::None,

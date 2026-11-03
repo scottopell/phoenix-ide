@@ -2572,6 +2572,45 @@ fn daemon_releases_descriptors_inherited_from_its_invoking_harness() {
     cli.ok(&["close"]);
 }
 
+fn wait_for_navigation_request(listener: &TcpListener) -> TcpStream {
+    let mut incoming: Vec<(TcpStream, Vec<u8>)> = Vec::new();
+    wait_for_observation("initial navigation sent complete HTTP headers", || {
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(true).unwrap();
+                    incoming.push((stream, Vec::new()));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("navigation listener failed: {error}"),
+            }
+        }
+        for index in 0..incoming.len() {
+            let (stream, headers) = &mut incoming[index];
+            let mut bytes = [0; 4096];
+            loop {
+                match stream.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(count) => headers.extend_from_slice(&bytes[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("navigation request read failed: {error}"),
+                }
+                if headers.windows(4).any(|part| part == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            if headers.starts_with(b"GET / HTTP/")
+                && headers.windows(4).any(|part| part == b"\r\n\r\n")
+            {
+                let (stream, _) = incoming.swap_remove(index);
+                stream.set_nonblocking(false).unwrap();
+                return Some(stream);
+            }
+        }
+        None
+    })
+}
+
 #[test]
 fn active_work_outlives_idle_budget_then_session_expires() {
     // REQ-BCLI-004, REQ-BCLI-005, REQ-BCLI-006.
@@ -2582,6 +2621,7 @@ fn active_work_outlives_idle_budget_then_session_expires() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
+    let _speculative_connection = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let opening = cli
         .command()
         .args(["--idle-timeout", "1", "open", &url])
@@ -2589,15 +2629,7 @@ fn active_work_outlives_idle_budget_then_session_expires() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut page_request =
-        wait_for_observation(
-            "initial navigation reached HTTP boundary",
-            || match listener.accept() {
-                Ok((stream, _)) => Some(stream),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
-                Err(error) => panic!("navigation listener failed: {error}"),
-            },
-        );
+    let mut page_request = wait_for_navigation_request(&listener);
     let queue = |request: Value| {
         let mut stream = UnixStream::connect(cli.socket()).unwrap();
         stream

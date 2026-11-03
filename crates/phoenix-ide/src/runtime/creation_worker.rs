@@ -485,6 +485,7 @@ async fn expand_product_creation_objective(
         &conversation.cwd,
         objective,
         policy,
+        &manager.skill_discovery(),
     )
     .await
     .map_err(|error| error.to_string())
@@ -1801,6 +1802,15 @@ enum ProvisionOutcome {
     InitialMessageSubmitted,
 }
 
+fn expand_initial_message(
+    manager: &RuntimeManager,
+    text: &str,
+    cwd: &str,
+) -> Result<crate::message_expander::ExpandedMessage, crate::message_expander::ExpansionError> {
+    let root = crate::resolution_root::ResolutionRoot::working_dir(cwd);
+    crate::message_expander::expand_with_discovery(text, &root, &manager.skill_discovery())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn provision_conversation(
     manager: &Arc<RuntimeManager>,
@@ -2298,10 +2308,8 @@ async fn provision_conversation(
                 intent.skill_invocation.clone(),
             )
         } else {
-            let resolution_root =
-                crate::resolution_root::ResolutionRoot::working_dir(&effective_cwd);
-            let expanded = crate::message_expander::expand(&intent.text, &resolution_root)
-                .map_err(|e| {
+            let expanded =
+                expand_initial_message(manager, &intent.text, &effective_cwd).map_err(|e| {
                     (
                         format!("{} ({})", e, e.error_type()),
                         ErrorKind::InvalidRequest,
@@ -4395,6 +4403,57 @@ mod product_creation_delivery_replay_tests {
             assert!(expanded.llm_text.is_none());
             assert!(expanded.skill_invocation.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn initial_plugin_slash_expansion_uses_instance_activation_and_preserves_metadata() {
+        let home = tempfile::tempdir().unwrap();
+        let plugin = home.path().join(".agents/plugins/demo");
+        std::fs::create_dir_all(plugin.join("skills/greet")).unwrap();
+        std::fs::write(plugin.join("plugin.json"), r#"{"$schema":"https://agent-plugins.org/schemas/1.1.0/plugin.schema.json","name":"demo"}"#).unwrap();
+        std::fs::write(
+            plugin.join("skills/greet/SKILL.md"),
+            "---\nname: greet\ndescription: Greet.\n---\nHello $ARGUMENTS",
+        )
+        .unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        let mcp = Arc::new(McpClientManager::new());
+        mcp.plugin_activation()
+            .publish(std::collections::HashSet::new());
+        let manager = RuntimeManager::new_with_message_retriever_and_runtime_env(
+            db.clone(),
+            Arc::new(ModelRegistry::new_empty()),
+            Arc::new(db.fts_retriever()),
+            PlatformCapability::None {
+                details: "test".into(),
+            },
+            mcp.clone(),
+            None,
+            &phoenix_core::runtime_env::PhoenixRuntimeEnvironment::with_root(home.path()),
+        );
+        let expanded =
+            expand_initial_message(&manager, "/demo:greet world", home.path().to_str().unwrap())
+                .unwrap();
+        assert_eq!(expanded.display_text, "/demo:greet world");
+        assert!(expanded.llm_text.contains("Hello world"));
+        let metadata = expanded.skill_invocation.unwrap();
+        assert_eq!(metadata.name, "demo:greet");
+        assert_eq!(metadata.body, expanded.llm_text);
+        assert_eq!(
+            metadata.skill_dir,
+            plugin
+                .join("skills/greet")
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+        );
+        mcp.plugin_activation()
+            .publish(std::collections::HashSet::from(["demo".into()]));
+        let expanded =
+            expand_initial_message(&manager, "/demo:greet world", home.path().to_str().unwrap())
+                .unwrap();
+        assert!(expanded.skill_invocation.is_none());
+        assert!(!expanded.llm_text.contains("Hello world"));
     }
 
     #[tokio::test]

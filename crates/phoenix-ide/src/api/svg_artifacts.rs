@@ -128,6 +128,7 @@ mod tests {
         let sessions = crate::api::auth::SessionStore::new(db.clone(), "svg-test-password".into());
         AppState {
             slack_gateway_access: crate::slack_gateway::access_gate(),
+            plugin_lifecycle: Arc::default(),
             runtime,
             llm_registry,
             db,

@@ -129,7 +129,9 @@ async fn project_id_for_cwd(
         .map_err(|error| DriveTurnError::Database(error.to_string()))
 }
 
-async fn configure_mcp_manager(db: &Database) -> Arc<crate::tools::mcp::McpClientManager> {
+async fn configure_mcp_manager(
+    db: &Database,
+) -> Result<Arc<crate::tools::mcp::McpClientManager>, DriveTurnError> {
     let manager = Arc::new(crate::tools::mcp::McpClientManager::new());
     manager.set_oauth_store(Arc::new(crate::mcp_oauth_store::DbOAuthStore::new(
         db.clone(),
@@ -138,10 +140,13 @@ async fn configure_mcp_manager(db: &Database) -> Arc<crate::tools::mcp::McpClien
         Ok(disabled) => manager.set_disabled_servers(disabled).await,
         Err(error) => tracing::warn!(error = %error, "Failed to load disabled MCP servers"),
     }
+    crate::plugin_activation::refresh(db, manager.plugin_activation())
+        .await
+        .map_err(|error| DriveTurnError::Database(error.to_string()))?;
     if let Err(error) = manager.start_background_discovery().await {
         tracing::warn!(error = %error, "MCP discovery task terminated unexpectedly");
     }
-    manager
+    Ok(manager)
 }
 
 async fn shutdown_browser_sessions(manager: &Arc<RuntimeManager>) -> Result<(), DriveTurnError> {
@@ -211,7 +216,7 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
     .await
     .map_err(|error| DriveTurnError::Database(error.to_string()))?;
 
-    let mcp_manager = configure_mcp_manager(&db).await;
+    let mcp_manager = configure_mcp_manager(&db).await?;
     let manager = Arc::new(RuntimeManager::new(
         db.clone(),
         llm_registry,
@@ -269,14 +274,17 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
 fn expand_prompt(
     prompt: &str,
     cwd: &std::path::Path,
+    discovery: &phoenix_skills::SkillDiscovery,
 ) -> Result<crate::message_expander::ExpandedMessage, DriveTurnError> {
     let resolution_root = crate::resolution_root::ResolutionRoot::working_dir(cwd);
-    crate::message_expander::expand(prompt, &resolution_root).map_err(|error| {
-        DriveTurnError::Runtime(format!(
-            "prompt expansion failed: {error} ({})",
-            error.error_type()
-        ))
-    })
+    crate::message_expander::expand_with_discovery(prompt, &resolution_root, discovery).map_err(
+        |error| {
+            DriveTurnError::Runtime(format!(
+                "prompt expansion failed: {error} ({})",
+                error.error_type()
+            ))
+        },
+    )
 }
 
 async fn drive_conversation(
@@ -288,7 +296,7 @@ async fn drive_conversation(
     conversation_id: &str,
     started: std::time::Instant,
 ) -> Result<DriveTurnResult, DriveTurnError> {
-    let _ = expand_prompt(&request.prompt, cwd)?;
+    let _ = expand_prompt(&request.prompt, cwd, &manager.skill_discovery())?;
 
     let mut state_rx = manager
         .subscribe_state(conversation_id)
@@ -549,7 +557,12 @@ mod tests {
         std::fs::write(directory.join("context.txt"), "EXPANSION_SECRET_7419\n").unwrap();
 
         let prompt = "Read @context.txt and report the token.";
-        let expanded = expand_prompt(prompt, &directory).unwrap();
+        let expanded = expand_prompt(
+            prompt,
+            &directory,
+            &phoenix_skills::SkillDiscovery::default(),
+        )
+        .unwrap();
 
         assert_eq!(expanded.display_text, prompt);
         assert!(expanded.llm_text.contains("EXPANSION_SECRET_7419"));

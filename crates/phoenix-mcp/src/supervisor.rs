@@ -1909,6 +1909,7 @@ mod epoch_tests {
 
     fn http_config() -> McpServerConfig {
         McpServerConfig::Http {
+            source: crate::McpConfigSource::User,
             url: "https://example.test/mcp".to_string(),
             headers: HashMap::new(),
             auth: HttpAuth::None,
@@ -1918,9 +1919,11 @@ mod epoch_tests {
 
     fn stdio_config() -> McpServerConfig {
         McpServerConfig::Stdio {
-            command: "test".to_string(),
+            source: crate::McpConfigSource::User,
+            command: "test".into(),
             args: Vec::new(),
             env: HashMap::new(),
+            cwd: None,
             tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         }
     }

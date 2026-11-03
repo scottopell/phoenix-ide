@@ -3088,6 +3088,7 @@ dependencies = [
  "chrono",
  "futures",
  "phoenix-core",
+ "phoenix-plugins",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
@@ -3100,10 +3101,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "phoenix-plugins"
+version = "0.1.0"
+dependencies = [
+ "http",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "phoenix-skills"
 version = "0.1.0"
 dependencies = [
  "phoenix-core",
+ "phoenix-plugins",
  "rust-embed",
  "tempfile",
  "tracing",
@@ -3247,6 +3261,7 @@ dependencies = [
  "phoenix-core",
  "phoenix-db",
  "phoenix-llm",
+ "phoenix-plugins",
  "phoenix-skills",
  "phoenix-state-machine",
  "phoenix-svg",
@@ -3261,6 +3276,7 @@ dependencies = [
  "rcgen",
  "reqwest 0.13.4",
  "rust-embed",
+ "rustix",
  "rustls",
  "rustls-pki-types",
  "schemars",

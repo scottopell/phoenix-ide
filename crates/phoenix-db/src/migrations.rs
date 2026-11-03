@@ -787,6 +787,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "federated_subscription_terminal_cancellation",
         sql: include_str!("migrations/federated_subscription_terminal_cancellation.sql"),
     },
+    Migration {
+        version: 151,
+        name: "user_level_plugin_registry",
+        sql: include_str!("migrations/plugin_registry.sql"),
+    },
 ];
 
 const MIGRATION_138: &str = concat!(
@@ -15762,6 +15767,7 @@ with tempfile.TemporaryDirectory() as directory:
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (151, "user_level_plugin_registry"),
             (150, "federated_subscription_terminal_cancellation"),
             (149, "product_creation_image_retirement"),
             (148, "product_creation_initial_execution_receipts"),
@@ -20015,6 +20021,7 @@ with tempfile.TemporaryDirectory() as directory:
                 (148, "product_creation_initial_execution_receipts"),
                 (149, "product_creation_image_retirement"),
                 (150, "federated_subscription_terminal_cancellation"),
+                (151, "user_level_plugin_registry"),
             ]
         );
         let goal = MIGRATIONS
@@ -20028,7 +20035,7 @@ with tempfile.TemporaryDirectory() as directory:
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 149);
+        assert_eq!(MIGRATIONS.len(), 150);
     }
 
     #[tokio::test]
@@ -20044,7 +20051,7 @@ with tempfile.TemporaryDirectory() as directory:
         }
         sqlx::query("UPDATE product_creation_jobs SET status = 'published', published_product_id = 'deleted-product', published_conversation_id = 'deleted-transcript' WHERE request_id = 'orphan-image'")
             .execute(&pool).await.unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 2);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
         let identity: Vec<(String, String)> = sqlx::query_as(
             "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
         ).fetch_all(&pool).await.unwrap();
@@ -20098,7 +20105,7 @@ with tempfile.TemporaryDirectory() as directory:
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 2);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
         let retained: (String, String, String) = sqlx::query_as(
             "SELECT status, published_product_id, published_conversation_id
              FROM product_creation_jobs WHERE request_id = 'orphan-text'",

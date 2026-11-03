@@ -1,0 +1,412 @@
+# User-Level Agent Plugins (Agent Plugins Spec 1.1.0)
+
+## Rebase onto latest main — 2026-11-03
+
+Rebased onto `origin/main` `64a6f23d0`, retaining main's explicit-local routing
+and durable Federation changes. Main owns migration 150, so the plugin registry
+is migration 151. Main owns ADR-216, so the plugin scope ADR is now ADR-223;
+all live references are updated. Existing ADR-217 through ADR-222 keep their IDs.
+Migration tests retain main's staged upgrade assertions and account for both
+migration 150 and 151 in full upgrades. Historical checkpoint IDs and earlier
+migration/ADR numbers below describe their original source, not the rebased head.
+
+This rebase does not imply merge, deployment, or completed runtime acceptance.
+Focused migration/runtime seam tests and specification checks qualify the
+conflict resolution; new-head hosted CI remains separate evidence.
+
+## FD-bound purge and final CI fixture repair — 2026-11-03
+
+Run 41700513114 failed one real-browser CLI test at its 20-second socket read.
+The fixture considered bare TCP acceptance a navigation boundary and did not
+consume HTTP headers. It now waits for the actual complete root GET, deliberately
+includes an idle preconnection, and keeps all idle/operation budgets unchanged.
+Three focused real-Chrome runs and the full 37-test local integration module
+pass. The first local full-module attempt lacked PHOENIX_CHROME_EXECUTABLE;
+rerunning with the same explicit executable configuration as CI passed.
+
+Four newer review threads are fixed: purge now consumes a no-follow directory
+capability instead of re-resolving a checked pathname; bare commands reject
+Windows path syntax; server IDs containing the reserved __ tool delimiter are
+skipped; and present non-regular SKILL.md entries receive skipped diagnostics.
+Descriptor-relative traversal is iterative, unlinks but never follows child
+symlinks, and checks directory identity before unlinking. Controlled swaps of
+the data root and target preserve outside witnesses. ADR-222 records the bounds.
+
+Local verification: loader 43, macOS plugin runtime/API 48, browser CLI module 37;
+strict all-target clippy passes. Earlier MCP 212, skills 66, Python 17 and UI/spec
+results remain supporting evidence. The new head still needs hosted CI; the
+failed prior run is not called green or ignored. No merge or deployment occurs.
+
+## Exact ownership and global-status review — 2026-11-03
+
+Hosted CI passed on `b67ec1d48`:
+https://github.com/scottopell/phoenix-ide/actions/runs/41679041282
+
+Six new threads on that head are addressed by explicit config-source tags and
+failure owner sets; early rejection of unsupported plugin Authorization;
+composed CLI platform dispatch; retaining the approved resolved cwd; separating
+package-target missingness from entry state; and context-free global skill
+admission. Serving/queued owned bindings also block destructive retirement
+while teardown is deferred. No separate ownership cache or name-prefix policy
+is used. ADR-221 records the metadata and scope decisions.
+
+The API adds `entry_state` and failure `owners`; UI types and interaction mocks
+carry both. Dangling links show a missing target but offer Remove, not Purge.
+Unknown entry state offers neither destructive action. Conversation skill
+precedence is unchanged; only global status omits arbitrary project scans.
+
+Local evidence: 41 loader, 212 MCP, 66 skills, 46 macOS plugin runtime/API and
+17 Python client tests; strict clippy and UI/spec/structural checks pass.
+New-head CI is required after publication; the preceding green run is not a
+substitute. Task remains in progress, with no merge/deploy performed and real
+browser/runtime mutation acceptance still distinct from automated CI.
+
+## Native process and late-purge review — 2026-11-03
+
+Hosted CI passed again on `0c13975fc`:
+https://github.com/scottopell/phoenix-ide/actions/runs/41673872053
+
+Four further threads arrived during that run. Fixes repeat purge absence checks
+after reconciliation, preserve native command/argument/env units through spawn
+and respawn, diagnose special fixed-component locations, and retain UI
+activation controls for missing identities. Native process types are threaded
+through configuration and supervisor comparison, not duplicated as strings.
+Tests restore a package at both its retained entry and another same-name entry
+during reconciliation and preserve its data. Linux has a raw-name bundled
+executable launch regression; Unix pure tests verify native placeholder units.
+
+Local validation: full workspace/all-target compilation; 40 loader, 210 MCP,
+44 macOS runtime/API tests; strict clippy; all ten UI/spec/structural lanes pass.
+Hosted CI must run on the subsequent head; earlier green checkpoints are not
+substitutes. Task stays in progress pending review/runtime acceptance, with no
+merge or deployment performed. ADR-220 records the process-value decision.
+
+## Late review during green CI — 2026-11-03
+
+Exact-head hosted CI passed on `063f9fd22`:
+https://github.com/scottopell/phoenix-ide/actions/runs/41664991424
+
+Eight new threads on that checkpoint arrived during CI. Their fixes cover:
+regular-file manifest admission (FIFO rejection), cross-plugin qualified-key
+collisions, HTTP header syntax, closed MCP top-level structure, lossless native
+registry paths, Git-supported URL/source forms, late filesystem-entry identity
+revalidation, and refusal to remove a valid different manifest identity.
+
+Deletion tests replace a directory during reconciliation with both the same
+and a different plugin name, and verify replacement witnesses remain. Registry
+paths use a typed PathBuf and native BLOB bytes; presentation strings confer no
+filesystem authority. The full raw-name lifecycle test is Linux-only because
+the local macOS filesystem rejects illegal byte sequences. Unix registry byte
+round-trip coverage runs independently of filesystem name support. ADR-219
+records the bounds and explicitly adds no prototype-DB conversion or recovery.
+
+Focused new-edit validation: 38 loader, 210 MCP, 43 macOS runtime/API, and five
+registry tests pass. Strict clippy and spec/format preflight pass. Linux's
+additional raw-name lifecycle test and new-head CI still require hosted
+verification. The earlier green run is not evidence for these later edits.
+
+## CI and outstanding threads — 2026-11-03
+
+All nine unresolved review threads on `74929d23f` have confirmed fixes:
+selected-entry provenance; non-Unicode inherited environment; settings
+navigation; user-config-shadowed MCP status; writable data admission;
+missing-root purge; invalid/dangling registered-entry removal; empty command
+validation; and rejection of unknown enable/disable identities.
+
+Lifecycle fallback validates a stored entry's parent as the trusted root and
+never follows its final package symlink. Unknown identities cannot create
+unclearable registry rows. Provenance is retained only for the same entry.
+Status and execution share one user-config collision filter. Stdio receives
+only configured/client-owned env overlays and inherits OS values losslessly.
+Data admission performs a create/write/remove probe without changing permissions.
+
+Current hosted CI failures were traced to two more stale pending-migration
+counts, `/root`-dependent cwd fixtures, and a source-guidance test truncating
+at a test-only re-export. Repairs preserve the original data/containment and
+public-contract assertions. A wider Goal integration probe found one further
+exact-ledger expectation; it now includes migration 150 and passes. No
+production failure is hidden by relaxing these assertions.
+
+Targeted validation passes: loader 35, MCP 209, plugin runtime/API 40,
+registry/image-retirement 6, and Python API-guidance 8 tests; strict clippy
+and all ten UI/spec/structural-lint checks pass. New-head hosted CI is the
+remaining CI verification, not assumed green from those focused runs.
+All nine GitHub review threads have evidence replies and are resolved. Two
+separate macOS runtime fixtures still reject `/var` aliases as non-normalized
+paths; they are not claimed fixed or classified as baseline by these changes.
+Task remains in progress; ready-for-review does not imply merge,
+deployment, or complete runtime/browser acceptance. Earlier results below
+are historical checkpoints, not current-head clearance.
+
+## Follow-up review — 2026-11-02
+
+Review: https://github.com/scottopell/phoenix-ide/pull/1017#issuecomment-6587958396
+User requested addressing the findings and opening the PR for review.
+
+All three confirmed findings have fixes and regressions:
+- Startup and reload capture configuration/activation only under the existing
+  reconciliation lock; application requires the held guard. Deterministic
+  queued-reload test verifies capture waits and disabled plugins admit no
+  supervisor.
+- Shared MCP HTTP client rejects cross-origin redirects, permits at most ten
+  same-origin redirects, and keeps configured headers at their origin. Real
+  socket tests cover different-port rejection, same-origin POST/header/body
+  preservation, and redirect loops. Policy also covers non-plugin MCP servers;
+  ADR-218 records the scope choice.
+- Plugin URL validation uses parsed hosts and IP loopback predicates, accepting
+  IPv6 loopback and the full IPv4 loopback range while rejecting remote HTTP,
+  userinfo, fragments, and invalid ports.
+
+Validation: loader 34, MCP 205, and plugin runtime/API 32 tests pass;
+transport/loader all-target and IDE/DB lib/test strict clippy pass.
+Independent read-only challenge found no remaining
+code defect in these three fixes; socket execution was sandbox-blocked for
+that reviewer, not for the passing main test run. UI typecheck/lint/Vitest,
+Allium, spec anchors, formatting, ADR shape, and structural lint pass. The
+ADR-shape lane's separate dev.py unit-test step and broad Rust run are still
+running; no full-check pass is claimed.
+
+Also repaired CI integration gaps from the rebase: six migration-test failures
+came from stale tail/count expectations after migration 150; the full affected
+modules pass (24 tests). Rollback, preservation, FK and idempotence assertions
+remain intact. A full DB-library attempt timed out after 166 passes, not a
+suite pass. Plugin cloning now uses the shared Git command builder, and ADR
+217/218 use the required metadata/headings.
+
+Prior test totals and review holds below are historical evidence, not a
+substitute for this revision's verification or final acceptance.
+
+Ready-for-review is not a done transition, merge, or deployment. Success-path
+browser/MCP lifecycle acceptance and remaining broad-check classification stay
+explicit until qualified. No automatic prototype-DB conversion is added.
+
+## Rebase — 2026-11-02
+
+Rebased onto `origin/main` at `9441cd282`. Plugin registry migration is 150
+because main owns 143–149. Plugin ADRs are 216/217 because main owns 191/192.
+Preserve main's agent-origin literal-text policy while injecting plugin skill
+discovery; keep both initial-plugin and literal-objective regressions.
+This rebase does not clear the review hold or authorize leaving draft.
+Earlier validation counts below describe the pre-rebase checkpoint.
+
+## Review remediation — 2026-11-02
+
+Draft PR: https://github.com/scottopell/phoenix-ide/pull/1017
+Review hold: https://github.com/scottopell/phoenix-ide/pull/1017#issuecomment-6583976225
+
+The earlier done transition was premature. This task remains in progress.
+The 11 review findings have implementation changes and focused regressions;
+that is not review clearance, full qualification, merge, or deployment.
+
+Corrections cover validated deletion identity, install-entry ownership,
+fail-closed instance activation, package containment and cwd anchoring,
+exclusive staged publication, retained disabled identities, reinstall refresh,
+structured component admission outcomes, timestamp removal, and single-pass
+expansion. Follow-up review also found initial-message activation omission,
+invalid-manifest purge eligibility, root-alias purge failure, duplicate skill
+status mismatch, and removal falling through to a duplicate package. These
+have additional fixes and regressions.
+
+Verification must distinguish focused tests from real runtime acceptance:
+loader/MCP/skills library suites passed during remediation; UI typecheck,
+lint, Vitest, formatting and spec lanes passed. Final integrated runtime,
+strict clippy and registry tests pass at code checkpoint `c10f2bee5`:
+33 loader, 66 skills, 201 MCP, 32 plugin runtime/API, and four registry tests.
+The migration ledger, schema-138, and controller-schema tests also pass in
+focused reruns. These library totals include existing tests, not that many
+new plugin tests. No full `./dev.py check` pass is established. Lifecycle tests
+use disposable filesystem/SQLite and
+actual Axum error/list routes; success-path MCP reload and browser mutations
+still require acceptance. Broad-check failures must be classified, not hidden.
+
+The broad Rust run finished with 5709 passed, six failed, and 210 skipped.
+Three failures introduced by migration registration/format assertions were
+fixed and rerun: migration ledger, schema-138 latest-version assertion, and
+controller registry parsing. The three remaining failures are not classified
+as pre-existing:
+- `coordinator_bash_executes_owned_home_with_zero_ordinary_conversations`:
+  isolated rerun fails expected home in output.
+- `real_bash_wait_zero_and_normal_bounds_preserve_child_without_replay`:
+  isolated rerun sees tombstoned rather than still_running.
+- `conversation_runtime_dispatches_real_zero_and_normal_bash_waits`:
+  isolated rerun times out waiting for the Bash child readiness marker.
+
+TODO: classify those against baseline, qualify real MCP/browser mutations,
+and check settings navigation discoverability. Do not clear the review hold
+or mark this task done from focused test counts.
+
+Remaining gates: final exact-source validation, independent adversarial
+re-review, real runtime/browser mutation acceptance, and PR claims corrected
+to match that evidence. Preserve local databases created by the earlier
+unshipped prototype schema; no automatic conversion is promised.
+
+## Goal
+
+Support a native, user-level-only (never project-level) add/remove path for
+plugins, adhering to the Agent Plugins specification 1.1.0. A plugin bundles
+two component types Phoenix already runs: skills and MCP servers.
+
+Before starting: read the roadmap issue (#806) body for related outcomes.
+
+## Spec reality: what "adhere to 1.1.0" means
+
+The portable surface is exactly three things:
+
+- `<plugin-root>/plugin.json` — manifest, exact field set, `name` pattern
+  `^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$`
+- `<plugin-root>/skills/<dir>/SKILL.md` — Agent Skills format, immediate
+  children only (non-recursive)
+- `<plugin-root>/mcp.json` — MCP servers, stdio or streamable-http; the
+  deprecated `sse` transport may be skipped (consistent with REQ-MCP-019)
+
+Everything else — install roots, skill naming/collision policy, enabled
+state, install/uninstall UX, marketplaces — is deliberately client-defined.
+The spec is a Working Draft; recognition pins to the exact canonical
+`$schema` identifiers and never fetches schemas while loading.
+
+Failure boundaries (each row needs a test):
+
+| Condition | Required scope |
+|---|---|
+| Manifest missing, invalid, or unsupported `$schema` version | Reject whole plugin |
+| Unknown top-level manifest field | Report and ignore; continue |
+| Non-object `extensions` | Report and ignore; continue |
+| Unimplemented extension namespace | Ignore without validating contents |
+| Component location wrong filesystem kind / escapes root | Invalidate that component type; continue others |
+| Invalid or escaping `SKILL.md` | Skip that skill; continue |
+| Invalid `mcp.json` (structure, version mismatch with `plugin.json`) | Disable that plugin's MCP; skills still load |
+| Invalid individual server | Skip that server; continue |
+| Unsupported transport | Skip that server; continue |
+
+Runtime contract for stdio servers:
+
+- Supply `PLUGIN_ROOT` and `PLUGIN_DATA`; client-owned values override any
+  equivalent names last.
+- Single-pass `${PLUGIN_ROOT}` / `${PLUGIN_DATA}` expansion in each `args`
+  element, each `env` value, and `cwd`. Never expand `command` or `env` keys.
+  No recursive or other expansion.
+- Configured `env` may not declare `PLUGIN_ROOT`/`PLUGIN_DATA`.
+- `cwd` defaults to the plugin root; explicit values must be `./`-relative or
+  `${PLUGIN_ROOT}`/`${PLUGIN_DATA}`-anchored and resolve inside the boundary.
+- `command` is one executable token: bare name (PATH lookup) or plugin-
+  relative `./` path. Bundled executables must use `./`.
+- `PLUGIN_DATA`: create before launch, make writable, preserve across plugin
+  update; deletion on uninstall is optional (client choice).
+- Containment: resolve real paths including symlinks; accessed package
+  paths must stay inside the resolved plugin root (`PLUGIN_DATA` has its
+  own boundary). Escapes are rejected.
+
+## Approved decisions
+
+1. Install root `~/.agents/plugins/<name>/`; `PLUGIN_DATA` at
+   `~/.agents/plugins/data/<name>/` (the spec's own example shape). This root
+   may be shared with other harnesses — that is the accepted tradeoff.
+2. Plugin skills surface as `plugin:skill` (e.g. `devtools:deploy`) in both
+   catalog and invocation, lowest precedence under user skills. The spec
+   mandates no collision policy; this is a client choice matching the
+   existing nested-skill precedent (`allium:distill`). Frontmatter `name`
+   keeps matching its parent directory; the prefix is derived at discovery,
+   never rewritten.
+3. Plugin MCP servers key as `<plugin>.<server>`, merged after all user
+   config files (user config wins collisions, first-seen-wins). Tools keep
+   surfacing as `{server}__{tool}`.
+4. User-level only: no project-relative plugin root discovery, ever.
+5. Plugin skills are ordinary filesystem skills: audience stays Conversation.
+   REQ-SK-008 already structurally prevents filesystem skills from claiming
+   GlobalCoordinator visibility — no new machinery.
+6. Extension namespace reserved: `dev.scottopell.phoenix-ide/`. v1 ignores
+   all extension namespaces (spec-conformant).
+7. Shared-root hygiene: plugin directories Phoenix did not install are
+   "unmanaged" — loaded read-only, no destructive actions without explicit
+   user intent. Uninstall removes the plugin directory; `PLUGIN_DATA` is
+   retained by default, purged only by an explicit separate action.
+8. Plugin identity = manifest `name`, not directory name. Two plugin roots
+   declaring the same name: first-seen-wins with a reported diagnostic
+   (MCP config merge precedent). Missing root for an enabled plugin: report,
+   do not crash.
+
+## Phases
+
+### Phase 0 — Specs (gates everything else)
+
+- `specs/plugins/requirements.md` (REQ-AP-xxx): user-level install scope,
+  installed-plugin discovery, enabled/disabled semantics, component loading
+  with the failure-boundary matrix, containment, env/expansion contract,
+  uninstall semantics, status surfacing.
+- `specs/plugins/plugins.allium`: lifecycle states
+  (not-installed → installed{enabled|disabled} → removing), the
+  failure-boundary matrix as rules, env construction ordering.
+- One ADR: user-level-only scope, shared install root, naming scheme
+  (`plugin:skill`, `<plugin>.<server>`), `PLUGIN_DATA` retention policy,
+  Working-Draft version pinning.
+- Run the spec pre-flight checklist (specs/AUTHORING.md) before pushing.
+
+### Phase 1 — `crates/phoenix-plugins` (pure, no runtime wiring)
+
+- Manifest model: exact field set with the spec's ignore/report/reject
+  semantics; the `name` regex.
+- `mcp.json` model: closed stdio / streamable-http variants; `sse` recognized
+  but skipped; per-server validation independent of the document.
+- Pure functions: placeholder expansion (single pass, correct target fields),
+  env overlay ordering with client-owned `PLUGIN_*` last, containment checks
+  (realpath, both boundaries).
+- Unit tests built from the spec's own examples, one per failure-boundary
+  row.
+
+### Phase 2 — MCP runtime integration
+
+- `McpServerConfig::Stdio` gains `cwd`; `stdio.rs` spawn sets
+  `current_dir`. Resolved values stay stable across respawn (REQ-MCP-003).
+- Transport translation: `streamable-http` maps to Phoenix's existing HTTP
+  transport; `headers` from `mcp.json` map through.
+- Plugin servers feed into the `read_all_configs` merge after user files,
+  keyed `<plugin>.<server>`.
+- `PLUGIN_DATA`: create-before-spawn, writable, preserved across update.
+- Reload reconciliation reports plugin server add/remove/restart
+  (REQ-MCP-015 extends).
+- `specs/mcp` requirements updated where behavior changes (`cwd`, plugin
+  config source) — normative change, not silent hardening.
+
+### Phase 3 — Skills integration
+
+- Discovery reads enabled plugins' `skills/` directories: immediate children
+  only (spec non-recursive). Phoenix's recursive sub-skill extension stays
+  confined to non-plugin directories.
+- Namespace `plugin:skill`, lowest precedence; dedup interplay (same file
+  through two roots counts once) follows existing rules.
+- Catalog fragment marks plugin provenance; refresh rides existing REQ-SK-009
+  turn boundaries — no new machinery.
+- `specs/skills` requirements updated for the plugin source.
+
+### Phase 4 — Lifecycle UX
+
+- SQLite registry: plugin identity, enabled/disabled, provenance
+  (managed/unmanaged). Columns per the persisted-structure rules — no JSON
+  blobs. Mirrors the `mcp_disabled_servers` precedent.
+- API: `/api/plugins` list/status/add/remove/enable/disable. Add accepts a
+  local path or a git URL in v1; nothing more.
+- UI: Plugins page (sibling to skills-ui), information-density style,
+  inline status indicators.
+- `phoenix-client.py`: `plugins` subcommands matching the API.
+
+## Acceptance criteria
+
+- Every failure-boundary row has a test.
+- A plugin at `~/.agents/plugins/devtools/` with skills and `mcp.json`
+  becomes usable: skills via `/devtools:deploy` and the Skill tool; MCP
+  tools via live resolution (REQ-MCP-014).
+- A disabled plugin contributes nothing; re-enable restores skills next
+  turn (REQ-SK-009) and MCP live.
+- Remove deletes the plugin directory and retains `PLUGIN_DATA`; purge is
+  a separate explicit action.
+- No project-level plugin discovery exists anywhere.
+- `./dev.py check` passes.
+
+## Risks
+
+- Working Draft churn: mitigated by exact-`$schema` recognition and the
+  `mcp.json`/`plugin.json` version-match rule.
+- Shared root: external tools may add/remove plugin dirs concurrently;
+  registry keyed on manifest name tolerates churn (missing root → report).
+- The stdio spawn/respawn path is touched; keep resolved `cwd`/env stable
+  across respawn.

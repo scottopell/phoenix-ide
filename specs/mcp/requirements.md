@@ -48,6 +48,10 @@ from one that is merely waiting on me.
 THE SYSTEM SHALL read MCP server definitions from the known config files in a
 fixed priority order, merging by server name (first-seen wins).
 
+Plugin-installed servers (specs/plugins/) join the merge after every user
+config file, keyed `<plugin>.<server>`, so user configuration always wins a
+name collision.
+
 For each `mcpServers` entry THE SYSTEM SHALL select a transport:
 
 - an entry with a `command` field is a **stdio** server
@@ -57,12 +61,25 @@ Each entry MAY set `timeoutSeconds` to a positive integer to override the
 five-minute `tools/call` deadline for that server. A changed timeout SHALL take
 effect through config reload reconciliation like any other server config change.
 
+A stdio entry MAY set a working directory. A user-config entry carries none
+and inherits the manager's cwd; a plugin stdio server always carries its
+resolved working directory validated against its selected plugin-root or
+plugin-data boundary (specs/plugins/ REQ-AP-006)
+through spawn and respawn unchanged.
+Stdio executable, argument, and environment values SHALL retain native OS
+units from configuration admission through spawn, respawn, and reload
+comparison. Unicode replacement SHALL NOT change a package executable path
+or a client-owned path environment value.
+
 WHERE an entry declares neither a usable `command` nor an HTTP `url`
 THE SYSTEM SHALL skip it and record the reason at `debug` level.
 
 **Rationale:** The config schema already distinguishes transports via `type`
 and `command`/`url`. Discovery is the single place transport selection happens,
-so the rest of the system is transport-agnostic above the JSON-RPC layer.
+so the rest of the system is transport-agnostic above the JSON-RPC layer. The
+working directory is part of the stdio spawn configuration and therefore part
+of the reload reconciler's unchanged-vs-restart comparison. A plugin server's
+cwd comes from the plugin loading contract, not the user config format.
 
 ---
 
@@ -120,6 +137,12 @@ WHEN the client POSTs a JSON-RPC **notification** (e.g.
 THE SYSTEM SHALL treat an HTTP `202 Accepted` with an empty body as success,
 not as a parse failure -- a conforming server acknowledges an accepted
 notification with `202` and no JSON-RPC body.
+
+THE SYSTEM SHALL reject redirects to a different origin for every MCP HTTP
+transport request, including POST, the server-initiated GET stream, and session
+DELETE. Origin SHALL mean scheme, host, and effective port. THE SYSTEM SHALL
+follow at most ten same-origin redirects per request and fail when that limit
+is exceeded. Configured headers SHALL remain within the configured origin.
 
 **Rationale:** The Streamable HTTP transport lets a server answer a single POST
 with either a unary reply or a stream. The client advertises both shapes via
@@ -480,9 +503,23 @@ outcome within the reload polling window, including while another server is read
 Applying a queued configuration SHALL consume its queued target so later
 recovery on that configuration remains eligible for replay.
 
+Startup discovery and reload SHALL acquire the same reconciliation lock
+before reading configuration files or capturing plugin activation. Capture
+and application SHALL share that lock through reconciliation. A reload
+waiting for the lock SHALL NOT prepare a stale desired plugin set that can
+be applied after a completed disable reconciliation.
+
 **Rationale:** Reload must not tear down healthy connections. Reconciliation
 applies the minimum change and reports what happened so the operator sees the
 effect of an edit.
+
+Configuration source SHALL be tagged by the discovering client as user or
+an exact plugin identity, and carried with serving and queued configuration.
+Reload failures SHALL report the exact owner set from the desired and still
+retained/queued configurations affected by the failure. Prefixes of server
+names SHALL NOT imply ownership. Orphan credential cleanup without a retained
+configuration has no known owner to fabricate. Ownership changes participate
+in configuration reconciliation, even when process fields are otherwise equal.
 
 ---
 

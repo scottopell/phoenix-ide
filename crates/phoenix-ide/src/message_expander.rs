@@ -8,7 +8,6 @@
 //! Path (`./`) references are not expanded here — they are autocomplete-only (Task 572).
 
 use crate::resolution_root::{FileResolution, ResolutionRoot};
-use crate::system_prompt::discover_skills;
 
 /// The result of expanding a user message.
 ///
@@ -322,7 +321,16 @@ fn is_path_token_char(c: char) -> bool {
 ///
 /// Returns `Ok(ExpandedMessage)` when all references resolve successfully.
 /// Returns the first `Err(ExpansionError)` encountered when any reference fails.
+#[cfg(test)]
 pub fn expand(text: &str, root: &ResolutionRoot) -> Result<ExpandedMessage, ExpansionError> {
+    expand_with_discovery(text, root, &phoenix_skills::SkillDiscovery::default())
+}
+
+pub fn expand_with_discovery(
+    text: &str,
+    root: &ResolutionRoot,
+    discovery: &phoenix_skills::SkillDiscovery,
+) -> Result<ExpandedMessage, ExpansionError> {
     let refs = tokenize_references(text, &['/', '@']);
 
     // --- Skill expansion (REQ-IR-002, REQ-IR-003) ----------------------------
@@ -333,7 +341,7 @@ pub fn expand(text: &str, root: &ResolutionRoot) -> Result<ExpandedMessage, Expa
         // GitTree root; keep it alive through `invoke_skill`, which reads them
         // back from the same paths.
         let skills_view = root.skills_view();
-        let skills = discover_skills(&skills_view.dir);
+        let skills = discovery.discover(&skills_view.dir);
         if skills.iter().any(|skill| {
             skill.name == skill_ref.token
                 && skill.audience == crate::skills::SkillAudience::Conversation

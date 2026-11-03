@@ -1899,6 +1899,66 @@ const PROMPT_TAIL_AFTER_SQL: &str =
      WHERE conversation_id = ?1 AND sequence_id > ?2
      ORDER BY sequence_id ASC";
 
+/// One persisted plugin registry row (specs/plugins/). An absent row means
+/// the plugin is unmanaged (another harness installed it) and enabled
+/// (REQ-AP-008).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginRecord {
+    pub name: String,
+    pub provenance: PluginProvenance,
+    pub enabled: bool,
+    pub install_entry: Option<std::path::PathBuf>,
+}
+
+fn plugin_entry_bytes(path: &std::path::Path) -> Vec<u8> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+    #[cfg(not(windows))]
+    path.as_os_str().as_encoded_bytes().to_vec()
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn plugin_entry_from_bytes(bytes: Vec<u8>) -> DbResult<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(std::ffi::OsString::from_vec(bytes).into())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        if bytes.len() % 2 != 0 {
+            return Err(DbError::Serialization(
+                "invalid plugin path UTF-16 byte length".into(),
+            ));
+        }
+        let wide: Vec<_> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        Ok(std::ffi::OsString::from_wide(&wide).into())
+    }
+    #[cfg(not(any(unix, windows)))]
+    String::from_utf8(bytes)
+        .map(std::path::PathBuf::from)
+        .map_err(|error| DbError::Serialization(error.to_string()))
+}
+
+/// How a plugin directory came to exist (REQ-AP-009).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginProvenance {
+    /// Phoenix installed it through the add path.
+    Managed,
+    /// Another harness installed it; Phoenix merely loads it.
+    Unmanaged,
+}
+
 impl Database {
     /// Access the underlying connection pool (for migrations and testing).
     #[must_use]
@@ -3938,6 +3998,114 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn enable_mcp_server(&self, name: &str) -> DbResult<()> {
         sqlx::query("DELETE FROM mcp_disabled_servers WHERE server_name = ?1")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ==================== Plugin registry (specs/plugins/) ====================
+
+    /// All persisted plugin registry rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn get_plugins(&self) -> DbResult<Vec<PluginRecord>> {
+        let rows: Vec<(String, String, i64, Option<Vec<u8>>)> =
+            sqlx::query_as("SELECT name, provenance, enabled, install_entry FROM plugins")
+                .fetch_all(&self.pool)
+                .await?;
+        rows.into_iter()
+            .map(|(name, provenance, enabled, install_entry)| {
+                Ok(PluginRecord {
+                    name,
+                    provenance: if provenance == "managed" {
+                        PluginProvenance::Managed
+                    } else {
+                        PluginProvenance::Unmanaged
+                    },
+                    enabled: enabled != 0,
+                    install_entry: install_entry.map(plugin_entry_from_bytes).transpose()?,
+                })
+            })
+            .collect()
+    }
+
+    /// Set a plugin's enabled state, upserting its registry row. A row that
+    /// does not exist yet is created as unmanaged (the plugin was discovered
+    /// in the shared root, not installed by Phoenix); disabling an
+    /// unmanaged plugin records user intent without claiming install
+    /// ownership (REQ-AP-008, REQ-AP-009).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn set_plugin_enabled(&self, name: &str, enabled: bool) -> DbResult<()> {
+        sqlx::query(
+            "INSERT INTO plugins (name, provenance, enabled) \
+             VALUES (?1, 'unmanaged', ?2) \
+             ON CONFLICT(name) DO UPDATE SET enabled = ?2",
+        )
+        .bind(name)
+        .bind(i64::from(enabled))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Register a plugin Phoenix installed through the add path: managed
+    /// provenance, enabled (REQ-AP-009).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn register_plugin(&self, name: &str, entry: &std::path::Path) -> DbResult<()> {
+        sqlx::query(
+            "INSERT INTO plugins (name, provenance, enabled, install_entry) \
+             VALUES (?1, 'managed', 1, ?2) \
+             ON CONFLICT(name) DO UPDATE SET provenance = 'managed', enabled = 1, install_entry = ?2",
+        )
+        .bind(name)
+        .bind(plugin_entry_bytes(entry))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record an observed entry and enablement; preserve ownership only for the same entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn record_plugin_entry(
+        &self,
+        name: &str,
+        entry: &std::path::Path,
+        enabled: bool,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "INSERT INTO plugins (name, provenance, enabled, install_entry) \
+             VALUES (?1, 'unmanaged', ?2, ?3) \
+             ON CONFLICT(name) DO UPDATE SET enabled = ?2, \
+             provenance = CASE WHEN plugins.install_entry = ?3 THEN plugins.provenance ELSE 'unmanaged' END, \
+             install_entry = ?3",
+        )
+        .bind(name)
+        .bind(i64::from(enabled))
+        .bind(plugin_entry_bytes(entry))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Forget a plugin after its retained data has been purged (REQ-AP-009).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn unregister_plugin(&self, name: &str) -> DbResult<()> {
+        sqlx::query("DELETE FROM plugins WHERE name = ?1")
             .bind(name)
             .execute(&self.pool)
             .await?;
@@ -32999,5 +33167,200 @@ mod tests {
         let ordinals: Vec<i64> = sqlx::query_scalar("SELECT ordinal FROM continuation_handoff_candidates WHERE conversation_id = 'candidate-parent' ORDER BY ordinal").fetch_all(db.pool()).await.unwrap();
         assert_eq!(ordinals, [0, 1]);
         assert_eq!(db.get_messages("candidate-parent").await.unwrap().len(), 1);
+    }
+
+    // ==================== Plugin registry (specs/plugins/) ====================
+
+    #[tokio::test]
+    async fn plugin_registry_upgrades_existing_database_and_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plugins.sqlite");
+        let path = path.to_str().unwrap();
+        let db = Database::open(path).await.unwrap();
+        migrations::run_pending_migrations(db.pool()).await.unwrap();
+        let instance_id = db.instance_id().await.unwrap();
+
+        // Reconstruct the schema and ledger immediately before plugin support.
+        sqlx::raw_sql("DROP TABLE plugins; DELETE FROM _migrations WHERE version = 151;")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.pool().close().await;
+
+        let db = Database::open(path).await.unwrap();
+        assert!(db.get_plugins().await.is_err());
+        assert_eq!(
+            migrations::run_pending_migrations(db.pool()).await.unwrap(),
+            1
+        );
+        assert_eq!(db.instance_id().await.unwrap(), instance_id);
+        assert!(db.get_plugins().await.unwrap().is_empty());
+        let migration_name: String =
+            sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 151")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(migration_name, "user_level_plugin_registry");
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('plugins') ORDER BY cid")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(columns, ["name", "provenance", "enabled", "install_entry"]);
+
+        db.register_plugin("devtools", std::path::Path::new("/plugins/devtools"))
+            .await
+            .unwrap();
+        db.set_plugin_enabled("devtools", false).await.unwrap();
+        db.set_plugin_enabled("other-harness", false).await.unwrap();
+        let mut expected = db.get_plugins().await.unwrap();
+        expected.sort_by(|a, b| a.name.cmp(&b.name));
+        db.pool().close().await;
+
+        let reopened = Database::open(path).await.unwrap();
+        assert_eq!(
+            migrations::run_pending_migrations(reopened.pool())
+                .await
+                .unwrap(),
+            0
+        );
+        let mut actual = reopened.get_plugins().await.unwrap();
+        actual.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn plugin_registry_defaults_and_upserts() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        // Absent row = unmanaged + enabled: the empty registry lists nothing
+        // and every plugin is enabled (REQ-AP-008).
+        assert!(db.get_plugins().await.unwrap().is_empty());
+
+        // Register a Phoenix-installed plugin (managed, enabled).
+        db.register_plugin("devtools", std::path::Path::new("/plugins/devtools"))
+            .await
+            .unwrap();
+        let rows = db.get_plugins().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "devtools");
+        assert_eq!(rows[0].provenance, PluginProvenance::Managed);
+        assert!(rows[0].enabled);
+
+        // Disabling an unmanaged plugin upserts without claiming install
+        // ownership (REQ-AP-009).
+        db.set_plugin_enabled("other-harness-plugin", false)
+            .await
+            .unwrap();
+        let rows = db.get_plugins().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        let other = rows
+            .iter()
+            .find(|r| r.name == "other-harness-plugin")
+            .unwrap();
+        assert_eq!(other.provenance, PluginProvenance::Unmanaged);
+        assert!(!other.enabled);
+
+        // Re-enabling preserves provenance; disabling a managed plugin
+        // preserves its managed provenance.
+        db.set_plugin_enabled("devtools", false).await.unwrap();
+        db.set_plugin_enabled("other-harness-plugin", true)
+            .await
+            .unwrap();
+        let rows = db.get_plugins().await.unwrap();
+        let devtools = rows.iter().find(|r| r.name == "devtools").unwrap();
+        assert_eq!(devtools.provenance, PluginProvenance::Managed);
+        assert!(!devtools.enabled);
+        let other = rows
+            .iter()
+            .find(|r| r.name == "other-harness-plugin")
+            .unwrap();
+        assert_eq!(other.provenance, PluginProvenance::Unmanaged);
+        assert!(other.enabled);
+
+        // Registering again after disable restores managed + enabled.
+        db.register_plugin("devtools", std::path::Path::new("/plugins/devtools"))
+            .await
+            .unwrap();
+        let devtools = db
+            .get_plugins()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.name == "devtools")
+            .unwrap();
+        assert!(devtools.enabled);
+        assert_eq!(devtools.provenance, PluginProvenance::Managed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plugin_entry_round_trips_non_unicode_os_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let db = Database::open_in_memory().await.unwrap();
+        let entry = std::path::PathBuf::from(std::ffi::OsString::from_vec(
+            b"/home-\xff/plugins/demo".to_vec(),
+        ));
+        db.register_plugin("demo", &entry).await.unwrap();
+        assert_eq!(
+            db.get_plugins().await.unwrap()[0].install_entry.as_deref(),
+            Some(entry.as_path())
+        );
+        db.record_plugin_entry("demo", &entry, false).await.unwrap();
+        let row = &db.get_plugins().await.unwrap()[0];
+        assert_eq!(row.install_entry.as_deref(), Some(entry.as_path()));
+        assert_eq!(row.provenance, PluginProvenance::Managed);
+        let storage: String =
+            sqlx::query_scalar("SELECT typeof(install_entry) FROM plugins WHERE name='demo'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(storage, "blob");
+    }
+
+    #[tokio::test]
+    async fn plugin_entry_is_retained_across_enablement_and_removal_records() {
+        let db = Database::open_in_memory().await.unwrap();
+        let first = std::path::Path::new("/plugins/entry-one");
+        let second = std::path::Path::new("/plugins/entry-two");
+        db.set_plugin_enabled("demo", true).await.unwrap();
+        assert_eq!(db.get_plugins().await.unwrap()[0].install_entry, None);
+        db.record_plugin_entry("demo", first, false).await.unwrap();
+        let row = &db.get_plugins().await.unwrap()[0];
+        assert_eq!(row.install_entry.as_deref(), Some(first));
+        assert_eq!(row.provenance, PluginProvenance::Unmanaged);
+        assert!(!row.enabled);
+        db.register_plugin("demo", second).await.unwrap();
+        db.set_plugin_enabled("demo", false).await.unwrap();
+        let row = &db.get_plugins().await.unwrap()[0];
+        assert_eq!(row.install_entry.as_deref(), Some(second));
+        assert_eq!(row.provenance, PluginProvenance::Managed);
+        db.record_plugin_entry("demo", second, true).await.unwrap();
+        assert_eq!(
+            db.get_plugins().await.unwrap()[0].provenance,
+            PluginProvenance::Managed
+        );
+        db.record_plugin_entry("demo", first, false).await.unwrap();
+        let row = &db.get_plugins().await.unwrap()[0];
+        assert_eq!(row.install_entry.as_deref(), Some(first));
+        assert_eq!(row.provenance, PluginProvenance::Unmanaged);
+        assert!(!row.enabled);
+        assert!(sqlx::query("UPDATE plugins SET install_entry = ''")
+            .execute(db.pool())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn plugin_unregister_removes_the_row() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.register_plugin("devtools", std::path::Path::new("/plugins/devtools"))
+            .await
+            .unwrap();
+        db.unregister_plugin("devtools").await.unwrap();
+        assert!(db.get_plugins().await.unwrap().is_empty());
+        // Unregistering an absent name is a no-op.
+        db.unregister_plugin("never-was").await.unwrap();
+        assert!(db.get_plugins().await.unwrap().is_empty());
     }
 }
