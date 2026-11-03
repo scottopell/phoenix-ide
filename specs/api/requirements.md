@@ -403,3 +403,13 @@ THE SYSTEM SHALL require the observed revision and use the same lifecycle author
 AND SHALL report not-found, revision conflict, already-due and already-cancelled outcomes without claiming retraction of a due occurrence.
 
 THE SYSTEM SHALL expose a bounded read-only recent-due feed for connected-browser notifications, including actual current navigation targets, under `../notifications/requirements.md`.
+
+### REQ-API-033: Reserved scheduled-reminder input identities
+
+WHEN admitting a new conversation input with a client message identity beginning with `reminder:`
+THE SYSTEM SHALL accept that identity only for a trusted scheduled-reminder input whose owner, due occurrence, saved text and provenance match
+AND SHALL reject other origins before creating a direct-turn or steering acceptance with HTTP 409 `reserved_message_id` on the public chat endpoint.
+
+WHEN a client exactly retries an already accepted input
+THE SYSTEM SHALL preserve the existing ordinary replay contract, including historical client identities in the reserved namespace
+AND SHALL NOT permit changed payload or provenance to claim that identity.

@@ -54,6 +54,10 @@ AND SHALL NOT impose an Idle-only condition or create a reminder-specific runtim
 WHEN normal admission has already accepted the occurrence, including a steering acceptance whose live queue entry has been removed
 THE SYSTEM SHALL recognize that existing acceptance and SHALL NOT submit a replacement input merely because a turn failed, was stopped, or the queued input was removed.
 
+THE SYSTEM SHALL bind each occurrence identity to its scheduled-reminder origin and saved input
+AND SHALL NOT treat an unrelated input with the same client key as acceptance of that occurrence
+AND SHALL retain reminder provenance on the ordinary acceptance authority after live steering removal and continuation.
+
 ### REQ-REM-006: Revision-checked management
 
 WHEN the owner reschedules or cancels a scheduled reminder with its current revision

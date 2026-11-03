@@ -594,6 +594,18 @@ impl SendChatApplicationService {
             *replay = SendChatReplay::Steering;
             return Ok(outcome);
         }
+        if req.message_id.starts_with("reminder:")
+            && !matches!(
+                req.origin,
+                phoenix_core::domain::db_schema::InputOrigin::ScheduledReminder { .. }
+            )
+        {
+            return Ok(SendChatOutcome::Rejected {
+                message: "message_id namespace reminder: is reserved for scheduled reminder inputs"
+                    .into(),
+                code: "reserved_message_id",
+            });
+        }
         let acceptance_guard = match admission_guard {
             Some(guard) => guard,
             None => self.runtime.lock_message_acceptance(&conversation.id).await,
@@ -1854,6 +1866,75 @@ mod tests {
             files: vec![],
             user_agent: None,
             expansion_policy: MessageExpansionPolicy::ExpandReferences,
+        }
+    }
+
+    #[tokio::test]
+    async fn reminder_namespace_preserves_existing_exact_replay_and_unreserved_client_ids() {
+        for historical in [false, true] {
+            let runtime = acceptance_pass_runtime().await;
+            let db = runtime.db();
+            db.create_conversation("client-id", "client-id", "/tmp", true, None, None)
+                .await
+                .unwrap();
+            let req = SendChatRequest {
+                conversation_id: "client-id".into(),
+                origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
+                message_id: if historical {
+                    "reminder:historical-client-key".into()
+                } else {
+                    "ordinary-client-key".into()
+                },
+                text: "original input".into(),
+                images: vec![],
+                files: vec![],
+                user_agent: None,
+                expansion_policy: MessageExpansionPolicy::LiteralText,
+            };
+            if historical {
+                let payload = PreparedDirectTurnPayload::from_parts(
+                    super::submitted_identity_from_request(&req),
+                    PreparedDirectTurnDelivery {
+                        text: req.text.clone(),
+                        llm_text: None,
+                        images: vec![],
+                        files: vec![],
+                        user_agent: None,
+                        skill_invocation: None,
+                    },
+                );
+                db.workflow_repository()
+                    .accept_authoritative_turn(&AcceptAuthoritativeTurn {
+                        client_key: ClientTurnKey::new(req.message_id.clone()).unwrap(),
+                        prepared: PreparedTurn::from_exact_payload(
+                            &ConversationAuthority(req.conversation_id.clone()),
+                            payload.to_exact_bytes().unwrap(),
+                        ),
+                        disposition: AcceptedDisposition::Runtime,
+                        accepted_at: Timestamp(10),
+                    })
+                    .await
+                    .established()
+                    .unwrap()
+                    .unwrap();
+            }
+            let service = super::SendChatApplicationService::new(db.clone(), runtime.clone());
+            assert_eq!(
+                service.send(req.clone()).await.unwrap(),
+                SendChatOutcome::Delivered
+            );
+            assert_eq!(
+                service.send(req.clone()).await.unwrap(),
+                SendChatOutcome::Delivered
+            );
+            let changed = SendChatRequest {
+                text: "changed".into(),
+                ..req
+            };
+            assert!(matches!(
+                service.send(changed).await,
+                Err(SendChatServiceError::IdempotencyConflict)
+            ));
         }
     }
 

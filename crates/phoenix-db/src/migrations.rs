@@ -15777,6 +15777,8 @@ with tempfile.TemporaryDirectory() as directory:
              VALUES ('queued-message', 'source', 1, 'conversation input',
                      'internal_conversation', 'parent-product', 'parent-transcript',
                      'parent-message', 'parent-tool');
+             INSERT INTO steering_acceptance_receipts (conversation_id, message_id, request_fingerprint)
+             VALUES ('source', 'queued-message', 'saved-steering-fingerprint');
              INSERT INTO workflows (workflow_id, profile_kind, profile_version,
                  runtime_acceptance_enabled, external_acceptance_enabled, version, generation,
                  status, snapshot_codec_family, snapshot_codec_version, snapshot_payload,
@@ -15802,7 +15804,7 @@ with tempfile.TemporaryDirectory() as directory:
         for (table, rows) in &mut after {
             if matches!(
                 table.as_str(),
-                "messages" | "steering_messages" | "durable_turns"
+                "messages" | "steering_messages" | "durable_turns" | "steering_acceptance_receipts"
             ) {
                 for row in rows {
                     assert_eq!(row.pop().as_deref(), Some("null:"));

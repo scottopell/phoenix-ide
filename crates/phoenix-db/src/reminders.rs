@@ -394,10 +394,12 @@ impl Database {
                AND (?1 IS NULL OR (r.due_at_us, r.id) > (?1, ?2))
                AND NOT EXISTS (SELECT 1 FROM durable_turns t JOIN conversations owner ON owner.id = t.conversation_id
                  WHERE owner.product_conversation_id = r.product_conversation_id
-                   AND t.client_turn_key = 'reminder:' || r.id || ':' || r.revision)
+                   AND t.client_turn_key = 'reminder:' || r.id || ':' || r.revision
+                   AND t.origin_kind = 'scheduled_reminder' AND t.origin_reminder_id = r.id)
                AND NOT EXISTS (SELECT 1 FROM steering_acceptance_receipts receipt JOIN conversations owner ON owner.id = receipt.conversation_id
                  WHERE owner.product_conversation_id = r.product_conversation_id
-                   AND receipt.message_id = 'reminder:' || r.id || ':' || r.revision)
+                   AND receipt.message_id = 'reminder:' || r.id || ':' || r.revision
+                   AND receipt.origin_reminder_id = r.id AND receipt.request_fingerprint IS NOT NULL)
              ORDER BY r.due_at_us, r.id LIMIT ?3"
         );
         sqlx::query(sqlx::AssertSqlSafe(sql))

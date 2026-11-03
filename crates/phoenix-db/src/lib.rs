@@ -7798,11 +7798,13 @@ impl Database {
         for (ordinal, entry) in queue.iter().enumerate() {
             sqlx::query(
                 "INSERT OR IGNORE INTO steering_acceptance_receipts
-                    (conversation_id, message_id, request_fingerprint)
-                 VALUES (?1, ?2, NULL)",
+                    (conversation_id, message_id, request_fingerprint, origin_reminder_id)
+                 SELECT ?1, ?2, NULL, ?3 WHERE NOT EXISTS (
+                     SELECT 1 FROM steering_acceptance_receipts WHERE conversation_id=?1 AND message_id=?2)",
             )
             .bind(id)
             .bind(&entry.message_id)
+            .bind(entry.origin.reminder_id())
             .execute(&mut *tx)
             .await?;
             insert_steering_entry_tx(
@@ -7990,12 +7992,13 @@ impl Database {
 
         sqlx::query(
             "INSERT INTO steering_acceptance_receipts
-                (conversation_id, message_id, request_fingerprint)
-             VALUES (?1, ?2, ?3)",
+                (conversation_id, message_id, request_fingerprint, origin_reminder_id)
+             VALUES (?1, ?2, ?3, ?4)",
         )
         .bind(id)
         .bind(&entry.message_id)
         .bind(request_fingerprint)
+        .bind(entry.origin.reminder_id())
         .execute(&mut **tx)
         .await?;
         insert_steering_entry_tx(tx, id, ordinal, entry).await?;

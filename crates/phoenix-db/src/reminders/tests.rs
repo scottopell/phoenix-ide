@@ -446,8 +446,37 @@ async fn reminders_steering_acceptance_prevents_rediscovery_after_queue_removal(
     let due = db.pending_due_reminders(None, 100).await.unwrap();
     assert_eq!(due.len(), 1);
     sqlx::query("INSERT INTO steering_acceptance_receipts (conversation_id, message_id, request_fingerprint) VALUES (?1, ?2, ?3)")
-        .bind(&source.id).bind(reminder.input_message_id()).bind("accepted-payload")
+        .bind(&source.id).bind(reminder.input_message_id()).bind("ordinary-payload")
         .execute(db.pool()).await.unwrap();
+    assert_eq!(db.pending_due_reminders(None, 100).await.unwrap().len(), 1);
+    sqlx::query("DELETE FROM steering_acceptance_receipts WHERE conversation_id=?1")
+        .bind(&source.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.append_steering_entry(
+        &source.id,
+        &phoenix_core::domain::sm_event::SteerEntry {
+            text: reminder.text.as_str().into(),
+            origin: phoenix_core::domain::db_schema::InputOrigin::ScheduledReminder {
+                reminder_id: reminder.id.clone(),
+            },
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            message_id: reminder.input_message_id(),
+            user_agent: None,
+            skill_invocation: None,
+        },
+        "accepted-payload",
+    )
+    .await
+    .unwrap();
+    let queue = db.get_steering_queue(&source.id).await.unwrap();
+    db.update_steering_queue(&source.id, &queue).await.unwrap();
+    db.remove_steering_entries(&source.id, &[reminder.input_message_id()])
+        .await
+        .unwrap();
     let live_queue_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM steering_messages WHERE conversation_id = ?1")
             .bind(&source.id)

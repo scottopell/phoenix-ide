@@ -24,6 +24,19 @@ CREATE TABLE reminders (
 CREATE INDEX reminders_scheduled_deadline ON reminders(due_at_us, id) WHERE state = 'scheduled';
 CREATE INDEX reminders_owner ON reminders(product_conversation_id, created_at_us, id);
 
+ALTER TABLE steering_acceptance_receipts ADD COLUMN origin_reminder_id TEXT REFERENCES reminders(id);
+CREATE TRIGGER steering_acceptance_reminder_insert BEFORE INSERT ON steering_acceptance_receipts
+WHEN NEW.origin_reminder_id IS NOT NULL AND
+    (NEW.request_fingerprint IS NULL OR NOT EXISTS (
+        SELECT 1 FROM reminders r JOIN conversations c ON c.product_conversation_id = r.product_conversation_id
+        WHERE c.id = NEW.conversation_id AND r.id = NEW.origin_reminder_id
+          AND r.state = 'due' AND NEW.message_id = 'reminder:' || r.id || ':' || r.revision
+    ))
+BEGIN SELECT RAISE(ABORT, 'invalid reminder acceptance identity'); END;
+CREATE TRIGGER steering_acceptance_reminder_update BEFORE UPDATE OF origin_reminder_id ON steering_acceptance_receipts
+WHEN NEW.origin_reminder_id IS NOT OLD.origin_reminder_id
+BEGIN SELECT RAISE(ABORT, 'immutable reminder acceptance provenance'); END;
+
 CREATE TRIGGER reminders_owner_insert BEFORE INSERT ON reminders
 WHEN NOT EXISTS (
     SELECT 1 FROM conversations c JOIN product_conversations p ON p.id = c.product_conversation_id

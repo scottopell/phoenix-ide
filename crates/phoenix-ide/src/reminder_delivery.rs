@@ -109,6 +109,173 @@ mod tests {
     use phoenix_db::{CreateReminderInput, Database};
 
     #[tokio::test]
+    async fn ordinary_direct_input_cannot_claim_reminder_occurrence_identity() {
+        ordinary_input_cannot_claim_reminder_identity(false).await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_steering_input_cannot_claim_reminder_occurrence_identity() {
+        ordinary_input_cannot_claim_reminder_identity(true).await;
+    }
+
+    async fn ordinary_input_cannot_claim_reminder_identity(busy: bool) {
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("reminder-identity", "identity", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let reminder = save(&db, &source.id, "create").await;
+        let runtime = manager(&db);
+        if busy {
+            let state = ConvState::LlmRequesting { attempt: 1 };
+            db.update_conversation_state(&source.id, &state)
+                .await
+                .unwrap();
+            runtime.inject_handle_for_test(&source.id, state).await;
+        }
+        let service = SendChatApplicationService::new(db.clone(), runtime.clone());
+        let outcome = service
+            .send(SendChatRequest {
+                conversation_id: source.id.clone(),
+                origin: InputOrigin::UserApi,
+                text: "unrelated ordinary input".into(),
+                message_id: reminder.input_message_id(),
+                images: vec![],
+                files: vec![],
+                user_agent: None,
+                expansion_policy: MessageExpansionPolicy::LiteralText,
+            })
+            .await
+            .unwrap();
+        // Exercise removed-queue poisoning too before asserting the reservation.
+        if busy {
+            db.remove_steering_entries(&source.id, &[reminder.input_message_id()])
+                .await
+                .unwrap();
+        }
+        db.promote_due_reminders(time(30), 100).await.unwrap();
+        let pending = db.pending_due_reminders(None, 100).await.unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "ordinary acceptance must not suppress the due occurrence: {outcome:?}"
+        );
+        assert!(
+            matches!(
+                outcome,
+                SendChatOutcome::Rejected {
+                    code: "reserved_message_id",
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        deliver_pass(&runtime, time(30)).await;
+        deliver_pass(&runtime, time(40)).await;
+        if busy {
+            let queue = db.get_steering_queue(&source.id).await.unwrap();
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].text, reminder.text.as_str());
+            assert_eq!(
+                queue[0].origin,
+                InputOrigin::ScheduledReminder {
+                    reminder_id: reminder.id.clone()
+                }
+            );
+            db.remove_steering_entries(&source.id, &[reminder.input_message_id()])
+                .await
+                .unwrap();
+            deliver_pass(&runtime, time(50)).await;
+            assert!(db.get_steering_queue(&source.id).await.unwrap().is_empty());
+        } else {
+            assert_eq!(count(&db, &reminder).await, 1);
+            let origin: (String, String) = sqlx::query_as("SELECT origin_kind, origin_reminder_id FROM durable_turns WHERE client_turn_key=?1")
+                .bind(reminder.input_message_id()).fetch_one(db.pool()).await.unwrap();
+            assert_eq!(
+                origin,
+                ("scheduled_reminder".into(), reminder.id.as_str().into())
+            );
+        }
+        assert!(db
+            .pending_due_reminders(None, 100)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn scheduled_receipt_survives_queue_copy_continuation_removal_and_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reminder-receipt.db");
+        let path = path.to_str().unwrap();
+        let db = Database::open(path).await.unwrap();
+        phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
+        let source = db
+            .create_conversation("receipt-source", "source", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let reminder = save(&db, &source.id, "create").await;
+        let runtime = manager(&db);
+        let busy = ConvState::LlmRequesting { attempt: 1 };
+        db.update_conversation_state(&source.id, &busy)
+            .await
+            .unwrap();
+        runtime.inject_handle_for_test(&source.id, busy).await;
+        deliver_pass(&runtime, time(30)).await;
+        let queue = db.get_steering_queue(&source.id).await.unwrap();
+        assert_eq!(queue.len(), 1);
+        let original_fingerprint = db
+            .get_steering_acceptance_fingerprint(&source.id, &reminder.input_message_id())
+            .await
+            .unwrap()
+            .unwrap();
+        db.update_steering_queue(&source.id, &queue).await.unwrap();
+        db.update_conversation_state(
+            &source.id,
+            &ConvState::ContextExhausted {
+                summary: "Continue".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let successor = match db.continue_conversation(&source.id).await.unwrap() {
+            phoenix_db::ContinueOutcome::Created(next) => next,
+            other @ (phoenix_db::ContinueOutcome::AlreadyContinued(_)
+            | phoenix_db::ContinueOutcome::ParentNotContextExhausted { .. }) => panic!("{other:?}"),
+        };
+        let receipt: (String, String) = sqlx::query_as("SELECT origin_reminder_id, request_fingerprint FROM steering_acceptance_receipts WHERE conversation_id=?1 AND message_id=?2")
+            .bind(&successor.id).bind(reminder.input_message_id()).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(receipt.0, reminder.id.as_str());
+        assert_eq!(receipt.1.len(), 64);
+        assert_eq!(
+            original_fingerprint,
+            phoenix_db::SteeringAcceptanceFingerprint::Exact(receipt.1)
+        );
+        db.remove_steering_entries(&successor.id, &[reminder.input_message_id()])
+            .await
+            .unwrap();
+        db.delete_conversation(&source.id).await.unwrap();
+        drop(runtime);
+        db.pool().close().await;
+        let reopened = Database::open(path).await.unwrap();
+        phoenix_db::run_pending_migrations(reopened.pool())
+            .await
+            .unwrap();
+        assert!(reopened
+            .pending_due_reminders(None, 100)
+            .await
+            .unwrap()
+            .is_empty());
+        deliver_pass(&manager(&reopened), time(50)).await;
+        assert!(reopened
+            .get_steering_queue(&successor.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(count(&reopened, &reminder).await, 0);
+    }
+
+    #[tokio::test]
     async fn reminder_promotion_cannot_mutate_after_local_authority_closes() {
         let db = Database::open_in_memory().await.unwrap();
         let source = db
