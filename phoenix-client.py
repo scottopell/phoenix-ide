@@ -1231,7 +1231,7 @@ def main(message, conversation, directory, images, model, list_models, list_proj
     # must run after ensure_authenticated() so they can prompt for a password.
     # If --version is combined with other platform flags, print version then
     # continue to the authenticated projections (don't return early).
-    other_platform = deployment or show_env or mcp_status or usage_overview or trajectory_export
+    other_platform = any(flag != '--version' for flag in platform_selected)
     if show_version:
         click.echo("=== VERSION ===")
         _print_json(client.get_version())
@@ -1258,29 +1258,20 @@ def main(message, conversation, directory, images, model, list_models, list_proj
     if plugins:
         click.echo("=== PLUGINS ===")
         _print_json(client.get_plugins())
-    if plugin_add:
+    if plugin_add is not None:
         _print_json(client.add_plugin(plugin_add))
-    if plugin_disable:
+    if plugin_disable is not None:
         client.set_plugin_enabled(plugin_disable, enabled=False)
         click.echo(f"disabled {plugin_disable}")
-    if plugin_enable:
+    if plugin_enable is not None:
         client.set_plugin_enabled(plugin_enable, enabled=True)
         click.echo(f"enabled {plugin_enable}")
-    if plugin_remove:
+    if plugin_remove is not None:
         client.remove_plugin(plugin_remove)
         click.echo(f"removed {plugin_remove} (data retained)")
-    if plugin_purge_data:
+    if plugin_purge_data is not None:
         client.purge_plugin_data(plugin_purge_data)
         click.echo(f"purged data for {plugin_purge_data}")
-    if (
-        plugins
-        or plugin_add
-        or plugin_disable
-        or plugin_enable
-        or plugin_remove
-        or plugin_purge_data
-    ):
-        sys.exit(0)
     if usage_overview:
         click.echo("=== USAGE OVERVIEW ===")
         _print_json(client.get_usage_overview())
@@ -1288,7 +1279,7 @@ def main(message, conversation, directory, images, model, list_models, list_proj
         conv = client.get_conversation(conversation)
         click.echo("=== TRAJECTORY EXPORT ===")
         _print_json(client.trajectory_export(conv['id']))
-    if deployment or show_env or mcp_status or usage_overview or trajectory_export:
+    if other_platform:
         return
 
     if list_models:
