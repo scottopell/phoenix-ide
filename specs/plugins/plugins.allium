@@ -196,11 +196,11 @@ surface PluginControl {
 
     provides:
         DisablePlugin(plugin)
-            when plugin.enabled and plugin.phase = installed
+            when plugin.enabled
         EnablePlugin(plugin)
-            when not plugin.enabled and plugin.phase = installed
+            when not plugin.enabled
         RemovePlugin(plugin)
-            when plugin.phase = installed
+            when removable_entry_known(plugin)
         PurgePluginData(plugin)
             when plugin.purgeable
 }
@@ -232,8 +232,11 @@ surface PluginControl {
 --   (REQ-AP-004, REQ-AP-006).
 -- load_components(plugin): produce the plugin's full List<LoadEntry>,
 --   covering both component types' scoped outcomes (REQ-AP-004).
--- provenance_for(plugin_root): managed when Phoenix installed the
---   directory, unmanaged when another harness did (REQ-AP-009).
+-- provenance_for(plugin_root): managed only when the selected entry matches
+--   the stored managed installation entry; same-name siblings are unmanaged.
+-- removable_entry_known(plugin): a selected valid scan entry, or a retained
+--   entry validated as an immediate non-data child of the trusted root.
+--   Validation resolves its parent, never the package symlink target.
 -- registry_enabled(name): true only in an available, successfully loaded
 --   activation snapshot that does not disable name; absent row then means
 --   enabled. The snapshot is stable for one discovery pass (REQ-AP-008).
@@ -422,7 +425,7 @@ rule PluginComponentsLoad {
 rule PluginDisabled {
     when: DisablePlugin(plugin)
 
-    requires: plugin.enabled and plugin.phase = installed
+    requires: plugin.enabled
 
     ensures:
         plugin.enabled = false
@@ -432,7 +435,7 @@ rule PluginDisabled {
 rule PluginEnabled {
     when: EnablePlugin(plugin)
 
-    requires: not plugin.enabled and plugin.phase = installed
+    requires: not plugin.enabled
 
     ensures: plugin.enabled = true
 }
@@ -443,7 +446,7 @@ rule PluginEnabled {
 rule PluginRemovalRequested {
     when: RemovePlugin(plugin)
 
-    requires: plugin.phase = installed
+    requires: removable_entry_known(plugin)
 
     ensures:
         plugin.phase = retained
@@ -453,8 +456,10 @@ rule PluginRemovalRequested {
         plugin.missing = null
         retract_components(plugin.name)
     @guidance
-        -- Validate identity before path construction. Record the observed
-        -- entry, persist disabled state, refresh and reconcile MCP before
+        -- Validate identity before path construction. Prefer the selected
+        -- scan entry; if its manifest is unavailable, use only the validated
+        -- registered entry. Reject unknown identities. Record the entry,
+        -- persist disabled state, refresh and reconcile MCP before
         -- deletion. Reconciliation failure preserves the entry. Unlink a symlink
         -- entry without deleting its canonical target. Preserve provenance
         -- and data. A deletion failure retains disabled identity and reports
@@ -478,6 +483,8 @@ rule PluginDataPurged {
         -- and reconcile before destructive deletion. Delete data before
         -- forgetting the registry identity. On either failure retain identity
         -- and report failure; no crash recovery or rollback is promised.
+        -- A genuinely absent trusted root has no data to delete; do not
+        -- recreate it. Dangling root or ancestor symlinks do not prove absence.
 }
 
 -- A registered-but-absent root: report, retain the record, continue. Another

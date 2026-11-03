@@ -66,6 +66,9 @@ SYSTEM SHALL load the first discovered and SHALL report the duplicate at
 `warn` level
 
 Plugin identity SHALL be the manifest `name`, not the directory name.
+Managed provenance SHALL describe the selected installation entry, not every
+entry with the same manifest name. An observed different entry SHALL be
+unmanaged even when a managed registry record shares its name.
 
 Discovery SHALL exclude the reserved `data` entry. An installation entry MAY
 be a directory symlink; its canonical target is the package execution root.
@@ -222,6 +225,11 @@ SYSTEM SHALL invalidate that server
 THE SYSTEM SHALL create the plugin's data directory before first launch,
 maintain it writable, and preserve its contents across plugin updates; update
 MUST NOT delete or reset it
+Before admitting a stdio server, THE SYSTEM SHALL verify that creating,
+writing, and removing a temporary file in that data directory succeeds.
+Failure SHALL skip that server with a diagnostic, not defer the failure to
+its subprocess. The inherited OS environment SHALL retain non-Unicode
+entries; only configured and client-owned values need a textual overlay.
 
 Plugin server tools SHALL surface to conversations through the existing
 live-resolution tool exposure (`specs/mcp/` REQ-MCP-014) under the
@@ -293,6 +301,9 @@ snapshot publication SHALL be serialized within the instance.
 MCP configuration capture and reconciliation SHALL use one serialization
 boundary for startup and every reload, so a delayed enabled snapshot cannot
 be applied after disabling reconciliation completes.
+Enable and disable SHALL require a discovered or retained identity. A valid
+name alone SHALL NOT create registry state. Retained identities MAY be
+explicitly enabled or disabled without an installed package.
 
 **Rationale:** Default-enabled matches how filesystem skills behave today:
 putting a directory in the discovery path is the act of installing. The
@@ -324,6 +335,12 @@ symlink entry SHALL be unlinked without deleting its target. Removal SHALL
 retain identity, installation-entry location, and provenance with
 enabled=false. Only successful add or explicit enable may reactivate that
 identity. Disabling SHALL precede entry deletion.
+Removal SHALL prefer the selected valid discovery entry. When discovery
+cannot load a registered package, removal MAY use its stored installation
+entry only after validating that it is an immediate non-data child of the
+trusted plugins root. Missing/corrupt manifests and dangling package symlinks
+SHALL NOT prevent removal of that validated entry. Resolving its parent
+SHALL NOT resolve or authorize deletion of its symlink target.
 
 Purge SHALL require a retained identity with a known absent installation
 entry and no installed package declaring that identity. An invalid manifest
@@ -331,6 +348,9 @@ or unknown entry location SHALL NOT establish absence. Purge SHALL delete
 data before forgetting the identity, and SHALL retain the identity on failure.
 The trusted user-level root MAY be a symlink alias; data entries below its
 canonical target SHALL NOT traverse symlinks during destructive operations.
+A genuinely absent shared plugins root SHALL count as already-absent data,
+without recreating the root. A dangling root or ancestor symlink SHALL NOT
+establish absence. Successful purge SHALL still forget retained identity.
 
 Add SHALL stage outside discoverable candidate locations, validate the staged
 manifest identity, then publish the complete entry exclusively. It SHALL NOT
@@ -362,6 +382,12 @@ THE SYSTEM SHALL expose, per plugin: name, description, version, provenance
 (managed or unmanaged), enabled state, per-component load outcomes (skills
 loaded or skipped with reasons, MCP servers loaded, skipped, or disabled with
 reasons), and missing-root state for registered-but-absent plugins
+An MCP server shadowed by a higher-priority user configuration SHALL be
+reported as skipped with a collision reason, not loaded. Status and execution
+SHALL use the same user-configuration precedence decision.
+
+THE SYSTEM SHALL provide a normal settings-navigation link to plugin
+management; knowing the route address SHALL NOT be required.
 
 **Rationale:** A plugin that half-loads (skills present, `mcp.json` invalid)
 must be legible in the UI the same way a failed MCP server is

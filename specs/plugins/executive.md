@@ -35,6 +35,26 @@ lifecycle and status coverage.
 | REQ-AP-011 | Extension namespaces inert | No extension execution path |
 | REQ-AP-012 | Exact 1.1.0 schema identifiers | Unsupported manifest version rejects; incompatible MCP document disables that component |
 
+## Outstanding-thread repairs
+
+Selected-entry provenance now requires a matching stored managed entry;
+observing another same-name entry records unmanaged provenance. MCP status and
+execution share user-config collision decisions. Child processes inherit the OS
+environment without enumerating it as Unicode, and data admission performs a
+create/write/remove probe before launch. Empty stdio commands are rejected by
+the package validator. Settings includes a Plugins navigation button.
+
+Lifecycle controls reject unknown identities, retain known enable/disable
+intent, and allow removal using a validated stored entry when its manifest is
+invalid or its target is dangling. Each destructive target remains an immediate
+non-data child of the trusted root. Tests cover unsafe stored paths and preserve
+outside witnesses.
+
+CI-specific repairs replace `/root` test paths with isolated temporary roots,
+include migration 150 in the remaining image-retirement counts, and extract the
+prompt's production source before its test module rather than its first
+test-only item. These are verification repairs, not relaxed runtime contracts.
+
 ## Follow-up review verification
 
 The follow-up adds a deterministic queued-reload regression, real-socket
@@ -68,9 +88,12 @@ It does not convert local databases created by an earlier unshipped prototype
 schema. Installation timestamps were removed because they had no consumer.
 
 A failed filesystem removal can leave a disabled retained identity and an entry
-still on disk. A malformed installed manifest blocks purge; repair or manual
-entry removal is needed before purge can proceed. Do not interpret either case
-as successful uninstall. Full success-path runtime MCP reconciliation and browser
+still on disk. A malformed installed manifest blocks purge, but Remove can use
+the validated retained installation entry without following its package target.
+A genuinely absent shared root has no data to delete; purge can forget the
+retained identity without recreating the root. Dangling root/ancestor symlinks
+do not prove absence. Do not interpret a failed removal as successful uninstall.
+Full success-path runtime MCP reconciliation and browser
 mutation acceptance remain separate qualification steps.
 
 ## Cross-spec references

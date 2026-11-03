@@ -1,5 +1,33 @@
 # User-Level Agent Plugins (Agent Plugins Spec 1.1.0)
 
+## CI and outstanding threads — 2026-11-03
+
+All nine unresolved review threads on `74929d23f` have confirmed fixes:
+selected-entry provenance; non-Unicode inherited environment; settings
+navigation; user-config-shadowed MCP status; writable data admission;
+missing-root purge; invalid/dangling registered-entry removal; empty command
+validation; and rejection of unknown enable/disable identities.
+
+Lifecycle fallback validates a stored entry's parent as the trusted root and
+never follows its final package symlink. Unknown identities cannot create
+unclearable registry rows. Provenance is retained only for the same entry.
+Status and execution share one user-config collision filter. Stdio receives
+only configured/client-owned env overlays and inherits OS values losslessly.
+Data admission performs a create/write/remove probe without changing permissions.
+
+Current hosted CI failures were traced to two more stale pending-migration
+counts, `/root`-dependent cwd fixtures, and a source-guidance test truncating
+at a test-only re-export. Repairs preserve the original data/containment and
+public-contract assertions. No production failure is hidden by relaxing them.
+
+Targeted validation passes: loader 35, MCP 209, plugin runtime/API 40,
+registry/image-retirement 6, and Python API-guidance 8 tests; strict clippy
+and all ten UI/spec/structural-lint checks pass. New-head hosted CI is the
+remaining CI verification, not assumed green from those focused runs.
+Task remains in progress; ready-for-review does not imply merge,
+deployment, or complete runtime/browser acceptance. Earlier results below
+are historical checkpoints, not current-head clearance.
+
 ## Follow-up review — 2026-11-02
 
 Review: https://github.com/scottopell/phoenix-ide/pull/1017#issuecomment-6587958396
