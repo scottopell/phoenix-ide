@@ -939,6 +939,8 @@ fn sqlx_from_db_error(error: crate::DbError) -> sqlx::Error {
     match error {
         crate::DbError::Sqlx(error) => error,
         crate::DbError::ConversationNotFound(_)
+        | crate::DbError::ReminderInvalid(_)
+        | crate::DbError::ReminderRequestConflict
         | crate::DbError::ConversationTitleInvalid
         | crate::DbError::CurrentCoordinatorRequired
         | crate::DbError::ProductCreationIntentInvalid(_)

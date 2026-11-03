@@ -23,7 +23,11 @@ pub use coordinator_watches::{
 };
 pub use federation_peers::FederationPeerConnection;
 mod ddl;
+mod reminders;
 mod request_capacity;
+pub use reminders::{
+    CreateReminderInput, DueReminder, DueReminderCursor, ReminderChange, RescheduleReminderInput,
+};
 pub use request_capacity::CapacityDiagnosticRow;
 mod git_repository_reconciliation;
 mod message_attachments;
@@ -357,6 +361,10 @@ impl std::error::Error for ProjectSeedIdError {}
 
 #[derive(Error, Debug)]
 pub enum DbError {
+    #[error("Invalid reminder request: {0}")]
+    ReminderInvalid(String),
+    #[error("reminder create identity was already used with different input")]
+    ReminderRequestConflict,
     #[error("Coordinator WorkScope: {0}")]
     CoordinatorWorkScope(String),
     #[error("Database error: {0}")]

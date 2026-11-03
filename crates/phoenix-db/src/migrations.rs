@@ -782,6 +782,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "product_creation_image_retirement",
         sql: include_str!("migrations/product_creation_image_retirement.sql"),
     },
+    Migration {
+        version: 150,
+        name: "one_shot_conversation_reminders",
+        sql: include_str!("migrations/reminders.sql"),
+    },
 ];
 
 const MIGRATION_138: &str = concat!(

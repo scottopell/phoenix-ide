@@ -1,0 +1,115 @@
+-- allium: 3
+-- Reminder time eligibility only. Standard input acceptance, runtime execution,
+-- continuation and Close retain their owning contracts.
+
+use "../bedrock/bedrock.allium" as bedrock
+
+external entity Conversation {
+    id: String
+}
+
+actor DeadlineDiscovery {}
+
+entity Reminder {
+    id: String
+    conversation: Conversation
+    text: String
+    due_at_us: Integer
+    timezone: String
+    revision: Integer
+    status: scheduled | due | cancelled
+    occurred_at_us: Integer when status = due
+    cancelled_at_us: Integer when status = cancelled
+
+    transitions status {
+        scheduled -> due
+        scheduled -> cancelled
+        terminal: due, cancelled
+    }
+}
+
+surface ReminderRegistration {
+    facing owner: Conversation
+    exposes:
+        owner.id
+    provides:
+        ReminderRegistered(owner, id, text, due_at_us, timezone, now_us)
+}
+
+surface ReminderManagement {
+    facing owner: Conversation
+    context reminder: Reminder where reminder.conversation = owner
+    exposes:
+        reminder.id
+        reminder.text
+        reminder.due_at_us
+        reminder.timezone
+        reminder.revision
+        reminder.status
+    provides:
+        ReminderRescheduled(reminder, expected_revision, due_at_us, timezone, now_us)
+            when reminder.status = scheduled
+        ReminderCancelled(reminder, expected_revision, now_us)
+            when reminder.status = scheduled
+}
+
+surface ReminderDeadlines {
+    facing clock: DeadlineDiscovery
+    context reminder: Reminder
+    exposes:
+        reminder.due_at_us
+        reminder.status
+    provides:
+        ReminderDeadlineObserved(clock, reminder, now_us)
+            when reminder.status = scheduled
+}
+
+rule RegisterReminder {
+    when: ReminderRegistered(conversation, id, text, due_at_us, timezone, now_us)
+    requires: due_at_us > now_us
+    ensures: Reminder.created(
+        id: id,
+        conversation: conversation,
+        text: text,
+        due_at_us: due_at_us,
+        timezone: timezone,
+        revision: 1,
+        status: scheduled
+    )
+}
+
+rule RescheduleReminder {
+    when: ReminderRescheduled(reminder, expected_revision, due_at_us, timezone, now_us)
+    requires: reminder.status = scheduled
+    requires: reminder.revision = expected_revision
+    requires: due_at_us > now_us
+    ensures: reminder.due_at_us = due_at_us
+    ensures: reminder.timezone = timezone
+    ensures: reminder.revision = reminder.revision + 1
+}
+
+rule CancelReminder {
+    when: ReminderCancelled(reminder, expected_revision, now_us)
+    requires: reminder.status = scheduled
+    requires: reminder.revision = expected_revision
+    ensures: reminder.status = cancelled
+    ensures: reminder.cancelled_at_us = now_us
+}
+
+rule ObserveDeadline {
+    when: ReminderDeadlineObserved(_, reminder, now_us)
+    requires: reminder.status = scheduled
+    requires: reminder.due_at_us <= now_us
+    ensures: reminder.status = due
+    ensures: reminder.occurred_at_us = now_us
+}
+
+invariant PositiveRevision {
+    for reminder in Reminders:
+        reminder.revision >= 1
+}
+
+invariant DueObservationDoesNotPrecedeDeadline {
+    for reminder in Reminders where status = due:
+        reminder.occurred_at_us >= reminder.due_at_us
+}
