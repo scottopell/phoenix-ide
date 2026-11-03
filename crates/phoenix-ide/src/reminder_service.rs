@@ -5,12 +5,52 @@ use async_trait::async_trait;
 use chrono::Utc;
 use phoenix_core::domain::db_schema::SourceToolCall;
 use phoenix_core::domain::reminder::{Reminder, ReminderTimestampUs};
+use phoenix_db::workflow::LocalAuthorityResult;
 use phoenix_db::{CreateReminderInput, RescheduleReminderInput};
 use phoenix_tools::reminders::{ReminderOperation, ReminderService};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::runtime::RuntimeManager;
+use crate::runtime::{AdmittedOperation, RuntimeManager};
+
+pub(crate) struct ReminderWritePass {
+    owner: Option<AdmittedOperation>,
+    reason: &'static str,
+}
+
+impl ReminderWritePass {
+    pub(crate) fn new(owner: AdmittedOperation, reason: &'static str) -> Self {
+        Self {
+            owner: Some(owner),
+            reason,
+        }
+    }
+
+    pub(crate) fn complete<T>(
+        mut self,
+        result: LocalAuthorityResult<phoenix_db::DbResult<T>>,
+    ) -> phoenix_db::DbResult<T> {
+        match result {
+            LocalAuthorityResult::DurableFactEstablished(result) => {
+                self.owner.take();
+                result
+            }
+            LocalAuthorityResult::DurableFactUnclassified => {
+                Err(phoenix_db::DbError::Serialization(
+                    "Reminder commit could not be classified; local authority closed".into(),
+                ))
+            }
+        }
+    }
+}
+
+impl Drop for ReminderWritePass {
+    fn drop(&mut self) {
+        if let Some(owner) = &self.owner {
+            owner.close(self.reason);
+        }
+    }
+}
 
 pub(crate) fn tool(
     runtime: &Arc<RuntimeManager>,
@@ -133,38 +173,47 @@ impl HostReminderService {
             timezone,
             now_us,
         };
-        let reminder = match db.create_reminder(&input).await {
-            Ok(reminder) => reminder,
-            Err(
-                error @ (phoenix_db::DbError::ReminderInvalid(_)
-                | phoenix_db::DbError::ReminderRequestConflict),
-            ) => return Err(error.to_string()),
-            Err(error) => match db
-                .reminder_for_create_call(
-                    &self.transcript_id,
-                    &source_call.message_id,
-                    &source_call.tool_use_id,
-                    &fingerprint,
-                )
-                .await
-            {
-                Ok(Some(existing)) => existing,
-                Ok(None) => return Err(error.to_string()),
-                Err(error @ phoenix_db::DbError::ReminderRequestConflict) => {
-                    return Err(error.to_string())
-                }
-                Err(probe) => {
-                    authority.close("reminder_create_unclassified");
-                    return Err(format!(
-                        "Reminder commit could not be classified: {error}; {probe}"
-                    ));
-                }
-            },
-        };
+        let command = ReminderWritePass::new(authority, "reminder_create_unclassified");
+        let reminder = command
+            .complete(create_command(db, &input).await)
+            .map_err(|error| error.to_string())?;
         let receipt = receipt(&reminder)?;
         runtime.kick_direct_turn_worker();
         Ok(receipt)
     }
+}
+
+async fn create_command(
+    db: &phoenix_db::Database,
+    input: &CreateReminderInput,
+) -> LocalAuthorityResult<phoenix_db::DbResult<Reminder>> {
+    let result = match db.create_reminder(input).await {
+        Ok(reminder) => reminder,
+        Err(
+            error @ (phoenix_db::DbError::ReminderInvalid(_)
+            | phoenix_db::DbError::ReminderRequestConflict),
+        ) => return LocalAuthorityResult::DurableFactEstablished(Err(error)),
+        Err(error) => match db
+            .reminder_for_create_call(
+                &input.source_transcript_id,
+                &input.source_message_id,
+                &input.source_tool_use_id,
+                &input.request_fingerprint,
+            )
+            .await
+        {
+            Ok(Some(existing)) => existing,
+            Ok(None) => return LocalAuthorityResult::DurableFactEstablished(Err(error)),
+            Err(error @ phoenix_db::DbError::ReminderRequestConflict) => {
+                return LocalAuthorityResult::DurableFactEstablished(Err(error))
+            }
+            Err(probe) => {
+                tracing::error!(%error, %probe, "reminder create commit could not be classified");
+                return LocalAuthorityResult::DurableFactUnclassified;
+            }
+        },
+    };
+    LocalAuthorityResult::DurableFactEstablished(Ok(result))
 }
 
 #[async_trait]
@@ -294,29 +343,41 @@ pub(crate) async fn reschedule(
         .acquire_local_authority_pass()
         .map_err(|()| phoenix_db::DbError::ReminderInvalid("local authority is closed".into()))?;
     let db = runtime.db();
-    let result = match db.reschedule_reminder(input).await {
-        Ok(change) => change,
-        Err(error @ phoenix_db::DbError::Sqlx(_)) => {
-            let current = db
-                .get_reminder(&input.source_transcript_id, &input.reminder_id)
-                .await
-                .map_err(|probe| {
-                    authority.close("reminder_reschedule_unclassified");
-                    phoenix_db::DbError::Serialization(format!(
-                        "Reminder reschedule commit could not be classified: {error}; {probe}"
-                    ))
-                })?;
-            match rescheduled_probe(current, input) {
-                ReminderMutationProbe::Established(change) => change,
-                ReminderMutationProbe::Unapplied => return Err(error),
-            }
-        }
-        Err(error) => return Err(error),
-    };
+    let command = ReminderWritePass::new(authority, "reminder_reschedule_unclassified");
+    let result = command.complete(reschedule_command(db, input).await)?;
     if matches!(result, phoenix_db::ReminderChange::Updated { .. }) {
         runtime.kick_direct_turn_worker();
     }
     Ok(result)
+}
+
+async fn reschedule_command(
+    db: &phoenix_db::Database,
+    input: &RescheduleReminderInput,
+) -> LocalAuthorityResult<phoenix_db::DbResult<phoenix_db::ReminderChange>> {
+    let result = match db.reschedule_reminder(input).await {
+        Ok(change) => change,
+        Err(error @ phoenix_db::DbError::Sqlx(_)) => {
+            let current = match db
+                .get_reminder(&input.source_transcript_id, &input.reminder_id)
+                .await
+            {
+                Ok(current) => current,
+                Err(probe) => {
+                    tracing::error!(%error, %probe, "reminder reschedule commit could not be classified");
+                    return LocalAuthorityResult::DurableFactUnclassified;
+                }
+            };
+            match rescheduled_probe(current, input) {
+                ReminderMutationProbe::Established(change) => change,
+                ReminderMutationProbe::Unapplied => {
+                    return LocalAuthorityResult::DurableFactEstablished(Err(error))
+                }
+            }
+        }
+        Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error)),
+    };
+    LocalAuthorityResult::DurableFactEstablished(Ok(result))
 }
 
 pub(crate) async fn cancel(
@@ -330,32 +391,46 @@ pub(crate) async fn cancel(
         .acquire_local_authority_pass()
         .map_err(|()| phoenix_db::DbError::ReminderInvalid("local authority is closed".into()))?;
     let db = runtime.db();
+    let command = ReminderWritePass::new(authority, "reminder_cancel_unclassified");
+    let result = command.complete(
+        cancel_command(db, transcript_id, reminder_id, expected_revision, now_us).await,
+    )?;
+    if matches!(result, phoenix_db::ReminderChange::Updated { .. }) {
+        runtime.kick_direct_turn_worker();
+    }
+    Ok(result)
+}
+
+async fn cancel_command(
+    db: &phoenix_db::Database,
+    transcript_id: &str,
+    reminder_id: &phoenix_core::domain::reminder::ReminderId,
+    expected_revision: phoenix_core::domain::reminder::ReminderRevision,
+    now_us: ReminderTimestampUs,
+) -> LocalAuthorityResult<phoenix_db::DbResult<phoenix_db::ReminderChange>> {
     let result = match db
         .cancel_reminder(transcript_id, reminder_id, expected_revision, now_us)
         .await
     {
         Ok(change) => change,
         Err(error @ phoenix_db::DbError::Sqlx(_)) => {
-            let current = db
-                .get_reminder(transcript_id, reminder_id)
-                .await
-                .map_err(|probe| {
-                    authority.close("reminder_cancel_unclassified");
-                    phoenix_db::DbError::Serialization(format!(
-                        "Reminder cancel commit could not be classified: {error}; {probe}"
-                    ))
-                })?;
+            let current = match db.get_reminder(transcript_id, reminder_id).await {
+                Ok(current) => current,
+                Err(probe) => {
+                    tracing::error!(%error, %probe, "reminder cancel commit could not be classified");
+                    return LocalAuthorityResult::DurableFactUnclassified;
+                }
+            };
             match cancelled_probe(current, expected_revision) {
                 ReminderMutationProbe::Established(change) => change,
-                ReminderMutationProbe::Unapplied => return Err(error),
+                ReminderMutationProbe::Unapplied => {
+                    return LocalAuthorityResult::DurableFactEstablished(Err(error))
+                }
             }
         }
-        Err(error) => return Err(error),
+        Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error)),
     };
-    if matches!(result, phoenix_db::ReminderChange::Updated { .. }) {
-        runtime.kick_direct_turn_worker();
-    }
-    Ok(result)
+    LocalAuthorityResult::DurableFactEstablished(Ok(result))
 }
 
 #[cfg(test)]
@@ -441,6 +516,124 @@ mod mutation_tests {
     };
     use phoenix_db::ReminderChange;
 
+    #[tokio::test]
+    async fn reminder_abandoned_mutation_commit_closes_local_authority() {
+        for operation in [
+            AbandonedWrite::Create,
+            AbandonedWrite::Reschedule,
+            AbandonedWrite::Cancel,
+            AbandonedWrite::Promote,
+        ] {
+            abandoned_commit_closes_authority(operation).await;
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum AbandonedWrite {
+        Create,
+        Reschedule,
+        Cancel,
+        Promote,
+    }
+
+    async fn abandoned_commit_closes_authority(operation: AbandonedWrite) {
+        let db = phoenix_db::Database::open_in_memory().await.unwrap();
+        let original = saved(&db).await;
+        let runtime = manager(&db);
+        let (commit_entered, entered) = tokio::sync::oneshot::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        {
+            let mut connection = db.pool().acquire().await.unwrap();
+            let mut handle = connection.lock_handle().await.unwrap();
+            let mut commit_entered = Some(commit_entered);
+            handle.set_commit_hook(move || {
+                if let Some(entered) = commit_entered.take() {
+                    let _ = entered.send(());
+                    resume.recv().unwrap();
+                }
+                true
+            });
+        }
+        let worker_runtime = runtime.clone();
+        let original_id = original.id.clone();
+        let task = tokio::spawn(async move {
+            match operation {
+                AbandonedWrite::Create => {
+                    HostReminderService {
+                        runtime: Arc::downgrade(&worker_runtime),
+                        transcript_id: "mutation-source".into(),
+                    }
+                    .create(
+                        &worker_runtime,
+                        &SourceToolCall {
+                            message_id: "new-assistant".into(),
+                            tool_use_id: "create".into(),
+                        },
+                        ReminderText::parse("new reminder").unwrap(),
+                        phoenix_tools::reminders::ReminderWhen::After { seconds: 10 },
+                        chrono::DateTime::from_timestamp_micros(10).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                }
+                AbandonedWrite::Reschedule => {
+                    reschedule(
+                        &worker_runtime,
+                        &RescheduleReminderInput {
+                            source_transcript_id: "mutation-source".into(),
+                            reminder_id: original_id,
+                            expected_revision: original.revision,
+                            due_at_us: time(40),
+                            timezone: original.timezone,
+                            now_us: time(11),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                AbandonedWrite::Cancel => {
+                    cancel(
+                        &worker_runtime,
+                        "mutation-source",
+                        &original_id,
+                        original.revision,
+                        time(11),
+                    )
+                    .await
+                    .unwrap();
+                }
+                AbandonedWrite::Promote => {
+                    crate::reminder_delivery::deliver_pass(&worker_runtime, time(30)).await;
+                }
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let fenced = runtime.acquire_local_authority_pass().is_err();
+        release.send(()).unwrap();
+        let rows = db.list_reminders("mutation-source", 100).await.unwrap();
+        match operation {
+            AbandonedWrite::Create => assert_eq!(rows.len(), 2),
+            AbandonedWrite::Reschedule => assert_eq!(rows[0].due_at_us, time(40)),
+            AbandonedWrite::Cancel => assert!(matches!(
+                rows[0].state,
+                phoenix_core::domain::reminder::ReminderState::Cancelled { .. }
+            )),
+            AbandonedWrite::Promote => assert!(matches!(
+                rows[0].state,
+                phoenix_core::domain::reminder::ReminderState::Due { .. }
+            )),
+        }
+        assert!(
+            fenced,
+            "{operation:?} lost its typed SQLite command result without fencing admission"
+        );
+    }
+
     fn time(value: i64) -> ReminderTimestampUs {
         ReminderTimestampUs::parse(value).unwrap()
     }
@@ -472,6 +665,82 @@ mod mutation_tests {
         .await
         .unwrap()
     }
+
+    #[tokio::test]
+    async fn reminder_create_preflight_failures_do_not_close_local_authority() {
+        let db = phoenix_db::Database::open_in_memory().await.unwrap();
+        saved(&db).await;
+        let runtime = manager(&db);
+        let service = HostReminderService {
+            runtime: Arc::downgrade(&runtime),
+            transcript_id: "mutation-source".into(),
+        };
+        let source_call = SourceToolCall {
+            message_id: "new-assistant".into(),
+            tool_use_id: "create".into(),
+        };
+        assert!(service
+            .create(
+                &runtime,
+                &source_call,
+                ReminderText::parse("check").unwrap(),
+                phoenix_tools::reminders::ReminderWhen::After { seconds: 0 },
+                Utc::now()
+            )
+            .await
+            .is_err());
+        assert!(runtime.acquire_local_authority_pass().is_ok());
+        db.pool().close().await;
+        assert!(service
+            .create(
+                &runtime,
+                &source_call,
+                ReminderText::parse("check").unwrap(),
+                phoenix_tools::reminders::ReminderWhen::After { seconds: 10 },
+                Utc::now()
+            )
+            .await
+            .is_err());
+        assert!(runtime.acquire_local_authority_pass().is_ok());
+    }
+    #[tokio::test]
+    async fn reminder_completed_mutations_keep_local_authority_open() {
+        let db = phoenix_db::Database::open_in_memory().await.unwrap();
+        let original = saved(&db).await;
+        let runtime = manager(&db);
+        let input = RescheduleReminderInput {
+            source_transcript_id: "mutation-source".into(),
+            reminder_id: original.id.clone(),
+            expected_revision: original.revision,
+            due_at_us: time(40),
+            timezone: original.timezone,
+            now_us: time(11),
+        };
+        let ReminderChange::Updated { reminder } = reschedule(&runtime, &input).await.unwrap()
+        else {
+            panic!("reschedule must commit")
+        };
+        assert!(runtime.acquire_local_authority_pass().is_ok());
+        assert!(matches!(
+            reschedule(&runtime, &input).await.unwrap(),
+            ReminderChange::RevisionConflict { .. }
+        ));
+        assert!(runtime.acquire_local_authority_pass().is_ok());
+        assert!(matches!(
+            cancel(
+                &runtime,
+                "mutation-source",
+                &reminder.id,
+                reminder.revision,
+                time(12)
+            )
+            .await
+            .unwrap(),
+            ReminderChange::Updated { .. }
+        ));
+        assert!(runtime.acquire_local_authority_pass().is_ok());
+    }
+
     #[tokio::test]
     async fn reminder_management_probes_classify_committed_unchanged_and_competing_mutations() {
         let db = phoenix_db::Database::open_in_memory().await.unwrap();

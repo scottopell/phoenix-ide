@@ -13,8 +13,24 @@ use crate::{
 
 pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>, now: ReminderTimestampUs) {
     let db = runtime.db();
-    if let Err(error) = db.promote_due_reminders(now, 100).await {
-        tracing::warn!(%error, "reminder clock promotion failed; persisted facts will be rediscovered");
+    let Ok(authority) = runtime.acquire_local_authority_pass() else {
+        return;
+    };
+    let command = crate::reminder_service::ReminderWritePass::new(
+        authority,
+        "reminder_promotion_unclassified",
+    );
+    let result = match db.promote_due_reminders(now, 100).await {
+        Ok(reminders) => {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(reminders))
+        }
+        Err(error) => {
+            tracing::error!(%error, "reminder clock promotion commit could not be classified");
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified
+        }
+    };
+    if command.complete(result).is_err() {
+        return;
     }
     let service = SendChatApplicationService::new(db.clone(), runtime.clone());
     let mut cursor = None;
@@ -91,6 +107,40 @@ mod tests {
         sm_state::ConvState,
     };
     use phoenix_db::{CreateReminderInput, Database};
+
+    #[tokio::test]
+    async fn reminder_promotion_cannot_mutate_after_local_authority_closes() {
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("fenced-reminder", "fenced", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let reminder = save(&db, &source.id, "create").await;
+        let runtime = manager(&db);
+        runtime
+            .acquire_local_authority_pass()
+            .unwrap()
+            .close("test_closed");
+        deliver_pass(&runtime, time(30)).await;
+        assert_eq!(
+            db.get_reminder(&source.id, &reminder.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ReminderState::Scheduled
+        );
+        assert_eq!(count(&db, &reminder).await, 0);
+    }
+
+    #[tokio::test]
+    async fn reminder_promotion_without_a_classified_result_closes_authority() {
+        let db = Database::open_in_memory().await.unwrap();
+        let runtime = manager(&db);
+        db.pool().close().await;
+        deliver_pass(&runtime, time(30)).await;
+        assert!(runtime.acquire_local_authority_pass().is_err());
+    }
 
     fn time(value: i64) -> ReminderTimestampUs {
         ReminderTimestampUs::parse(value).unwrap()
@@ -233,37 +283,68 @@ mod tests {
     }
     #[tokio::test]
     async fn reminder_routes_to_stable_conversation_successor() {
-        let db = Database::open_in_memory().await.unwrap();
-        let source = db
-            .create_conversation("reminder-old", "old", "/tmp", true, None, None)
+        for busy in [false, true] {
+            let db = Database::open_in_memory().await.unwrap();
+            let source = db
+                .create_conversation("reminder-old", "old", "/tmp", true, None, None)
+                .await
+                .unwrap();
+            let reminder = save(&db, &source.id, "create").await;
+            db.update_conversation_state(
+                &source.id,
+                &ConvState::ContextExhausted {
+                    summary: "Continue".into(),
+                },
+            )
             .await
             .unwrap();
-        let reminder = save(&db, &source.id, "create").await;
-        db.update_conversation_state(
-            &source.id,
-            &ConvState::ContextExhausted {
-                summary: "Continue".into(),
-            },
-        )
-        .await
-        .unwrap();
-        let next = match db.continue_conversation(&source.id).await.unwrap() {
-            phoenix_db::ContinueOutcome::Created(next) => next,
-            other @ (phoenix_db::ContinueOutcome::AlreadyContinued(_)
-            | phoenix_db::ContinueOutcome::ParentNotContextExhausted { .. }) => {
-                panic!("{other:?}")
+            let next = match db.continue_conversation(&source.id).await.unwrap() {
+                phoenix_db::ContinueOutcome::Created(next) => next,
+                other @ (phoenix_db::ContinueOutcome::AlreadyContinued(_)
+                | phoenix_db::ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                    panic!("{other:?}")
+                }
+            };
+            let runtime = manager(&db);
+            if busy {
+                let state = ConvState::LlmRequesting { attempt: 1 };
+                db.update_conversation_state(&next.id, &state)
+                    .await
+                    .unwrap();
+                runtime.inject_handle_for_test(&next.id, state).await;
             }
-        };
-        deliver_pass(&manager(&db), time(30)).await;
-        let target: String = sqlx::query_scalar(
-            "SELECT conversation_id FROM durable_turns WHERE client_turn_key=?1",
-        )
-        .bind(reminder.input_message_id())
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(target, next.id);
-        assert_eq!(count(&db, &reminder).await, 1);
+            deliver_pass(&runtime, time(30)).await;
+            if busy {
+                let queue = db.get_steering_queue(&next.id).await.unwrap();
+                assert_eq!(queue.len(), 1);
+                assert_eq!(
+                    queue[0].origin,
+                    InputOrigin::ScheduledReminder {
+                        reminder_id: reminder.id.clone()
+                    }
+                );
+            } else {
+                let target: String = sqlx::query_scalar(
+                    "SELECT conversation_id FROM durable_turns WHERE client_turn_key=?1",
+                )
+                .bind(reminder.input_message_id())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                assert_eq!(target, next.id);
+                assert_eq!(count(&db, &reminder).await, 1);
+            }
+            let members = db
+                .product_conversation_member_ids(&source.id)
+                .await
+                .unwrap();
+            db.delete_conversations_atomically(&members).await.unwrap();
+            assert!(sqlx::query("PRAGMA foreign_key_check")
+                .fetch_all(db.pool())
+                .await
+                .unwrap()
+                .is_empty());
+        }
     }
     #[tokio::test]
     async fn awaiting_user_and_approval_preserve_due_until_ordinary_admission_accepts() {
