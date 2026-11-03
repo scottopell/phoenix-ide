@@ -64,6 +64,8 @@ pub struct NotificationEventSettings {
     pub error: NotificationToggle,
     #[serde(rename = "notify_idle")]
     pub idle: NotificationToggle,
+    #[serde(rename = "notify_reminder")]
+    pub reminder: NotificationToggle,
 }
 
 impl Default for NotificationEventSettings {
@@ -73,6 +75,7 @@ impl Default for NotificationEventSettings {
             question: NotificationToggle::Enabled,
             error: NotificationToggle::Enabled,
             idle: NotificationToggle::Enabled,
+            reminder: NotificationToggle::Enabled,
         }
     }
 }

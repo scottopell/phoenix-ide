@@ -45,6 +45,12 @@ describe('ConversationNav input provenance', () => {
     expect(units).toHaveLength(3);
   });
 
+  it('identifies persisted reminder inputs in chapter navigation', () => {
+    render(<ConversationNav chapters={[{ unitIndex: 3, sequenceId: 4, kind: 'prompt', target: { kind: 'persisted', messageId: 'reminder-input', transcriptId: 'c' }, label: 'Inspect Safari', origin: { kind: 'scheduled_reminder', reminder_id: 'saved-id' } }]} activeUnitIndex={3} onJump={vi.fn()} />);
+    expect(screen.getByRole('button', { name: 'Saved reminder saved-id: Inspect Safari' })).toHaveClass('meta');
+    expect(screen.getByText('Scheduled reminder · Inspect Safari')).toBeInTheDocument();
+  });
+
   it('distinguishes channels visually and accessibly without shifting the unit jump target', () => {
     const onJump = vi.fn();
     render(<ConversationNav chapters={chapters} activeUnitIndex={2} onJump={onJump} />);

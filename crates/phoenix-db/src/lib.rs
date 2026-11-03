@@ -3755,6 +3755,7 @@ impl Database {
                 "notify_question" => settings.events.question = parsed.into(),
                 "notify_error" => settings.events.error = parsed.into(),
                 "notify_idle" => settings.events.idle = parsed.into(),
+                "notify_reminder" => settings.events.reminder = parsed.into(),
                 _ => {}
             }
         }
@@ -3775,6 +3776,7 @@ impl Database {
             ("notify_question", settings.events.question.as_bool()),
             ("notify_error", settings.events.error.as_bool()),
             ("notify_idle", settings.events.idle.as_bool()),
+            ("notify_reminder", settings.events.reminder.as_bool()),
         ];
         for (key, enabled) in pairs {
             sqlx::query(

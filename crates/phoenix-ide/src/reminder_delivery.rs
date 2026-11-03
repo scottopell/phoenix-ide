@@ -53,10 +53,10 @@ pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>, now: ReminderTim
                     | SendChatOutcome::QueuedAsSteering,
                 ) => {}
                 Ok(SendChatOutcome::Rejected { message, code }) => {
-                    tracing::debug!(reminder_id=%row.reminder.id.as_str(),code,%message,"reminder admission refused; retrying through ordinary admission")
+                    tracing::debug!(reminder_id=%row.reminder.id.as_str(),code,%message,"reminder admission refused; retrying through ordinary admission");
                 }
                 Err(error) => {
-                    tracing::warn!(reminder_id=%row.reminder.id.as_str(),%error,"reminder admission failed; retrying")
+                    tracing::warn!(reminder_id=%row.reminder.id.as_str(),%error,"reminder admission failed; retrying");
                 }
             }
         }

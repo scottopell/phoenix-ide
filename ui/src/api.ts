@@ -1,3 +1,6 @@
+import type { Reminder } from './generated/Reminder';
+import type { ReminderFeedResponse } from './generated/ReminderFeedResponse';
+import type { ReminderFeedCursor } from './generated/ReminderFeedCursor';
 import { observeViewResponse, type ViewResponseObserver } from './hooks/conversationViewResponse';
 
 type HistoryRequestCorrelation = { open_id?: string; request_id?: never } | { request_id: string; open_id?: never };
@@ -1153,6 +1156,7 @@ export interface NotificationSettings {
   notify_question: boolean;
   notify_error: boolean;
   notify_idle: boolean;
+  notify_reminder: boolean;
 }
 
 /** Global default LLM language for new conversations. The selected
@@ -1527,6 +1531,35 @@ export const api = {
       }
       throw new Error(detail);
     }
+  },
+
+  async listReminders(id: string, signal?: AbortSignal): Promise<Reminder[]> {
+    const response = await fetch(`/api/conversations/${encodeURIComponent(id)}/reminders`, { signal: signal ?? null });
+    if (!response.ok) throw new Error('Failed to load reminders');
+    return response.json();
+  },
+
+  async manageReminder(id: string, reminderId: string, operation: 'cancel' | 'reschedule', expectedRevision: number, when?: { kind: 'at'; local_datetime: string; timezone: string; utc_offset: string | null }): Promise<void> {
+    const response = await fetch(`/api/conversations/${encodeURIComponent(id)}/reminders/${encodeURIComponent(reminderId)}/${operation}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ expected_revision: expectedRevision, ...(when ? { when } : {}) }),
+    });
+    if (!response.ok) {
+      const detail = await response.json().catch(() => ({})) as { kind?: string; error?: string };
+      const message = detail.kind === 'already_due' ? 'This reminder is already due and cannot be retracted.'
+        : detail.kind === 'revision_conflict' ? 'This reminder changed. Review its current time before trying again.'
+        : detail.kind === 'already_cancelled' ? 'This reminder is already cancelled.'
+        : detail.kind === 'not_found' ? 'Reminder not found in this conversation.'
+        : detail.error ?? 'Failed to update reminder';
+      throw new ApiResponseError(message, response.status);
+    }
+  },
+
+  async reminderDueFeed(cursor: ReminderFeedCursor | null, signal?: AbortSignal): Promise<ReminderFeedResponse> {
+    const query = cursor ? `?after_due_at_us=${cursor.due_at_us}&after_id=${encodeURIComponent(cursor.reminder_id)}` : '';
+    const response = await fetch(`/api/reminders/due${query}`, { signal: signal ?? null });
+    if (!response.ok) throw new Error('Failed to refresh reminder notifications');
+    return response.json();
   },
 
   async getNotificationSettings(): Promise<NotificationSettings> {

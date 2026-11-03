@@ -708,10 +708,10 @@ export function buildConversationSearchProjection(
             addConversationSource(sources, unitIndex, unit.kind, unit.key, fragmentId, text, fragmentId, { kind: 'message-text', fragmentId });
           }
         }
-        addConversationMessageSources(sources, unitIndex, unit.kind, unit.key, 'user-message', userMessageParts(unit.message));
+        addConversationMessageSources(sources, unitIndex, unit.kind, unit.key, unit.message.origin?.kind === 'scheduled_reminder' ? 'scheduled-reminder' : 'user-message', userMessageParts(unit.message));
         break;
       case 'pending_user':
-        addConversationMessageSources(sources, unitIndex, unit.kind, unit.key, 'pending-user-message', queuedMessageParts(unit.message));
+        addConversationMessageSources(sources, unitIndex, unit.kind, unit.key, unit.message.origin?.kind === 'scheduled_reminder' ? 'pending-scheduled-reminder' : 'pending-user-message', queuedMessageParts(unit.message));
         break;
       case 'skill':
         addConversationMessageSources(sources, unitIndex, unit.kind, unit.key, 'skill-message', skillMessageParts(unit.message));

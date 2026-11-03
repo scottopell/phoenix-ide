@@ -20,6 +20,7 @@ REST/JSON plus SSE. The conversation SSE stream is specified to carry root-keyed
 | **REQ-API-002:** Conversation Creation | Slug: day-time-word-word format | Implemented; durable creation cutover incomplete |
 | **REQ-API-003:** Message Retrieval | GET with `after_sequence` param | Implemented |
 | **REQ-API-004:** User Actions | POST chat, cancel endpoints | Implemented |
+| **REQ-API-032:** Reminder visibility and management | Owner reminder list, cancel/reschedule and global recent-due feed | Implemented; three focused API tests pass; integrated browser QA pending |
 | **REQ-API-031:** Explicit Public Literal Chat | `/chat` opt-in, closed policy, known receiver, policy-proven replay | Authored; offline qualification only, Rust/E2E execution pending |
 | **REQ-API-005:** Real-time Streaming | SSE with init, token events (`request_id` for correlation), replay-backed reconnection | Implemented |
 | **REQ-API-006:** Conversation Lifecycle | Archive, delete, rename | Partially implemented against current norms: archive/delete/rename ship, but unified Close/Open/History lifecycle does not |

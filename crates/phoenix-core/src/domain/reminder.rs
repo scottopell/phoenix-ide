@@ -2,6 +2,7 @@
 //! REQ-REM-001, REQ-REM-003, REQ-REM-004, REQ-REM-006.
 
 use serde::{Deserialize, Deserializer, Serialize};
+use ts_rs::TS;
 
 use super::product_conversation::ProductConversationId;
 
@@ -19,8 +20,9 @@ pub enum ReminderValueError {
     InvalidTimezone,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, TS)]
 #[serde(transparent)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ReminderId(String);
 
 impl ReminderId {
@@ -46,8 +48,9 @@ impl<'de> Deserialize<'de> for ReminderId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 #[serde(transparent)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ReminderText(String);
 
 impl ReminderText {
@@ -73,8 +76,9 @@ impl<'de> Deserialize<'de> for ReminderText {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 #[serde(transparent)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ReminderTimezone(String);
 
 impl ReminderTimezone {
@@ -100,9 +104,10 @@ impl<'de> Deserialize<'de> for ReminderTimezone {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, TS)]
 #[serde(transparent)]
-pub struct ReminderTimestampUs(i64);
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ReminderTimestampUs(#[ts(type = "number")] i64);
 
 impl ReminderTimestampUs {
     /// # Errors
@@ -126,9 +131,10 @@ impl<'de> Deserialize<'de> for ReminderTimestampUs {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
 #[serde(transparent)]
-pub struct ReminderRevision(i64);
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ReminderRevision(#[ts(type = "number")] i64);
 
 impl ReminderRevision {
     pub const INITIAL: Self = Self(1);
@@ -154,8 +160,9 @@ impl<'de> Deserialize<'de> for ReminderRevision {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub enum ReminderState {
     Scheduled,
     Due {
@@ -166,9 +173,11 @@ pub enum ReminderState {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct Reminder {
     pub id: ReminderId,
+    #[ts(type = "string")]
     pub product_conversation_id: ProductConversationId,
     pub text: ReminderText,
     pub due_at_us: ReminderTimestampUs,
@@ -183,6 +192,30 @@ impl Reminder {
     pub fn input_message_id(&self) -> String {
         format!("reminder:{}:{}", self.id.as_str(), self.revision.get())
     }
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ReminderNotification {
+    pub reminder: Reminder,
+    pub target: ReminderNotificationTarget,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ReminderNotificationTarget {
+    pub id: String,
+    pub slug: Option<String>,
+    pub title: Option<String>,
+    pub kind: ReminderNotificationTargetKind,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ReminderNotificationTargetKind {
+    Ordinary,
+    Coordinator,
 }
 
 #[cfg(test)]

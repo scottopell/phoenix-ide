@@ -460,6 +460,11 @@ function NotificationsSection() {
           />
           Long task finished
         </label>
+        <label className="settings-checkbox">
+          <input type="checkbox" checked={settings.notify_reminder}
+            onChange={(event) => setFlag('notify_reminder', event.target.checked)} />
+          Reminder due
+        </label>
       </div>
       {saving && <div className="settings-section__hint">Saving…</div>}
       {error && <div className="settings-section__error">{error}</div>}

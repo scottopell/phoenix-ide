@@ -124,6 +124,16 @@ async fn reminders_coordinator_owns_reminders_and_subagent_role_is_rejected() {
         coordinator.id
     );
 
+    let feed = db
+        .reminder_notification_feed(time(0), None, 10)
+        .await
+        .unwrap();
+    assert_eq!(feed[0].target.id, coordinator.id);
+    assert!(matches!(
+        feed[0].target.kind,
+        phoenix_core::domain::reminder::ReminderNotificationTargetKind::Coordinator
+    ));
+
     let parent = source(&db, "reminder-actor-parent").await;
     sqlx::query(
         "INSERT INTO conversations (id, product_conversation_id, slug, title,
@@ -554,4 +564,119 @@ async fn reminders_reused_provider_tool_id_in_distinct_assistant_messages_is_a_n
         .unwrap(),
         Some(b)
     );
+}
+
+#[tokio::test]
+async fn reminders_notification_feed_includes_accepted_due_and_follows_current_target() {
+    let db = Database::open_in_memory().await.unwrap();
+    let owner = source(&db, "feed-owner").await;
+    let a = db
+        .create_reminder(&input(&owner.id, "a", 20))
+        .await
+        .unwrap();
+    db.create_reminder(&input(&owner.id, "b", 21))
+        .await
+        .unwrap();
+    db.promote_due_reminders(time(30), 10).await.unwrap();
+    sqlx::query("INSERT INTO steering_acceptance_receipts (conversation_id, message_id, request_fingerprint) VALUES (?1, ?2, ?3)")
+        .bind(&owner.id).bind(a.input_message_id()).bind("request").execute(db.pool()).await.unwrap();
+    let first = db
+        .reminder_notification_feed(time(0), None, 1)
+        .await
+        .unwrap();
+    assert_eq!(first[0].reminder.id, a.id);
+    assert_eq!(first[0].target.id, owner.id);
+    let cursor = DueReminderCursor {
+        due_at_us: first[0].reminder.due_at_us,
+        reminder_id: first[0].reminder.id.clone(),
+    };
+    let second = db
+        .reminder_notification_feed(time(0), Some(&cursor), 1)
+        .await
+        .unwrap();
+    assert_ne!(first[0].reminder.id, second[0].reminder.id);
+    db.update_conversation_state(
+        &owner.id,
+        &crate::ConvState::ContextExhausted {
+            summary: "Continue".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let next = match db.continue_conversation(&owner.id).await.unwrap() {
+        crate::ContinueOutcome::Created(next) => next,
+        other => panic!("{other:?}"),
+    };
+    let continued_feed = db
+        .reminder_notification_feed(time(0), None, 10)
+        .await
+        .unwrap();
+    assert!(continued_feed
+        .iter()
+        .all(|item| item.target.id == next.id && item.target.slug == next.slug));
+    assert!(db
+        .reminder_notification_feed(time(31), None, 100)
+        .await
+        .unwrap()
+        .is_empty());
+    sqlx::query("UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1")
+        .bind(owner.product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(db
+        .reminder_notification_feed(time(0), None, 100)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(db.list_reminders(&owner.id, 10).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn reminders_notification_setting_defaults_and_survives_file_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("notification-settings.db");
+    let path = path.to_str().unwrap();
+    let db = file_db(path).await;
+    let mut settings = db.get_notification_settings().await.unwrap();
+    assert!(settings.events.reminder.as_bool());
+    settings.events.reminder = false.into();
+    db.set_notification_settings(&settings).await.unwrap();
+    db.pool().close().await;
+    let reopened = file_db(path).await;
+    assert!(!reopened
+        .get_notification_settings()
+        .await
+        .unwrap()
+        .events
+        .reminder
+        .as_bool());
+}
+
+#[tokio::test]
+async fn reminders_owner_sections_cannot_crowd_out_due_cards() {
+    let db = Database::open_in_memory().await.unwrap();
+    let owner = source(&db, "bounded-owner").await;
+    let due = db
+        .create_reminder(&input(&owner.id, "due", 20))
+        .await
+        .unwrap();
+    db.promote_due_reminders(time(20), 10).await.unwrap();
+    db.create_reminder(&input(&owner.id, "future-a", 100))
+        .await
+        .unwrap();
+    db.create_reminder(&input(&owner.id, "future-b", 101))
+        .await
+        .unwrap();
+    let cancelled = db
+        .create_reminder(&input(&owner.id, "cancelled", 102))
+        .await
+        .unwrap();
+    db.cancel_reminder(&owner.id, &cancelled.id, cancelled.revision, time(30))
+        .await
+        .unwrap();
+    let rows = db.list_reminders(&owner.id, 1).await.unwrap();
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().any(|row| row.id == due.id));
+    assert!(rows.iter().any(|row| row.id == cancelled.id));
 }

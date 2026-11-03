@@ -188,10 +188,10 @@ impl ReminderService for HostReminderService {
             }
             ReminderOperation::List {} => {
                 let reminders = db
-                    .list_reminders(&self.transcript_id, 100)
+                    .list_reminders(&self.transcript_id, 10)
                     .await
                     .map_err(|e| e.to_string())?;
-                json!({"current_utc":now.to_rfc3339(),"reminders":reminders.iter().map(receipt).collect::<Result<Vec<_>, _>>()?,"limit":100})
+                json!({"current_utc":now.to_rfc3339(),"reminders":reminders.iter().map(receipt).collect::<Result<Vec<_>, _>>()?,"limit_per_state":10})
             }
             ReminderOperation::Reschedule {
                 reminder_id,

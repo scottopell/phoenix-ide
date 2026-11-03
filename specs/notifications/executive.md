@@ -42,11 +42,13 @@ Browser desktop notifications are implemented with the same completed status as 
 | **REQ-NOTIF-008:** Catch Me Up When I Reconnect After a Disconnect | ✅ Complete | Catch-up is implemented against the current conversation-list architecture: successful list refreshes populate `ConversationStore`, and `DesktopLayout` scans active top-level conversations for currently blocking states. |
 | **REQ-NOTIF-009:** Settings That Survive Browser Clears + Server Restarts | ✅ Complete | Preferences are stored server-side in the durable `notification_settings` SQLite table via `GET/PUT /api/settings/notifications`; the frontend does not use localStorage for notification preferences. |
 
-**Progress:** 9 of 9 complete. Browser desktop notifications are implemented with server-persisted preferences, focus gating, live transition notifications, list-refresh catch-up, notification click navigation, and conversation-open acknowledgement of live notifications owned by the current page.
+| **REQ-NOTIF-010:** Connected-page reminder alerts | Implemented; integrated QA pending | Dedicated reminder identity, quiet initial baseline, current target routing, server-persisted toggle and focus/permission gates; focused policy/feed tests. |
+
+**Progress:** Existing nine notification requirements are complete; REQ-NOTIF-010 reminder integration is implemented with focused validation and awaits integrated browser QA. Browser desktop notifications are implemented with server-persisted preferences, focus gating, live transition notifications, list-refresh catch-up, notification click navigation, and conversation-open acknowledgement of live notifications owned by the current page.
 
 ## Behavioural Specification
 
-`specs/notifications/notifications.allium` models the configuration entity, the four browser-notification event types, the master+per-event-toggle gating, the tab-focus gate, the SSE-reconnect catch-up rule, notification click navigation, and conversation-open acknowledgement. In-app toasts are not modelled formally — they're stateless render-and-dismiss UI with no transition graph worth capturing.
+`specs/notifications/notifications.allium` models the configuration entity, conversation-state browser notifications and connected-page reminder alerts, the master+per-event-toggle gating, the tab-focus gate, the SSE-reconnect catch-up rule, notification click navigation, and conversation-open acknowledgement. In-app toasts are not modelled formally — they're stateless render-and-dismiss UI with no transition graph worth capturing.
 
 ## Cross-Spec Cross-References
 
@@ -54,3 +56,8 @@ Browser desktop notifications are implemented with the same completed status as 
 - `specs/bedrock/`: the phase transitions that map to notification events (`awaiting_task_approval`, `awaiting_user_response`, `error`, `context_exhausted`, busy → idle) are owned there.
 - `specs/conversation-ui/`: the toast container is mounted in the desktop layout (`DesktopLayout.tsx:111`) and on the conversation list page; the settings panel for notifications would live in the same chrome.
 - `specs/terminal-panel/` (REQ-TPANEL-006): the partial note for "Let Phoenix set this up" called out that assist-setup failures only hit `console.error`. Closed by routing through `useToast.showError` (`TerminalPanel.tsx`); REQ-NOTIF-002 is the canonical visible-error mechanism.
+
+
+## Reminder notification integration
+
+REQ-NOTIF-010 uses the global DesktopLayout reminder feed and a dedicated `reminder_due` event through the existing permission/settings/focus policy. Initial recent history establishes a quiet baseline; new occurrences dedupe by saved reminder ID separately from blocking attention. The server KV notification preferences add `notify_reminder`, enabled for an absent key and persisted through ordinary settings updates. Feed targets carry actual ordinary/Coordinator navigation identity, with no fabricated Conversation model. The one-day feed window follows observed occurrence time; durable cards remain queryable beyond that window and after input/model failure. Focused policy, routing, late-observation refresh and persistence tests are included; integrated browser acceptance is pending.

@@ -250,19 +250,30 @@ impl Database {
         Ok(reminder)
     }
 
-    /// Read a bounded reminder list owned by the caller's stable conversation.
+    /// Read at most `per_state_limit` reminders independently for each state, owned by the caller.
     /// # Errors
     /// Returns owner validation or database errors.
-    pub async fn list_reminders(&self, transcript_id: &str, limit: u32) -> DbResult<Vec<Reminder>> {
+    pub async fn list_reminders(
+        &self,
+        transcript_id: &str,
+        per_state_limit: u32,
+    ) -> DbResult<Vec<Reminder>> {
         let mut tx = self.pool.begin().await?;
         let owner = owner_tx(&mut tx, transcript_id).await?;
         let rows = sqlx::query(
-            "SELECT * FROM reminders WHERE product_conversation_id = ?1
-             ORDER BY CASE state WHEN 'scheduled' THEN 0 WHEN 'due' THEN 1 ELSE 2 END,
-                due_at_us, id LIMIT ?2",
+            "SELECT * FROM (
+                SELECT * FROM reminders WHERE product_conversation_id = ?1 AND state = 'scheduled'
+                ORDER BY due_at_us, id LIMIT ?2
+             ) UNION ALL SELECT * FROM (
+                SELECT * FROM reminders WHERE product_conversation_id = ?1 AND state = 'due'
+                ORDER BY occurred_at_us DESC, id LIMIT ?2
+             ) UNION ALL SELECT * FROM (
+                SELECT * FROM reminders WHERE product_conversation_id = ?1 AND state = 'cancelled'
+                ORDER BY cancelled_at_us DESC, id LIMIT ?2
+             )",
         )
         .bind(owner.as_str())
-        .bind(i64::from(limit.clamp(1, 100)))
+        .bind(i64::from(per_state_limit.clamp(1, 100)))
         .fetch_all(&mut *tx)
         .await?;
         let reminders = rows.iter().map(decode).collect::<DbResult<Vec<_>>>()?;
@@ -398,6 +409,55 @@ impl Database {
                 Ok(DueReminder {
                     reminder: decode(row)?,
                     transcript_id: row.try_get("current_transcript_id")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Read a bounded recent due feed, including occurrences already accepted by input admission.
+    /// # Errors
+    /// Returns database or persisted-shape errors.
+    pub async fn reminder_notification_feed(
+        &self,
+        since: ReminderTimestampUs,
+        after: Option<&DueReminderCursor>,
+        limit: u32,
+    ) -> DbResult<Vec<phoenix_core::domain::reminder::ReminderNotification>> {
+        use phoenix_core::domain::reminder::{
+            ReminderNotification, ReminderNotificationTarget, ReminderNotificationTargetKind,
+        };
+        let sql = format!(
+            "SELECT r.*, c.id AS target_id, c.slug AS target_slug, c.title AS target_title, p.kind AS target_kind
+             FROM reminders r JOIN product_conversations p ON p.id = r.product_conversation_id
+             JOIN conversations c ON c.product_conversation_id = p.id
+               AND c.parent_conversation_id IS NULL AND c.continued_in_conv_id IS NULL
+               AND ((p.kind = 'ordinary' AND c.runtime_role = 'user')
+                 OR (p.kind = 'coordinator' AND c.runtime_role = 'coordinator' AND c.coordinator_head = 1))
+             WHERE r.state = 'due' AND {ELIGIBLE} AND r.occurred_at_us >= ?1
+               AND (?2 IS NULL OR (r.due_at_us, r.id) > (?2, ?3))
+             ORDER BY r.due_at_us, r.id LIMIT ?4"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(since.get())
+            .bind(after.map(|c| c.due_at_us.get()))
+            .bind(after.map(|c| c.reminder_id.as_str()))
+            .bind(i64::from(limit.clamp(1, 100)))
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(|row| {
+                Ok(ReminderNotification {
+                    reminder: decode(row)?,
+                    target: ReminderNotificationTarget {
+                        id: row.try_get("target_id")?,
+                        slug: row.try_get("target_slug")?,
+                        title: row.try_get("target_title")?,
+                        kind: match row.try_get::<String, _>("target_kind")?.as_str() {
+                            "ordinary" => ReminderNotificationTargetKind::Ordinary,
+                            "coordinator" => ReminderNotificationTargetKind::Coordinator,
+                            _ => return Err(invalid("invalid reminder target kind")),
+                        },
+                    },
                 })
             })
             .collect()

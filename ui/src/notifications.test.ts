@@ -100,6 +100,7 @@ describe('Coordinator notification routing', () => {
     registerCoordinatorForNotifications('coordinator-id');
     expect(notificationRoute({ id: 'coordinator-id', slug: 'coordinator' }))
       .toBe('/global/coordinator-id');
+    expect(notificationRoute({ id: 'feed-coordinator', slug: null, kind: 'coordinator' })).toBe('/global/feed-coordinator');
     expect(notificationRoute({ id: 'ordinary-id', slug: 'ordinary' }))
       .toBe('/c/ordinary');
   });
