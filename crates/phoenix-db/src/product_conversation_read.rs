@@ -1896,9 +1896,8 @@ mod tests {
             .unwrap()
             .iter()
             .map(|row| {
-                assert_eq!(row.len(), 17);
                 let mut value = serde_json::Map::new();
-                for column in [
+                let text_columns = [
                     "message_id",
                     "conversation_id",
                     "message_type",
@@ -1915,14 +1914,17 @@ mod tests {
                     "origin_reminder_id",
                     "origin_source_message_id",
                     "origin_source_tool_use_id",
-                ] {
+                ];
+                let integer_columns = ["sequence_id", "ordinal"];
+                assert_eq!(row.len(), text_columns.len() + integer_columns.len());
+                for column in text_columns {
                     value.insert(
                         column.into(),
                         serde_json::to_value(row.try_get::<Option<String>, _>(column).unwrap())
                             .unwrap(),
                     );
                 }
-                for column in ["sequence_id", "ordinal"] {
+                for column in integer_columns {
                     value.insert(column.into(), row.try_get::<i64, _>(column).unwrap().into());
                 }
                 serde_json::Value::Object(value)
