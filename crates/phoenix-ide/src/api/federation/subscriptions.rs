@@ -846,6 +846,16 @@ async fn drain_notifications(
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) async fn drain_notifications_for_test(
+    db: &Database,
+    runtime: &Arc<RuntimeManager>,
+    remote: &RemoteSubscription,
+    peer: Option<&FederationPeerConnection>,
+) -> Result<(), String> {
+    drain_notifications(db, runtime, remote, peer).await
+}
+
 pub(crate) const SYNC_PASS_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[derive(Default)]

@@ -518,7 +518,7 @@ async fn stage_one(
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn cancel_close_keeps_authorization_retryable_and_future_watch_active() {
+async fn repeated_refresh_keeps_authorization_retryable_and_future_watch_active() {
     use phoenix_core::domain::close::{CloseCompletionOutcome, TranscriptConversationId};
     let a = TestInstance::start().await;
     let b = TestInstance::start().await;
@@ -565,12 +565,30 @@ async fn cancel_close_keeps_authorization_retryable_and_future_watch_active() {
             navigation: None,
         }
     ));
-    sync_once(&a.state.db, &a.state.runtime, &remote)
-        .await
-        .unwrap();
+    for _ in 0..3 {
+        sync_once(&a.state.db, &a.state.runtime, &remote)
+            .await
+            .unwrap();
+        let row = refreshed(&a, &remote).await;
+        assert_eq!(row.state, SubscriptionState::Active);
+        assert_eq!(row.admitted_cursor, SubscriptionCursor::START);
+        let pending = a
+            .state
+            .db
+            .pending_remote_notifications(&row)
+            .await
+            .unwrap();
+        assert!(matches!(
+            pending.as_slice(),
+            [phoenix_db::federation_subscriptions::RemoteNotification {
+                content: SubscriptionDelivery::Fact { .. },
+                disposition:
+                    phoenix_db::federation_subscriptions::RemoteNotificationDisposition::Authorizing,
+                ..
+            }]
+        ));
+    }
     let row = refreshed(&a, &remote).await;
-    assert_eq!(row.state, SubscriptionState::Active);
-    assert_eq!(row.admitted_cursor, SubscriptionCursor::START);
     let cancelled = b
         .state
         .db
@@ -602,6 +620,152 @@ async fn cancel_close_keeps_authorization_retryable_and_future_watch_active() {
         row.admitted_cursor.get(),
         2,
         "a cancelled Close must not end future observation"
+    );
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn failed_gap_repeated_refresh_exhausts_before_gap_exposure() {
+    use phoenix_core::domain::close::TranscriptConversationId;
+    use phoenix_db::federation_subscriptions::{
+        RemoteNotificationDisposition, RemoteSuppressionReason,
+    };
+
+    let a = TestInstance::start().await;
+    let b = TestInstance::start().await;
+    let peer = a.connect_to(&b).await;
+    let source = source(&b).await;
+    let remote = create_saved_peer_subscription(
+        &a.state.db,
+        peer.peer_instance_id.to_string(),
+        source.product_conversation_id.clone(),
+        None,
+    )
+    .await
+    .unwrap()
+    .subscription;
+    commit_terminal(&b, &source, TerminalFactOutcome::Completed).await;
+    let fact = stage_one(&a, &b, &peer, &remote).await;
+    b.state
+        .db
+        .begin_close_foundation(
+            &source.product_conversation_id,
+            &TranscriptConversationId::parse(&source.id).unwrap(),
+            "failed-gap-refresh-close",
+        )
+        .await
+        .unwrap();
+
+    let failed_at_us = chrono::Utc::now().timestamp_micros();
+    a.state
+        .db
+        .stage_remote_replay(
+            &remote,
+            &SubscriptionReplay::Gap {
+                gap: SubscriptionGap {
+                    last_acknowledged: SubscriptionCursor::START,
+                    last_produced: SubscriptionCursor::try_from(1).unwrap(),
+                    reason: GapReason::DisconnectedAge,
+                    failed_at_us,
+                    terminal_evidence_expires_at_us: failed_at_us
+                        + TERMINAL_EVIDENCE_LIFETIME_US,
+                    snapshot: SubscriptionSnapshot {
+                        transcript_id: TranscriptConversationId::parse(&source.id).unwrap(),
+                        state: SubscriptionCurrentState::Terminal {
+                            outcome: TerminalFactOutcome::Completed,
+                        },
+                    },
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let failed = refreshed(&a, &remote).await;
+    assert_eq!(failed.state, SubscriptionState::FailedGap);
+
+    for expected_attempt in 1..=3 {
+        drain_notifications_for_test(
+            &a.state.db,
+            &a.state.runtime,
+            &failed,
+            Some(&peer),
+        )
+        .await
+        .unwrap();
+        let pending = a
+            .state
+            .db
+            .pending_remote_notifications(&failed)
+            .await
+            .unwrap();
+        assert!(matches!(
+            pending.as_slice(),
+            [phoenix_db::federation_subscriptions::RemoteNotification {
+                content: SubscriptionDelivery::Fact { .. },
+                disposition: RemoteNotificationDisposition::Authorizing,
+                ..
+            }]
+        ));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT terminal_settlement_attempts FROM federation_remote_admissions WHERE admission_id = ?1"
+            )
+            .bind(&fact.admission_id)
+            .fetch_one(a.state.db.pool())
+            .await
+            .unwrap(),
+            expected_attempt
+        );
+    }
+
+    drain_notifications_for_test(&a.state.db, &a.state.runtime, &failed, Some(&peer))
+        .await
+        .unwrap();
+    let pending_gap = a
+        .state
+        .db
+        .pending_remote_notifications(&failed)
+        .await
+        .unwrap();
+    assert!(matches!(
+        pending_gap.as_slice(),
+        [phoenix_db::federation_subscriptions::RemoteNotification {
+            content: SubscriptionDelivery::Gap { .. },
+            disposition: RemoteNotificationDisposition::Pending,
+            ..
+        }]
+    ));
+    let history = a
+        .state
+        .db
+        .remote_notification_history(&failed, SubscriptionCursor::START)
+        .await
+        .unwrap();
+    assert!(matches!(
+        history[0].disposition,
+        RemoteNotificationDisposition::Suppressed {
+            reason: RemoteSuppressionReason::SourceUnreachable
+        }
+    ));
+
+    drain_notifications_for_test(&a.state.db, &a.state.runtime, &failed, None)
+        .await
+        .unwrap();
+    let history = a
+        .state
+        .db
+        .remote_notification_history(&failed, SubscriptionCursor::START)
+        .await
+        .unwrap();
+    assert!(matches!(
+        history[1].disposition,
+        RemoteNotificationDisposition::Accepted { .. }
+    ));
+    assert_eq!(
+        refreshed(&a, &remote).await.admitted_cursor,
+        SubscriptionCursor::START
     );
     a.stop().await;
     b.stop().await;
