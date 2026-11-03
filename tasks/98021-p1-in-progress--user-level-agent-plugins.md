@@ -18,12 +18,17 @@ Data admission performs a create/write/remove probe without changing permissions
 Current hosted CI failures were traced to two more stale pending-migration
 counts, `/root`-dependent cwd fixtures, and a source-guidance test truncating
 at a test-only re-export. Repairs preserve the original data/containment and
-public-contract assertions. No production failure is hidden by relaxing them.
+public-contract assertions. A wider Goal integration probe found one further
+exact-ledger expectation; it now includes migration 150 and passes. No
+production failure is hidden by relaxing these assertions.
 
 Targeted validation passes: loader 35, MCP 209, plugin runtime/API 40,
 registry/image-retirement 6, and Python API-guidance 8 tests; strict clippy
 and all ten UI/spec/structural-lint checks pass. New-head hosted CI is the
 remaining CI verification, not assumed green from those focused runs.
+All nine GitHub review threads have evidence replies and are resolved. Two
+separate macOS runtime fixtures still reject `/var` aliases as non-normalized
+paths; they are not claimed fixed or classified as baseline by these changes.
 Task remains in progress; ready-for-review does not imply merge,
 deployment, or complete runtime/browser acceptance. Earlier results below
 are historical checkpoints, not current-head clearance.
