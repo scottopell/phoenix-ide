@@ -1281,6 +1281,8 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
         | crate::db::DbError::DirectTurnConflict(_)
         | crate::db::DbError::GitRepositoryWorkScopeProjectConflict { .. }
         | crate::db::DbError::FederationSendAuthorityInactive
+        | crate::db::DbError::FederationPeerNotFound
+        | crate::db::DbError::FederationPeerAmbiguous
         | crate::db::DbError::FederationSteeringDuplicate
         | crate::db::DbError::DormantGitRepositoryCatchupPermitTargetMismatch
         | crate::db::DbError::DormantGitRepositoryCatchupStaleOperation
@@ -1343,6 +1345,8 @@ fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceErr
         | crate::db::DbError::ForkProposalConflict(_)
         | crate::db::DbError::GitRepositoryWorkScopeProjectConflict { .. }
         | crate::db::DbError::FederationSendAuthorityInactive
+        | crate::db::DbError::FederationPeerNotFound
+        | crate::db::DbError::FederationPeerAmbiguous
         | crate::db::DbError::FederationSteeringDuplicate
         | crate::db::DbError::DormantGitRepositoryCatchupPermitTargetMismatch
         | crate::db::DbError::DormantGitRepositoryCatchupStaleOperation

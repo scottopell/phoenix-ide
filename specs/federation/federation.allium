@@ -52,12 +52,44 @@ enum ConsumerEventState {
     received
     | admitted
     | acknowledged
+    | suppressed
 }
 
 enum GapReason {
     event_limit
     | byte_limit
     | disconnected_age
+}
+
+enum TerminalFactOutcome {
+    completed
+    | failed
+    | cancelled
+}
+
+enum TerminalEvidenceState {
+    retained
+    | released
+}
+
+enum TerminalEvidenceReleaseReason {
+    settled
+    | trust_revoked
+    | source_closed
+    | subscription_replaced
+    | expired
+}
+
+enum PrefixSettlementReason {
+    authorization_denied
+    | trust_revoked
+    | source_unreachable
+    | evidence_expired
+}
+
+enum ConsumerGapState {
+    waiting_prefix
+    | presented
 }
 
 entity MessageTarget {
@@ -122,26 +154,51 @@ entity RemoteSubscription {
 
 entity RemoteEvent {
     subscription: RemoteSubscription
+    event_id: String
     sequence: Integer
     stable_conversation_id: String
     exact_transcript_id: String
+    outcome: TerminalFactOutcome
+    occurred_at: Timestamp
+    occurrence_kind: String
+    occurrence_id: String
+    occurrence_generation: Integer
     payload_digest: String
     payload_bytes: Integer
+    terminal_evidence_state: TerminalEvidenceState
+    terminal_evidence_release_reason: TerminalEvidenceReleaseReason?
+
+    transitions terminal_evidence_state {
+        retained -> released
+        terminal: released
+    }
 }
 
 entity ConsumerEvent {
     subscription_id: String
+    event_id: String
     sequence: Integer
     stable_conversation_id: String
     exact_transcript_id: String
+    outcome: TerminalFactOutcome
+    occurred_at: Timestamp
+    occurrence_kind: String
+    occurrence_id: String
+    occurrence_generation: Integer
     payload_digest: String
     payload_bytes: Integer
     state: ConsumerEventState
+    source_authorized: Boolean
+    authorization_started: Boolean
+    terminal_settlement_attempts: Integer
+    settlement_reason: PrefixSettlementReason?
 
     transitions state {
         received -> admitted
+        received -> suppressed
         admitted -> acknowledged
         terminal: acknowledged
+        terminal: suppressed
     }
 }
 
@@ -151,6 +208,22 @@ entity GapTombstone {
     last_produced_sequence: Integer
     reason: GapReason
     failed_at: Timestamp
+    terminal_evidence_expires_at: Timestamp
+}
+
+entity ConsumerGap {
+    subscription_id: String
+    last_acknowledged_sequence: Integer
+    last_produced_sequence: Integer
+    reason: GapReason
+    failed_at: Timestamp
+    terminal_evidence_expires_at: Timestamp
+    state: ConsumerGapState
+
+    transitions state {
+        waiting_prefix -> presented
+        terminal: presented
+    }
 }
 
 entity WatchClose {
@@ -163,6 +236,9 @@ config {
     max_unacknowledged_events: Integer
     max_unacknowledged_bytes: Integer
     max_disconnected_age: Duration
+    terminal_prefix_authorization_attempts: Integer = 3
+    federation_request_timeout: Duration = 5.seconds
+    terminal_evidence_lifetime: Duration = 30.days
 }
 
 -- saved_peer(instance) resolves exactly one saved peer by UUID or display name
@@ -320,18 +396,33 @@ rule CreateRemoteSubscription {
         unacknowledged_bytes: 0,
         disconnected_since: null
     )
+    ensures:
+        for event in RemoteEvent where event.subscription.watcher = watcher and event.subscription.conversation = conversation and event.subscription.state = failed_gap and event.terminal_evidence_state = retained:
+            event.terminal_evidence_state = released
+            event.terminal_evidence_release_reason = subscription_replaced
 }
 
 rule AppendRemoteEvent {
-    when: AppendRemoteEvent(subscription, exact_transcript_id, payload_digest, payload_bytes)
+    when: AppendRemoteEvent(subscription, event_id, exact_transcript_id,
+                            outcome, occurred_at, occurrence_kind,
+                            occurrence_id, occurrence_generation,
+                            payload_digest, payload_bytes)
     requires: subscription.state = active
     ensures: RemoteEvent.created(
         subscription: subscription,
+        event_id: event_id,
         sequence: subscription.next_event_sequence,
         stable_conversation_id: subscription.conversation.id,
         exact_transcript_id: exact_transcript_id,
+        outcome: outcome,
+        occurred_at: occurred_at,
+        occurrence_kind: occurrence_kind,
+        occurrence_id: occurrence_id,
+        occurrence_generation: occurrence_generation,
         payload_digest: payload_digest,
-        payload_bytes: payload_bytes
+        payload_bytes: payload_bytes,
+        terminal_evidence_state: retained,
+        terminal_evidence_release_reason: null
     )
     ensures: subscription.next_event_sequence = subscription.next_event_sequence + 1
     ensures: subscription.unacknowledged_events = subscription.unacknowledged_events + 1
@@ -370,12 +461,22 @@ rule ReceiveRemoteEvent {
     requires: not exists ConsumerEvent{subscription_id: subscription.subscription_id, sequence: remote_event.sequence}
     ensures: ConsumerEvent.created(
         subscription_id: subscription.subscription_id,
+        event_id: remote_event.event_id,
         sequence: remote_event.sequence,
         stable_conversation_id: remote_event.stable_conversation_id,
         exact_transcript_id: remote_event.exact_transcript_id,
+        outcome: remote_event.outcome,
+        occurred_at: remote_event.occurred_at,
+        occurrence_kind: remote_event.occurrence_kind,
+        occurrence_id: remote_event.occurrence_id,
+        occurrence_generation: remote_event.occurrence_generation,
         payload_digest: remote_event.payload_digest,
         payload_bytes: remote_event.payload_bytes,
-        state: received
+        state: received,
+        source_authorized: false,
+        authorization_started: false,
+        terminal_settlement_attempts: 0,
+        settlement_reason: null
     )
 }
 
@@ -383,8 +484,14 @@ rule ReplayIdenticalEvent {
     when: ReceiveRemoteEvent(subscription, remote_event)
     let prior = ConsumerEvent{subscription_id: subscription.subscription_id, sequence: remote_event.sequence}
     requires: exists prior
+    requires: prior.event_id = remote_event.event_id
     requires: prior.stable_conversation_id = remote_event.stable_conversation_id
     requires: prior.exact_transcript_id = remote_event.exact_transcript_id
+    requires: prior.outcome = remote_event.outcome
+    requires: prior.occurred_at = remote_event.occurred_at
+    requires: prior.occurrence_kind = remote_event.occurrence_kind
+    requires: prior.occurrence_id = remote_event.occurrence_id
+    requires: prior.occurrence_generation = remote_event.occurrence_generation
     requires: prior.payload_digest = remote_event.payload_digest
     requires: prior.payload_bytes = remote_event.payload_bytes
     ensures: EventAlreadyReceived(prior)
@@ -395,7 +502,7 @@ rule RejectConflictingEventReplay {
     when: ReceiveRemoteEvent(subscription, remote_event)
     let prior = ConsumerEvent{subscription_id: subscription.subscription_id, sequence: remote_event.sequence}
     requires: exists prior
-    requires: prior.stable_conversation_id != remote_event.stable_conversation_id or prior.exact_transcript_id != remote_event.exact_transcript_id or prior.payload_digest != remote_event.payload_digest or prior.payload_bytes != remote_event.payload_bytes
+    requires: prior.event_id != remote_event.event_id or prior.stable_conversation_id != remote_event.stable_conversation_id or prior.exact_transcript_id != remote_event.exact_transcript_id or prior.outcome != remote_event.outcome or prior.occurred_at != remote_event.occurred_at or prior.occurrence_kind != remote_event.occurrence_kind or prior.occurrence_id != remote_event.occurrence_id or prior.occurrence_generation != remote_event.occurrence_generation or prior.payload_digest != remote_event.payload_digest or prior.payload_bytes != remote_event.payload_bytes
     ensures: EventReplayConflict(subscription.subscription_id, remote_event.sequence)
     -- Never replace the durable event or admit its conflicting payload.
 }
@@ -403,6 +510,7 @@ rule RejectConflictingEventReplay {
 rule AdmitCoordinatorNotification {
     when: AdmitCoordinatorNotification(event)
     requires: event.state = received
+    requires: event.source_authorized
     requires: not exists CoordinatorNotification{event_identity: event.subscription_id + ":" + event.sequence}
     ensures: CoordinatorNotification.created(event_identity: event.subscription_id + ":" + event.sequence)
     ensures: event.state = admitted
@@ -418,11 +526,15 @@ rule AcknowledgeRemoteEvent {
     requires: event.state = admitted
     requires: event.sequence = subscription.acknowledged_sequence + 1
     requires: exists CoordinatorNotification{event_identity: event.subscription_id + ":" + event.sequence}
-    requires: exists RemoteEvent{subscription: subscription, sequence: event.sequence, payload_digest: event.payload_digest, payload_bytes: event.payload_bytes}
+    let source_event = RemoteEvent{subscription: subscription, sequence: event.sequence, payload_digest: event.payload_digest, payload_bytes: event.payload_bytes}
+    requires: exists source_event
+    requires: source_event.terminal_evidence_state = retained
     ensures: subscription.acknowledged_sequence = event.sequence
     ensures: subscription.unacknowledged_events = subscription.unacknowledged_events - 1
     ensures: subscription.unacknowledged_bytes = subscription.unacknowledged_bytes - event.payload_bytes
     ensures: event.state = acknowledged
+    ensures: source_event.terminal_evidence_state = released
+    ensures: source_event.terminal_evidence_release_reason = settled
 }
 
 rule ReplayAcknowledgement {
@@ -439,23 +551,244 @@ rule ReplayAcknowledgement {
 rule FailEventBacklog {
     when: subscription: RemoteSubscription.unacknowledged_events > config.max_unacknowledged_events
     requires: subscription.state = active
+    requires: terminal_evidence_deadline_representable(now, config.terminal_evidence_lifetime)
     ensures: subscription.state = failed_gap
-    ensures: GapTombstone.created(subscription_id: subscription.subscription_id, last_acknowledged_sequence: subscription.acknowledged_sequence, last_produced_sequence: subscription.next_event_sequence - 1, reason: event_limit, failed_at: now)
+    ensures: GapTombstone.created(subscription_id: subscription.subscription_id, last_acknowledged_sequence: subscription.acknowledged_sequence, last_produced_sequence: subscription.next_event_sequence - 1, reason: event_limit, failed_at: now, terminal_evidence_expires_at: now + config.terminal_evidence_lifetime)
+    @guidance
+        -- Commit failed_at and its checked terminal-evidence deadline atomically.
+        -- Failure to represent the deadline leaves no authorizable terminal evidence.
 }
 
 rule FailByteBacklog {
     when: subscription: RemoteSubscription.unacknowledged_bytes > config.max_unacknowledged_bytes
     requires: subscription.state = active
+    requires: terminal_evidence_deadline_representable(now, config.terminal_evidence_lifetime)
     ensures: subscription.state = failed_gap
-    ensures: GapTombstone.created(subscription_id: subscription.subscription_id, last_acknowledged_sequence: subscription.acknowledged_sequence, last_produced_sequence: subscription.next_event_sequence - 1, reason: byte_limit, failed_at: now)
+    ensures: GapTombstone.created(subscription_id: subscription.subscription_id, last_acknowledged_sequence: subscription.acknowledged_sequence, last_produced_sequence: subscription.next_event_sequence - 1, reason: byte_limit, failed_at: now, terminal_evidence_expires_at: now + config.terminal_evidence_lifetime)
+    @guidance
+        -- Commit failed_at and its checked terminal-evidence deadline atomically.
+        -- Failure to represent the deadline leaves no authorizable terminal evidence.
 }
 
 rule FailDisconnectedWatch {
     when: subscription: RemoteSubscription.disconnected_since + config.max_disconnected_age <= now
     requires: subscription.state = active
     requires: subscription.disconnected_since != null
+    requires: subscription.next_event_sequence - 1 > subscription.acknowledged_sequence
+    requires: terminal_evidence_deadline_representable(now, config.terminal_evidence_lifetime)
     ensures: subscription.state = failed_gap
-    ensures: GapTombstone.created(subscription_id: subscription.subscription_id, last_acknowledged_sequence: subscription.acknowledged_sequence, last_produced_sequence: subscription.next_event_sequence - 1, reason: disconnected_age, failed_at: now)
+    ensures: GapTombstone.created(subscription_id: subscription.subscription_id, last_acknowledged_sequence: subscription.acknowledged_sequence, last_produced_sequence: subscription.next_event_sequence - 1, reason: disconnected_age, failed_at: now, terminal_evidence_expires_at: now + config.terminal_evidence_lifetime)
+    @guidance
+        -- Commit failed_at and its checked terminal-evidence deadline atomically.
+        -- Failure to represent the deadline leaves no authorizable terminal evidence.
+}
+
+rule AuthorizeTerminalPrefixFact {
+    when: AuthorizeTerminalPrefixFact(subscription, event, request, observed_at)
+    let gap = GapTombstone{subscription_id: subscription.subscription_id}
+    requires: subscription.state = failed_gap
+    requires: subscription.watcher.trusted
+    requires: exists gap
+    requires: observed_at < gap.terminal_evidence_expires_at
+    requires: event.subscription = subscription
+    requires: event.terminal_evidence_state = retained
+    requires: event.sequence > gap.last_acknowledged_sequence
+    requires: event.sequence <= gap.last_produced_sequence
+    requires: request.subscription_id = subscription.subscription_id
+    requires: request.event_id = event.event_id
+    requires: request.sequence = event.sequence
+    requires: request.stable_conversation_id = event.stable_conversation_id
+    requires: request.exact_transcript_id = event.exact_transcript_id
+    requires: request.outcome = event.outcome
+    requires: request.occurred_at = event.occurred_at
+    requires: request.occurrence_kind = event.occurrence_kind
+    requires: request.occurrence_id = event.occurrence_id
+    requires: request.occurrence_generation = event.occurrence_generation
+    requires: request.payload_digest = event.payload_digest
+    requires: request.payload_bytes = event.payload_bytes
+    ensures: TerminalPrefixFactAuthorizationGranted(event)
+}
+
+rule RefuseUntrustedTerminalPrefixAuthorization {
+    when: AuthorizeTerminalPrefixFact(subscription, event, request, observed_at)
+    requires: subscription.state = failed_gap
+    requires: not subscription.watcher.trusted
+    requires: event.subscription = subscription
+    ensures:
+        for retained_event in RemoteEvent where retained_event.subscription = subscription and retained_event.terminal_evidence_state = retained:
+            retained_event.terminal_evidence_state = released
+            retained_event.terminal_evidence_release_reason = trust_revoked
+    ensures: TerminalPrefixFactAuthorizationDenied(event, trust_revoked)
+}
+
+rule RefuseExpiredTerminalPrefixAuthorization {
+    when: AuthorizeTerminalPrefixFact(subscription, event, request, observed_at)
+    let gap = GapTombstone{subscription_id: subscription.subscription_id}
+    requires: subscription.state = failed_gap
+    requires: exists gap
+    requires: observed_at >= gap.terminal_evidence_expires_at
+    requires: event.subscription = subscription
+    requires: event.terminal_evidence_state = retained
+    ensures:
+        for retained_event in RemoteEvent where retained_event.subscription = subscription and retained_event.sequence > gap.last_acknowledged_sequence and retained_event.sequence <= gap.last_produced_sequence and retained_event.terminal_evidence_state = retained:
+            retained_event.terminal_evidence_state = released
+            retained_event.terminal_evidence_release_reason = expired
+    ensures: TerminalPrefixFactAuthorizationDenied(event, evidence_expired)
+    @guidance
+        -- Expiry is inclusive: authorization succeeds only strictly before the
+        -- stored deadline. Observation releases the whole remaining frozen prefix.
+}
+
+rule ObserveExpiredTerminalEvidence {
+    when: ObserveTerminalEvidence(subscription, observed_at)
+    let gap = GapTombstone{subscription_id: subscription.subscription_id}
+    requires: subscription.state = failed_gap
+    requires: exists gap
+    requires: observed_at >= gap.terminal_evidence_expires_at
+    ensures:
+        for event in RemoteEvent where event.subscription = subscription and event.sequence > gap.last_acknowledged_sequence and event.sequence <= gap.last_produced_sequence and event.terminal_evidence_state = retained:
+            event.terminal_evidence_state = released
+            event.terminal_evidence_release_reason = expired
+}
+
+rule ReleaseSettledTerminalFactEvidence {
+    when: TerminalFactSettlementObserved(event)
+    requires: event.subscription.state = failed_gap
+    requires: event.terminal_evidence_state = retained
+    ensures: event.terminal_evidence_state = released
+    ensures: event.terminal_evidence_release_reason = settled
+}
+
+rule ReleaseClosedSourceTerminalEvidence {
+    when: SourceConversationClosed(conversation)
+    ensures:
+        for event in RemoteEvent where event.subscription.conversation = conversation and event.subscription.state = failed_gap and event.terminal_evidence_state = retained:
+            event.terminal_evidence_state = released
+            event.terminal_evidence_release_reason = source_closed
+}
+
+rule StageTerminalGap {
+    when: StageTerminalGap(subscription, gap)
+    requires: subscription.state = failed_gap
+    requires: gap.subscription_id = subscription.subscription_id
+    requires: not exists ConsumerGap{subscription_id: subscription.subscription_id}
+    ensures: ConsumerGap.created(
+        subscription_id: subscription.subscription_id,
+        last_acknowledged_sequence: gap.last_acknowledged_sequence,
+        last_produced_sequence: gap.last_produced_sequence,
+        reason: gap.reason,
+        failed_at: gap.failed_at,
+        terminal_evidence_expires_at: gap.terminal_evidence_expires_at,
+        state: waiting_prefix
+    )
+    ensures:
+        for event in ConsumerEvent where event.subscription_id = subscription.subscription_id and event.state = received:
+            if event.authorization_started:
+                event.terminal_settlement_attempts = 1
+            else:
+                event.terminal_settlement_attempts = 0
+    @guidance
+        -- The authenticated replay transaction persists the immutable gap and
+        -- changes the consumer subscription to failed_gap. Its frozen prefix is
+        -- the ConsumerEvent row set already durable before that state change;
+        -- no redundant cutoff value is stored. An authorization already started
+        -- for a received fact counts as terminal-settlement attempt one.
+}
+
+rule ReplayIdenticalTerminalGap {
+    when: StageTerminalGap(subscription, gap)
+    let prior = ConsumerGap{subscription_id: subscription.subscription_id}
+    requires: exists prior
+    requires: prior.last_acknowledged_sequence = gap.last_acknowledged_sequence
+    requires: prior.last_produced_sequence = gap.last_produced_sequence
+    requires: prior.reason = gap.reason
+    requires: prior.failed_at = gap.failed_at
+    requires: prior.terminal_evidence_expires_at = gap.terminal_evidence_expires_at
+    ensures: GapAlreadyStaged(prior)
+}
+
+rule RejectConflictingTerminalGap {
+    when: StageTerminalGap(subscription, gap)
+    let prior = ConsumerGap{subscription_id: subscription.subscription_id}
+    requires: exists prior
+    requires: prior.last_acknowledged_sequence != gap.last_acknowledged_sequence or prior.last_produced_sequence != gap.last_produced_sequence or prior.reason != gap.reason or prior.failed_at != gap.failed_at or prior.terminal_evidence_expires_at != gap.terminal_evidence_expires_at
+    ensures: GapReplayConflict(subscription.subscription_id)
+}
+
+rule RejectPostGapFactAdmission {
+    when: ReceiveRemoteEvent(subscription, remote_event)
+    requires: subscription.state = failed_gap
+    requires: not exists ConsumerEvent{subscription_id: subscription.subscription_id, sequence: remote_event.sequence}
+    ensures: PostGapFactRejected(subscription.subscription_id, remote_event.sequence)
+}
+
+rule BeginActiveFactAuthorization {
+    when: AuthorizeStagedFact(subscription, event)
+    requires: subscription.state = active
+    requires: event.subscription_id = subscription.subscription_id
+    requires: event.state = received
+    requires: event.sequence = subscription.acknowledged_sequence + 1
+    ensures: event.authorization_started = true
+}
+
+rule BeginTerminalPrefixAuthorization {
+    when: AuthorizeStagedFact(subscription, event)
+    requires: subscription.state = failed_gap
+    requires: exists ConsumerGap{subscription_id: subscription.subscription_id, state: waiting_prefix}
+    requires: event.subscription_id = subscription.subscription_id
+    requires: event.state = received
+    requires: event.sequence = earliest_unsettled_staged_sequence(subscription.subscription_id)
+    requires: event.terminal_settlement_attempts < config.terminal_prefix_authorization_attempts
+    ensures: event.authorization_started = true
+    ensures: event.terminal_settlement_attempts = event.terminal_settlement_attempts + 1
+    @guidance
+        -- Persist the increment before making the outbound request. Each request
+        -- uses config.federation_request_timeout. A pre-gap request already in
+        -- flight starts terminal settlement with one attempt consumed. A missing
+        -- source sequence and a settled earlier row do not make this staged row
+        -- ineligible.
+}
+
+rule AuthorizeEarliestUnsettledStagedFact {
+    when: StagedFactAuthorizationGranted(event)
+    requires: event.state = received
+    requires: event.authorization_started
+    ensures: event.source_authorized = true
+}
+
+rule SettleFailedStagedPrefixFact {
+    when: StagedFactAuthorizationDenied(event, reason)
+    requires: exists ConsumerGap{subscription_id: event.subscription_id, state: waiting_prefix}
+    requires: event.state = received
+    requires: event.sequence = earliest_unsettled_staged_sequence(event.subscription_id)
+    requires: reason = authorization_denied or reason = trust_revoked or reason = source_unreachable or reason = evidence_expired
+    requires: reason != source_unreachable or event.terminal_settlement_attempts = config.terminal_prefix_authorization_attempts
+    ensures: event.state = suppressed
+    ensures: event.settlement_reason = reason
+    @guidance
+        -- Settle only this staged fact. The next staged sequence remains eligible
+        -- for its own source authorization. Neither a sequence hole nor a
+        -- suppressed fact advances the contiguous admitted fact cursor.
+}
+
+rule PresentTerminalGap {
+    when: PresentTerminalGap(gap, admission)
+    requires: gap.subscription_id = admission.subscription_id
+    requires: admission.state = waiting_prefix
+    requires: not exists ConsumerEvent{subscription_id: admission.subscription_id, state: received}
+    requires: not exists CoordinatorNotification{event_identity: gap.subscription_id + ":gap"}
+    ensures: CoordinatorNotification.created(event_identity: gap.subscription_id + ":gap")
+    ensures: admission.state = presented
+    @guidance
+        -- The authenticated replay that staged the immutable tombstone is the
+        -- authority for this control notification. It never authorizes a fact.
+        -- Presenting the gap does not change a source or consumer fact cursor.
+}
+
+rule ReplayTerminalGapPresentation {
+    when: PresentTerminalGap(gap, admission)
+    requires: admission.state = presented
+    ensures: GapAlreadyPresented(gap)
 }
 
 rule UnsubscribeRemoteWatch {
@@ -481,10 +814,40 @@ rule PeerRevocationCommitted {
         for subscription in RemoteSubscription where subscription.watcher = peer and subscription.state = active:
             subscription.state = revoked
             WatchClose.created(subscription_id: subscription.subscription_id, last_acknowledged_sequence: subscription.acknowledged_sequence, state: revoked)
+    ensures:
+        for event in RemoteEvent where event.subscription.watcher = peer and event.subscription.state = failed_gap and event.terminal_evidence_state = retained:
+            event.terminal_evidence_state = released
+            event.terminal_evidence_release_reason = trust_revoked
     @guidance
         -- Gate admission of message and Goal operations, subscription creation,
         -- pulls, acknowledgements and unsubscribe on authenticated trust at the
         -- destination transaction boundary; admitted work may finish and is audited.
+}
+
+invariant TerminalEvidenceDeadlineIsFixed {
+    for gap in GapTombstones:
+        gap.terminal_evidence_expires_at = gap.failed_at + config.terminal_evidence_lifetime
+    -- The persisted deadline is never recomputed or extended by reconnect,
+    -- retry, restart, clock rollback, or duplicate gap replay.
+}
+
+invariant TerminalEvidenceReleaseIsExplicit {
+    for event in RemoteEvents:
+        event.terminal_evidence_state = released implies event.terminal_evidence_release_reason != null
+        event.terminal_evidence_state = retained implies event.terminal_evidence_release_reason = null
+}
+
+invariant TerminalTombstoneSurvivesEvidenceRelease {
+    for subscription in RemoteSubscriptions where subscription.state = failed_gap:
+        exists GapTombstone{subscription_id: subscription.subscription_id}
+    -- Releasing source evidence does not delete or mutate the immutable gap.
+}
+
+invariant TerminalEvidenceDoesNotExpandReplay {
+    for gap in GapTombstones:
+        gap.last_produced_sequence >= gap.last_acknowledged_sequence
+    -- The lease retains only the original bounded prefix. It admits no later
+    -- event and never makes failed_gap eligible for normal ordered pulling.
 }
 
 invariant RemoteSelectionNeverFallsBack {
@@ -504,6 +867,16 @@ invariant WatchCursorAndBacklogStayConsistent {
 invariant DurableAdmissionPrecedesAcknowledgement {
     for e in ConsumerEvents where e.state = acknowledged:
         exists CoordinatorNotification{event_identity: e.subscription_id + ":" + e.sequence}
+}
+
+invariant UnauthorizedFactsAreNeverAdmitted {
+    for e in ConsumerEvents where e.state = admitted or e.state = acknowledged:
+        e.source_authorized
+}
+
+invariant TerminalPrefixAttemptsAreBounded {
+    for e in ConsumerEvents:
+        e.terminal_settlement_attempts >= 0 and e.terminal_settlement_attempts <= config.terminal_prefix_authorization_attempts
 }
 
 actor TrustedPeer {
@@ -530,6 +903,8 @@ surface FederationWatchSurface {
         CreateRemoteSubscription(peer, conversation, subscription_id)
         PullRemoteEvents(subscription, after_sequence)
         AcknowledgeRemoteEvent(subscription, event)
+        AuthorizeTerminalPrefixFact(subscription, event, request, observed_at)
+        ObserveTerminalEvidence(subscription, observed_at)
         UnsubscribeRemoteWatch(subscription)
     @guarantee DurableCursor
         -- Watch state, ordered cursor and pending deliveries survive either

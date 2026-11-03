@@ -1,3 +1,5 @@
+pub(crate) mod subscriptions;
+
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -798,6 +800,10 @@ pub enum FederationClientError {
     PeerAmbiguous,
     #[error("peer selector must not be empty")]
     InvalidPeerSelector,
+    #[error("subscription enrollment authentication rejected")]
+    SubscriptionAuthenticationRejected,
+    #[error("peer navigation URL is invalid: {0}")]
+    Navigation(#[from] phoenix_core::domain::instance_identity::PeerNavigationUrlError),
     #[error("invalid Goal wait request: {0}")]
     InvalidGoalWait(String),
     #[error("peer database lookup failed: {0}")]

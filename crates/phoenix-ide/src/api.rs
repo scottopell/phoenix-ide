@@ -340,3 +340,6 @@ impl AppState {
         })
     }
 }
+
+#[cfg(test)]
+mod federation_two_instance;

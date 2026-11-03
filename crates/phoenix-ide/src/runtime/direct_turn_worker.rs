@@ -12,7 +12,7 @@ use phoenix_db::workflow::{
 };
 use phoenix_db::LocalAttemptAuthority;
 use phoenix_workflow::{ClaimOutcome, LeaseExpiry, ProcessIncarnation, Timestamp};
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex};
 
 use crate::runtime::{AddressedConversationEventDispatcher, RuntimeManager};
 use crate::state_machine::Event;
@@ -143,6 +143,7 @@ pub(crate) struct DirectTurnWorker<D: DirectTurnDispatcher, C: DirectTurnClock> 
     clock: Arc<C>,
     process_incarnation: ProcessIncarnation,
     input_discovery: Option<Arc<RuntimeManager>>,
+    subscription_sync: Arc<Mutex<crate::api::federation::subscriptions::SubscriptionSync>>,
     #[cfg(test)]
     pre_dispatch_hook: Option<PreDispatchHook>,
 }
@@ -167,6 +168,9 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
             clock,
             process_incarnation,
             input_discovery: None,
+            subscription_sync: Arc::new(Mutex::new(
+                crate::api::federation::subscriptions::SubscriptionSync::default(),
+            )),
             #[cfg(test)]
             pre_dispatch_hook: None,
         }
@@ -185,6 +189,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
             ) {
                 crate::reminder_delivery::deliver_pass(manager, now).await;
             }
+            self.subscription_sync.lock().await.sync_pass(manager).await;
         }
     }
 

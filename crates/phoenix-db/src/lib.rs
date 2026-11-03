@@ -16,6 +16,7 @@ mod coordinator_work_scope;
 mod federation_enrollment;
 pub use federation_enrollment::FederationSendAuthority;
 mod federation_peers;
+pub mod federation_subscriptions;
 pub use coordinator_watches::{
     append_mandatory_close_failure_event_tx, CloseFailureStop, MandatoryCloseFailureSubject,
     PendingWatchEvent, WatchEventPresentation, WatchEventProvenance, WatchEventRoute, WatchOutcome,
@@ -403,6 +404,10 @@ pub enum DbError {
     FederationSendAuthorityInactive,
     #[error("federation send identity is already owned by another conversation")]
     FederationSendIdentityConflict,
+    #[error("saved federation peer not found")]
+    FederationPeerNotFound,
+    #[error("saved federation peer name is ambiguous")]
+    FederationPeerAmbiguous,
     #[error("federation steering send exactly replays a prior admission")]
     FederationSteeringDuplicate,
     #[error("steering queue is full")]
@@ -8236,24 +8241,7 @@ impl Database {
             ExecutionOccurrenceTerminal::Completed => ("Completed", None),
             ExecutionOccurrenceTerminal::Failed { reason } => ("Failed", Some(reason.as_str())),
         };
-        crate::coordinator_watches::record_steering_event_tx(
-            &mut tx,
-            source_kind,
-            source_message_id,
-            conversation_id,
-            terminal_kind,
-            terminal_reason,
-        )
-        .await?;
-        sqlx::query(
-            "DELETE FROM steering_execution_occurrences
-             WHERE conversation_id = ?1 AND message_id = ?2",
-        )
-        .bind(conversation_id)
-        .bind(source_message_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
+        let projection_changed = sqlx::query(
             "UPDATE conversations
              SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
              WHERE id = ?4
@@ -8282,7 +8270,27 @@ impl Database {
         .bind(conversation_id)
         .bind(source_message_id)
         .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        sqlx::query(
+            "DELETE FROM steering_execution_occurrences
+             WHERE conversation_id = ?1 AND message_id = ?2",
+        )
+        .bind(conversation_id)
+        .bind(source_message_id)
+        .execute(&mut *tx)
         .await?;
+        if projection_changed == 1 {
+            crate::coordinator_watches::record_steering_event_tx(
+                &mut tx,
+                source_kind,
+                source_message_id,
+                conversation_id,
+                terminal_kind,
+                terminal_reason,
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok(true)
     }

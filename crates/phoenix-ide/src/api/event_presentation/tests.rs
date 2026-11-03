@@ -88,7 +88,11 @@ async fn remote_origins_never_receive_local_subscription_presentation() {
         let remote_only = EventPresentations::load(&db, [&remote]).await;
         assert!(remote_only.events.is_empty());
         assert!(matches!(
-            remote_only.fallback,
+            remote_only.local_fallback,
+            EventPresentationUnavailableReason::Missing
+        ));
+        assert!(matches!(
+            remote_only.federated_fallback,
             EventPresentationUnavailableReason::Missing
         ));
         assert!(remote_only.for_message(&remote).is_none());

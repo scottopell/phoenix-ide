@@ -144,6 +144,19 @@ export const InputOriginSchema: v.GenericSchema<unknown, InputOrigin> = v.varian
   }),
 ]);
 
+const FederatedDispositionSchema = v.variant('state', [
+  v.looseObject({ state: v.literal('pending') }),
+  v.looseObject({ state: v.literal('authorizing') }),
+  v.looseObject({ state: v.literal('authorized'), authorization_id: v.string() }),
+  v.looseObject({ state: v.literal('suppressed'), reason: v.picklist(['authorization_denied', 'trust_revoked', 'source_unreachable', 'evidence_expired', 'subscription_ended']) }),
+  v.looseObject({ state: v.literal('accepted'), transcript_id: v.string() }),
+]);
+
+const FederatedNavigationSchema = v.variant('status', [
+  v.looseObject({ status: v.literal('available'), stable_url: v.string(), source_url: v.string() }),
+  v.looseObject({ status: v.literal('unavailable') }),
+]);
+
 export const EventPresentationSchema: v.GenericSchema<unknown, EventPresentation> = v.variant('status', [
   v.looseObject({
     status: v.literal('available'),
@@ -165,6 +178,42 @@ export const EventPresentationSchema: v.GenericSchema<unknown, EventPresentation
       v.looseObject({ kind: v.literal('awaiting_task_approval') }),
       v.looseObject({ kind: v.literal('goal_changed') }),
     ]),
+  }),
+  v.looseObject({
+    status: v.literal('federated_fact'),
+    event_id: v.string(),
+    source_instance_id: v.string(),
+    source_product_conversation_id: v.string(),
+    subscription_id: v.string(),
+    source_event_id: v.string(),
+    sequence: v.number(),
+    source_occurrence_kind: v.picklist(['direct_turn', 'steering', 'seeded_fork', 'interaction_response', 'creation', 'continuation_summary']),
+    source_occurrence_id: v.string(),
+    source_generation: v.number(),
+    source_transcript_id: v.string(),
+    outcome: v.picklist(['completed', 'failed', 'cancelled']),
+    occurred_at_us: v.number(),
+    disposition: FederatedDispositionSchema,
+    navigation: FederatedNavigationSchema,
+  }),
+  v.looseObject({
+    status: v.literal('federated_gap'),
+    event_id: v.string(),
+    source_instance_id: v.string(),
+    source_product_conversation_id: v.string(),
+    subscription_id: v.string(),
+    last_acknowledged: v.number(),
+    last_produced: v.number(),
+    reason: v.picklist(['event_count', 'payload_bytes', 'disconnected_age']),
+    failed_at_us: v.number(),
+    terminal_evidence_expires_at_us: v.number(),
+    source_transcript_id: v.string(),
+    current: v.variant('kind', [
+      v.looseObject({ kind: v.literal('nonterminal') }),
+      v.looseObject({ kind: v.literal('terminal'), outcome: v.picklist(['completed', 'failed', 'cancelled']) }),
+    ]),
+    disposition: FederatedDispositionSchema,
+    navigation: FederatedNavigationSchema,
   }),
   v.looseObject({
     status: v.literal('unavailable'),

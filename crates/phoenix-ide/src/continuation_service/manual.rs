@@ -364,6 +364,8 @@ pub(super) async fn continue_manual(
             | DbError::DirectTurnConflict(_)
             | DbError::FederationSendAuthorityInactive
             | DbError::FederationSendIdentityConflict
+            | DbError::FederationPeerNotFound
+            | DbError::FederationPeerAmbiguous
             | DbError::FederationSteeringDuplicate
             | DbError::ForkProposalConflict(_)
             | DbError::GitRepositoryWorkScopeProjectConflict { .. }

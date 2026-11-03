@@ -1664,6 +1664,8 @@ fn map_db_resolve_error(e: DbError) -> ForkResolveError {
         | DbError::GitRepositoryWorkScopeProjectConflict { .. }
         | DbError::FederationSendAuthorityInactive
         | DbError::FederationSendIdentityConflict
+        | DbError::FederationPeerNotFound
+        | DbError::FederationPeerAmbiguous
         | DbError::FederationSteeringDuplicate
         | DbError::DormantGitRepositoryCatchupPermitTargetMismatch
         | DbError::DormantGitRepositoryCatchupStaleOperation

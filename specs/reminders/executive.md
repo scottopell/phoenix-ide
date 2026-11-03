@@ -2,7 +2,7 @@
 
 ## Current Reality
 
-Reminder domain types, normalized storage and migration 150 implement registration,
+Reminder domain types, normalized storage and migration 151 implement registration,
 owner-scoped reads, revision-checked cancellation/rescheduling, immutable due
 commitment, restart discovery and standard-acceptance lookup. Registration is
 bound to a trusted top-level transcript and tool invocation; ordinary conversations

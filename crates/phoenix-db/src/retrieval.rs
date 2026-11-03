@@ -957,6 +957,8 @@ fn sqlx_from_db_error(error: crate::DbError) -> sqlx::Error {
         | crate::DbError::ProductConversationUnavailable(_)
         | crate::DbError::FederationSendAuthorityInactive
         | crate::DbError::FederationSendIdentityConflict
+        | crate::DbError::FederationPeerNotFound
+        | crate::DbError::FederationPeerAmbiguous
         | crate::DbError::FederationSteeringDuplicate
         | crate::DbError::SteeringQueueFull
         | crate::DbError::ProductCreationClaimLost
