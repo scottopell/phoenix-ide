@@ -1045,7 +1045,7 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
             if growth_bytes
             else ""
         )
-        script = f"""#!/usr/bin/env python3
+        script = f"""#!{sys.executable}
 import os, sqlite3, sys
 connection = sqlite3.connect(os.environ['PHOENIX_DB_PATH'])
 connection.executemany('INSERT INTO _migrations (version, name) VALUES (?, ?)', {migrations!r})
@@ -1201,7 +1201,7 @@ sys.exit({7 if partial else 0})
         assert current is not None
         target = Path(manifest.target_binary)
         target.write_text(
-            """#!/usr/bin/env python3
+            f"""#!{sys.executable}
 import os, sqlite3
 connection = sqlite3.connect(os.environ['PHOENIX_DB_PATH'])
 connection.execute('CREATE TABLE same_schema_reconciliation (value TEXT NOT NULL)')
@@ -3343,7 +3343,12 @@ connection.close()
 
 
 class ExactSchema129RefreshTests(unittest.TestCase):
-    setUp = CurrentSchemaPreparedUpgradeTests.setUp
+    def setUp(self) -> None:
+        CurrentSchemaPreparedUpgradeTests.setUp(self)
+        self.enterContext(mock.patch.object(
+            helper, "_capacity_pool_key", return_value=("test", "shared"),
+        ))
+
     database = CurrentSchemaPreparedUpgradeTests.database
     manifest = CurrentSchemaPreparedUpgradeTests.manifest
 
@@ -3645,7 +3650,6 @@ class ExactSchema129RefreshTests(unittest.TestCase):
              mock.patch.object(helper, "assert_database_exclusive"), \
              mock.patch.object(helper, "require_loaded_plist"), \
              mock.patch.object(helper, "wait_for_identity"), \
-             mock.patch.object(helper, "_capacity_pool_key", return_value=("test", "shared")), \
              mock.patch.object(helper, "run_current_schema_migration", side_effect=AssertionError("live migration forbidden")), \
              mock.patch.object(helper, "restore_database", side_effect=AssertionError("backup replay forbidden")):
             self.assertEqual(helper.finalize_paired(manifest, current_schema=True), "committed")
@@ -3659,7 +3663,12 @@ class ExactSchema129RefreshTests(unittest.TestCase):
 
 
 class ExactSource128To129Tests(unittest.TestCase):
-    setUp = CurrentSchemaPreparedUpgradeTests.setUp
+    def setUp(self) -> None:
+        CurrentSchemaPreparedUpgradeTests.setUp(self)
+        self.enterContext(mock.patch.object(
+            helper, "_capacity_pool_key", return_value=("test", "shared"),
+        ))
+
     database = CurrentSchemaPreparedUpgradeTests.database
     manifest = CurrentSchemaPreparedUpgradeTests.manifest
 
@@ -3682,7 +3691,7 @@ class ExactSource128To129Tests(unittest.TestCase):
     def install_migration129_script(self, manifest: helper.Manifest, *, failure: bool = False, growth: int = 0) -> None:
         target = Path(manifest.candidate_binary)
         migration = compiled_ledger(129)[-1]
-        target.write_text(f"""#!/usr/bin/env python3
+        target.write_text(f"""#!{sys.executable}
 import os, sqlite3, sys
 with sqlite3.connect(os.environ['PHOENIX_DB_PATH']) as db:
     db.execute('INSERT INTO _migrations VALUES (?, ?)', {migration!r})

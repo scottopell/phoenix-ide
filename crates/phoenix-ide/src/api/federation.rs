@@ -9,7 +9,7 @@ use axum::{
 use base64::Engine;
 use futures::StreamExt as _;
 use phoenix_core::domain::instance_identity::{
-    FederationCredentialVerifier, InstanceId, PeerTlsTrust,
+    FederationCredentialVerifier, InstanceId, PeerDisplayName, PeerTlsTrust,
 };
 use phoenix_core::domain::{
     close::TranscriptConversationId,
@@ -47,7 +47,7 @@ where
 #[derive(Deserialize)]
 pub struct IssueEnrollmentRequest {
     pub caller_instance_id: InstanceId,
-    pub caller_display_name: String,
+    pub caller_display_name: PeerDisplayName,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -65,7 +65,7 @@ pub struct RevokeEnrollmentResponse {
 
 #[derive(Deserialize)]
 pub struct ImportPeerConnectionRequest {
-    pub peer_display_name: String,
+    pub peer_display_name: PeerDisplayName,
     pub base_url: String,
     pub enrollment: EnrollmentTransferBundle,
 }
@@ -1990,7 +1990,7 @@ pub async fn issue_enrollment(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    if request.caller_instance_id == local_id || request.caller_display_name.trim().is_empty() {
+    if request.caller_instance_id == local_id {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
 
@@ -2000,7 +2000,7 @@ pub async fn issue_enrollment(
         .db
         .replace_federation_enrollment(
             request.caller_instance_id,
-            request.caller_display_name.trim(),
+            &request.caller_display_name,
             &verifier,
         )
         .await
@@ -2035,7 +2035,6 @@ pub async fn import_peer_connection(
     };
     if request.enrollment.caller_instance_id != local_id
         || request.enrollment.receiver_instance_id == local_id
-        || request.peer_display_name.trim().is_empty()
     {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
@@ -2053,7 +2052,7 @@ pub async fn import_peer_connection(
         .db
         .save_federation_peer_connection(
             request.enrollment.receiver_instance_id,
-            request.peer_display_name.trim(),
+            &request.peer_display_name,
             &base_url,
             &bearer_credential,
             &request.enrollment.tls_trust,
@@ -2208,7 +2207,7 @@ mod tests {
                 .db
                 .save_federation_peer_connection(
                     id,
-                    name,
+                    &name.parse().unwrap(),
                     &url.parse().unwrap(),
                     &token(if id == first {
                         "a"
@@ -2228,7 +2227,7 @@ mod tests {
             .db
             .save_federation_peer_connection(
                 uuid_named_peer,
-                &uuid_shaped_name,
+                &uuid_shaped_name.parse().unwrap(),
                 &"https://uuid-name.example".parse().unwrap(),
                 &token("e"),
                 &PeerTlsTrust::PlatformRoots,
@@ -2256,7 +2255,7 @@ mod tests {
             .db
             .save_federation_peer_connection(
                 InstanceId::new(),
-                "duplicate",
+                &"duplicate".parse().unwrap(),
                 &"https://other.example".parse().unwrap(),
                 &token("d"),
                 &PeerTlsTrust::PlatformRoots,
@@ -2580,7 +2579,7 @@ mod tests {
             .db
             .replace_federation_enrollment(
                 caller,
-                "caller",
+                &"caller".parse().unwrap(),
                 &FederationCredentialVerifier::from_bearer(bearer.as_bytes()),
             )
             .await
@@ -2699,7 +2698,7 @@ mod tests {
             .db
             .replace_federation_enrollment(
                 caller,
-                "caller",
+                &"caller".parse().unwrap(),
                 &FederationCredentialVerifier::from_bearer(bearer.as_bytes()),
             )
             .await
@@ -3062,13 +3061,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reserved_local_peer_names_reject_enrollment_and_import_without_replacement() {
+        use axum::{body::Body, http::Request};
+        use phoenix_core::domain::instance_identity::{PeerBaseUrl, PeerBearerCredential};
+        use tower::ServiceExt as _;
+
+        let mut state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse("owner-password".into())
+                .unwrap(),
+        );
+        let local = state.db.instance_id().await.unwrap();
+        let peer = InstanceId::new();
+        let verifier = FederationCredentialVerifier::from_bearer(b"unchanged-enrollment");
+        state
+            .db
+            .replace_federation_enrollment(peer, &"remote-peer".parse().unwrap(), &verifier)
+            .await
+            .unwrap();
+        let bearer = PeerBearerCredential::parse(format!("phx_peer_{}", "a".repeat(43))).unwrap();
+        let url: PeerBaseUrl = "https://peer.example".parse().unwrap();
+        state
+            .db
+            .save_federation_peer_connection(
+                peer,
+                &"remote-peer".parse().unwrap(),
+                &url,
+                &bearer,
+                &PeerTlsTrust::PlatformRoots,
+            )
+            .await
+            .unwrap();
+        let app = crate::api::handlers::create_router(state.clone());
+        for name in ["local", "LOCAL", " \tLoCaL\n"] {
+            for (path, body) in [
+                (
+                    "/api/federation/enrollments",
+                    serde_json::json!({"caller_instance_id":peer,"caller_display_name":name}),
+                ),
+                (
+                    "/api/federation/peers/import",
+                    serde_json::json!({
+                        "peer_display_name":name,"base_url":"https://replacement.example",
+                        "enrollment":{"receiver_instance_id":peer,"caller_instance_id":local,"token":bearer.expose(),"tls_trust":PeerTlsTrust::PlatformRoots}
+                    }),
+                ),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(path)
+                            .header("content-type", "application/json")
+                            .header("authorization", "Bearer owner-password")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+                let body = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                assert!(std::str::from_utf8(&body).unwrap().contains("reserved"));
+            }
+        }
+        let active = state
+            .db
+            .authenticate_federation_verifier(&verifier)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.caller_display_name, "remote-peer");
+        let saved = state
+            .db
+            .federation_peer_connection(peer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.peer_display_name, "remote-peer");
+        assert_eq!(saved.base_url, url);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM federation_enrollments")
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
     async fn peer_import_rejects_bundle_for_another_caller() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         let response = import_peer_connection(
             OwnerAuthenticated,
             State(state),
             Json(ImportPeerConnectionRequest {
-                peer_display_name: "peer".to_string(),
+                peer_display_name: "peer".parse().unwrap(),
                 base_url: "https://peer.example".to_string(),
                 enrollment: EnrollmentTransferBundle {
                     receiver_instance_id: InstanceId::new(),
@@ -3114,7 +3202,7 @@ mod tests {
             .db
             .save_federation_peer_connection(
                 destination,
-                "remote",
+                &"remote".parse().unwrap(),
                 &format!("https://localhost:{port}").parse().unwrap(),
                 &bearer,
                 &trust,
@@ -3290,7 +3378,7 @@ mod tests {
                 .db
                 .save_federation_peer_connection(
                     peer,
-                    "peer",
+                    &"peer".parse().unwrap(),
                     &format!("https://localhost:{}", source_address.port())
                         .parse()
                         .unwrap(),

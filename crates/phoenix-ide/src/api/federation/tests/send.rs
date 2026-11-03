@@ -77,7 +77,7 @@ async fn fixture_from_state(
         .db
         .replace_federation_enrollment(
             caller,
-            "caller",
+            &"caller".parse().unwrap(),
             &FederationCredentialVerifier::from_bearer(bearer.as_bytes()),
         )
         .await
@@ -224,7 +224,7 @@ async fn detached_send_rechecks_exact_credential_at_direct_admission_and_preserv
     let replacement = FederationCredentialVerifier::from_bearer(replacement_bearer.as_bytes());
     state
         .db
-        .replace_federation_enrollment(caller, "peer", &replacement)
+        .replace_federation_enrollment(caller, &"peer".parse().unwrap(), &replacement)
         .await
         .unwrap();
     let again = request(destination, exact(&fresh.id));
@@ -301,7 +301,7 @@ async fn steering_admission_rechecks_exact_credential_after_authentication() {
     let replacement = FederationCredentialVerifier::from_bearer(replacement_bearer.as_bytes());
     state
         .db
-        .replace_federation_enrollment(caller, "peer", &replacement)
+        .replace_federation_enrollment(caller, &"peer".parse().unwrap(), &replacement)
         .await
         .unwrap();
     let still_rejected = admit_remote_message(
@@ -629,7 +629,7 @@ async fn peer_scoped_sends_replay_after_database_and_runtime_reconstruction() {
         .db
         .replace_federation_enrollment(
             second_caller,
-            "second-caller",
+            &"second-caller".parse().unwrap(),
             &FederationCredentialVerifier::from_bearer(second_bearer.as_bytes()),
         )
         .await

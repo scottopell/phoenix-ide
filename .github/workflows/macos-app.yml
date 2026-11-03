@@ -82,8 +82,10 @@ jobs:
           python3 scripts/test-desktop-release-workflow.py
           node --test scripts/test-check-signed-helper.cjs
           python3 scripts/test_release_version.py
+      - name: Set up uv
+        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
       - name: Test launchd deployment controller
-        run: python3 -m unittest tests.devpy.test_launchd_deploy tests.devpy.test_current_schema_prepared_upgrade
+        run: uv run --no-project --managed-python --python 3.13 python -m unittest tests.devpy.test_launchd_deploy tests.devpy.test_current_schema_prepared_upgrade
       - name: Build a real unsigned Release package
         run: |
           version=$(grep -m1 '^version' crates/phoenix-ide/Cargo.toml | sed 's/version = "\(.*\)"/\1/')

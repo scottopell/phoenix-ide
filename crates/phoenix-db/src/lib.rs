@@ -12511,46 +12511,12 @@ impl Database {
         Ok(())
     }
 
-    /// Materialize the assistant message and completed tool results that an
-    /// in-flight `ToolExecuting` or `CancellingTool` round carries only in its
-    /// `ConvState` JSON, so they survive the startup reset that overwrites the
-    /// state with idle.
-    ///
-    /// Both states bundle the un-persisted round for atomic end-of-round
-    /// persistence and hold the same recoverable data, differing only in how
-    /// the unfinished tools are named:
-    ///   - `assistant_message`: the LLM turn (with one `tool_use` block per
-    ///     dispatched tool) — broadcast over SSE and seen by the user, but not
-    ///     yet in `messages`;
-    ///   - `completed_results`: real outputs of tools that already finished;
-    ///   - the unfinished tools: `ToolExecuting` carries the running tool as
-    ///     `current_tool` (a `ToolCall`) plus `remaining_tools`; `CancellingTool`
-    ///     carries the tool being aborted as `tool_use_id` (just the id) plus
-    ///     `skipped_tools`. Both are normalized to a flat list of interrupted
-    ///     `tool_use` ids — that's all the builder needs to pair a synthetic
-    ///     result.
-    ///
-    /// Each `tool_use` needs exactly one paired `tool_result` or the next LLM
-    /// request 400s. We write the assistant message, then one result per
-    /// `tool_use`: completed tools contribute their real result, and every
-    /// unfinished tool gets a synthetic interrupted error. The whole round
-    /// commits atomically via [`Database::persist_tool_round`].
-    ///
-    /// The pairing count is checked before any write: if the materialized
-    /// results don't match the assistant's `tool_use` count, we skip this
-    /// conversation rather than persist a mis-paired chain — the subsequent
-    /// reset + `repair_orphaned_tool_use` then handles it the legacy way.
+    /// Read typed persisted terminal outcomes for pending child conversations.
+    /// Missing and nonterminal child rows are omitted.
     ///
     /// # Errors
     ///
-    /// Returns a [`DbError`] if the underlying database operation fails.
-    /// Resolve the real terminal outcome of each pending sub-agent by reading
-    /// its child conversation row (created with `id == agent_id`). A sub-agent
-    /// that reached `Completed`/`Failed` before the restart is returned with its
-    /// real `Success`/`Failure` outcome; one still running (or whose row is
-    /// missing or non-terminal) is omitted, so the caller falls back to the
-    /// "interrupted by server restart" synthetic outcome. Query and decode
-    /// failures remain errors because they cannot prove the child nonterminal.
+    /// Returns [`DbError`] when a child query or state decoding fails.
     async fn resolve_pending_sub_agent_outcomes(
         &self,
         pending: &[phoenix_core::domain::sm_state::PendingSubAgent],
@@ -12640,22 +12606,16 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        let mut materialized = std::collections::HashSet::new();
+        let mut plans = Vec::new();
         for (conv_id, state_json, state_updated_at) in conv_rows {
             if only_conversations.is_some_and(|ids| !ids.contains(&conv_id)) {
                 continue;
             }
-            let state: ConvState = match serde_json::from_str(&state_json) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(
-                        conv_id = %conv_id, error = %e,
-                        "could not parse in-flight tool round state for materialization; \
-                         leaving to reset + orphan repair",
-                    );
-                    continue;
-                }
-            };
+            let state: ConvState = serde_json::from_str(&state_json).map_err(|error| {
+                DbError::Serialization(format!(
+                    "cannot recover in-flight tool round for {conv_id}; persisted state retained: {error}"
+                ))
+            })?;
 
             // Normalize both states to the assistant message, completed
             // results, interrupted tool ids, and pending sub-agents. The
@@ -12670,7 +12630,9 @@ impl Database {
                 pending_sub_agents,
             }) = normalize_in_flight_round(state)
             else {
-                continue;
+                return Err(DbError::Serialization(format!(
+                    "in-flight tool round state kind differs for {conv_id}; persisted state retained"
+                )));
             };
 
             // A sub-agent can have reached its own terminal state (persisted in
@@ -12726,20 +12688,31 @@ impl Database {
                 &sub_agent_outcomes,
             );
 
-            let (agent_msg, tool_msgs) = match round {
-                Ok(messages) => messages,
-                Err(ToolRoundError::ResultCountMismatch { tool_uses, results }) => {
-                    tracing::warn!(
-                        conv_id = %conv_id,
-                        tool_uses,
-                        results,
-                        "in-flight tool round has mismatched tool_use/result counts; \
-                         skipping materialization, leaving to orphan repair",
-                    );
-                    continue;
-                }
-            };
+            let (agent_msg, tool_msgs) = round.map_err(|error| {
+                DbError::Serialization(format!(
+                    "cannot recover in-flight tool round for {conv_id}; persisted state retained: {error}"
+                ))
+            })?;
 
+            plans.push(RestartToolRoundPlan {
+                assistant: agent_msg,
+                results: tool_msgs,
+                pending_sub_agents,
+                sub_agent_outcomes,
+                completed_count: completed_results.len(),
+            });
+        }
+
+        let mut materialized = std::collections::HashSet::new();
+        for RestartToolRoundPlan {
+            assistant: agent_msg,
+            results: tool_msgs,
+            pending_sub_agents,
+            sub_agent_outcomes,
+            completed_count,
+        } in plans
+        {
+            let conv_id = agent_msg.conversation_id.clone();
             let interrupted = ConvState::Failed {
                 error: "Sub-agent interrupted by server restart".to_string(),
                 error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
@@ -12824,8 +12797,8 @@ impl Database {
 
             tracing::info!(
                 conv_id = %conv_id,
-                completed = completed_results.len(),
-                interrupted = tool_msgs.len() - completed_results.len(),
+                completed = completed_count,
+                interrupted = tool_msgs.len() - completed_count,
                 "materialized in-flight tool round on restart",
             );
         }
@@ -15947,6 +15920,15 @@ struct NormalizedRound {
     completed_results: Vec<ToolResult>,
     interrupted_tool_ids: Vec<String>,
     pending_sub_agents: Vec<phoenix_core::domain::sm_state::PendingSubAgent>,
+}
+
+struct RestartToolRoundPlan {
+    assistant: Message,
+    results: Vec<Message>,
+    pending_sub_agents: Vec<phoenix_core::domain::sm_state::PendingSubAgent>,
+    sub_agent_outcomes:
+        std::collections::HashMap<String, phoenix_core::domain::sm_state::SubAgentOutcome>,
+    completed_count: usize,
 }
 
 /// Normalize a recovered in-flight tool round (`ToolExecuting` or
@@ -19230,18 +19212,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_llm_language_unset_returns_phoenix_native() {
+    async fn default_llm_language_defaults_roundtrips_and_falls_back_for_unknown_values() {
         let db = Database::open_in_memory().await.unwrap();
         assert_eq!(
             db.get_default_llm_language().await.unwrap(),
             LlmLanguage::PhoenixNative
         );
-    }
-
-    #[tokio::test]
-    async fn default_llm_language_set_persists_and_reads_back() {
-        let db = Database::open_in_memory().await.unwrap();
-
         db.set_default_llm_language(LlmLanguage::Caveman)
             .await
             .unwrap();
@@ -19250,7 +19226,6 @@ mod tests {
             LlmLanguage::Caveman
         );
 
-        // Switch back.
         db.set_default_llm_language(LlmLanguage::PhoenixNative)
             .await
             .unwrap();
@@ -19258,14 +19233,6 @@ mod tests {
             db.get_default_llm_language().await.unwrap(),
             LlmLanguage::PhoenixNative
         );
-    }
-
-    #[tokio::test]
-    async fn default_llm_language_falls_back_when_value_unknown() {
-        let db = Database::open_in_memory().await.unwrap();
-        // Forge a value this build doesn't recognize (forward-compat: an
-        // older binary reading a DB written by a newer one). Should fall
-        // back to the default rather than poison startup.
         db.set_app_setting("default_llm_language", "klingon")
             .await
             .unwrap();
@@ -19348,6 +19315,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reopened.instance_id().await.unwrap(), first_id);
+        let error = sqlx::query(
+            "INSERT INTO instance_identity (singleton_key, instance_id) VALUES (1, ?1)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .execute(reopened.pool())
+        .await
+        .expect_err("a second identity with the singleton key must be rejected");
+        assert!(
+            error
+                .as_database_error()
+                .is_some_and(sqlx::error::DatabaseError::is_unique_violation),
+            "{error}"
+        );
         assert!(sqlx::query(
             "INSERT INTO instance_identity (singleton_key, instance_id) VALUES (2, ?1)",
         )
@@ -19361,32 +19341,9 @@ mod tests {
         .execute(reopened.pool())
         .await
         .is_err());
-    }
-
-    #[tokio::test]
-    async fn concurrent_initializers_commit_one_instance_identity() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("concurrent-instance-identity.sqlite");
-        let db_path = db_path.to_string_lossy().into_owned();
-        let first = Database::open(&db_path).await.unwrap();
-        let second = Database::open(&db_path).await.unwrap();
-
-        let _concurrent_results = tokio::join!(
-            migrations::run_pending_migrations(first.pool()),
-            migrations::run_pending_migrations(second.pool()),
-        );
-
-        migrations::run_pending_migrations(first.pool())
-            .await
-            .unwrap();
-        migrations::run_pending_migrations(second.pool())
-            .await
-            .unwrap();
-        let first_id = first.instance_id().await.unwrap();
-        assert_eq!(second.instance_id().await.unwrap(), first_id);
         let identities: Vec<String> =
             sqlx::query_scalar("SELECT instance_id FROM instance_identity")
-                .fetch_all(first.pool())
+                .fetch_all(reopened.pool())
                 .await
                 .unwrap();
         assert_eq!(identities, vec![first_id.to_string()]);
@@ -19426,7 +19383,7 @@ mod tests {
 
         db.replace_federation_enrollment(
             InstanceId::new(),
-            "peer",
+            &"peer".parse().unwrap(),
             &phoenix_core::domain::instance_identity::FederationCredentialVerifier::from_bearer(
                 b"peer-secret",
             ),
@@ -23986,27 +23943,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn steady_state_prompt_tail_has_constant_statement_shape_and_no_full_history_read() {
-        async fn measure(
-            user_count: usize,
-        ) -> (
-            Vec<crate::sqlite_workload::NativeStatementShape>,
-            Vec<crate::sqlite_workload::NativeStatementShape>,
+    #[allow(clippy::too_many_lines)]
+    async fn prompt_reads_batch_attachments_and_bound_tail_work() {
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        };
+
+        async fn append_rows(
+            db: &Database,
+            conversation: &str,
+            sequences: std::ops::Range<i64>,
+            prefix: &str,
         ) {
-            let db = Database::open_in_memory().await.unwrap();
-            let conversation_id = format!("projection-shape-{user_count}");
-            db.create_conversation(&conversation_id, &conversation_id, "/tmp", true, None, None)
-                .await
-                .unwrap();
-            for index in 0..user_count {
+            for sequence in sequences {
+                let id = format!("{prefix}-{sequence}");
                 db.add_message_with_seq(
-                    &format!("history-{index}"),
-                    &conversation_id,
-                    i64::try_from(index + 1).unwrap(),
+                    &id,
+                    conversation,
+                    sequence,
                     &MessageContent::user_with_attachments(
-                        format!("history {index}"),
-                        vec![image_attachment(&format!("image-{index}"))],
-                        vec![file_attachment(&format!("file-{index}"))],
+                        &id,
+                        vec![image_attachment(&format!("image-{id}"))],
+                        vec![file_attachment(&format!("file-{id}"))],
                     ),
                     None,
                     None,
@@ -24014,68 +23973,129 @@ mod tests {
                 .await
                 .unwrap();
             }
-            db.sqlite_workload_collector
-                .take_native_statement_shapes_for_test();
-            let snapshot = db
-                .load_hydrated_prompt_snapshot(&conversation_id)
-                .await
-                .unwrap();
-            let snapshot_statements = db
-                .sqlite_workload_collector
-                .take_native_statement_shapes_for_test();
-            db.add_message_with_seq(
-                "new-tail-row",
-                &conversation_id,
-                i64::try_from(user_count + 1).unwrap(),
-                &MessageContent::user_with_attachments(
-                    "new tail row",
-                    vec![image_attachment("tail-image")],
-                    vec![file_attachment("tail-file")],
-                ),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-            db.sqlite_workload_collector
-                .take_native_statement_shapes_for_test();
-            let tail = db
-                .load_hydrated_prompt_tail(&conversation_id, snapshot.fenced_position())
-                .await
-                .unwrap();
+        }
+
+        fn assert_read_shape(statements: &[crate::sqlite_workload::NativeStatementShape]) {
+            use crate::sqlite_workload::NativeStatementShape;
+            assert_eq!(statements.len(), 6, "prompt statements: {statements:#?}");
+            assert_eq!(statements[0], NativeStatementShape::Begin);
+            assert!(statements[1..5]
+                .iter()
+                .all(|statement| *statement == NativeStatementShape::OrdinaryRead));
+        }
+
+        fn assert_tail(tail: &HydratedPromptTail, expected_ids: &[String]) {
             let HydratedPromptTail::Current(rows) = tail else {
                 panic!("append must return a current tail");
             };
-            assert_eq!(rows.messages().len(), 1);
-            assert_eq!(rows.messages()[0].message_id, "new-tail-row");
-            let (images, files) = rows.messages()[0].content.attachments();
-            assert_eq!((images.len(), files.len()), (1, 1));
-            let tail_statements = db
-                .sqlite_workload_collector
-                .take_native_statement_shapes_for_test();
-            (snapshot_statements, tail_statements)
-        }
-
-        fn assert_prompt_read_shape(statements: &[crate::sqlite_workload::NativeStatementShape]) {
-            assert_eq!(statements.len(), 6, "prompt statements: {statements:#?}");
             assert_eq!(
-                statements[0],
-                crate::sqlite_workload::NativeStatementShape::Begin,
-                "prompt statements: {statements:#?}"
+                rows.messages()
+                    .iter()
+                    .map(|message| &message.message_id)
+                    .collect::<Vec<_>>(),
+                expected_ids.iter().collect::<Vec<_>>()
             );
-            assert!(statements[1..5].iter().all(|statement| *statement
-                == crate::sqlite_workload::NativeStatementShape::OrdinaryRead));
-            // The final statement is the transaction boundary. Native metadata may
-            // conservatively classify it as an ordinary read after a cache collision;
-            // its bracket position, not that degraded category, excludes it.
+            for message in rows.messages() {
+                let (images, files) = message.content.attachments();
+                assert_eq!((images.len(), files.len()), (1, 1));
+            }
         }
 
-        for _ in 0..3 {
-            let (zero, eight, twenty_seven) = tokio::join!(measure(0), measure(8), measure(27));
-            for (snapshot_statements, tail_statements) in [zero, eight, twenty_seven] {
-                assert_prompt_read_shape(&snapshot_statements);
-                assert_prompt_read_shape(&tail_statements);
+        for history_count in [0_i64, 2] {
+            let db = Database::open_in_memory().await.unwrap();
+            let conversation = "prompt-read-contract";
+            db.create_conversation(conversation, conversation, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            append_rows(&db, conversation, 1..history_count + 1, "history").await;
+            db.sqlite_workload_collector
+                .take_native_statement_shapes_for_test();
+            let snapshot = db
+                .load_hydrated_prompt_snapshot(conversation)
+                .await
+                .unwrap();
+            assert_eq!(
+                snapshot.messages().len(),
+                usize::try_from(history_count).unwrap()
+            );
+            assert_read_shape(
+                &db.sqlite_workload_collector
+                    .take_native_statement_shapes_for_test(),
+            );
+
+            let first = history_count + 1;
+            append_rows(&db, conversation, first..first + 2, "tail").await;
+            let steps = Arc::new(AtomicU64::new(0));
+            {
+                let mut connection = db.pool().acquire().await.unwrap();
+                let mut handle = connection.lock_handle().await.unwrap();
+                let observed = Arc::clone(&steps);
+                handle.set_progress_handler(1, move || {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    true
+                });
             }
+            db.sqlite_workload_collector
+                .take_native_statement_shapes_for_test();
+            let tail = db
+                .load_hydrated_prompt_tail(conversation, snapshot.fenced_position())
+                .await
+                .unwrap();
+            let small_tail_steps = steps.load(Ordering::Relaxed);
+            assert_tail(
+                &tail,
+                &[format!("tail-{first}"), format!("tail-{}", first + 1)],
+            );
+            assert_read_shape(
+                &db.sqlite_workload_collector
+                    .take_native_statement_shapes_for_test(),
+            );
+
+            if history_count > 0 {
+                append_rows(&db, conversation, first + 2..first + 66, "older-prefix").await;
+                db.sqlite_workload_collector
+                    .take_native_statement_shapes_for_test();
+                let later_snapshot = db
+                    .load_hydrated_prompt_snapshot(conversation)
+                    .await
+                    .unwrap();
+                assert_read_shape(
+                    &db.sqlite_workload_collector
+                        .take_native_statement_shapes_for_test(),
+                );
+                append_rows(&db, conversation, first + 66..first + 68, "later-tail").await;
+                db.sqlite_workload_collector
+                    .take_native_statement_shapes_for_test();
+                steps.store(0, Ordering::Relaxed);
+                let later_tail = db
+                    .load_hydrated_prompt_tail(conversation, later_snapshot.fenced_position())
+                    .await
+                    .unwrap();
+                let large_tail_steps = steps.load(Ordering::Relaxed);
+                assert_tail(
+                    &later_tail,
+                    &[
+                        format!("later-tail-{}", first + 66),
+                        format!("later-tail-{}", first + 67),
+                    ],
+                );
+                assert_read_shape(
+                    &db.sqlite_workload_collector
+                        .take_native_statement_shapes_for_test(),
+                );
+                assert!(small_tail_steps > 0);
+                assert!(large_tail_steps <= small_tail_steps + 32,
+                    "tail work grew with 64 older parents: {small_tail_steps} -> {large_tail_steps} VM steps");
+            }
+            db.pool()
+                .acquire()
+                .await
+                .unwrap()
+                .lock_handle()
+                .await
+                .unwrap()
+                .remove_progress_handler();
+            db.pool().close().await;
         }
     }
 

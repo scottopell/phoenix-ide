@@ -30,11 +30,26 @@ fn unprepared_report_cases() -> [(ToolResult, bool); 4] {
     ]
 }
 
+fn scoped_evidence(mut evidence: serde_json::Value) -> serde_json::Value {
+    let fields = evidence.as_object_mut().unwrap();
+    fields.remove("facts");
+    fields.remove("obligations");
+    evidence
+}
+
 #[tokio::test]
 async fn unprepared_report_guard_uses_outcome_not_output_across_db_entrypoints() {
+    let db = fixture().await;
+    let mut retained_cases = Vec::new();
     for entrypoint in ["plain", "state", "replay", "terminal", "pending"] {
-        for (result, rejected) in unprepared_report_cases() {
-            let (db, owner, mut round) = report_fixture().await;
+        for (index, (mut result, rejected)) in unprepared_report_cases().into_iter().enumerate() {
+            let case = format!("checkpoint-{entrypoint}-{index}");
+            let (owner, mut round) = report_fixture_in(&db, &case).await;
+            if let ToolOutcome::Error { output, .. } | ToolOutcome::Cancelled { message: output } =
+                &mut result.outcome
+            {
+                *output = format!("Goal {case}-goal recorded complete at owner version 2.");
+            }
             let finalized = vec![finalized_result(&round.assistant, &result)];
             round.results = vec![result.into()];
             let obligation = terminal::obligation(&db, &round).await;
@@ -107,7 +122,20 @@ async fn unprepared_report_guard_uses_outcome_not_output_across_db_entrypoints()
                     after_first = Some(after);
                 }
             }
+            retained_cases.push((
+                case,
+                owner,
+                round,
+                scoped_evidence(after_first.unwrap_or(before)),
+            ));
         }
+    }
+    for (case, owner, round, expected) in retained_cases {
+        assert_eq!(
+            scoped_evidence(evidence(&db, &owner, &round).await),
+            expected,
+            "later cases changed {case}"
+        );
     }
 }
 

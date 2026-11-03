@@ -3,7 +3,7 @@ use std::str::FromStr;
 use chrono::Utc;
 use phoenix_core::domain::instance_identity::{
     InstanceId, InstanceSelector, PeerBaseUrl, PeerBearerCredential, PeerCaCertificatePem,
-    PeerHost, PeerTlsTrust,
+    PeerDisplayName, PeerHost, PeerTlsTrust,
 };
 use sqlx::Row;
 
@@ -26,7 +26,7 @@ impl Database {
     pub async fn save_federation_peer_connection(
         &self,
         peer_instance_id: InstanceId,
-        peer_display_name: &str,
+        peer_display_name: &PeerDisplayName,
         base_url: &PeerBaseUrl,
         bearer_credential: &PeerBearerCredential,
         tls_trust: &PeerTlsTrust,
@@ -56,7 +56,7 @@ impl Database {
                  created_at_us = excluded.created_at_us",
         )
         .bind(peer_instance_id.to_string())
-        .bind(peer_display_name)
+        .bind(peer_display_name.as_str())
         .bind(domain_or_ipv4_host)
         .bind(ipv6_host)
         .bind(i64::from(base_url.port()))
@@ -335,7 +335,7 @@ mod tests {
         };
         db.save_federation_peer_connection(
             peer,
-            "peer",
+            &"peer".parse().unwrap(),
             &first_url,
             &first_token,
             &PeerTlsTrust::PlatformRoots,
@@ -344,7 +344,7 @@ mod tests {
         .unwrap();
         db.save_federation_peer_connection(
             peer,
-            "renamed",
+            &"renamed".parse().unwrap(),
             &second_url,
             &second_token,
             &private_ca,

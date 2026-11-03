@@ -5,6 +5,7 @@ import type { WorkScopeInventory } from '../generated/sse';
 import { ConversationContext } from './ConversationContext';
 import { conversationListsEqual } from '../utils/conversationDiff';
 import { isAgentWorking } from '../utils';
+import { getToolActivity } from './toolActivity';
 
 function useConversationStore() {
   const store = useContext(ConversationContext);
@@ -287,10 +288,8 @@ export function useLastSseEventAtRef(slug: string): MutableRefObject<number> {
 export function useConversationSelectors(slug: string) {
   const [atom, dispatch] = useConversationAtom(slug);
 
-  const currentTool =
-    atom.phase.type === 'tool_executing' || atom.phase.type === 'cancelling_tool'
-      ? atom.phase.current_tool
-      : null;
+  const activity = getToolActivity(atom.phase);
+  const currentTool = activity.type === 'none' ? null : activity.activeTool;
 
   return {
     atom,

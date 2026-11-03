@@ -606,10 +606,13 @@ mod tests {
         preflight(&fresh, crate::migrations::migration_identities())
             .await
             .unwrap();
+        let pool = real_prefix(129).await;
         for (through, _) in
             crate::migrations::migration_identities().filter(|(version, _)| *version >= 129)
         {
-            let pool = real_prefix(through).await;
+            crate::migrations::run_through_for_test(&pool, through)
+                .await
+                .unwrap();
             let start_tables: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name IN ('conversation_goal_starts', 'conversation_goal_start_canonical_inputs')",
             )

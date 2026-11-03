@@ -155,6 +155,13 @@ Mid-QA on a sub-agent's commit you spot drift in a file that was out of their sc
 
 **Always use `./dev.py`** — it configures the LLM environment automatically.
 
+`dev.py` requires uv-managed CPython 3.13. uv installs it automatically when
+needed. Its inline script configuration also governs `uv run dev.py` and copied
+deployment controllers. The deployment helper captures that interpreter's
+absolute path; the Rust controller-contract test requests managed Python 3.13
+through uv as well. This keeps SQLite validation on the upstream SQLite bundled
+with the managed runtime when reading databases produced by Rust.
+
 ```bash
 ./dev.py up          # Build and start Phoenix + Vite (auto-seeds DB if empty)
 ./dev.py down        # Stop all servers

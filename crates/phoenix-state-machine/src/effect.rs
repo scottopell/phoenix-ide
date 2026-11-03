@@ -21,8 +21,8 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Atomic persistence payload holding an assistant message and its supplied results.
-/// Construction checks cardinality only; identity matching and storage admissibility
-/// remain outside this payload.
+/// Construction proves unique call/result identity correspondence; storage admission
+/// additionally checks row ownership and tool-specific disposition.
 #[derive(Debug, Clone)]
 pub enum CheckpointData {
     ToolRound(ToolRoundAssembly),
@@ -46,14 +46,11 @@ pub enum SteeringDrainPostCommit {
 }
 
 impl CheckpointData {
-    /// Construct a `ToolRound` checkpoint, enforcing that the number of
-    /// `tool_use` blocks in the assistant message matches the number of
-    /// tool results.
+    /// Construct a checkpoint with one result for each unique assistant call.
     ///
     /// # Errors
     ///
-    /// Returns [`PersistError::ResultCountMismatch`] when the `tool_use` count
-    /// in the assistant message differs from the number of tool results.
+    /// Returns an error when call/result identities do not correspond one-to-one.
     pub fn tool_round(
         assistant_message: AssistantMessage,
         tool_results: Vec<ToolResult>,

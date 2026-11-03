@@ -1,7 +1,9 @@
 use std::str::FromStr;
 
 use chrono::Utc;
-use phoenix_core::domain::instance_identity::{FederationCredentialVerifier, InstanceId};
+use phoenix_core::domain::instance_identity::{
+    FederationCredentialVerifier, InstanceId, PeerDisplayName,
+};
 use sqlx::{Row, Sqlite, Transaction};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,7 +159,7 @@ impl Database {
     pub async fn replace_federation_enrollment(
         &self,
         caller_instance_id: InstanceId,
-        caller_display_name: &str,
+        caller_display_name: &PeerDisplayName,
         credential_verifier: &FederationCredentialVerifier,
     ) -> DbResult<FederationEnrollment> {
         self.replace_federation_enrollment_with_commit(
@@ -173,7 +175,7 @@ impl Database {
     async fn replace_federation_enrollment_with_commit(
         &self,
         caller_instance_id: InstanceId,
-        caller_display_name: &str,
+        caller_display_name: &PeerDisplayName,
         credential_verifier: &FederationCredentialVerifier,
         commit: EnrollmentCommit,
         observed_clock_us: Option<i64>,
@@ -205,7 +207,7 @@ impl Database {
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(caller_instance_id.to_string())
-        .bind(caller_display_name)
+        .bind(caller_display_name.as_str())
         .bind(credential_verifier.to_string())
         .bind(now)
         .execute(&mut *tx)
@@ -227,7 +229,7 @@ impl Database {
             {
                 Ok(Some(committed))
                     if committed.caller_instance_id == caller_instance_id
-                        && committed.caller_display_name == caller_display_name =>
+                        && committed.caller_display_name == caller_display_name.as_str() =>
                 {
                     Ok(committed)
                 }
@@ -452,7 +454,7 @@ mod tests {
         old: &FederationSendAuthority,
         second: FederationCredentialVerifier,
     ) {
-        db.replace_federation_enrollment(caller, "peer", &second)
+        db.replace_federation_enrollment(caller, &"peer".parse().unwrap(), &second)
             .await
             .unwrap();
         assert!(matches!(
@@ -488,7 +490,7 @@ mod tests {
         let caller = InstanceId::new();
         let first = FederationCredentialVerifier::from_bearer(b"first-steering-token");
         let second = FederationCredentialVerifier::from_bearer(b"second-steering-token");
-        db.replace_federation_enrollment(caller, "peer", &first)
+        db.replace_federation_enrollment(caller, &"peer".parse().unwrap(), &first)
             .await
             .unwrap();
         let old = FederationSendAuthority::new(caller, first);
@@ -507,7 +509,7 @@ mod tests {
         let enrollment = db
             .replace_federation_enrollment_with_commit(
                 caller,
-                "peer",
+                &"peer".parse().unwrap(),
                 &verifier,
                 EnrollmentCommit::CommittedAckLost,
                 None,
@@ -528,10 +530,10 @@ mod tests {
         let caller = InstanceId::new();
         let first = FederationCredentialVerifier::from_bearer(b"bearer-one");
         let second = FederationCredentialVerifier::from_bearer(b"bearer-two");
-        db.replace_federation_enrollment(caller, "peer", &first)
+        db.replace_federation_enrollment(caller, &"peer".parse().unwrap(), &first)
             .await
             .unwrap();
-        db.replace_federation_enrollment(caller, "renamed peer", &second)
+        db.replace_federation_enrollment(caller, &"renamed peer".parse().unwrap(), &second)
             .await
             .unwrap();
 
@@ -565,15 +567,19 @@ mod tests {
         let second_caller = InstanceId::new();
         let first = FederationCredentialVerifier::from_bearer(b"first-bearer");
         let duplicate = FederationCredentialVerifier::from_bearer(b"duplicate-bearer");
-        db.replace_federation_enrollment(first_caller, "first peer", &first)
+        db.replace_federation_enrollment(first_caller, &"first peer".parse().unwrap(), &first)
             .await
             .unwrap();
-        db.replace_federation_enrollment(second_caller, "second peer", &duplicate)
-            .await
-            .unwrap();
+        db.replace_federation_enrollment(
+            second_caller,
+            &"second peer".parse().unwrap(),
+            &duplicate,
+        )
+        .await
+        .unwrap();
 
         assert!(db
-            .replace_federation_enrollment(first_caller, "first peer", &duplicate)
+            .replace_federation_enrollment(first_caller, &"first peer".parse().unwrap(), &duplicate)
             .await
             .is_err());
         assert_eq!(
@@ -594,7 +600,7 @@ mod tests {
         assert!(db
             .replace_federation_enrollment_with_commit(
                 caller,
-                "peer",
+                &"peer".parse().unwrap(),
                 &verifier,
                 EnrollmentCommit::Normal,
                 Some(-1),
@@ -615,7 +621,7 @@ mod tests {
         let second = FederationCredentialVerifier::from_bearer(b"second");
         db.replace_federation_enrollment_with_commit(
             caller,
-            "peer",
+            &"peer".parse().unwrap(),
             &first,
             EnrollmentCommit::Normal,
             Some(100),
@@ -625,7 +631,7 @@ mod tests {
 
         db.replace_federation_enrollment_with_commit(
             caller,
-            "peer",
+            &"peer".parse().unwrap(),
             &second,
             EnrollmentCommit::Normal,
             Some(1),
@@ -646,7 +652,7 @@ mod tests {
         let verifier = FederationCredentialVerifier::from_bearer(b"bearer");
         db.replace_federation_enrollment_with_commit(
             caller,
-            "peer",
+            &"peer".parse().unwrap(),
             &verifier,
             EnrollmentCommit::Normal,
             Some(100),
@@ -670,7 +676,7 @@ mod tests {
         let db = test_db().await;
         let caller = InstanceId::new();
         let verifier = FederationCredentialVerifier::from_bearer(b"bearer");
-        db.replace_federation_enrollment(caller, "peer", &verifier)
+        db.replace_federation_enrollment(caller, &"peer".parse().unwrap(), &verifier)
             .await
             .unwrap();
 
@@ -723,7 +729,7 @@ mod tests {
         let caller = InstanceId::new();
         db.replace_federation_enrollment(
             caller,
-            "peer",
+            &"peer".parse().unwrap(),
             &FederationCredentialVerifier::from_bearer(b"bearer-one"),
         )
         .await

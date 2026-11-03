@@ -165,6 +165,56 @@ fn value(output: &ToolOutput) -> Value {
 }
 
 #[tokio::test]
+async fn explicit_local_goal_read_preserves_snapshot_wait_and_authority() {
+    let f = Fixture::new().await;
+    let prepared = f
+        .prepare(json!({"operation":"create","objective":"Local selector parity"}))
+        .await;
+    let applied = value(&f.apply(&prepared).await);
+    assert_eq!(applied["receipt"]["result"]["outcome"], "accepted");
+    let before = f.work_counts().await;
+    for mut input in [
+        json!({"target":f.target(),"after_version":0}),
+        json!({"target":f.target(),"after_version":1}),
+        json!({"target":f.target(),"wait":{"minimum_version":1,"timeout_seconds":1}}),
+    ] {
+        let omitted = value(&f.invoke("read_goal", input.clone()).await);
+        input["instance"] = json!("local");
+        let explicit = value(&f.invoke("read_goal", input.clone()).await);
+        assert_eq!(omitted, explicit);
+        input["instance"] = Value::Null;
+        assert_eq!(omitted, value(&f.invoke("read_goal", input.clone()).await));
+        input["instance"] = json!("local");
+        let unauthorized = GoalTool {
+            service: GoalCommandService::new(f.runtime.clone()),
+            runtime: f.runtime.clone(),
+            operation: Operation::Read,
+        }
+        .run(input, super::super::tests::context(&f.target_transcript))
+        .await;
+        assert!(!unauthorized.is_success());
+        assert!(unauthorized.output().contains("Coordinator"));
+    }
+    for selector in [
+        json!("missing-peer"),
+        json!("Local"),
+        json!(" local "),
+        json!(""),
+        json!(false),
+        json!({}),
+    ] {
+        assert!(!f
+            .invoke(
+                "read_goal",
+                json!({"target":f.target(), "instance":selector})
+            )
+            .await
+            .is_success());
+    }
+    assert_eq!(before, f.work_counts().await);
+}
+
+#[tokio::test]
 async fn native_goal_discovery_prepare_apply_read_and_replay_without_dispatch() {
     let f = Fixture::new().await;
     let definitions = f.executor.definitions().await;

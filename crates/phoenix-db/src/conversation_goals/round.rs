@@ -7,6 +7,7 @@ use phoenix_core::domain::db_schema::{
 use phoenix_core::domain::llm_types::ContentBlock;
 use phoenix_core::domain::sm_state::ConvState;
 use phoenix_core::domain::tool_result_identity::tool_result_message_id;
+use phoenix_core::domain::tool_round::validate_tool_round_ids;
 use sqlx::Row;
 
 use super::{GoalDbError, GoalTx, Result};
@@ -81,19 +82,31 @@ pub(crate) async fn persist_finalized_round_tx(
         ));
     };
     let mut calls = std::collections::HashMap::new();
+    let mut call_ids = Vec::new();
     for block in blocks {
         if let ContentBlock::ToolUse { id, name, .. } = block {
-            if calls.insert(id.as_str(), name.as_str()).is_some() {
-                return Err(DbError::Serialization("tool round duplicate call".into()));
-            }
+            call_ids.push(id.as_str());
+            calls.insert(id.as_str(), name.as_str());
         }
     }
-    if assistant.message_type != MessageType::Agent || calls.len() != results.len() {
+    if assistant.message_type != MessageType::Agent {
         return Err(DbError::Serialization(
-            "tool round call/result cardinality".into(),
+            "tool round requires a genuine assistant".into(),
         ));
     }
-    let mut seen = std::collections::HashSet::new();
+    let result_ids = results
+        .iter()
+        .map(|result| {
+            let MessageContent::Tool(content) = &result.content else {
+                return Err(DbError::Serialization(
+                    "tool round requires tool results".into(),
+                ));
+            };
+            Ok(content.tool_use_id.as_str())
+        })
+        .collect::<DbResult<Vec<_>>>()?;
+    validate_tool_round_ids(call_ids, result_ids)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
     for finalized in finalized {
         let result = finalized.row();
         let MessageContent::Tool(content) = &result.content else {
@@ -110,7 +123,6 @@ pub(crate) async fn persist_finalized_round_tx(
             || result.conversation_id != assistant.conversation_id
             || result.message_id
                 != tool_result_message_id(&assistant.message_id, &content.tool_use_id)
-            || !seen.insert(content.tool_use_id.as_str())
         {
             return Err(DbError::Serialization(
                 "tool round result owning assistant differs".into(),
@@ -326,18 +338,11 @@ pub(crate) fn validate_round_shape(checkpoint: &GoalRoundCheckpoint<'_>) -> Resu
         .iter()
         .map(ToolRoundResult::tool_use_id)
         .collect();
-    let call_set: std::collections::HashSet<_> = calls.iter().copied().collect();
-    let mut seen = std::collections::HashSet::new();
-    if assistant.message_type != MessageType::Agent
-        || calls.is_empty()
-        || calls.len() != result_ids.len()
-        || call_set.len() != calls.len()
-        || result_ids
-            .iter()
-            .any(|id| !call_set.contains(id) || !seen.insert(*id))
-    {
+    if assistant.message_type != MessageType::Agent || calls.is_empty() {
         return Err(GoalDbError::Integrity("goal round tool pairing"));
     }
+    validate_tool_round_ids(calls, result_ids)
+        .map_err(|_| GoalDbError::Integrity("goal round tool pairing"))?;
     for result in checkpoint.results {
         if let ToolRoundResult::Finalized(result) = result {
             if result.is_success() && blocks.iter().any(|block| matches!(block,

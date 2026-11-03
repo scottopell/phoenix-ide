@@ -11559,7 +11559,7 @@ mod scope_liveness_tests {
         let verifier = FederationCredentialVerifier::from_bearer(b"steering-replay-token");
         manager
             .db()
-            .replace_federation_enrollment(caller, "peer", &verifier)
+            .replace_federation_enrollment(caller, &"peer".parse().unwrap(), &verifier)
             .await
             .expect("enroll caller");
         let authority = crate::db::FederationSendAuthority::new(caller, verifier);

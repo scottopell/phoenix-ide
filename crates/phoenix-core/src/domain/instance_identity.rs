@@ -68,6 +68,47 @@ impl<'de> serde::Deserialize<'de> for InstanceId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(transparent)]
+pub struct PeerDisplayName(String);
+
+#[derive(Debug, thiserror::Error)]
+pub enum PeerDisplayNameError {
+    #[error("peer display name must not be blank")]
+    Blank,
+    #[error("peer display name 'local' is reserved for this Phoenix instance")]
+    ReservedLocal,
+}
+
+impl FromStr for PeerDisplayName {
+    type Err = PeerDisplayNameError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(PeerDisplayNameError::Blank);
+        }
+        if value.eq_ignore_ascii_case("local") {
+            return Err(PeerDisplayNameError::ReservedLocal);
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl PeerDisplayName {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PeerDisplayName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::from_str(&value).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstanceSelector {
     Id(InstanceId),
@@ -576,6 +617,41 @@ impl fmt::Display for FederationCredentialVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_display_names_reject_reserved_local_and_blank_values() {
+        for value in [
+            "local",
+            "Local",
+            "LOCAL",
+            " \tLoCaL\n",
+            "\u{a0}local\u{a0}",
+            "",
+            " \t\n",
+        ] {
+            assert!(value.parse::<PeerDisplayName>().is_err(), "{value:?}");
+            assert!(serde_json::from_value::<PeerDisplayName>(serde_json::json!(value)).is_err());
+        }
+    }
+
+    #[test]
+    fn peer_display_names_trim_and_round_trip_without_reserving_substrings() {
+        for value in [
+            " remote-peer ",
+            "localhost",
+            "local-server",
+            "my local machine",
+        ] {
+            let name: PeerDisplayName = value.parse().unwrap();
+            assert_eq!(name.as_str(), value.trim());
+            let encoded = serde_json::to_value(&name).unwrap();
+            assert_eq!(encoded, serde_json::json!(value.trim()));
+            assert_eq!(
+                serde_json::from_value::<PeerDisplayName>(encoded).unwrap(),
+                name
+            );
+        }
+    }
 
     #[test]
     fn peer_base_url_requires_a_bare_https_origin() {

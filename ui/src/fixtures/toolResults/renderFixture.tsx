@@ -7,6 +7,7 @@ import { ConversationContext } from '../../conversation/ConversationContext';
 import { ConversationStore } from '../../conversation/ConversationStore';
 import { DensityContext } from '../../hooks/useDensity';
 import { buildHistoricalUnits } from '../../conversation/renderUnits';
+import { getToolActivity } from '../../conversation/toolActivity';
 import '../../index.css';
 import './toolResultsFixture.css';
 import { toolResultsFixtureData } from './scenarios';
@@ -28,8 +29,9 @@ function ToolResultsFixtureContent({ scenario }: Props) {
 function ToolResultsFixtureBody({ scenario, ready }: Props & { ready: boolean }) {
   const data = toolResultsFixtureData(scenario);
   const store = useMemo(() => new ConversationStore(), []);
-  const activeToolUseId = data.convState.type === 'tool_executing'
-    ? data.convState.current_tool.id
+  const activity = getToolActivity(data.convState);
+  const activeToolUseId = activity.type === 'executing'
+    ? activity.activeTool.id
     : undefined;
   const renderedMessages = useMemo(() => data.messages.map((message) => {
     if (message.message_id !== 'agent-13') return message;

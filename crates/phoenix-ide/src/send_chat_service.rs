@@ -1624,7 +1624,9 @@ fn transition_code(err: &TransitionError) -> &'static str {
         TransitionError::AwaitingUserResponse => "awaiting_user_response",
         TransitionError::AgentBusy => "agent_busy",
         TransitionError::CancellationInProgress => "cancellation_in_progress",
-        TransitionError::InvalidTransition { .. } => "invalid_state_for_message",
+        TransitionError::InvalidTransition { .. } | TransitionError::InvalidToolRound(_) => {
+            "invalid_state_for_message"
+        }
     }
 }
 

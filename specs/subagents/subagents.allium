@@ -32,9 +32,24 @@
 
 use "../bedrock/bedrock.allium" as bedrock
 
+-- Required classification and diagnostics of the native unactivated-batch
+-- boundary. A classified reconciliation receipt also establishes exact parent
+-- membership; a database cleanup return alone is insufficient.
+external entity NativeSpawnClosureResult {}
+
 ------------------------------------------------------------
 -- Value Types
 ------------------------------------------------------------
+
+-- One selected spawn call, correlated across admission and return. Provider
+-- tool IDs can repeat in another assistant round, so parent plus tool ID alone
+-- does not identify this invocation.
+value SpawnInvocation {
+    parent: bedrock/Conversation
+    assistant_message_id: String
+    tool_use_id: String
+    batch_id: String
+}
 
 -- Per-task input from the `spawn_agents` tool. All fields except `task`
 -- are optional in the JSON wire form; this record captures the
@@ -84,16 +99,83 @@ value SubAgentSpec {
     parent_work_scope_id: String when parent_work_scope_kind = attached
 }
 
--- One durable row exists for every child admitted by a spawn call. Booleans
--- model durable facts, not construction phases.
+-- One durable row exists for every child admitted by a spawn call. These fields
+-- model durable facts and disjoint delivery dispositions, not construction phases.
 entity SubAgentAdmission {
     child: bedrock.Conversation
     parent: bedrock.Conversation
+    batch_id: String
     execution_authority: SubAgentExecutionAuthority
     cancellation_requested: Boolean = false
     initial_work_dispatched: Boolean = false
     terminal_evidence_persisted: Boolean = false
-    parent_accepted_terminal: Boolean = false
+    parent_terminal_disposition: ParentTerminalDisposition = owed
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract SpawnParentAdoption {
+    UnactivatedSpawnBatchClosureRequested: (invocation: SpawnInvocation) -> NativeSpawnClosureResult
+
+    @invariant OneReconciliationPerExactInvocation
+        -- The existing response/activation owner admits at most one native
+        -- reconciliation operation for the exact invocation and batch identity.
+        -- Cancellation and a later admission response are notifications to that
+        -- same owner: the first atomically claims the operation and later signals
+        -- join it. They do not start another cleanup transaction or create a
+        -- second classified lifecycle-reply obligation. The shared operation
+        -- publishes its established classification exactly once; releasing the
+        -- cancelling parent after that receipt cannot strand a second operation.
+        -- Joined signals do not reinterpret failure as success, replay effects,
+        -- or create another durable owner or restart authority.
+
+    @invariant AdmissionDoesNotActivateChildren
+        -- Atomic admission reserves exact batch/child identities. Initial child
+        -- work additionally requires the activation receiver released only after
+        -- committed parent membership contains every exact admitted child.
+        -- An admitted response by itself is not an activation capability.
+
+    @invariant CancellationKeepsTheOriginalBatchOwned
+        -- Withhold activation as soon as cancellation is accepted. Retain the
+        -- exact originating response/activation owner until its native admission
+        -- command is classified. Already-admitted unadopted children are cancelled
+        -- and terminalized through that same batch owner, never silently dropped.
+        -- A cancelled parent cannot report settlement from a missing receipt or
+        -- from a query that races an outstanding admission command.
+
+    @invariant UnresolvedLiveHandoffCannotAdvanceOrdinarily
+        -- While a live admission/activation handoff is unresolved, retain its
+        -- exact parent/assistant/tool owner. Accepting cancellation does not
+        -- release it. No ordinary active-call advance, round completion, Idle
+        -- settlement or cancellation-backstop acknowledgement may replace that
+        -- owner before either committed membership/activation disposition or
+        -- classified cancellation reconciliation is established. An admitted
+        -- unadopted batch therefore cannot normally return to a later selection.
+        -- Error, process retirement or restart may interrupt the live chain;
+        -- those paths preserve evidence and do not claim ordinary cancellation
+        -- succeeded. This contract grants no automatic historical-turn repair.
+
+    @invariant ClosureReceiptsAreEstablishedNativeFacts
+        -- UnactivatedSpawnBatchClosureRequested requires classification after
+        -- admission resolves. It returns one exact reconciled, known-failed, or
+        -- unclassified observation. Reconciled establishes either authoritative
+        -- rejection/no admission, or terminal cancellation evidence plus committed
+        -- exact parent pending membership for every admitted child. It never
+        -- means merely that a receiver or in-memory entry is absent.
+        -- Unknown local write authority selects REQ-BED-033, not false success,
+        -- speculative cleanup, or replay of an unknown-effect command.
+
+    @invariant AllAdmittedChildrenRemainOwedUntilParentAcceptance
+        -- REQ-SA-004 / REQ-SA-005: cancellation before activation prevents child
+        -- work, but never exempts an admitted child from parent fan-in. Every
+        -- admitted child remains owed/pending until its actual terminal outcome
+        -- is parent-accepted. Administrative delivery suppression is not that
+        -- acceptance and cannot substitute for a cancellation terminal result.
+        -- Reconciliation establishes exact admitted membership before a parent
+        -- tool-abort acknowledgement; cancellation then drains those outcomes.
+        -- Already-adopted children retain their existing fan-in owner.
 }
 
 ------------------------------------------------------------
@@ -102,6 +184,7 @@ entity SubAgentAdmission {
 
 enum SubAgentExecutionAuthority { read_only | write_capable }
 enum ParentWorkScopeKind { unattached | attached }
+enum ParentTerminalDisposition { owed | fan_in_accepted }
 
 -- Tool registries selectable for a sub-agent. The registry shape itself
 -- lives in code (crates/phoenix-ide/src/tools.rs); the spec only names
@@ -136,16 +219,18 @@ config {
 -- ===========================================================
 
 rule SpawnRejectedEmptyTasks {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: tasks.count = 0
-    ensures: SpawnAgentsRejected(parent,
+    ensures: SpawnAgentsRejected(invocation,
         reason: "At least one task is required")
 }
 
 rule SpawnRejectedTooManyTasks {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: tasks.count > config.max_sub_agents_per_spawn
-    ensures: SpawnAgentsRejected(parent,
+    ensures: SpawnAgentsRejected(invocation,
         reason: "Too many tasks in a single spawn_agents call")
 
     @guidance
@@ -159,10 +244,11 @@ rule SpawnRejectedTooManyTasks {
 -- ===========================================================
 
 rule WorkSubAgentRequiresWriteableParent {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: any_task_mode_is_work(tasks)
     requires: parent.execution_authority != write_capable
-    ensures: SpawnAgentsRejected(parent,
+    ensures: SpawnAgentsRejected(invocation,
         reason: "Work sub-agents require parent Work authority")
 }
 
@@ -170,24 +256,27 @@ rule WorkSubAgentRequiresWriteableParent {
 -- model. No Opus 5+ identifier exists in the supported catalog represented by
 -- this specification, so no Anthropic identifier is qualified.
 rule UnqualifiedParentRejectsMultipleWorkInBatch {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: not parallel_work_qualified(parent.resolved_model_id)
     requires: work_task_count(tasks) > 1
-    ensures: SpawnAgentsRejected(parent,
+    ensures: SpawnAgentsRejected(invocation,
         reason: "This parent model admits Work sub-agents sequentially")
 }
 
 rule UnqualifiedParentRejectsConcurrentWork {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: not parallel_work_qualified(parent.resolved_model_id)
     requires: work_task_count(tasks) > 0
     requires: pending_work_admissions(parent) > 0
-    ensures: SpawnAgentsRejected(parent,
+    ensures: SpawnAgentsRejected(invocation,
         reason: "A Work sub-agent is already pending for this parent")
 }
 
 rule QualifiedParentAllowsParallelWork {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: parent.mode = direct
     requires: parallel_work_qualified(parent.resolved_model_id)
     requires: work_task_count(tasks) > 1 or pending_work_admissions(parent) > 0
@@ -210,9 +299,10 @@ rule QualificationIgnoresChildChoices {
 -- names an unavailable tier/model/connection, requests unsupported explicit
 -- effort, or its default cannot resolve in the parent's request snapshot.
 rule SpawnRejectedInvalidExecution {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: any_task_has_invalid_execution(tasks, parent)
-    ensures: SpawnAgentsRejected(parent,
+    ensures: SpawnAgentsRejected(invocation,
         reason: "Execution selection is unavailable or invalid")
 
     @guidance
@@ -228,9 +318,10 @@ rule SpawnRejectedInvalidExecution {
 -- checks the LLM-supplied value. Mirrors SpawnRejectedInvalidExecution.
 -- (REQ-AG-007)
 rule SpawnRejectedUnknownAgentType {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: any_task_has_unknown_agent_type(tasks, parent)
-    ensures: SpawnAgentsRejected(parent,
+    ensures: SpawnAgentsRejected(invocation,
         reason: "Unknown agent_type in task spec")
 
     @guidance
@@ -250,10 +341,11 @@ rule SpawnRejectedUnknownAgentType {
 -- mode-independent: read-only tools can still consume unbounded resources
 -- when rooted at the filesystem root.
 rule SpawnRejectedSystemRootCwd {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: any_task_effective_cwd_resolves_to_system_root(
         tasks, parent.working_dir)
-    ensures: SpawnAgentsRejected(parent,
+    ensures: SpawnAgentsRejected(invocation,
         reason: "Sub-agent cwd must not resolve to the filesystem root")
 
     @guidance
@@ -266,10 +358,11 @@ rule SpawnRejectedSystemRootCwd {
 
 -- Starting-directory scoping assigns work; it does not confine filesystem writes.
 rule SpawnRejectedWorkCwdOutsideWorktree {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: parent.worktree_path != absent
     requires: any_work_task_has_cwd_outside_worktree(tasks, parent.worktree_path)
-    ensures: SpawnAgentsRejected(parent,
+    ensures: SpawnAgentsRejected(invocation,
         reason: "Work sub-agent cwd must be inside the parent's worktree")
 
     @guidance
@@ -322,16 +415,18 @@ rule SpawnedSubAgentCwdAssignment {
 -- `RuntimeManager::handle_spawn_request`. The bedrock-level
 -- `SpawnAgentsCompletes*` rule then drives the parent state transition.
 rule InvalidBatchAdmitsNoChildren {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: not batch_is_admissible(parent, tasks)
-    ensures: SpawnAgentsRejected(parent,
+    ensures: SpawnAgentsRejected(invocation,
         reason: "The complete sub-agent batch is not admissible")
     ensures: AdmittedChildCountForInvocation(parent, tasks)
         = previous(AdmittedChildCountForInvocation(parent, tasks))
 }
 
 rule SubAgentSpecsResolved {
-    when: SpawnAgentsToolInvoked(parent, tasks)
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
     requires: tasks.count >= 1
     requires: tasks.count <= config.max_sub_agents_per_spawn
     requires: parent.execution_authority = write_capable
@@ -353,9 +448,10 @@ rule SubAgentSpecsResolved {
     ensures:
         for child in pending_sub_agents_from(tasks):
             SubAgentAdmission{child: child}.parent = parent
-            SubAgentAdmission{child: child}.parent_accepted_terminal = false
+            SubAgentAdmission{child: child}.batch_id = invocation.batch_id
+            SubAgentAdmission{child: child}.parent_terminal_disposition = owed
             child.spec.parent_conversation_id = parent.id
-    ensures: SpawnAgentsCompletes(parent,
+    ensures: SpawnAgentsCompletes(invocation,
         spawned_agents: pending_sub_agents_from(tasks))
     ensures: parallel_work_qualified(parent.resolved_model_id)
         and work_task_count(tasks) > 1
@@ -423,12 +519,63 @@ rule CancelAdmittedChildBeforeInitialWork {
     ensures: CancelledTerminalEvidencePersisted(child)
 }
 
+rule CancelSpawnBeforeParentAdoption {
+    when: SpawnBatchCancellationRequested(invocation)
+    ensures: SpawnActivationWithheld(invocation)
+    ensures: UnactivatedSpawnBatchClosureRequested(invocation)
+
+    @guidance
+        -- This requests or joins the one operation in SpawnParentAdoption.
+        -- The pre-response abort and post-admission cancellation notifications
+        -- can both reach this rule; they cannot launch two closure operations.
+}
+
+rule ReconciledUnactivatedBatchRetainsEveryAdmittedChild {
+    when: UnactivatedSpawnBatchReconciled(invocation)
+    let members = SubAgentAdmissions where batch_id = invocation.batch_id
+    let parent = invocation.parent
+    let pending_children = parent.sub_agents_pending + children_of(members)
+    requires: parent_owns_cancelled_spawn(invocation)
+    ensures: parent.sub_agents_pending = pending_children
+    ensures:
+        for admission in members:
+            admission.cancellation_requested = true
+            admission.initial_work_dispatched = false
+            admission.terminal_evidence_persisted = true
+            admission.parent_terminal_disposition = owed
+            ParentDeliveryOwed(parent.id, admission.child.id,
+                cancellation_terminal_result(admission.child))
+
+    @guidance
+        -- The receipt observes established cancellation evidence and exact parent
+        -- membership reconciliation, not speculative state or administrative
+        -- acceptance. The later ToolAborted observes this complete pending set,
+        -- enters CancellingSubAgents and accepts these cancellation outcomes
+        -- through the ordinary atomic fan-in boundary. None is a success result.
+}
+
 rule InitialWorkStartsIfNotCancelled {
     when: SubAgentInitialWorkRequested(child)
     requires: SubAgentAdmission{child: child}.cancellation_requested = false
     requires: SubAgentAdmission{child: child}.initial_work_dispatched = false
+    requires: not SubAgentAdmission{child: child}.terminal_evidence_persisted
+    requires: activation_released_after_exact_parent_membership(child)
     ensures: SubAgentAdmission{child: child}.initial_work_dispatched = true
     ensures: InitialWorkDispatched(child)
+}
+
+rule ReleasedBatchRequestsItsExactChildrenInitialWork {
+    when: SpawnActivationReleased(invocation)
+    let members = SubAgentAdmissions where batch_id = invocation.batch_id
+    ensures:
+        for admission in members:
+            SubAgentInitialWorkRequested(admission.child)
+
+    @guidance
+        -- The owning manager observed the one-shot release after committed exact
+        -- parent membership. Each child's initial-work claim still atomically
+        -- checks cancellation; a cancellation winner starts no work. Admission
+        -- response alone is not this release and cannot request initial work.
 }
 
 rule ConcurrentMaterializationJoinsByChildIdentity {
@@ -447,16 +594,28 @@ rule TerminalEvidencePrecedesParentDelivery {
 rule DurableParentIdentityDeliversTerminal {
     when: ParentDeliveryAttempted(child, result)
     requires: SubAgentAdmission{child: child}.terminal_evidence_persisted
-    requires: not SubAgentAdmission{child: child}.parent_accepted_terminal
+    requires: SubAgentAdmission{child: child}.parent_terminal_disposition = owed
     ensures: CurrentParentRuntimeResolved(SubAgentAdmission{child: child}.parent.id)
-    ensures: ParentAcceptsSubAgentTerminal(
-        SubAgentAdmission{child: child}.parent, child, result)
-    ensures: SubAgentAdmission{child: child}.parent_accepted_terminal = true
+    ensures: bedrock/ParentTerminalTransportArrived(
+        SubAgentAdmission{child: child}.parent, parent_terminal_result(child, result))
 }
+
+rule ActualParentAcceptanceAcknowledgesTerminal {
+    when: bedrock/SubAgentParentAcceptanceCommitted(parent, result)
+    let admission = admission_for_parent_result(parent, result)
+    requires: admission.terminal_evidence_persisted
+    ensures: admission.parent_terminal_disposition = fan_in_accepted
+
+    @guidance
+        -- This observes the same established SQLite transaction as Bedrock's
+        -- exact pending -> completed adoption, not a second acknowledgement write.
+        -- Transport dispatch, buffering, and a pure reducer proposal cannot set it.
+}
+
 
 rule DuplicateParentDeliveryIsIdempotent {
     when: ParentDeliveryAttempted(child, result)
-    requires: SubAgentAdmission{child: child}.parent_accepted_terminal
+    requires: SubAgentAdmission{child: child}.parent_terminal_disposition = fan_in_accepted
     ensures: ParentDeliveryAcceptedAsDuplicate(child)
     ensures: ParentResultCount(child) = previous(ParentResultCount(child))
     ensures: ParentResumeCountForChild(child) = previous(ParentResumeCountForChild(child))
@@ -554,6 +713,15 @@ invariant ParentAcceptsChildTerminalAtMostOnce {
         and ParentResumeCountForChild(admission.child) <= 1
 }
 
+invariant EveryAdmissionRemainsPendingOrParentAccepted {
+    for admission in SubAgentAdmissions:
+        ParentPendingCount(admission.child) + ParentResultCount(admission.child) = 1
+        and (admission.parent_terminal_disposition = owed
+            implies ParentPendingCount(admission.child) = 1)
+        and (admission.parent_terminal_disposition = fan_in_accepted
+            implies ParentResultCount(admission.child) = 1)
+}
+
 -- Work children start within the parent's worktree when it has one.
 -- They are trusted writers; this is not a filesystem security boundary.
 invariant WorkSubAgentCwdInsideWorktree {
@@ -572,14 +740,103 @@ invariant ToolRegistryMatchesMode {
 }
 
 ------------------------------------------------------------
+-- Actors and Surfaces
+------------------------------------------------------------
+
+actor SpawnAdmissionOwner {
+    identified_by: String
+}
+
+surface NativeSpawnAdoptionBoundary {
+    facing owner: SpawnAdmissionOwner
+    context invocation: SpawnInvocation
+
+    contracts:
+        fulfils SpawnParentAdoption
+
+    provides:
+        SpawnActivationReleased(invocation)
+            when owner_controls_batch(owner, invocation)
+                 and exact_batch_activation_release_established(invocation)
+        UnactivatedSpawnBatchReconciled(invocation)
+            when owner_controls_batch(owner, invocation)
+                 and unactivated_batch_reconciliation_established(invocation)
+                 and parent_owns_cancelled_spawn(invocation)
+        SpawnBatchClosureFailed(invocation, reason)
+            when owner_controls_batch(owner, invocation)
+        SpawnBatchAuthorityUnclassified(invocation)
+            when owner_controls_batch(owner, invocation)
+
+    @guarantee OneClassifiedResponseForTheOwnedOperation
+        -- Observations must come from the exact native response/activation owner
+        -- classifying the operation. Only established terminalization and parent
+        -- reconciliation can mint Reconciled; a cleanup write alone cannot.
+        -- Cancellation suppresses activation while retaining that ownership.
+        -- No request retry, second durable store, or new restart policy is implied.
+        -- Calls of UnactivatedSpawnBatchClosureRequested for this exact invocation
+        -- atomically start or join ONE fulfilled native operation. Only that
+        -- operation publishes one Reconciled, Failed, or Unclassified lifecycle
+        -- observation, preserving its diagnostics. Joining signals require no
+        -- second publication after the first receipt retires parent ownership.
+
+    @guarantee SuccessfulParentCommitProducesOneActivationRelease
+        -- The exact normal spawn admission return remains bound to its native
+        -- response/activation owner across Bedrock's typed parent transition.
+        -- Validate every expected child in that parent's membership, establish
+        -- the parent-state commit, then release the one-shot activation sender.
+        -- The manager's successful receiver supplies SpawnActivationReleased
+        -- once for that same invocation/batch, producing each child's initial
+        -- work request above. Cancellation-before-adoption withholds this release;
+        -- cancellation racing a child claim is resolved atomically by the child
+        -- lifecycle, never by treating admission as permission to run.
+
+    @guidance
+        -- The required native response owns terminalization and reconciliation;
+        -- these observations are established facts, not a free-standing trigger
+        -- queue. Native admission must finish before absence or complete admitted
+        -- membership can be established. No additional store or restart policy is
+        -- implied, and an unknown commit cannot be acknowledged as reconciled.
+}
+
+------------------------------------------------------------
 -- Helpers
 ------------------------------------------------------------
+-- owner_controls_batch(owner, invocation) -> Boolean: the native response and
+--   activation owner is bound to invocation.batch_id and its exact parent/call.
+-- exact_batch_activation_release_established(invocation) -> Boolean: the native
+--   owner verified all exact admitted child IDs in the captured parent's state,
+--   established that state commit and successfully released its one-shot receiver.
+--   This is the existing parent-persist sender -> manager activation_rx seam;
+--   admission alone, a later round or a dropped receiver supplies no such proof.
+-- unactivated_batch_reconciliation_established(invocation) -> Boolean: the owner
+--   established rejection/no admission, or complete terminal cancellation evidence
+--   for the exact admitted membership with no initial dispatch/activation release,
+--   AND committed those children into this exact parent's pending membership.
+--   A cleanup-only return or administrative acceptance timestamp is not this
+--   receipt. An already-adopted batch retains its existing fan-in owner.
+-- parent_owns_cancelled_spawn(invocation) -> Boolean: the parent is CancellingTool
+--   with this exact held assistant round and cancelling provider tool identity.
+-- children_of(admissions) -> Set<bedrock/Conversation>: the exact durable children.
+-- cancellation_terminal_result(child): the authoritative pre-start cancellation
+--   payload preserving that child's identity and cancellation cause, not success.
+-- ParentPendingCount(child) -> Integer: one exactly while the durable admission
+--   still owes this parent its terminal outcome, including before the parent's
+--   ready fan-in projection is established; zero after exact parent acceptance.
+--   Pending ownership cannot be dropped merely by suppressing transport delivery.
+-- activation_released_after_exact_parent_membership(child) -> Boolean: the native
+--   activation receiver was released only after the parent state committed the
+--   complete exact admitted batch membership. Admission alone is false; an
+--   unadopted cancelled batch never receives this activation release.
+-- parent_terminal_result(child, result) -> bedrock/SubAgentResult: preserve the
+--   exact child identity and complete terminal payload for parent transport.
+-- admission_for_parent_result(parent, result) -> SubAgentAdmission: the admission
+--   whose exact child identity is result.agent_id and durable parent is parent.
 -- parallel_work_qualified(model_id: String) -> Boolean
 --   True exactly for gpt-5.6-sol, gpt-5.6-terra, gpt-6-astra, and gpt-6-sol.
 --   False for gpt-5.6-luna, gpt-6-luna, every Anthropic identifier in the supported catalog, custom
 --   routes, unknown identifiers, and newly introduced identifiers.
 -- pending_work_admissions(parent: Conversation) -> Integer
---   Counts durable write-capable admissions whose parent_accepted_terminal is false.
+--   Counts durable write-capable admissions whose parent_terminal_disposition is owed.
 -- batch_is_otherwise_valid(parent: Conversation, tasks: List<SubAgentTask>) -> Boolean
 --   True exactly when every non-qualification validation in this specification
 --   succeeds for the complete batch.
