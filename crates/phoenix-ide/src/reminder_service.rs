@@ -291,6 +291,7 @@ enum ReminderMutationProbe {
 fn cancelled_probe(
     current: Option<Reminder>,
     expected: phoenix_core::domain::reminder::ReminderRevision,
+    now_us: ReminderTimestampUs,
 ) -> ReminderMutationProbe {
     use phoenix_core::domain::reminder::ReminderState;
     use phoenix_db::ReminderChange;
@@ -298,7 +299,12 @@ fn cancelled_probe(
         return ReminderMutationProbe::Established(ReminderChange::NotFound);
     };
     let result = match current.state {
-        ReminderState::Cancelled { .. } => ReminderChange::Updated { reminder: current },
+        ReminderState::Cancelled { cancelled_at_us }
+            if current.revision == expected && cancelled_at_us == now_us =>
+        {
+            ReminderChange::Updated { reminder: current }
+        }
+        ReminderState::Cancelled { .. } => ReminderChange::AlreadyCancelled { current },
         ReminderState::Due { .. } => ReminderChange::AlreadyDue { current },
         ReminderState::Scheduled if current.revision != expected => {
             ReminderChange::RevisionConflict { current }
@@ -421,7 +427,7 @@ async fn cancel_command(
                     return LocalAuthorityResult::DurableFactUnclassified;
                 }
             };
-            match cancelled_probe(current, expected_revision) {
+            match cancelled_probe(current, expected_revision, now_us) {
                 ReminderMutationProbe::Established(change) => change,
                 ReminderMutationProbe::Unapplied => {
                     return LocalAuthorityResult::DurableFactEstablished(Err(error))
@@ -742,6 +748,48 @@ mod mutation_tests {
     }
 
     #[tokio::test]
+    async fn cancel_probe_recovers_only_exact_committed_revision_and_time() {
+        let db = phoenix_db::Database::open_in_memory().await.unwrap();
+        let original = saved(&db).await;
+        let runtime = manager(&db);
+        cancel(
+            &runtime,
+            "mutation-source",
+            &original.id,
+            original.revision,
+            time(12),
+        )
+        .await
+        .unwrap();
+        let current = db
+            .get_reminder("mutation-source", &original.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            cancelled_probe(Some(current.clone()), original.revision, time(12)),
+            ReminderMutationProbe::Established(ReminderChange::Updated { reminder }) if reminder == current
+        ));
+        assert!(matches!(
+            cancelled_probe(Some(current.clone()), original.revision, time(11)),
+            ReminderMutationProbe::Established(ReminderChange::AlreadyCancelled { current: returned }) if returned == current
+        ));
+        let competing = cancel(
+            &runtime,
+            "mutation-source",
+            &original.id,
+            original.revision,
+            time(11),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(competing, ReminderChange::AlreadyCancelled { current: returned } if returned == current)
+        );
+        assert!(runtime.acquire_local_authority_pass().is_ok());
+    }
+
+    #[tokio::test]
     async fn reminder_management_probes_classify_committed_unchanged_and_competing_mutations() {
         let db = phoenix_db::Database::open_in_memory().await.unwrap();
         let original = saved(&db).await;
@@ -758,7 +806,7 @@ mod mutation_tests {
             ReminderMutationProbe::Unapplied
         ));
         assert!(matches!(
-            cancelled_probe(Some(original.clone()), original.revision),
+            cancelled_probe(Some(original.clone()), original.revision, time(11)),
             ReminderMutationProbe::Unapplied
         ));
         db.reschedule_reminder(&input).await.unwrap();
@@ -772,7 +820,7 @@ mod mutation_tests {
             ReminderMutationProbe::Established(ReminderChange::Updated { .. })
         ));
         assert!(matches!(
-            cancelled_probe(Some(current.clone()), original.revision),
+            cancelled_probe(Some(current.clone()), original.revision, time(11)),
             ReminderMutationProbe::Established(ReminderChange::RevisionConflict { .. })
         ));
         let different = RescheduleReminderInput {
@@ -792,8 +840,8 @@ mod mutation_tests {
             .unwrap()
             .unwrap();
         assert!(matches!(
-            cancelled_probe(Some(cancelled.clone()), original.revision),
-            ReminderMutationProbe::Established(ReminderChange::Updated { .. })
+            cancelled_probe(Some(cancelled.clone()), original.revision, time(12)),
+            ReminderMutationProbe::Established(ReminderChange::AlreadyCancelled { .. })
         ));
         assert!(matches!(
             rescheduled_probe(Some(cancelled), &different),
@@ -808,7 +856,7 @@ mod mutation_tests {
             ReminderMutationProbe::Established(ReminderChange::AlreadyDue { .. })
         ));
         assert!(matches!(
-            cancelled_probe(Some(due), original.revision),
+            cancelled_probe(Some(due), original.revision, time(11)),
             ReminderMutationProbe::Established(ReminderChange::AlreadyDue { .. })
         ));
         assert!(matches!(
@@ -816,7 +864,7 @@ mod mutation_tests {
             ReminderMutationProbe::Established(ReminderChange::NotFound)
         ));
         assert!(matches!(
-            cancelled_probe(None, original.revision),
+            cancelled_probe(None, original.revision, time(11)),
             ReminderMutationProbe::Established(ReminderChange::NotFound)
         ));
     }
