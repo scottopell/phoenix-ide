@@ -305,6 +305,13 @@ struct UnwatchConversation(crate::db::Database);
 struct ListWatchedConversations(crate::db::Database);
 struct SafeRetryClose(Arc<SendChatApplicationService>);
 
+fn present_instance_selector<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    Ok(Some(value))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WatchInput {

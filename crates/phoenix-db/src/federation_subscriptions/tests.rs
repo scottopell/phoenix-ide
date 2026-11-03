@@ -62,7 +62,7 @@ impl Fixture {
                 .expose()
                 .as_bytes(),
         );
-        db.replace_federation_enrollment(caller, "caller", &verifier)
+        db.replace_federation_enrollment(caller, &"caller".parse().unwrap(), &verifier)
             .await
             .unwrap();
         let enrollment = active_enrollment_id(&db, caller).await;
@@ -618,7 +618,11 @@ async fn exact_enrollment_owns_subscription_and_replacement_ends_old_binding_ato
             .expose()
             .as_bytes(),
     );
-    f.db.replace_federation_enrollment(f.caller, "replacement", &verifier)
+    f.db.replace_federation_enrollment(
+        f.caller,
+        &"replacement".parse().unwrap(),
+        &verifier,
+    )
         .await
         .unwrap();
     assert_ne!(active_enrollment_id(&f.db, f.caller).await, f.enrollment);
@@ -2204,7 +2208,7 @@ async fn pre_enrollment_production_terminal_is_not_a_future_fact() {
     );
     let caller = InstanceId::new();
     let verifier = FederationCredentialVerifier::from_bearer(b"later-peer");
-    db.replace_federation_enrollment(caller, "later peer", &verifier)
+    db.replace_federation_enrollment(caller, &"later peer".parse().unwrap(), &verifier)
         .await
         .unwrap();
     let enrollment = active_enrollment_id(&db, caller).await;
@@ -3184,7 +3188,11 @@ async fn drain_1025_with_gap_and_authorization_keeps_other_subscription_independ
     let f = Fixture::new().await;
     let other_caller = InstanceId::new();
     let other_verifier = FederationCredentialVerifier::from_bearer(b"other-drain");
-    f.db.replace_federation_enrollment(other_caller, "other", &other_verifier)
+    f.db.replace_federation_enrollment(
+        other_caller,
+        &"other".parse().unwrap(),
+        &other_verifier,
+    )
         .await
         .unwrap();
     let other_authority = send_authority(other_caller, other_verifier);

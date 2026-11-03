@@ -122,7 +122,11 @@ impl TestInstance {
         let verifier = FederationCredentialVerifier::from_bearer(credential.expose().as_bytes());
         self.state
             .db
-            .replace_federation_enrollment(caller_instance_id, "isolated test caller", &verifier)
+            .replace_federation_enrollment(
+                caller_instance_id,
+                &"isolated test caller".parse().unwrap(),
+                &verifier,
+            )
             .await
             .unwrap();
         credential
@@ -144,7 +148,7 @@ impl TestInstance {
             .db
             .save_federation_peer_connection(
                 destination,
-                "isolated receiver",
+                &"isolated receiver".parse().unwrap(),
                 &receiver.origin,
                 credential,
                 &receiver.trust,

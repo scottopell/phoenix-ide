@@ -430,7 +430,7 @@ async fn tls_trust_failure_and_explicit_missing_instance_never_fall_back_to_loca
         .db
         .save_federation_peer_connection(
             peer.peer_instance_id,
-            "wrong trust",
+            &"wrong trust".parse().unwrap(),
             &peer.base_url,
             &peer.bearer_credential,
             &peer.tls_trust,
@@ -572,12 +572,7 @@ async fn repeated_refresh_keeps_authorization_retryable_and_future_watch_active(
         let row = refreshed(&a, &remote).await;
         assert_eq!(row.state, SubscriptionState::Active);
         assert_eq!(row.admitted_cursor, SubscriptionCursor::START);
-        let pending = a
-            .state
-            .db
-            .pending_remote_notifications(&row)
-            .await
-            .unwrap();
+        let pending = a.state.db.pending_remote_notifications(&row).await.unwrap();
         assert!(matches!(
             pending.as_slice(),
             [phoenix_db::federation_subscriptions::RemoteNotification {
@@ -669,8 +664,7 @@ async fn failed_gap_repeated_refresh_exhausts_before_gap_exposure() {
                     last_produced: SubscriptionCursor::try_from(1).unwrap(),
                     reason: GapReason::DisconnectedAge,
                     failed_at_us,
-                    terminal_evidence_expires_at_us: failed_at_us
-                        + TERMINAL_EVIDENCE_LIFETIME_US,
+                    terminal_evidence_expires_at_us: failed_at_us + TERMINAL_EVIDENCE_LIFETIME_US,
                     snapshot: SubscriptionSnapshot {
                         transcript_id: TranscriptConversationId::parse(&source.id).unwrap(),
                         state: SubscriptionCurrentState::Terminal {
@@ -686,14 +680,9 @@ async fn failed_gap_repeated_refresh_exhausts_before_gap_exposure() {
     assert_eq!(failed.state, SubscriptionState::FailedGap);
 
     for expected_attempt in 1..=3 {
-        drain_notifications_for_test(
-            &a.state.db,
-            &a.state.runtime,
-            &failed,
-            Some(&peer),
-        )
-        .await
-        .unwrap();
+        drain_notifications_for_test(&a.state.db, &a.state.runtime, &failed, Some(&peer))
+            .await
+            .unwrap();
         let pending = a
             .state
             .db
@@ -1037,7 +1026,7 @@ async fn offline_unsubscribe_is_locally_stopped_and_retries_the_exact_remote_ide
         .db
         .save_federation_peer_connection(
             peer.peer_instance_id,
-            "offline",
+            &"offline".parse().unwrap(),
             &offline_url,
             &peer.bearer_credential,
             &peer.tls_trust,

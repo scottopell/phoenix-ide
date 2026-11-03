@@ -263,7 +263,7 @@ mod tests {
 
         db.save_federation_peer_connection(
             first_id,
-            "Build Peer",
+            &"Build Peer".parse().unwrap(),
             &first_url,
             &first_token,
             &PeerTlsTrust::PlatformRoots,
@@ -292,7 +292,7 @@ mod tests {
 
         db.save_federation_peer_connection(
             second_id,
-            "Build Peer",
+            &"Build Peer".parse().unwrap(),
             &second_url,
             &second_token,
             &PeerTlsTrust::PlatformRoots,
