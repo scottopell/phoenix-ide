@@ -234,6 +234,8 @@ A plugin stdio server SHALL run with:
 - native OS executable, argument, and environment values after expansion,
   without Unicode replacement in package paths or client-owned path values;
   spawning and respawning SHALL preserve those same native values
+- explicit cwd values retained as the resolved target approved by containment,
+  not an unresolved symlink expression
 - configured `env` values that do not declare `PLUGIN_ROOT` or `PLUGIN_DATA`
 
 WHERE a configured `env` entry declares `PLUGIN_ROOT` or `PLUGIN_DATA` THE
@@ -262,6 +264,10 @@ Configured HTTP headers SHALL NOT be forwarded through a redirect to another
 origin without explicit authorization. Phoenix SHALL reject cross-origin
 MCP redirects; origin is scheme, host, and effective port. Same-origin
 redirects SHALL have a finite limit (`specs/mcp/` REQ-MCP-004).
+Phoenix SHALL reject plugin `Authorization` generic headers during server
+admission, with a capability diagnostic. Static credentials belong in user
+MCP auth configuration; a parsed but unsupported credential SHALL NOT be
+reported as an admitted server.
 
 **Rationale:** Qualified keys give user config structural precedence over
 plugins. A pass-scoped admission decision detects ambiguous dotted keys
@@ -315,6 +321,10 @@ contribute. An absent row SHALL mean enabled only in a successfully loaded
 snapshot. A failed refresh SHALL NOT replace the last successful snapshot.
 Each discovery pass SHALL use one stable snapshot. Lifecycle mutations and
 snapshot publication SHALL be serialized within the instance.
+Reconciliation failures SHALL be attributed by exact configuration source,
+including retained or queued configurations affected by a failed handoff.
+A user server or another plugin SHALL NOT be attributed by a shared dotted
+prefix. Global failure diagnostics SHALL retain those exact owner tags.
 MCP configuration capture and reconciliation SHALL use one serialization
 boundary for startup and every reload, so a delayed enabled snapshot cannot
 be applied after disabling reconciliation completes.
@@ -362,6 +372,9 @@ symlink entry SHALL be unlinked without deleting its target. Removal SHALL
 retain identity, installation-entry location, and provenance with
 enabled=false. Only successful add or explicit enable may reactivate that
 identity. Disabling SHALL precede entry deletion.
+Destructive retirement SHALL retain files and data while an exact serving
+or queued MCP binding for that plugin remains. A deferred reconciliation
+outcome SHALL NOT be treated as completed retirement.
 Removal SHALL prefer the selected valid discovery entry. When discovery
 cannot load a registered package, removal MAY use its stored installation
 entry only after validating that it is an immediate non-data child of the
@@ -424,6 +437,14 @@ SHALL use the same user-configuration precedence decision.
 
 THE SYSTEM SHALL provide a normal settings-navigation link to plugin
 management; knowing the route address SHALL NOT be required.
+Missingness SHALL describe the selected canonical package target. The API
+SHALL separately report installation-entry state as present, absent, or
+unknown. A dangling entry has a missing target but remains removable, not
+purgeable, until the entry is unlinked.
+
+Global skill status SHALL evaluate global user/builtin/plugin inputs without
+choosing an arbitrary repository or projects-directory context. Conversation
+catalogs retain their context-specific precedence and deduplication.
 
 **Rationale:** A plugin that half-loads (skills present, `mcp.json` invalid)
 must be legible in the UI the same way a failed MCP server is

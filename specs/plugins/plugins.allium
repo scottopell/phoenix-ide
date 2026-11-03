@@ -50,6 +50,7 @@ enum PluginPhase { installed | retained }
 -- Why the plugin directory exists: Phoenix installed it, or another
 -- harness did and Phoenix merely loads it (REQ-AP-009).
 enum Provenance { managed | unmanaged }
+enum InstallationEntryState { present | absent | unknown }
 
 -- Component-type discriminant for scoped failure reporting.
 enum ComponentType { skills | mcp }
@@ -108,6 +109,7 @@ entity Plugin {
     enabled: Boolean
     provenance: Provenance
     entry_dir: String?
+    entry_state: InstallationEntryState
     root: String
 
     -- Per-component load outcome, retained until the next scan.
@@ -115,7 +117,7 @@ entity Plugin {
 
     -- Set when a registry record exists but the plugin root is absent
     -- (a shared-root harness removed the directory).
-    missing: Boolean when phase = installed
+    missing: Boolean
 
     -- True once removal (or a missing root) has made the plugin's data
     -- directory eligible for an explicit purge (REQ-AP-009).
@@ -246,6 +248,10 @@ surface PluginControl {
 --   Validation resolves its parent, never the package symlink target.
 --   A valid different manifest identity at a retained entry rejects removal.
 --   Registry paths retain native OS bytes, not lossy display strings.
+-- observed_entry_state(plugin): present/absent/unknown for the selected
+--   install entry, or its retained registry entry when no package loads.
+-- package_target_missing(plugin): known target absence following entry links;
+--   a dangling entry is present while its package target is missing.
 -- registry_enabled(name): true only in an available, successfully loaded
 --   activation snapshot that does not disable name; absent row then means
 --   enabled. The snapshot is stable for one discovery pass (REQ-AP-008).
@@ -260,6 +266,8 @@ surface PluginControl {
 --   absolute package path for a ./ command, independent of cwd.
 -- command_valid(command, root): command_allowed and any package path stays
 --   within root after resolving existing symlink ancestors.
+--   cwd_resolved and command_resolved retain the exact resolved target that
+--   passed containment; they never return an unresolved symlink expression.
 -- expand_args(args, root, data): expand_placeholders on each argument.
 -- install_succeeded(source): complete exclusive publication and successful
 --   managed/enabled registry registration, not merely a successful copy.
@@ -320,6 +328,7 @@ rule PluginDiscovered {
         enabled: registry_enabled(manifest.name),
         provenance: provenance_for(plugin_root),
         entry_dir: plugin_root,
+        entry_state: present,
         root: canonical_root(plugin_root),
         missing: false,
         purgeable: false,
@@ -338,6 +347,7 @@ rule PluginAdded {
         enabled: true,
         provenance: managed,
         entry_dir: added.entry_dir,
+        entry_state: present,
         root: added.root,
         missing: false,
         purgeable: false,
@@ -364,6 +374,7 @@ rule PluginReinstalled {
         plugin.enabled = true
         plugin.provenance = managed
         plugin.entry_dir = added.entry_dir
+        plugin.entry_state = present
         plugin.root = added.root
         plugin.version = added.version
         plugin.purgeable = false
@@ -463,9 +474,10 @@ rule PluginRemovalRequested {
     ensures:
         plugin.phase = retained
         plugin.enabled = false
-        plugin.purgeable = true
+        plugin.purgeable = installation_entry_absent(plugin)
         plugin.load_report = null
-        plugin.missing = null
+        plugin.missing = package_target_missing(plugin)
+        plugin.entry_state = observed_entry_state(plugin)
         retract_components(plugin.name)
     @guidance
         -- Validate identity before path construction. Prefer the selected
@@ -509,7 +521,9 @@ rule PluginDataPurged {
 rule RegisteredPluginRootMissing {
     when: plugins: Plugin.missing becomes true
 
-    ensures: plugins.purgeable = true
+    ensures:
+        plugins.entry_state = observed_entry_state(plugins)
+        plugins.purgeable = installation_entry_absent(plugins)
 }
 
 ------------------------------------------------------------

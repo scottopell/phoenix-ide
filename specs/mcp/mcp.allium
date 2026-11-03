@@ -44,6 +44,13 @@ enum AuthScheme { none | static | oauth }
 enum OAuthPhase { discovering | registering | awaiting_user | authorized | refreshing }
 
 contract ReconciliationPreparation {
+    @invariant ExactFailureOwners
+        -- Configuration carries client-generated user/plugin source metadata.
+        -- Failure ownership uses exact captured and retained/queued sources,
+        -- never server-name prefixes. A failed ownership handoff keeps the
+        -- retained owner relevant until retirement completes. An orphan
+        -- credential cleanup without configuration has no known owner.
+
     @invariant ConfigCaptureSharesReconciliationOrder
         -- Startup discovery and every reload capture configuration files and
         -- plugin activation only after acquiring the reconciliation boundary.

@@ -513,6 +513,14 @@ be applied after a completed disable reconciliation.
 applies the minimum change and reports what happened so the operator sees the
 effect of an edit.
 
+Configuration source SHALL be tagged by the discovering client as user or
+an exact plugin identity, and carried with serving and queued configuration.
+Reload failures SHALL report the exact owner set from the desired and still
+retained/queued configurations affected by the failure. Prefixes of server
+names SHALL NOT imply ownership. Orphan credential cleanup without a retained
+configuration has no known owner to fabricate. Ownership changes participate
+in configuration reconciliation, even when process fields are otherwise equal.
+
 ---
 
 ### REQ-MCP-016: Per-Server Enable/Disable

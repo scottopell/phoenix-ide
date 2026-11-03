@@ -1,5 +1,29 @@
 # User-Level Agent Plugins (Agent Plugins Spec 1.1.0)
 
+## Exact ownership and global-status review — 2026-11-03
+
+Hosted CI passed on `b67ec1d48`:
+https://github.com/scottopell/phoenix-ide/actions/runs/41679041282
+
+Six new threads on that head are addressed by explicit config-source tags and
+failure owner sets; early rejection of unsupported plugin Authorization;
+composed CLI platform dispatch; retaining the approved resolved cwd; separating
+package-target missingness from entry state; and context-free global skill
+admission. Serving/queued owned bindings also block destructive retirement
+while teardown is deferred. No separate ownership cache or name-prefix policy
+is used. ADR-221 records the metadata and scope decisions.
+
+The API adds `entry_state` and failure `owners`; UI types and interaction mocks
+carry both. Dangling links show a missing target but offer Remove, not Purge.
+Unknown entry state offers neither destructive action. Conversation skill
+precedence is unchanged; only global status omits arbitrary project scans.
+
+Local evidence: 41 loader, 212 MCP, 66 skills, 46 macOS plugin runtime/API and
+17 Python client tests; strict clippy and UI/spec/structural checks pass.
+New-head CI is required after publication; the preceding green run is not a
+substitute. Task remains in progress, with no merge/deploy performed and real
+browser/runtime mutation acceptance still distinct from automated CI.
+
 ## Native process and late-purge review — 2026-11-03
 
 Hosted CI passed again on `0c13975fc`:
