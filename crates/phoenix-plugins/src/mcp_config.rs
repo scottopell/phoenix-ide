@@ -128,6 +128,12 @@ fn mcp_schema_for(manifest_schema: &str) -> String {
 
 /// Validate one `mcpServers` entry against the closed variants.
 fn validate_server(name: &str, entry: &Value) -> ServerValidation {
+    if name.is_empty() || name.contains("__") {
+        return skip(
+            name,
+            "server name is empty or contains reserved tool delimiter __",
+        );
+    }
     let Some(fields) = entry.as_object() else {
         return skip(name, "server entry is not an object");
     };
@@ -151,7 +157,7 @@ fn validate_stdio(name: &str, fields: &serde_json::Map<String, Value>) -> Server
     if command.is_empty() || command.contains(char::is_whitespace) {
         return skip(name, "stdio command must be one executable token");
     }
-    if command.contains('/') && !command.starts_with("./") {
+    if command.contains(['/', '\\', ':']) && !command.starts_with("./") {
         return skip(name, "stdio command must be bare or plugin-relative ./");
     }
 
@@ -526,6 +532,40 @@ mod tests {
                 .any(|(name, outcome)| name == "good"
                     && matches!(outcome, ServerValidation::Valid(_))));
         }
+    }
+
+    #[test]
+    fn path_like_bare_commands_and_ambiguous_server_ids_are_skipped() {
+        for command in [
+            r"C:\tools\server.exe",
+            r"..\outside.exe",
+            r"\\host\share\server.exe",
+            r"C:server.exe",
+            r"file:stream.exe",
+            r".\server.exe",
+        ] {
+            let document = serde_json::json!({"$schema": MCP_SCHEMA_URL, "mcpServers": {
+                "bad": {"type": "stdio", "command": command},
+                "good": {"type": "stdio", "command": "sh"}
+            }});
+            let parsed =
+                McpDocument::parse(&document.to_string(), crate::manifest::MANIFEST_SCHEMA_URL)
+                    .unwrap();
+            let outcomes = parsed.validate_servers();
+            assert!(
+                outcomes.iter().any(|(name, outcome)| name == "bad"
+                    && matches!(outcome, ServerValidation::Skipped(_))),
+                "{command}"
+            );
+            assert!(outcomes
+                .iter()
+                .any(|(name, outcome)| name == "good"
+                    && matches!(outcome, ServerValidation::Valid(_))));
+        }
+        let parsed = McpDocument::parse(&serde_json::json!({"$schema": MCP_SCHEMA_URL,
+            "mcpServers": {"foo__bar": {"type": "stdio", "command": "sh"}, "good": {"type": "stdio", "command": "sh"}}
+        }).to_string(), crate::manifest::MANIFEST_SCHEMA_URL).unwrap();
+        assert!(parsed.validate_servers().iter().any(|(name, outcome)| name == "foo__bar" && matches!(outcome, ServerValidation::Skipped(failure) if failure.reason.contains("delimiter"))));
     }
 
     #[test]

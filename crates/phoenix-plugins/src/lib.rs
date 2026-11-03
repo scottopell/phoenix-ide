@@ -216,8 +216,29 @@ fn load_skills(loaded: &mut ParsedPlugin) {
 
     for dir in dirs {
         let skill_md = dir.join("SKILL.md");
-        if !skill_md.is_file() {
-            continue; // no SKILL.md: not a skill; nested trees are ignored (REQ-AP-005)
+        let invalid = match std::fs::metadata(&skill_md) {
+            Ok(metadata) if metadata.is_file() => None,
+            Ok(_) => Some("SKILL.md is not a regular file".to_string()),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && std::fs::symlink_metadata(&skill_md)
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue
+            }
+            Err(error) => Some(format!("SKILL.md metadata unreadable: {error}")),
+        };
+        if let Some(reason) = invalid {
+            tracing::warn!(plugin = %loaded.manifest.name, skill = %dir.display(), %reason, "skipping invalid skill file");
+            loaded.skipped_skills.push(SkillFailure {
+                skill: dir
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                reason,
+            });
+            continue;
         }
         let resolved = std::fs::canonicalize(&skill_md).unwrap_or_else(|_| skill_md.clone());
         if !within_boundary(&resolved, &loaded.root) {
@@ -306,6 +327,41 @@ fn load_mcp(loaded: &mut ParsedPlugin) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn present_non_regular_skill_files_are_skipped_with_diagnostics() {
+        for fifo in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                temp.path().join("plugin.json"),
+                serde_json::json!({"$schema": manifest::MANIFEST_SCHEMA_URL, "name": "demo"})
+                    .to_string(),
+            )
+            .unwrap();
+            let bad = temp.path().join("skills/bad/SKILL.md");
+            std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
+            if fifo {
+                assert!(std::process::Command::new("mkfifo")
+                    .arg(&bad)
+                    .status()
+                    .unwrap()
+                    .success());
+            } else {
+                std::fs::create_dir(&bad).unwrap();
+            }
+            let good = temp.path().join("skills/good/SKILL.md");
+            std::fs::create_dir_all(good.parent().unwrap()).unwrap();
+            std::fs::write(good, "---\nname: good\ndescription: valid\n---\nBody").unwrap();
+            let package = load_plugin(temp.path()).unwrap();
+            assert_eq!(package.skills.len(), 1);
+            assert_eq!(package.skipped_skills.len(), 1);
+            assert_eq!(package.skipped_skills[0].skill, "bad");
+            assert!(package.skipped_skills[0]
+                .reason
+                .contains("not a regular file"));
+        }
+    }
 
     #[cfg(unix)]
     #[test]
