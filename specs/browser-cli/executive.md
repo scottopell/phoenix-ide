@@ -10,6 +10,16 @@ The CLI reuses the browser-specific operation boundary from `phoenix-tools` and 
 
 The lifecycle contract is specified in `browser-cli.allium`; browser operation semantics remain in `specs/browser-tool/`.
 
+## Idle-expiry fixture correction
+
+The CI idle-lifetime test could release a bare accepted TCP connection rather
+than Chrome's actual navigation request. Its fixture now consumes complete HTTP
+request headers before releasing the page and includes a deliberate idle
+preconnection. Idle and operation budgets are unchanged. The focused real-Chrome
+test passed three times; the full local browser CLI integration module passed
+37 tests with the configured Chrome executable. This is test evidence, not a
+replacement shipping qualification or the frozen witness receipts below.
+
 ## Scenario queue admission and cancellation — focused qualification passed
 
 Exact v27 `c10c96d55b196498e211684e09143b77e839252f` passed strict both-package all-target Clippy and all 56 focused tests on the sole host. Receipt SHA-256 `bdc7b47c8b506a8025a1caeb328a544fc5e6d206dc0d58d331c4fd1abd507dde`; full source/custody attribution is in the [browser-tool executive](../browser-tool/executive.md). All 3392 source hashes matched and custody was released. Hosted successor CI remains separate.
