@@ -1,5 +1,7 @@
 //! Plugin filesystem and registry mutations, serialized through activation refresh.
 
+mod data;
+
 use std::path::{Path, PathBuf};
 
 use phoenix_core::plugin_activation::PluginActivation;
@@ -242,11 +244,8 @@ impl PluginLifecycle {
                 reconciliation.retire(name.0).await?;
                 verify_purge_absence(root, entry, name.0)?;
                 if let Some(data) = owned_data_dir(root, &name)? {
-                    match std::fs::remove_dir_all(&data) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(LifecycleError::internal(&error)),
-                    }
+                    data.remove()
+                        .map_err(|error| LifecycleError::internal(&error))?;
                 }
                 db.unregister_plugin(name.0)
                     .await
@@ -407,26 +406,22 @@ fn validated_install_entry(root: &Path, entry: &Path) -> Result<PathBuf> {
     }
 }
 
-fn owned_data_dir(root: &Path, name: &PluginName<'_>) -> Result<Option<PathBuf>> {
+fn owned_data_dir(root: &Path, name: &PluginName<'_>) -> Result<Option<data::OwnedPluginData>> {
     let Some(root) = canonical_plugins_root(root)? else {
         return Ok(None);
     };
-    let boundary = root.join("data");
-    let data = boundary.join(name.0);
-    for ancestor in [&boundary, &data] {
-        match std::fs::symlink_metadata(ancestor) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(LifecycleError::bad("plugin data path contains a symlink"));
-            }
-            Ok(metadata) if !metadata.is_dir() => {
-                return Err(LifecycleError::bad("plugin data path is not a directory"));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(LifecycleError::internal(&error)),
+    data::OwnedPluginData::open(&root, name).map_err(|error| {
+        #[cfg(unix)]
+        if error
+            .raw_os_error()
+            .is_some_and(|code| code == libc::ENOTDIR || code == libc::ELOOP)
+        {
+            return LifecycleError::bad(
+                "plugin data path contains a symlink or is not a directory",
+            );
         }
-    }
-    Ok(Some(data))
+        LifecycleError::internal(&error)
+    })
 }
 
 async fn install(db: &Database, root: &Path, source: &Path) -> Result<String> {
@@ -591,6 +586,55 @@ mod tests {
         assert!(std::fs::symlink_metadata(&root).is_err());
         assert!(db.get_plugins().await.unwrap().is_empty());
         assert!(source.join("witness").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_purge_does_not_follow_a_replaced_data_root_or_child_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("plugins");
+        let inside = root.join("data/demo");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(inside.join("nested")).unwrap();
+        std::fs::create_dir_all(outside.join("demo")).unwrap();
+        std::fs::write(inside.join("nested/old-data"), "delete").unwrap();
+        std::fs::write(outside.join("demo/witness"), "retain").unwrap();
+        std::os::unix::fs::symlink(&outside, inside.join("child-link")).unwrap();
+        let bound = owned_data_dir(&root, &PluginName::parse("demo").unwrap())
+            .unwrap()
+            .unwrap();
+        std::fs::rename(root.join("data"), root.join("data-before")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("data")).unwrap();
+        bound.remove().unwrap();
+        assert!(outside.join("demo/witness").is_file());
+        assert!(!root.join("data-before/demo").exists());
+        assert!(std::fs::symlink_metadata(root.join("data"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_purge_preserves_a_replacement_target_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("plugins");
+        let data = root.join("data/demo");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("witness"), "retain").unwrap();
+        let bound = owned_data_dir(&root, &PluginName::parse("demo").unwrap())
+            .unwrap()
+            .unwrap();
+        std::fs::rename(&data, root.join("data/original")).unwrap();
+        std::os::unix::fs::symlink(&outside, &data).unwrap();
+        assert!(bound.remove().is_err());
+        assert!(outside.join("witness").is_file());
+        assert!(std::fs::symlink_metadata(&data)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[tokio::test]

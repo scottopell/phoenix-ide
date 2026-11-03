@@ -169,6 +169,9 @@ which = "8"
 # via `git diff --exit-code ui/src/generated/` in `./dev.py check`.
 ts-rs = { version = "12", features = ["serde-compat", "chrono-impl"] }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 [dev-dependencies]
 # Re-declared with test-support so phoenix-core's #[cfg(test)] domain
 # constructors (ContentBlock::tool_use, …) are visible to this crate's tests.
