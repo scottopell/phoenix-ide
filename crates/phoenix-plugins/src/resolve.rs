@@ -438,32 +438,19 @@ mod tests {
 
     #[test]
     fn anchored_cwd_must_resolve_inside_its_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("plugin");
+        let data = temp.path().join("data/plugin");
+        std::fs::create_dir_all(root.join("work")).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
         let data_escape = stdio_spec(vec![], &[], Some("${PLUGIN_DATA}/../.."));
-        assert!(resolved_environment(
-            &data_escape,
-            Path::new("/root"),
-            Path::new("/root/data/p"),
-            &base_env(),
-        )
-        .is_err());
+        assert!(resolved_environment(&data_escape, &root, &data, &base_env(),).is_err());
 
         let root_escape = stdio_spec(vec![], &[], Some("./../../etc"));
-        assert!(resolved_environment(
-            &root_escape,
-            Path::new("/root"),
-            Path::new("/root/data/p"),
-            &base_env(),
-        )
-        .is_err());
+        assert!(resolved_environment(&root_escape, &root, &data, &base_env(),).is_err());
 
         let ok = stdio_spec(vec![], &[], Some("./work"));
-        assert!(resolved_environment(
-            &ok,
-            Path::new("/root"),
-            Path::new("/root/data/p"),
-            &base_env(),
-        )
-        .is_ok());
+        assert!(resolved_environment(&ok, &root, &data, &base_env(),).is_ok());
     }
 
     #[cfg(unix)]
