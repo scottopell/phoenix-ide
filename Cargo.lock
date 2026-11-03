@@ -3104,6 +3104,7 @@ dependencies = [
 name = "phoenix-plugins"
 version = "0.1.0"
 dependencies = [
+ "http",
  "serde",
  "serde_json",
  "tempfile",

@@ -148,6 +148,11 @@ pub fn load_plugin(root: &Path) -> Result<ParsedPlugin, String> {
     if !within_boundary(&manifest_path, &resolved_root) {
         return Err("plugin.json escapes plugin root".into());
     }
+    match std::fs::metadata(&manifest_path) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => return Err("plugin.json is not a regular file".into()),
+        Err(e) => return Err(format!("plugin.json unreadable: {e}")),
+    }
     let content = std::fs::read_to_string(&manifest_path)
         .map_err(|e| format!("plugin.json unreadable: {e}"))?;
     let manifest = Manifest::parse(&content)?;
@@ -289,5 +294,63 @@ fn load_mcp(loaded: &mut ParsedPlugin) {
                 loaded.skipped_servers.push(failure);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn fifo_manifest_is_rejected_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("fifo-plugin");
+        std::fs::create_dir(&pkg).unwrap();
+        let manifest = pkg.join("plugin.json");
+        std::process::Command::new("mkfifo")
+            .arg(&manifest)
+            .status()
+            .unwrap();
+        // load_plugin must reject via metadata check, never attempting read.
+        let result = load_plugin(&pkg);
+        assert!(result.is_err(), "FIFO manifest must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("not a regular file"),
+            "rejection reason should mention regular file: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fifo_manifest_skipped_in_scan_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Package with a FIFO manifest.
+        let bad_pkg = root.join("fifo-pkg");
+        std::fs::create_dir(&bad_pkg).unwrap();
+        std::process::Command::new("mkfifo")
+            .arg(bad_pkg.join("plugin.json"))
+            .status()
+            .unwrap();
+        // Valid sibling.
+        let good_pkg = root.join("good-pkg");
+        std::fs::create_dir(&good_pkg).unwrap();
+        std::fs::write(
+            good_pkg.join("plugin.json"),
+            serde_json::json!({
+                "$schema": crate::manifest::MANIFEST_SCHEMA_URL,
+                "name": "good",
+                "version": "1.0.0",
+                "description": "valid"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let plugins = scan_plugins_root(root);
+        assert_eq!(plugins.len(), 1, "only the valid package loads");
+        assert_eq!(plugins[0].manifest.name, "good");
     }
 }

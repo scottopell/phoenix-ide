@@ -5341,16 +5341,13 @@ fn plugin_server_configs_under_activation_with_user_config_keys(
     user_config_keys: &std::collections::HashSet<String>,
 ) -> Vec<(String, McpServerConfig)> {
     let mut configs = Vec::new();
+    let mut admission = PluginServerAdmission::new(user_config_keys);
     for plugin in phoenix_plugins::scan_plugins_root(root) {
         if !activation.is_enabled(&plugin.manifest.name) {
             tracing::debug!(plugin = %plugin.manifest.name, "plugin inactive; contributing no MCP servers");
             continue;
         }
-        for (server, outcome) in McpClientManager::plugin_server_outcomes_with_user_config_keys(
-            &plugin,
-            root,
-            user_config_keys,
-        ) {
+        for (server, outcome) in admission.prepare(&plugin, root) {
             match outcome {
                 Ok(config) => {
                     configs.push((format!("{}.{}", plugin.manifest.name, server), config));
@@ -5361,6 +5358,37 @@ fn plugin_server_configs_under_activation_with_user_config_keys(
         }
     }
     configs
+}
+
+#[derive(Clone, Copy)]
+enum ServerKeyOwner {
+    User,
+    Plugin,
+}
+
+/// A single discovery pass's qualified-name admission decisions.
+pub struct PluginServerAdmission {
+    occupied: HashMap<String, ServerKeyOwner>,
+}
+
+impl PluginServerAdmission {
+    #[must_use]
+    pub fn new(user_keys: &std::collections::HashSet<String>) -> Self {
+        Self {
+            occupied: user_keys
+                .iter()
+                .map(|key| (key.clone(), ServerKeyOwner::User))
+                .collect(),
+        }
+    }
+
+    pub fn prepare(
+        &mut self,
+        plugin: &phoenix_plugins::ParsedPlugin,
+        root: &Path,
+    ) -> Vec<(String, Result<McpServerConfig, String>)> {
+        McpClientManager::plugin_server_outcomes_for_admission(plugin, root, self)
+    }
 }
 
 impl McpClientManager {
@@ -5392,6 +5420,14 @@ impl McpClientManager {
         plugins_root: &Path,
         user_config_keys: &std::collections::HashSet<String>,
     ) -> Vec<(String, Result<McpServerConfig, String>)> {
+        PluginServerAdmission::new(user_config_keys).prepare(plugin, plugins_root)
+    }
+
+    fn plugin_server_outcomes_for_admission(
+        plugin: &phoenix_plugins::ParsedPlugin,
+        plugins_root: &Path,
+        admission: &mut PluginServerAdmission,
+    ) -> Vec<(String, Result<McpServerConfig, String>)> {
         let mut outcomes: Vec<_> = plugin
             .skipped_servers
             .iter()
@@ -5400,12 +5436,17 @@ impl McpClientManager {
         let data_dir = phoenix_plugins::data_dir_for(plugins_root, &plugin.manifest.name);
         for spec in &plugin.servers {
             let qualified_name = format!("{}.{}", plugin.manifest.name, spec.server());
-            if user_config_keys.contains(&qualified_name) {
+            if let Some(owner) = admission.occupied.get(&qualified_name) {
+                let reason = match owner {
+                    ServerKeyOwner::User => "shadowed by user MCP configuration",
+                    ServerKeyOwner::Plugin => {
+                        "qualified server key collision with an earlier plugin"
+                    }
+                };
+                tracing::warn!(plugin = %plugin.manifest.name, server = %spec.server(), %reason, "skipping plugin server");
                 outcomes.push((
                     spec.server().to_string(),
-                    Err(format!(
-                        "shadowed by user MCP configuration: {qualified_name}"
-                    )),
+                    Err(format!("{reason}: {qualified_name}")),
                 ));
                 continue;
             }
@@ -5439,6 +5480,11 @@ impl McpClientManager {
                     })
                 }
             };
+            if outcome.is_ok() {
+                admission
+                    .occupied
+                    .insert(qualified_name, ServerKeyOwner::Plugin);
+            }
             outcomes.push((spec.server().to_string(), outcome));
         }
         outcomes
@@ -5998,6 +6044,38 @@ mod tests {
                 1,
                 "no collision: plugin server should appear"
             );
+        }
+
+        #[test]
+        fn ambiguous_qualified_plugin_keys_have_one_deterministic_admission() {
+            let root = plugin_root();
+            for (plugin, server) in [("a", "b.c"), ("a.b", "c")] {
+                write(
+                    &root.path().join(plugin).join("plugin.json"),
+                    &serde_json::json!({
+                        "$schema": phoenix_plugins::manifest::MANIFEST_SCHEMA_URL, "name": plugin
+                    })
+                    .to_string(),
+                );
+                write(&root.path().join(plugin).join("mcp.json"), &serde_json::json!({
+                    "$schema": phoenix_plugins::mcp_config::MCP_SCHEMA_URL,
+                    "mcpServers": {server: {"type": "streamable-http", "url": "https://example.com/mcp"}}
+                }).to_string());
+            }
+            let activation = phoenix_core::plugin_activation::PluginActivation::default();
+            activation.publish(HashSet::new());
+            let configs =
+                plugin_server_configs_under_activation(root.path(), &activation.snapshot());
+            assert_eq!(configs.len(), 1);
+            assert_eq!(configs[0].0, "a.b.c");
+            let plugins = phoenix_plugins::scan_plugins_root(root.path());
+            let mut scope = PluginServerAdmission::new(&HashSet::new());
+            assert!(scope.prepare(&plugins[0], root.path())[0].1.is_ok());
+            assert!(scope.prepare(&plugins[1], root.path())[0]
+                .1
+                .as_ref()
+                .unwrap_err()
+                .contains("earlier plugin"));
         }
 
         #[test]

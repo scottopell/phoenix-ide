@@ -1907,7 +1907,47 @@ pub struct PluginRecord {
     pub name: String,
     pub provenance: PluginProvenance,
     pub enabled: bool,
-    pub install_entry: Option<String>,
+    pub install_entry: Option<std::path::PathBuf>,
+}
+
+fn plugin_entry_bytes(path: &std::path::Path) -> Vec<u8> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+    #[cfg(not(windows))]
+    path.as_os_str().as_encoded_bytes().to_vec()
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn plugin_entry_from_bytes(bytes: Vec<u8>) -> DbResult<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(std::ffi::OsString::from_vec(bytes).into())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        if bytes.len() % 2 != 0 {
+            return Err(DbError::Serialization(
+                "invalid plugin path UTF-16 byte length".into(),
+            ));
+        }
+        let wide: Vec<_> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        Ok(std::ffi::OsString::from_wide(&wide).into())
+    }
+    #[cfg(not(any(unix, windows)))]
+    String::from_utf8(bytes)
+        .map(std::path::PathBuf::from)
+        .map_err(|error| DbError::Serialization(error.to_string()))
 }
 
 /// How a plugin directory came to exist (REQ-AP-009).
@@ -3972,23 +4012,24 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_plugins(&self) -> DbResult<Vec<PluginRecord>> {
-        let rows: Vec<(String, String, i64, Option<String>)> =
+        let rows: Vec<(String, String, i64, Option<Vec<u8>>)> =
             sqlx::query_as("SELECT name, provenance, enabled, install_entry FROM plugins")
                 .fetch_all(&self.pool)
                 .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(name, provenance, enabled, install_entry)| PluginRecord {
-                name,
-                provenance: if provenance == "managed" {
-                    PluginProvenance::Managed
-                } else {
-                    PluginProvenance::Unmanaged
-                },
-                enabled: enabled != 0,
-                install_entry,
+        rows.into_iter()
+            .map(|(name, provenance, enabled, install_entry)| {
+                Ok(PluginRecord {
+                    name,
+                    provenance: if provenance == "managed" {
+                        PluginProvenance::Managed
+                    } else {
+                        PluginProvenance::Unmanaged
+                    },
+                    enabled: enabled != 0,
+                    install_entry: install_entry.map(plugin_entry_from_bytes).transpose()?,
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Set a plugin's enabled state, upserting its registry row. A row that
@@ -4026,7 +4067,7 @@ impl Database {
              ON CONFLICT(name) DO UPDATE SET provenance = 'managed', enabled = 1, install_entry = ?2",
         )
         .bind(name)
-        .bind(entry.to_string_lossy().as_ref())
+        .bind(plugin_entry_bytes(entry))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -4052,7 +4093,7 @@ impl Database {
         )
         .bind(name)
         .bind(i64::from(enabled))
-        .bind(entry.to_string_lossy().as_ref())
+        .bind(plugin_entry_bytes(entry))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -33252,6 +33293,31 @@ mod tests {
         assert_eq!(devtools.provenance, PluginProvenance::Managed);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plugin_entry_round_trips_non_unicode_os_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let db = Database::open_in_memory().await.unwrap();
+        let entry = std::path::PathBuf::from(std::ffi::OsString::from_vec(
+            b"/home-\xff/plugins/demo".to_vec(),
+        ));
+        db.register_plugin("demo", &entry).await.unwrap();
+        assert_eq!(
+            db.get_plugins().await.unwrap()[0].install_entry.as_deref(),
+            Some(entry.as_path())
+        );
+        db.record_plugin_entry("demo", &entry, false).await.unwrap();
+        let row = &db.get_plugins().await.unwrap()[0];
+        assert_eq!(row.install_entry.as_deref(), Some(entry.as_path()));
+        assert_eq!(row.provenance, PluginProvenance::Managed);
+        let storage: String =
+            sqlx::query_scalar("SELECT typeof(install_entry) FROM plugins WHERE name='demo'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(storage, "blob");
+    }
+
     #[tokio::test]
     async fn plugin_entry_is_retained_across_enablement_and_removal_records() {
         let db = Database::open_in_memory().await.unwrap();
@@ -33261,13 +33327,13 @@ mod tests {
         assert_eq!(db.get_plugins().await.unwrap()[0].install_entry, None);
         db.record_plugin_entry("demo", first, false).await.unwrap();
         let row = &db.get_plugins().await.unwrap()[0];
-        assert_eq!(row.install_entry.as_deref(), first.to_str());
+        assert_eq!(row.install_entry.as_deref(), Some(first));
         assert_eq!(row.provenance, PluginProvenance::Unmanaged);
         assert!(!row.enabled);
         db.register_plugin("demo", second).await.unwrap();
         db.set_plugin_enabled("demo", false).await.unwrap();
         let row = &db.get_plugins().await.unwrap()[0];
-        assert_eq!(row.install_entry.as_deref(), second.to_str());
+        assert_eq!(row.install_entry.as_deref(), Some(second));
         assert_eq!(row.provenance, PluginProvenance::Managed);
         db.record_plugin_entry("demo", second, true).await.unwrap();
         assert_eq!(
@@ -33276,7 +33342,7 @@ mod tests {
         );
         db.record_plugin_entry("demo", first, false).await.unwrap();
         let row = &db.get_plugins().await.unwrap()[0];
-        assert_eq!(row.install_entry.as_deref(), first.to_str());
+        assert_eq!(row.install_entry.as_deref(), Some(first));
         assert_eq!(row.provenance, PluginProvenance::Unmanaged);
         assert!(!row.enabled);
         assert!(sqlx::query("UPDATE plugins SET install_entry = ''")

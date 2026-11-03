@@ -9314,7 +9314,7 @@ async fn plugins_list(State(state): State<AppState>) -> Result<Json<serde_json::
     );
 
     Ok(Json(
-        serde_json::json!({ "plugins": entries, "root": root }),
+        serde_json::json!({ "plugins": entries, "root": root.to_string_lossy() }),
     ))
 }
 
@@ -9394,6 +9394,7 @@ fn plugin_list_entries_with_user_config_keys(
     let mut entries = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::default();
 
+    let mut mcp_admission = crate::tools::mcp::PluginServerAdmission::new(user_config_keys);
     for plugin in plugins {
         seen.insert(plugin.manifest.name.clone());
         let record = registry.get(&plugin.manifest.name);
@@ -9401,7 +9402,7 @@ fn plugin_list_entries_with_user_config_keys(
             r.provenance == phoenix_db::PluginProvenance::Managed
                 && r.install_entry
                     .as_deref()
-                    .is_some_and(|entry| std::path::Path::new(entry) == plugin.entry_dir)
+                    .is_some_and(|entry| entry == plugin.entry_dir)
         });
         let enabled = record.is_none_or(|r| r.enabled);
         let mut skills: Vec<_> = plugin
@@ -9427,16 +9428,13 @@ fn plugin_list_entries_with_user_config_keys(
                 .entry_dir
                 .parent()
                 .expect("plugin directory has a parent");
-            crate::tools::mcp::McpClientManager::plugin_server_outcomes_with_user_config_keys(
-                &plugin,
-                plugins_root,
-                user_config_keys,
-            )
-            .into_iter()
-            .map(|(name, outcome)| {
-                PluginComponentStatus::from_validation(name, outcome.map(|_| ()), true)
-            })
-            .collect()
+            mcp_admission
+                .prepare(&plugin, plugins_root)
+                .into_iter()
+                .map(|(name, outcome)| {
+                    PluginComponentStatus::from_validation(name, outcome.map(|_| ()), true)
+                })
+                .collect()
         } else {
             plugin
                 .skipped_servers
@@ -9460,7 +9458,7 @@ fn plugin_list_entries_with_user_config_keys(
             "name": plugin.manifest.name,
             "version": plugin.manifest.version,
             "description": plugin.manifest.description,
-            "root": plugin.root,
+            "root": plugin.root.to_string_lossy(),
             "enabled": enabled,
             "provenance": if managed { "managed" } else { "unmanaged" },
             "missing": false,
@@ -9481,7 +9479,7 @@ fn plugin_list_entries_with_user_config_keys(
                     std::fs::symlink_metadata(entry)
                         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
                 }),
-                "root": record.install_entry,
+                "root": record.install_entry.as_ref().map(|path| path.to_string_lossy()),
                 "load_error": match record.install_entry.as_deref() {
                     Some(entry) => match phoenix_plugins::load_plugin(std::path::Path::new(entry)) {
                         Ok(_) => Some("installation entry no longer declares this plugin identity".to_string()),
@@ -9528,8 +9526,7 @@ async fn plugin_add(
 }
 
 /// Resolve an add-source to a local plugin directory: an existing local
-/// directory passes through; an http(s)/`.git` source clones shallowly into
-/// `clone_target`; anything else is a bad request.
+/// directory passes through; Git validates all other nonempty source forms.
 async fn resolve_plugin_source(
     source: &str,
     clone_target: std::path::PathBuf,
@@ -9538,20 +9535,13 @@ async fn resolve_plugin_source(
     if source_path.is_dir() {
         return Ok(source_path.to_path_buf());
     }
-    let looks_like_git = source.starts_with("http://")
-        || source.starts_with("https://")
-        || source.to_ascii_lowercase().ends_with(".git");
-    if !looks_like_git {
+    if source.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             "source must be a local directory or a git URL".to_string(),
         ));
     }
-    let output = tokio::process::Command::from(phoenix_core::git::command())
-        .args(["clone", "--depth", "1", "--", source])
-        .arg(&clone_target)
-        .output()
-        .await;
+    let output = plugin_clone_command(source, &clone_target).output().await;
     match output {
         Ok(out) if out.status.success() => Ok(clone_target),
         Ok(out) => {
@@ -9566,6 +9556,14 @@ async fn resolve_plugin_source(
             format!("git clone failed: {e}"),
         )),
     }
+}
+
+fn plugin_clone_command(source: &str, target: &std::path::Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::from(phoenix_core::git::command());
+    command
+        .args(["clone", "--depth", "1", "--", source])
+        .arg(target);
+    command
 }
 
 fn plugin_error(error: crate::plugin_lifecycle::LifecycleError) -> Response {
@@ -22283,13 +22281,61 @@ mod plugin_api_tests {
                 PluginProvenance::Unmanaged
             },
             enabled,
-            install_entry: Some(format!("/plugins/{name}")),
+            install_entry: Some(PathBuf::from(format!("/plugins/{name}"))),
         }
     }
 
     fn write(path: &std::path::Path, text: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn plugin_clone_accepts_git_supported_remote_source_forms_as_one_argument() {
+        for source in [
+            "ssh://git@example.com/team/plugin",
+            "git://example.com/team/plugin",
+            "https://example.com/team/plugin",
+            "git@example.com:team/plugin",
+            "file:///tmp/plugin",
+        ] {
+            let command =
+                super::plugin_clone_command(source, std::path::Path::new("/tmp/destination"));
+            let args: Vec<_> = command.as_std().get_args().collect();
+            assert_eq!(args[args.len() - 3], "--");
+            assert_eq!(args[args.len() - 2], source);
+        }
+    }
+
+    #[test]
+    fn plugin_status_reports_cross_plugin_qualified_key_collisions() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("plugins");
+        for (name, server) in [("a", "b.c"), ("a.b", "c")] {
+            write(
+                &root.join(name).join("plugin.json"),
+                &serde_json::json!({
+                    "$schema": phoenix_plugins::manifest::MANIFEST_SCHEMA_URL, "name": name
+                })
+                .to_string(),
+            );
+            write(&root.join(name).join("mcp.json"), &serde_json::json!({
+                "$schema": phoenix_plugins::mcp_config::MCP_SCHEMA_URL,
+                "mcpServers": {server: {"type": "streamable-http", "url": "https://example.com/mcp"}}
+            }).to_string());
+        }
+        let entries = super::plugin_list_entries_with_user_config_keys(
+            phoenix_plugins::scan_plugins_root(&root),
+            &HashMap::new(),
+            home.path(),
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(entries[0]["mcp_servers"][0]["status"], "loaded");
+        assert_eq!(entries[1]["mcp_servers"][0]["status"], "skipped");
+        assert!(entries[1]["mcp_servers"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("earlier plugin"));
     }
 
     #[test]
@@ -22310,7 +22356,7 @@ mod plugin_api_tests {
             }).to_string());
         }
         let mut owned = record("demo", true, true);
-        owned.install_entry = Some(root.join("z-managed").to_string_lossy().into_owned());
+        owned.install_entry = Some(root.join("z-managed"));
         let registry = HashMap::from([("demo".into(), owned)]);
         let entries = super::plugin_list_entries_with_user_config_keys(
             phoenix_plugins::scan_plugins_root(&root),
@@ -22521,7 +22567,7 @@ mod plugin_api_tests {
         let entry = temp.path().join("entry");
         write(&entry.join("plugin.json"), "malformed update");
         let mut row = record("demo", true, true);
-        row.install_entry = Some(entry.to_string_lossy().into_owned());
+        row.install_entry = Some(entry.clone());
         let mut registry = HashMap::from([("demo".to_string(), row)]);
         let entries = plugin_list_entries(vec![], &registry);
         assert_eq!(entries[0]["missing"], false);

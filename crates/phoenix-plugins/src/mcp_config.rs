@@ -95,6 +95,12 @@ impl McpDocument {
             return Err("mcp.json missing required mcpServers object".to_string());
         };
 
+        // Closed document: only $schema and mcpServers are allowed (REQ-AP-004).
+        let allowed = ["$schema", "mcpServers"];
+        if let Some(extra) = object.keys().find(|k| !allowed.contains(&k.as_str())) {
+            return Err(format!("mcp.json has unknown top-level field: {extra}"));
+        }
+
         Ok(Self {
             servers: servers
                 .iter()
@@ -217,11 +223,19 @@ fn validate_http(name: &str, fields: &serde_json::Map<String, Value>) -> ServerV
             }
         },
     };
-    // Duplicate header names differing only in case invalidate the entry;
-    // BTreeMap keys are case-sensitive so compare lowercased.
+    // Validate header names and values using HTTP types before admission.
     let mut seen_lower: Vec<String> = Vec::new();
-    for header in headers.keys() {
-        let lower = header.to_ascii_lowercase();
+    for (header_name, header_value) in &headers {
+        if http::header::HeaderName::from_bytes(header_name.as_bytes()).is_err() {
+            return skip(name, &format!("invalid HTTP header name: {header_name}"));
+        }
+        if http::header::HeaderValue::from_bytes(header_value.as_bytes()).is_err() {
+            return skip(
+                name,
+                &format!("invalid HTTP header value for {header_name}"),
+            );
+        }
+        let lower = header_name.to_ascii_lowercase();
         if seen_lower.contains(&lower) {
             return skip(name, "duplicate header names differing only in case");
         }
@@ -478,6 +492,40 @@ mod tests {
             r#"{"$schema": "https://agent-plugins.org/schemas/1.1.0/mcp.schema.json", "mcpServers": {"good": {"type": "streamable-http", "url": "https://example.com/mcp"}}}"#,
         );
         assert_eq!(servers.len(), 1);
+    }
+
+    #[test]
+    fn mcp_top_level_is_closed_and_invalid_headers_skip_only_their_server() {
+        let extra = serde_json::json!({"$schema": MCP_SCHEMA_URL, "mcpServers": {}, "extra": true});
+        assert!(
+            McpDocument::parse(&extra.to_string(), crate::manifest::MANIFEST_SCHEMA_URL)
+                .unwrap_err()
+                .contains("unknown top-level")
+        );
+        for headers in [
+            serde_json::json!({"Bad Header": "value"}),
+            serde_json::json!({"X-Test": "line\nvalue"}),
+        ] {
+            let document = serde_json::json!({
+                "$schema": MCP_SCHEMA_URL,
+                "mcpServers": {
+                    "bad": {"type": "streamable-http", "url": "https://example.com/mcp", "headers": headers},
+                    "good": {"type": "stdio", "command": "sh"}
+                }
+            });
+            let parsed =
+                McpDocument::parse(&document.to_string(), crate::manifest::MANIFEST_SCHEMA_URL)
+                    .unwrap();
+            let outcomes = parsed.validate_servers();
+            assert!(outcomes
+                .iter()
+                .any(|(name, outcome)| name == "bad"
+                    && matches!(outcome, ServerValidation::Skipped(_))));
+            assert!(outcomes
+                .iter()
+                .any(|(name, outcome)| name == "good"
+                    && matches!(outcome, ServerValidation::Valid(_))));
+        }
     }
 
     #[test]

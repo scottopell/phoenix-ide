@@ -63,6 +63,8 @@ enum Reconciliation<'a> {
     Offline,
     #[cfg(test)]
     Refuse,
+    #[cfg(test)]
+    SwapEntry(&'a Path, &'a Path, &'a str),
 }
 
 impl Reconciliation<'_> {
@@ -90,6 +92,21 @@ impl Reconciliation<'_> {
             Self::Offline => Ok(()),
             #[cfg(test)]
             Self::Refuse => Err(LifecycleError::internal(&"reconciliation refused")),
+            #[cfg(test)]
+            Self::SwapEntry(entry, backup, name) => {
+                std::fs::rename(entry, backup).map_err(|error| LifecycleError::internal(&error))?;
+                std::fs::create_dir(entry).map_err(|error| LifecycleError::internal(&error))?;
+                std::fs::write(
+                    entry.join("plugin.json"),
+                    serde_json::json!({
+                        "$schema": phoenix_plugins::manifest::MANIFEST_SCHEMA_URL, "name": name
+                    })
+                    .to_string(),
+                )
+                .map_err(|error| LifecycleError::internal(&error))?;
+                std::fs::write(entry.join("replacement-witness"), "keep")
+                    .map_err(|error| LifecycleError::internal(&error))
+            }
         }
     }
 }
@@ -123,6 +140,7 @@ impl PluginLifecycle {
         Self::mutate(db, activation, root, operation, &Reconciliation::Offline).await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn mutate(
         db: &Database,
         activation: &PluginActivation,
@@ -160,14 +178,15 @@ impl PluginLifecycle {
             Mutation::Remove(name) => {
                 let name = PluginName::parse(name)?;
                 let entry = removal_entry(db, root, &name).await?;
-                db.record_plugin_entry(name.0, &entry, false)
+                let observed = ObservedRemoval::capture(entry, name.0)?;
+                db.record_plugin_entry(name.0, &observed.path, false)
                     .await
                     .map_err(|error| LifecycleError::internal(&error))?;
                 crate::plugin_activation::refresh(db, activation)
                     .await
                     .map_err(|error| LifecycleError::internal(&error))?;
                 reconciliation.apply(name.0).await?;
-                remove_entry(&entry)?;
+                observed.remove(name.0)?;
                 name.0.to_owned()
             }
             Mutation::Purge(name) => {
@@ -185,7 +204,7 @@ impl PluginLifecycle {
                         "installation entry is unknown; cannot prove plugin absence",
                     )
                 })?;
-                let entry = validated_install_entry(root, Path::new(entry))?;
+                let entry = validated_install_entry(root, entry)?;
                 match std::fs::symlink_metadata(&entry) {
                     Ok(_) => {
                         return Err(LifecycleError::bad(
@@ -244,21 +263,59 @@ async fn removal_entry(db: &Database, root: &Path, name: &PluginName<'_>) -> Res
             .into_iter()
             .find(|record| record.name == name.0)
             .and_then(|record| record.install_entry)
-            .map(PathBuf::from)
             .ok_or_else(|| LifecycleError::bad("plugin is not installed"))?,
     };
     validated_install_entry(root, &entry)
 }
 
-fn remove_entry(entry: &Path) -> Result<()> {
-    let metadata =
-        std::fs::symlink_metadata(entry).map_err(|error| LifecycleError::internal(&error))?;
-    if metadata.file_type().is_symlink() {
-        std::fs::remove_file(entry)
-    } else {
-        std::fs::remove_dir_all(entry)
+struct ObservedRemoval {
+    path: PathBuf,
+    metadata: std::fs::Metadata,
+}
+
+impl ObservedRemoval {
+    fn capture(path: PathBuf, name: &str) -> Result<Self> {
+        let metadata =
+            std::fs::symlink_metadata(&path).map_err(|error| LifecycleError::internal(&error))?;
+        reject_replacement_identity(&path, name)?;
+        Ok(Self { path, metadata })
     }
-    .map_err(|error| LifecycleError::internal(&error))
+
+    fn remove(self, name: &str) -> Result<()> {
+        let current = std::fs::symlink_metadata(&self.path)
+            .map_err(|error| LifecycleError::internal(&error))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if (self.metadata.dev(), self.metadata.ino()) != (current.dev(), current.ino()) {
+                return Err(LifecycleError::bad(
+                    "installation entry changed during removal; nothing deleted",
+                ));
+            }
+        }
+        #[cfg(not(unix))]
+        return Err(LifecycleError::bad(
+            "installation identity verification is unsupported on this platform",
+        ));
+        reject_replacement_identity(&self.path, name)?;
+        if current.file_type().is_symlink() {
+            std::fs::remove_file(&self.path)
+        } else {
+            std::fs::remove_dir_all(&self.path)
+        }
+        .map_err(|error| LifecycleError::internal(&error))
+    }
+}
+
+fn reject_replacement_identity(entry: &Path, name: &str) -> Result<()> {
+    if let Ok(package) = phoenix_plugins::load_plugin(entry) {
+        if package.manifest.name != name {
+            return Err(LifecycleError::bad(
+                "installation entry now declares a different plugin; nothing deleted",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn canonical_plugins_root(root: &Path) -> Result<Option<PathBuf>> {
@@ -502,6 +559,81 @@ mod tests {
         assert!(source.join("witness").is_file());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn removal_rejects_replacements_before_and_during_reconciliation() {
+        for replacement in ["demo", "other"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("plugins");
+            let entry = root.join("demo");
+            bundle(&entry, "demo");
+            let backup = temp.path().join("old-entry");
+            let db = Database::open_in_memory().await.unwrap();
+            db.register_plugin("demo", &entry).await.unwrap();
+            let activation = PluginActivation::default();
+            let error = PluginLifecycle::mutate(
+                &db,
+                &activation,
+                &root,
+                Mutation::Remove("demo"),
+                &Reconciliation::SwapEntry(&entry, &backup, replacement),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.message.contains("changed during removal"));
+            assert!(entry.join("replacement-witness").is_file());
+            assert!(backup.join("witness").is_file());
+            assert!(!db.get_plugins().await.unwrap()[0].enabled);
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("plugins");
+        let entry = root.join("demo");
+        bundle(&entry, "other");
+        let db = Database::open_in_memory().await.unwrap();
+        db.register_plugin("demo", &entry).await.unwrap();
+        let activation = PluginActivation::default();
+        let error = apply(&db, &activation, &root, Mutation::Remove("demo"))
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("different plugin"));
+        assert!(entry.join("witness").is_file());
+        assert!(db.get_plugins().await.unwrap()[0].enabled);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn non_unicode_home_install_remove_and_purge_preserve_the_exact_entry() {
+        use std::os::unix::ffi::OsStringExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(b"home-\xff".to_vec()))
+            .join(".agents/plugins");
+        let source = temp.path().join("source");
+        bundle(&source, "demo");
+        let db = Database::open_in_memory().await.unwrap();
+        let activation = PluginActivation::default();
+        apply(&db, &activation, &root, Mutation::Add(&source))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_plugins().await.unwrap()[0].install_entry,
+            Some(root.join("demo"))
+        );
+        let data = root.join("data/demo");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("state"), "retained").unwrap();
+        apply(&db, &activation, &root, Mutation::Remove("demo"))
+            .await
+            .unwrap();
+        assert!(data.join("state").is_file());
+        apply(&db, &activation, &root, Mutation::Purge("demo"))
+            .await
+            .unwrap();
+        assert!(!data.exists());
+        assert!(db.get_plugins().await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn state_changes_reject_unknown_names_but_accept_retained_identities() {
         let temp = tempfile::tempdir().unwrap();
@@ -536,7 +668,10 @@ mod tests {
             let rows = db.get_plugins().await.unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].enabled, enabled);
-            assert_eq!(rows[0].install_entry.as_deref(), root.join("demo").to_str());
+            assert_eq!(
+                rows[0].install_entry.as_deref(),
+                Some(root.join("demo").as_path())
+            );
             assert_eq!(activation.snapshot().is_enabled("demo"), enabled);
         }
         assert!(!root.exists());
@@ -578,7 +713,7 @@ mod tests {
             assert!(!entry.exists());
             assert!(data.join("state").is_file());
             let rows = db.get_plugins().await.unwrap();
-            assert_eq!(rows[0].install_entry.as_deref(), entry.to_str());
+            assert_eq!(rows[0].install_entry.as_deref(), Some(entry.as_path()));
             assert_eq!(rows[0].provenance, phoenix_db::PluginProvenance::Managed);
             assert!(!rows[0].enabled);
             assert!(!activation.snapshot().is_enabled("demo"));
@@ -943,7 +1078,7 @@ mod tests {
         let row = &db.get_plugins().await.unwrap()[0];
         assert!(!row.enabled);
         assert_eq!(row.provenance, phoenix_db::PluginProvenance::Managed);
-        assert_eq!(row.install_entry.as_deref(), original.to_str());
+        assert_eq!(row.install_entry.as_deref(), Some(original.as_path()));
         assert!(apply(&db, &activation, &root, Mutation::Purge("demo"))
             .await
             .is_err());
@@ -988,7 +1123,7 @@ mod tests {
             .await
             .unwrap();
         let row = &db.get_plugins().await.unwrap()[0];
-        assert_eq!(row.install_entry.as_deref(), entry.to_str());
+        assert_eq!(row.install_entry.as_deref(), Some(entry.as_path()));
         assert_eq!(row.provenance, phoenix_db::PluginProvenance::Unmanaged);
         apply(&db, &activation, &root, Mutation::Remove("demo"))
             .await
