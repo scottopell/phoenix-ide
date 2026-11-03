@@ -1134,13 +1134,14 @@ def scenario_reminders(_base_url: str) -> None:
             changed.raise_for_status()
             revised = changed.json()['reminder']
             assert revised['revision'] == 2 and revised['due_at_us'] != upcoming['due_at_us'], revised
-            reserved = httpx.post(
-                f"{base_url}/api/conversations/{conv_id}/chat",
-                json={"message_id": f"reminder:{revised['id']}:{revised['revision'] + 1}",
-                      "text": "Unrelated client input", "expansion_policy": "literal_text"},
-                timeout=10,
-            )
-            assert reserved.status_code == 409 and reserved.json()['error_type'] == 'reserved_message_id', reserved.text
+            occurrence_id = f"reminder:{revised['id']}:{revised['revision'] + 1}"
+            for message_id in [occurrence_id, f"{conv_id}:{occurrence_id}"]:
+                reserved = httpx.post(
+                    f"{base_url}/api/conversations/{conv_id}/chat",
+                    json={"message_id": message_id, "text": "Unrelated client input",
+                          "expansion_policy": "literal_text"}, timeout=10,
+                )
+                assert reserved.status_code == 409 and reserved.json()['error_type'] == 'reserved_message_id', reserved.text
             assert reminders(conv_id) == [revised]
             stale = mutate(conv_id, upcoming, 'cancel')
             assert stale.status_code == 409 and stale.json()['current'] == revised, stale.text

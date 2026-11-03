@@ -144,6 +144,10 @@ pub(crate) struct SendChatApplicationService {
     runtime: Arc<RuntimeManager>,
 }
 
+pub(crate) fn is_reserved_reminder_message_id(message_id: &str) -> bool {
+    message_id.starts_with("reminder:") || message_id.contains(":reminder:")
+}
+
 impl SendChatApplicationService {
     pub(crate) async fn respond_to_question(
         &self,
@@ -521,7 +525,7 @@ impl SendChatApplicationService {
             .get_conversation(&req.conversation_id)
             .await
             .map_err(map_conversation_load_error)?;
-        if let Some(intent) = self
+        let validated_continuation_opening = if let Some(intent) = self
             .db
             .continuation_dispatch_intent_for_successor(&conversation.id)
             .await
@@ -530,8 +534,7 @@ impl SendChatApplicationService {
                 intent.message_id.as_str() == req.message_id
                     || format!("{}:{}", conversation.id, intent.message_id.as_str())
                         == req.message_id
-            })
-        {
+            }) {
             if matches!(
                 req.origin,
                 phoenix_core::domain::db_schema::InputOrigin::RemoteApi { .. }
@@ -557,7 +560,10 @@ impl SendChatApplicationService {
             };
             req.text = intent.handoff;
             req.user_agent = intent.user_agent;
-        }
+            true
+        } else {
+            false
+        };
         let request_fingerprint = request_fingerprint(&req)?;
         let submitted = submitted_identity_from_request(&req);
         match lookup_durable_replay(&self.db, &req, &submitted).await? {
@@ -594,15 +600,15 @@ impl SendChatApplicationService {
             *replay = SendChatReplay::Steering;
             return Ok(outcome);
         }
-        if req.message_id.starts_with("reminder:")
+        if is_reserved_reminder_message_id(&req.message_id)
+            && !validated_continuation_opening
             && !matches!(
                 req.origin,
                 phoenix_core::domain::db_schema::InputOrigin::ScheduledReminder { .. }
             )
         {
             return Ok(SendChatOutcome::Rejected {
-                message: "message_id namespace reminder: is reserved for scheduled reminder inputs"
-                    .into(),
+                message: "message_id is reserved for scheduled reminder inputs".into(),
                 code: "reserved_message_id",
             });
         }
@@ -1871,7 +1877,11 @@ mod tests {
 
     #[tokio::test]
     async fn reminder_namespace_preserves_existing_exact_replay_and_unreserved_client_ids() {
-        for historical in [false, true] {
+        for historical_id in [
+            None,
+            Some("reminder:historical-client-key"),
+            Some("old-transcript:reminder:historical-client-key"),
+        ] {
             let runtime = acceptance_pass_runtime().await;
             let db = runtime.db();
             db.create_conversation("client-id", "client-id", "/tmp", true, None, None)
@@ -1880,18 +1890,14 @@ mod tests {
             let req = SendChatRequest {
                 conversation_id: "client-id".into(),
                 origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
-                message_id: if historical {
-                    "reminder:historical-client-key".into()
-                } else {
-                    "ordinary-client-key".into()
-                },
+                message_id: historical_id.unwrap_or("ordinary-client-key").into(),
                 text: "original input".into(),
                 images: vec![],
                 files: vec![],
                 user_agent: None,
                 expansion_policy: MessageExpansionPolicy::LiteralText,
             };
-            if historical {
+            if historical_id.is_some() {
                 let payload = PreparedDirectTurnPayload::from_parts(
                     super::submitted_identity_from_request(&req),
                     PreparedDirectTurnDelivery {

@@ -118,6 +118,177 @@ mod tests {
         ordinary_input_cannot_claim_reminder_identity(true).await;
     }
 
+    #[tokio::test]
+    async fn canonical_reminder_alias_cannot_block_due_materialization() {
+        canonical_alias_cannot_block_materialization(false).await;
+    }
+
+    #[tokio::test]
+    async fn cross_conversation_canonical_reminder_alias_cannot_block_due_materialization() {
+        canonical_alias_cannot_block_materialization(true).await;
+    }
+
+    async fn canonical_alias_cannot_block_materialization(cross_conversation: bool) {
+        use phoenix_core::domain::db_schema::{Message, MessageContent, MessageType};
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("canonical-target", "target", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let reminder = save(&db, &source.id, "create").await;
+        let attacker = if cross_conversation {
+            db.create_conversation("canonical-attacker", "attacker", "/tmp", true, None, None)
+                .await
+                .unwrap()
+                .id
+        } else {
+            source.id.clone()
+        };
+        let runtime = manager(&db);
+        let busy = ConvState::LlmRequesting { attempt: 1 };
+        db.update_conversation_state(&attacker, &busy)
+            .await
+            .unwrap();
+        runtime.inject_handle_for_test(&attacker, busy).await;
+        let alias = format!("{}:{}", source.id, reminder.input_message_id());
+        let outcome = SendChatApplicationService::new(db.clone(), runtime)
+            .send(SendChatRequest {
+                conversation_id: attacker.clone(),
+                origin: InputOrigin::UserApi,
+                text: "unrelated ordinary input".into(),
+                message_id: alias.clone(),
+                images: vec![],
+                files: vec![],
+                user_agent: None,
+                expansion_policy: MessageExpansionPolicy::LiteralText,
+            })
+            .await
+            .unwrap();
+        if outcome == SendChatOutcome::QueuedAsSteering {
+            let queue = db.get_steering_queue(&attacker).await.unwrap();
+            let message = Message {
+                message_id: queue[0].message_id.clone(),
+                origin: queue[0].origin.clone(),
+                conversation_id: attacker.clone(),
+                sequence_id: 1,
+                message_type: MessageType::User,
+                content: MessageContent::user(&queue[0].text),
+                display_data: None,
+                usage_data: None,
+                created_at: chrono::Utc::now(),
+            };
+            db.commit_steering_drain(
+                &attacker,
+                &[message],
+                &ConvState::LlmRequesting { attempt: 1 },
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+            db.add_message(
+                "ordinary-response",
+                &attacker,
+                &MessageContent::Agent(vec![]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            db.update_conversation_state(&attacker, &ConvState::Idle)
+                .await
+                .unwrap();
+        } else {
+            assert!(
+                matches!(
+                    outcome,
+                    SendChatOutcome::Rejected {
+                        code: "reserved_message_id",
+                        ..
+                    }
+                ),
+                "{outcome:?}"
+            );
+            db.update_conversation_state(&attacker, &ConvState::Idle)
+                .await
+                .unwrap();
+        }
+        deliver_pass(&manager(&db), time(30)).await;
+        assert_materialized_reminder(&db, &source.id, &alias, &reminder).await;
+    }
+
+    async fn assert_materialized_reminder(
+        db: &Database,
+        transcript: &str,
+        alias: &str,
+        reminder: &Reminder,
+    ) {
+        use phoenix_core::domain::{
+            db_schema::MessageContent, sm_event::PreparedDirectTurnPayload,
+        };
+        use phoenix_db::workflow::{
+            ClaimAuthoritativeTurnInput, LocalAuthorityResult, MaterializeAuthoritativeTurnInput,
+            MaterializeAuthoritativeTurnOutcome,
+        };
+        use phoenix_workflow::{ConversationAuthority, LeaseExpiry, ProcessIncarnation, Timestamp};
+        let repository = db.workflow_repository();
+        let turn = repository
+            .load_owning_authoritative_turn(&ConversationAuthority(transcript.into()))
+            .await
+            .unwrap()
+            .unwrap();
+        let workflow_id = repository
+            .workflow_id_for_turn(turn.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let now = Timestamp(chrono::Utc::now().timestamp().try_into().unwrap());
+        let claim = repository
+            .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
+                turn_id: turn.id,
+                workflow_id,
+                process_incarnation: ProcessIncarnation(1),
+                now,
+                lease_until: LeaseExpiry(now.0 + 60),
+            })
+            .await
+            .unwrap();
+        let result = repository
+            .materialize_authoritative_turn(&MaterializeAuthoritativeTurnInput {
+                turn_id: turn.id,
+                authority: claim.authority.unwrap(),
+                prepared: PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload())
+                    .unwrap(),
+                sequence_id: 3,
+                created_at: now,
+                accepted_state: ConvState::LlmRequesting { attempt: 1 },
+                state_updated_at: chrono::Utc::now(),
+                now,
+            })
+            .await;
+        assert!(
+            matches!(
+                result,
+                LocalAuthorityResult::DurableFactEstablished(
+                    MaterializeAuthoritativeTurnOutcome::Materialized(_)
+                        | MaterializeAuthoritativeTurnOutcome::ExactReplay(_)
+                        | MaterializeAuthoritativeTurnOutcome::ClassifiedCommitted(_)
+                )
+            ),
+            "canonical alias occupied reminder materialization: {result:?}"
+        );
+        let message = db.get_message_by_id(alias).await.unwrap();
+        assert_eq!(
+            message.origin,
+            InputOrigin::ScheduledReminder {
+                reminder_id: reminder.id.clone()
+            }
+        );
+        assert_eq!(
+            message.content,
+            MessageContent::user(reminder.text.as_str())
+        );
+    }
+
     async fn ordinary_input_cannot_claim_reminder_identity(busy: bool) {
         let db = Database::open_in_memory().await.unwrap();
         let source = db

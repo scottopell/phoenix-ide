@@ -406,10 +406,17 @@ THE SYSTEM SHALL expose a bounded read-only recent-due feed for connected-browse
 
 ### REQ-API-033: Reserved scheduled-reminder input identities
 
-WHEN admitting a new conversation input with a client message identity beginning with `reminder:`
+WHEN admitting a fresh conversation input with a client message identity beginning with `reminder:` or containing `:reminder:`
 THE SYSTEM SHALL accept that identity only for a trusted scheduled-reminder input whose owner, due occurrence, saved text and provenance match
 AND SHALL reject other origins before creating a direct-turn or steering acceptance with HTTP 409 `reserved_message_id` on the public chat endpoint.
+
+WHEN a fresh continuation request supplies a reserved message identity
+THE SYSTEM SHALL reject it before creating a successor or persisting its opening intent.
 
 WHEN a client exactly retries an already accepted input
 THE SYSTEM SHALL preserve the existing ordinary replay contract, including historical client identities in the reserved namespace
 AND SHALL NOT permit changed payload or provenance to claim that identity.
+
+WHEN an existing durable continuation opening owns a reserved identity
+THE SYSTEM SHALL retain its original winning identity and allow its opening to finish only through the existing validated intent, owner, source and payload policy
+AND SHALL NOT substitute a losing retry's requested identity or treat an arbitrary new chat input as that owned opening.

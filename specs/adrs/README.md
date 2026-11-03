@@ -211,6 +211,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [216](216_explicit-local-tool-selector-reuses-local-admission.md) | Explicit local tool selection reuses local admission | Accepted | REQ-FED-001, REQ-FED-002, REQ-FED-019 |
 | [217](217_reminders-submit-through-standard-input-admission.md) | Reminders submit through standard input admission | Accepted | REQ-REM-001–009 |
 | [218](218_reminder-occurrence-identities-are-reserved.md) | Reminder occurrence identities are reserved at fresh input admission | Accepted | REQ-REM-005/008, REQ-API-033 |
+| [219](219_reminder-reservations-cover-canonical-aliases-and-fresh-openings.md) | Reminder reservations cover canonical aliases and fresh openings | Accepted | REQ-API-033, REQ-REM-005 |
 
 ## For agents: which decisions bind your task
 
@@ -218,7 +219,7 @@ Consult the relevant ADRs before starting work of each kind.
 
 | Task type | Relevant ADRs |
 | --- | --- |
-| Changing reminder occurrence identity, time eligibility or ordinary input acceptance | 217, 218 |
+| Changing reminder occurrence identity, time eligibility or ordinary input acceptance | 217, 218, 219 |
 | Changing navigation console attribution or CDP context ownership | 110/111, superseding 109, with 107/108 |
 | Changing conversation Markdown disclosures, their source ranges, streaming selection, or find interpretation | 099 |
 | Changing Codex model discovery, availability, or account-bound routing | 062, then 052 and 034 |

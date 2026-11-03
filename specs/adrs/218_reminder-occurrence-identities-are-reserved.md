@@ -32,5 +32,6 @@ Migration 151 is unreleased and adds the nullable provenance column. Pre-feature
 
 ## References
 
+- ADR-219 extends the reservation to canonical aliases and records the existing-owned-opening admission boundary.
 - ADR-217: reminder submission through standard input admission.
 - `../reminders/requirements.md`, `../api/requirements.md`.
