@@ -1717,6 +1717,10 @@ pub enum InputOrigin {
     SubscriptionEvent {
         event_id: String,
     },
+    ScheduledReminder {
+        #[ts(type = "string")]
+        reminder_id: super::reminder::ReminderId,
+    },
 }
 
 impl InputOrigin {
@@ -1759,7 +1763,8 @@ impl InputOrigin {
             | Self::RemoteApi { .. }
             | Self::SystemGenerated
             | Self::SlackGateway { .. }
-            | Self::SubscriptionEvent { .. } => None,
+            | Self::SubscriptionEvent { .. }
+            | Self::ScheduledReminder { .. } => None,
         }
     }
 
@@ -1816,6 +1821,7 @@ impl InputOrigin {
             ),
             Self::SystemGenerated => ("system_generated", None, None, None, None),
             Self::SlackGateway { .. } => ("slack_gateway", None, None, None, None),
+            Self::ScheduledReminder { .. } => ("scheduled_reminder", None, None, None, None),
             Self::SubscriptionEvent { event_id } => {
                 ("subscription_event", None, None, Some(event_id), None)
             }
@@ -1864,7 +1870,63 @@ impl InputOrigin {
             | Self::SubscriptionEvent { .. }
             | Self::RemoteApi { .. }
             | Self::RemoteConversation { .. }
+            | Self::RemoteCoordinator { .. }
+            | Self::ScheduledReminder { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn reminder_id(&self) -> Option<&str> {
+        match self {
+            Self::ScheduledReminder { reminder_id } => Some(reminder_id.as_str()),
+            Self::UnknownHistorical
+            | Self::UserApi
+            | Self::InternalConversation { .. }
+            | Self::SystemGenerated
+            | Self::SlackGateway { .. }
+            | Self::SubscriptionEvent { .. }
+            | Self::RemoteApi { .. }
+            | Self::RemoteConversation { .. }
             | Self::RemoteCoordinator { .. } => None,
+        }
+    }
+
+    /// Decode normalized source columns, rejecting identities on another kind.
+    /// # Errors
+    /// Rejects malformed or mixed provenance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_db_source_columns(
+        kind: &str,
+        product: Option<String>,
+        transcript: Option<String>,
+        event: Option<String>,
+        source_instance_id: Option<String>,
+        slack: Option<String>,
+        reminder: Option<String>,
+    ) -> Result<Self, String> {
+        match (kind, reminder) {
+            ("scheduled_reminder", Some(id))
+                if product.is_none()
+                    && transcript.is_none()
+                    && event.is_none()
+                    && source_instance_id.is_none()
+                    && slack.is_none() =>
+            {
+                Ok(Self::ScheduledReminder {
+                    reminder_id: super::reminder::ReminderId::parse(id)
+                        .map_err(|error| error.to_string())?,
+                })
+            }
+            ("scheduled_reminder", _) => Err("invalid scheduled reminder origin".into()),
+            (_, None) => Self::from_db_parts_with_slack(
+                kind,
+                product,
+                transcript,
+                event,
+                source_instance_id,
+                slack,
+            ),
+            _ => Err("reminder source on another origin".into()),
         }
     }
 
@@ -1984,6 +2046,58 @@ mod input_origin_tests {
             r#"{"kind":"remote_conversation","instance_id":"aabbccdd-1234-4abc-8def-0123456789ab","product_conversation_id":"product","transcript_id":"transcript","source_call":null}"#,
             r#"{"kind":"remote_coordinator","instance_id":"aabbccdd-1234-4abc-8def-0123456789ab","product_conversation_id":"product","transcript_id":"transcript","source_call":null}"#,
         ]
+    }
+
+    #[test]
+    fn scheduled_reminder_origin_is_separate_from_other_sources() {
+        let origin = InputOrigin::ScheduledReminder {
+            reminder_id: super::super::reminder::ReminderId::parse("reminder-1").unwrap(),
+        };
+        let json = serde_json::to_string(&origin).unwrap();
+        assert_eq!(serde_json::from_str::<InputOrigin>(&json).unwrap(), origin);
+        assert_eq!(
+            InputOrigin::from_db_source_columns(
+                "scheduled_reminder",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("reminder-1".into())
+            )
+            .unwrap(),
+            origin
+        );
+        assert!(InputOrigin::from_db_source_columns(
+            "scheduled_reminder",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None
+        )
+        .is_err());
+        assert!(InputOrigin::from_db_source_columns(
+            "user_api",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("reminder-1".into())
+        )
+        .is_err());
+        assert!(InputOrigin::from_db_source_columns(
+            "scheduled_reminder",
+            None,
+            None,
+            Some("event".into()),
+            None,
+            None,
+            Some("reminder-1".into())
+        )
+        .is_err());
     }
 
     fn origins() -> Vec<InputOrigin> {

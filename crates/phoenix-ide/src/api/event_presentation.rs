@@ -119,6 +119,7 @@ impl EventPresentations {
                 | InputOrigin::RemoteApi { .. }
                 | InputOrigin::RemoteConversation { .. }
                 | InputOrigin::RemoteCoordinator { .. }
+                | InputOrigin::ScheduledReminder { .. }
                 | InputOrigin::SystemGenerated => None,
             })
             .collect();
@@ -164,6 +165,7 @@ impl EventPresentations {
             | InputOrigin::RemoteApi { .. }
             | InputOrigin::RemoteConversation { .. }
             | InputOrigin::RemoteCoordinator { .. }
+            | InputOrigin::ScheduledReminder { .. }
             | InputOrigin::SystemGenerated => None,
         }
     }

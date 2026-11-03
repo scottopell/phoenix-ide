@@ -421,7 +421,7 @@ const ORIGINAL_PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL: &str = "WITH RECURSIVE tra
             json_extract(value, '$.tail_sequence_id') AS tail_sequence_id,
             json_extract(value, '$.tail_message_id') AS tail_message_id
      FROM json_each(?2)
- ) SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_slack_request_id, origin_source_message_id, origin_source_tool_use_id, transcript.ordinal
+ ) SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_slack_request_id, origin_reminder_id, origin_source_message_id, origin_source_tool_use_id, transcript.ordinal
  FROM transcript
  CROSS JOIN messages INDEXED BY messages_conversation_sequence
    ON messages.conversation_id = transcript.id
@@ -447,7 +447,7 @@ const PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL: &str = "WITH RECURSIVE transcript(i
      WHERE (?2 IS NULL OR EXISTS (SELECT 1 FROM snapshot_ceiling ceiling WHERE ceiling.transcript_row_id = transcript.id AND (messages.sequence_id < ceiling.tail_sequence_id OR (messages.sequence_id = ceiling.tail_sequence_id AND messages.message_id <= ceiling.tail_message_id))))
        AND (?3 IS NULL OR transcript.ordinal < ?3 OR (transcript.ordinal = ?3 AND (messages.sequence_id < ?4 OR (messages.sequence_id = ?4 AND messages.message_id < ?5))))
      ORDER BY transcript.ordinal DESC, messages.sequence_id DESC, messages.message_id DESC LIMIT ?6
- ) SELECT m.message_id, m.conversation_id, m.sequence_id, m.message_type, m.content, m.display_data, m.usage_data, m.created_at, m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id, m.origin_subscription_event_id, m.origin_source_instance_id, m.origin_slack_request_id, m.origin_source_message_id, m.origin_source_tool_use_id, selected.ordinal
+ ) SELECT m.message_id, m.conversation_id, m.sequence_id, m.message_type, m.content, m.display_data, m.usage_data, m.created_at, m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id, m.origin_subscription_event_id, m.origin_source_instance_id, m.origin_slack_request_id, m.origin_reminder_id, m.origin_source_message_id, m.origin_source_tool_use_id, selected.ordinal
  FROM selected JOIN messages m ON m.message_id = selected.message_id
  ORDER BY selected.ordinal DESC, selected.sequence_id DESC, selected.message_id DESC";
 
@@ -1775,7 +1775,7 @@ impl Database {
                    AND successor.parent_conversation_id IS NULL
              )
              SELECT message_id, conversation_id, sequence_id, message_type, content,
-                    display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_slack_request_id, origin_source_message_id, origin_source_tool_use_id, transcript.ordinal
+                    display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_slack_request_id, origin_reminder_id, origin_source_message_id, origin_source_tool_use_id, transcript.ordinal
              FROM transcript
              JOIN messages ON messages.conversation_id = transcript.id
              WHERE (?2 IS NULL
@@ -1912,6 +1912,7 @@ mod tests {
                     "origin_subscription_event_id",
                     "origin_source_instance_id",
                     "origin_slack_request_id",
+                    "origin_reminder_id",
                     "origin_source_message_id",
                     "origin_source_tool_use_id",
                 ] {
@@ -1949,7 +1950,7 @@ mod tests {
                 message_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, sequence_id INTEGER NOT NULL,
                 message_type TEXT NOT NULL, content TEXT NOT NULL, display_data TEXT, usage_data TEXT,
                 created_at TEXT NOT NULL, origin_kind TEXT NOT NULL, origin_product_conversation_id TEXT,
-                origin_transcript_id TEXT, origin_subscription_event_id TEXT, origin_source_instance_id TEXT, origin_slack_request_id TEXT,
+                origin_transcript_id TEXT, origin_subscription_event_id TEXT, origin_source_instance_id TEXT, origin_slack_request_id TEXT, origin_reminder_id TEXT,
                 origin_source_message_id TEXT, origin_source_tool_use_id TEXT
              );
              CREATE INDEX messages_conversation_sequence ON messages(conversation_id, sequence_id);

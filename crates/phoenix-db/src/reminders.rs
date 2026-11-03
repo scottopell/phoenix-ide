@@ -13,6 +13,7 @@ use crate::{Database, DbError, DbResult};
 
 pub struct CreateReminderInput {
     pub source_transcript_id: String,
+    pub source_message_id: String,
     pub source_tool_use_id: String,
     pub request_fingerprint: String,
     pub text: ReminderText,
@@ -142,15 +143,17 @@ impl Database {
     pub async fn reminder_for_create_call(
         &self,
         transcript_id: &str,
+        source_message_id: &str,
         tool_use_id: &str,
         request_fingerprint: &str,
     ) -> DbResult<Option<Reminder>> {
         let mut tx = self.pool.begin().await?;
         owner_tx(&mut tx, transcript_id).await?;
         let row = sqlx::query(
-            "SELECT * FROM reminders WHERE source_transcript_id = ?1 AND source_tool_use_id = ?2",
+            "SELECT * FROM reminders WHERE source_transcript_id = ?1 AND source_message_id = ?2 AND source_tool_use_id = ?3",
         )
         .bind(transcript_id)
+        .bind(source_message_id)
         .bind(tool_use_id)
         .fetch_optional(&mut *tx)
         .await?;
@@ -184,7 +187,8 @@ impl Database {
     /// # Errors
     /// Rejects changed replay input, invalid dates, unavailable owners, or database failures.
     pub async fn create_reminder(&self, input: &CreateReminderInput) -> DbResult<Reminder> {
-        if input.source_tool_use_id.trim().is_empty()
+        if input.source_message_id.trim().is_empty()
+            || input.source_tool_use_id.trim().is_empty()
             || input.request_fingerprint.len() != 64
             || !input
                 .request_fingerprint
@@ -198,9 +202,10 @@ impl Database {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         owner_tx(&mut tx, &input.source_transcript_id).await?;
         if let Some(row) = sqlx::query(
-            "SELECT * FROM reminders WHERE source_transcript_id = ?1 AND source_tool_use_id = ?2",
+            "SELECT * FROM reminders WHERE source_transcript_id = ?1 AND source_message_id = ?2 AND source_tool_use_id = ?3",
         )
         .bind(&input.source_transcript_id)
+        .bind(&input.source_message_id)
         .bind(&input.source_tool_use_id)
         .fetch_optional(&mut *tx)
         .await?
@@ -224,13 +229,14 @@ impl Database {
         let id = uuid::Uuid::new_v4().to_string();
         let row = sqlx::query(
             "INSERT INTO reminders (id, product_conversation_id, source_transcript_id,
-                source_tool_use_id, create_request_fingerprint, text, due_at_us, timezone,
+                source_message_id, source_tool_use_id, create_request_fingerprint, text, due_at_us, timezone,
                 revision, created_at_us, state)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, 'scheduled') RETURNING *",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, 'scheduled') RETURNING *",
         )
         .bind(id)
         .bind(owner.as_str())
         .bind(&input.source_transcript_id)
+        .bind(&input.source_message_id)
         .bind(&input.source_tool_use_id)
         .bind(&input.request_fingerprint)
         .bind(input.text.as_str())
@@ -271,9 +277,6 @@ impl Database {
         &self,
         input: &RescheduleReminderInput,
     ) -> DbResult<ReminderChange> {
-        if input.due_at_us <= input.now_us {
-            return Err(invalid("choose a reminder time in the future"));
-        }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let Some(current) =
             owned_tx(&mut tx, &input.source_transcript_id, &input.reminder_id).await?
@@ -282,6 +285,9 @@ impl Database {
         };
         if let Some(outcome) = changed_state(current, input.expected_revision) {
             return Ok(outcome);
+        }
+        if input.due_at_us <= input.now_us {
+            return Err(invalid("choose a reminder time in the future"));
         }
         crate::close_foundation::require_product_conversation_admission_tx(
             &mut tx,

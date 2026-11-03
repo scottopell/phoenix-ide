@@ -1906,6 +1906,7 @@ pub(crate) fn attributed_role(
             InputOrigin::RemoteCoordinator { .. } => "Remote Coordinator",
             InputOrigin::InternalConversation { .. } => "Conversation",
             InputOrigin::SlackGateway { .. } => "Slack request",
+            InputOrigin::ScheduledReminder { .. } => "Scheduled reminder",
             InputOrigin::SystemGenerated => "System input",
             InputOrigin::SubscriptionEvent { .. } => "Conversation event",
             InputOrigin::UnknownHistorical => "Unknown input",
@@ -1922,6 +1923,7 @@ pub(crate) fn attributed_role(
             InputOrigin::RemoteCoordinator { .. } => "Skill · Remote Coordinator",
             InputOrigin::InternalConversation { .. } => "Skill · Conversation",
             InputOrigin::SlackGateway { .. } => "Skill · Slack request",
+            InputOrigin::ScheduledReminder { .. } => "Skill · Scheduled reminder",
             InputOrigin::SystemGenerated => "Skill · System input",
             InputOrigin::SubscriptionEvent { .. } => "Skill · Conversation event",
             InputOrigin::UnknownHistorical => "Skill · Unknown input",
@@ -1950,6 +1952,7 @@ pub(crate) fn attributed_sender(origin: &phoenix_core::domain::db_schema::InputO
         | InputOrigin::UserApi
         | InputOrigin::SlackGateway { .. }
         | InputOrigin::SystemGenerated
+        | InputOrigin::ScheduledReminder { .. }
         | InputOrigin::SubscriptionEvent { .. } => String::new(),
     }
 }
@@ -2004,6 +2007,7 @@ async fn attributed_sender_with_cache(
         | InputOrigin::UserApi
         | InputOrigin::SlackGateway { .. }
         | InputOrigin::SystemGenerated
+        | InputOrigin::ScheduledReminder { .. }
         | InputOrigin::SubscriptionEvent { .. } => Ok(String::new()),
     }
 }
@@ -2924,6 +2928,8 @@ fn map_db_not_found(e: DbError) -> AppError {
         | DbError::TranscriptSnapshotChanged
         | DbError::SlugExists(_)
         | DbError::ConversationAlreadyExists(_)
+        | DbError::ReminderInvalid(_)
+        | DbError::ReminderRequestConflict
         | DbError::CoordinatorWorkScope(_)
         | DbError::ConversationTitleInvalid
         | DbError::CurrentCoordinatorRequired

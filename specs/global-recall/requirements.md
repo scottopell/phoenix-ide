@@ -426,7 +426,11 @@ AND SHALL NOT infer a coordination role for ordinary conversations
 
 ### REQ-GR-014: Preserve Trusted Input Attribution
 
-THE SYSTEM SHALL assign input origin at trusted server boundaries and SHALL distinguish user-facing API input, internal conversation messages, system-generated input, and subscription events.
+THE SYSTEM SHALL assign input origin at trusted server boundaries and SHALL distinguish user-facing API input, internal conversation messages, system-generated input, subscription events, and scheduled reminders.
+
+WHEN reminder input is admitted
+THE SYSTEM SHALL retain its validated reminder identity through durable admission, steering, persisted history, transport, UI attribution and model-bound rendering
+AND SHALL present its text as saved reminder data rather than a new human instruction or grant of authority.
 
 WHEN a conversation sends a message
 THE SYSTEM SHALL preserve the sender's stable ProductConversation identity and exact transcript identity through durable admission, steering, persisted history, transport, UI attribution, and model-bound rendering.

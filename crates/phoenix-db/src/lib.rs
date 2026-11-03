@@ -1892,12 +1892,12 @@ fn parent_creation_values(
 }
 
 const PROMPT_TAIL_EMPTY_SQL: &str =
-    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
      FROM messages
      WHERE conversation_id = ?1
      ORDER BY sequence_id ASC";
 const PROMPT_TAIL_AFTER_SQL: &str =
-    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
      FROM messages
      WHERE conversation_id = ?1 AND sequence_id > ?2
      ORDER BY sequence_id ASC";
@@ -8629,7 +8629,7 @@ impl Database {
 
         let rows = sqlx::query(
             "SELECT message_id, text, llm_text, user_agent, skill_name, skill_body, skill_dir,
-                    origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                    origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM steering_messages WHERE conversation_id = ?1 ORDER BY ordinal ASC",
         )
         .bind(id)
@@ -8681,13 +8681,14 @@ impl Database {
                     });
             queue.push(SteerEntry {
                 text: row.try_get("text")?,
-                origin: phoenix_core::domain::db_schema::InputOrigin::from_db_parts_with_slack(
+                origin: phoenix_core::domain::db_schema::InputOrigin::from_db_source_columns(
                     &row.try_get::<String, _>("origin_kind")?,
                     row.try_get("origin_product_conversation_id")?,
                     row.try_get("origin_transcript_id")?,
                     row.try_get("origin_subscription_event_id")?,
                     row.try_get("origin_source_instance_id")?,
                     row.try_get("origin_slack_request_id")?,
+                    row.try_get("origin_reminder_id")?,
                 )
                 .and_then(|origin| {
                     origin.with_source_call_columns(
@@ -10730,7 +10731,7 @@ impl Database {
                     return Err(DbError::MessageNotFound(message_id.clone()));
                 }
                 let updated_message = sqlx::query(
-                    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
                      FROM messages WHERE message_id = ?1",
                 )
                 .bind(message_id)
@@ -12821,7 +12822,7 @@ impl Database {
         let mut tx = self.pool.begin().await?;
         if let Some(tool_id) = spawn_tool_id {
             let messages = sqlx::query(
-                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
                  FROM messages WHERE conversation_id = ?1 AND message_type = 'tool'",
             )
             .bind(conversation_id)
@@ -12859,7 +12860,7 @@ impl Database {
             }
             let updated_message = sqlx::query(
                 "SELECT message_id, conversation_id, sequence_id, message_type,
-                        content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                        content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
                  FROM messages WHERE message_id = ?1",
             )
             .bind(message_id)
@@ -13536,7 +13537,7 @@ impl Database {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(mut existing) = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content,
-                    display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                    display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages WHERE message_id = ?1",
         )
         .bind(message_id)
@@ -13752,8 +13753,8 @@ impl Database {
 
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         )
         .bind(message_id)
         .bind(conversation_id)
@@ -13771,6 +13772,7 @@ impl Database {
     .bind(origin.source_call().map(|call| call.message_id.as_str()))
     .bind(origin.source_call().map(|call| call.tool_use_id.as_str()))
     .bind(origin.slack_request_id())
+    .bind(origin.reminder_id())
         .execute(&mut *tx)
         .await?;
         if matches!(
@@ -13905,7 +13907,7 @@ impl Database {
     pub async fn get_messages(&self, conversation_id: &str) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::FullHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC",
         )
         .bind(conversation_id)
@@ -13941,7 +13943,7 @@ impl Database {
             .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))
             .and_then(PromptTranscriptGeneration::from_persisted)?;
         let mut messages = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC",
         )
         .bind(conversation_id)
@@ -14016,7 +14018,7 @@ impl Database {
     ) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
             let mut rows = sqlx::query(
-                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
                  FROM messages
                  WHERE conversation_id = ?1
                    AND sequence_id >= (
@@ -14053,7 +14055,7 @@ impl Database {
     pub async fn get_recovery_messages(&self, conversation_id: &str) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages
              WHERE conversation_id = ?1
                AND (
@@ -14139,7 +14141,7 @@ impl Database {
     ) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages WHERE conversation_id = ?1 AND sequence_id > ?2 ORDER BY sequence_id ASC",
         )
         .bind(conversation_id)
@@ -14169,7 +14171,7 @@ impl Database {
     ) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::LatestBoundedHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages
              WHERE conversation_id = ?1
              ORDER BY sequence_id DESC
@@ -14245,7 +14247,7 @@ impl Database {
         limit: i64,
     ) -> DbResult<Vec<Message>> {
         let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages
              WHERE conversation_id = ?1 AND sequence_id < ?2
              ORDER BY sequence_id DESC
@@ -14276,7 +14278,7 @@ impl Database {
     ) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::LatestBoundedHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages
              WHERE conversation_id = ?1 AND sequence_id > ?2
              ORDER BY sequence_id ASC
@@ -14318,7 +14320,7 @@ impl Database {
                         m.origin_product_conversation_id, m.origin_transcript_id, \
                         m.origin_subscription_event_id, \
                         m.origin_source_message_id, m.origin_source_tool_use_id, \
-                        m.origin_slack_request_id, \
+                        m.origin_slack_request_id, m.origin_reminder_id, \
                         CASE WHEN json_valid(m.display_data) \
                                   AND json_type(m.display_data, '$.hidden') = 'true' \
                              THEN 1 ELSE 0 END AS hidden, \
@@ -14353,7 +14355,7 @@ impl Database {
     ) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages
              WHERE conversation_id = ?1 AND sequence_id >= ?2 AND sequence_id <= ?3
              ORDER BY sequence_id ASC",
@@ -14387,7 +14389,7 @@ impl Database {
     ) -> DbResult<(Vec<Message>, Vec<Message>)> {
         self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
             let mut before = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages
              WHERE conversation_id = ?1 AND sequence_id < ?2
              ORDER BY sequence_id DESC
@@ -14402,7 +14404,7 @@ impl Database {
         before.reverse();
 
         let mut after = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages
              WHERE conversation_id = ?1 AND sequence_id > ?2
              ORDER BY sequence_id ASC
@@ -14467,7 +14469,7 @@ impl Database {
                     m.origin_product_conversation_id, m.origin_transcript_id, \
                     m.origin_subscription_event_id, \
                     m.origin_source_message_id, m.origin_source_tool_use_id, \
-                    m.origin_slack_request_id, \
+                    m.origin_slack_request_id, m.origin_reminder_id, \
                     CASE WHEN json_valid(m.display_data) \
                               AND json_type(m.display_data, '$.hidden') = 'true' \
                          THEN 1 ELSE 0 END AS hidden, \
@@ -14490,7 +14492,7 @@ impl Database {
         message_id: &str,
     ) -> DbResult<Message> {
         let mut message = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages
              WHERE message_id = ?1 AND (?2 IS NULL OR conversation_id = ?2)",
         )
@@ -14568,7 +14570,7 @@ impl Database {
         let body = async {
             let mut message = sqlx::query(
                 "SELECT message_id, conversation_id, sequence_id, message_type, content,
-                        display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                        display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
                  FROM messages WHERE message_id = ?1",
             )
             .bind(message_id)
@@ -14678,7 +14680,7 @@ impl Database {
         // Re-index the mutated message so the retrieval index reflects the new
         // content (specs/conversation-retrieval/ REQ-RET-003).
         let updated: Option<Message> = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages WHERE message_id = ?1",
         )
         .bind(message_id)
@@ -15704,8 +15706,8 @@ async fn insert_steering_entry_tx(
     sqlx::query(
         "INSERT INTO steering_messages
             (message_id, conversation_id, ordinal, text, llm_text, user_agent,
-             skill_name, skill_body, skill_dir, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+             skill_name, skill_body, skill_dir, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
     )
     .bind(&entry.message_id)
     .bind(conversation_id)
@@ -15724,6 +15726,7 @@ async fn insert_steering_entry_tx(
     .bind(entry.origin.source_call().map(|call| call.message_id.as_str()))
     .bind(entry.origin.source_call().map(|call| call.tool_use_id.as_str()))
     .bind(entry.origin.slack_request_id())
+    .bind(entry.origin.reminder_id())
     .execute(&mut **tx)
     .await?;
     for (file_ordinal, file) in entry.files.iter().enumerate() {
@@ -16267,8 +16270,8 @@ async fn insert_message_tx(
         .map_err(|e| DbError::Serialization(e.to_string()))?;
 
     let inserted = sqlx::query(
-        "INSERT OR IGNORE INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        "INSERT OR IGNORE INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
     )
     .bind(&msg.message_id)
     .bind(&msg.conversation_id)
@@ -16286,11 +16289,12 @@ async fn insert_message_tx(
     .bind(msg.origin.source_call().map(|call| call.message_id.as_str()))
     .bind(msg.origin.source_call().map(|call| call.tool_use_id.as_str()))
     .bind(msg.origin.slack_request_id())
+    .bind(msg.origin.reminder_id())
     .execute(&mut **tx)
     .await?;
     if inserted.rows_affected() == 0 {
         let Some(mut existing) = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages WHERE message_id = ?1",
         )
         .bind(&msg.message_id)
@@ -16347,7 +16351,7 @@ async fn steering_message_matches_tx(
     message: &Message,
 ) -> DbResult<Option<bool>> {
     let row = sqlx::query(
-        "SELECT conversation_id, message_type, content, display_data, usage_data, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+        "SELECT conversation_id, message_type, content, display_data, usage_data, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
          FROM messages WHERE message_id = ?1",
     )
     .bind(&message.message_id)
@@ -16704,13 +16708,14 @@ fn prompt_decode_error(error: impl std::fmt::Display) -> sqlx::Error {
 fn decode_origin(
     row: &SqliteRow,
 ) -> Result<phoenix_core::domain::db_schema::InputOrigin, sqlx::Error> {
-    phoenix_core::domain::db_schema::InputOrigin::from_db_parts_with_slack(
+    phoenix_core::domain::db_schema::InputOrigin::from_db_source_columns(
         &row.try_get::<String, _>("origin_kind")?,
         row.try_get("origin_product_conversation_id")?,
         row.try_get("origin_transcript_id")?,
         row.try_get("origin_subscription_event_id")?,
         row.try_get("origin_source_instance_id")?,
         row.try_get("origin_slack_request_id")?,
+        row.try_get("origin_reminder_id")?,
     )
     .and_then(|origin| {
         origin.with_source_call_columns(
@@ -23651,7 +23656,7 @@ mod tests {
 
         let mut parents = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content,
-                    display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                    display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages WHERE conversation_id = 'snapshot-tx' ORDER BY sequence_id",
         )
         .try_map(parse_prompt_message_row)
@@ -24539,6 +24544,7 @@ mod tests {
                 | InputOrigin::InternalConversation { .. }
                 | InputOrigin::SystemGenerated
                 | InputOrigin::SlackGateway { .. }
+                | InputOrigin::ScheduledReminder { .. }
                 | InputOrigin::SubscriptionEvent { .. } => unreachable!(),
             }
             assert!(matches!(

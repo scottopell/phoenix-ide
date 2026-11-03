@@ -7,6 +7,7 @@ fn time(value: i64) -> ReminderTimestampUs {
 fn input(transcript_id: &str, call: &str, deadline: i64) -> CreateReminderInput {
     CreateReminderInput {
         source_transcript_id: transcript_id.into(),
+        source_message_id: "assistant-message".into(),
         source_tool_use_id: call.into(),
         request_fingerprint: "a".repeat(64),
         text: ReminderText::parse("Check Safari Web Inspector and capture storage screenshots.")
@@ -41,9 +42,14 @@ async fn reminders_create_replay_preserves_original_deadline_and_rejects_conflic
     retry.now_us = time(100);
     assert_eq!(db.create_reminder(&retry).await.unwrap(), original);
     assert_eq!(
-        db.reminder_for_create_call(&source.id, "call", &retry.request_fingerprint)
-            .await
-            .unwrap(),
+        db.reminder_for_create_call(
+            &source.id,
+            "assistant-message",
+            "call",
+            &retry.request_fingerprint
+        )
+        .await
+        .unwrap(),
         Some(original.clone())
     );
     retry.request_fingerprint = "b".repeat(64);
@@ -52,8 +58,13 @@ async fn reminders_create_replay_preserves_original_deadline_and_rejects_conflic
         Err(DbError::ReminderRequestConflict)
     ));
     assert!(matches!(
-        db.reminder_for_create_call(&source.id, "call", &retry.request_fingerprint)
-            .await,
+        db.reminder_for_create_call(
+            &source.id,
+            "assistant-message",
+            "call",
+            &retry.request_fingerprint
+        )
+        .await,
         Err(DbError::ReminderRequestConflict)
     ));
     assert_eq!(
@@ -464,5 +475,83 @@ async fn reminders_cancellation_accepts_a_backward_clock_observation() {
         ReminderState::Cancelled {
             cancelled_at_us: time(5)
         }
+    );
+}
+
+#[tokio::test]
+async fn reminders_origin_roundtrips_through_history_and_schema_rejects_mixed_sources() {
+    use phoenix_core::domain::db_schema::{InputOrigin, MessageContent};
+    let db = Database::open_in_memory().await.unwrap();
+    let owner = source(&db, "origin-roundtrip").await;
+    let reminder = db
+        .create_reminder(&input(&owner.id, "create", 20))
+        .await
+        .unwrap();
+    db.promote_due_reminders(time(30), 100).await.unwrap();
+    let origin = InputOrigin::ScheduledReminder {
+        reminder_id: reminder.id.clone(),
+    };
+    db.add_message_with_seq_and_origin(
+        &reminder.input_message_id(),
+        &owner.id,
+        1,
+        &MessageContent::user(reminder.text.as_str()),
+        None,
+        None,
+        &origin,
+    )
+    .await
+    .unwrap();
+    assert_eq!(db.get_messages(&owner.id).await.unwrap()[0].origin, origin);
+    assert_eq!(
+        db.get_message_by_id(&reminder.input_message_id())
+            .await
+            .unwrap()
+            .origin,
+        origin
+    );
+    for update in [
+        "origin_kind='user_api'",
+        "origin_reminder_id=NULL",
+        "origin_subscription_event_id='event'",
+        "origin_reminder_id='missing'",
+    ] {
+        let query = format!("UPDATE messages SET {update} WHERE message_id=?1");
+        assert!(sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(reminder.input_message_id())
+            .execute(db.pool())
+            .await
+            .is_err());
+    }
+    db.delete_conversation(&owner.id).await.unwrap();
+    assert!(sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn reminders_reused_provider_tool_id_in_distinct_assistant_messages_is_a_new_call() {
+    let db = Database::open_in_memory().await.unwrap();
+    let owner = source(&db, "full-call-identity").await;
+    let first = input(&owner.id, "reused-provider-tool-id", 20);
+    let a = db.create_reminder(&first).await.unwrap();
+    let mut second = input(&owner.id, "reused-provider-tool-id", 20);
+    second.source_message_id = "different-assistant-message".into();
+    let b = db.create_reminder(&second).await.unwrap();
+    assert_ne!(a.id, b.id);
+    assert_eq!(db.create_reminder(&first).await.unwrap(), a);
+    assert_eq!(db.create_reminder(&second).await.unwrap(), b);
+    assert_eq!(
+        db.reminder_for_create_call(
+            &owner.id,
+            &second.source_message_id,
+            &second.source_tool_use_id,
+            &second.request_fingerprint
+        )
+        .await
+        .unwrap(),
+        Some(b)
     );
 }

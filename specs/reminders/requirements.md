@@ -11,7 +11,7 @@ arrives, without keeping a browser or model request open.
 ### REQ-REM-001: Explicit conversation-owned reminders
 
 WHEN a top-level ordinary conversation or the Coordinator explicitly creates a reminder
-THE SYSTEM SHALL bind it to that stable ProductConversation and its trusted creating transcript/tool invocation
+THE SYSTEM SHALL bind it to that stable ProductConversation and its trusted creating transcript, assistant message and tool invocation
 AND SHALL retain its text, resolved due instant, display timezone and revision
 AND SHALL require neither a repository nor a WorkScope for reminder ownership
 AND SHALL reject subordinate-agent registration and arbitrary cross-conversation targeting.
@@ -22,7 +22,7 @@ WHEN reminder creation succeeds
 THE SYSTEM SHALL have committed the reminder before returning a receipt containing its ID, saved text and exact resolved time/zone
 AND SHALL return immediately without keeping a tool call or provider request open, parking the tool round, or changing conversation execution state.
 
-WHEN the same trusted creating invocation is replayed with the same normalized request
+WHEN the same trusted creating transcript/assistant-message/tool-call identity is replayed with the same normalized request
 THE SYSTEM SHALL return the same reminder without shifting a relative deadline
 AND SHALL reject reuse of that invocation identity with a different normalized request.
 

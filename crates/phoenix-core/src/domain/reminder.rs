@@ -106,7 +106,7 @@ pub struct ReminderTimestampUs(i64);
 
 impl ReminderTimestampUs {
     /// # Errors
-    /// Rejects timestamps outside the supported nonnegative SQLite range.
+    /// Rejects timestamps outside the supported nonnegative `SQLite` range.
     pub const fn parse(value: i64) -> Result<Self, ReminderValueError> {
         if value < 0 {
             return Err(ReminderValueError::InvalidTime);

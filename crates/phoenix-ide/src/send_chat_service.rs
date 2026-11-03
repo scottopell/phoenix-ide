@@ -493,6 +493,28 @@ impl SendChatApplicationService {
         replay: &mut SendChatReplay,
         authority: Option<&crate::db::FederationSendAuthority>,
     ) -> Result<SendChatOutcome, SendChatServiceError> {
+        if let phoenix_core::domain::db_schema::InputOrigin::ScheduledReminder { reminder_id } =
+            &req.origin
+        {
+            let reminder = self
+                .db
+                .get_reminder(&req.conversation_id, reminder_id)
+                .await
+                .map_err(|error| map_db_internal_error(&error))?
+                .ok_or(SendChatServiceError::IdempotencyConflict)?;
+            if !matches!(
+                reminder.state,
+                phoenix_core::domain::reminder::ReminderState::Due { .. }
+            ) || req.message_id != reminder.input_message_id()
+                || req.text != reminder.text.as_str()
+                || !req.images.is_empty()
+                || !req.files.is_empty()
+                || req.user_agent.is_some()
+                || req.expansion_policy != MessageExpansionPolicy::LiteralText
+            {
+                return Err(SendChatServiceError::IdempotencyConflict);
+            }
+        }
         let conversation = self
             .runtime
             .db()
@@ -1241,6 +1263,8 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
         | crate::db::DbError::TranscriptSnapshotChanged
         | crate::db::DbError::SlugExists(_)
         | crate::db::DbError::ConversationAlreadyExists(_)
+        | crate::db::DbError::ReminderInvalid(_)
+        | crate::db::DbError::ReminderRequestConflict
         | crate::db::DbError::CoordinatorWorkScope(_)
         | crate::db::DbError::ConversationTitleInvalid
         | crate::db::DbError::CurrentCoordinatorRequired
@@ -1302,6 +1326,8 @@ fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceErr
         | crate::db::DbError::MessageConflict(_)
         | crate::db::DbError::TranscriptSnapshotChanged
         | crate::db::DbError::SlugExists(_)
+        | crate::db::DbError::ReminderInvalid(_)
+        | crate::db::DbError::ReminderRequestConflict
         | crate::db::DbError::CoordinatorWorkScope(_)
         | crate::db::DbError::ConversationTitleInvalid
         | crate::db::DbError::CurrentCoordinatorRequired

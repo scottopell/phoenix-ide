@@ -37,7 +37,7 @@ revision, cancellation and one immutable due occurrence. A clock observation
 freezes a scheduled revision into due state in SQLite. Direct display reads that
 fact independently of provider or model success.
 
-Creation is replay-safe under the trusted transcript/tool-call identity and an
+Creation is replay-safe under the trusted transcript, assistant-message and tool-call identity and an
 immutable fingerprint of normalized unresolved request arguments. The fingerprint
 describes the original operation; the mutable deadline describes the current
 schedule. Comparing the original request prevents a retried relative duration

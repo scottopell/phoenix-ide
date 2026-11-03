@@ -340,7 +340,9 @@ pub(super) async fn continue_manual(
                     "continuation_not_allowed",
                 )))
             }
-            other @ (DbError::CoordinatorWorkScope(_)
+            other @ (DbError::ReminderInvalid(_)
+        | DbError::ReminderRequestConflict
+        | DbError::CoordinatorWorkScope(_)
             | DbError::Sqlx(_)
             | DbError::ConversationTitleInvalid
             | DbError::CurrentCoordinatorRequired
