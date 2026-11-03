@@ -215,6 +215,8 @@ surface PluginControl {
 --   value are reported as diagnostics and otherwise ignored; a type
 --   violation, a bad name, or an unrecognized $schema identifier returns
 --   null (whole-plugin rejection) (REQ-AP-003).
+--   Resolved metadata must identify a regular file before any manifest read;
+--   special files are rejected without opening them (REQ-AP-002).
 -- spec_versions_match(plugin, mcp_doc): both plugin.json and mcp.json
 --   declare the same recognized specification version (REQ-AP-012).
 -- skills_dir_valid(plugin_root): the skills location is a directory or
@@ -237,6 +239,8 @@ surface PluginControl {
 -- removable_entry_known(plugin): a selected valid scan entry, or a retained
 --   entry validated as an immediate non-data child of the trusted root.
 --   Validation resolves its parent, never the package symlink target.
+--   A valid different manifest identity at a retained entry rejects removal.
+--   Registry paths retain native OS bytes, not lossy display strings.
 -- registry_enabled(name): true only in an available, successfully loaded
 --   activation snapshot that does not disable name; absent row then means
 --   enabled. The snapshot is stable for one discovery pass (REQ-AP-008).
@@ -460,8 +464,11 @@ rule PluginRemovalRequested {
         -- scan entry; if its manifest is unavailable, use only the validated
         -- registered entry. Reject unknown identities. Record the entry,
         -- persist disabled state, refresh and reconcile MCP before
-        -- deletion. Reconciliation failure preserves the entry. Unlink a symlink
-        -- entry without deleting its canonical target. Preserve provenance
+        -- deletion. Reconciliation failure preserves the entry. Capture the
+        -- filesystem identity before asynchronous work and revalidate it and
+        -- the manifest name immediately before deletion; preserve replacements
+        -- and return an error. Unlink a symlink entry without deleting its
+        -- canonical target. Preserve provenance
         -- and data. A deletion failure retains disabled identity and reports
         -- failure rather than treating the entry as absent.
 }
@@ -544,8 +551,10 @@ rule PluginServersContribute {
     @guidance
         -- The MCP configuration merge consumes these contributions after
         -- every user configuration file, preserving first-seen-wins so
-        -- user configuration always wins a collision. streamable-http
-        -- maps to the existing HTTP transport; stdio servers additionally
+        -- user configuration always wins a collision. Across plugins, the
+        -- first eligible qualified key wins; later ambiguous dotted keys are
+        -- skipped with a reason by the same pass-scoped admission used for
+        -- status. streamable-http maps to HTTP; stdio servers additionally
         -- pass through StdioEnvironmentContract before spawning. Server
         -- tools surface through live tool resolution (mcp/REQ-MCP-014).
 }

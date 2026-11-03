@@ -1,5 +1,29 @@
 # User-Level Agent Plugins (Agent Plugins Spec 1.1.0)
 
+## Late review during green CI — 2026-11-03
+
+Exact-head hosted CI passed on `063f9fd22`:
+https://github.com/scottopell/phoenix-ide/actions/runs/41664991424
+
+Eight new threads on that checkpoint arrived during CI. Their fixes cover:
+regular-file manifest admission (FIFO rejection), cross-plugin qualified-key
+collisions, HTTP header syntax, closed MCP top-level structure, lossless native
+registry paths, Git-supported URL/source forms, late filesystem-entry identity
+revalidation, and refusal to remove a valid different manifest identity.
+
+Deletion tests replace a directory during reconciliation with both the same
+and a different plugin name, and verify replacement witnesses remain. Registry
+paths use a typed PathBuf and native BLOB bytes; presentation strings confer no
+filesystem authority. The full raw-name lifecycle test is Linux-only because
+the local macOS filesystem rejects illegal byte sequences. Unix registry byte
+round-trip coverage runs independently of filesystem name support. ADR-219
+records the bounds and explicitly adds no prototype-DB conversion or recovery.
+
+Focused new-edit validation: 38 loader, 210 MCP, 43 macOS runtime/API, and five
+registry tests pass. Strict clippy and spec/format preflight pass. Linux's
+additional raw-name lifecycle test and new-head CI still require hosted
+verification. The earlier green run is not evidence for these later edits.
+
 ## CI and outstanding threads — 2026-11-03
 
 All nine unresolved review threads on `74929d23f` have confirmed fixes:

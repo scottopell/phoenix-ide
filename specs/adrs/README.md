@@ -193,6 +193,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [216](216_agent-plugins-are-user-level-shared-root-namespaced-bundles.md) | Agent plugins are user-level-only, shared-root, namespaced bundles | Accepted | REQ-AP-001 through REQ-AP-012 |
 | [217](217_plugin-lifecycle-separates-installation-ownership-from-activation.md) | Plugin lifecycle separates installation ownership from activation | Accepted | REQ-AP-002, REQ-AP-007 through REQ-AP-010 |
 | [218](218_mcp-redirects-preserve-origin-and-reload-capture-is-serialized.md) | MCP redirects preserve origin and reload capture is serialized | Accepted | REQ-MCP-004/015, REQ-AP-006/008 |
+| [219](219_plugin-removal-revalidates-entry-identity-and-retains-native-paths.md) | Plugin removal revalidates entry identity and retains native paths | Accepted | REQ-AP-006/009/010 |
 | [149](149_selective-coordinator-checkins.md) | Selective coordinator check-ins and attention-first briefings | Accepted | REQ-GR-011 |
 | [150](150_concrete-coordinator-reporting-and-blocker-recovery.md) | Concrete Coordinator reporting and blocked-work recovery | Accepted | REQ-GR-011 |
 | [148](148_qualify-exact-ordinary-launchd-source129-to-target131.md) | Qualify exact ordinary launchd source 129 to target 131 | Accepted | REQ-COMP-019, REQ-LDD-023/028 |

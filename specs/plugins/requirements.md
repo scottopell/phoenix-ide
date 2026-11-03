@@ -60,6 +60,9 @@ WHERE the plugins root itself is missing THE SYSTEM SHALL treat the plugin
 set as empty without error
 
 THE SYSTEM SHALL NOT recurse into nested directories searching for manifests
+THE SYSTEM SHALL verify resolved regular-file metadata before opening a
+manifest. A readable special file, including a FIFO, SHALL be rejected
+without reading or waiting for a writer.
 
 WHERE two plugin roots in the same scan declare the same manifest `name` THE
 SYSTEM SHALL load the first discovered and SHALL report the duplicate at
@@ -144,6 +147,10 @@ WHERE `mcp.json` is missing, its JSON is invalid, its top-level structure is
 invalid, its declared specification version differs from the manifest's, or
 it declares an unsupported specification version THE SYSTEM SHALL disable
 that plugin's MCP contribution and continue loading skills
+The MCP document SHALL reject top-level fields other than `$schema` and
+`mcpServers`. Configured HTTP names and values SHALL pass the owning HTTP
+header syntax validator before a server can be admitted; a bad header skips
+only that server.
 
 WHERE an individual server entry in a valid `mcp.json` is invalid, uses an
 unsupported transport, or resolves outside the plugin root THE SYSTEM SHALL
@@ -200,6 +207,10 @@ THE SYSTEM SHALL key each enabled plugin's MCP servers as
 `<plugin>.<server>` and merge them into the MCP configuration after every
 user configuration file, preserving the first-seen-wins merge so user
 configuration always wins a name collision
+When distinct plugin/server pairs produce the same qualified key, THE SYSTEM
+SHALL admit only the first eligible contribution in discovery order and
+report later contributions as skipped with a collision reason. Status and
+execution SHALL share this pass-scoped decision.
 
 THE SYSTEM SHALL translate the 1.1.0 transport tags to the transport-tagged
 config model (`specs/mcp/` REQ-MCP-001): `stdio` and `streamable-http` map
@@ -246,9 +257,9 @@ origin without explicit authorization. Phoenix SHALL reject cross-origin
 MCP redirects; origin is scheme, host, and effective port. Same-origin
 redirects SHALL have a finite limit (`specs/mcp/` REQ-MCP-004).
 
-**Rationale:** Keying as `<plugin>.<server>` keeps tool names unambiguous
-without new machinery and gives user config a structural precedence over
-plugins. The environment and expansion contract is the 1.1.0 runtime
+**Rationale:** Qualified keys give user config structural precedence over
+plugins. A pass-scoped admission decision detects ambiguous dotted keys
+across plugins instead of silently overwriting one contribution. The environment and expansion contract is the 1.1.0 runtime
 requirement verbatim: one textual pass over the designated fields, no other
 expansion, client-owned variables last, data directory preserved across
 updates so a plugin update never destroys plugin state.
@@ -318,6 +329,14 @@ reconciliation so disabling a plugin cannot orphan a running subprocess.
 THE SYSTEM SHALL provide an add path that installs a plugin from a local
 path or a git URL into a plugin directory under the plugins root, and a
 remove path that uninstalls it
+Git-supported sources, including SSH URLs, native Git URLs, and scp-style
+repository arguments, SHALL NOT require a `.git` suffix. THE SYSTEM SHALL
+pass the repository as one argument after Git's option terminator and let
+Git validate nonempty remote/source forms.
+
+The retained installation entry SHALL round-trip native OS path values
+without Unicode replacement. Display text MAY be lossy, but SHALL NOT be
+used to reconstruct deletion authority.
 
 WHERE an added plugin's manifest name collides with an already-loaded
 plugin THE SYSTEM SHALL reject the add with a diagnostic
@@ -341,6 +360,11 @@ entry only after validating that it is an immediate non-data child of the
 trusted plugins root. Missing/corrupt manifests and dangling package symlinks
 SHALL NOT prevent removal of that validated entry. Resolving its parent
 SHALL NOT resolve or authorize deletion of its symlink target.
+A stored fallback entry declaring a different valid manifest name SHALL NOT
+be removed. Removal SHALL capture the observed entry's filesystem identity
+before asynchronous registry/reconciliation work, then revalidate identity
+and manifest name immediately before deletion. A replacement SHALL be
+preserved and reported as an error, even if its manifest name is unchanged.
 
 Purge SHALL require a retained identity with a known absent installation
 entry and no installed package declaring that identity. An invalid manifest

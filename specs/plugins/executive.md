@@ -35,6 +35,30 @@ lifecycle and status coverage.
 | REQ-AP-011 | Extension namespaces inert | No extension execution path |
 | REQ-AP-012 | Exact 1.1.0 schema identifiers | Unsupported manifest version rejects; incompatible MCP document disables that component |
 
+## Late-review ownership and format checks
+
+A later review on the CI-green checkpoint found eight more gaps. Removal now
+captures Unix device/inode identity before teardown and revalidates it and the
+manifest name immediately before deletion. Registered fallbacks declaring
+another valid plugin are refused. Registry installation paths are typed native
+paths stored as BLOB values; presentation strings do not confer deletion
+authority. [ADR-219](../adrs/219_plugin-removal-revalidates-entry-identity-and-retains-native-paths.md)
+records these boundaries and their limits.
+
+MCP admission detects qualified-name collisions across plugins in one pass,
+shared with status. Headers are syntax-validated and the MCP document is closed
+to unknown top-level fields. Manifest metadata must identify a regular file
+before reading, so FIFO siblings are skipped. Git validates all nonempty
+repository source forms after the option terminator, including SSH and scp-style
+sources without a `.git` suffix.
+
+The earlier checkpoint passed the complete hosted CI workflow. That result does
+not cover subsequent late-review edits. Focused tests for the new edits pass:
+38 loader, 210 MCP, 43 runtime/API on macOS, and five registry tests. The raw
+non-Unicode filesystem lifecycle regression is Linux-specific; macOS storage
+round-trip tests cover the byte-safe registry separately. New-head CI remains
+a separate verification gate until it completes.
+
 ## Outstanding-thread repairs
 
 Selected-entry provenance now requires a matching stored managed entry;
@@ -69,7 +93,7 @@ records the shared HTTP transport policy and reload boundary. The redirect
 restriction applies to non-plugin MCP servers too; configure the destination
 explicitly when an endpoint redirects to another origin.
 
-## Verification boundaries
+## Earlier verification boundaries
 
 Focused loader, adapter, registry-upgrade, activation, lifecycle, API, and UI
 regressions are the relevant evidence. Existing unrelated MCP/skills tests are
@@ -78,10 +102,10 @@ mutations. The remediation checkpoint passes loader (33), skills (66), MCP
 (201), plugin runtime/API (32), registry (4), and strict clippy checks. These
 suite totals include existing tests. UI and spec lanes also pass.
 
-The broad Rust run had six failures. Three migration-related failures were
-fixed and pass focused reruns. Three Bash/runtime failures reproduce alone
-and remain unclassified against baseline. There is no full-check pass or
-independent review clearance.
+The earlier local broad Rust run had six failures. Three migration-related
+failures were fixed and passed focused reruns. Three Bash/runtime failures
+reproduced alone and remained unclassified against baseline. That checkpoint
+had no full-check pass or independent review clearance.
 
 The numbered registry migration covers fresh and supported pre-plugin databases.
 It does not convert local databases created by an earlier unshipped prototype
