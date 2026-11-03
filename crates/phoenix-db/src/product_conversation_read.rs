@@ -1974,8 +1974,13 @@ mod tests {
                 let id = format!("{segment}-{index}");
                 let optional = |field| (index % 2 == 0).then(|| format!("{field}-{id}"));
                 sqlx::query(
-                    "INSERT INTO messages VALUES (?1, ?2, ?3, 'user', ?4, ?5, ?6,
-                     '2026-01-01T00:00:00Z', 'internal_conversation', ?7, ?8, ?9, NULL, NULL, ?10, ?11)",
+                    "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type,
+                     content, display_data, usage_data, created_at, origin_kind,
+                     origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id,
+                     origin_source_instance_id, origin_slack_request_id, origin_reminder_id,
+                     origin_source_message_id, origin_source_tool_use_id)
+                     VALUES (?1, ?2, ?3, 'user', ?4, ?5, ?6,
+                     '2026-01-01T00:00:00Z', 'internal_conversation', ?7, ?8, ?9, NULL, NULL, ?10, ?11, ?12)",
                 )
                 .bind(&id)
                 .bind(segment)
@@ -1986,6 +1991,7 @@ mod tests {
                 .bind(optional("product"))
                 .bind(optional("transcript"))
                 .bind(optional("subscription"))
+                .bind(optional("reminder"))
                 .bind(optional("source-message"))
                 .bind(optional("source-tool"))
                 .execute(&mut connection)
@@ -2085,6 +2091,7 @@ mod tests {
         .await;
         assert_eq!(complete.len(), 15);
         assert_eq!(complete[0]["message_id"], "s2-4");
+        assert_eq!(complete[0]["origin_reminder_id"], "reminder-s2-4");
         assert_eq!(complete[0]["sequence_id"].as_i64(), Some(i64::MAX));
         assert_eq!(
             complete[1]["sequence_id"].as_i64(),
