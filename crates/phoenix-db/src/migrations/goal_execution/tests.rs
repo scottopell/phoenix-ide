@@ -53,7 +53,9 @@ async fn migration_138_backfills_materialized_without_breaking_ordinary_message_
     assert_eq!(run_through_for_test(db.pool(), 141).await.unwrap(), 0);
     assert_eq!(run_through_for_test(db.pool(), 142).await.unwrap(), 1);
     assert_eq!(run_through_for_test(db.pool(), 142).await.unwrap(), 0);
-    super::super::run_pending_migrations(db.pool()).await.unwrap();
+    super::super::run_pending_migrations(db.pool())
+        .await
+        .unwrap();
     let written = db
         .add_message(
             "after-138",
