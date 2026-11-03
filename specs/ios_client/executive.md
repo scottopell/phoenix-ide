@@ -32,10 +32,18 @@ and reducer ordering/hard-delete behavior. Remaining verification steps:
 on-device build and an airplane-mode queue/drain test pass.
 
 Slack gateway input provenance is a typed origin with an exact request source
-link. Conversation snapshots use version 2 and migrate version-1 envelopes;
-older writers are fenced from overwriting the expanded origin vocabulary.
+link. Scheduled reminders retain their reminder ID and label without human-input
+authority or cross-source navigation. Conversation snapshots use version 3 and
+migrate version-1 and version-2 envelopes; older writers are fenced from
+overwriting the expanded origin vocabulary.
 Wire-model type checking is available locally; simulator execution remains a
 separate qualification when no simulator runtime is installed.
+
+The reminder-origin and snapshot-version regressions compile with the full app
+and unit-test target under Xcode's iOS 26.5 simulator SDK. Local execution is
+unqualified: the simulator runner failed with `IDEPseudoTerminalDomain` code 7
+and `NSPOSIXErrorDomain` code 6 because the host exhausted its pseudo-terminals.
+The hosted iOS job remains responsible for executing these unit regressions.
 
 ## Requirement Coverage
 

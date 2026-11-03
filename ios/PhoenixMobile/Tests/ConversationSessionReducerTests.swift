@@ -36,7 +36,7 @@ final class ConversationSessionReducerTests: XCTestCase {
     }
 
     @MainActor
-    func testLegacySnapshotMigratesAndSlackSnapshotFencesOlderWriters() async throws {
+    func testPriorSnapshotsMigrateAndReminderSnapshotFencesOlderWriters() async throws {
         let session = makeSession()
         struct LegacySnapshot: Codable {
             var conversation: Conversation?
@@ -44,26 +44,37 @@ final class ConversationSessionReducerTests: XCTestCase {
             var lastSequenceId: Int64
             var syncedAt: Date?
         }
-        let prior = LegacySnapshot(conversation: try conversation(),
+        var prior = LegacySnapshot(conversation: try conversation(),
             messages: [try message(id: "legacy", content: "[]")], lastSequenceId: 2, syncedAt: Date())
-        XCTAssertTrue(DiskStore.saveVersioned(prior, name: "conv-c1", version: 1))
-        XCTAssertTrue(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
-        let restored = ConversationSession(conversationId: "c1",
-            api: PhoenixAPI(baseURL: URL(string: "https://phoenix.invalid")!, password: nil, allowSelfSigned: false)!,
-            connectivity: ConnectivityMonitor())
-        XCTAssertEqual(restored.messages.map(\.message_id), ["legacy"])
-        var slack = try message(id: "slack", type: "user", content: "[]")
-        slack.origin = .slackGateway(requestId: "request-1")
-        session.receive(.initSnapshot(.init(conversation: try conversation(), messages: [slack],
+        for version in [1, 2] {
+            if version == 2 {
+                prior.messages[0].origin = .slackGateway(requestId: "request-1")
+            }
+            XCTAssertTrue(DiskStore.saveVersioned(prior, name: "conv-c1", version: version))
+            XCTAssertTrue(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
+            let restored = ConversationSession(conversationId: "c1",
+                api: PhoenixAPI(baseURL: URL(string: "https://phoenix.invalid")!, password: nil, allowSelfSigned: false)!,
+                connectivity: ConnectivityMonitor())
+            XCTAssertEqual(restored.messages, prior.messages)
+        }
+        var reminder = try message(id: "reminder", type: "user", content: "[]")
+        reminder.origin = .scheduledReminder(reminderId: "reminder-1")
+        session.receive(.initSnapshot(.init(conversation: try conversation(), messages: [reminder],
             agentWorking: false, presentationMode: "idle", lastSequenceId: 0,
             pendingAnchorSequenceId: 2, pendingEvents: [], pendingTruncated: false)))
         let saved = await session.flushSnapshotPersistence()
         XCTAssertTrue(saved)
-        guard case .incompatible(storedVersion: 2) = DiskStore.loadVersionedResult(
-            LegacySnapshot.self, name: "conv-c1", version: 1) else {
-            return XCTFail("Slack snapshots must be recognized as newer by an older client")
+        for version in [1, 2] {
+            guard case .incompatible(storedVersion: 3) = DiskStore.loadVersionedResult(
+                LegacySnapshot.self, name: "conv-c1", version: version) else {
+                return XCTFail("Reminder snapshots must be recognized as newer by an older client")
+            }
+            XCTAssertFalse(DiskStore.saveVersioned(prior, name: "conv-c1", version: version))
         }
-        XCTAssertFalse(DiskStore.saveVersioned(prior, name: "conv-c1", version: 1))
+        let restored = ConversationSession(conversationId: "c1",
+            api: PhoenixAPI(baseURL: URL(string: "https://phoenix.invalid")!, password: nil, allowSelfSigned: false)!,
+            connectivity: ConnectivityMonitor())
+        XCTAssertEqual(restored.messages, [reminder])
     }
 
     @MainActor

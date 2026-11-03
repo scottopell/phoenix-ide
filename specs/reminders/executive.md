@@ -80,6 +80,12 @@ The authenticated HTTP surface provides `GET /api/conversations/:id/reminders`, 
 
 The conversation panel displays saved-zone exact times, immutable due cards and scheduled-only management. Editing retains the opening revision; validation exposes IANA zone and optional UTC offset, and conflicts reload current state. Abortable non-overlapping polling refreshes at five seconds and on visibility/focus/network return. Browser alerts use the existing notification store/policy, a server-persisted `notify_reminder` key defaulting enabled, an initially quiet baseline and independent per-reminder dedupe. This does not provide closed-app phone notifications.
 
+The native iOS transcript decodes and caches scheduled-reminder provenance with
+its reminder ID and label, retaining non-human authority and no cross-source
+link. Snapshot version 3 reads version-1/version-2 envelopes and fences older
+writers. The app and unit tests compile; simulator execution is blocked locally
+by host pseudo-terminal exhaustion and remains a hosted iOS CI qualification.
+
 Focused API, persistence, component, policy, navigation and stale-refresh regressions accompany this slice. Integrated API/browser journey validation passes; broad checks and adversarial review remain pending.
 
 ## API journey qualification
@@ -104,3 +110,11 @@ document width=393). Native date-field keyboard editing worked; earlier CLI
 fill/capture/resize attempts were inconclusive. Notification permission delivery
 and physical devices were not exercised. The complete project check and
 independent adversarial review remain pending. No deployment was performed.
+
+Main integration preserves Federation's immutable migration 150 and appends
+reminders as migration 151. All 16 reminder DB tests, 14 application reminder
+tests, three predecessor-migration regressions and 17 migration/ledger/upgrade
+fixtures pass. The populated 151 test compares every original table and column,
+including provenance, Federation state and inert wake history, and verifies
+foreign keys and idempotent reentry. Full checks and the integrated mock journey
+remain assigned to parent QA; no post-integration full-check pass is claimed.

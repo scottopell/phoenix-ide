@@ -123,3 +123,11 @@ the three Federation migration regressions and exact-ledger assertions pass.
 The populated 151 regression preserves every original table/column, including
 provenance, Federation records and inert wake history, with clean foreign keys.
 Final project checks and the integrated mock journey are assigned to parent QA.
+
+Native integration adds scheduled-reminder decoding/encoding and a non-human
+label without cross-source links. Snapshot version 3 migrates exact v1/v2
+envelopes and fences older writers. Xcode build-for-testing passes for the full
+app and unit-test target, including origin and cache regression sources. Test
+execution is unqualified because host pseudo-terminal exhaustion blocked the
+simulator runner; hosted iOS CI must execute these cases. Migration-fixture
+batches pass 9 and 8 tests after the merge. No deployment or phone alerts added.
