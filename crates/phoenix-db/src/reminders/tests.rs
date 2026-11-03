@@ -1,6 +1,54 @@
 use super::*;
 
 #[tokio::test]
+async fn reminders_cancel_requires_existing_product_lifecycle_admission() {
+    use phoenix_core::domain::close::TranscriptConversationId;
+    for history in [false, true] {
+        let db = Database::open_in_memory().await.unwrap();
+        let owner = source(&db, "cancel-fenced").await;
+        let reminder = db
+            .create_reminder(&input(&owner.id, "create", 20))
+            .await
+            .unwrap();
+        if history {
+            sqlx::query(
+                "UPDATE product_conversations SET ordinary_lifecycle='history' WHERE id=?1",
+            )
+            .bind(owner.product_conversation_id.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        } else {
+            db.begin_close_foundation(
+                &owner.product_conversation_id,
+                &TranscriptConversationId::parse(owner.id.clone()).unwrap(),
+                "cancel-close",
+            )
+            .await
+            .unwrap();
+        }
+        let result = db
+            .cancel_reminder(&owner.id, &reminder.id, reminder.revision, time(11))
+            .await;
+        if history {
+            assert!(
+                matches!(result, Err(DbError::ProductConversationUnavailable(_))),
+                "{result:?}"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(DbError::CloseAdmissionFenced(_))),
+                "{result:?}"
+            );
+        }
+        assert_eq!(
+            db.get_reminder(&owner.id, &reminder.id).await.unwrap(),
+            Some(reminder)
+        );
+    }
+}
+
+#[tokio::test]
 async fn reminders_due_in_successor_preserve_provenance_and_allow_aggregate_delete() {
     use phoenix_core::domain::{
         db_schema::{InputOrigin, MessageContent},

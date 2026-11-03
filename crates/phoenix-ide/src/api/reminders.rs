@@ -190,6 +190,71 @@ mod tests {
     use phoenix_core::domain::reminder::{ReminderText, ReminderTimezone};
 
     #[tokio::test]
+    async fn cancellation_reports_lifecycle_conflict_without_failing_local_authority() {
+        use phoenix_core::domain::close::TranscriptConversationId;
+        for history in [false, true] {
+            let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+            let owner = state
+                .db
+                .create_conversation("fenced-reminder", "fenced", "/tmp", true, None, None)
+                .await
+                .unwrap();
+            let reminder = state
+                .db
+                .create_reminder(&phoenix_db::CreateReminderInput {
+                    source_transcript_id: owner.id.clone(),
+                    source_message_id: "assistant".into(),
+                    source_tool_use_id: "create".into(),
+                    request_fingerprint: "a".repeat(64),
+                    text: ReminderText::parse("saved reminder").unwrap(),
+                    timezone: ReminderTimezone::parse("UTC").unwrap(),
+                    due_at_us: ReminderTimestampUs::parse(20).unwrap(),
+                    now_us: ReminderTimestampUs::parse(10).unwrap(),
+                })
+                .await
+                .unwrap();
+            if history {
+                sqlx::query(
+                    "UPDATE product_conversations SET ordinary_lifecycle='history' WHERE id=?1",
+                )
+                .bind(owner.product_conversation_id.as_str())
+                .execute(state.db.pool())
+                .await
+                .unwrap();
+            } else {
+                state
+                    .db
+                    .begin_close_foundation(
+                        &owner.product_conversation_id,
+                        &TranscriptConversationId::parse(owner.id.clone()).unwrap(),
+                        "cancel-close",
+                    )
+                    .await
+                    .unwrap();
+            }
+            let response = cancel(
+                State(state.clone()),
+                Path((owner.id.clone(), reminder.id.clone())),
+                Json(RevisionRequest {
+                    expected_revision: reminder.revision,
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                state
+                    .db
+                    .get_reminder(&owner.id, &reminder.id)
+                    .await
+                    .unwrap(),
+                Some(reminder)
+            );
+            assert!(state.runtime.acquire_local_authority_pass().is_ok());
+        }
+    }
+
+    #[tokio::test]
     async fn management_is_owner_scoped_and_reports_conflicts_without_erasing_due_facts() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         for id in ["rem-owner", "other-owner"] {

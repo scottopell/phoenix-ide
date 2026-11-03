@@ -337,6 +337,8 @@ impl Database {
         if let Some(outcome) = changed_state(current, expected_revision) {
             return Ok(outcome);
         }
+        crate::close_foundation::require_product_conversation_admission_tx(&mut tx, transcript_id)
+            .await?;
         let row = sqlx::query(
             "UPDATE reminders SET state = 'cancelled', cancelled_at_us = ?2
              WHERE id = ?1 RETURNING *",
