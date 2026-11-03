@@ -141,7 +141,7 @@ pub struct CloseRun {
     pub status: CloseRunStatus,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, schemars::JsonSchema)]
 #[serde(transparent)]
 pub struct TranscriptConversationId(String);
 

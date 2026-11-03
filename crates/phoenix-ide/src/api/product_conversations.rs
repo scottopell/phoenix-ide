@@ -620,6 +620,53 @@ pub(crate) fn product_route(slug: Option<&str>, product_id: &str) -> String {
     )
 }
 
+pub(crate) fn exact_transcript_route(
+    id: &phoenix_core::domain::close::TranscriptConversationId,
+) -> String {
+    let encoded = percent_encode_route_segment(id.as_str());
+    format!("{PRODUCT_CONVERSATION_ROUTE_PREFIX}{encoded}?source_transcript={encoded}")
+}
+
+pub(crate) fn canonical_product_route_shape(route: &str) -> bool {
+    let Some(segment) = route.strip_prefix(PRODUCT_CONVERSATION_ROUTE_PREFIX) else {
+        return false;
+    };
+    if segment.is_empty() || segment.contains('/') || segment.contains('?') || segment.contains('#')
+    {
+        return false;
+    }
+    let Ok(decoded) = percent_encoding::percent_decode_str(segment).decode_utf8() else {
+        return false;
+    };
+    let Ok(id) = ProductConversationId::parse(decoded.as_ref()) else {
+        return false;
+    };
+    product_route(None, id.as_str()) == route
+}
+
+#[cfg(test)]
+#[test]
+fn canonical_product_route_shape_requires_one_canonical_stable_id_segment() {
+    assert!(canonical_product_route_shape("/c/product%20id"));
+    assert!(!canonical_product_route_shape("/c/"));
+    assert!(!canonical_product_route_shape("/c/product/id"));
+    assert!(!canonical_product_route_shape("/c/product%2fid"));
+    assert!(!canonical_product_route_shape("/c/product?id=other"));
+    assert!(!canonical_product_route_shape(
+        "https://peer.invalid/c/product"
+    ));
+}
+
+#[cfg(test)]
+#[test]
+fn exact_transcript_route_preserves_exact_source_identity() {
+    let transcript = TranscriptConversationId::parse("transcript / one").unwrap();
+    assert_eq!(
+        exact_transcript_route(&transcript),
+        "/c/transcript%20%2F%20one?source_transcript=transcript%20%2F%20one"
+    );
+}
+
 pub(crate) fn canonical_route(aggregate: &ProductConversationAggregate) -> String {
     product_route(
         aggregate.root.conversation.slug.as_deref(),

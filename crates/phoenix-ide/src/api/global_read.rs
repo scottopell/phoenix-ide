@@ -2945,6 +2945,8 @@ fn map_db_not_found(e: DbError) -> AppError {
         | DbError::GitRepositoryWorkScopeProjectConflict { .. }
         | DbError::FederationSendAuthorityInactive
         | DbError::FederationSendIdentityConflict
+        | DbError::FederationPeerNotFound
+        | DbError::FederationPeerAmbiguous
         | DbError::FederationSteeringDuplicate
         | DbError::DormantGitRepositoryCatchupPermitTargetMismatch
         | DbError::DormantGitRepositoryCatchupStaleOperation
