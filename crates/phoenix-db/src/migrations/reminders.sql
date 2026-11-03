@@ -1,7 +1,7 @@
 CREATE TABLE reminders (
     id TEXT PRIMARY KEY NOT NULL CHECK (length(trim(id)) > 0),
     product_conversation_id TEXT NOT NULL REFERENCES product_conversations(id) ON DELETE CASCADE,
-    source_transcript_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    source_transcript_id TEXT NOT NULL CHECK (length(trim(source_transcript_id)) > 0),
     source_message_id TEXT NOT NULL CHECK (length(trim(source_message_id)) > 0),
     source_tool_use_id TEXT NOT NULL CHECK (length(trim(source_tool_use_id)) > 0),
     create_request_fingerprint TEXT NOT NULL CHECK (length(create_request_fingerprint) = 64

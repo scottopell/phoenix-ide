@@ -1,5 +1,116 @@
 use super::*;
 
+#[tokio::test]
+async fn reminders_due_in_successor_preserve_provenance_and_allow_aggregate_delete() {
+    use phoenix_core::domain::{
+        db_schema::{InputOrigin, MessageContent},
+        sm_state::ConvState,
+    };
+    let db = Database::open_in_memory().await.unwrap();
+    let original = source(&db, "reminder-source").await;
+    let reminder = db
+        .create_reminder(&input(&original.id, "create", 20))
+        .await
+        .unwrap();
+    db.update_conversation_state(
+        &original.id,
+        &ConvState::ContextExhausted {
+            summary: "Continue".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let successor = match db.continue_conversation(&original.id).await.unwrap() {
+        crate::ContinueOutcome::Created(next) => next,
+        other @ (crate::ContinueOutcome::AlreadyContinued(_)
+        | crate::ContinueOutcome::ParentNotContextExhausted { .. }) => panic!("{other:?}"),
+    };
+    db.promote_due_reminders(time(30), 100).await.unwrap();
+    db.add_message_with_seq_and_origin(
+        &reminder.input_message_id(),
+        &successor.id,
+        2,
+        &MessageContent::user(reminder.text.as_str()),
+        None,
+        None,
+        &InputOrigin::ScheduledReminder {
+            reminder_id: reminder.id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let members = db
+        .product_conversation_member_ids(&original.id)
+        .await
+        .unwrap();
+    assert_eq!(members, vec![original.id.clone(), successor.id]);
+    let provenance: (String, String, String) = sqlx::query_as("SELECT source_transcript_id, source_message_id, source_tool_use_id FROM reminders WHERE id=?1")
+        .bind(reminder.id.as_str()).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(
+        provenance,
+        (original.id, "assistant-message".into(), "create".into())
+    );
+    db.delete_conversations_atomically(&members)
+        .await
+        .expect("complete aggregate remains deletable after delivery in a successor");
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM reminders")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
+    assert!(sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn reminders_source_identity_survives_source_transcript_removal() {
+    use phoenix_core::domain::sm_state::ConvState;
+    let db = Database::open_in_memory().await.unwrap();
+    let original = source(&db, "reminder-provenance").await;
+    let reminder = db
+        .create_reminder(&input(&original.id, "create", 20))
+        .await
+        .unwrap();
+    db.update_conversation_state(
+        &original.id,
+        &ConvState::ContextExhausted {
+            summary: "Continue".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let successor = match db.continue_conversation(&original.id).await.unwrap() {
+        crate::ContinueOutcome::Created(next) => next,
+        other @ (crate::ContinueOutcome::AlreadyContinued(_)
+        | crate::ContinueOutcome::ParentNotContextExhausted { .. }) => panic!("{other:?}"),
+    };
+    db.delete_conversation(&original.id).await.unwrap();
+    assert_eq!(
+        db.get_reminder(&successor.id, &reminder.id).await.unwrap(),
+        Some(reminder.clone())
+    );
+    let provenance: (String, String, String) = sqlx::query_as("SELECT source_transcript_id, source_message_id, source_tool_use_id FROM reminders WHERE id=?1")
+        .bind(reminder.id.as_str()).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(
+        provenance,
+        (original.id, "assistant-message".into(), "create".into())
+    );
+    db.delete_conversation(&successor.id).await.unwrap();
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM reminders")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
+    assert!(sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 fn time(value: i64) -> ReminderTimestampUs {
     ReminderTimestampUs::parse(value).unwrap()
 }
