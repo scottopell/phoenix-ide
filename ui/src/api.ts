@@ -1118,6 +1118,7 @@ export type PluginComponentStatus =
   | { name: string; status: 'skipped' | 'disabled'; reason: string };
 
 export interface PluginStatus {
+  entry_state: 'present' | 'absent' | 'unknown';
   name: string;
   version?: string;
   description?: string;
@@ -1141,6 +1142,7 @@ export interface PluginsListResponse {
 }
 
 export interface McpReloadFailure {
+  owners: Array<{ kind: 'user' } | { kind: 'plugin'; plugin: string }>;
   server: string;
   action: string;
   error: string;

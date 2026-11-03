@@ -165,12 +165,9 @@ pub fn resolved_environment(
                     let expanded = expand_placeholders(relative, plugin_root, data_dir);
                     (plugin_root, plugin_root.join(PathBuf::from(expanded)))
                 };
-            if !within_boundary(&candidate, anchor) {
-                return Err(format!(
-                    "{server}: cwd {value} resolves outside its anchor boundary"
-                ));
-            }
-            candidate
+            resolved_within_boundary(&candidate, anchor).ok_or_else(|| {
+                format!("{server}: cwd {value} resolves outside its anchor boundary")
+            })?
         }
     };
 
@@ -180,13 +177,9 @@ pub fn resolved_environment(
     // the root. Bare executable names keep their PATH lookup.
     let resolved_command = if command.starts_with("./") {
         let candidate = plugin_root.join(command.strip_prefix("./").unwrap_or(command));
-        if !within_boundary(&candidate, plugin_root) {
-            return Err(format!(
-                "{server}: command {command} resolves outside the plugin root"
-            ));
-        }
-        let checked = resolve_existing_ancestors(&candidate)
-            .ok_or_else(|| format!("{server}: command cannot be resolved"))?;
+        let checked = resolved_within_boundary(&candidate, plugin_root).ok_or_else(|| {
+            format!("{server}: command {command} resolves outside the plugin root")
+        })?;
         ResolvedCommand::PackagePath(checked)
     } else {
         ResolvedCommand::PathLookup(command.clone())
@@ -208,13 +201,13 @@ pub fn resolved_environment(
 /// Existing ancestors are resolved even when a descendant does not yet exist.
 #[must_use]
 pub fn within_boundary(path: &Path, boundary: &Path) -> bool {
-    match (
-        resolve_existing_ancestors(path),
-        resolve_existing_ancestors(boundary),
-    ) {
-        (Some(path), Some(boundary)) => path.starts_with(boundary),
-        _ => false,
-    }
+    resolved_within_boundary(path, boundary).is_some()
+}
+
+fn resolved_within_boundary(path: &Path, boundary: &Path) -> Option<PathBuf> {
+    let path = resolve_existing_ancestors(path)?;
+    let boundary = resolve_existing_ancestors(boundary)?;
+    path.starts_with(boundary).then_some(path)
 }
 
 fn resolve_existing_ancestors(path: &Path) -> Option<PathBuf> {
@@ -426,7 +419,10 @@ mod tests {
 
         let spec = stdio_spec(vec![], &[], Some("${PLUGIN_ROOT}/work"));
         let resolved = resolved_environment(&spec, &root, &data, &base_env()).unwrap();
-        assert_eq!(resolved.cwd, root.join("work"));
+        assert_eq!(
+            resolved.cwd,
+            std::fs::canonicalize(&root).unwrap().join("work")
+        );
     }
 
     /// Regression: a `./`-relative cwd crossing into the data directory was
@@ -455,7 +451,10 @@ mod tests {
 
         let spec = stdio_spec(vec![], &[], Some("${PLUGIN_DATA}/work"));
         let resolved = resolved_environment(&spec, &root, &data, &base_env()).unwrap();
-        assert_eq!(resolved.cwd, data.join("work"));
+        assert_eq!(
+            resolved.cwd,
+            std::fs::canonicalize(&data).unwrap().join("work")
+        );
     }
 
     /// Regression: a `./`-prefixed command escaping the root passed
@@ -508,6 +507,28 @@ mod tests {
 
         let ok = stdio_spec(vec![], &[], Some("./work"));
         assert!(resolved_environment(&ok, &root, &data, &base_env(),).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admitted_cwd_retains_its_resolved_target_when_a_link_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("plugin");
+        let real = root.join("real");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&real, root.join("work")).unwrap();
+        let spec = stdio_spec(vec![], &[], Some("./work"));
+        let resolved = resolved_environment(&spec, &root, &root.join("data"), &base_env()).unwrap();
+        assert_eq!(resolved.cwd, std::fs::canonicalize(&real).unwrap());
+        std::fs::remove_file(root.join("work")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("work")).unwrap();
+        assert!(within_boundary(&resolved.cwd, &root));
+        assert_ne!(
+            resolved.cwd,
+            std::fs::canonicalize(root.join("work")).unwrap()
+        );
     }
 
     #[cfg(unix)]

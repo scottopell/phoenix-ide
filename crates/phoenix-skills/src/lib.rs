@@ -456,6 +456,23 @@ impl SkillDiscovery {
         .collect()
     }
 
+    /// Global package admission excludes repository and projects-directory scans.
+    #[must_use]
+    pub fn global_plugin_catalog(
+        &self,
+        home: &Path,
+        builtin_dir: Option<&Path>,
+        plugins: &[phoenix_plugins::ParsedPlugin],
+    ) -> SkillCatalog {
+        discover_catalog_with_plugins(
+            None,
+            Some(home),
+            builtin_dir,
+            &self.activation.snapshot(),
+            plugins,
+        )
+    }
+
     /// Discover against an already scanned plugin set, retaining admission outcomes.
     #[must_use]
     pub fn catalog_with_plugins(
@@ -466,7 +483,7 @@ impl SkillDiscovery {
         plugins: &[phoenix_plugins::ParsedPlugin],
     ) -> SkillCatalog {
         discover_catalog_with_plugins(
-            working_dir,
+            Some(working_dir),
             Some(home),
             builtin_dir,
             &self.activation.snapshot(),
@@ -599,7 +616,7 @@ fn discover_all_skills_with_options(
     });
     let plugins = phoenix_plugins::scan_plugins_root(&phoenix_plugins::default_plugins_root(&home));
     discover_catalog_with_plugins(
-        working_dir,
+        Some(working_dir),
         home_override,
         builtin_dir,
         activation,
@@ -609,7 +626,7 @@ fn discover_all_skills_with_options(
 
 #[allow(clippy::too_many_lines)]
 fn discover_catalog_with_plugins(
-    working_dir: &Path,
+    working_dir: Option<&Path>,
     home_override: Option<&Path>,
     builtin_dir: Option<&Path>,
     activation: &phoenix_core::plugin_activation::PluginActivationSnapshot,
@@ -620,7 +637,7 @@ fn discover_catalog_with_plugins(
     let mut seen_paths: HashSet<PathBuf> = HashSet::new(); // canonical paths for symlink dedup
     let mut seen_content: HashSet<u64> = HashSet::new(); // content hash for copy dedup
     let mut scanned_dirs: HashSet<PathBuf> = HashSet::new(); // directories already scanned
-    let mut current = Some(working_dir.to_path_buf());
+    let mut current = working_dir.map(Path::to_path_buf);
 
     while let Some(dir) = current {
         for skill_subdir in SKILL_DIRS {
@@ -649,7 +666,7 @@ fn discover_catalog_with_plugins(
     // Scan immediate child directories of working_dir for skills.
     // Handles the "projects directory" case where CWD is a parent containing
     // multiple project subdirs, each with their own .claude/skills/.
-    if let Ok(children) = std::fs::read_dir(working_dir) {
+    if let Some(children) = working_dir.and_then(|path| std::fs::read_dir(path).ok()) {
         for child in children.flatten() {
             if !child.path().is_dir() {
                 continue;

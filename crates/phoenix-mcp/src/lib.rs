@@ -4426,6 +4426,35 @@ impl McpClientManager {
         self.reconcile_actor_configs(configs, &serial).await
     }
 
+    pub async fn has_plugin_binding(&self, name: &str) -> bool {
+        self.servers.read().await.values().any(|handle| {
+            let snapshot = handle.snapshot();
+            matches!(snapshot.config.source(), McpConfigSource::Plugin(plugin) if plugin == name)
+                || matches!(snapshot.recovery_target, RecoveryTarget::Reconfigure(config) if matches!(config.source(), McpConfigSource::Plugin(plugin) if plugin == name))
+        })
+    }
+
+    async fn reload_failure_owners(
+        &self,
+        name: &str,
+        desired: Option<&McpConfigSource>,
+    ) -> std::collections::BTreeSet<McpConfigSource> {
+        let mut owners: std::collections::BTreeSet<_> = desired.cloned().into_iter().collect();
+        if let Some(snapshot) = self
+            .servers
+            .read()
+            .await
+            .get(name)
+            .map(SupervisorHandle::snapshot)
+        {
+            owners.insert(snapshot.config.source().clone());
+            if let RecoveryTarget::Reconfigure(queued) = snapshot.recovery_target {
+                owners.insert(queued.source().clone());
+            }
+        }
+        owners
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn reconcile_actor_configs(
         &self,
@@ -4464,6 +4493,7 @@ impl McpClientManager {
                                 .await
                                 .insert(name.clone(), error.clone());
                             failed.push(McpReloadFailure {
+                                owners: self.reload_failure_owners(&name, None).await,
                                 server: name,
                                 action: "remove".to_owned(),
                                 error,
@@ -4481,6 +4511,7 @@ impl McpClientManager {
             if let Some(handle) = handle {
                 if let Err(error) = self.oauth.store().record_removal(&name).await {
                     failed.push(McpReloadFailure {
+                        owners: self.reload_failure_owners(&name, None).await,
                         server: name,
                         action: "remove".to_owned(),
                         error,
@@ -4495,6 +4526,7 @@ impl McpClientManager {
                     match result {
                         Ok(()) => removed.push(name),
                         Err(error) => failed.push(McpReloadFailure {
+                            owners: self.reload_failure_owners(&name, None).await,
                             server: name,
                             action: "remove".to_owned(),
                             error,
@@ -4531,6 +4563,7 @@ impl McpClientManager {
                         }
                         tracing::warn!(server = %name, %error, "MCP server removal failed; handle retained for teardown retry");
                         failed.push(McpReloadFailure {
+                            owners: self.reload_failure_owners(&name, None).await,
                             server: name,
                             action: "remove".to_string(),
                             error,
@@ -4544,6 +4577,7 @@ impl McpClientManager {
         let mut restarted = Vec::new();
         let mut unchanged = Vec::new();
         for (name, config) in desired {
+            let source = Some(config.source().clone());
             let gate = self.oauth.mutation_gate(&name);
             let mutations = gate.lock().await;
             if let Err(error) = self.oauth.store().cancel_removal(&name).await {
@@ -4554,6 +4588,7 @@ impl McpClientManager {
                         .insert(name.clone(), error.clone());
                 }
                 failed.push(McpReloadFailure {
+                    owners: self.reload_failure_owners(&name, source.as_ref()).await,
                     server: name,
                     action: "restart".to_owned(),
                     error,
@@ -4628,6 +4663,9 @@ impl McpClientManager {
                                 self.begin_actor_connect(name.clone(), old, handle).await
                             {
                                 failed.push(McpReloadFailure {
+                                    owners: self
+                                        .reload_failure_owners(&name, source.as_ref())
+                                        .await,
                                     server: name,
                                     action: "restart".to_owned(),
                                     error,
@@ -4645,6 +4683,7 @@ impl McpClientManager {
                         .await
                     {
                         failed.push(McpReloadFailure {
+                            owners: self.reload_failure_owners(&name, source.as_ref()).await,
                             server: name,
                             action: "restart".to_owned(),
                             error,
@@ -4670,6 +4709,7 @@ impl McpClientManager {
                 Ok(task) => task,
                 Err(error) => {
                     failed.push(McpReloadFailure {
+                        owners: self.reload_failure_owners(&name, source.as_ref()).await,
                         server: name,
                         action: "restart".to_string(),
                         error,
@@ -4690,6 +4730,7 @@ impl McpClientManager {
                     );
                     handle.fail(handle.snapshot().epoch, error.clone()).await;
                     failed.push(McpReloadFailure {
+                        owners: self.reload_failure_owners(&name, source.as_ref()).await,
                         server: name,
                         action: "restart".to_string(),
                         error,
@@ -4703,6 +4744,7 @@ impl McpClientManager {
                     | SupervisorState::Recovering
                     | SupervisorState::Failed
                     | SupervisorState::Removed => failed.push(McpReloadFailure {
+                        owners: self.reload_failure_owners(&name, source.as_ref()).await,
                         server: name,
                         action: "restart".to_string(),
                         error: snapshot
@@ -5127,6 +5169,7 @@ impl McpClientManager {
                 },
             };
             return Some(McpServerConfig::Http {
+                source: crate::McpConfigSource::User,
                 url: url.to_string(),
                 headers: string_map(cfg.get("headers")),
                 auth,
@@ -5151,6 +5194,7 @@ impl McpClientManager {
             .unwrap_or_default();
 
         Some(McpServerConfig::Stdio {
+            source: crate::McpConfigSource::User,
             command: command.into(),
             args,
             env: string_map(cfg.get("env"))
@@ -5466,6 +5510,7 @@ impl McpClientManager {
                     .and_then(|resolved| {
                         prepare_plugin_data_dir(plugins_root, &data_dir)?;
                         Ok(McpServerConfig::Stdio {
+                            source: McpConfigSource::Plugin(plugin.manifest.name.clone()),
                             command: resolved.command.into_spawn_command(),
                             args: resolved.args,
                             env: resolved.env.into_iter().collect(),
@@ -5475,7 +5520,15 @@ impl McpClientManager {
                     })
                 }
                 phoenix_plugins::ServerSpec::StreamableHttp { url, headers, .. } => {
+                    if headers
+                        .keys()
+                        .any(|name| name.eq_ignore_ascii_case("authorization"))
+                    {
+                        outcomes.push((spec.server().to_string(), Err("Authorization in plugin headers is unsupported; configure a static credential in user MCP configuration".into())));
+                        continue;
+                    }
                     Ok(McpServerConfig::Http {
+                        source: McpConfigSource::Plugin(plugin.manifest.name.clone()),
                         url: url.clone(),
                         headers: headers.clone().into_iter().collect(),
                         auth: HttpAuth::None,
@@ -5546,8 +5599,35 @@ pub struct McpReloadResult {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct McpReloadFailure {
     pub server: String,
+    pub owners: std::collections::BTreeSet<McpConfigSource>,
     pub action: String,
     pub error: String,
+}
+
+/// Configuration provenance captured with the execution configuration.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(tag = "kind", content = "plugin", rename_all = "snake_case")]
+pub enum McpConfigSource {
+    User,
+    Plugin(String),
+}
+
+impl McpReloadFailure {
+    #[must_use]
+    pub fn belongs_to_plugin(&self, name: &str) -> bool {
+        self.owners
+            .iter()
+            .any(|source| matches!(source, McpConfigSource::Plugin(plugin) if plugin == name))
+    }
+}
+
+impl McpServerConfig {
+    #[must_use]
+    pub fn source(&self) -> &McpConfigSource {
+        match self {
+            Self::Stdio { source, .. } | Self::Http { source, .. } => source,
+        }
+    }
 }
 
 /// Parsed MCP server configuration from a config file, tagged by transport
@@ -5556,6 +5636,7 @@ pub struct McpReloadFailure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpServerConfig {
     Stdio {
+        source: McpConfigSource,
         command: std::ffi::OsString,
         args: Vec<std::ffi::OsString>,
         env: HashMap<std::ffi::OsString, std::ffi::OsString>,
@@ -5567,6 +5648,7 @@ pub enum McpServerConfig {
         tool_call_timeout: Duration,
     },
     Http {
+        source: McpConfigSource,
         url: String,
         /// Generic per-request headers (org id, beta flag, ...) attached
         /// under ANY auth scheme; they do not imply auth and must not
@@ -6050,6 +6132,116 @@ mod tests {
             );
         }
 
+        #[tokio::test]
+        async fn reload_failures_keep_exact_config_ownership_without_prefix_inference() {
+            let temp = plugin_root();
+            let manager = McpClientManager::new();
+            let mut configs = Vec::new();
+            for (name, source) in [
+                ("a.foo", McpConfigSource::User),
+                ("a.b.api", McpConfigSource::Plugin("a.b".into())),
+                ("a.own", McpConfigSource::Plugin("a".into())),
+            ] {
+                let config = McpServerConfig::Stdio {
+                    source,
+                    command: temp.path().join("missing-executable").into_os_string(),
+                    args: vec![],
+                    env: HashMap::new(),
+                    cwd: None,
+                    tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
+                };
+                let handle = SupervisorHandle::connecting(config.clone());
+                handle
+                    .fail(handle.snapshot().epoch, "prior failure".into())
+                    .await;
+                manager.servers.write().await.insert(name.into(), handle);
+                configs.push((name.into(), config));
+            }
+            let result = manager.reload_from_configs(configs).await;
+            assert_eq!(result.failed.len(), 3);
+            let owned: Vec<_> = result
+                .failed
+                .iter()
+                .filter(|failure| failure.belongs_to_plugin("a"))
+                .map(|failure| failure.server.as_str())
+                .collect();
+            assert_eq!(owned, vec!["a.own"]);
+            assert!(result
+                .failed
+                .iter()
+                .all(|failure| !failure.owners.is_empty()));
+            let orphan = McpReloadFailure {
+                server: "a.orphan".into(),
+                owners: std::collections::BTreeSet::new(),
+                action: "remove".into(),
+                error: "cleanup failed".into(),
+            };
+            assert!(!orphan.belongs_to_plugin("a"));
+            let retained = manager
+                .servers
+                .read()
+                .await
+                .get("a.own")
+                .unwrap()
+                .snapshot()
+                .config;
+            assert!(manager.has_plugin_binding("a").await);
+            manager.servers.write().await.remove("a.own");
+            assert!(
+                !manager.has_plugin_binding("a").await,
+                "user and a.b prefixes must not imply an a binding"
+            );
+            manager.servers.write().await.insert(
+                "a.transition".into(),
+                SupervisorHandle::connecting(retained),
+            );
+            let transition = McpReloadFailure {
+                owners: manager
+                    .reload_failure_owners("a.transition", Some(&McpConfigSource::User))
+                    .await,
+                server: "a.transition".into(),
+                action: "restart".into(),
+                error: "handoff failed".into(),
+            };
+            assert!(
+                transition.belongs_to_plugin("a"),
+                "a failed user takeover must still attribute a retained plugin process"
+            );
+            assert!(transition.owners.contains(&McpConfigSource::User));
+        }
+
+        #[test]
+        fn unsupported_authorization_header_is_skipped_before_transport_admission() {
+            let root = plugin_root();
+            write(
+                &root.path().join("demo/plugin.json"),
+                &serde_json::json!({
+                    "$schema": phoenix_plugins::manifest::MANIFEST_SCHEMA_URL, "name": "demo"
+                })
+                .to_string(),
+            );
+            write(&root.path().join("demo/mcp.json"), &serde_json::json!({
+                "$schema": phoenix_plugins::mcp_config::MCP_SCHEMA_URL,
+                "mcpServers": {
+                    "auth": {"type": "streamable-http", "url": "https://example.com/mcp", "headers": {"aUtHoRiZaTiOn": "Bearer secret"}},
+                    "good": {"type": "streamable-http", "url": "https://example.com/mcp"}
+                }
+            }).to_string());
+            let package = phoenix_plugins::load_plugin(&root.path().join("demo")).unwrap();
+            let outcomes = McpClientManager::plugin_server_outcomes_with_user_config_keys(
+                &package,
+                root.path(),
+                &HashSet::new(),
+            );
+            assert!(outcomes.iter().any(|(name, outcome)| name == "auth"
+                && outcome.as_ref().is_err_and(
+                    |error| error.contains("Authorization") && !error.contains("secret")
+                )));
+            assert!(outcomes
+                .iter()
+                .any(|(name, outcome)| name == "good" && outcome.is_ok()));
+        }
+
         #[test]
         fn ambiguous_qualified_plugin_keys_have_one_deterministic_admission() {
             let root = plugin_root();
@@ -6390,6 +6582,7 @@ mod tests {
         assert_eq!(
             config,
             McpServerConfig::Stdio {
+                source: crate::McpConfigSource::User,
                 command: "uvx".into(),
                 args: vec!["server".into()],
                 env: HashMap::from([("KEY".into(), "v".into())]),
@@ -6438,6 +6631,7 @@ mod tests {
         assert_eq!(
             config,
             McpServerConfig::Http {
+                source: crate::McpConfigSource::User,
                 url: "https://example.com/mcp".to_string(),
                 headers: HashMap::from([("X-Org".to_string(), "acme".to_string())]),
                 auth: HttpAuth::None,
@@ -6456,6 +6650,7 @@ mod tests {
         assert_eq!(
             McpClientManager::classify_config_entry("s", &bearer),
             Some(McpServerConfig::Http {
+                source: crate::McpConfigSource::User,
                 url: "https://example.com/mcp".to_string(),
                 headers: HashMap::new(),
                 auth: HttpAuth::Static(StaticCred::Bearer("tok".to_string())),
@@ -6471,6 +6666,7 @@ mod tests {
         assert_eq!(
             McpClientManager::classify_config_entry("s", &auth_headers),
             Some(McpServerConfig::Http {
+                source: crate::McpConfigSource::User,
                 url: "https://example.com/mcp".to_string(),
                 headers: HashMap::new(),
                 auth: HttpAuth::Static(StaticCred::Headers(HashMap::from([(
@@ -6501,6 +6697,7 @@ mod tests {
             assert_eq!(
                 McpClientManager::classify_config_entry("s", &cfg),
                 Some(McpServerConfig::Http {
+                    source: crate::McpConfigSource::User,
                     url: "https://example.com/mcp".to_string(),
                     headers: HashMap::new(),
                     auth: HttpAuth::OAuth(OAuthConfig::default()),
@@ -6521,6 +6718,7 @@ mod tests {
         assert_eq!(
             McpClientManager::classify_config_entry("slack", &preconfigured),
             Some(McpServerConfig::Http {
+                source: crate::McpConfigSource::User,
                 url: "https://example.com/mcp".to_string(),
                 headers: HashMap::new(),
                 auth: HttpAuth::OAuth(OAuthConfig {
@@ -6546,6 +6744,7 @@ mod tests {
         assert_eq!(
             McpClientManager::classify_config_entry("slack", &configured_scopes),
             Some(McpServerConfig::Http {
+                source: crate::McpConfigSource::User,
                 url: "https://mcp.slack.com/mcp".to_string(),
                 headers: HashMap::new(),
                 auth: HttpAuth::OAuth(OAuthConfig {
@@ -6571,6 +6770,7 @@ mod tests {
         assert_eq!(
             McpClientManager::classify_config_entry("dynamic", &dynamic_with_scopes),
             Some(McpServerConfig::Http {
+                source: crate::McpConfigSource::User,
                 url: "https://example.com/mcp".to_string(),
                 headers: HashMap::new(),
                 auth: HttpAuth::OAuth(OAuthConfig {
@@ -6591,6 +6791,7 @@ mod tests {
         assert_eq!(
             McpClientManager::classify_config_entry("s", &static_wins),
             Some(McpServerConfig::Http {
+                source: crate::McpConfigSource::User,
                 url: "https://example.com/mcp".to_string(),
                 headers: HashMap::new(),
                 auth: HttpAuth::Static(StaticCred::Bearer("tok".to_string())),
@@ -6818,6 +7019,7 @@ mod tests {
                 }),
                 tools: Arc::new(std::sync::RwLock::new(Vec::new())),
                 config: McpServerConfig::Stdio {
+                    source: crate::McpConfigSource::User,
                     command: "unused".into(),
                     args: Vec::new(),
                     env: HashMap::new(),
@@ -6928,6 +7130,7 @@ mod tests {
         fake_server_with_config(
             script,
             McpServerConfig::Stdio {
+                source: crate::McpConfigSource::User,
                 command: "unused".into(),
                 args: Vec::new(),
                 env: HashMap::new(),
@@ -7130,6 +7333,7 @@ mod tests {
                     60_000,
                 )],
                 McpServerConfig::Stdio {
+                    source: crate::McpConfigSource::User,
                     command: "unused".into(),
                     args: Vec::new(),
                     env: HashMap::new(),
@@ -7243,6 +7447,7 @@ mod tests {
         let (server, requests, _) = fake_server_with_config(
             vec![exchange(Ok(serde_json::json!({"content": []})))],
             McpServerConfig::Stdio {
+                source: crate::McpConfigSource::User,
                 command: "unused".into(),
                 args: Vec::new(),
                 env: HashMap::new(),
@@ -7262,6 +7467,7 @@ mod tests {
     #[test]
     fn timeout_change_participates_in_reload_comparison() {
         let base = McpServerConfig::Stdio {
+            source: crate::McpConfigSource::User,
             command: "unused".into(),
             args: Vec::new(),
             env: HashMap::new(),
@@ -7654,6 +7860,7 @@ mod tests {
 
     fn http_none_config(url: &str) -> McpServerConfig {
         McpServerConfig::Http {
+            source: crate::McpConfigSource::User,
             url: url.to_string(),
             headers: HashMap::new(),
             auth: HttpAuth::None,
@@ -7865,6 +8072,7 @@ mod tests {
     #[tokio::test]
     async fn http_recovery_policy_covers_timeout_and_session_expiry() {
         let http_config = McpServerConfig::Http {
+            source: crate::McpConfigSource::User,
             url: "https://example.com/mcp".to_string(),
             headers: HashMap::new(),
             auth: HttpAuth::None,
@@ -7900,6 +8108,7 @@ mod tests {
 
     fn stdio_test_config(command: &str) -> McpServerConfig {
         McpServerConfig::Stdio {
+            source: crate::McpConfigSource::User,
             command: command.into(),
             args: Vec::new(),
             env: HashMap::new(),
@@ -7917,6 +8126,7 @@ mod tests {
             let (serving, _, _) = fake_server_with_config(
                 vec![serving_exchange],
                 McpServerConfig::Http {
+                    source: crate::McpConfigSource::User,
                     url: "http://127.0.0.1:1/mcp".to_string(),
                     headers: HashMap::new(),
                     auth: HttpAuth::None,
@@ -8104,6 +8314,7 @@ for line in sys.stdin:
         env_value: &str,
     ) -> McpServerConfig {
         McpServerConfig::Stdio {
+            source: crate::McpConfigSource::User,
             command: std::env::var_os("PYTHON").unwrap_or_else(|| "python3".into()),
             args: vec![
                 script.as_os_str().to_owned(),
@@ -8492,6 +8703,7 @@ for line in sys.stdin:
 
         // Port 1 refuses connections, so the HTTP handshake fails fast.
         let changed = McpServerConfig::Http {
+            source: crate::McpConfigSource::User,
             url: "http://127.0.0.1:1/mcp".to_string(),
             headers: HashMap::new(),
             auth: HttpAuth::None,

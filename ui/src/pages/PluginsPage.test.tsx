@@ -30,7 +30,7 @@ describe('PluginsPage', () => {
   beforeEach(() => vi.resetAllMocks());
 
   it('enables and disables a retained missing identity while keeping purge available', async () => {
-    const missing: PluginStatus = { name: 'retained', enabled: false, provenance: 'managed', missing: true };
+    const missing: PluginStatus = { name: 'retained', enabled: false, provenance: 'managed', missing: true, entry_state: 'absent' };
     apiMock.getPlugins.mockResolvedValueOnce(listResponse([missing]))
       .mockResolvedValueOnce(listResponse([{ ...missing, enabled: true }]))
       .mockResolvedValueOnce(listResponse([missing]));
@@ -44,11 +44,21 @@ describe('PluginsPage', () => {
     expect(screen.getByRole('button', { name: 'Purge data' })).toBeInTheDocument();
   });
 
+  it('shows a dangling package root as missing but offers entry removal rather than purge', async () => {
+    apiMock.getPlugins.mockResolvedValue(listResponse([{ name: 'dangling', enabled: false,
+      provenance: 'managed', missing: true, entry_state: 'present' }]));
+    render(<PluginsPage />);
+    await screen.findByText('dangling');
+    expect(screen.getByRole('button', { name: 'Remove' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Purge data' })).not.toBeInTheDocument();
+  });
+
   it('renders installed plugins with status, provenance, and counts', async () => {
     apiMock.getPlugins.mockResolvedValue(
       listResponse([
         {
           name: 'devtools',
+          entry_state: 'present',
           version: '1.2.0',
           description: 'Developer tools',
           enabled: true,
@@ -57,7 +67,7 @@ describe('PluginsPage', () => {
           mcp_servers: [{ name: 'validator', status: 'loaded' }],
         },
         {
-          name: 'muted',
+          entry_state: 'present', name: 'muted',
           enabled: false,
           provenance: 'unmanaged',
         },
@@ -65,7 +75,7 @@ describe('PluginsPage', () => {
           name: 'vanished',
           enabled: false,
           provenance: 'managed',
-          missing: true,
+          missing: true, entry_state: 'absent',
         },
       ]),
     );
@@ -87,7 +97,7 @@ describe('PluginsPage', () => {
 
   it('counts only admitted components and shows skip and disable reasons', async () => {
     apiMock.getPlugins.mockResolvedValue(listResponse([{
-      name: 'broken', enabled: true, provenance: 'unmanaged',
+      entry_state: 'present', name: 'broken', enabled: true, provenance: 'unmanaged',
       skills: [
         { name: 'ok', status: 'loaded' },
         { name: 'bad', status: 'skipped', reason: 'invalid SKILL.md frontmatter' },
@@ -108,7 +118,7 @@ describe('PluginsPage', () => {
 
   it('shows a present but unloadable installation as an error', async () => {
     apiMock.getPlugins.mockResolvedValue(listResponse([{
-      name: 'malformed', enabled: true, provenance: 'managed', missing: false,
+      name: 'malformed', enabled: true, provenance: 'managed', missing: false, entry_state: 'present',
       load_error: 'invalid plugin manifest',
     }]));
     render(<PluginsPage />);

@@ -1395,6 +1395,7 @@ mod tests {
 
     fn http_config(url: &str, auth: HttpAuth) -> McpServerConfig {
         McpServerConfig::Http {
+            source: crate::McpConfigSource::User,
             url: url.to_string(),
             headers: HashMap::from([("x-org".to_string(), "acme".to_string())]),
             auth,
@@ -7667,6 +7668,7 @@ mod tests {
             .await
             .unwrap();
         let preconfigured = |client_id: &str| McpServerConfig::Http {
+            source: crate::McpConfigSource::User,
             url: server.url.clone(),
             headers: HashMap::new(),
             auth: HttpAuth::OAuth(crate::OAuthConfig {
@@ -7740,6 +7742,7 @@ mod tests {
             .await
             .unwrap();
         let configured = |scope: &str| McpServerConfig::Http {
+            source: crate::McpConfigSource::User,
             url: server.url.clone(),
             headers: HashMap::new(),
             auth: HttpAuth::OAuth(crate::OAuthConfig {
@@ -7867,6 +7870,7 @@ mod tests {
         server.push_responses(vec![delete_ack()]);
         server.push_responses(handshake_responses("sess-2"));
         let repointed = McpServerConfig::Http {
+            source: crate::McpConfigSource::User,
             url: format!("{}/v2", server.url),
             headers: HashMap::from([("x-org".to_string(), "acme".to_string())]),
             auth: HttpAuth::None,
@@ -7957,6 +7961,7 @@ mod tests {
         // (ReloadCancelsPendingAuth).
         server.push_responses(vec![unauthorized(&server)]);
         let changed = McpServerConfig::Http {
+            source: crate::McpConfigSource::User,
             url: server.url.clone(),
             headers: HashMap::from([("x-org".to_string(), "other".to_string())]),
             auth: HttpAuth::None,

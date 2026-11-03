@@ -50,7 +50,7 @@ describe('McpStatusPanel', () => {
     fireEvent.click(screen.getByRole('button', { name: /^MCP / }));
     reloadMcp.mockResolvedValue(deferred
       ? { ...emptyReload, pending_removals: ['remote'], unchanged: survivors.map(s => s.name) }
-      : { ...emptyReload, failed: [{ server: 'remote', action: 'remove', error: 'transient refresh' }] });
+      : { ...emptyReload, failed: [{ server: 'remote', owners: [{ kind: 'user' }], action: 'remove', error: 'transient refresh' }] });
     getMcpStatus.mockResolvedValue([...survivors, { ...healthy, name: 'remote', state: 'removing' }]);
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Reload MCP servers' })); });
     if (deferred) expect(showToast).toHaveBeenCalledWith(expect.stringContaining('removal pending'), 3000);

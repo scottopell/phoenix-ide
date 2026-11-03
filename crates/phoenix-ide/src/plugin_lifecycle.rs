@@ -70,15 +70,29 @@ enum Reconciliation<'a> {
 }
 
 impl Reconciliation<'_> {
+    async fn retire(&self, name: &str) -> Result<()> {
+        self.apply(name).await?;
+        let pending = match self {
+            Self::Live(manager) => manager.has_plugin_binding(name).await,
+            #[cfg(test)]
+            Self::Offline | Self::Refuse | Self::SwapEntry(..) | Self::RestoreEntry(..) => false,
+        };
+        if pending {
+            return Err(LifecycleError::internal(
+                &"plugin retirement is still pending; files and data retained",
+            ));
+        }
+        Ok(())
+    }
+
     async fn apply(&self, name: &str) -> Result<()> {
         match self {
             Self::Live(manager) => {
                 let result = manager.reload().await;
-                let prefix = format!("{name}.");
                 let errors: Vec<_> = result
                     .failed
                     .into_iter()
-                    .filter(|failure| failure.server.starts_with(&prefix))
+                    .filter(|failure| failure.belongs_to_plugin(name))
                     .map(|failure| format!("{}: {}", failure.server, failure.error))
                     .collect();
                 if errors.is_empty() {
@@ -199,7 +213,7 @@ impl PluginLifecycle {
                 crate::plugin_activation::refresh(db, activation)
                     .await
                     .map_err(|error| LifecycleError::internal(&error))?;
-                reconciliation.apply(name.0).await?;
+                reconciliation.retire(name.0).await?;
                 observed.remove(name.0)?;
                 name.0.to_owned()
             }
@@ -225,7 +239,7 @@ impl PluginLifecycle {
                 crate::plugin_activation::refresh(db, activation)
                     .await
                     .map_err(|error| LifecycleError::internal(&error))?;
-                reconciliation.apply(name.0).await?;
+                reconciliation.retire(name.0).await?;
                 verify_purge_absence(root, entry, name.0)?;
                 if let Some(data) = owned_data_dir(root, &name)? {
                     match std::fs::remove_dir_all(&data) {

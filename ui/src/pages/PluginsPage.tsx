@@ -169,7 +169,7 @@ export function PluginsPage() {
                 >
                   {plugin.enabled ? 'Disable' : 'Enable'}
                 </button>
-                {plugin.missing ? (
+                {plugin.entry_state === 'absent' ? (
                   <button
                     type="button"
                     onClick={() => void purge(plugin)}
@@ -177,7 +177,7 @@ export function PluginsPage() {
                   >
                     Purge data
                   </button>
-                ) : (
+                ) : plugin.entry_state === 'present' ? (
                   <>
                     {confirmingRemove === plugin.name ? (
                       <>
@@ -200,7 +200,7 @@ export function PluginsPage() {
                       </button>
                     )}
                   </>
-                )}
+                ) : null}
               </div>
             </li>
           ))}

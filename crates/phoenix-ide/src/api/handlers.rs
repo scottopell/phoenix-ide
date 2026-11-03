@@ -9369,6 +9369,24 @@ fn plugin_list_entries_with_home(
     plugin_list_entries_with_user_config_keys(plugins, registry, home, &user_config_keys)
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PluginEntryState {
+    Present,
+    Absent,
+    Unknown,
+}
+
+fn plugin_entry_state(path: Option<&std::path::Path>) -> PluginEntryState {
+    match path.map(std::fs::symlink_metadata) {
+        Some(Ok(_)) => PluginEntryState::Present,
+        Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            PluginEntryState::Absent
+        }
+        Some(Err(_)) | None => PluginEntryState::Unknown,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn plugin_list_entries_with_user_config_keys(
     plugins: Vec<phoenix_plugins::ParsedPlugin>,
@@ -9385,8 +9403,7 @@ fn plugin_list_entries_with_user_config_keys(
             .collect(),
     );
     let builtin_dir = phoenix_skills::builtin::default_extract_dir();
-    let mut catalog = phoenix_skills::SkillDiscovery::new(activation).catalog_with_plugins(
-        home,
+    let mut catalog = phoenix_skills::SkillDiscovery::new(activation).global_plugin_catalog(
         home,
         builtin_dir.as_deref(),
         &plugins,
@@ -9462,6 +9479,7 @@ fn plugin_list_entries_with_user_config_keys(
             "enabled": enabled,
             "provenance": if managed { "managed" } else { "unmanaged" },
             "missing": false,
+            "entry_state": PluginEntryState::Present,
             "skills": skills,
             "skills_disabled_reason": plugin.skills_disabled_reason,
             "mcp_servers": mcp_servers,
@@ -9476,9 +9494,10 @@ fn plugin_list_entries_with_user_config_keys(
                 "enabled": record.enabled,
                 "provenance": if record.provenance == phoenix_db::PluginProvenance::Managed { "managed" } else { "unmanaged" },
                 "missing": record.install_entry.as_deref().is_some_and(|entry| {
-                    std::fs::symlink_metadata(entry)
+                    std::fs::metadata(entry)
                         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
                 }),
+                "entry_state": plugin_entry_state(record.install_entry.as_deref()),
                 "root": record.install_entry.as_ref().map(|path| path.to_string_lossy()),
                 "load_error": match record.install_entry.as_deref() {
                     Some(entry) => match phoenix_plugins::load_plugin(std::path::Path::new(entry)) {
@@ -22305,6 +22324,50 @@ mod plugin_api_tests {
             assert_eq!(args[args.len() - 3], "--");
             assert_eq!(args[args.len() - 2], source);
         }
+    }
+
+    #[test]
+    fn global_plugin_status_ignores_child_project_skill_deduplication() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".agents/plugins/demo");
+        write(
+            &root.join("plugin.json"),
+            &serde_json::json!({
+                "$schema": phoenix_plugins::manifest::MANIFEST_SCHEMA_URL, "name": "demo"
+            })
+            .to_string(),
+        );
+        let content = "---\nname: deploy\ndescription: Project-context independence.\n---\nUnique package action.\n";
+        write(&root.join("skills/deploy/SKILL.md"), content);
+        write(
+            &home.path().join("project/.agents/skills/deploy/SKILL.md"),
+            content,
+        );
+        let entries = super::plugin_list_entries_with_user_config_keys(
+            vec![phoenix_plugins::load_plugin(&root).unwrap()],
+            &HashMap::new(),
+            home.path(),
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(entries[0]["skills"][0]["status"], "loaded");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_installation_entry_reports_missing_target_and_present_entry() {
+        let home = tempfile::tempdir().unwrap();
+        let entry = home.path().join("demo");
+        std::os::unix::fs::symlink(home.path().join("missing-target"), &entry).unwrap();
+        let mut row = record("demo", true, false);
+        row.install_entry = Some(entry);
+        let entries = super::plugin_list_entries_with_user_config_keys(
+            vec![],
+            &HashMap::from([("demo".into(), row)]),
+            home.path(),
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(entries[0]["missing"], true);
+        assert_eq!(entries[0]["entry_state"], "present");
     }
 
     #[test]
