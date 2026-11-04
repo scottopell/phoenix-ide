@@ -27444,7 +27444,7 @@ mod work_subagent_cwd_guard_tests {
         for (mode, cwd) in [
             (Some(SubAgentMode::Work), None),
             (None, Some("/tmp".into())),
-            (None, Some("".into())),
+            (None, Some(String::new())),
         ] {
             let (spawn_tx, mut spawn_rx) = mpsc::channel(1);
             let (cancel_tx, _) = mpsc::channel(1);
