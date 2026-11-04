@@ -9761,9 +9761,11 @@ where
             explore_bash,
         );
         let mut system_prompt = if is_coordinator {
+            let authority = self.storage.coordinator_authority().await?;
             crate::system_prompt::build_coordinator_system_prompt(
                 llm_language,
                 tool_executor.coordinator_skill_catalog().as_ref(),
+                &authority,
             )
         } else {
             let turn_context = self.ordinary_turn_context.get_or_insert_with(|| {
@@ -14495,10 +14497,211 @@ mod dispatch_context_budget_tests {
     use crate::runtime::traits::MessageStore;
     use crate::state_machine::ConvContext;
     use crate::tools::BrowserSessionManager;
+    use phoenix_core::llm_language::LlmLanguage;
     use phoenix_llm::{ContentBlock, LlmResponse, ModelRegistry, Usage};
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
+
+    type AuthorityRuntime =
+        ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>;
+
+    fn authority_runtime(
+        id: &str,
+        cwd: &Path,
+        storage: Arc<InMemoryStorage>,
+        llm: Arc<MockLlmClient>,
+        coordinator: bool,
+        sub_agent: bool,
+    ) -> AuthorityRuntime {
+        let mut context = ConvContext::new(id, cwd.to_path_buf(), "test-model", 200_000, 16_384);
+        context.is_coordinator = coordinator;
+        context.is_sub_agent = sub_agent;
+        let (event_tx, event_rx) = mpsc::channel(8);
+        ConversationRuntime::new(
+            context,
+            ConvState::LlmRequesting { attempt: 1 },
+            storage,
+            llm,
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            SseBroadcaster::new(16, 0),
+        )
+    }
+
+    async fn dispatch_authority_request(runtime: &mut AuthorityRuntime, llm: &MockLlmClient) {
+        llm.queue_response(LlmResponse {
+            provider_replay: None,
+            content: vec![ContentBlock::text("done")],
+            end_turn: true,
+            usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+        runtime.execute_effect(Effect::RequestLlm).await.unwrap();
+        runtime.llm_task_handle.take().unwrap().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn coordinator_authority_refreshes_each_dispatch_and_successor_without_restart() {
+        use phoenix_core::domain::coordinator_authority::CoordinatorAuthority;
+
+        let cwd = TempDir::new().unwrap();
+        let storage = Arc::new(InMemoryStorage::new());
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        let mut runtime = authority_runtime(
+            "authority-current",
+            cwd.path(),
+            storage.clone(),
+            llm.clone(),
+            true,
+            false,
+        );
+        storage
+            .add_message(
+                "initial",
+                "authority-current",
+                &MessageContent::user("Work within scope"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let first = "  User allows unused cache cleanup.\n\n";
+        let replacement = "User allows unused caches; preserve active artifacts. 🐦\n";
+        for text in ["", first, first, replacement, ""] {
+            let authority = CoordinatorAuthority::try_from(text.to_owned()).unwrap();
+            storage.set_coordinator_authority(Ok(authority.clone()));
+            dispatch_authority_request(&mut runtime, &llm).await;
+            let requests = llm.recorded_requests();
+            let request = requests.last().unwrap();
+            assert_eq!(request.system.len(), 1);
+            assert_eq!(
+                request.system[0].text,
+                crate::system_prompt::build_coordinator_system_prompt(
+                    LlmLanguage::default(),
+                    None,
+                    &authority
+                )
+            );
+            assert_eq!(request.cache_key.as_str(), "authority-current");
+        }
+        let requests = llm.recorded_requests();
+        assert_eq!(requests[0].system[0].text, requests[4].system[0].text);
+        assert_eq!(requests[1].system[0].text, requests[2].system[0].text);
+        assert_ne!(requests[2].system[0].text, requests[3].system[0].text);
+        storage.set_coordinator_authority(Err("Authority read failed after prior dispatch".into()));
+        assert!(runtime.execute_effect(Effect::RequestLlm).await.is_err());
+        assert_eq!(llm.recorded_requests().len(), 5);
+        assert!(runtime.llm_task_handle.is_none());
+
+        storage
+            .set_coordinator_authority(Ok(
+                CoordinatorAuthority::try_from(replacement.to_owned()).unwrap()
+            ));
+        let mut successor = authority_runtime(
+            "authority-successor",
+            cwd.path(),
+            storage.clone(),
+            llm.clone(),
+            true,
+            false,
+        );
+        storage
+            .add_message(
+                "handoff",
+                "authority-successor",
+                &MessageContent::user("Continue commissioned work"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let (successor_context, _) = successor.prepare_successor_overhead().await.unwrap();
+        assert_eq!(successor_context, requests[3].system[0].text);
+        let newest =
+            CoordinatorAuthority::try_from("Newly approved successor scope.\n".to_owned()).unwrap();
+        storage.set_coordinator_authority(Ok(newest.clone()));
+        dispatch_authority_request(&mut successor, &llm).await;
+        let requests = llm.recorded_requests();
+        assert_eq!(
+            requests.last().unwrap().system[0].text,
+            crate::system_prompt::build_coordinator_system_prompt(
+                LlmLanguage::default(),
+                None,
+                &newest
+            )
+        );
+        assert_ne!(requests.last().unwrap().system[0].text, successor_context);
+        assert_eq!(
+            requests.last().unwrap().cache_key.as_str(),
+            "authority-successor"
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_authority_read_failure_prevents_dispatch_but_ordinary_contexts_do_not_read_it(
+    ) {
+        let cwd = TempDir::new().unwrap();
+        let storage = Arc::new(InMemoryStorage::new());
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        storage.set_coordinator_authority(Err("Authority storage unavailable".into()));
+        let mut coordinator = authority_runtime(
+            "authority-failure",
+            cwd.path(),
+            storage.clone(),
+            llm.clone(),
+            true,
+            false,
+        );
+        storage
+            .add_message(
+                "request",
+                "authority-failure",
+                &MessageContent::user("Continue"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let error = coordinator
+            .execute_effect(Effect::RequestLlm)
+            .await
+            .unwrap_err();
+        assert!(error.contains("Authority storage unavailable"));
+        assert!(llm.recorded_requests().is_empty());
+        assert!(coordinator.llm_task_handle.is_none());
+        assert!(coordinator.prepare_successor_overhead().await.is_err());
+
+        for sub_agent in [false, true] {
+            let mut ordinary = authority_runtime(
+                "ordinary",
+                cwd.path(),
+                storage.clone(),
+                llm.clone(),
+                false,
+                sub_agent,
+            );
+            let (prompt, _) = ordinary.prepare_ordinary_overhead().await.unwrap();
+            assert!(!prompt.contains("Current Coordinator Authority"));
+            storage.set_coordinator_authority(Ok(
+                phoenix_core::domain::coordinator_authority::CoordinatorAuthority::try_from(
+                    "UNIQUE_SAVED_STANDING_GRANT".to_owned(),
+                )
+                .unwrap(),
+            ));
+            let (prompt, _) = ordinary.prepare_successor_overhead().await.unwrap();
+            assert!(!prompt.contains("UNIQUE_SAVED_STANDING_GRANT"));
+            assert!(!prompt.contains("Current Coordinator Authority"));
+            storage.set_coordinator_authority(Err("Authority storage unavailable".into()));
+        }
+    }
 
     #[test]
     fn provider_context_attributes_internal_sender_without_changing_user_role() {
@@ -14952,6 +15155,7 @@ mod dispatch_context_budget_tests {
         let expected = crate::system_prompt::build_coordinator_system_prompt(
             crate::llm_language::LlmLanguage::default(),
             None,
+            &Default::default(),
         );
         for request in &requests {
             assert_eq!(request.system.len(), 1);

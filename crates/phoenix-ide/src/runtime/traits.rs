@@ -121,6 +121,10 @@ pub struct AuthoritativeUserMessageAdoptionInput {
 /// Storage for conversation messages
 #[async_trait]
 pub trait MessageStore: Send + Sync {
+    async fn coordinator_authority(
+        &self,
+    ) -> Result<phoenix_core::domain::coordinator_authority::CoordinatorAuthority, String>;
+
     async fn save_continuation_handoff_candidate(
         &self,
         candidate: &crate::db::ContinuationHandoffCandidate,
@@ -825,6 +829,12 @@ impl<T: SvgArtifactRepository + ?Sized> SvgArtifactRepository for Arc<T> {
 
 #[async_trait]
 impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
+    async fn coordinator_authority(
+        &self,
+    ) -> Result<phoenix_core::domain::coordinator_authority::CoordinatorAuthority, String> {
+        (**self).coordinator_authority().await
+    }
+
     async fn save_continuation_handoff_candidate(
         &self,
         candidate: &crate::db::ContinuationHandoffCandidate,
@@ -1665,6 +1675,15 @@ fn direct_turn_terminal_command(
 
 #[async_trait]
 impl MessageStore for DatabaseStorage {
+    async fn coordinator_authority(
+        &self,
+    ) -> Result<phoenix_core::domain::coordinator_authority::CoordinatorAuthority, String> {
+        self.db
+            .coordinator_authority()
+            .await
+            .map_err(|error| format!("Failed to read current Coordinator Authority: {error}"))
+    }
+
     async fn save_continuation_handoff_candidate(
         &self,
         candidate: &crate::db::ContinuationHandoffCandidate,
