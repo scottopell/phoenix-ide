@@ -1051,6 +1051,143 @@ def _user_message_images(message: dict) -> list[dict]:
 # ----------------------- scenarios -----------------------
 
 
+def scenario_reminders(_base_url: str) -> None:
+    """Real native registration, restart recovery, management and ordinary input."""
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    with tempfile.TemporaryDirectory(prefix="phoenix-reminders-") as directory:
+        root = Path(directory)
+        env = _server_env(root)
+        proc, base_url, log_path, log_file = _start_server_with_retries(env, root)
+
+        def stop():
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+            log_file.close()
+
+        def reminders(conv_id):
+            response = httpx.get(f"{base_url}/api/conversations/{conv_id}/reminders", timeout=10)
+            response.raise_for_status()
+            return response.json()
+
+        def mutate(conv_id, reminder, operation, **extra):
+            return httpx.post(
+                f"{base_url}/api/conversations/{conv_id}/reminders/{reminder['id']}/{operation}",
+                json={"expected_revision": reminder['revision'], **extra}, timeout=10,
+            )
+
+        def assert_one_input(conv_id, reminder):
+            expected_id = f"reminder:{reminder['id']}:{reminder['revision']}"
+            data = _get_conv(base_url, conv_id)
+            inputs = [m for m in _user_messages(data['messages'])
+                      if m.get('origin', {}).get('kind') == 'scheduled_reminder']
+            assert len(inputs) == 1, inputs
+            assert inputs[0]['message_id'] == f"{conv_id}:{expected_id}", inputs
+            assert inputs[0]['origin']['reminder_id'] == reminder['id'], inputs
+            assert inputs[0]['content']['text'] == reminder['text'], inputs
+            assert _count_tool_use(data['messages'], 'reminders') == 1
+            with sqlite3.connect(f"file:{env['PHOENIX_DB_PATH']}?mode=ro", uri=True) as db:
+                assert db.execute(
+                    "SELECT COUNT(*) FROM durable_turns WHERE origin_reminder_id = ?",
+                    (reminder['id'],),
+                ).fetchone()[0] == 1
+
+        try:
+            conv = _new_conv(base_url, '[[scenario:reminder]] Save my Safari reminder.')
+            conv_id = conv['id']
+            initial = _poll_to_idle_with_messages(
+                base_url, conv_id, lambda m: _has_tool_use(m, 'reminders')
+                and any(x.get('message_type') == 'tool' for x in m),
+                'native reminder receipt', timeout=SCENARIO_TIMEOUT_SECONDS,
+            )
+            upcoming, = reminders(conv_id)
+            assert upcoming['state'] == {'kind': 'scheduled'}, upcoming
+            assert upcoming['revision'] == 1 and upcoming['timezone'] == 'UTC'
+            results = [m['content'] for m in initial['messages'] if m.get('message_type') == 'tool']
+            result, = [r for r in results if r['tool_use_id'] == 'mock-reminder-create']
+            assert result['is_error'] is False, result
+            receipt = json.loads(result['content'])
+            assert receipt['id'] == upcoming['id'] and receipt['text'] == upcoming['text'], receipt
+            assert receipt['timezone'] == 'UTC' and receipt['revision'] == 1, receipt
+            receipt_time = datetime.fromisoformat(receipt['scheduled_at'])
+            epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            assert (receipt_time - epoch) // timedelta(microseconds=1) == upcoming['due_at_us'], receipt
+            assert 'Closed-app phone alerts are unavailable' in receipt['notification_capability'], receipt
+            with sqlite3.connect(f"file:{env['PHOENIX_DB_PATH']}?mode=ro", uri=True) as db:
+                source = db.execute(
+                    "SELECT source_transcript_id, source_message_id, source_tool_use_id FROM reminders WHERE id = ?",
+                    (upcoming['id'],),
+                ).fetchone()
+            assert source[0] == conv_id and source[1] and source[2] == 'mock-reminder-create', source
+
+            # The accepted, not-yet-due schedule survives actual process teardown.
+            stop()
+            proc, base_url, log_path, log_file = _start_server_with_retries(env, root)
+            assert reminders(conv_id) == [upcoming]
+
+            changed = mutate(conv_id, upcoming, 'reschedule', when={'kind': 'after', 'seconds': 3600})
+            changed.raise_for_status()
+            revised = changed.json()['reminder']
+            assert revised['revision'] == 2 and revised['due_at_us'] != upcoming['due_at_us'], revised
+            occurrence_id = f"reminder:{revised['id']}:{revised['revision'] + 1}"
+            for message_id in [occurrence_id, f"{conv_id}:{occurrence_id}"]:
+                reserved = httpx.post(
+                    f"{base_url}/api/conversations/{conv_id}/chat",
+                    json={"message_id": message_id, "text": "Unrelated client input",
+                          "expansion_policy": "literal_text"}, timeout=10,
+                )
+                assert reserved.status_code == 409 and reserved.json()['error_type'] == 'reserved_message_id', reserved.text
+            assert reminders(conv_id) == [revised]
+            stale = mutate(conv_id, upcoming, 'cancel')
+            assert stale.status_code == 409 and stale.json()['current'] == revised, stale.text
+            changed = mutate(conv_id, revised, 'reschedule', when={'kind': 'after', 'seconds': 2})
+            changed.raise_for_status()
+            revised = changed.json()['reminder']
+            assert revised['revision'] == 3 and revised['due_at_us'] < upcoming['due_at_us'], revised
+            completed = _poll_to_idle_with_messages(
+                base_url, conv_id, lambda m: 'Your saved reminder is due' in _agent_text(m),
+                'deadline discovery and ordinary model follow-up', timeout=SCENARIO_TIMEOUT_SECONDS,
+            )
+            due, = reminders(conv_id)
+            assert due['state']['kind'] == 'due', due
+            assert due['due_at_us'] == revised['due_at_us'] and due['revision'] == 3
+            assert due['state']['occurred_at_us'] >= revised['due_at_us']
+            assert datetime.now().timestamp() * 1_000_000 >= revised['due_at_us']
+            assert 'Your saved reminder is due' in _agent_text(completed['messages'])
+            assert_one_input(conv_id, due)
+            assert mutate(conv_id, due, 'cancel').status_code == 409
+            for _ in range(2):
+                feed = httpx.get(f"{base_url}/api/reminders/due", timeout=10)
+                feed.raise_for_status()
+                item, = [x for x in feed.json()['items'] if x['reminder']['id'] == due['id']]
+                assert item['reminder'] == due and item['target']['id'] == conv_id
+                _wait_for_sse_signal(base_url, conv_id, lambda name, _data: name == 'init', SCENARIO_TIMEOUT_SECONDS)
+                assert_one_input(conv_id, due)
+            stop()
+            proc, base_url, log_path, log_file = _start_server_with_retries(env, root)
+            assert reminders(conv_id) == [due]
+            assert_one_input(conv_id, due)
+
+            other = _new_conv(base_url, '[[scenario:reminder]] Save a reminder I can cancel.')
+            _poll_to_idle_with_messages(base_url, other['id'], lambda m: _has_tool_use(m, 'reminders')
+                                        and any(x.get('message_type') == 'tool' for x in m),
+                                        'second native reminder', timeout=SCENARIO_TIMEOUT_SECONDS)
+            cancellable, = reminders(other['id'])
+            wrong_owner = mutate(conv_id, cancellable, 'cancel')
+            assert wrong_owner.status_code == 404, wrong_owner.text
+            cancelled = mutate(other['id'], cancellable, 'cancel')
+            cancelled.raise_for_status()
+            assert cancelled.json()['reminder']['state']['kind'] == 'cancelled', cancelled.text
+            assert reminders(other['id']) == [cancelled.json()['reminder']]
+        finally:
+            stop()
+
+
 def scenario_coordinator_home(_base_url: str) -> None:
     """Disposable server: actual scoped tool dispatch and persistent home, no worker bootstrap."""
     import sqlite3
@@ -1885,6 +2022,7 @@ def scenario_perf_stream(base_url: str) -> None:
 
 
 SCENARIOS = [
+    ("reminders", scenario_reminders),
     ("coordinator_home", scenario_coordinator_home),
     ("list_models", scenario_list_models),
     ("text_streaming", scenario_text_streaming),

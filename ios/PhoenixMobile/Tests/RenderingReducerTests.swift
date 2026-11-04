@@ -50,6 +50,8 @@ final class RenderingReducerTests: XCTestCase {
              .slackGateway(requestId: "request-1"), "Slack request"),
             (#"{"kind":"subscription_event","event_id":"event-1"}"#,
              .subscriptionEvent(eventId: "event-1"), "Conversation event"),
+            (#"{"kind":"scheduled_reminder","reminder_id":"reminder-1"}"#,
+             .scheduledReminder(reminderId: "reminder-1"), "Scheduled reminder"),
             (#"{"kind":"unknown_historical"}"#, .unknownHistorical, "Unknown input"),
         ]
         let base = #"{"message_id":"m1","sequence_id":1,"message_type":"user","content":{"text":"hello"}"#
@@ -63,6 +65,11 @@ final class RenderingReducerTests: XCTestCase {
             XCTAssertEqual(decoded.inputOrigin.label, label)
             let roundTrip = try JSONDecoder().decode(Message.self, from: JSONEncoder().encode(decoded))
             XCTAssertEqual(roundTrip.inputOrigin, expected)
+            if case .scheduledReminder = expected {
+                XCTAssertNil(decoded.inputOrigin.sourceTranscriptURL(serverURL: "https://phoenix.example"))
+                XCTAssertNil(decoded.inputOrigin.sourceCallURL(serverURL: "https://phoenix.example"))
+                XCTAssertFalse(decoded.inputOrigin.sourceCallUnavailable)
+            }
             XCTAssertEqual(decoded.inputOrigin.slackSourceURL(serverURL: "https://phoenix.example")?.absoluteString,
                            expected == .slackGateway(requestId: "request-1")
                            ? "https://phoenix.example/api/slack-gateway/requests/request-1/source" : nil)
@@ -77,6 +84,7 @@ final class RenderingReducerTests: XCTestCase {
             (.systemGenerated, false),
             (.slackGateway(requestId: "request-1"), false),
             (.subscriptionEvent(eventId: "event-1"), false),
+            (.scheduledReminder(reminderId: "reminder-1"), false),
         ]
         for (origin, isHuman) in origins {
             XCTAssertEqual(origin.isUserApiInput, isHuman)

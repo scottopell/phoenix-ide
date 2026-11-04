@@ -288,7 +288,7 @@ describe('notification policy reducer', () => {
       env());
     expect(delivered.state.attentionSeenByConversationId.get('conv-1')).toBe('conv-1:question_asked');
     const rolledBack = notificationPolicyReducer(delivered.state,
-      { type: 'notification_delivery_failed', conversationId: 'conv-1', attentionKey: 'conv-1:question_asked' },
+      { type: 'notification_delivery_failed', conversationId: 'conv-1', dedupeKey: { kind: 'attention', key: 'conv-1:question_asked' } },
       env());
     expect(rolledBack.state.attentionSeenByConversationId.has('conv-1')).toBe(false);
   });
@@ -356,5 +356,53 @@ describe('notification policy reducer', () => {
       state = notificationPolicyReducer(state, { type: 'settings_loaded', settings: DEFAULT_NOTIFICATION_SETTINGS }, env()).state;
       expect(state.settings.enabled).toBe(false);
     });
+  });
+});
+
+describe('connected reminder notifications', () => {
+  const item = (id: string) => ({
+    reminder: { id, product_conversation_id: 'pc', text: 'Check Safari', due_at_us: 10, timezone: 'UTC', revision: 1, created_at_us: 1, state: { kind: 'due' as const, occurred_at_us: 10 } },
+    target: { id: 'conv-1', slug: 'conv-a', title: 'Safari', kind: 'ordinary' as const },
+  });
+  const seed = () => notificationPolicyReducer(loadedState(), { type: 'reminder_feed', items: [] }, env()).state;
+
+  it('quietly baselines existing history and alerts for a new due occurrence without a busy threshold', () => {
+    const baseline = notificationPolicyReducer(loadedState(), { type: 'reminder_feed', items: [item('old')] }, env());
+    expect(baseline.effects).toEqual([]);
+    const result = notificationPolicyReducer(baseline.state, { type: 'reminder_feed', items: [item('old'), item('new')] }, env({ now: 0 }));
+    expect(result.effects).toEqual([expect.objectContaining({ title: 'Reminder due', tag: 'reminder_due:new', body: 'Safari\nCheck Safari' })]);
+  });
+
+  it.each([
+    { settings: { ...DEFAULT_NOTIFICATION_SETTINGS, enabled: false }, permission: 'granted' as const },
+    { settings: { ...DEFAULT_NOTIFICATION_SETTINGS, notify_reminder: false }, permission: 'granted' as const },
+    { settings: DEFAULT_NOTIFICATION_SETTINGS, permission: 'denied' as const },
+    { settings: DEFAULT_NOTIFICATION_SETTINGS, permission: 'default' as const },
+  ])('obeys master, reminder and permission gates', ({ settings, permission }) => {
+    expect(notificationPolicyReducer({ ...seed(), settings }, { type: 'reminder_feed', items: [item('new')] }, env({ permission })).effects).toEqual([]);
+  });
+
+  it('focus suppression acknowledges only that occurrence and keeps separate attention dedupe', () => {
+    const focused = notificationPolicyReducer(seed(), { type: 'reminder_feed', items: [item('new')] }, env({ visible: true, hasFocus: true, activeSlug: 'conv-a' }));
+    expect(focused.effects).toEqual([]);
+    const attention = notificationPolicyReducer(focused.state, { type: 'catchup_scan', conversations: [conversation({ state: { type: 'awaiting_user_response', questions: [] } })] }, env());
+    expect(attention.effects).toHaveLength(1);
+    const repeated = notificationPolicyReducer(attention.state, { type: 'reminder_feed', items: [item('new')] }, env());
+    expect(repeated.effects).toEqual([]);
+    const missing = notificationPolicyReducer(repeated.state, { type: 'reminder_feed', items: [] }, env());
+    expect(notificationPolicyReducer(missing.state, { type: 'reminder_feed', items: [item('new')] }, env()).effects).toEqual([]);
+    expect(notificationPolicyReducer(repeated.state, { type: 'reminder_feed', items: [item('new'), item('next')] }, env()).effects).toHaveLength(1);
+  });
+
+  it('does not mistake a missing target slug for a focused conversation on the list route', () => {
+    const due = item('coordinator-reminder');
+    const target = { ...due.target, slug: null, kind: 'coordinator' as const };
+    expect(notificationPolicyReducer(seed(), { type: 'reminder_feed', items: [{ ...due, target }] }, env({ visible: true, hasFocus: true, activeSlug: null })).effects).toHaveLength(1);
+  });
+
+  it('retries browser construction failure without resetting unrelated attention', () => {
+    const sent = notificationPolicyReducer(seed(), { type: 'reminder_feed', items: [item('new')] }, env());
+    const failed = notificationPolicyReducer(sent.state, { type: 'notification_delivery_failed', conversationId: 'conv-1', dedupeKey: { kind: 'reminder', id: 'new' } }, env());
+    expect(notificationPolicyReducer(failed.state, { type: 'reminder_feed', items: [item('new')] }, env()).effects).toHaveLength(1);
   });
 });

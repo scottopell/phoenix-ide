@@ -5,6 +5,7 @@
 -- Driven by SSE state_change events, configured via server-side settings.
 
 use "../bedrock/bedrock.allium" as bedrock
+use "../reminders/reminders.allium" as reminders
 
 ------------------------------------------------------------
 -- Enumerations
@@ -15,6 +16,7 @@ enum NotificationEventType {
     question_asked
     agent_error
     agent_finished
+    reminder_due
 }
 
 enum BrowserPermission {
@@ -53,6 +55,7 @@ entity NotificationSettings {
     notify_question: Boolean = true
     notify_error: Boolean = true
     notify_idle: Boolean = true
+    notify_reminder: Boolean = true
 }
 
 -- Runtime policy state, distinct from the persisted settings: load status
@@ -75,6 +78,11 @@ entity AttentionSeen {
     event_key: String     -- event_key_of(event.type) of the blocking event
 }
 
+-- Connected-page occurrence acknowledgement is independent of blocking attention.
+entity ReminderSeen {
+    reminder_id: String
+}
+
 ------------------------------------------------------------
 -- Helpers
 ------------------------------------------------------------
@@ -90,10 +98,11 @@ entity AttentionSeen {
 --         question_asked       -> settings.notify_question
 --         agent_error          -> settings.notify_error
 --         agent_finished       -> settings.notify_idle
+--         reminder_due         -> settings.notify_reminder
 --
 --   is_blocking(type: NotificationEventType) -> Boolean
 --       True for the unresolved-attention events (task_approval_needed,
---       question_asked, agent_error); false for agent_finished.
+--       question_asked, agent_error); false for agent_finished and reminder_due.
 --
 --   event_key_of(type: NotificationEventType) -> String
 --       The dedupe key component for a blocking event — its event type.
@@ -136,6 +145,7 @@ config {
     default_notify_question: Boolean = true
     default_notify_error: Boolean = true
     default_notify_idle: Boolean = true
+    default_notify_reminder: Boolean = true
 }
 
 ------------------------------------------------------------
@@ -429,6 +439,7 @@ rule UpdateNotificationSettings {
     ensures: NotificationSettings.notify_question = new_settings.notify_question
     ensures: NotificationSettings.notify_error = new_settings.notify_error
     ensures: NotificationSettings.notify_idle = new_settings.notify_idle
+    ensures: NotificationSettings.notify_reminder = new_settings.notify_reminder
     ensures: NotificationPolicy.settings_status = loaded
     ensures: NotificationPolicy.latest_save_id = NotificationPolicy.latest_save_id + 1
 
@@ -451,6 +462,7 @@ rule ApplyNotificationSettingsSaveResult {
     ensures: NotificationSettings.notify_question = saved_settings.notify_question
     ensures: NotificationSettings.notify_error = saved_settings.notify_error
     ensures: NotificationSettings.notify_idle = saved_settings.notify_idle
+    ensures: NotificationSettings.notify_reminder = saved_settings.notify_reminder
 }
 
 rule RequestBrowserPermission {
@@ -483,6 +495,7 @@ surface NotificationSettingsPanel {
         settings.notify_question
         settings.notify_error
         settings.notify_idle
+        settings.notify_reminder
         BrowserPermission
 
     provides:
@@ -561,4 +574,57 @@ invariant NewerSettingsSaveWins {
     for r in SettingsSaveResponses:
         r.request_id != NotificationPolicy.latest_save_id implies
             not NotificationSettingsAppliedFrom(r)
+}
+
+
+surface ConnectedReminderFeed {
+    facing user: bedrock/User
+    context reminder: reminders/Reminder
+    context conversation: bedrock/Conversation
+    exposes:
+        user
+        reminder.id
+        reminder.text
+        reminder.status
+        conversation.slug
+    provides:
+        ConnectedReminderObserved(reminder, conversation, initial)
+            when reminder.status = due
+}
+
+rule BaselineReminderHistoryQuietly {
+    when: ConnectedReminderObserved(reminder, conversation, initial)
+    requires: initial
+    ensures: ReminderSeen.created(reminder_id: reminder.id)
+}
+
+rule DeliverConnectedReminder {
+    when: ConnectedReminderObserved(reminder, conversation, initial)
+    requires: not initial
+    requires: NotificationPolicy.settings_status = loaded
+    requires: NotificationSettings.enabled
+    requires: NotificationSettings.notify_reminder
+    requires: BrowserPermission = granted
+    requires: not tab_is_focused
+    requires: not exists ReminderSeen{reminder_id: reminder.id}
+    ensures: BrowserNotificationShown("Reminder due", reminder.text, conversation)
+    ensures: ReminderSeen.created(reminder_id: reminder.id)
+
+    @guidance
+        -- Feed targets are current Open ordinary or Coordinator conversations.
+        -- The recent window follows actual due observation time. Each scan pages
+        -- from the beginning; no deadline cursor survives into the next scan.
+        -- The browser tag is reminder_due:<reminder.id>. Construction failure
+        -- removes that occurrence's optimistic seen mark so retry can notify.
+}
+
+rule AcknowledgeReminderWhileFocused {
+    when: ConnectedReminderObserved(reminder, conversation, initial)
+    requires: not initial
+    requires: NotificationPolicy.settings_status = loaded
+    requires: NotificationSettings.enabled
+    requires: NotificationSettings.notify_reminder
+    requires: tab_is_focused
+    requires: not exists ReminderSeen{reminder_id: reminder.id}
+    ensures: ReminderSeen.created(reminder_id: reminder.id)
 }

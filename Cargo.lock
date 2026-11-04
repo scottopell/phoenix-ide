@@ -2983,6 +2983,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "chrono-tz",
  "libc",
  "nono",
  "phoenix-tls",
@@ -3169,6 +3170,7 @@ dependencies = [
  "brush-parser",
  "chromiumoxide",
  "chrono",
+ "chrono-tz",
  "fs2",
  "futures",
  "globset",

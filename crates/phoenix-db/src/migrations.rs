@@ -787,6 +787,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "federated_subscription_terminal_cancellation",
         sql: include_str!("migrations/federated_subscription_terminal_cancellation.sql"),
     },
+    Migration {
+        version: 151,
+        name: "one_shot_conversation_reminders",
+        sql: include_str!("migrations/reminders.sql"),
+    },
 ];
 
 const MIGRATION_138: &str = concat!(
@@ -13574,7 +13579,7 @@ mod tests {
                 .is_empty());
         }
 
-        async fn historical_tables(pool: &SqlitePool) -> Vec<String> {
+        pub(super) async fn historical_tables(pool: &SqlitePool) -> Vec<String> {
             sqlx::query_scalar(
                 "SELECT name FROM sqlite_schema
                  WHERE type = 'table' AND name <> '_migrations' ORDER BY name",
@@ -13584,7 +13589,7 @@ mod tests {
             .unwrap()
         }
 
-        async fn snapshot_tables(
+        pub(super) async fn snapshot_tables(
             pool: &SqlitePool,
             tables: &[String],
         ) -> Vec<(String, Vec<Vec<String>>)> {
@@ -15757,11 +15762,83 @@ with tempfile.TemporaryDirectory() as directory:
         }
     }
 
+    #[tokio::test]
+    async fn migration_151_preserves_provenance_federation_and_retired_wake_history() {
+        let (db, _) = migration_150_fixture(false).await;
+        assert_eq!(run_through_for_test(db.pool(), 150).await.unwrap(), 1);
+        sqlx::raw_sql(
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type,
+                 content, created_at, origin_kind, origin_subscription_event_id)
+             VALUES ('received-message', 'source', 1, 'user', '{\"text\":\"event\"}', '2026-11-03',
+                     'subscription_event', 'federation:accepted');
+             INSERT INTO steering_messages (message_id, conversation_id, ordinal, text,
+                 origin_kind, origin_product_conversation_id, origin_transcript_id,
+                 origin_source_message_id, origin_source_tool_use_id)
+             VALUES ('queued-message', 'source', 1, 'conversation input',
+                     'internal_conversation', 'parent-product', 'parent-transcript',
+                     'parent-message', 'parent-tool');
+             INSERT INTO steering_acceptance_receipts (conversation_id, message_id, request_fingerprint)
+             VALUES ('source', 'queued-message', 'saved-steering-fingerprint');
+             INSERT INTO workflows (workflow_id, profile_kind, profile_version,
+                 runtime_acceptance_enabled, external_acceptance_enabled, version, generation,
+                 status, snapshot_codec_family, snapshot_codec_version, snapshot_payload,
+                 created_at, updated_at)
+             VALUES (1000, 'wake', 1, 1, 0, 1, 0, 'Completed', 'wake.snapshot', 1, X'00FF01', 10, 20),
+                    (1001, 'direct_turn', 1, 0, 1, 1, 0, 'Active', 'direct_turn.snapshot', 1, X'00FE02', 10, 20);
+             INSERT INTO workflow_feature_retirements (workflow_id, reason)
+             VALUES (1000, 'WakeFeatureRetired');
+             INSERT INTO durable_turns (turn_id, workflow_id, conversation_id, client_turn_key,
+                 prepared_fingerprint, prepared_payload, disposition, generation,
+                 owns_conversation, origin_kind)
+             VALUES (1001, 1001, 'source', 'human-turn', 'saved-fingerprint', X'FF000A',
+                     'Runtime', 0, 1, 'user_api');",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let tables = wake_feature_retirement_tests::historical_tables(db.pool()).await;
+        let before = wake_feature_retirement_tests::snapshot_tables(db.pool(), &tables).await;
+
+        assert_eq!(run_through_for_test(db.pool(), 151).await.unwrap(), 1);
+        let mut after = wake_feature_retirement_tests::snapshot_tables(db.pool(), &tables).await;
+        for (table, rows) in &mut after {
+            if matches!(
+                table.as_str(),
+                "messages" | "steering_messages" | "durable_turns" | "steering_acceptance_receipts"
+            ) {
+                for row in rows {
+                    assert_eq!(row.pop().as_deref(), Some("null:"));
+                }
+            }
+        }
+        assert_eq!(after, before);
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
+        let ledger: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT version, name FROM _migrations WHERE version >= 150 ORDER BY version",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            ledger,
+            vec![
+                (150, "federated_subscription_terminal_cancellation".into()),
+                (151, "one_shot_conversation_reminders".into()),
+            ]
+        );
+    }
+
     #[test]
     fn capability_migrations_are_forward_only_and_unique() {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (151, "one_shot_conversation_reminders"),
             (150, "federated_subscription_terminal_cancellation"),
             (149, "product_creation_image_retirement"),
             (148, "product_creation_initial_execution_receipts"),
@@ -20015,6 +20092,7 @@ with tempfile.TemporaryDirectory() as directory:
                 (148, "product_creation_initial_execution_receipts"),
                 (149, "product_creation_image_retirement"),
                 (150, "federated_subscription_terminal_cancellation"),
+                (151, "one_shot_conversation_reminders"),
             ]
         );
         let goal = MIGRATIONS
@@ -20028,7 +20106,7 @@ with tempfile.TemporaryDirectory() as directory:
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 149);
+        assert_eq!(MIGRATIONS.len(), 150);
     }
 
     #[tokio::test]
@@ -20044,7 +20122,7 @@ with tempfile.TemporaryDirectory() as directory:
         }
         sqlx::query("UPDATE product_creation_jobs SET status = 'published', published_product_id = 'deleted-product', published_conversation_id = 'deleted-transcript' WHERE request_id = 'orphan-image'")
             .execute(&pool).await.unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 2);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
         let identity: Vec<(String, String)> = sqlx::query_as(
             "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
         ).fetch_all(&pool).await.unwrap();
@@ -20098,7 +20176,7 @@ with tempfile.TemporaryDirectory() as directory:
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 2);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
         let retained: (String, String, String) = sqlx::query_as(
             "SELECT status, published_product_id, published_conversation_id
              FROM product_creation_jobs WHERE request_id = 'orphan-text'",

@@ -1,4 +1,4 @@
-# ADR-217: Coordinator Authority uses conversational approval and direct tools
+# ADR-221: Coordinator Authority uses conversational approval and direct tools
 
 - **Status:** Accepted
 - **Date:** 2026-11-04

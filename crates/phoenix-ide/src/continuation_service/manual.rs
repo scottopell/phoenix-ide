@@ -283,6 +283,12 @@ pub(super) async fn continue_manual(
     };
 
     if parent.continued_in_conv_id.is_none() {
+        if crate::send_chat_service::is_reserved_reminder_message_id(message_id.as_str()) {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Continuation message_id is reserved for scheduled reminder inputs",
+                "reserved_message_id",
+            ))));
+        }
         let admission = service
             .runtime
             .db()
@@ -340,7 +346,9 @@ pub(super) async fn continue_manual(
                     "continuation_not_allowed",
                 )))
             }
-            other @ (DbError::CoordinatorWorkScope(_)
+            other @ (DbError::ReminderInvalid(_)
+        | DbError::ReminderRequestConflict
+        | DbError::CoordinatorWorkScope(_)
             | DbError::Sqlx(_)
             | DbError::ConversationTitleInvalid
             | DbError::CurrentCoordinatorRequired

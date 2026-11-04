@@ -233,7 +233,8 @@ async fn native_goal_discovery_prepare_apply_read_and_replay_without_dispatch() 
             (147, "retain_product_creation_receipts".into()),
             (148, "product_creation_initial_execution_receipts".into()),
             (149, "product_creation_image_retirement".into()),
-            (150, "federated_subscription_terminal_cancellation".into())
+            (150, "federated_subscription_terminal_cancellation".into()),
+            (151, "one_shot_conversation_reminders".into())
         ]
     );
     for name in [

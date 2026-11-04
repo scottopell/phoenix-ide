@@ -8,6 +8,10 @@ The user explicitly separated this design from Authority tool delivery on 2026-1
 
 This is a brainstorming design task, not implementation authorization. It preserves investigation of approval cards, request-bound human grants, optional execution waits, timed continuation, and late answers. Task 33003 proceeds independently with conversational approval and plain read/set tools. No active Authority grant, runtime transition, automatic dismissal, scheduler, UI or deployment is authorized by this task.
 
+## Updated research pointer
+
+Main commit `7258b21e6` ([PR #1025](https://github.com/scottopell/phoenix-ide/pull/1025)) adds real durable conversation reminders through ordinary input admission; consult `specs/reminders/` and ADR-217 through ADR-220 for that shipped contract. It does not implement independently pending questions or authorize automatic question dismissal. This is evidence for future design research, not a commission to add interaction waits or connect Authority to reminder scheduling. The older investigation below remains a historical snapshot.
+
 ## Design questions
 
 - Whether pending questions and approvals have lifecycles independent of conversation activity.

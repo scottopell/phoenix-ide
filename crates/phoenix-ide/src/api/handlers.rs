@@ -530,6 +530,19 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/mcp/servers/:name/disable", post(disable_mcp_server))
         .route("/api/mcp/servers/:name/enable", post(enable_mcp_server))
         .route("/api/mcp/oauth/callback", get(mcp_oauth_callback))
+        .route(
+            "/api/conversations/:id/reminders",
+            get(super::reminders::list),
+        )
+        .route(
+            "/api/conversations/:id/reminders/:reminder_id/cancel",
+            post(super::reminders::cancel),
+        )
+        .route(
+            "/api/conversations/:id/reminders/:reminder_id/reschedule",
+            post(super::reminders::reschedule),
+        )
+        .route("/api/reminders/due", get(super::reminders::due_feed))
         // Notification settings (REQ-NOTIF-006, REQ-NOTIF-009)
         .route(
             "/api/settings/notifications",

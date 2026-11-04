@@ -3064,7 +3064,7 @@ pub struct ToolRegistryExecutor {
     /// Named-worker descriptions used to construct the base tool registry.
     agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
     writing_tools: Option<WritingConversationTools>,
-    predecessor_tool: Option<Arc<dyn crate::tools::Tool>>,
+    host_bound_tools: Vec<Arc<dyn crate::tools::Tool>>,
     coordinator_skill_catalog: Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog>,
 }
 
@@ -3081,7 +3081,7 @@ impl ToolRegistryExecutor {
             mcp_manager: None,
             agent_catalog,
             writing_tools: None,
-            predecessor_tool: None,
+            host_bound_tools: Vec::new(),
             coordinator_skill_catalog: None,
         }
     }
@@ -3099,7 +3099,7 @@ impl ToolRegistryExecutor {
             mcp_manager: Some(manager),
             agent_catalog,
             writing_tools: None,
-            predecessor_tool: None,
+            host_bound_tools: Vec::new(),
             coordinator_skill_catalog: None,
         }
     }
@@ -3120,8 +3120,13 @@ impl ToolRegistryExecutor {
     }
 
     #[must_use]
-    pub fn with_predecessor_tool(mut self, tool: Arc<dyn crate::tools::Tool>) -> Self {
-        self.predecessor_tool = Some(tool);
+    pub fn with_predecessor_tool(self, tool: Arc<dyn crate::tools::Tool>) -> Self {
+        self.with_host_bound_tool(tool)
+    }
+
+    #[must_use]
+    pub fn with_host_bound_tool(mut self, tool: Arc<dyn crate::tools::Tool>) -> Self {
+        self.host_bound_tools.push(tool);
         self
     }
 
@@ -3258,12 +3263,14 @@ impl ToolExecutor for ToolRegistryExecutor {
             }
             None => ToolRegistry::direct(self.agent_catalog.to_vec()).with_propose_task(),
         };
-        let registry = match &self.predecessor_tool {
-            Some(tool) => registry
-                .try_with_host_bound_tool(tool.clone())
-                .expect("fresh writing registry cannot collide with host-bound predecessor tool"),
-            None => registry,
-        };
+        let registry = self
+            .host_bound_tools
+            .iter()
+            .fold(registry, |registry, tool| {
+                registry
+                    .try_with_host_bound_tool(tool.clone())
+                    .expect("fresh writing registry cannot collide with host-bound tools")
+            });
         self.swap_registry(registry);
         tracing::info!("Tool registry upgraded to Git-backed writing mode");
     }
@@ -3326,6 +3333,7 @@ mod tool_registry_executor_tests {
     #[tokio::test]
     async fn explore_upgrade_preserves_host_bound_predecessor_without_global_authority() {
         let predecessor: Arc<dyn Tool> = Arc::new(NamedMarker("previous_transcripts"));
+        let reminder: Arc<dyn Tool> = Arc::new(NamedMarker("reminders"));
         let registry = ToolRegistry::explore(
             "tasks",
             Vec::new(),
@@ -3336,9 +3344,12 @@ mod tool_registry_executor_tests {
             ),
         )
         .try_with_host_bound_tool(predecessor.clone())
+        .unwrap()
+        .try_with_host_bound_tool(reminder.clone())
         .unwrap();
         let executor = ToolRegistryExecutor::builtin_only(registry, Arc::from(Vec::new()))
-            .with_predecessor_tool(predecessor);
+            .with_predecessor_tool(predecessor)
+            .with_host_bound_tool(reminder);
 
         let names = |definitions: Vec<phoenix_llm::ToolDefinition>| {
             definitions
@@ -3348,11 +3359,13 @@ mod tool_registry_executor_tests {
         };
         let before = names(executor.definitions().await);
         assert!(before.contains("previous_transcripts"));
+        assert!(before.contains("reminders"));
         assert!(!before.contains("search_conversations"));
         assert!(!before.contains("send_conversation_message"));
         executor.upgrade_to_work_mode();
         let after = names(executor.definitions().await);
         assert!(after.contains("previous_transcripts"));
+        assert!(after.contains("reminders"));
         assert!(!after.contains("search_conversations"));
         assert!(!after.contains("send_conversation_message"));
         assert!(after.contains("propose_task"));

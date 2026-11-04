@@ -5118,6 +5118,10 @@ impl RuntimeManager {
         );
         coordinator_tools.extend(crate::coordinator_tools::goal_tools(self));
         coordinator_tools.extend(crate::coordinator_tools::authority_tools(self));
+        coordinator_tools.push(crate::reminder_service::tool(
+            self,
+            conversation_id.to_owned(),
+        ));
         Ok(ToolRegistry::coordinator(coordinator_tools, catalog))
     }
 
@@ -6163,7 +6167,10 @@ impl RuntimeManager {
                         None,
                     ),
                 };
-                let registry = registry.try_with_host_bound_tool(predecessor_tool.clone())?;
+                let reminder_tool = crate::reminder_service::tool(self, conv.id.clone());
+                let registry = registry
+                    .try_with_host_bound_tool(predecessor_tool.clone())?
+                    .try_with_host_bound_tool(reminder_tool.clone())?;
                 let registry = if crate::slack_gateway::has_explicit_binding(
                     &self.db,
                     conv.product_conversation_id.as_str(),
@@ -6184,6 +6191,7 @@ impl RuntimeManager {
                 )
                 .with_writing_tools(upgrade_writing_tools)
                 .with_predecessor_tool(predecessor_tool)
+                .with_host_bound_tool(reminder_tool)
             }
         };
 

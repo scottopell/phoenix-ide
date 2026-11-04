@@ -390,3 +390,33 @@ THE SYSTEM SHALL keep the newest transcript identity distinct from write readine
 AND SHALL NOT advertise a reserved successor as writable before its continuation opening is accepted.
 
 Web consumption is specified by `specs/conversation-ui` REQ-CONV-023 and REQ-CONV-026.
+
+
+### REQ-API-032: Reminder visibility and management
+
+WHEN a client reads a top-level conversation's reminders
+THE SYSTEM SHALL return canonical saved reminder records belonging to its stable ProductConversation
+AND SHALL independently bound upcoming, recent due and recent cancelled sections so one section cannot crowd out another.
+
+WHEN a client reschedules or cancels a reminder
+THE SYSTEM SHALL require the observed revision and use the same lifecycle authority and time resolver as the native reminder tool
+AND SHALL report not-found, revision conflict, already-due and already-cancelled outcomes without claiming retraction of a due occurrence.
+
+THE SYSTEM SHALL expose a bounded read-only recent-due feed for connected-browser notifications, including actual current navigation targets, under `../notifications/requirements.md`.
+
+### REQ-API-033: Reserved scheduled-reminder input identities
+
+WHEN admitting a fresh conversation input with a client message identity beginning with `reminder:` or containing `:reminder:`
+THE SYSTEM SHALL accept that identity only for a trusted scheduled-reminder input whose owner, due occurrence, saved text and provenance match
+AND SHALL reject other origins before creating a direct-turn or steering acceptance with HTTP 409 `reserved_message_id` on the public chat endpoint.
+
+WHEN a fresh continuation request supplies a reserved message identity
+THE SYSTEM SHALL reject it before creating a successor or persisting its opening intent.
+
+WHEN a client exactly retries an already accepted input
+THE SYSTEM SHALL preserve the existing ordinary replay contract, including historical client identities in the reserved namespace
+AND SHALL NOT permit changed payload or provenance to claim that identity.
+
+WHEN an existing durable continuation opening owns a reserved identity
+THE SYSTEM SHALL retain its original winning identity and allow its opening to finish only through the existing validated intent, owner, source and payload policy
+AND SHALL NOT substitute a losing retry's requested identity or treat an arbitrary new chat input as that owned opening.

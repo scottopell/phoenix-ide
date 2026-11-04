@@ -25,7 +25,7 @@ Writes use the existing local persistence ownership and outcome classification.
 Live model requests and the system-prompt inspector share a renderer that reads
 current instructions without clipping. Missing saved text means no additional
 grant; a failed read must remain an error. Constant text renders identically
-across calls and is loaded afresh after continuation. ADR-217 records the choice
+across calls and is loaded afresh after continuation. ADR-221 records the choice
 to keep human approval conversational rather than add an interaction workflow.
 
 ## Status Summary

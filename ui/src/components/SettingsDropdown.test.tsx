@@ -19,6 +19,7 @@ vi.mock('../notifications', () => ({
       notify_question: false,
       notify_error: false,
       notify_idle: false,
+      notify_reminder: true,
     },
     saving: false,
     error: null,

@@ -23,7 +23,7 @@ that does not seed production Authority or authorize disk deletion/deployment.
 
 - `specs/coordinator-authority/requirements.md`: REQ-AUTH-001–006.
 - `specs/global-recall/requirements.md`: REQ-GR-007/013/022.
-- ADR-217: conversational approval and direct read/set tools.
+- ADR-221: conversational approval and direct read/set tools.
 - Existing permissions and compatibility contracts remain binding.
 
 One instance-wide document is stored as one indivisible scalar under the
@@ -40,7 +40,7 @@ from database correctness.
 
 - [x] Contract: narrow this task, preserve deferred research separately, author
   Authority requirements and executive, link Coordinator capability/continuation
-  requirements, record ADR-217 and run task/spec preflight.
+  requirements, record ADR-221 and run task/spec preflight.
 - [ ] Storage and tools: typed document validation, existing scalar persistence,
   current-source guards, closed schemas, full-replacement and clearing behavior,
   commit-time source validation and focused boundary tests.

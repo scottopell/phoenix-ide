@@ -1,3 +1,4 @@
+import { useReminderDueNotifications } from '../reminders/useReminderDueNotifications';
 import { useDesktopRouteOwner } from './useDesktopRouteOwner';
 import { extractProductRouteReference } from './desktopRouteReference';
 import { conversationGroundingContext } from './FileExplorer/groundingContext';
@@ -85,6 +86,7 @@ function SubAgentViewerDock() {
 }
 
 export function DesktopLayout({ children }: DesktopLayoutProps) {
+  useReminderDueNotifications();
   const isDesktop = useIsDesktop();
   const sidebarPane = useResizablePane({
     key: 'sidebar-width',

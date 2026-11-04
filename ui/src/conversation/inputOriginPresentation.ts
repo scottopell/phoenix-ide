@@ -46,6 +46,8 @@ export function inputOriginPresentation(origin: InputOrigin | undefined): {
       };
     case 'slack_gateway':
       return { label: 'Slack request', title: `Slack request ${origin.request_id}`, className: 'user' };
+    case 'scheduled_reminder':
+      return { label: 'Scheduled reminder', title: `Saved reminder ${origin.reminder_id}`, className: 'meta' };
     case 'subscription_event':
       return { label: 'Conversation event', title: 'Conversation event', className: 'meta' };
     case 'system_generated':
