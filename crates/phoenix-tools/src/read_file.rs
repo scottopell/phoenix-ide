@@ -115,6 +115,10 @@ impl Tool for ReadFileTool {
 }
 
 impl ReadFileTool {
+    /// Read numbered file lines using an explicit directory instead of a tool context.
+    ///
+    /// # Panics
+    /// Panics if the read-file display metadata cannot be serialized.
     pub async fn read_in_directory(
         input: Value,
         working_dir: &Path,
