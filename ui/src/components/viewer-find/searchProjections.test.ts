@@ -1163,3 +1163,12 @@ it.each(bashLaunchOutcomes)('indexes visible uncertainty for $status / $launch_e
     expect(projection.fullText).not.toContain('signal 9');
   }
 });
+
+
+it('retains scheduled provenance in searchable reminder inputs', () => {
+  const message = { ...userMsg('reminder-input', 'Inspect Safari'), origin: { kind: 'scheduled_reminder' as const, reminder_id: 'saved-id' } };
+  const projection = buildConversationSearchProjection([{ kind: 'user', key: 'reminder-input', message }], 'Safari');
+  expect(projection.sources[0]?.role).toBe('scheduled-reminder');
+  expect(projection.matches).toHaveLength(1);
+  expect(projection.matches[0]?.target).toMatchObject({ unitKey: 'reminder-input', unitIndex: 0 });
+});

@@ -366,7 +366,7 @@ impl Database {
             .transpose()
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         sqlx::query(
-            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         )
         .bind(message_id)
         .bind(conversation_id)
@@ -384,6 +384,7 @@ impl Database {
     .bind(origin.source_call().map(|call| call.message_id.as_str()))
     .bind(origin.source_call().map(|call| call.tool_use_id.as_str()))
     .bind(origin.slack_request_id())
+    .bind(origin.reminder_id())
         .execute(&mut *tx)
         .await?;
         if matches!(

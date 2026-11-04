@@ -26,6 +26,7 @@ pub mod product_conversation;
 pub mod product_creation;
 pub mod provider_replay;
 pub mod quota_details;
+pub mod reminder;
 pub mod responses_replay;
 pub mod retry_policy;
 pub mod skill_invocation;

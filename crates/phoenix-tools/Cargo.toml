@@ -53,6 +53,7 @@ serde_json = "1"
 # Wall-clock timestamps for the work-scope inventory projection
 # (Handle.started_at: SystemTime -> DateTime<Utc> on the wire).
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 
 # Chrome DevTools Protocol types used by the browser tool glue (CDP param
 # structs passed to the engine's page handle). The engine itself lives in

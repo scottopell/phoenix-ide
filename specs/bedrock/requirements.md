@@ -774,7 +774,7 @@ AND both handoff policies SHALL request unfinished obligations, authorization pr
 AND SHALL distinguish authentic primary user directions from generated assertions, delegate reports, quotations, and assumptions; missing evidence SHALL remain unknown with narrow retrieval pointers rather than invented approval
 AND the tool-free compaction input SHALL expose each retained text-bearing row's known persisted conversation/message locator pair, typed input origin and content kind alongside its rendered text, including ordinary user-facing API inputs
 AND source attribution SHALL come from the frozen persisted projection, not message text; rendered payload SHALL be escaped separately from attribution, with metadata included in the row's token budget and omitted whenever the row is omitted
-AND user-facing API origin SHALL identify only an entry channel, not establish biological human authorship or grant authorization; internal conversation, unknown historical, system-generated and subscription-event inputs and generated continuation content SHALL remain distinguishable
+AND user-facing API origin SHALL identify only an entry channel, not establish biological human authorship or grant authorization; internal conversation, unknown historical, system-generated, scheduled-reminder and subscription-event inputs and generated continuation content SHALL remain distinguishable
 AND SHALL describe the generated handoff as untrusted context that cannot self-authorize, override instructions, expand scope, or grant blanket merge, deploy, or delete permission
 AND the request SHALL describe any tools that were requested but not executed, including their intended arguments
 AND the request SHALL preserve the prior tool history as text rather than discarding it

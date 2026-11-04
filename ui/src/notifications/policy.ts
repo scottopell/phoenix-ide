@@ -10,12 +10,18 @@
 
 import type { Conversation, ConversationState, NotificationSettings } from '../api';
 import { isAgentWorking, parseConversationState } from '../utils';
+import type { ReminderNotification } from '../generated/ReminderNotification';
+import type { ReminderNotificationTarget } from '../generated/ReminderNotificationTarget';
+
+export type NotificationTarget = { id: string; slug: string | null; kind?: 'ordinary' | 'coordinator' };
+export type NotificationDedupeKey = { kind: 'attention'; key: string } | { kind: 'reminder'; id: string } | null;
 
 export type NotificationEventType =
   | 'task_approval_needed'
   | 'question_asked'
   | 'agent_error'
-  | 'agent_finished';
+  | 'agent_finished'
+  | 'reminder_due';
 
 export const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = {
   enabled: true,
@@ -23,6 +29,7 @@ export const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = {
   notify_question: true,
   notify_error: true,
   notify_idle: true,
+  notify_reminder: true,
 };
 
 const DISABLED_NOTIFICATION_SETTINGS: NotificationSettings = {
@@ -39,10 +46,10 @@ export type SettingsStatus = 'unloaded' | 'loading' | 'loaded' | 'failed';
 // A notification candidate derived from a conversation's state. Not every
 // candidate is delivered — delivery is gated by `decideDelivery`.
 export type PolicyNotificationEvent = {
-  type: NotificationEventType;
+  type: Exclude<NotificationEventType, 'reminder_due'>;
   title: string;
   conversation: Conversation;
-};
+} | { type: 'reminder_due'; title: string; conversation: ReminderNotificationTarget; reminderId: string; text: string };
 
 export type NotificationPolicyState = {
   settingsStatus: SettingsStatus;
@@ -67,6 +74,8 @@ export type NotificationPolicyState = {
   // Last delivered blocking attention key per conversation, used to dedupe
   // live SSE delivery against list-refresh catch-up.
   attentionSeenByConversationId: Map<string, string>;
+  reminderFeedSeeded: boolean;
+  reminderSeenIds: Set<string>;
 };
 
 // Ambient browser facts the reducer needs to decide delivery. Supplied by
@@ -89,7 +98,8 @@ export type NotificationPolicyEvent =
   | { type: 'conversation_state_changed'; conversation: Conversation; previousState: ConversationState | undefined; nextState: ConversationState }
   | { type: 'conversation_snapshot_seeded'; conversation: Conversation; state: ConversationState }
   | { type: 'catchup_scan'; conversations: readonly Conversation[] }
-  | { type: 'notification_delivery_failed'; conversationId: string; attentionKey: string | null }
+  | { type: 'reminder_feed'; items: readonly ReminderNotification[] }
+  | { type: 'notification_delivery_failed'; conversationId: string; dedupeKey: NotificationDedupeKey }
   | { type: 'permission_cue_consumed' };
 
 export type NotificationEffect =
@@ -100,11 +110,10 @@ export type NotificationEffect =
       title: string;
       body: string;
       tag: string;
-      conversation: Conversation;
+      conversation: NotificationTarget;
       // Carried through so a failed `new Notification(...)` can roll back the
-      // dedupe mark the reducer set optimistically. Null for completions,
-      // which are never deduped.
-      attentionKey: string | null;
+      // dedupe mark the reducer set optimistically. Null for completions.
+      dedupeKey: NotificationDedupeKey;
     };
 
 export type ReduceResult = { state: NotificationPolicyState; effects: NotificationEffect[] };
@@ -120,6 +129,8 @@ export function initialPolicyState(): NotificationPolicyState {
     permissionCuePending: false,
     busyStartedAtByConversationId: new Map(),
     attentionSeenByConversationId: new Map(),
+    reminderFeedSeeded: false,
+    reminderSeenIds: new Set(),
   };
 }
 
@@ -130,6 +141,7 @@ function eventTypeEnabled(type: NotificationEventType, settings: NotificationSet
     case 'question_asked': return settings.notify_question;
     case 'agent_error': return settings.notify_error;
     case 'agent_finished': return settings.notify_idle;
+    case 'reminder_due': return settings.notify_reminder;
   }
 }
 
@@ -158,6 +170,7 @@ export function eventForState(state: ConversationState, conversation: Conversati
 // completion is independently notification-worthy.
 export function attentionKeyFor(event: PolicyNotificationEvent): string | null {
   if (event.type === 'agent_finished') return null;
+  if (event.type === 'reminder_due') return null;
   if (event.conversation.state?.type === 'recoverable_continuation_failure') {
     const state = event.conversation.state;
     return `${event.conversation.id}:${event.type}:${state.operation_id}:${state.attempt}`;
@@ -169,17 +182,21 @@ export function attentionKeyFor(event: PolicyNotificationEvent): string | null {
 // conversation is a distinct browser notification; blocking states collapse
 // by conversation + event.
 export function notificationTagFor(event: PolicyNotificationEvent): string {
+  if (event.type === 'reminder_due') return `reminder_due:${event.reminderId}`;
   if (event.type === 'agent_finished') {
     return `${event.type}:${event.conversation.id}:${event.conversation.updated_at}`;
   }
   return `${event.type}:${event.conversation.id}`;
 }
 
-function shouldSuppressForFocus(env: NotificationEnv, conversation: Conversation): boolean {
-  return env.visible && env.hasFocus && (env.activeSlug === conversation.slug || env.activeSlug === conversation.id);
+function shouldSuppressForFocus(env: NotificationEnv, conversation: NotificationTarget): boolean {
+  return env.visible && env.hasFocus && env.activeSlug !== null && (env.activeSlug === conversation.slug || env.activeSlug === conversation.id);
 }
 
 function markAttentionSeen(state: NotificationPolicyState, event: PolicyNotificationEvent): NotificationPolicyState {
+  if (event.type === 'reminder_due') {
+    return { ...state, reminderSeenIds: new Set([...state.reminderSeenIds, event.reminderId]) };
+  }
   const key = attentionKeyFor(event);
   if (!key) return state;
   const attentionSeenByConversationId = new Map(state.attentionSeenByConversationId);
@@ -228,15 +245,18 @@ function decideDelivery(state: NotificationPolicyState, env: NotificationEnv, ev
   }
   if (env.permission !== 'granted') return { state, effects: [] };
 
+  const attentionKey = attentionKeyFor(event);
   return {
     state: markAttentionSeen(state, event),
     effects: [{
       type: 'show_browser_notification',
       title: event.title,
-      body: event.conversation.slug,
+      body: event.type === 'reminder_due' ? `${event.conversation.title ?? event.conversation.slug ?? event.conversation.id}\n${event.text}` : (event.conversation.slug ?? event.conversation.id),
       tag: notificationTagFor(event),
       conversation: event.conversation,
-      attentionKey: attentionKeyFor(event),
+      dedupeKey: event.type === 'reminder_due'
+        ? { kind: 'reminder', id: event.reminderId }
+        : attentionKey === null ? null : { kind: 'attention', key: attentionKey },
     }],
   };
 }
@@ -353,9 +373,30 @@ export function notificationPolicyReducer(
     case 'catchup_scan':
       return reduceCatchupScan(state, env, event.conversations);
 
+    case 'reminder_feed': {
+      const currentIds = new Set(event.items.map((item) => item.reminder.id));
+      if (!state.reminderFeedSeeded) {
+        return { state: { ...state, reminderFeedSeeded: true, reminderSeenIds: currentIds }, effects: [] };
+      }
+      let next = state;
+      const effects: NotificationEffect[] = [];
+      for (const item of event.items) {
+        if (next.reminderSeenIds.has(item.reminder.id)) continue;
+        const result = decideDelivery(next, env, { type: 'reminder_due', title: 'Reminder due', conversation: item.target, reminderId: item.reminder.id, text: item.reminder.text });
+        next = result.state;
+        effects.push(...result.effects);
+      }
+      return { state: next, effects };
+    }
+
     case 'notification_delivery_failed': {
-      if (event.attentionKey === null) return { state, effects: [] };
-      if (state.attentionSeenByConversationId.get(event.conversationId) !== event.attentionKey) return { state, effects: [] };
+      if (event.dedupeKey === null) return { state, effects: [] };
+      if (event.dedupeKey.kind === 'reminder') {
+        const reminderSeenIds = new Set(state.reminderSeenIds);
+        reminderSeenIds.delete(event.dedupeKey.id);
+        return { state: { ...state, reminderSeenIds }, effects: [] };
+      }
+      if (state.attentionSeenByConversationId.get(event.conversationId) !== event.dedupeKey.key) return { state, effects: [] };
       return { state: clearAttentionSeen(state, event.conversationId), effects: [] };
     }
 

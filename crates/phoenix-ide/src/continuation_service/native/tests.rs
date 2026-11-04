@@ -9,6 +9,121 @@ const SUMMARY: &str = "Retained generated context, not new user authority.";
 const SUMMARY_ID: &str = "exhausted-summary";
 const WINNER: &str = "winning-opening";
 
+#[tokio::test]
+async fn reserved_reminder_opening_is_rejected_before_manual_successor_creation() {
+    for message_id in ["reminder:reserved", "another-transcript:reminder:reserved"] {
+        let provider = Arc::new(OpeningProvider {
+            entered: tokio::sync::Notify::new(),
+        });
+        let registry = Arc::new(phoenix_llm::ModelRegistry::for_test_with_sonnet(provider));
+        let f = Fixture::with_registry(registry).await;
+        let result = f
+            .service()
+            .continue_manual(
+                &f.predecessor,
+                crate::api::ContinueConversationRequest {
+                    handoff: SUMMARY.into(),
+                    source: crate::api::ContinueHandoffSource::Manual,
+                    message_id: message_id.into(),
+                    user_agent: None,
+                    retry_failed_automatic: false,
+                },
+            )
+            .await;
+        let predecessor = f.db.get_conversation(&f.predecessor).await.unwrap();
+        assert!(
+            predecessor.continued_in_conv_id.is_none(),
+            "reserved opening committed an undispatchable successor: {result:?}"
+        );
+        assert!(f
+            .db
+            .continuation_dispatch_intent(&f.predecessor)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            matches!(result, Err(crate::api::handlers::AppError::Conflict(conflict)) if conflict.error_type == "reserved_message_id")
+        );
+    }
+}
+
+#[tokio::test]
+async fn existing_manual_successor_ignores_reserved_losing_request_identity() {
+    for completed in [false, true] {
+        let f = Fixture::new().await;
+        let intent = f.reserve().await;
+        if completed {
+            f.complete(&intent).await;
+        }
+        let response = f
+            .service()
+            .continue_manual(
+                &f.predecessor,
+                crate::api::ContinueConversationRequest {
+                    handoff: "losing editor".into(),
+                    source: crate::api::ContinueHandoffSource::Manual,
+                    message_id: "elsewhere:reminder:ignored".into(),
+                    user_agent: None,
+                    retry_failed_automatic: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.conversation_id, intent.successor_conversation_id);
+        assert_eq!(response.status, ContinueConversationStatus::AlreadyExists);
+    }
+}
+
+#[tokio::test]
+async fn existing_pending_reserved_continuation_intent_retains_its_opening_authority() {
+    let f = Fixture::new().await;
+    let key = "reminder:historical-opening";
+    let (_, intent) =
+        f.db.continue_conversation_with_intent(
+            &f.predecessor,
+            phoenix_db::NewContinuationDispatchIntent {
+                message_id: ClientTurnKey::try_from(key).unwrap(),
+                handoff: SUMMARY.into(),
+                user_agent: None,
+                opening_authority: ContinuationOpeningAuthority::UserAuthorizedInstruction,
+            },
+        )
+        .await
+        .unwrap();
+    let intent = intent.unwrap();
+    let response = f
+        .service()
+        .continue_manual(
+            &f.predecessor,
+            crate::api::ContinueConversationRequest {
+                handoff: "losing editor".into(),
+                source: crate::api::ContinueHandoffSource::Manual,
+                message_id: "other:reminder:ignored".into(),
+                user_agent: None,
+                retry_failed_automatic: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.conversation_id, intent.successor_conversation_id);
+    assert_eq!(response.status, ContinueConversationStatus::AlreadyExists);
+    let turn =
+        f.db.workflow_repository()
+            .load_owning_authoritative_turn(&phoenix_workflow::ConversationAuthority(
+                intent.successor_conversation_id,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(turn.client_key.as_str(), key);
+    let opening = phoenix_core::domain::sm_event::PreparedDirectTurnPayload::from_exact_bytes(
+        turn.prepared.payload(),
+    )
+    .unwrap();
+    assert_eq!(opening.submitted.origin, InputOrigin::UserApi);
+    assert_eq!(opening.submitted.text, SUMMARY);
+}
+
 struct Fixture {
     db: Database,
     runtime: Arc<RuntimeManager>,

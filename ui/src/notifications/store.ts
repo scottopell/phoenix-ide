@@ -27,8 +27,8 @@ export function registerCoordinatorNotificationTarget(conversationId: string): v
   coordinatorConversationIds.add(conversationId);
 }
 
-export function notificationRoute(conversation: { id: string; slug?: string | null }): string {
-  return coordinatorConversationIds.has(conversation.id)
+export function notificationRoute(conversation: { id: string; slug?: string | null; kind?: 'ordinary' | 'coordinator' }): string {
+  return conversation.kind === 'coordinator' || coordinatorConversationIds.has(conversation.id)
     ? `/global/${conversation.id}`
     : `/c/${conversation.slug ?? conversation.id}`;
 }
@@ -140,7 +140,7 @@ export class NotificationStore {
           this.dispatch({
             type: 'notification_delivery_failed',
             conversationId: effect.conversation.id,
-            attentionKey: effect.attentionKey,
+            dedupeKey: effect.dedupeKey,
           });
         }
         return;

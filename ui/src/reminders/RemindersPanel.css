@@ -1,0 +1,105 @@
+.reminders-panel {
+  margin: 0.5rem 1rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  font-size: 0.85rem;
+  max-height: 30vh;
+  overflow: auto;
+  flex-shrink: 0;
+}
+
+.reminders-panel h2 {
+  margin: 0 0 0.5rem;
+  font-size: 0.95rem;
+}
+
+.reminders-panel ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.reminder-card {
+  padding: 0.5rem;
+  border-left: 3px solid var(--border-color);
+  overflow-wrap: anywhere;
+}
+
+.reminder-card--due {
+  border-left-color: var(--accent-color, #c88a31);
+  background: rgb(200 138 49 / 8%);
+}
+
+.reminder-card--cancelled {
+  opacity: 0.7;
+}
+
+.reminder-card p {
+  margin: 0.25rem 0;
+  white-space: pre-wrap;
+}
+
+.reminder-card time {
+  display: block;
+  color: var(--text-secondary);
+}
+
+.reminder-card__state {
+  font-weight: 600;
+}
+
+.reminder-card__actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-top: 0.5rem;
+}
+
+.reminder-edit {
+  display: grid;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.reminder-edit label {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.reminder-edit input {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.reminders-panel button,
+.reminder-edit input {
+  padding: 0.35rem 0.5rem;
+  color: var(--text-primary);
+  font: inherit;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+}
+
+.reminders-panel button {
+  cursor: pointer;
+}
+
+.reminders-panel button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.reminders-panel button:focus-visible,
+.reminder-edit input:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
+}
+
+.reminders-panel button:hover:not(:disabled) {
+  background: var(--bg-tertiary);
+}

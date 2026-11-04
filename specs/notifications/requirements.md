@@ -59,7 +59,7 @@ THE SYSTEM SHALL display an in-app toast with the failure reason, styled distinc
 WHEN the failure happens because of an external service Phoenix doesn't control (e.g., MCP server not responding)
 THE SYSTEM SHALL include enough context in the toast for the user to know which thing failed (server name, operation name)
 
-**Rationale:** A silently-failing button is the worst outcome — the user doesn't know whether to wait, retry, or work around. The error toast is the floor: it doesn't have to explain how to fix the problem, just confirm that one happened. The `console.error`-only path that PR #56 documented (REQ-TPANEL-009) is the anti-pattern: invisible to the user, only visible to people inspecting devtools.
+**Rationale:** A silently-failing button leaves the user unsure whether to wait, retry, or work around. The error toast confirms the failure even when it cannot explain a fix. Reporting a failure only through `console.error` leaves it invisible in the application.
 
 ---
 
@@ -116,7 +116,7 @@ THE SYSTEM SHALL continue to render in-app toasts (REQ-NOTIF-001/002) regardless
 THE SYSTEM SHALL provide a settings panel reachable from the sidebar or StateBar where I can:
 
 - Enable or disable browser notifications globally (master toggle)
-- Toggle each event type independently (task approval, question, agent error, agent finished)
+- Toggle each event type independently (task approval, question, agent error, agent finished, reminder due)
 - See current browser notification permission status (granted / denied / not yet asked)
 - Request browser permission when status is `default` (not yet asked) — the OS-level permission cannot be re-prompted programmatically once denied; the UI shows guidance to change it in browser settings instead
 
@@ -170,3 +170,18 @@ WHEN the Phoenix server restarts
 THE SYSTEM SHALL restore preferences from durable storage on startup
 
 **Rationale:** Notification preferences are a tuning decision the user makes once and expects to persist. Storing them in localStorage means the user re-tunes after every browser clear and the preferences don't follow them across devices. Server-side storage is the correct durability tier for "I configured this; remember it."
+
+
+### REQ-NOTIF-010: Connected-page reminder alerts
+
+WHEN the connected browser observes a new durable due reminder after its initial feed baseline
+THE SYSTEM SHALL offer a distinct reminder-due browser notification through the master, reminder-event, permission and active-conversation focus gates
+AND SHALL identify that saved reminder independently of agent completion or its duration threshold
+AND SHALL retain per-reminder deduplication independently of conversation attention events during the connected page lifetime.
+
+WHEN the browser first reads the recent due feed
+THE SYSTEM SHALL quietly establish the baseline rather than replay existing reminder history as popups.
+
+The recent feed SHALL include due facts independently of input admission or model success, SHALL resolve the current ordinary or Coordinator target, and SHALL exclude final History from new alerts. Its bounded notification window SHALL use actual due observation time so late discovery does not hide an old scheduled deadline. Feed paging SHALL restart on each refresh so a late-observed occurrence cannot fall behind a prior scan's deadline cursor.
+
+Reminder alerts SHALL be best-effort while the page is connected. Durable owner-scoped reminder cards and ordinary conversation input SHALL remain available independently of notification settings and the recent alert window. The system SHALL NOT claim closed-app phone delivery.

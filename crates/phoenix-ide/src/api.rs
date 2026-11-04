@@ -25,6 +25,7 @@ pub(crate) mod pr_monitoring;
 mod process_sample;
 pub(crate) mod product_conversations;
 mod release_updates;
+mod reminders;
 pub(crate) mod resource_monitor;
 mod share_svg_artifacts;
 mod spa_routes;

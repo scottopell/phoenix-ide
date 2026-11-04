@@ -14,6 +14,7 @@ pub mod process_inspection;
 mod propose_task;
 mod read_file;
 mod read_image;
+pub mod reminders;
 mod search;
 mod skill;
 mod subagent;
@@ -45,6 +46,7 @@ pub use present_svg::{
 pub use propose_task::ProposeTaskTool;
 pub use read_file::ReadFileTool;
 pub use read_image::ReadImageTool;
+pub use reminders::RemindersTool;
 pub use search::SearchTool;
 pub use skill::SkillTool;
 pub use subagent::{SpawnAgentsTool, SpawnModelChoice, SubmitErrorTool, SubmitResultTool};

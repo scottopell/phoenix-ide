@@ -86,7 +86,7 @@ final class ConversationSession {
 
     /// Bump when Snapshot's persisted shape changes incompatibly (DiskStore
     /// versioning rule). Additive-optional fields (syncedAt) need no bump.
-    private static let snapshotSchemaVersion = 2
+    private static let snapshotSchemaVersion = 3
 
     private struct Snapshot: Codable, Sendable {
         var conversation: Conversation?
@@ -99,14 +99,14 @@ final class ConversationSession {
         var syncedAt: Date?
     }
 
-    private struct SnapshotV1Envelope: Decodable {
+    private struct PriorSnapshotEnvelope: Decodable {
         var payload: Snapshot
     }
 
     private static func loadSnapshot(name: String) -> Snapshot? {
         DiskStore.loadVersioned(Snapshot.self, name: name, version: snapshotSchemaVersion) { version, data in
-            guard version == 1 else { return nil }
-            return try? JSONDecoder().decode(SnapshotV1Envelope.self, from: data).payload
+            guard version == 1 || version == 2 else { return nil }
+            return try? JSONDecoder().decode(PriorSnapshotEnvelope.self, from: data).payload
         }
     }
 

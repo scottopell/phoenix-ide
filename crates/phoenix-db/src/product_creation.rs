@@ -145,6 +145,7 @@ impl ProductCreationOrigin {
             | InputOrigin::InternalConversation { .. }
             | InputOrigin::SystemGenerated
             | InputOrigin::SlackGateway { .. }
+            | InputOrigin::ScheduledReminder { .. }
             | InputOrigin::SubscriptionEvent { .. }
             | InputOrigin::RemoteApi { .. }
             | InputOrigin::RemoteConversation { .. }
