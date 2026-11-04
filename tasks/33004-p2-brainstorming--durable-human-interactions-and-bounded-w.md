@@ -36,16 +36,20 @@ This task records an investigated proposal, not approval of a particular cleanup
 
 Task identity: this task replaces provisional task 33001 from the older detached checkout. After moving to the design/coordinator-authority branch at origin/main (64a6f23d084e6927d3a5aca6f8225c345e14014e), 33001 was already allocated upstream to remove-durable-wake. The same task body was reallocated atomically with taskmd new as 33003, in-progress, and the duplicate provisional file was removed only after verifying identical contents. The user explicitly approved the Authority direction and requested in-progress status and specification/design investigation; this does not commission production changes.
 
-Read-only investigation on 2026-11-03. Checkout HEAD 27c514034, clean detached worktree at /Users/scottopell/.codex-workspaces/worktrees/ios-88e63b9a-876b-4617-aec7-657ee19a8fbc/phoenix-ide. Local production deployed.sha was ce4b0bffdad0b11eb156d91c3584ff8767f60a02; relevant deployed source was inspected with git show because it is materially newer than this checkout. Query production SQLite read-only; never copy the full DB for this task. Delivery roadmap #806 was read; it contains disk-cleanup status but is not the permission authority. Implementation must re-ground on current main/deployed contracts rather than applying the old checkout's capability assumptions.
+A bounded read-only production investigation used a clean detached local checkout at HEAD 27c514034. Local production deployed.sha was ce4b0bffdad0b11eb156d91c3584ff8767f60a02; relevant deployed source was inspected with git show because it is materially newer than this checkout. Query production SQLite read-only; never copy the full DB for this task. Delivery roadmap #806 was read; it contains disk-cleanup status but is not the permission authority. Implementation must re-ground on current main/deployed contracts rather than applying the old checkout's capability assumptions.
 
 User approves cleanup -> Ember interprets scope -> delegates to existing disk/execution owners -> user authority and exclusions are copied into prompts/handoffs -> new targets or contexts trigger another approval packet. There is no dedicated standing-authority charter in the inspected Coordinator prompt path.
 
 ## Verified evidence
 
-- Production primary user input 6c01967a-6c9b-4b70-973b-b761cc13761e, transcript ee39d71c-4828-44bc-818b-1db991d84fcf, 2026-10-27T00:29:30.541243Z, ends: "approved, I want to issue blanket approval, this is cache and easily removable". It appears as free text accompanying a narrowly scoped generated answer preview. The model must reconcile those two meanings.
-- Ember response 7aa23018-caeb-4b72-a732-3c671edaa056 in that transcript, 2026-10-27T00:32:36.044742Z, reports clearing three additional disposable Tools caches "under your standing permission". This disproves a pure never-recognized-approval explanation.
-- Production primary user answers 3d9fe394-6729-4522-8244-858b354acfca (2026-11-02T12:45:04Z) and 1d032178-4ce5-466e-bda4-433551e9731a (2026-11-03T00:13:27Z) approve individual file/batch cleanup packets. Whether any intervening human restriction narrowed the October grant has NOT been exhaustively adjudicated. Do not backfill authority from this sample.
-- Response aa32e74a-5d18-4668-a7cc-51674a266f3a, transcript cc641b4c-880b-40d5-91da-d8d493888143, reports the batch complete and concludes "No additional deletion is authorized." An assistant report must not itself become a user revocation.
+- A bounded read-only sample contained three primary user inputs and two
+  Coordinator responses. It showed a standing cleanup grant, a response reporting
+  action under that grant, and later individual approval requests for the same
+  broad action class.
+- One response's completion wording could be mistaken for a restriction; an
+  assistant report must not itself become a user revocation.
+- Intervening human restrictions were not exhaustively adjudicated. This sample
+  does not establish current Authority and must not be imported as a grant.
 - Deployed coordinator_prompt in phoenix-core/src/llm_language.rs already says to avoid redundant permissions and continue within verified authority, but also says "No new scope or blanket merge, deploy or delete permission." Its security guidance requires recovering authentic primary input and later supersession, and denies authority to summaries, quotes, and delegate claims.
 - Deployed coordinator_home::context explicitly says notes and files never confer authority; they are deliberately retrieved historical data. notes.md is therefore not an adequate authoritative-policy workaround.
 - Coordinator request construction is in system_prompt::build_coordinator_system_prompt and ConversationRuntime::dispatch_llm_request; system-prompt inspection is a separate handler and must remain consistent. Continuation CompactionPolicy prioritizes scoped authority but is still model-generated text.

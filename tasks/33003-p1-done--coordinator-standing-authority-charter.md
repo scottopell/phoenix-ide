@@ -52,22 +52,21 @@ from database correctness.
 
 ## Observed problem and evidence
 
-Read-only production investigation on 2026-11-03 used deployed source ce4b0bff
+A bounded read-only production investigation used deployed source ce4b0bff
 and primary user messages. Source implementation work is on
 `design/coordinator-authority` based on origin/main 64a6f23d0. The original old
 checkout allocated provisional task 33001, already used upstream; taskmd
-reallocated this task 33003. The full historical evidence and superseded larger
+reallocated this task 33003. Sanitized historical observations and the superseded larger
 proposal are preserved in task 33004.
 
-- Primary user input 6c01967a-6c9b-4b70-973b-b761cc13761e in transcript
-  ee39d71c-4828-44bc-818b-1db991d84fcf, 2026-10-27T00:29:30Z, says:
-  "approved, I want to issue blanket approval, this is cache and easily removable".
-- Ember response 7aa23018-caeb-4b72-a732-3c671edaa056 reports clearing additional
-  caches under that standing permission. It did recognize the approval.
-- Later individual file/batch approvals 3d9fe394-6729-4522-8244-858b354acfca
-  and 1d032178-4ce5-466e-bda4-433551e9731a show recurring scope reconstruction.
-  Intervening human restrictions were not exhaustively adjudicated; do not
-  import a grant from this sample.
+- A bounded read-only sample contained three primary user inputs and two
+  Coordinator responses. It showed a standing cleanup grant, a response reporting
+  action under that grant, and later individual approval requests for the same
+  broad action class.
+- One response's completion wording could be mistaken for a restriction; an
+  assistant report must not itself become a user revocation.
+- Intervening human restrictions were not exhaustively adjudicated. This sample
+  does not establish current Authority and must not be imported as a grant.
 - Existing prompts ask for confident action yet prohibit invented blanket
   permission. Explicit saved Authority must be distinguished from historical
   claims; deliberately user-granted broad authority is allowed.
