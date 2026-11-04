@@ -167,3 +167,21 @@ Prompt assertions do not establish human-approval compliance in live LLM use.
 No existing historical cleanup approval has been imported into saved Authority.
 Implementation and bounded local qualification are complete; PR review/hosted
 CI and any later merge/deployment remain separate delivery states.
+
+## Adversarial review follow-up
+
+The isolated local code/spec review found no actionable code defects at
+`7258b21e6...4a50fa21d`; a subsequent artifact check sanitized production evidence
+in the task notes. GitHub review comment 4472022056 claimed a write-worker panic
+would leave admission open. The existing `AuthorityWritePass` receiver lives
+across the awaited persistence argument, and its destructor closes admission
+before releasing its owner. A standalone exact-guard probe and two actual-module
+regressions disproved that failure mechanism. The regressions suspend a synthetic
+persistence future, then panic or cancel the worker; they assert one owner at
+first closure and refusal of further admission. They do not inject SQLite faults.
+
+All eight Authority tool tests passed after rebuilding, including those two
+regressions. Clippy, formatting and task validation passed again (137.6s). No
+production implementation change was needed for the panic finding. Hosted CI at
+`4a50fa21d` passed all four Rust shards and other applicable checks; qualification
+of later review commits is reported separately on PR #1026.

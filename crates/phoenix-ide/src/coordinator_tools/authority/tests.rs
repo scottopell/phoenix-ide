@@ -240,3 +240,52 @@ async fn authority_unclassified_write_closes_admission_before_owner_release() {
     assert!(runtime.local_authority_is_closed());
     assert!(runtime.acquire_local_authority_pass().is_err());
 }
+
+async fn suspended_authority_write(
+    runtime: &Arc<RuntimeManager>,
+) -> (
+    tokio::task::JoinHandle<Result<(), String>>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let owner = runtime.acquire_local_authority_pass().unwrap();
+    let (at_boundary, waiting) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let worker = tokio::spawn(async move {
+        AuthorityWritePass { owner: Some(owner) }.classify::<()>(
+            async {
+                at_boundary.send(()).unwrap();
+                released.await.unwrap();
+                panic!("synthetic persistence future panic");
+            }
+            .await,
+        )
+    });
+    waiting.await.unwrap();
+    assert!(!runtime.local_authority_is_closed());
+    assert_eq!(runtime.fatal_authority_owners_at_first_close(), None);
+    (worker, release)
+}
+
+fn assert_authority_closed_before_owner_release(runtime: &RuntimeManager) {
+    assert!(runtime.local_authority_is_closed());
+    assert_eq!(runtime.fatal_authority_owners_at_first_close(), Some(1));
+    assert!(runtime.acquire_local_authority_pass().is_err());
+}
+
+#[tokio::test]
+async fn authority_awaited_write_panic_closes_admission_before_owner_release() {
+    let (runtime, _, _) = native_runtime().await;
+    let (worker, release) = suspended_authority_write(&runtime).await;
+    release.send(()).unwrap();
+    assert!(worker.await.unwrap_err().is_panic());
+    assert_authority_closed_before_owner_release(&runtime);
+}
+
+#[tokio::test]
+async fn authority_awaited_write_abort_closes_admission_before_owner_release() {
+    let (runtime, _, _) = native_runtime().await;
+    let (worker, _release) = suspended_authority_write(&runtime).await;
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+    assert_authority_closed_before_owner_release(&runtime);
+}

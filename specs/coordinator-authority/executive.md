@@ -50,6 +50,10 @@ Current-source validation occurs inside the committing transaction; source
 rotation tests use an already-rotated source rather than an injected transaction
 race. Cancellation coverage drops the requester before write admission, and lost
 commit acknowledgement is simulated rather than a SQLite fault injection.
+Additional write-guard regressions suspend a synthetic persistence future, then
+panic or abort the worker. Both establish that admission closes with the owner
+still held and that new admission is refused; they do not inject a fault into
+SQLite itself.
 
 All 31 system-prompt tests, application test-target compilation, formatting,
 Allium, requirement anchors and task validation passed before integration with
