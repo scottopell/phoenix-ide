@@ -5117,6 +5117,7 @@ impl RuntimeManager {
                 .map_err(|error| error.to_string())?,
         );
         coordinator_tools.extend(crate::coordinator_tools::goal_tools(self));
+        coordinator_tools.extend(crate::coordinator_tools::authority_tools(self));
         Ok(ToolRegistry::coordinator(coordinator_tools, catalog))
     }
 

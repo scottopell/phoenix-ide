@@ -10,6 +10,7 @@ use phoenix_core::domain::tool_round::{tool_result_message, ToolRoundAssembly, T
 mod slack_gateway;
 pub use slack_gateway::*;
 mod close_foundation;
+mod coordinator_authority;
 mod coordinator_query;
 mod coordinator_watches;
 mod coordinator_work_scope;
