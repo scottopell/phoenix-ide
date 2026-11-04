@@ -5883,8 +5883,8 @@ where
             .iter()
             .map(|task| task.mode.unwrap_or_default())
             .collect();
-        let parent_allows_work =
-            self.context.resource_authority == crate::work_scope::ResourceAuthority::Work;
+        let parent_allows_work = !self.context.is_coordinator
+            && self.context.resource_authority == crate::work_scope::ResourceAuthority::Work;
 
         let mut work_count_in_batch = 0u32;
         for &mode in &resolved_tasks {
@@ -5947,53 +5947,72 @@ where
         let mut specs: Vec<SubAgentSpec> = Vec::with_capacity(input.tasks.len());
 
         for (task, &mode) in input.tasks.iter().zip(&resolved_tasks) {
+            use phoenix_core::domain::sm_state::ConversationExecutionEnvironment;
             let cwd_override = nonblank(task.cwd.as_deref());
-            let cwd_path = cwd_override.map_or_else(
-                || self.context.filesystem_root().to_path_buf(),
-                |cwd| {
-                    let path = std::path::Path::new(cwd);
-                    if path.is_absolute() {
-                        path.to_path_buf()
-                    } else {
-                        self.context.filesystem_root().join(path)
+            let environment = if self.context.is_coordinator {
+                if task.cwd.is_some() {
+                    return Ok(Some(Event::ToolComplete {
+                        tool_use_id: tool_use_id.clone(),
+                        result: ToolResult::error(
+                            tool_use_id,
+                            "Coordinator research agents have no filesystem; omit cwd".into(),
+                        ),
+                    }));
+                }
+                ConversationExecutionEnvironment::NoFilesystem
+            } else {
+                let cwd_path = cwd_override.map_or_else(
+                    || self.context.filesystem_root().to_path_buf(),
+                    |cwd| {
+                        let path = std::path::Path::new(cwd);
+                        if path.is_absolute() {
+                            path.to_path_buf()
+                        } else {
+                            self.context.filesystem_root().join(path)
+                        }
+                    },
+                );
+                let cwd = match crate::conversation_cwd::validate_conversation_cwd(
+                    cwd_path.to_string_lossy(),
+                ) {
+                    Ok(valid) => valid.into_raw(),
+                    Err(e) => {
+                        let result = ToolResult::error(
+                            tool_use_id.clone(),
+                            format!("Invalid sub-agent working directory: {e}"),
+                        );
+                        return Ok(Some(Event::ToolComplete {
+                            tool_use_id,
+                            result,
+                        }));
                     }
-                },
-            );
-            let cwd = match crate::conversation_cwd::validate_conversation_cwd(
-                cwd_path.to_string_lossy(),
-            ) {
-                Ok(valid) => valid.into_raw(),
-                Err(e) => {
+                };
+
+                if mode == SubAgentMode::Work
+                    && parent_worktree_path
+                        .as_deref()
+                        .is_some_and(|root| !path_is_within(&cwd, root))
+                {
+                    let worktree_root =
+                        parent_worktree_path.as_deref().expect("checked as present");
                     let result = ToolResult::error(
                         tool_use_id.clone(),
-                        format!("Invalid sub-agent working directory: {e}"),
+                        format!(
+                            "Work sub-agent cwd '{cwd}' must be inside the parent's worktree \
+                         '{worktree_root}'. Omit `cwd` to inherit the worktree, or pass a path \
+                         that resolves under it."
+                        ),
                     );
                     return Ok(Some(Event::ToolComplete {
                         tool_use_id,
                         result,
                     }));
                 }
-            };
 
-            if mode == SubAgentMode::Work
-                && parent_worktree_path
-                    .as_deref()
-                    .is_some_and(|root| !path_is_within(&cwd, root))
-            {
-                let worktree_root = parent_worktree_path.as_deref().expect("checked as present");
-                let result = ToolResult::error(
-                    tool_use_id.clone(),
-                    format!(
-                        "Work sub-agent cwd '{cwd}' must be inside the parent's worktree \
-                         '{worktree_root}'. Omit `cwd` to inherit the worktree, or pass a path \
-                         that resolves under it."
-                    ),
-                );
-                return Ok(Some(Event::ToolComplete {
-                    tool_use_id,
-                    result,
-                }));
-            }
+                ConversationExecutionEnvironment::Filesystem {
+                    working_dir: cwd.into(),
+                }
+            };
 
             let selected = match catalog.select(
                 task.agent_type.as_deref(),
@@ -6036,7 +6055,7 @@ where
             specs.push(SubAgentSpec {
                 agent_id: uuid::Uuid::new_v4().to_string(),
                 task: task.task.clone(),
-                cwd,
+                environment,
                 timeout: DEFAULT_SUBAGENT_TIMEOUT,
                 mode,
                 model_id: selected.execution.model,
@@ -8948,6 +8967,7 @@ where
             let definition = catalog.tool_definition(
                 &self.context.model_id,
                 self.llm_registry.is_builtin_model(&self.context.model_id),
+                self.context.is_coordinator,
             );
             if !advertised || definition.input_schema != request_schema {
                 return Ok(Some(Event::ToolComplete {
@@ -9047,6 +9067,8 @@ where
                     self.llm_registry.clone(),
                     self.terminals.clone(),
                     self.tmux_registry.clone(),
+                    self.context.resource_scope.clone(),
+                    self.context.resource_authority,
                 )
             }
         }
@@ -9743,6 +9765,7 @@ where
             *tool = catalog.tool_definition(
                 &self.context.model_id,
                 self.llm_registry.is_builtin_model(&self.context.model_id),
+                is_coordinator,
             );
             self.spawn_catalog = Some(catalog);
             self.spawn_parent_parallel_work_qualified = Some(
@@ -9770,6 +9793,11 @@ where
                 llm_language,
                 tool_executor.coordinator_skill_catalog().as_ref(),
                 &authority,
+            )
+        } else if is_sub_agent && working_dir.is_none() {
+            crate::system_prompt::build_coordinator_research_prompt(
+                llm_language,
+                persona.as_deref(),
             )
         } else {
             let turn_context = self.ordinary_turn_context.get_or_insert_with(|| {
@@ -26756,7 +26784,7 @@ mod work_subagent_cwd_guard_tests {
                 &template.agent_config,
                 template.llm_registry.available_execution_routes(),
             )
-            .tool_definition("gpt-5.6-sol", true);
+            .tool_definition("gpt-5.6-sol", true, false);
             let call = spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "implement the fix".into(),
@@ -27370,9 +27398,84 @@ mod work_subagent_cwd_guard_tests {
         assert_eq!(specs[0].effort, rt.context.effort);
         assert_eq!(specs[0].mode, SubAgentMode::Explore);
         assert_eq!(
-            std::fs::canonicalize(&specs[0].cwd).unwrap(),
+            std::fs::canonicalize(specs[0].environment.working_dir().unwrap()).unwrap(),
             std::fs::canonicalize(parent.path()).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn coordinator_spawns_parallel_research_without_a_cwd() {
+        let parent = TempDir::new().unwrap();
+        let (spawn_tx, spawn_rx) = mpsc::channel(1);
+        let (cancel_tx, _) = mpsc::channel(1);
+        let mut rt = runtime_in_direct_mode(parent.path()).with_spawn_channels(spawn_tx, cancel_tx);
+        rt.context = ConvContext::coordinator("coordinator", "gpt-5.6-sol", 200_000, 16_384);
+        let responder = tokio::spawn(accept_spawn_batch(spawn_rx));
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: (0..2)
+                    .map(|i| SubAgentTask {
+                        task: format!("Research question {i}"),
+                        cwd: None,
+                        mode: None,
+                        execution: None,
+                        max_turns: None,
+                        agent_type: None,
+                    })
+                    .collect(),
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(result, Some(Event::SpawnAgentsComplete { .. })));
+        let specs = responder.await.unwrap();
+        assert_eq!(specs.len(), 2);
+        for spec in specs {
+            assert_eq!(
+                spec.environment,
+                phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem
+            );
+            assert_eq!(spec.mode, SubAgentMode::Explore);
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_rejects_work_and_cwd_before_any_batch_admission() {
+        let parent = TempDir::new().unwrap();
+        for (mode, cwd) in [
+            (Some(SubAgentMode::Work), None),
+            (None, Some("/tmp".into())),
+            (None, Some("".into())),
+        ] {
+            let (spawn_tx, mut spawn_rx) = mpsc::channel(1);
+            let (cancel_tx, _) = mpsc::channel(1);
+            let mut rt =
+                runtime_in_direct_mode(parent.path()).with_spawn_channels(spawn_tx, cancel_tx);
+            rt.context = ConvContext::coordinator("coordinator", "gpt-5.6-sol", 200_000, 16_384);
+            let result = rt
+                .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                    tasks: vec![SubAgentTask {
+                        task: "Research".into(),
+                        cwd,
+                        mode,
+                        execution: None,
+                        max_turns: None,
+                        agent_type: None,
+                    }],
+                }))
+                .await
+                .unwrap();
+            assert!(matches!(
+                result,
+                Some(Event::ToolComplete {
+                    result: ToolResult {
+                        outcome: ToolOutcome::Error { .. },
+                        ..
+                    },
+                    ..
+                })
+            ));
+            assert!(spawn_rx.try_recv().is_err());
+        }
     }
 
     #[tokio::test]

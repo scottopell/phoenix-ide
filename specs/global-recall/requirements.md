@@ -4,7 +4,7 @@
 
 As a Phoenix user, I often have several unrelated streams of work active across projects, continuation chains, and standalone conversations. I want one durable Phoenix-wide conversation where I can survey that work, inspect relevant history, and send useful text guidance to existing conversations without opening and operating each one manually.
 
-The Coordinator is an open-ended cross-conversation console, not a manager for one global objective. It queries current-work facts on demand, selectively reads source conversations, and may communicate through the same message acceptance path used by the ordinary chat composer. Write-capable ordinary ProductConversations may use bounded global evidence and singular cross-conversation messaging on explicit turns, while restricted planning conversations and sub-agents remain scoped. Structurally, Phoenix models Coordinator identity separately from ordinary product-conversation lifecycle rows: ordinary parent transcript rows participate in the Open/History product lifecycle and WorkScope model, while the Coordinator retains normal transcript persistence, continuation, and message runtime without any ProductConversation Open/History lifecycle or ordinary Close/Delete controls. Sub-agents remain a separate execution kind and are not Coordinators.
+The Coordinator is an open-ended cross-conversation console, not a manager for one global objective. It queries current-work facts on demand, selectively reads source conversations, and may communicate through the same message acceptance path used by the ordinary chat composer. Write-capable ordinary ProductConversations may use bounded global evidence and singular cross-conversation messaging on explicit turns, while restricted planning conversations and ordinary sub-agents remain scoped. The Coordinator may delegate bounded global research to read-only inline children. Structurally, Phoenix models Coordinator identity separately from ordinary product-conversation lifecycle rows: ordinary parent transcript rows participate in the Open/History product lifecycle and WorkScope model, while the Coordinator retains normal transcript persistence, continuation, and message runtime without any ProductConversation Open/History lifecycle or ordinary Close/Delete controls. Sub-agents remain a separate execution kind and are not Coordinators.
 
 ## Why the User Cares
 
@@ -12,7 +12,7 @@ The Coordinator is an open-ended cross-conversation console, not a manager for o
 - **Long-running work should not fragment identity.** A continuation chain represents one work item even though it spans multiple conversations.
 - **Intervention should be narrow and trustworthy.** The Coordinator may send text to existing conversations, while the receiving conversation's authoritative state determines whether the message starts immediately, becomes steering, or is rejected.
 - **Committed actions should be truthful.** When reporting a delivery, the Coordinator distinguishes each target's acceptance from another agent's understanding, execution, or completion.
-- **Global access should be deliberate and bounded.** Write-capable ordinary ProductConversations and the Coordinator may inspect Phoenix-wide evidence and send singular messages; restricted planning conversations and sub-agents remain scoped.
+- **Global access should be deliberate and bounded.** Write-capable ordinary ProductConversations and the Coordinator may inspect Phoenix-wide evidence and send singular messages; Coordinator research children receive only bounded global reads, while restricted planning conversations and ordinary sub-agents remain scoped.
 
 ## Transparency Contract
 
@@ -118,8 +118,18 @@ THE SYSTEM SHALL reject the entire operation before mutating any chain member
 WHILE a write-capable ordinary ProductConversation or the Coordinator is answering a user request
 THE SYSTEM MAY provide host-bound tools for global message search across Phoenix's own ProductConversation/transcript/message corpus, bounded transcript reads, bounded read-only database queries, and singular cross-conversation messaging
 
-WHILE a restricted planning conversation or sub-agent is running
+WHILE a restricted planning conversation or a sub-agent of an ordinary conversation is running
 THE SYSTEM SHALL NOT provide Phoenix-wide history search, global conversation reads, database queries, global reference resolution, or cross-conversation messaging tools
+
+WHEN the Global Coordinator delegates bounded research or analysis through `spawn_agents`
+THE SYSTEM SHALL provide inline read-only research children with bounded global history search, conversation reads, database queries, and reference resolution
+AND SHALL give those children no filesystem environment, WorkScope attachment, Bash, browser, MCP, messaging, subscriptions, skills, Authority updates, task approval, lifecycle mutation, or recursive delegation capabilities
+AND SHALL reject Work mode and filesystem overrides before admitting any child
+AND SHALL use the normal sub-agent limits, cancellation, terminal submission, and parent fan-in
+AND SHALL restore the research capability from the child's durable Coordinator parent identity when recreating its runtime
+
+THE Coordinator SHALL be instructed to delegate context-intensive research to focused inline agents, request concise evidence and citations, and retain synthesis, decisions, and actions
+AND SHALL have access to the configured worker and execution-tier catalog and usable model routes for cost-appropriate selection
 
 THE ordinary-parent predecessor capability defined by
 `../conversation-retrieval/requirements.md` REQ-RET-009 SHALL remain separate
@@ -345,7 +355,7 @@ AND SHALL include compact hypothetical bad-versus-good wording and silence examp
 
 ### REQ-GR-011A: Bound Database Integrity and Resource Use
 
-WHILE a write-capable ordinary ProductConversation or the Coordinator executes a database query
+WHILE a write-capable ordinary ProductConversation, the Coordinator, or its inline research child executes a database query
 THE SYSTEM SHALL permit reads from Phoenix application tables, including hidden messages, settings, serialized state, and workflow payloads that may not be visible through normal UI
 
 THE SYSTEM SHALL deny reads of known credential-bearing columns, including owner sessions, share tokens, MCP OAuth client secrets and tokens, and federation credential verifiers, without treating the query surface as a general security sandbox

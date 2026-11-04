@@ -111,6 +111,8 @@ mod previous_transcripts_tool_tests {
             Arc::new(NoLlm),
             phoenix_terminal::ActiveTerminals::new(),
             Arc::new(crate::tools::TmuxRegistry::new()),
+            crate::work_scope::ResourceScopeKey::Coordinator,
+            crate::work_scope::ResourceAuthority::Work,
         )
     }
 
@@ -182,6 +184,24 @@ use crate::tools::{
 };
 use phoenix_core::domain::bash_types::{BashInvocation, BashSpawnTarget};
 use phoenix_core::domain::instance_identity::InstanceId;
+
+pub(crate) fn research_tools(
+    service: GlobalReadService,
+    db: crate::db::Database,
+) -> Vec<Arc<dyn Tool>> {
+    vec![
+        Arc::new(SearchConversations(service.clone())),
+        Arc::new(FederatedReadConversation {
+            service: service.clone(),
+            remote_db: db.clone(),
+        }),
+        Arc::new(QueryDatabase(service.clone())),
+        Arc::new(ResolveReference {
+            service,
+            remote_db: db,
+        }),
+    ]
+}
 
 pub(crate) fn writing_tools(
     service: GlobalReadService,
@@ -1361,6 +1381,8 @@ mod tests {
             Arc::new(NoLlm),
             phoenix_terminal::ActiveTerminals::new(),
             Arc::new(crate::tools::TmuxRegistry::new()),
+            crate::work_scope::ResourceScopeKey::Coordinator,
+            crate::work_scope::ResourceAuthority::Work,
         )
     }
 

@@ -4792,7 +4792,7 @@ impl RuntimeManager {
                         },
                     },
                     slug: format!("sub-{}", spec.agent_id),
-                    cwd: spec.cwd.clone(),
+                    environment: spec.environment.clone(),
                     model: spec.model_id.clone(),
                     conv_mode,
                     llm_language: parent.llm_language,
@@ -5887,7 +5887,17 @@ impl RuntimeManager {
         let is_sub_agent = conv.parent_conversation_id.is_some();
         let is_coordinator =
             !is_sub_agent && conv.runtime_role == crate::work_scope::RuntimeRole::Coordinator;
-        let conv_cwd = if is_coordinator {
+        let is_coordinator_research = if let Some(parent_id) = &conv.parent_conversation_id {
+            self.db
+                .get_conversation(parent_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .runtime_role
+                == crate::work_scope::RuntimeRole::Coordinator
+        } else {
+            false
+        };
+        let conv_cwd = if is_coordinator || is_coordinator_research {
             None
         } else {
             Some(
@@ -5934,12 +5944,12 @@ impl RuntimeManager {
         let mode_context = conv_mode_to_context(&conv.conv_mode);
         let mut context = if is_sub_agent {
             let root_id = find_root_conversation_id(&self.db, conversation_id).await;
-            ConvContext::sub_agent(
+            ConvContext::sub_agent_with_environment(
                 &conv.id,
                 conv_cwd
                     .as_ref()
-                    .expect("sub-agent has filesystem environment")
-                    .path_buf(),
+                    .map_or(phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem,
+                        |cwd| phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem { working_dir: cwd.path_buf() }),
                 &model_id,
                 context_window,
                 output_budget,
@@ -6065,12 +6075,7 @@ impl RuntimeManager {
         let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), model_id)
             .with_connection(pinned_connection);
 
-        // Tool registry selection -- sub-agents get a restricted tool set
-        // (no spawn_agents, no ask_user_question, no skill); parent
-        // conversations get the mode-appropriate registry. Both layers wrap
-        // their registry with `with_mcp` so MCP tool defs resolve live from
-        // the manager on every `definitions()` call.
-        let agent_config = if is_sub_agent || is_coordinator {
+        let agent_config = if is_sub_agent {
             phoenix_agents::AgentConfig::default()
         } else {
             phoenix_agents::load_user_config().unwrap_or_else(|error| {
@@ -6083,15 +6088,28 @@ impl RuntimeManager {
         context.is_coordinator = is_coordinator;
 
         let tool_executor = if is_sub_agent {
-            let registry = sub_agent_registry_for_authority(
-                context.resource_authority,
-                ExploreToolPolicy::from_platform(&self.platform),
-            );
-            ToolRegistryExecutor::with_mcp(
-                registry,
-                self.mcp_manager.clone(),
-                agent_catalog.clone(),
-            )
+            if is_coordinator_research {
+                ToolRegistryExecutor::builtin_only(
+                    ToolRegistry::coordinator_research(crate::coordinator_tools::research_tools(
+                        crate::api::global_read::GlobalReadService::new(
+                            self.db.clone(),
+                            self.message_retriever.clone(),
+                        ),
+                        self.db.clone(),
+                    )),
+                    agent_catalog.clone(),
+                )
+            } else {
+                let registry = sub_agent_registry_for_authority(
+                    context.resource_authority,
+                    ExploreToolPolicy::from_platform(&self.platform),
+                );
+                ToolRegistryExecutor::with_mcp(
+                    registry,
+                    self.mcp_manager.clone(),
+                    agent_catalog.clone(),
+                )
+            }
         } else {
             use crate::db::ConvMode;
             if is_coordinator {
@@ -10312,7 +10330,10 @@ mod scope_liveness_tests {
         let mut spec = SubAgentSpec {
             agent_id: "direct-work-child".to_string(),
             task: "inherit the unowned cwd".to_string(),
-            cwd: "/tmp/direct-cwd".to_string(),
+            environment:
+                phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
+                    working_dir: "/tmp/direct-cwd".into(),
+                },
             timeout: std::time::Duration::from_secs(60),
             mode: SubAgentMode::Work,
             model_id: "gpt-5.6-sol".to_string(),
@@ -10377,7 +10398,10 @@ mod scope_liveness_tests {
         let spec = SubAgentSpec {
             agent_id: "trusted-work-child".into(),
             task: "implement assigned work".into(),
-            cwd: subdir.to_str().unwrap().into(),
+            environment:
+                phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
+                    working_dir: subdir.clone(),
+                },
             timeout: std::time::Duration::from_secs(60),
             mode: SubAgentMode::Work,
             model_id: "gpt-6-astra".into(),
@@ -10483,7 +10507,7 @@ mod scope_liveness_tests {
                         specs: vec![SubAgentSpec {
                             agent_id: agent_id.to_string(),
                             task: "persist all child semantics".to_string(),
-                            cwd: "/tmp".to_string(),
+                            environment: phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem,
                             timeout: std::time::Duration::from_secs(60),
                             mode: SubAgentMode::Explore,
                             model_id: "gpt-5.6-sol".to_string(),
@@ -10562,7 +10586,8 @@ mod scope_liveness_tests {
         let spec = SubAgentSpec {
             agent_id: agent_id.to_string(),
             task: "must never begin".to_string(),
-            cwd: "/tmp".to_string(),
+            environment:
+                phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem,
             timeout: std::time::Duration::from_secs(60),
             mode: SubAgentMode::Explore,
             model_id: "gpt-5.6-sol".to_string(),
@@ -10968,6 +10993,170 @@ mod scope_liveness_tests {
     }
 
     struct FailingLlm;
+
+    #[derive(Default)]
+    struct CoordinatorResearchLlm {
+        requests: Mutex<Vec<phoenix_llm::LlmRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl phoenix_llm::LlmService for CoordinatorResearchLlm {
+        async fn complete(
+            &self,
+            request: &phoenix_llm::LlmRequest,
+        ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
+            use phoenix_llm::ContentBlock;
+            let conv_id = &request.telemetry.as_ref().unwrap().conversation_id;
+            let mut requests = self.requests.lock().unwrap();
+            let turn = requests
+                .iter()
+                .filter(|prior| &prior.telemetry.as_ref().unwrap().conversation_id == conv_id)
+                .count();
+            let research = request.system[0]
+                .text
+                .starts_with("You are an inline research agent");
+            requests.push(request.clone());
+            let content = match (research, turn) {
+                (false, 0) => ContentBlock::tool_use(
+                    "delegate",
+                    "spawn_agents",
+                    serde_json::json!({"tasks":[{"task":"Query SELECT 42 AS evidence and report research-evidence-42"}]}),
+                ),
+                (true, 0) => ContentBlock::tool_use(
+                    "research-query",
+                    "query_database",
+                    serde_json::json!({"sql":"SELECT 42 AS evidence"}),
+                ),
+                (true, 1) => {
+                    assert!(request.messages.iter().flat_map(|message| &message.content).any(|block| matches!(block,
+                        ContentBlock::ToolResult { tool_use_id, content, is_error: false, .. }
+                        if tool_use_id == "research-query" && content.contains("42") && content.contains("evidence"))));
+                    ContentBlock::tool_use(
+                        "research-result",
+                        "submit_result",
+                        serde_json::json!({"result":"research-evidence-42"}),
+                    )
+                }
+                (false, 1) => {
+                    assert!(request
+                        .messages
+                        .iter()
+                        .flat_map(|message| &message.content)
+                        .any(|block| matches!(block,
+                        ContentBlock::ToolResult { tool_use_id, content, is_error: false, .. }
+                        if tool_use_id == "delegate" && content.contains("research-evidence-42"))));
+                    ContentBlock::text("Research received")
+                }
+                _ => panic!("unexpected research round trip"),
+            };
+            let end_turn = matches!(content, ContentBlock::Text { .. });
+            Ok(phoenix_llm::LlmResponse::non_streaming(
+                vec![content],
+                end_turn,
+                phoenix_llm::Usage::default(),
+            ))
+        }
+
+        fn model_id(&self) -> &'static str {
+            "claude-sonnet-5"
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_inline_research_queries_and_returns_through_normal_fan_in() {
+        let llm = Arc::new(CoordinatorResearchLlm::default());
+        let manager = Arc::new(RuntimeManager::new(
+            Database::open_in_memory().await.unwrap(),
+            Arc::new(ModelRegistry::for_test_with_sonnet(llm.clone())),
+            PlatformCapability::None {
+                details: "no sandbox needed for research".into(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        ));
+        manager.start_sub_agent_handler().await;
+        let parent = manager
+            .db()
+            .get_or_create_coordinator(
+                Some("claude-sonnet-5"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        let handle = manager.get_or_create(&parent.id).await.unwrap();
+        manager
+            .send_event(
+                &parent.id,
+                Event::UserMessage {
+                    text: "Delegate this research".into(),
+                    llm_text: None,
+                    images: vec![],
+                    files: vec![],
+                    message_id: "research-user".into(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut states = handle.state_rx.clone();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            states
+                .wait_for(|state| matches!(state, ConvState::Idle | ConvState::Error { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("research and parent fan-in complete");
+        assert_eq!(*states.borrow(), ConvState::Idle);
+        let requests = llm.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 4);
+        let child_requests: Vec<_> = requests
+            .iter()
+            .filter(|request| {
+                request.system[0]
+                    .text
+                    .starts_with("You are an inline research agent")
+            })
+            .collect();
+        assert_eq!(child_requests.len(), 2);
+        for request in &child_requests {
+            let tools: std::collections::BTreeSet<_> = request
+                .tool_availability
+                .declarations()
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect();
+            assert_eq!(
+                tools,
+                std::collections::BTreeSet::from([
+                    "think",
+                    "query_database",
+                    "search_conversations",
+                    "read_conversation",
+                    "resolve_reference",
+                    "submit_result",
+                    "submit_error"
+                ])
+            );
+        }
+        let child_id = &child_requests[0]
+            .telemetry
+            .as_ref()
+            .unwrap()
+            .conversation_id;
+        let child = manager.db().get_conversation(child_id).await.unwrap();
+        assert_eq!(child.runtime_role, crate::work_scope::RuntimeRole::SubAgent);
+        assert_eq!(
+            child.parent_conversation_id.as_deref(),
+            Some(parent.id.as_str())
+        );
+        assert!(child.attached_work_scope_id.is_none());
+        assert!(child.cwd.is_empty());
+        assert!(matches!(child.state, ConvState::Completed { .. }));
+        manager.begin_process_shutdown();
+        manager.drain_process_shutdown().await;
+    }
 
     #[async_trait::async_trait]
     impl phoenix_llm::LlmService for FailingLlm {

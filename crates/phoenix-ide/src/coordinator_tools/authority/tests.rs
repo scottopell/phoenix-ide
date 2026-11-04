@@ -19,6 +19,8 @@ fn context(transcript: &str, with_source: bool) -> ToolContext {
         Arc::new(Offline),
         phoenix_terminal::ActiveTerminals::new(),
         Arc::new(phoenix_tools::TmuxRegistry::new()),
+        phoenix_core::work_scope::ResourceScopeKey::Coordinator,
+        phoenix_core::work_scope::ResourceAuthority::Work,
     );
     if with_source {
         ctx.with_svg_assistant_message_id("authority-message")

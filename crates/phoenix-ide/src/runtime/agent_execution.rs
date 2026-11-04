@@ -227,6 +227,7 @@ impl SpawnCatalog {
         &self,
         resolved_parent_model_id: &str,
         parent_is_builtin: bool,
+        is_coordinator: bool,
     ) -> phoenix_core::domain::llm_types::ToolDefinition {
         use phoenix_tools::Tool;
         use phoenix_tools::{SpawnAgentsTool, SpawnModelChoice};
@@ -252,6 +253,11 @@ impl SpawnCatalog {
         } else {
             ""
         });
+        let tool = if is_coordinator {
+            tool.for_coordinator()
+        } else {
+            tool
+        };
         phoenix_core::domain::llm_types::ToolDefinition {
             name: tool.name().to_string(),
             description: tool.description(),
@@ -318,7 +324,7 @@ execution = [{model = "luna", connection = "codex", reasoning_effort = "low"}]
         assert!(catalog
             .select(Some("unavailable"), None, "sol", None)
             .is_err());
-        let definition = catalog.tool_definition("gpt-5.6-luna", true);
+        let definition = catalog.tool_definition("gpt-5.6-luna", true, false);
         let agents = &definition.input_schema["properties"]["tasks"]["items"]["properties"]
             ["agent_type"]["enum"];
         assert_eq!(agents, &serde_json::json!(["reviewer"]));
@@ -329,7 +335,7 @@ execution = [{model = "luna", connection = "codex", reasoning_effort = "low"}]
     fn tool_definition_uses_one_qualification_for_description_and_schema() {
         let catalog =
             SpawnCatalog::resolve(&AgentConfig::default(), vec![route("gpt-6-sol", "codex")]);
-        let qualified = catalog.tool_definition("gpt-6-sol", true);
+        let qualified = catalog.tool_definition("gpt-6-sol", true, false);
         assert!(qualified.description.contains("may run in parallel"));
         assert!(qualified
             .input_schema
@@ -337,8 +343,8 @@ execution = [{model = "luna", connection = "codex", reasoning_effort = "low"}]
             .contains("may run in parallel"));
 
         for definition in [
-            catalog.tool_definition("gpt-6-luna", true),
-            catalog.tool_definition("gpt-6-sol", false),
+            catalog.tool_definition("gpt-6-luna", true, false),
+            catalog.tool_definition("gpt-6-sol", false, false),
         ] {
             assert!(definition.description.contains("one at a time per parent"));
             assert!(definition
@@ -346,6 +352,18 @@ execution = [{model = "luna", connection = "codex", reasoning_effort = "low"}]
                 .to_string()
                 .contains("one at a time per parent"));
         }
+    }
+
+    #[test]
+    fn coordinator_schema_preserves_execution_choices_without_work_or_cwd() {
+        let catalog =
+            SpawnCatalog::resolve(&AgentConfig::default(), vec![route("gpt-6-luna", "codex")]);
+        let definition = catalog.tool_definition("gpt-6-sol", true, true);
+        let props = &definition.input_schema["properties"]["tasks"]["items"]["properties"];
+        assert!(props.get("cwd").is_none());
+        assert_eq!(props["mode"]["enum"], serde_json::json!(["explore"]));
+        assert!(props["execution"].to_string().contains("gpt-6-luna"));
+        assert!(definition.description.contains("inline read-only agents"));
     }
 
     #[test]

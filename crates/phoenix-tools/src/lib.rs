@@ -417,6 +417,8 @@ impl ToolContext {
         llm_selector: Arc<dyn LlmSelector>,
         terminals: phoenix_terminal::ActiveTerminals,
         tmux_registry: Arc<TmuxRegistry>,
+        work_scope: ResourceScopeKey,
+        authority: phoenix_core::work_scope::ResourceAuthority,
     ) -> Self {
         let root_conversation_id = conversation_id.clone();
         Self {
@@ -424,7 +426,7 @@ impl ToolContext {
             legacy_tmux_conversation_id: Some(conversation_id.clone()),
             resource_access: phoenix_core::work_scope::EffectiveResourceAccess::new(
                 conversation_id.clone(),
-                phoenix_core::work_scope::ResourceAuthority::Work,
+                authority,
             ),
             conversation_id,
             root_conversation_id,
@@ -435,7 +437,7 @@ impl ToolContext {
             terminals,
             tmux_registry,
             worktree_path: None,
-            work_scope: ResourceScopeKey::Coordinator,
+            work_scope,
             bash_progress_sink: None,
             tool_use_id: None,
             direct_turn_id: None,
@@ -978,10 +980,21 @@ impl ToolRegistry {
         mut global_read_tools: Vec<Arc<dyn Tool>>,
         coordinator_catalog: Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog>,
     ) -> Self {
-        let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(ThinkTool)];
+        let mut tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(ThinkTool),
+            Arc::new(SpawnAgentsTool::new().for_coordinator()),
+        ];
         if let Some(catalog) = coordinator_catalog {
             tools.push(Arc::new(SkillTool::for_global_coordinator(catalog)));
         }
+        tools.append(&mut global_read_tools);
+        Self { tools }
+    }
+
+    #[must_use]
+    pub fn coordinator_research(mut global_read_tools: Vec<Arc<dyn Tool>>) -> Self {
+        let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(ThinkTool)];
+        tools.extend(sub_agent_terminal_tools());
         tools.append(&mut global_read_tools);
         Self { tools }
     }
@@ -1454,7 +1467,11 @@ mod tests {
         let no_catalog = ToolRegistry::coordinator(vec![Arc::new(ReadFileTool)], None);
         assert_eq!(
             names(&no_catalog),
-            BTreeSet::from(["read_file".to_string(), "think".to_string()])
+            BTreeSet::from([
+                "read_file".to_string(),
+                "think".to_string(),
+                "spawn_agents".to_string()
+            ])
         );
 
         let temp = tempfile::TempDir::new().unwrap();

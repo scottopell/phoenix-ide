@@ -23,6 +23,12 @@ Direct's unscoped write semantics. Results are submitted via dedicated
 tools (`submit_result` / `submit_error`). Maximum 10 sub-agents per
 spawn call.
 
+The Global Coordinator exposes inline read-only research using the same fan-in.
+These children have no filesystem environment or WorkScope attachment and receive
+only bounded global read tools, thinking, and terminal submission. Ordinary
+children retain the workspace and tool rules above. The Coordinator uses the
+configured worker/tier catalog and usable routes to select suitable execution.
+
 ## Technical Summary
 
 The detailed state-machine and spawn-layer behaviour is normative in
@@ -63,8 +69,11 @@ only the architectural seams.
   model omission of effort uses its native default. Request schema and admission
   share a resolved catalog. Selected connection identity is persisted for runtime
   recreation without adding server-restart survival guarantees.
-- **Path defaults** treat blank cwd overrides as absent and resolve relative cwd
-  values from the parent conversation.
+- **Path defaults** for ordinary children treat blank cwd overrides as absent
+  and resolve relative cwd values from the parent conversation. Coordinator
+  children reject cwd and Work requests; their typed environment persists no
+  directory, and durable parent identity selects their builtin-only research
+  registry on materialization and recreation. See ADR-222.
 - **Wake retirement** removes REQ-SA-009's wake binding and delivery obligations
   under ADR-098. Ordinary durable terminal evidence and parent fan-in remain;
   candidate retirement implementation and verification are ongoing.

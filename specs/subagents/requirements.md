@@ -62,6 +62,12 @@ failures, resource exhaustion, and unbounded recursion.
 
 **Dependencies:** REQ-BED-009
 
+Coordinator research children follow REQ-GR-007 in
+`../global-recall/requirements.md`: their durable parent identifies a
+filesystem-free, read-only global research capability. They share ordinary
+sub-agent isolation, bounds, cancellation, terminal delivery, and fan-in.
+Ordinary conversation children retain their inherited workspace capability.
+
 ---
 
 ### REQ-SA-003: Result Submission

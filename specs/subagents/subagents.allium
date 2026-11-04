@@ -27,7 +27,7 @@
 --   - Tool implementations (bash, patch, etc.).
 --
 -- Requirement traceability: REQ-SA-001 .. REQ-SA-008, REQ-SA-011,
--- REQ-PROJ-008. REQ-SA-007 is superseded by REQ-PROJ-008; REQ-SA-008
+-- REQ-PROJ-008, REQ-GR-007. REQ-SA-008
 -- read_first injection is outside this spawn-resolution model.
 
 use "../bedrock/bedrock.allium" as bedrock
@@ -85,7 +85,8 @@ variant ModelExecution : ExecutionSelector {
 value SubAgentSpec {
     agent_id: String              -- fresh UUID generated at spawn time
     task: String
-    cwd: String                   -- absolute path on disk
+    environment_kind: filesystem | no_filesystem
+    cwd: String when environment_kind = filesystem -- absolute path on disk
     timeout: Duration             -- mandatory (REQ-SA-006)
     execution_authority: SubAgentExecutionAuthority
     model_id: String              -- available through selected connection
@@ -343,6 +344,7 @@ rule SpawnRejectedUnknownAgentType {
 rule SpawnRejectedSystemRootCwd {
     when: SpawnAgentsToolInvoked(invocation, tasks)
     let parent = invocation.parent
+    requires: not coordinator_parent(parent)
     requires: any_task_effective_cwd_resolves_to_system_root(
         tasks, parent.working_dir)
     ensures: SpawnAgentsRejected(invocation,
@@ -383,6 +385,7 @@ rule SpawnRejectedWorkCwdOutsideWorktree {
 -- the worktree path when the parent has one, else the parent's cwd).
 rule SpawnedSubAgentCwdAssignment {
     when: SubAgentSpawnSucceeded(parent, sub_agent, execution_authority, cwd_override)
+    requires: not coordinator_parent(parent)
     ensures:
         if cwd_override != absent:
             sub_agent.working_dir = cwd_override
@@ -427,6 +430,7 @@ rule InvalidBatchAdmitsNoChildren {
 rule SubAgentSpecsResolved {
     when: SpawnAgentsToolInvoked(invocation, tasks)
     let parent = invocation.parent
+    requires: not coordinator_parent(parent)
     requires: tasks.count >= 1
     requires: tasks.count <= config.max_sub_agents_per_spawn
     requires: parent.execution_authority = write_capable
@@ -451,6 +455,7 @@ rule SubAgentSpecsResolved {
             SubAgentAdmission{child: child}.batch_id = invocation.batch_id
             SubAgentAdmission{child: child}.parent_terminal_disposition = owed
             child.spec.parent_conversation_id = parent.id
+            child.spec.environment_kind = filesystem
     ensures: SpawnAgentsCompletes(invocation,
         spawned_agents: pending_sub_agents_from(tasks))
     ensures: parallel_work_qualified(parent.resolved_model_id)
@@ -505,6 +510,50 @@ rule SubAgentSpecsResolved {
         -- (or `SpawnAgentsCompletesWithMoreTools`) drives the parent into
         -- `awaiting_sub_agents` and REQ-PROJ-008's inherited-workspace contract covers
         -- the worktree-side seam.
+}
+
+rule CoordinatorRejectsFilesystemOrWorkResearch {
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
+    requires: coordinator_parent(parent)
+    requires: any_task_mode_is_work(tasks) or any_task_supplies_cwd(tasks)
+    ensures: SpawnAgentsRejected(invocation,
+        reason: "Coordinator research requires read-only authority and no filesystem")
+    ensures: AdmittedChildCountForInvocation(parent, tasks) = 0
+}
+
+rule CoordinatorResearchSpecsResolved {
+    when: SpawnAgentsToolInvoked(invocation, tasks)
+    let parent = invocation.parent
+    requires: coordinator_parent(parent)
+    requires: tasks.count >= 1
+    requires: tasks.count <= config.max_sub_agents_per_spawn
+    requires: not any_task_mode_is_work(tasks)
+    requires: not any_task_supplies_cwd(tasks)
+    requires: not any_task_has_invalid_execution(tasks, parent)
+    requires: not any_task_has_unknown_agent_type(tasks, parent)
+    requires: batch_is_otherwise_valid(parent, tasks)
+    ensures: SubAgentSpecsCreated(parent, tasks)
+    ensures: AtomicSubAgentBatchAdmitted(parent, pending_sub_agents_from(tasks))
+    ensures:
+        for child in pending_sub_agents_from(tasks):
+            child.spec.environment_kind = no_filesystem
+            child.spec.parent_work_scope_kind = unattached
+            child.attached_work_scope_id = absent
+            child.execution_authority = read_only
+            child.spec.parent_conversation_id = parent.id
+            SubAgentAdmission{child: child}.parent = parent
+            SubAgentAdmission{child: child}.batch_id = invocation.batch_id
+            SubAgentAdmission{child: child}.parent_terminal_disposition = owed
+    ensures: SpawnAgentsCompletes(invocation,
+        spawned_agents: pending_sub_agents_from(tasks))
+
+    @guidance
+        -- Execution selection uses the same configured workers, tiers, usable
+        -- routes, persona restoration, max-turn defaults, and timeout as ordinary
+        -- children. No cwd is resolved, inherited, fabricated, or persisted.
+        -- Durable Coordinator parent identity selects the research capability;
+        -- model and worker selection cannot grant it to ordinary children.
 }
 
 ------------------------------------------------------------
@@ -646,28 +695,31 @@ rule DuplicateParentDeliveryIsIdempotent {
 rule SubAgentRegistryOnFreshSpawn {
     when: SubAgentSpawnSucceeded(parent, sub_agent, execution_authority, cwd_override)
     ensures:
-        if execution_authority = write_capable:
+        if coordinator_parent(parent):
+            sub_agent.tool_registry = coordinator_research
+        else if execution_authority = write_capable:
             sub_agent.tool_registry = subagent_write_capable
         else:
             sub_agent.tool_registry = subagent_read_only
-    ensures: sub_agent.mcp_enabled = true
+    ensures: sub_agent.mcp_enabled = not coordinator_parent(parent)
     ensures: sub_agent.execution_authority = write_capable implies sub_agent.bash_sandboxed = false
 }
 
 -- Resume path (`RuntimeManager::get_or_create` for a sub-agent
 -- conversation): the registry is recovered from the persisted `conv_mode`
--- so the sub-agent does not lose its write capability across a restart or
--- model-upgrade eviction. Sub-agents do not normally survive server
--- restart, so this path is exercised only for in-process re-creation
+-- so the sub-agent retains its capability across runtime eviction.
+-- Active sub-agents do not survive server restart; this path handles in-process re-creation
 -- (e.g. model upgrade).
 rule SubAgentRegistryOnResume {
     when: SubAgentRuntimeResumed(sub_agent)
     ensures:
-        if sub_agent.execution_authority = read_only:
+        if coordinator_parent(sub_agent.parent):
+            sub_agent.tool_registry = coordinator_research
+        else if sub_agent.execution_authority = read_only:
             sub_agent.tool_registry = subagent_read_only
         else:
             sub_agent.tool_registry = subagent_write_capable
-    ensures: sub_agent.mcp_enabled = true
+    ensures: sub_agent.mcp_enabled = not coordinator_parent(sub_agent.parent)
     ensures: sub_agent.execution_authority = write_capable implies sub_agent.bash_sandboxed = false
     -- A named agent's persona is likewise restored on this path: it is
     -- persisted with the sub-agent conversation at spawn and re-read into the
@@ -729,10 +781,19 @@ invariant WorkSubAgentCwdInsideWorktree {
         is_within(sa.working_dir, sa.parent.worktree_path)
 }
 
+invariant CoordinatorResearchHasOnlyReadCapabilities {
+    for sa in SubAgents where coordinator_parent(sa.parent):
+        sa.execution_authority = read_only
+        and sa.spec.environment_kind = no_filesystem
+        and sa.attached_work_scope_id = absent
+        and sa.tool_registry = coordinator_research
+        and sa.mcp_enabled = false
+}
+
 -- Child execution authority selects tools independently of parent provenance.
 invariant ToolRegistryMatchesMode {
     for sa in SubAgents:
-        (sa.execution_authority = read_only
+        (sa.execution_authority = read_only and not coordinator_parent(sa.parent)
             implies sa.tool_registry = subagent_read_only)
         and
         (sa.execution_authority = write_capable
@@ -847,3 +908,11 @@ surface NativeSpawnAdoptionBoundary {
 --   True exactly when parent instructions assign partitioning and integration,
 --   and each Work child is told that trusted collaborators share the exact
 --   WorkScope, to preserve unrelated edits, and to report overlap or conflict.
+-- coordinator_parent(parent: Conversation) -> Boolean
+--   True exactly when the durable parent's runtime role is Coordinator.
+-- any_task_supplies_cwd(tasks: List<SubAgentTask>) -> Boolean
+--   True when any task supplies a non-null cwd, including a blank string.
+-- coordinator_research registry:
+--   query_database, search_conversations, read_conversation, resolve_reference,
+--   think, submit_result, submit_error. No filesystem, Bash, browser, MCP,
+--   messaging, subscriptions, skills, task approval, lifecycle, or spawn tools.
