@@ -1,0 +1,187 @@
+# Coordinator standing Authority tools
+
+## Authorized scope
+
+Implement local Coordinator-only `read_authority` and `set_authority` tools,
+backed by one current natural-language instructions document. Read it into every
+ordinary Coordinator model request and the prompt inspector independently of
+transcript history and continuation. Instruct Ember to interpret user feedback,
+clarify material ambiguity, present the complete replacement and obtain human
+approval in ordinary conversation before calling the setter.
+
+The user's scope decision on 2026-11-04:
+
+> Okay the human grants permission (and my ideas around auto dismissing certain states) are clearly scope creep and potentially contain complexity-cliff-review, so we must be careful here. Please consider those as a separate design problem, let's proceed with the authority tools and rely on the agent checking for human approval before calling the tool.
+
+The approval requirement is model guidance. No server proof, `human_approved`
+flag, approval card, proposal/revision protocol, timed wait, background workflow,
+new conversation state, remote target, or semantic action-permission engine is
+part of this implementation. The user approved implementation of the tools;
+that does not seed production Authority or authorize disk deletion/deployment.
+
+## Normative contract and decision
+
+- `specs/coordinator-authority/requirements.md`: REQ-AUTH-001–006.
+- `specs/global-recall/requirements.md`: REQ-GR-007/013/022.
+- ADR-221: conversational approval and direct read/set tools.
+- Existing permissions and compatibility contracts remain binding.
+
+One instance-wide document is stored as one indivisible scalar under the
+`coordinator_authority` application setting. Reuse `app_settings`; no migration
+or separate current/history representation is needed. `read_authority` accepts
+`{}`; `set_authority` accepts exactly `{instructions: string}`. Replace the
+whole value, empty text clears it, maximum 16,384 UTF-8 bytes, explicit errors
+rather than clipping. A current-Coordinator check is required at reads and
+inside the committing write transaction. Existing owned-write and local
+persistence-classification rules apply; conversational approval is separate
+from database correctness.
+
+## Delivery phases
+
+- [x] Contract: narrow this task, preserve deferred research separately, author
+  Authority requirements and executive, link Coordinator capability/continuation
+  requirements, record ADR-221 and run task/spec preflight.
+- [x] Storage and tools: typed document validation, existing scalar persistence,
+  current-source guards, closed schemas, full-replacement and clearing behavior,
+  commit-time source validation and focused boundary tests.
+- [x] Runtime and prompt context: fresh shared Authority rendering in normal
+  Coordinator requests and inspector; visible read failures; explicit empty
+  context; conversational approval and in-scope-action policy; registry isolation.
+- [x] Qualification and integration: focused storage/tool/runtime tests, relevant
+  `./dev.py check` lanes, spec preflight, executive evidence and completion status.
+
+## Observed problem and evidence
+
+A bounded read-only production investigation used deployed source ce4b0bff
+and primary user messages. Source implementation work is on
+`design/coordinator-authority` based on origin/main 64a6f23d0. The original old
+checkout allocated provisional task 33001, already used upstream; taskmd
+reallocated this task 33003. Sanitized historical observations and the superseded larger
+proposal are preserved in task 33004.
+
+- A bounded read-only sample contained three primary user inputs and two
+  Coordinator responses. It showed a standing cleanup grant, a response reporting
+  action under that grant, and later individual approval requests for the same
+  broad action class.
+- One response's completion wording could be mistaken for a restriction; an
+  assistant report must not itself become a user revocation.
+- Intervening human restrictions were not exhaustively adjudicated. This sample
+  does not establish current Authority and must not be imported as a grant.
+- Existing prompts ask for confident action yet prohibit invented blanket
+  permission. Explicit saved Authority must be distinguished from historical
+  claims; deliberately user-granted broad authority is allowed.
+- Coordinator home notes are historical evidence, not authoritative instructions.
+  Summary retention alone cannot establish a current standing document.
+
+## Complexity-cliff review
+
+Highest cost relative to immediate value:
+
+1. **Server-verified human grants.** An approval button looks small, but exact
+   reviewed content requires proposal identity, pending lifecycle, activation,
+   stale-state handling and client actions. This changes the feature into an
+   interaction workflow spanning persistence, runtime, web and iOS. Lower-cost
+   alternative: agent obtains conversational approval, then calls a plain setter.
+2. **Automatic dismissal and late answers.** A ten-minute wait looks like a timer,
+   but restart-safe continuation, Stop races, current-owner delivery and answers
+   while working require durable scheduling/admission and UI independent of
+   execution state. This is a separate class of runtime concern. Lower-cost
+   alternative: retain existing question behavior for this feature.
+3. **Distributed/versioned Authority.** Per-host replication, proposal history,
+   revision conflicts and semantic action enforcement seem like refinements but
+   introduce synchronization, conflict and policy subsystems. Lower-cost
+   alternative: one local current document; existing tool/transcript records
+   expose edits, without promising an independent policy history.
+
+The hidden commitments are permanent pending-request state, crash-spanning
+execution after a deadline, hard human-consent proof and cross-instance policy
+synchronization. Removing them collapses this change to bounded document CRUD
+and prompt assembly. The remaining source guard, input validation, atomic local
+write and fresh read are ordinary correctness obligations. Do not add boolean
+approval theater or a generic permission framework to recover the removed scope.
+
+## Acceptance and validation
+
+- [x] Read default empty Authority; replace and read exact text; empty setter
+  clears it; file-backed reopen retains it without transcript-summary recovery.
+- [x] Reject malformed arguments, extra fields and more than 16,384 UTF-8 bytes;
+  boundary-byte behavior is correct for multibyte text and never clips.
+- [x] Deny ordinary conversations, sub-agents and stale Coordinator predecessors.
+  The setter rechecks inside its committing transaction. Rotation tests exercise
+  an already-rotated source, not an injected transaction interleaving.
+- [x] Register both tools only for the Coordinator; no remote selectors or
+  model-supplied source identity.
+- [x] Writes follow existing owned-command outcome classification and do not
+  publish ordinary success/error after unclassified local authority.
+- [x] Mock provider requests and prompt inspector expose the same current body.
+  Setting Authority changes subsequent requests without a runtime restart.
+- [x] Watch-driven and successor Coordinator requests receive current Authority;
+  unchanged text renders identically; failed reads remain visible failures.
+- [x] Instructions require interpreted scoped wording and conversational approval
+  before setting, preserve later user constraints, distinguish one-shot approval,
+  and direct routine in-scope work without renewed permission.
+- [x] Prompt checks establish what instructions are sent, not guaranteed model
+  compliance. No live production policy or disk-cleanup experiment is required.
+- [x] Run appropriate focused tests, `./dev.py check`, task/spec validation and
+  final diff review; no UI/codegen work unless an actual typed wire change occurs.
+
+## Separate design problem
+
+Task 33004 (`durable-human-interactions-and-bounded-waits`, brainstorming) retains
+the full prior investigation of formal approval, independently pending questions,
+wait deadlines and late answers. It is not a delivery dependency, a mandatory
+rollout phase or an implementation commission. Existing AUQ documentation drift
+and dormant fork-proposal code observations stay with that research; this task
+does not redesign or repair those paths.
+
+## Delivery evidence
+
+Implementation is in PR #1026 on `design/coordinator-authority`; no deployment
+or production Authority mutation is included. Main's reminder feature is merged
+at `366fa38a0`, retaining both tool registrations and independent provenance
+rules. ADR-221 replaces this branch's unmerged provisional ADR-217 allocation.
+
+- Combined-source focused tests passed: core Authority 2, database Authority 4,
+  application Authority rendering/runtime/inspection 5, Authority tools 6.
+  Tests use temporary databases and mock providers.
+- Direct linked-binary checks passed: both core Coordinator prompt tests,
+  reminder attribution, stable Coordinator system-prefix/cache-key behavior,
+  and reminder/predecessor registry upgrade. All 31 system-prompt tests passed
+  in the prior source qualification before merging reminders.
+- Combined `cargo check -p phoenix_ide --tests` passed. Initial Clippy identified
+  four test-only `default_trait_access` findings; `4d5b4a3ad` makes their inferred
+  types explicit without changing behavior. The final
+  `./dev.py check --lanes clippy,cargo-fmt` passed both lanes (169.6s).
+- Task validation, Allium, requirement anchors, `audit-specs` and diff whitespace
+  checks passed. The broader spec-shape structural scan passed; its Python unit
+  suite unexpectedly launched a real backend build and was deliberately stopped
+  to release the build lock. Task 33005 records that validation hazard. No full
+  repository check is claimed.
+- Independent Authority review and the final reminder/Authority merge-seam
+  review found no actionable issues. Review does not replace executed tests.
+
+Coverage limits: the setter rechecks source identity transactionally, but the
+rotation fixture uses an already-rotated source. Requester cancellation is
+exercised before write admission; lost commit acknowledgement is simulated.
+Prompt assertions do not establish human-approval compliance in live LLM use.
+No existing historical cleanup approval has been imported into saved Authority.
+Implementation and bounded local qualification are complete; PR review/hosted
+CI and any later merge/deployment remain separate delivery states.
+
+## Adversarial review follow-up
+
+The isolated local code/spec review found no actionable code defects at
+`7258b21e6...4a50fa21d`; a subsequent artifact check sanitized production evidence
+in the task notes. GitHub review comment 4472022056 claimed a write-worker panic
+would leave admission open. The existing `AuthorityWritePass` receiver lives
+across the awaited persistence argument, and its destructor closes admission
+before releasing its owner. A standalone exact-guard probe and two actual-module
+regressions disproved that failure mechanism. The regressions suspend a synthetic
+persistence future, then panic or cancel the worker; they assert one owner at
+first closure and refusal of further admission. They do not inject SQLite faults.
+
+All eight Authority tool tests passed after rebuilding, including those two
+regressions. Clippy, formatting and task validation passed again (137.6s). No
+production implementation change was needed for the panic finding. Hosted CI at
+`4a50fa21d` passed all four Rust shards and other applicable checks; qualification
+of later review commits is reported separately on PR #1026.

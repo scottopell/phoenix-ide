@@ -8,6 +8,7 @@ pub mod bash_types;
 pub mod close;
 pub mod codex_reset_credits;
 pub mod conversation_goal;
+pub mod coordinator_authority;
 pub mod creation_protocol;
 pub mod db_schema;
 pub mod federation_subscription;

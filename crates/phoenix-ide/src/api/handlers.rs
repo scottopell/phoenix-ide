@@ -5034,9 +5034,20 @@ async fn get_system_prompt(
     );
     let system_prompt = if is_coordinator {
         let catalog = crate::skills::AuthenticatedCoordinatorSkillCatalog::discover(None);
+        let authority = state
+            .runtime
+            .db()
+            .coordinator_authority()
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "Failed to read current Coordinator Authority: {error}"
+                ))
+            })?;
         let mut prompt = crate::system_prompt::build_coordinator_system_prompt(
             conversation.llm_language,
             catalog.as_ref(),
+            &authority,
         );
         crate::coordinator_home::append_context(
             &mut prompt,
@@ -5065,6 +5076,94 @@ async fn get_system_prompt(
     };
 
     Ok(Json(SystemPromptResponse { system_prompt }))
+}
+
+#[cfg(test)]
+mod coordinator_authority_inspection_tests {
+    use super::*;
+    use phoenix_core::domain::coordinator_authority::CoordinatorAuthority;
+    use phoenix_core::llm_language::LlmLanguage;
+    use phoenix_db::workflow::LocalAuthorityResult;
+
+    #[tokio::test]
+    async fn coordinator_authority_inspector_uses_fresh_complete_shared_rendering() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let coordinator = state
+            .db
+            .get_or_create_coordinator(None, LlmLanguage::default())
+            .await
+            .unwrap();
+        let catalog = crate::skills::AuthenticatedCoordinatorSkillCatalog::discover(None);
+        for text in [
+            "  Permit unused cache cleanup. 🐦\n\n",
+            "Preserve active caches.\n",
+            "",
+        ] {
+            let authority = CoordinatorAuthority::try_from(text.to_owned()).unwrap();
+            assert!(matches!(
+                state.db.set_coordinator_authority(&coordinator.id, &authority).await,
+                LocalAuthorityResult::DurableFactEstablished(Ok(saved)) if saved == authority
+            ));
+            let Json(inspected) =
+                get_system_prompt(State(state.clone()), Path(coordinator.id.clone()))
+                    .await
+                    .unwrap();
+            let mut expected = crate::system_prompt::build_coordinator_system_prompt(
+                coordinator.llm_language,
+                catalog.as_ref(),
+                &authority,
+            );
+            crate::coordinator_home::append_context(
+                &mut expected,
+                state
+                    .db
+                    .coordinator_work_scope()
+                    .await
+                    .map_err(|error| error.to_string()),
+            );
+            assert_eq!(inspected.system_prompt, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_authority_inspector_surfaces_invalid_saved_document_without_affecting_ordinary_prompt(
+    ) {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let coordinator = state
+            .db
+            .get_or_create_coordinator(None, LlmLanguage::default())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO app_settings (key, value) VALUES ('coordinator_authority', ?1)")
+            .bind("x".repeat(16_385))
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        let result = get_system_prompt(State(state.clone()), Path(coordinator.id)).await;
+        assert!(
+            matches!(result, Err(AppError::Internal(message)) if message.contains("Failed to read current Coordinator Authority"))
+        );
+        let cwd = tempfile::TempDir::new().unwrap();
+        state
+            .db
+            .create_conversation(
+                "ordinary-authority-inspection",
+                "ordinary",
+                cwd.path().to_str().unwrap(),
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let Json(inspected) =
+            get_system_prompt(State(state), Path("ordinary-authority-inspection".into()))
+                .await
+                .unwrap();
+        assert!(!inspected
+            .system_prompt
+            .contains("Current Coordinator Authority"));
+    }
 }
 
 // ============================================================
