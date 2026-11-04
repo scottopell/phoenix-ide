@@ -64,7 +64,8 @@ failures, resource exhaustion, and unbounded recursion.
 
 Coordinator research children follow REQ-GR-007 in
 `../global-recall/requirements.md`: their durable parent identifies a
-filesystem-free, read-only global research capability. They share ordinary
+read-only global research capability with no default filesystem and explicit
+WorkScope-targeted file reads. They share ordinary
 sub-agent isolation, bounds, cancellation, terminal delivery, and fan-in.
 Ordinary conversation children retain their inherited workspace capability.
 

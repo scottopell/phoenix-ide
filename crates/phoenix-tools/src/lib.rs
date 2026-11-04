@@ -451,7 +451,7 @@ impl ToolContext {
     ///
     /// # Panics
     /// Panics for a filesystem-free context. Its registry must not expose
-    /// filesystem-capable tools.
+    /// tools requiring an ambient working directory.
     #[must_use]
     pub fn working_dir(&self) -> &Path {
         match &self.execution_environment {

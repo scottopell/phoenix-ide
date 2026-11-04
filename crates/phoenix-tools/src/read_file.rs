@@ -110,12 +110,22 @@ impl Tool for ReadFileTool {
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        Self::read_in_directory(input, ctx.working_dir(), &ctx.cancel).await
+    }
+}
+
+impl ReadFileTool {
+    pub async fn read_in_directory(
+        input: Value,
+        working_dir: &Path,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> ToolOutput {
         let input: ReadFileInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
         };
 
-        let resolved = match resolve_and_validate(&input.path, ctx.working_dir()) {
+        let resolved = match resolve_and_validate(&input.path, working_dir) {
             Ok(p) => p,
             Err(e) => return ToolOutput::error(e),
         };
@@ -151,7 +161,7 @@ impl Tool for ReadFileTool {
         let start_idx = (offset - 1).min(total_lines);
         let end_idx = (start_idx + limit).min(total_lines);
 
-        if ctx.cancel.is_cancelled() {
+        if cancel.is_cancelled() {
             return ToolOutput::error("Cancelled");
         }
 
@@ -173,7 +183,7 @@ impl Tool for ReadFileTool {
             output = "(empty file)".to_string();
         }
 
-        let viewer_available = is_within_viewer_roots(&resolved, ctx.working_dir())
+        let viewer_available = is_within_viewer_roots(&resolved, working_dir)
             && std::fs::metadata(&resolved)
                 .is_ok_and(|metadata| metadata.len() <= FILE_VIEWER_MAX_BYTES)
             && classify_for_viewer(&resolved) == ViewerFileClass::Text

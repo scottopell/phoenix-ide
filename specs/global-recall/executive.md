@@ -14,7 +14,7 @@ Standing Coordinator Authority is specified separately in `specs/coordinator-aut
 
 Ember exposes `spawn_agents` with configured workers, tiers, and model routes.
 Inline research children receive bounded SQL, history search, transcript reads,
-reference resolution, thinking, and terminal submission. They have no filesystem,
+reference resolution, explicit WorkScope-targeted file reads, thinking, and terminal submission. They have no default filesystem,
 WorkScope, MCP, messaging, watches, Authority tools, or lifecycle actions. Durable
 Coordinator parent identity restores this capability on runtime recreation.
 ADR-222 records the boundary.
@@ -70,7 +70,7 @@ The failed `8f10d54d` packet was correctly stopped by the host; the earlier stat
 
 The inline-research regression exercises delegation, real bounded SQLite tool
 dispatch, terminal submission, and normal parent fan-in using a deterministic
-model. It asserts the exact seven-tool child surface and persisted absence of cwd
+model. It asserts the exact eight-tool child surface and persisted absence of cwd
 and WorkScope. Companion regressions cover parallel research, rejected Work/cwd
 requests before admission, and model selection in the research-only schema.
 

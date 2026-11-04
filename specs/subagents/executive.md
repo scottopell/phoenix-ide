@@ -24,8 +24,9 @@ tools (`submit_result` / `submit_error`). Maximum 10 sub-agents per
 spawn call.
 
 The Global Coordinator exposes inline read-only research using the same fan-in.
-These children have no filesystem environment or WorkScope attachment and receive
-only bounded global read tools, thinking, and terminal submission. Ordinary
+These children have no default filesystem environment or WorkScope attachment and
+receive bounded global readers, explicit WorkScope-targeted file reads, thinking,
+and terminal submission. Ordinary
 children retain the workspace and tool rules above. The Coordinator uses the
 configured worker/tier catalog and usable routes to select suitable execution.
 

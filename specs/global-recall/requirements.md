@@ -122,8 +122,9 @@ WHILE a restricted planning conversation or a sub-agent of an ordinary conversat
 THE SYSTEM SHALL NOT provide Phoenix-wide history search, global conversation reads, database queries, global reference resolution, or cross-conversation messaging tools
 
 WHEN the Global Coordinator delegates bounded research or analysis through `spawn_agents`
-THE SYSTEM SHALL provide inline read-only research children with bounded global history search, conversation reads, database queries, and reference resolution
-AND SHALL give those children no filesystem environment, WorkScope attachment, Bash, browser, MCP, messaging, subscriptions, skills, Authority updates, task approval, lifecycle mutation, or recursive delegation capabilities
+THE SYSTEM SHALL provide inline read-only research children with bounded global history search, conversation reads, database queries, reference resolution, and read-only file inspection
+AND SHALL require an explicit active WorkScope ID for each file read, resolve its authoritative server directory, and use ordinary numbered read_file offset/limit and path semantics
+AND SHALL give those children no default filesystem environment, WorkScope attachment, Bash, browser, MCP, messaging, subscriptions, skills, Authority updates, task approval, lifecycle mutation, or recursive delegation capabilities
 AND SHALL reject Work mode and filesystem overrides before admitting any child
 AND SHALL use the normal sub-agent limits, cancellation, terminal submission, and parent fan-in
 AND SHALL restore the research capability from the child's durable Coordinator parent identity when recreating its runtime

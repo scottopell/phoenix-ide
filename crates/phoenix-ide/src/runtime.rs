@@ -11135,6 +11135,7 @@ mod scope_liveness_tests {
                     "search_conversations",
                     "read_conversation",
                     "resolve_reference",
+                    "read_file",
                     "submit_result",
                     "submit_error"
                 ])

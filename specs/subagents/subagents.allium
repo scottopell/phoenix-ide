@@ -914,5 +914,6 @@ surface NativeSpawnAdoptionBoundary {
 --   True when any task supplies a non-null cwd, including a blank string.
 -- coordinator_research registry:
 --   query_database, search_conversations, read_conversation, resolve_reference,
---   think, submit_result, submit_error. No filesystem, Bash, browser, MCP,
+--   read_file with an explicit active WorkScope target, think, submit_result,
+--   submit_error. No ambient filesystem, Bash, browser, MCP,
 --   messaging, subscriptions, skills, task approval, lifecycle, or spawn tools.

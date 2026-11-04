@@ -196,11 +196,53 @@ pub(crate) fn research_tools(
             remote_db: db.clone(),
         }),
         Arc::new(QueryDatabase(service.clone())),
+        Arc::new(WorkScopeResearchReadFile(service.clone())),
         Arc::new(ResolveReference {
             service,
             remote_db: db,
         }),
     ]
+}
+
+struct WorkScopeResearchReadFile(GlobalReadService);
+
+#[async_trait]
+impl Tool for WorkScopeResearchReadFile {
+    fn name(&self) -> &'static str {
+        "read_file"
+    }
+    fn description(&self) -> String {
+        "Read numbered text-file lines using an explicit active work_scope_id obtained through query_database or supplied by the parent. Relative paths resolve from that WorkScope's authoritative server directory; absolute paths follow ordinary read_file semantics. Use offset and limit to bound context. No default directory, process execution, or write access.".into()
+    }
+    fn input_schema(&self) -> Value {
+        let mut schema = crate::tools::ReadFileTool.input_schema();
+        schema["properties"]["work_scope_id"] = json!({"type":"string","minLength":1});
+        schema["required"] = json!(["path", "work_scope_id"]);
+        schema["additionalProperties"] = json!(false);
+        schema
+    }
+    fn clearable(&self) -> bool {
+        true
+    }
+    async fn run(&self, mut input: Value, ctx: ToolContext) -> ToolOutput {
+        let Some(scope) = input
+            .get("work_scope_id")
+            .and_then(Value::as_str)
+            .filter(|scope| !scope.trim().is_empty())
+        else {
+            return ToolOutput::error("read_file requires an explicit active work_scope_id");
+        };
+        let target = match self.0.resolve_active_work_scope_bash_target(scope).await {
+            Ok(target) => target,
+            Err(error) => {
+                return ToolOutput::error(format!("Cannot resolve read_file WorkScope: {error:?}"))
+            }
+        };
+        if let Some(path) = input.get("path").and_then(Value::as_str) {
+            input["path"] = json!(target.path.join(path).to_string_lossy());
+        }
+        crate::tools::ReadFileTool::read_in_directory(input, &target.path, &ctx.cancel).await
+    }
 }
 
 pub(crate) fn writing_tools(
@@ -1388,6 +1430,42 @@ mod tests {
 
     fn tool_names(tools: &[Arc<dyn Tool>]) -> Vec<String> {
         tools.iter().map(|tool| tool.name().to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn coordinator_research_reads_file_lines_only_with_an_active_explicit_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("source.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let owner = db
+            .create_conversation(
+                "file-owner",
+                "file-owner",
+                dir.path().to_str().unwrap(),
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let tool = WorkScopeResearchReadFile(GlobalReadService::new(
+            db.clone(),
+            Arc::new(db.fts_retriever()),
+        ));
+        for input in [
+            json!({"path":"source.txt"}),
+            json!({"path":"source.txt","work_scope_id":"unknown"}),
+        ] {
+            assert!(matches!(
+                tool.run(input, context("research-child")).await,
+                ToolOutput::Error { .. }
+            ));
+        }
+        let output = tool.run(json!({"path":"source.txt", "work_scope_id":owner.attached_work_scope_id.unwrap().as_str(), "offset":2, "limit":1}), context("research-child")).await;
+        assert!(matches!(output, ToolOutput::Success { .. }));
+        assert!(output.output().contains("beta"));
+        assert!(!output.output().contains("alpha"));
+        assert!(!output.output().contains("gamma"));
     }
 
     #[tokio::test]

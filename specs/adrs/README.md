@@ -214,7 +214,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [219](219_reminder-reservations-cover-canonical-aliases-and-fresh-openings.md) | Reminder reservations cover canonical aliases and fresh openings | Accepted | REQ-API-033, REQ-REM-005 |
 | [220](220_reminder-management-errors-use-existing-fail-stop.md) | Reminder management errors use existing fail-stop authority | Accepted | REQ-REM-006, REQ-DWF-043, REQ-BED-033 |
 | [221](221_coordinator-authority-uses-conversational-approval-and-direct-tools.md) | Coordinator Authority uses conversational approval and direct tools | Accepted | REQ-AUTH-001–006, REQ-GR-007/013/022 |
-| [222](222_coordinator-delegates-to-filesystem-free-research-agents.md) | Coordinator delegates to filesystem-free research agents | Accepted | REQ-GR-007, REQ-SA-001, REQ-SA-002, REQ-SA-007 |
+| [222](222_coordinator-research-uses-explicit-file-targets.md) | Coordinator research agents use explicit file targets | Accepted | REQ-GR-007, REQ-SA-001, REQ-SA-002, REQ-SA-007 |
 
 ## For agents: which decisions bind your task
 

@@ -159,6 +159,21 @@ impl SpawnAgentsTool {
         self
     }
 
+    fn configure_task_schema(&self, task_props: &mut Value) {
+        if self.coordinator_research {
+            task_props
+                .as_object_mut()
+                .expect("task properties")
+                .remove("cwd");
+            task_props["mode"] = json!({
+                "type": "string", "enum": ["explore"],
+                "description": "Read-only global research (default). Work authority is unavailable."
+            });
+            task_props["max_turns"]["description"] =
+                json!("Maximum LLM turns before forced completion. Defaults to 20.");
+        }
+    }
+
     fn work_guidance(&self) -> &'static str {
         if self.parallel_work_subagents {
             "Work sub-agents may run in parallel for this qualified parent model. The parent should partition assignments and owns integration. Other trusted collaborators may edit the shared worktree concurrently, so preserve unrelated edits and report conflicts, overlap, or uncertainty."
@@ -176,7 +191,7 @@ impl Tool for SpawnAgentsTool {
 
     fn description(&self) -> String {
         if self.coordinator_research {
-            return "Delegate bounded research or analysis to inline read-only agents and receive their results in this conversation. Children can query_database, search_conversations, read_conversation, and resolve_reference. They have no filesystem, Bash, MCP, messaging, watches, or lifecycle tools and cannot spawn children. Assign independent questions with concise evidence and citations requested; use an available execution tier or model connection to control cost. Omit execution to inherit the selected worker's preferences or the parent model. Mode is explore only; cwd is not supported. Up to 10 tasks run in parallel; the parent resumes after all finish.".into();
+            return "Delegate bounded research or analysis to inline read-only agents and receive their results in this conversation. Children can query_database, search_conversations, read_conversation, resolve_reference, and read_file with an explicit active work_scope_id. They have no default directory, Bash, MCP, messaging, watches, or lifecycle tools and cannot spawn children. Assign independent questions with concise evidence and citations requested; use an available execution tier or model connection to control cost. Omit execution to inherit the selected worker's preferences or the parent model. Mode is explore only; cwd is not supported. Up to 10 tasks run in parallel; the parent resumes after all finish.".into();
         }
         format!(
             "Spawn sub-agents to execute tasks. Explore sub-agents may run in parallel. {} Each sub-agent has an independent conversation and returns its own result. Work sub-agents use the resolved task cwd directly. An omitted or blank cwd inherits the parent cwd; Work/Branch overrides stay within the parent worktree, while Direct overrides are unscoped. Phoenix does not create a separate child worktree or merge child changes. Omit agent_type for a generic Phoenix sub-agent, or set agent_type to one of the available named personas. Omit execution to use the named worker's preferences, or otherwise inherit the parent's model, connection, and effort. Choose a configured tier or an explicit model connection to override execution. Execution selection is independent of permissions. Use for: multiple perspectives on code review, exploring unfamiliar parts of a codebase, parallel research or analysis tasks, or divide-and-conquer problem solving.",
@@ -210,19 +225,7 @@ impl Tool for SpawnAgentsTool {
             }
         });
 
-        if self.coordinator_research {
-            task_props
-                .as_object_mut()
-                .expect("task properties")
-                .remove("cwd");
-            task_props["mode"] = json!({
-                "type": "string",
-                "enum": ["explore"],
-                "description": "Read-only global research (default). Work authority is unavailable."
-            });
-            task_props["max_turns"]["description"] =
-                json!("Maximum LLM turns before forced completion. Defaults to 20.");
-        }
+        self.configure_task_schema(&mut task_props);
 
         let mut execution_options = Vec::new();
         if !self.tiers.is_empty() {
