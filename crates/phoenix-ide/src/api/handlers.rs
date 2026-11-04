@@ -5082,6 +5082,7 @@ async fn get_system_prompt(
 mod coordinator_authority_inspection_tests {
     use super::*;
     use phoenix_core::domain::coordinator_authority::CoordinatorAuthority;
+    use phoenix_core::llm_language::LlmLanguage;
     use phoenix_db::workflow::LocalAuthorityResult;
 
     #[tokio::test]
@@ -5089,7 +5090,7 @@ mod coordinator_authority_inspection_tests {
         let state = hard_delete_cascade_tests::make_test_state().await;
         let coordinator = state
             .db
-            .get_or_create_coordinator(None, Default::default())
+            .get_or_create_coordinator(None, LlmLanguage::default())
             .await
             .unwrap();
         let catalog = crate::skills::AuthenticatedCoordinatorSkillCatalog::discover(None);
@@ -5130,7 +5131,7 @@ mod coordinator_authority_inspection_tests {
         let state = hard_delete_cascade_tests::make_test_state().await;
         let coordinator = state
             .db
-            .get_or_create_coordinator(None, Default::default())
+            .get_or_create_coordinator(None, LlmLanguage::default())
             .await
             .unwrap();
         sqlx::query("INSERT INTO app_settings (key, value) VALUES ('coordinator_authority', ?1)")

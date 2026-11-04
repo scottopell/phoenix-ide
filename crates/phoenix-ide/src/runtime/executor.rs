@@ -15174,7 +15174,7 @@ mod dispatch_context_budget_tests {
         let expected = crate::system_prompt::build_coordinator_system_prompt(
             crate::llm_language::LlmLanguage::default(),
             None,
-            &Default::default(),
+            &phoenix_core::domain::coordinator_authority::CoordinatorAuthority::default(),
         );
         for request in &requests {
             assert_eq!(request.system.len(), 1);

@@ -739,7 +739,9 @@ impl InMemoryStorage {
 
     pub fn new() -> Self {
         Self {
-            coordinator_authority: Mutex::new(Ok(Default::default())),
+            coordinator_authority: Mutex::new(Ok(
+                phoenix_core::domain::coordinator_authority::CoordinatorAuthority::default(),
+            )),
             handoff_candidates: Mutex::new(Vec::new()),
             svg_artifacts: Mutex::new(HashMap::new()),
             tool_admission_policies: Mutex::new(HashMap::new()),
