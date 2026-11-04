@@ -41,13 +41,13 @@ from database correctness.
 - [x] Contract: narrow this task, preserve deferred research separately, author
   Authority requirements and executive, link Coordinator capability/continuation
   requirements, record ADR-221 and run task/spec preflight.
-- [ ] Storage and tools: typed document validation, existing scalar persistence,
+- [x] Storage and tools: typed document validation, existing scalar persistence,
   current-source guards, closed schemas, full-replacement and clearing behavior,
   commit-time source validation and focused boundary tests.
-- [ ] Runtime and prompt context: fresh shared Authority rendering in normal
+- [x] Runtime and prompt context: fresh shared Authority rendering in normal
   Coordinator requests and inspector; visible read failures; explicit empty
   context; conversational approval and in-scope-action policy; registry isolation.
-- [ ] Qualification and integration: focused storage/tool/runtime tests, relevant
+- [x] Qualification and integration: focused storage/tool/runtime tests, relevant
   `./dev.py check` lanes, spec preflight, executive evidence and completion status.
 
 ## Observed problem and evidence
@@ -103,26 +103,27 @@ approval theater or a generic permission framework to recover the removed scope.
 
 ## Acceptance and validation
 
-- [ ] Read default empty Authority; replace and read exact text; empty setter
+- [x] Read default empty Authority; replace and read exact text; empty setter
   clears it; file-backed reopen retains it without transcript-summary recovery.
-- [ ] Reject malformed arguments, extra fields and more than 16,384 UTF-8 bytes;
+- [x] Reject malformed arguments, extra fields and more than 16,384 UTF-8 bytes;
   boundary-byte behavior is correct for multibyte text and never clips.
-- [ ] Deny ordinary conversations, sub-agents and stale Coordinator predecessors,
-  including a source that rotates before its write commits.
-- [ ] Register both tools only for the Coordinator; no remote selectors or
+- [x] Deny ordinary conversations, sub-agents and stale Coordinator predecessors.
+  The setter rechecks inside its committing transaction. Rotation tests exercise
+  an already-rotated source, not an injected transaction interleaving.
+- [x] Register both tools only for the Coordinator; no remote selectors or
   model-supplied source identity.
-- [ ] Writes follow existing owned-command outcome classification and do not
+- [x] Writes follow existing owned-command outcome classification and do not
   publish ordinary success/error after unclassified local authority.
-- [ ] Live provider requests and prompt inspector expose the same current body.
+- [x] Mock provider requests and prompt inspector expose the same current body.
   Setting Authority changes subsequent requests without a runtime restart.
-- [ ] Watch-driven and successor Coordinator requests receive current Authority;
+- [x] Watch-driven and successor Coordinator requests receive current Authority;
   unchanged text renders identically; failed reads remain visible failures.
-- [ ] Instructions require interpreted scoped wording and conversational approval
+- [x] Instructions require interpreted scoped wording and conversational approval
   before setting, preserve later user constraints, distinguish one-shot approval,
   and direct routine in-scope work without renewed permission.
-- [ ] Prompt checks establish what instructions are sent, not guaranteed model
+- [x] Prompt checks establish what instructions are sent, not guaranteed model
   compliance. No live production policy or disk-cleanup experiment is required.
-- [ ] Run appropriate focused tests, `./dev.py check`, task/spec validation and
+- [x] Run appropriate focused tests, `./dev.py check`, task/spec validation and
   final diff review; no UI/codegen work unless an actual typed wire change occurs.
 
 ## Separate design problem
@@ -133,3 +134,37 @@ wait deadlines and late answers. It is not a delivery dependency, a mandatory
 rollout phase or an implementation commission. Existing AUQ documentation drift
 and dormant fork-proposal code observations stay with that research; this task
 does not redesign or repair those paths.
+
+## Delivery evidence
+
+Implementation is in PR #1026 on `design/coordinator-authority`; no deployment
+or production Authority mutation is included. Main's reminder feature is merged
+at `366fa38a0`, retaining both tool registrations and independent provenance
+rules. ADR-221 replaces this branch's unmerged provisional ADR-217 allocation.
+
+- Combined-source focused tests passed: core Authority 2, database Authority 4,
+  application Authority rendering/runtime/inspection 5, Authority tools 6.
+  Tests use temporary databases and mock providers.
+- Direct linked-binary checks passed: both core Coordinator prompt tests,
+  reminder attribution, stable Coordinator system-prefix/cache-key behavior,
+  and reminder/predecessor registry upgrade. All 31 system-prompt tests passed
+  in the prior source qualification before merging reminders.
+- Combined `cargo check -p phoenix_ide --tests` passed. Initial Clippy identified
+  four test-only `default_trait_access` findings; `4d5b4a3ad` makes their inferred
+  types explicit without changing behavior. The final
+  `./dev.py check --lanes clippy,cargo-fmt` passed both lanes (169.6s).
+- Task validation, Allium, requirement anchors, `audit-specs` and diff whitespace
+  checks passed. The broader spec-shape structural scan passed; its Python unit
+  suite unexpectedly launched a real backend build and was deliberately stopped
+  to release the build lock. Task 33005 records that validation hazard. No full
+  repository check is claimed.
+- Independent Authority review and the final reminder/Authority merge-seam
+  review found no actionable issues. Review does not replace executed tests.
+
+Coverage limits: the setter rechecks source identity transactionally, but the
+rotation fixture uses an already-rotated source. Requester cancellation is
+exercised before write admission; lost commit acknowledgement is simulated.
+Prompt assertions do not establish human-approval compliance in live LLM use.
+No existing historical cleanup approval has been imported into saved Authority.
+Implementation and bounded local qualification are complete; PR review/hosted
+CI and any later merge/deployment remain separate delivery states.

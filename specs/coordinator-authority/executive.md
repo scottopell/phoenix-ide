@@ -32,23 +32,39 @@ to keep human approval conversational rather than add an interaction workflow.
 
 | Requirement | Status | Notes |
 | --- | --- | --- |
-| **REQ-AUTH-001:** Retain One Instance-Wide Authority Document | 🔄 In Progress | Contract authored; storage implementation pending. |
-| **REQ-AUTH-002:** Read and Replace Through Current-Coordinator Tools | 🔄 In Progress | Closed local read/set shapes and source boundary specified; adapters pending. |
-| **REQ-AUTH-003:** Obtain Conversational Approval Before Saving | 🔄 In Progress | Agent policy specified; prompt wiring and qualification pending. |
-| **REQ-AUTH-004:** Supply Current Authority in Model Context | 🔄 In Progress | Shared live/inspection rendering contract specified; integration pending. |
-| **REQ-AUTH-005:** Establish Replacement Through Normal Persistence Ownership | 🔄 In Progress | Existing persistence classification selected; implementation pending. |
-| **REQ-AUTH-006:** Apply Grants Within Existing Execution Boundaries | 🔄 In Progress | Prompt and capability contract specified; qualification pending. |
+| **REQ-AUTH-001:** Retain One Instance-Wide Authority Document | ✅ Complete | Validated scalar setting; exact replacement, clearing and file-backed reopen tests pass. |
+| **REQ-AUTH-002:** Read and Replace Through Current-Coordinator Tools | ✅ Complete | Closed read/set schemas, trusted source binding, registry isolation and stale-source rejection tested. |
+| **REQ-AUTH-003:** Obtain Conversational Approval Before Saving | ✅ Complete | Both prompt variants and setter guidance require interpreted wording, full replacement review and conversational approval. Model compliance is not established by prompt assertions. |
+| **REQ-AUTH-004:** Supply Current Authority in Model Context | ✅ Complete | Shared live/inspector renderer, per-request refresh, successor context, stable text and visible read-failure tests pass. |
+| **REQ-AUTH-005:** Establish Replacement Through Normal Persistence Ownership | ✅ Complete | Owned write follows existing local outcome classification; rollback, simulated lost acknowledgement and cancellation boundary tests pass. |
+| **REQ-AUTH-006:** Apply Grants Within Existing Execution Boundaries | ✅ Complete | Prompt applies saved grants subject to later user constraints and structural restrictions; ordinary/sub-agent capability isolation tested. |
 
-**Progress:** 0 of 6 complete.
+**Progress:** 6 of 6 implemented with bounded local qualification; not deployed.
 
 ## Verification Summary
 
-Implementation verification must cover local persistence, clearing, UTF-8 byte
-limits, malformed tool arguments, ordinary/sub-agent/stale-Coordinator refusal,
-commit-time source validation, fresh live/inspected context, continuation,
-unchanged-context stability and visible read failures. Prompt assertions verify
-instructions; they do not prove the LLM will always obtain approval or classify
-every action correctly. No production Authority has been seeded or changed.
+Focused tests cover local persistence, clearing, UTF-8 byte limits, malformed
+arguments, ordinary/sub-agent/stale-Coordinator refusal, fresh live/inspected
+context, continuation, unchanged-context stability and visible read failures.
+Current-source validation occurs inside the committing transaction; source
+rotation tests use an already-rotated source rather than an injected transaction
+race. Cancellation coverage drops the requester before write admission, and lost
+commit acknowledgement is simulated rather than a SQLite fault injection.
+
+All 31 system-prompt tests, application test-target compilation, formatting,
+Allium, requirement anchors and task validation passed before integration with
+main's durable reminders. Combined-source test-target compilation, 22 focused
+tests and a bounded review of the merge seams passed at `366fa38a0`. Final
+Clippy and formatting passed after equivalent explicit-default test annotations
+in `4d5b4a3ad`; details are recorded in task 33003 and PR #1026. The broader local
+spec-shape
+structural scan passed, but its Python unit suite unexpectedly started a real
+backend build and was deliberately stopped; task 33005 tracks that separate
+validation hazard. A full repository check is not claimed.
+
+Prompt assertions verify instructions; they do not prove the LLM will always
+obtain approval or classify every action correctly. No live provider behavior
+has been qualified and no production Authority has been seeded or changed.
 
 ## Scope Boundaries
 
