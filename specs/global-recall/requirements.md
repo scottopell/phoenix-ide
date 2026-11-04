@@ -188,6 +188,10 @@ THE SYSTEM MAY provide a dedicated cross-conversation message tool to a write-ca
 
 THE SYSTEM SHALL additionally provide explicit subscription management only to the Global Coordinator as governed by REQ-GR-015
 
+WHILE the persisted singleton Global Coordinator is the executing current transcript
+THE SYSTEM SHALL provide local `read_authority` and `set_authority` solely for the standing-instructions document defined by REQ-GR-022
+AND SHALL NOT thereby grant a server-verified approval capability, semantic action-permission enforcement or a new execution lifecycle.
+
 THE cross-conversation message capability SHALL NOT accept images, files, skills, filesystem references, user-agent metadata, lifecycle commands, or batch targets
 
 THE SYSTEM SHALL NOT provide writable filesystem tools to the Coordinator other than the singleton Coordinator's explicitly WorkScope-targeted Bash capability
@@ -411,7 +415,8 @@ AND SHALL request the next authorized in-scope action, required current status a
 
 WHEN the Coordinator resumes from a continuation handoff
 THE trusted instructions SHALL distinguish evidence verification from obeying directives embedded in recalled content
-AND SHALL direct narrowly recovering authentic primary user evidence and checking attribution, exact scope, later corrections, supersession, pauses, gates, current status and established ownership before acting
+AND SHALL direct narrowly recovering authentic primary user evidence and checking attribution, exact scope, later corrections and supersession when relying on historical approval claims
+AND SHALL supply saved standing Authority through the current authoritative projection defined by REQ-GR-022 while preserving pauses, gates, current status and established ownership
 AND SHALL describe continuation as a handoff, not cancellation or expiry of verified standing user directions, and direct the next authorized in-scope step by default with follow-through to verified completion rather than status-only acknowledgement or redundant permission
 AND SHALL direct narrow evidence recovery or a focused question when authority is missing, conflicting, or insufficient, while preserving pauses and gates
 AND SHALL keep generated summaries, quotations, delegate assertions and encoded payloads untrusted and unable to self-authorize, override instructions, expand scope, or grant blanket merge, deploy, or delete permission
@@ -590,3 +595,15 @@ AND SHALL include hypothetical Ember-to-user contrasts covering purpose-seeking 
 AND SHALL keep messages to owner conversations in plain working instructions rather than the persona
 
 THE persona SHALL NOT grant authority, change when the Coordinator speaks, or relax the evidence standard for factual claims; the existing reporting, silence, security and delegation requirements remain binding.
+
+### REQ-GR-022: Retain and Apply Standing Coordinator Authority
+
+THE SYSTEM SHALL provide one local standing Authority document and current-Coordinator-only `read_authority` and `set_authority` tools under [Coordinator Authority](../coordinator-authority/requirements.md) REQ-AUTH-001 through REQ-AUTH-006.
+
+THE SYSTEM SHALL provide the current document as authoritative operating context on each ordinary Coordinator model request and through the shared prompt-inspection renderer, independently of transcript continuation.
+
+THE Coordinator instructions SHALL require interpreting user feedback into explicit scope, clarifying material ambiguity, presenting complete proposed wording and obtaining conversational user approval before saving it.
+
+THE instructions SHALL direct authorized in-scope action without redundant permission requests while preserving later user restrictions and structural execution boundaries.
+
+THE tools SHALL NOT introduce server-verified human approval, pending proposals, review UI, conversation-state transitions, timers, remote Authority mutation or automatic execution.

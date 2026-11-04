@@ -209,6 +209,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [214](214_coordinator-speaks-as-ember.md) | The Coordinator speaks as Ember, the phoenix on the user's shoulder | Accepted | REQ-GR-021, REQ-GR-011 |
 | [215](215_tool-round-identities-are-validated-before-dispatch-and-reset.md) | Tool-round identities are validated before dispatch and reset | Accepted | REQ-BED-004, REQ-BED-007 |
 | [216](216_explicit-local-tool-selector-reuses-local-admission.md) | Explicit local tool selection reuses local admission | Accepted | REQ-FED-001, REQ-FED-002, REQ-FED-019 |
+| [217](217_coordinator-authority-uses-conversational-approval-and-direct-tools.md) | Coordinator Authority uses conversational approval and direct tools | Accepted | REQ-AUTH-001–006, REQ-GR-007/013/022 |
 
 ## For agents: which decisions bind your task
 
@@ -279,6 +280,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying modern build identity or role-bound legacy predecessor rollback | 064, then 034, 017, and 010 |
 | Working on stable/RC release version parsing, Apple bundle mapping, or prerelease publication classification | 065, then proposed 063 and 018 |
 | Specifying the Coordinator surface, current-activity orientation, or database read boundary | 066 for on-demand activity, 027 for tool eligibility, then 022 and 021 for Coordinator-specific evidence and UI history |
+| Specifying standing Coordinator Authority, conversational approval or read/set tools | 217, with 066 for stable prompt context and 070 for input provenance |
 | Specifying projects task-file shapes, proposal classification, or managed approval behavior across taskmd and plain markdown briefs | 023 |
 | Specifying continuation summary retry, restart recovery, or exactly-once commit | 025 |
 | Specifying provider prompt persistence authority, bounded transcript projection, or continuation prompt freezing | 045, then 025 and 031 |

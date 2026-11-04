@@ -1,126 +1,135 @@
-# Coordinator / Ember standing authority charter
+# Coordinator standing Authority tools
 
-## User need
+## Authorized scope
 
-The user wants to specify standing approvals and operating boundaries that are reliably provided to Global / Ember so it can act confidently without repeatedly asking for permission, especially for disk cleanup. User wording: "I want the use[r] to be able to specify standing approvals or authority boundaries and have this provided to the LLM so the agent can be more confident it is operating within operating authority and does not ask for my input quite so often."
+Implement local Coordinator-only `read_authority` and `set_authority` tools,
+backed by one current natural-language instructions document. Read it into every
+ordinary Coordinator model request and the prompt inspector independently of
+transcript history and continuation. Instruct Ember to interpret user feedback,
+clarify material ambiguity, present the complete replacement and obtain human
+approval in ordinary conversation before calling the setter.
 
-This task records an investigated proposal, not approval of a particular cleanup, implementation, production change, or historical-authority import. The user subsequently clarified their preferred interaction: "to have the LLM write its own authority based on my feedback"; the LLM should not use the human text literally, but "clarify authority boundaries and then write the new authority (probably want a human to approve this?)". Use a formal agent-authored proposal and human-approved activation workflow. Human approval is the recommended activation rule, pending final product agreement; do not interpret this design discussion as an active operational grant. Semantic tool-action enforcement remains a separate product choice from enforcing who may activate an Authority revision.
+The user's scope decision on 2026-11-04:
 
-## Observed journey / environment
+> Okay the human grants permission (and my ideas around auto dismissing certain states) are clearly scope creep and potentially contain complexity-cliff-review, so we must be careful here. Please consider those as a separate design problem, let's proceed with the authority tools and rely on the agent checking for human approval before calling the tool.
 
-Task identity: this task replaces provisional task 33001 from the older detached checkout. After moving to the design/coordinator-authority branch at origin/main (64a6f23d084e6927d3a5aca6f8225c345e14014e), 33001 was already allocated upstream to remove-durable-wake. The same task body was reallocated atomically with taskmd new as 33003, in-progress, and the duplicate provisional file was removed only after verifying identical contents. The user explicitly approved the Authority direction and requested in-progress status and specification/design investigation; this does not commission production changes.
+The approval requirement is model guidance. No server proof, `human_approved`
+flag, approval card, proposal/revision protocol, timed wait, background workflow,
+new conversation state, remote target, or semantic action-permission engine is
+part of this implementation. The user approved implementation of the tools;
+that does not seed production Authority or authorize disk deletion/deployment.
 
-Read-only investigation on 2026-11-03. Checkout HEAD 27c514034, clean detached worktree at /Users/scottopell/.codex-workspaces/worktrees/ios-88e63b9a-876b-4617-aec7-657ee19a8fbc/phoenix-ide. Local production deployed.sha was ce4b0bffdad0b11eb156d91c3584ff8767f60a02; relevant deployed source was inspected with git show because it is materially newer than this checkout. Query production SQLite read-only; never copy the full DB for this task. Delivery roadmap #806 was read; it contains disk-cleanup status but is not the permission authority. Implementation must re-ground on current main/deployed contracts rather than applying the old checkout's capability assumptions.
+## Normative contract and decision
 
-User approves cleanup -> Ember interprets scope -> delegates to existing disk/execution owners -> user authority and exclusions are copied into prompts/handoffs -> new targets or contexts trigger another approval packet. There is no dedicated standing-authority charter in the inspected Coordinator prompt path.
+- `specs/coordinator-authority/requirements.md`: REQ-AUTH-001–006.
+- `specs/global-recall/requirements.md`: REQ-GR-007/013/022.
+- ADR-217: conversational approval and direct read/set tools.
+- Existing permissions and compatibility contracts remain binding.
 
-## Verified evidence
+One instance-wide document is stored as one indivisible scalar under the
+`coordinator_authority` application setting. Reuse `app_settings`; no migration
+or separate current/history representation is needed. `read_authority` accepts
+`{}`; `set_authority` accepts exactly `{instructions: string}`. Replace the
+whole value, empty text clears it, maximum 16,384 UTF-8 bytes, explicit errors
+rather than clipping. A current-Coordinator check is required at reads and
+inside the committing write transaction. Existing owned-write and local
+persistence-classification rules apply; conversational approval is separate
+from database correctness.
 
-- Production primary user input 6c01967a-6c9b-4b70-973b-b761cc13761e, transcript ee39d71c-4828-44bc-818b-1db991d84fcf, 2026-10-27T00:29:30.541243Z, ends: "approved, I want to issue blanket approval, this is cache and easily removable". It appears as free text accompanying a narrowly scoped generated answer preview. The model must reconcile those two meanings.
-- Ember response 7aa23018-caeb-4b72-a732-3c671edaa056 in that transcript, 2026-10-27T00:32:36.044742Z, reports clearing three additional disposable Tools caches "under your standing permission". This disproves a pure never-recognized-approval explanation.
-- Production primary user answers 3d9fe394-6729-4522-8244-858b354acfca (2026-11-02T12:45:04Z) and 1d032178-4ce5-466e-bda4-433551e9731a (2026-11-03T00:13:27Z) approve individual file/batch cleanup packets. Whether any intervening human restriction narrowed the October grant has NOT been exhaustively adjudicated. Do not backfill authority from this sample.
-- Response aa32e74a-5d18-4668-a7cc-51674a266f3a, transcript cc641b4c-880b-40d5-91da-d8d493888143, reports the batch complete and concludes "No additional deletion is authorized." An assistant report must not itself become a user revocation.
-- Deployed coordinator_prompt in phoenix-core/src/llm_language.rs already says to avoid redundant permissions and continue within verified authority, but also says "No new scope or blanket merge, deploy or delete permission." Its security guidance requires recovering authentic primary input and later supersession, and denies authority to summaries, quotes, and delegate claims.
-- Deployed coordinator_home::context explicitly says notes and files never confer authority; they are deliberately retrieved historical data. notes.md is therefore not an adequate authoritative-policy workaround.
-- Coordinator request construction is in system_prompt::build_coordinator_system_prompt and ConversationRuntime::dispatch_llm_request; system-prompt inspection is a separate handler and must remain consistent. Continuation CompactionPolicy prioritizes scoped authority but is still model-generated text.
-- Ordinary prompts discover working-directory guidance, while Coordinator uses a separate builder. This is a structural difference relevant to the reported ordinary/global contrast, not proof that ordinary chats never lose approval context.
-- ADR-066 removes changing activity snapshots to preserve prompt-prefix stability. ADR-070 says API-channel provenance does not prove biological human authorship. The existing permission seam has deterministic non-overridable denies, not a general user-intent policy evaluator.
+## Delivery phases
 
-## Failure model / owning invariant
+- [x] Contract: narrow this task, preserve deferred research separately, author
+  Authority requirements and executive, link Coordinator capability/continuation
+  requirements, record ADR-217 and run task/spec preflight.
+- [ ] Storage and tools: typed document validation, existing scalar persistence,
+  current-source guards, closed schemas, full-replacement and clearing behavior,
+  commit-time source validation and focused boundary tests.
+- [ ] Runtime and prompt context: fresh shared Authority rendering in normal
+  Coordinator requests and inspector; visible read failures; explicit empty
+  context; conversational approval and in-scope-action policy; registry isolation.
+- [ ] Qualification and integration: focused storage/tool/runtime tests, relevant
+  `./dev.py check` lanes, spec preflight, executive evidence and completion status.
 
-Standing permission and its provenance are reconstructed from mixed historical evidence instead of being supplied as current user-controlled operating instructions. One-shot previews, assistant-authored restrictions, and handoffs can narrow interpretation without a deliberate user policy change. Fact uncertainty (is this regenerable and unused?) is conflated with permission uncertainty (may I remove this class of material?).
+## Observed problem and evidence
 
-Owning invariant: a current explicit user standing grant remains available to Ember across turns and continuation until the user changes it. In-scope actions require ordinary factual verification, not renewed user approval. The agent cannot expand, revoke, or invent user authority by reporting or summarizing it.
+Read-only production investigation on 2026-11-03 used deployed source ce4b0bff
+and primary user messages. Source implementation work is on
+`design/coordinator-authority` based on origin/main 64a6f23d0. The original old
+checkout allocated provisional task 33001, already used upstream; taskmd
+reallocated this task 33003. The full historical evidence and superseded larger
+proposal are preserved in task 33004.
 
-## Proposed smallest shippable scope
+- Primary user input 6c01967a-6c9b-4b70-973b-b761cc13761e in transcript
+  ee39d71c-4828-44bc-818b-1db991d84fcf, 2026-10-27T00:29:30Z, says:
+  "approved, I want to issue blanket approval, this is cache and easily removable".
+- Ember response 7aa23018-caeb-4b72-a732-3c671edaa056 reports clearing additional
+  caches under that standing permission. It did recognize the approval.
+- Later individual file/batch approvals 3d9fe394-6729-4522-8244-858b354acfca
+  and 1d032178-4ce5-466e-bda4-433551e9731a show recurring scope reconstruction.
+  Intervening human restrictions were not exhaustively adjudicated; do not
+  import a grant from this sample.
+- Existing prompts ask for confident action yet prohibit invented blanket
+  permission. Explicit saved Authority must be distinguished from historical
+  claims; deliberately user-granted broad authority is allowed.
+- Coordinator home notes are historical evidence, not authoritative instructions.
+  Summary retention alone cannot establish a current standing document.
 
-1. Make Authority a first-class, per-instance Coordinator concept with a current approved revision and separate proposed revisions. Treat each full natural-language body as one indivisible document outside transcript/summary/home notes; store proposal/revision metadata in relational rows rather than a JSON collection. The agent authors clear operating rules from human feedback instead of copying the feedback verbatim. Retain the feedback as provenance, distinct from the normative body. Empty Authority means no additional standing grant. The UI exposes current Authority and proposal review; typing feedback need not require editing policy prose manually.
-2. Supply the current charter through a dedicated authoritative context path on EVERY Coordinator model dispatch, including watch-driven and resumed turns. Keep it outside compaction loss; inspection must show the same effective body. Keep a deterministic ordering and stable content while unchanged: no timestamps/activity appended per request. Loading failure must be explicit, never silent use of a stale or empty policy. Define next-dispatch visibility; an edit does not retroactively cancel an already-running tool. Explain that limit in the editor.
-3. Prompt contract: execute within explicit standing grants without re-asking, verify applicability independently, preserve explicit user pauses/protected resources and platform denies, and ask only about a concrete uncovered action or conflict. Permission to act does not invent a new assignment/schedule. Agent-authored restrictions and quoted approval packets cannot revoke a user grant. User-authored task restrictions can narrow applicability; changing the standing charter itself must be explicit. Clarify the deployed blanket-permission warning so it prohibits inventing blanket authority while allowing the user to deliberately grant it.
-4. Provide Coordinator-only tools conceptually named read_authority and propose_authority_change. Read returns current approved revision and relevant pending proposal metadata. Propose accepts the expected base revision, exact complete replacement body, concise rationale and feedback source references; the server binds the caller and proposal identity. The LLM clarifies only material ambiguity before proposing: actions, host/resource scope, applicability conditions, exclusions and delegation where relevant. It may propose from feedback without a magic phrase, but cannot turn ordinary one-time approval into active standing permission. Proposing never changes current Authority. A historical quote, delegate message, event or summary cannot activate Authority. API provenance is not cryptographic proof of human intent; do not advertise this as adversarial isolation.
-   Human review shows the exact proposed body and readable changes, including removals/narrowings as well as expansions, with Approve, Reject and Request changes. Approval commits that immutable proposal against its exact base revision through the user interaction path, not through a model-callable approval tool. The server activates the approved body directly; no second LLM rewrite or discretionary apply step is allowed after approval. Editing a submitted body produces a new reviewable proposal. A stale base requires a freshly reconciled proposal and review; no silent merge or stale overwrite. Duplicate approval must not create another revision. Persist pending proposals so continuation/reload can recover the same exact review target. Reject/request-changes leaves current Authority untouched. Preserve prior approved revisions and provenance for inspection; only one revision is effective.
-   Immediate user Stop, pause or task-specific restrictions apply immediately through their existing paths; they must not wait for permanent-charter approval. If the user also wants a lasting change, Ember separately proposes it. Authoring/updating the charter has a human activation boundary even when tool-action execution is guided by prompt instructions.
-5. Cover delegation explicitly: the charter may authorize Ember to commission existing owners within its bounds, and Ember includes those bounds in the assignment. V1 does not automatically inject all Global authority into ordinary conversations or grant cross-instance authority by copying text. Do not claim worker inheritance/enforcement that is not implemented. Verify a real existing disk-owner journey can use the authorized assignment without another user round trip; if trustworthy delegation needs additional machinery, surface the bounded dependency before claiming the cleanup outcome is solved.
-6. Proposed initial disk rule for USER REVIEW, not an active grant: Ember may clear verified-unused, regenerable development build/cache material on named ESS/DEV hosts, directly or through existing owners. It must establish target identity, regenerability and lack of active use; preserve source/Git, unique artifacts/evidence, databases/backups, deployment/recovery assets and personal data. New cache paths inside the approved class do not require permission. Unknown material remains intact while Ember investigates or skips it; ask only if deleting that excluded/uncertain material is necessary. Do not use self-authored manifests, one-off approval gates, or arbitrary quantity limits to narrow the grant. Broader deletion classes require their own user choice.
-7. Update normative global-recall requirements, relevant permission-boundary language, and executive status. Record the policy/trust/prompt-injection decision in the shared ADR chain. Read specs/AUTHORING.md before pushing. Precisely specify the proposal/review/activation lifecycle, approval ownership and stale-base behavior; use Allium for the approval lifecycle per repository guidance. This formal lifecycle does not require a generic policy language or semantic permission engine.
+## Complexity-cliff review
 
-## Interaction map
+Highest cost relative to immediate value:
 
-User feedback -> Ember interprets and clarifies material boundaries -> read current Authority -> submit immutable proposed replacement against its revision -> human reviews exact body/change -> server commits approved revision -> current revision read at Coordinator request construction -> model instructions -> applicability inspection -> authorized scoped execution/delegation -> observed result. Reject/request-changes preserves the current revision. The prompt inspector follows the same context builder. Continuation regenerates current authority from storage rather than from its summary; old messages remain history. Existing WorkScope selection, destination authorization, permission denies and Stop remain independent.
+1. **Server-verified human grants.** An approval button looks small, but exact
+   reviewed content requires proposal identity, pending lifecycle, activation,
+   stale-state handling and client actions. This changes the feature into an
+   interaction workflow spanning persistence, runtime, web and iOS. Lower-cost
+   alternative: agent obtains conversational approval, then calls a plain setter.
+2. **Automatic dismissal and late answers.** A ten-minute wait looks like a timer,
+   but restart-safe continuation, Stop races, current-owner delivery and answers
+   while working require durable scheduling/admission and UI independent of
+   execution state. This is a separate class of runtime concern. Lower-cost
+   alternative: retain existing question behavior for this feature.
+3. **Distributed/versioned Authority.** Per-host replication, proposal history,
+   revision conflicts and semantic action enforcement seem like refinements but
+   introduce synchronization, conflict and policy subsystems. Lower-cost
+   alternative: one local current document; existing tool/transcript records
+   expose edits, without promising an independent policy history.
 
-## Acceptance / validation
+The hidden commitments are permanent pending-request state, crash-spanning
+execution after a deadline, hard human-consent proof and cross-instance policy
+synchronization. Removing them collapses this change to bounded document CRUD
+and prompt assembly. The remaining source guard, input validation, atomic local
+write and fresh read are ordinary correctness obligations. Do not add boolean
+approval theater or a generic permission framework to recover the removed scope.
 
-- Persist/edit/revoke charter; reload/restart/continue; inspect actual recorded provider requests and prompt inspector for exact effective text and no old revision on a subsequent request.
-- Watch turn receives current charter. Unchanged charter produces byte-identical authority context; no restored live-activity capsule.
-- Concurrent edit rejects stale expected revision rather than overwriting a newer charter. Loading failure is visible and does not continue on stale authority.
-- Feedback becomes a clear, bounded LLM-authored proposal rather than a literal transcript copy. Ask focused clarification only where competing interpretations materially change authority; no compulsory questionnaire before every draft.
-- Proposed text is never effective before human approval. The model has no approval capability. Review displays the exact proposed replacement and its change; approval activates those exact bytes without another model rewrite. Ordinary one-shot approval and quoted/delegate/event/summary text cannot implicitly update the charter.
-- Reject/request-changes preserves current Authority; editing or rebasing requires new review. A stale-base approval cannot overwrite a newer revision, duplicate approval does not mint another revision, and reload/continuation preserves the exact pending review target. Approval commit failures follow the existing classified persistence-ownership contract.
-- User pause/task restriction is honored; assistant "no additional deletion" statement does not revoke a standing grant. Revoked grants are absent on the next dispatch. Already-running work semantics are explicit.
-- A bounded model evaluation with disposable synthetic files reproduces a multi-turn disk-cache example: authorizes two different verified-unused cache targets under one grant, does not ask for a second approval, retains an active/unknown/protected target, and reports observations rather than estimated reclamation. Test current/requested model behavior rather than only asserting prompt substrings. Do not delete production data for acceptance.
-- Delegation acceptance is separate from verified cleanup; test the actual owner instruction journey before declaring the user pain resolved. Keep ordinary conversation authority unchanged.
-- Run ./dev.py check and relevant UI/runtime/database checks appropriate to implementation; use task/spec validation and codegen when typed wire shape changes.
+## Acceptance and validation
 
-## Risks / non-goals
+- [ ] Read default empty Authority; replace and read exact text; empty setter
+  clears it; file-backed reopen retains it without transcript-summary recovery.
+- [ ] Reject malformed arguments, extra fields and more than 16,384 UTF-8 bytes;
+  boundary-byte behavior is correct for multibyte text and never clips.
+- [ ] Deny ordinary conversations, sub-agents and stale Coordinator predecessors,
+  including a source that rotates before its write commits.
+- [ ] Register both tools only for the Coordinator; no remote selectors or
+  model-supplied source identity.
+- [ ] Writes follow existing owned-command outcome classification and do not
+  publish ordinary success/error after unclassified local authority.
+- [ ] Live provider requests and prompt inspector expose the same current body.
+  Setting Authority changes subsequent requests without a runtime restart.
+- [ ] Watch-driven and successor Coordinator requests receive current Authority;
+  unchanged text renders identically; failed reads remain visible failures.
+- [ ] Instructions require interpreted scoped wording and conversational approval
+  before setting, preserve later user constraints, distinguish one-shot approval,
+  and direct routine in-scope work without renewed permission.
+- [ ] Prompt checks establish what instructions are sent, not guaranteed model
+  compliance. No live production policy or disk-cleanup experiment is required.
+- [ ] Run appropriate focused tests, `./dev.py check`, task/spec validation and
+  final diff review; no UI/codegen work unless an actual typed wire change occurs.
 
-Prompt guidance influences behavior; it does not enforce semantic filesystem policy against arbitrary Bash. Existing deterministic denies remain binding. No automatic historical import or adjudication, default production cleanup, live policy change, deployment, background cleanup scheduler, ordinary-conversation rollout, federated authority registry, or generic role/permission engine is commissioned by this proposal. The disk grant's exact host coverage, retention categories and delegation wording remain a user decision.
+## Separate design problem
 
-## Design investigation: durable interactions versus execution waiting (2026-11-03)
-
-### User steering
-
-The user approved the Authority proposal and asked to investigate the broader state-machine concern before implementation: inline approval is probably net new; another parked conversation state is possible, but they increasingly want the agent to proceed independently after a wait such as ten minutes. This should potentially apply to ask_user_question too. The unanswered interaction should remain visible and answerable later, with the user able to see that the agent moved on. Timeout followed by dismissal is explicitly an option to evaluate, not a chosen design. Ten minutes is illustrative, not an approved fixed timeout.
-
-### Verified contract and code map
-
-- specs/ask-user-question/requirements.md REQ-AUQ-001 mandates execution pause on question submission. REQ-AUQ-004 mandates that user dismissal records no answer, grants no autonomous continuation and waits for a later explicit message. REQ-AUQ-009 binds answer/dismiss actions to the one current Phoenix-owned request identity under mutation admission. Changing these meanings requires deliberate normative updates.
-- phoenix-state-machine::transition_parent handles AskUserQuestion from the LlmResponse interception path, requires it to be the sole tool, checkpoints the assistant tool call with a synthetic completed tool result, and stores question payload plus request authority in AwaitingUserResponse. No provider request remains open while the user thinks. UserQuestionResponse persists a new attributed user message and requests the LLM; it does not complete a second provider tool result. The legacy ask-user-question/design.md and executive language about executor/ToolExecuting interception and formatted answer tool results are stale against this actual path. Reconcile this on-path documentation drift when revising the feature.
-- Dismissal records USER_QUESTION_DISMISSED_MARKER and persists Idle with no RequestLlm. The marker participates in settled-turn recovery semantics. The focused test test_awaiting_user_response_dismisses_without_resuming_llm falsifies any assumption that dismissal already means continue without an answer.
-- SendChatApplicationService::respond_to_question requires AwaitingUserResponse and matching request identity. A late answer after entering another execution state is rejected today. Question contents currently live inside ConvState rather than an independently addressable request lifecycle.
-- ui/src/pages/ConversationPage.tsx replaces the normal composer with QuestionPanel while awaiting_user_response; the panel is keyed by request_id and local success predicts a whole-conversation phase change. It cannot retain an independently actionable old question while working. iOS QuestionCard and REQ-IOS-016 likewise use the waiting state; mobile submits online only and preserves drafts until server success. Both surfaces need a current durable interaction projection independent of activity state.
-- specs/bedrock/bedrock.allium rules AskUserQuestionIntercepted, UserAnswersQuestion, UserDismissesQuestion and the parent/core partition encode the same coupling. Its stale generalization that question exits reset to idle must not be used to override the actual answer-to-LlmRequesting transition.
-- specs/steering-messages/steering-messages.allium supplies normal busy-input admission, FIFO durable queueing and atomic delivery before the next model request at eligible tool-round boundaries. Late answers should reuse that admission discipline after domain validation, not force a busy conversation back into an old waiting state.
-- specs/durable-workflows/requirements.md REQ-DWF-033/034/035/043 and direct-chat ownership/refinement require singular scheduling/delivery ownership, durable acknowledgment before independently recoverable owed work, and recovery from committed facts rather than live timers or transcript wording. RuntimeManager::preserved_restart_state currently restores pending question waits; a new timeout continuation must have explicit durable ownership and cannot be inferred from age alone. The requirements document's concluding current-authority list and executive must be consulted before citing older foundation sections as the feature contract. No second scheduler or ad-hoc browser timer may become authority.
-- specs/wake-contracts/requirements.md and ADR-098 retire wake execution without commissioning a replacement. The durable-workflow executive classifies generic schedule/observation wrappers as verification foundations, not an active runtime producer. An interaction wait deadline would require a newly specified and implemented production admission/recovery contract; it cannot be presented as switching on an existing wake feature or a generic scheduler already wired for human decisions. Scope any shared-foundation reuse narrowly and preserve the retirement contract.
-- REQ-GR-015 and coordinator_watches::durable_question_wait_is_emitted_once_per_request_without_settling_turn record wait entry as a distinct factual occurrence without terminating active direct-turn ownership. Changing wait/continue semantics also changes notifications and direct-turn settlement; awaiting input is not task completion.
-- Legacy fork-proposal persistence/UI offer a historical nonblocking review shape, but current REQ-PROJ-033 requires blocking task proposal review and the Project-specific fork requirements are retired. The apparent nonblocking code in transition_parent is after an exhaustive eligible/reject/blocking-return sequence; it is not a supported generic inline-permission contract. Do not revive fork behavior as an Authority shortcut. Off-path cleanup is not included.
-
-### Separate the three questions
-
-1. What user decision remains open? A durable, addressable request with an immutable reviewed payload and kind-specific actions: answer a question set, or approve/reject/request changes to an Authority revision.
-2. Is this conversation choosing to wait for that request? A reference to the pending request and an optional durable wait deadline belongs to execution control. Ending that wait does not answer, reject, withdraw or approve the request.
-3. What may proceed without the answer? Existing user authority and the model's current task reasoning determine independent work. No elapsed deadline creates permission, establishes a default answer, adds scope, or guarantees useful work exists. If nothing useful is authorized, the agent can become idle while the request remains pending.
-
-The durable request and execution wait are distinct facts, not duplicate representations. Working+pending and idle+pending are valid. A waiting reference to a resolved/withdrawn request is invalid and must be prevented by the owning transition/admission boundary. Do not encode every request lifecycle as a new whole-conversation state or introduce an unsound Cartesian product of states.
-
-### Options compared
-
-- Another dedicated parked Authority state: smallest familiar blocking path, but by itself cannot retain a proposal across moving on or accept a late action while working. It remains viable if chosen, yet still needs a durable proposal record for exact approval. Do not assume this is the chosen architecture.
-- Park, then invoke current dismissal: superficially small, but current dismissal deliberately settles the turn without a restart and removes the current question identity/payload from active state. Preserving a late-answerable request, adding a durable autonomous continuation and distinguishing the human's action would substantially change that contract. A separate WaitElapsed/StopWaiting event can share implementation helpers where justified; do not publish it as a human dismissal or manufacture an answer.
-- Independently durable interactions with optional waits: represent the request lifecycle outside the execution enum. Posting can continue immediately or park on a request reference; a deadline releases only that wait and admits one bounded reassessment under unchanged authority. This supports Authority and questions without requiring all interactions to be nonblocking or deleting a useful parked execution state. It has larger initial persistence/admission/UI scope but addresses the stated future direction directly.
-
-Working recommendation, not a ratified architectural decision: the third model. Authority proposals can be pending while Ember continues other work immediately. AskUserQuestion may initially retain a wait, with an explicit chosen wait policy later allowing a bounded timeout. No need to force the same initial waiting policy on both request kinds. Reuse identity, ownership, review visibility and delivery foundations where they genuinely match, while keeping question responses and Authority activation separate typed domain commands. Avoid a generic arbitrary-action approval/callback engine.
-
-### Transition sketch and concurrency obligations
-
-- Post: persist the immutable request and transcript reference with the completed posting acknowledgment before exposing the review action. Continue immediately or atomically establish a wait ticket referencing that request.
-- Answer while waiting: resolve the exact request and consume the matching wait in one authoritative transition; deliver one attributed answer and resume once.
-- Deadline while still waiting: validate exact wait identity/generation and durable deadline, consume that wait and establish one durable continuation/reassessment obligation; leave the request pending. The next LLM sees a factual wait-elapsed event plus pending context, not a fabricated user instruction. Ordinary expiry of a wait must never grant the requested approval.
-- Answer racing deadline: serialize through one owner. If the answer wins, the timeout becomes stale. If the deadline wins, accept the answer through the now-current idle/busy admission path. Neither order loses the answer, rewinds state or dispatches two concurrent LLM calls.
-- Answer after moving on: validate the durable request, retain its original wording/options and provenance, and atomically resolve it with a durable input/notification delivery obligation. Use current execution admission: idle can start, busy queues steering, a successor receives an explicitly bound stable-owner delivery where permitted. Do not replay the old tool round. A question response is user input to current reasoning; it need not blindly replay a stale plan. Authority approval separately checks exact proposed body/base revision and activates the reviewed bytes transactionally, then reports that committed fact.
-- Stop: retire any outstanding timeout continuation authority. Pending questions/proposals may remain inspectable; an old deadline must not restart stopped work. Define whether an explicit later answer is a new user input separately from whether a metadata approval click requests execution. Never conflate approval with universal permission to resume paused work.
-- Continuation: preserve requests at the durable ProductConversation/Coordinator owner, keep original transcript/tool references as provenance, and resolve late delivery to the allowed current execution owner. A historical transcript id is not a mutable delivery destination. Ordinary Close/History/Delete require explicit retirement rules; a late response must not resurrect closed work.
-- Supersession: only unresolved, current reviewable content may be acted upon. A replaced question/proposal remains historical with an explicit reason and current replacement link; it does not silently accept an old answer against new wording. For Authority, a stale base is not made current by silently merging it.
-- Duplicates and crashes: resolve once per request/action identity. A client retry converges on the committed result; answer acceptance cannot be lost between request resolution and message admission. Reload/reconnect snapshots recover pending/closed outcomes independently of transcript virtualization or SSE delivery. Restart preserves the original deadline and the exact consumed/not-consumed wait fact.
-
-### Presentation and boundedness
-
-Show activity and input debt separately: "Working · 1 question awaiting you", "Idle · 1 question awaiting you", or "Waiting for your answer · continues with independent work after …" only when that policy is actually enabled. The retained card can say "Agent moved on; you can still answer" once the wait was released. Keep a visible route back to pending requests after their transcript anchors scroll away; no need for a separate work dashboard. Closing a panel, postponing an answer, withdrawing a question, rejecting an approval, and stopping execution are different actions.
-
-Moving on permits more than one pending request. Specify ordering and exposure of those requests, avoid repeated requests for the same unresolved decision, and do not inject an unbounded full archive into every prompt. Current approved Authority still needs its full authoritative context; unresolved request reminders are a separate bounded context problem. Partial answers inside a multi-question request are not implicitly introduced by this design.
-
-### Remaining product decisions before normative specs
-
-Decide immediate continuation versus an initial bounded wait for each request kind; whether the wait duration is user policy or agent-selected within bounds; precise human dismissal/postponement semantics; whether a late answer merely sends input or also requests execution after Stop; how an Authority approval should notify an idle/paused Ember; and when stale decisions are withdrawn versus remain answerable. Ten minutes alone does not resolve these semantics. Authority must not be blocked indefinitely on a full migration of task approvals; decide whether the shared durable-interaction foundation and Authority can ship first while existing AskUserQuestion retains its behavior, then use a separately scoped follow-up for its timeout/late-answer migration.
-
-Validation must include answer/deadline races in both orders, Stop/deadline, answer/continuation, answer/Close, duplicate answer from two clients, proposal-base changes, browser reload with an old open panel, restart before/after each acceptance/deadline/delivery boundary, working/idle plus pending display on web/iOS, no useful independent work, and a truly blocked action remaining prohibited after timeout. Use fake durable time/failpoints; no real ten-minute sleeps or production experiments.
+Task 33004 (`durable-human-interactions-and-bounded-waits`, brainstorming) retains
+the full prior investigation of formal approval, independently pending questions,
+wait deadlines and late answers. It is not a delivery dependency, a mandatory
+rollout phase or an implementation commission. Existing AUQ documentation drift
+and dormant fork-proposal code observations stay with that research; this task
+does not redesign or repair those paths.
