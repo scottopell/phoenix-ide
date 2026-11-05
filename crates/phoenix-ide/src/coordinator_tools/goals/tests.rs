@@ -7,7 +7,9 @@ use phoenix_core::domain::{
         DirectTurnTurnId, PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
         SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
     },
+    sm_state::{AssistantMessage, ToolCall, ToolInput},
 };
+use phoenix_db::ConvState;
 use phoenix_workflow::{
     AcceptedDisposition, ClientTurnKey, ConversationAuthority, PreparedTurn, Timestamp,
 };
@@ -234,7 +236,8 @@ async fn native_goal_discovery_prepare_apply_read_and_replay_without_dispatch() 
             (148, "product_creation_initial_execution_receipts".into()),
             (149, "product_creation_image_retirement".into()),
             (150, "federated_subscription_terminal_cancellation".into()),
-            (151, "one_shot_conversation_reminders".into())
+            (151, "one_shot_conversation_reminders".into()),
+            (152, "goal_preparation_inflight_source".into())
         ]
     );
     for name in [
@@ -777,6 +780,205 @@ async fn native_suspended_goal_replacement_uses_auto_continue_admission_and_pres
         history_after
     );
     assert_eq!(f.work_counts().await, work_before);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn native_goal_prepare_after_owner_and_coordinator_continuation_uses_in_flight_source() {
+    use phoenix_core::domain::conversation_goal::GoalActor;
+
+    let f = Fixture::new().await;
+    let initial_preparation = f
+        .prepare(json!({"operation":"create","objective":"initial Goal"}))
+        .await;
+    value(&f.apply(&initial_preparation).await);
+    let initial_goal = f.db.conversation_goal(&f.owner).await.unwrap().unwrap();
+
+    f.db.update_conversation_state(
+        &f.target_transcript,
+        &ConvState::ContextExhausted {
+            summary: "ordinary owner continuation".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let phoenix_db::ContinueOutcome::Created(owner_successor) =
+        f.db.continue_conversation(&f.target_transcript)
+            .await
+            .unwrap()
+    else {
+        panic!("fresh ordinary continuation")
+    };
+    assert_eq!(owner_successor.product_conversation_id, f.owner);
+
+    f.db.update_conversation_state(
+        &f.caller,
+        &ConvState::ContextExhausted {
+            summary: "Coordinator continuation".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let phoenix_db::ContinueOutcome::Created(coordinator_successor) =
+        f.db.continue_conversation(&f.caller).await.unwrap()
+    else {
+        panic!("fresh Coordinator continuation")
+    };
+    assert!(f
+        .runtime
+        .coordinator_tool_registry(&f.caller, None)
+        .await
+        .is_err());
+
+    let accepted =
+        f.db.workflow_repository()
+            .accept_authoritative_turn(&runtime_input(
+                &coordinator_successor.id,
+                "continued-goal-replacement",
+            ))
+            .await
+            .established()
+            .expect("continued Coordinator turn admission must establish a durable fact")
+            .unwrap();
+    let phoenix_workflow::TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
+        panic!("fresh continued Coordinator Runtime turn")
+    };
+    let turn_id = DirectTurnTurnId(turn_id.0);
+
+    let prepare_message_id = uuid::Uuid::new_v4().to_string();
+    let prepare_tool_use_id = uuid::Uuid::new_v4().to_string();
+    let prepare_input = json!({
+        "target": f.target(),
+        "action": {"operation":"replace","objective":"continued replacement"}
+    });
+    f.db.update_conversation_state(
+        &coordinator_successor.id,
+        &ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                &prepare_tool_use_id,
+                ToolInput::Unknown {
+                    name: "prepare_goal".into(),
+                    input: prepare_input.clone(),
+                },
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: AssistantMessage::new(
+                prepare_message_id.clone(),
+                vec![ContentBlock::ToolUse {
+                    id: prepare_tool_use_id.clone(),
+                    name: "prepare_goal".into(),
+                    input: prepare_input.clone(),
+                }],
+                None,
+                None,
+            ),
+        },
+    )
+    .await
+    .unwrap();
+    let persisted_prepare_message: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM messages WHERE conversation_id=? AND message_id=?",
+    )
+    .bind(&coordinator_successor.id)
+    .bind(&prepare_message_id)
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(persisted_prepare_message, 0);
+
+    let registry = f
+        .runtime
+        .coordinator_tool_registry(&coordinator_successor.id, None)
+        .await
+        .unwrap();
+    let executor = ToolRegistryExecutor::builtin_only(registry, Arc::from([]));
+    let prepared = executor
+        .execute(
+            CheckedToolCall::cleared_for_test("prepare_goal", prepare_input.clone()),
+            super::super::tests::context(&coordinator_successor.id)
+                .with_direct_turn_id(turn_id)
+                .with_tool_use_id(&prepare_tool_use_id)
+                .with_svg_assistant_message_id(&prepare_message_id),
+        )
+        .await
+        .unwrap();
+    let prepared = value(&prepared);
+    assert_eq!(prepared["target"], f.target());
+    assert_eq!(prepared["expected_version"], initial_goal.version().get());
+    assert!(uuid::Uuid::parse_str(prepared["action_reference"].as_str().unwrap()).is_ok());
+    f.db.add_message(
+        &prepare_message_id,
+        &coordinator_successor.id,
+        &MessageContent::Agent(vec![ContentBlock::ToolUse {
+            id: prepare_tool_use_id.clone(),
+            name: "prepare_goal".into(),
+            input: prepare_input,
+        }]),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let before_apply = f.work_counts().await;
+    let apply_tool_use_id = uuid::Uuid::new_v4().to_string();
+    let apply_message_id = uuid::Uuid::new_v4().to_string();
+    let apply_input = json!({"action_reference":prepared["action_reference"]});
+    f.db.add_message(
+        &apply_message_id,
+        &coordinator_successor.id,
+        &MessageContent::Agent(vec![ContentBlock::ToolUse {
+            id: apply_tool_use_id.clone(),
+            name: "apply_goal".into(),
+            input: apply_input.clone(),
+        }]),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let apply = || CheckedToolCall::cleared_for_test("apply_goal", apply_input.clone());
+    let apply_context = || {
+        super::super::tests::context(&coordinator_successor.id)
+            .with_direct_turn_id(turn_id)
+            .with_tool_use_id(&apply_tool_use_id)
+            .with_svg_assistant_message_id(&apply_message_id)
+    };
+    let accepted = executor.execute(apply(), apply_context()).await.unwrap();
+    value(&accepted);
+    let replay = executor.execute(apply(), apply_context()).await.unwrap();
+    assert!(replay.is_success());
+    assert_eq!(replay.output(), accepted.output());
+    assert_eq!(f.work_counts().await, before_apply);
+
+    let current_owner =
+        f.db.get_ordinary_product_conversation(&f.owner)
+            .await
+            .unwrap();
+    assert_eq!(current_owner.latest_transcript_row_id, owner_successor.id);
+    let replacement = f.db.conversation_goal(&f.owner).await.unwrap().unwrap();
+    assert_ne!(replacement.goal_id(), initial_goal.goal_id());
+    assert_eq!(
+        replacement.version().get(),
+        initial_goal.version().get() + 1
+    );
+    assert_eq!(replacement.objective().as_str(), "continued replacement");
+    let history =
+        f.db.conversation_goal_history(&f.owner, GoalVersion::INITIAL)
+            .await
+            .unwrap();
+    assert_eq!(history.len(), 2);
+    assert!(matches!(
+        &history[1].mutation().attribution.requested_by,
+        GoalActor::Coordinator(source)
+            if source.product_conversation_id == coordinator_successor.product_conversation_id
+                && source.transcript_id.as_str() == coordinator_successor.id
+                && source.message_id.as_str() == prepare_message_id
+                && source.tool_use_id.as_str() == prepare_tool_use_id
+                && source.execution.turn_id() == i64::try_from(turn_id.0).unwrap()
+    ));
 }
 
 #[tokio::test]
