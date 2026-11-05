@@ -1697,7 +1697,7 @@ mod tests {
                     crate::api::resource_monitor::ResourceMonitor::new(),
                     phoenix_terminal::ActiveTerminals::new(),
                 ),
-                db,
+                &db,
             ),
         )
     }
