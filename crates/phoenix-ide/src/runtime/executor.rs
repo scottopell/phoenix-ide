@@ -23925,152 +23925,176 @@ mod steer_drain_detector_tests {
             SubAgentBatchAdmission, SubAgentExecutionAuthority, SubAgentRunAdmission,
             SubAgentTerminalCause,
         };
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("summary-ack.db");
-        let db = crate::db::Database::open(path.to_str().unwrap())
-            .await
-            .unwrap();
-        crate::db::run_pending_migrations(db.pool()).await.unwrap();
-        let id = "summary-parent";
-        db.create_conversation(id, id, "/tmp", true, None, None)
-            .await
-            .unwrap();
-        db.create_conversation("child", "child", "/tmp", false, Some(id), None)
-            .await
-            .unwrap();
-        db.admit_sub_agent_batch(&SubAgentBatchAdmission {
-            batch_id: "batch".into(),
-            parent_conversation_id: id.into(),
-            parallel_work_qualified: false,
-            runs: vec![SubAgentRunAdmission {
-                child_conversation_id: "child".into(),
-                execution_authority: SubAgentExecutionAuthority::ReadOnly,
-            }],
-        })
-        .await
-        .unwrap();
-        let mut initial = ordinary_completion_state();
-        if let ConvState::ToolExecuting {
-            pending_sub_agents,
-            assistant_message,
-            completed_results,
-            ..
-        } = &mut initial
-        {
-            pending_sub_agents.push(PendingSubAgent {
-                agent_id: "child".into(),
-                task: "authentic work".into(),
-                mode: SubAgentMode::Explore,
-            });
-            assistant_message.content.insert(
-                0,
-                ContentBlock::tool_use("spawn-1", "spawn_agents", serde_json::json!({"tasks": []})),
-            );
-            completed_results.push(ToolResult::success(
-                "spawn-1".into(),
-                "Spawning sub-agents".into(),
-            ));
-        }
-        db.update_conversation_state(id, &initial).await.unwrap();
-        let (event_tx, event_rx) = mpsc::channel(16);
-        let storage = crate::runtime::traits::DatabaseStorage::new(db.clone());
-        storage.lose_summary_ack_once();
-        let mut runtime = ConversationRuntime::new(
-            ConvContext::new(id, PathBuf::from("/tmp"), "test-model", 200_000, 16_384),
-            initial,
-            storage,
-            Arc::new(MockLlmClient::new("test-model")),
-            Arc::new(MockToolExecutor::new()),
-            Arc::new(BrowserSessionManager::default()),
-            Arc::new(crate::tools::BashHandleRegistry::new()),
-            Arc::new(crate::tools::TmuxRegistry::new()),
-            Arc::new(ModelRegistry::new_empty()),
-            crate::terminal::ActiveTerminals::new(),
-            event_rx,
-            event_tx,
-            SseBroadcaster::new(128, 0),
-        );
-        runtime
-            .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Completed(
-                ToolResult::success("tool-1".into(), "bash complete".into()),
-            )))
-            .await
-            .unwrap();
-        assert!(matches!(
-            runtime.state,
-            ConvState::AwaitingSubAgents {
-                spawn_tool_id: None,
-                ..
-            }
-        ));
-        let at = Utc::now();
-        db.update_child_state_and_record_sub_agent_terminal(
-            "child",
-            &ConvState::Completed {
-                result: "authentic result".into(),
-            },
-            at,
-            SubAgentTerminalCause::SubmitResult,
-            at,
-        )
-        .await
-        .established()
-        .unwrap()
-        .unwrap();
-        let original = Event::SubAgentResult {
-            agent_id: "child".into(),
-            outcome: SubAgentOutcome::Success {
-                result: "authentic result".into(),
-            },
-        };
-        runtime.process_event(original.clone()).await.unwrap();
-        assert!(runtime.sub_agent_result_buffer.is_empty());
-        assert!(!runtime.fatal_local_authority_fence.is_closed());
-        assert!(db.sub_agent_terminal_is_accepted("child").await.unwrap());
-        let messages = db.get_messages(id).await.unwrap();
-        let summaries = messages
-            .iter()
-            .filter(|m| {
-                m.display_data
-                    .as_ref()
-                    .and_then(|v| v.get("type"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("subagent_summary")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(summaries.len(), 1);
-        let summary_id = summaries[0].message_id.clone();
-        let mut broadcasts = runtime.broadcast_tx.subscribe();
-        runtime.process_event(original).await.unwrap();
-        runtime
-            .process_event(Event::RetryBufferedSubAgentResults)
-            .await
-            .unwrap();
-        assert!(runtime.sub_agent_result_buffer.is_empty());
-        assert!(broadcasts.try_recv().is_err());
-        let expected_history = serde_json::to_value(&messages).unwrap();
-        assert_eq!(
-            serde_json::to_value(db.get_messages(id).await.unwrap()).unwrap(),
-            expected_history
-        );
-        runtime.abort_external_effects().await;
-        drop(runtime);
-        db.pool().close().await;
-        let reopened = crate::db::Database::open(path.to_str().unwrap())
-            .await
-            .unwrap();
-        assert_eq!(
-            serde_json::to_value(reopened.get_messages(id).await.unwrap()).unwrap(),
-            expected_history
-        );
-        assert_eq!(
-            reopened
-                .get_message_by_id(&summary_id)
+        for reject_acceptance_once in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("summary-ack.db");
+            let db = crate::db::Database::open(path.to_str().unwrap())
                 .await
-                .unwrap()
-                .message_id,
-            summary_id
-        );
+                .unwrap();
+            crate::db::run_pending_migrations(db.pool()).await.unwrap();
+            let id = "summary-parent";
+            db.create_conversation(id, id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            db.create_conversation("child", "child", "/tmp", false, Some(id), None)
+                .await
+                .unwrap();
+            db.admit_sub_agent_batch(&SubAgentBatchAdmission {
+                batch_id: "batch".into(),
+                parent_conversation_id: id.into(),
+                parallel_work_qualified: false,
+                runs: vec![SubAgentRunAdmission {
+                    child_conversation_id: "child".into(),
+                    execution_authority: SubAgentExecutionAuthority::ReadOnly,
+                }],
+            })
+            .await
+            .unwrap();
+            let mut initial = ordinary_completion_state();
+            if let ConvState::ToolExecuting {
+                pending_sub_agents,
+                assistant_message,
+                completed_results,
+                ..
+            } = &mut initial
+            {
+                pending_sub_agents.push(PendingSubAgent {
+                    agent_id: "child".into(),
+                    task: "authentic work".into(),
+                    mode: SubAgentMode::Explore,
+                });
+                assistant_message.content.insert(
+                    0,
+                    ContentBlock::tool_use(
+                        "spawn-1",
+                        "spawn_agents",
+                        serde_json::json!({"tasks": []}),
+                    ),
+                );
+                completed_results.push(ToolResult::success(
+                    "spawn-1".into(),
+                    "Spawning sub-agents".into(),
+                ));
+            }
+            db.update_conversation_state(id, &initial).await.unwrap();
+            let (event_tx, event_rx) = mpsc::channel(16);
+            let storage = crate::runtime::traits::DatabaseStorage::new(db.clone());
+            storage.lose_summary_ack_once();
+            let mut runtime = ConversationRuntime::new(
+                ConvContext::new(id, PathBuf::from("/tmp"), "test-model", 200_000, 16_384),
+                initial,
+                storage,
+                Arc::new(MockLlmClient::new("test-model")),
+                Arc::new(MockToolExecutor::new()),
+                Arc::new(BrowserSessionManager::default()),
+                Arc::new(crate::tools::BashHandleRegistry::new()),
+                Arc::new(crate::tools::TmuxRegistry::new()),
+                Arc::new(ModelRegistry::new_empty()),
+                crate::terminal::ActiveTerminals::new(),
+                event_rx,
+                event_tx,
+                SseBroadcaster::new(128, 0),
+            );
+            runtime
+                .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Completed(
+                    ToolResult::success("tool-1".into(), "bash complete".into()),
+                )))
+                .await
+                .unwrap();
+            assert!(matches!(
+                runtime.state,
+                ConvState::AwaitingSubAgents {
+                    spawn_tool_id: None,
+                    ..
+                }
+            ));
+            let at = Utc::now();
+            db.update_child_state_and_record_sub_agent_terminal(
+                "child",
+                &ConvState::Completed {
+                    result: "authentic result".into(),
+                },
+                at,
+                SubAgentTerminalCause::SubmitResult,
+                at,
+            )
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
+            let original = Event::SubAgentResult {
+                agent_id: "child".into(),
+                outcome: SubAgentOutcome::Success {
+                    result: "authentic result".into(),
+                },
+            };
+            if reject_acceptance_once {
+                sqlx::query("CREATE TRIGGER reject_parent_acceptance BEFORE UPDATE OF parent_accepted_at_unix_micros ON sub_agent_runs BEGIN SELECT RAISE(ABORT, 'injected known acceptance failure'); END").execute(db.pool()).await.unwrap();
+            }
+            runtime.process_event(original.clone()).await.unwrap();
+            if reject_acceptance_once {
+                assert_eq!(runtime.sub_agent_result_buffer.len(), 1);
+                assert!(!db.sub_agent_terminal_is_accepted("child").await.unwrap());
+                sqlx::query("DROP TRIGGER reject_parent_acceptance")
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                runtime
+                    .process_event(Event::RetryBufferedSubAgentResults)
+                    .await
+                    .unwrap();
+                while let Ok(event) = runtime.event_rx.try_recv() {
+                    runtime.process_event(event).await.unwrap();
+                }
+            }
+            assert!(runtime.sub_agent_result_buffer.is_empty());
+            assert!(!runtime.fatal_local_authority_fence.is_closed());
+            assert!(db.sub_agent_terminal_is_accepted("child").await.unwrap());
+            let messages = db.get_messages(id).await.unwrap();
+            let summaries = messages
+                .iter()
+                .filter(|m| {
+                    m.display_data
+                        .as_ref()
+                        .and_then(|v| v.get("type"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("subagent_summary")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(summaries.len(), 1);
+            let summary_id = summaries[0].message_id.clone();
+            let mut broadcasts = runtime.broadcast_tx.subscribe();
+            runtime.process_event(original).await.unwrap();
+            runtime
+                .process_event(Event::RetryBufferedSubAgentResults)
+                .await
+                .unwrap();
+            assert!(runtime.sub_agent_result_buffer.is_empty());
+            assert!(broadcasts.try_recv().is_err());
+            let expected_history = serde_json::to_value(&messages).unwrap();
+            assert_eq!(
+                serde_json::to_value(db.get_messages(id).await.unwrap()).unwrap(),
+                expected_history
+            );
+            runtime.abort_external_effects().await;
+            drop(runtime);
+            db.pool().close().await;
+            let reopened = crate::db::Database::open(path.to_str().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(reopened.get_messages(id).await.unwrap()).unwrap(),
+                expected_history
+            );
+            assert_eq!(
+                reopened
+                    .get_message_by_id(&summary_id)
+                    .await
+                    .unwrap()
+                    .message_id,
+                summary_id
+            );
+        }
     }
 
     #[tokio::test]
