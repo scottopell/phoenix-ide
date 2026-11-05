@@ -27,7 +27,7 @@ use std::time::SystemTime;
 
 use phoenix_core::work_scope::ResourceScopeKey;
 use thiserror::Error;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{watch, Notify, RwLock};
 
 use super::handle::{BashLaunchIdentity, Handle, HandleId, HandleState};
 use super::ring::RING_BUFFER_BYTES;
@@ -48,7 +48,7 @@ pub enum BashHandleError {
         live_handles: Vec<LiveHandleSummary>,
     },
     #[error(
-        "this work scope no longer accepts bash spawns: teardown or an unverified prior launch; do not automatically retry"
+        "bash launch admission is closed: owner teardown, controller retirement, or an unverified prior launch; do not automatically retry"
     )]
     SpawnFenced,
 }
@@ -114,6 +114,7 @@ pub struct SpawnReservation {
     settled: bool,
     launched: bool,
     admission: Arc<SpawnAdmission>,
+    controller_admission: Option<Arc<SpawnAdmission>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,9 +230,16 @@ impl SpawnReservation {
     /// The reservation continues to count as pending until custody is settled.
     pub fn mark_unregistered(&mut self) {
         self.launched = true;
+        self.mark_uncertain();
+    }
+
+    fn mark_uncertain(&self) {
         self.admission
             .unverified_launch
             .store(true, Ordering::Release);
+        if let Some(controller) = &self.controller_admission {
+            controller.unverified_launch.store(true, Ordering::Release);
+        }
     }
 
     fn settle(&mut self) {
@@ -244,6 +252,10 @@ impl SpawnReservation {
             }
             self.admission.pending.fetch_sub(1, Ordering::AcqRel);
             self.admission.settled.notify_waiters();
+            if let Some(controller) = &self.controller_admission {
+                controller.pending.fetch_sub(1, Ordering::AcqRel);
+                controller.settled.notify_waiters();
+            }
         }
     }
 }
@@ -251,9 +263,7 @@ impl SpawnReservation {
 impl Drop for SpawnReservation {
     fn drop(&mut self) {
         if self.launched && !self.registered {
-            self.admission
-                .unverified_launch
-                .store(true, Ordering::Release);
+            self.mark_uncertain();
             tracing::warn!(handle = %self.handle_id, "bash launch was not registered; descendant cleanup remains unverified");
         }
         self.settle();
@@ -280,6 +290,7 @@ pub struct ResourceScopeKeyHandles {
     lifecycle_epoch: Arc<AtomicU64>,
     /// Monotonic identity of the lifecycle request that most recently fenced admission.
     teardown_generation: u64,
+    controller_retirement: Option<watch::Receiver<Option<CascadeBashReport>>>,
 }
 
 impl ResourceScopeKeyHandles {
@@ -658,9 +669,45 @@ impl BashHandleRegistry {
         &self,
         owner: &ResourceScopeKey,
     ) -> Result<SpawnReservation, BashHandleError> {
+        self.reserve_spawn_for_controller(owner, owner).await
+    }
+
+    /// Acquires owner capacity and, for an explicitly targeted inline child,
+    /// controller custody before process creation. The returned reservation owns
+    /// both leases through gated registration and payload release.
+    ///
+    /// # Errors
+    /// Returns [`BashHandleError::SpawnFenced`] when either admission gate is
+    /// closed, or [`BashHandleError::HandleCapReached`] when the owner is full.
+    pub async fn reserve_spawn_for_controller(
+        &self,
+        owner: &ResourceScopeKey,
+        controller: &ResourceScopeKey,
+    ) -> Result<SpawnReservation, BashHandleError> {
         let entry = self.get_or_create(owner).await;
+        let controller_entry = if matches!(owner, ResourceScopeKey::Work(_))
+            && matches!(controller, ResourceScopeKey::Unattached(_))
+        {
+            Some(self.get_or_create(controller).await)
+        } else {
+            None
+        };
+        let controller_table = match &controller_entry {
+            Some(entry) => Some(entry.write().await),
+            None => None,
+        };
+        if controller_table.as_ref().is_some_and(|table| {
+            table.controller_retirement.is_some()
+                || table.teardown_started
+                || table.admission.unverified_launch.load(Ordering::Acquire)
+        }) {
+            return Err(BashHandleError::SpawnFenced);
+        }
         let handles = entry.write().await;
-        if handles.teardown_started || handles.admission.unverified_launch.load(Ordering::Acquire) {
+        if handles.teardown_started
+            || handles.controller_retirement.is_some()
+            || handles.admission.unverified_launch.load(Ordering::Acquire)
+        {
             return Err(BashHandleError::SpawnFenced);
         }
         if handles.live_count().await
@@ -680,6 +727,10 @@ impl BashHandleRegistry {
             .admission
             .capacity_reservations
             .fetch_add(1, Ordering::AcqRel);
+        let controller_admission = controller_table.as_ref().map(|table| {
+            table.admission.pending.fetch_add(1, Ordering::AcqRel);
+            table.admission.clone()
+        });
         Ok(SpawnReservation {
             owner: owner.clone(),
             handle_id: Self::allocate_handle_id(),
@@ -687,6 +738,7 @@ impl BashHandleRegistry {
             settled: false,
             launched: false,
             admission: handles.admission.clone(),
+            controller_admission,
         })
     }
 
@@ -788,6 +840,150 @@ impl BashHandleRegistry {
 
     pub async fn get_by_id(&self, handle_id: &HandleId) -> Option<RegisteredHandle> {
         self.handles_by_id.read().await.get(handle_id).cloned()
+    }
+
+    /// Permanently closes one inline child's controller admission and joins its
+    /// detached cleanup. Repeated callers share the same result and deadline;
+    /// dropping any caller cannot cancel cleanup. Owning tables and handles stay
+    /// registered, including when signaling or exit observation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the detached cleanup task cannot publish its result.
+    pub async fn retire_unattached_controller(
+        self: &Arc<Self>,
+        child_id: &str,
+    ) -> Result<CascadeBashReport, String> {
+        let controller = ResourceScopeKey::Unattached(child_id.to_owned());
+        let entry = self.get_or_create(&controller).await;
+        let mut result = {
+            let mut table = entry.write().await;
+            if let Some(result) = &table.controller_retirement {
+                result.clone()
+            } else {
+                let (sender, receiver) = watch::channel(None);
+                table.controller_retirement = Some(receiver.clone());
+                let admission = table.admission.clone();
+                let registry = self.clone();
+                tokio::spawn(async move {
+                    let report = registry
+                        .retire_controller_handles(controller, admission)
+                        .await;
+                    sender.send_replace(Some(report));
+                });
+                receiver
+            }
+        };
+        loop {
+            if let Some(report) = result.borrow_and_update().clone() {
+                return Ok(report);
+            }
+            if result.changed().await.is_err() {
+                let error = format!(
+                    "Bash controller cleanup task ended without an observation: {child_id}"
+                );
+                tracing::error!(%error);
+                return Err(error);
+            }
+        }
+    }
+
+    async fn retire_controller_handles(
+        &self,
+        controller: ResourceScopeKey,
+        admission: Arc<SpawnAdmission>,
+    ) -> CascadeBashReport {
+        loop {
+            let notified = admission.settled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if admission.pending.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            notified.await;
+        }
+        let mut report = CascadeBashReport::default();
+        if admission.unverified_launch.load(Ordering::Acquire) {
+            report.scope_uncertainty = Some(BashScopeUncertainty::UnregisteredLaunch);
+            tracing::warn!(%controller, "Bash controller retirement includes an unverified launch");
+        }
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(super::reaper::SHUTDOWN_KILL_GRACE_SECONDS);
+        let cleanup = async {
+            let handles = {
+                let index = self.handles_by_id.read().await;
+                let mut handles = Vec::new();
+                for registered in index.values() {
+                    if tokio::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    if registered.handle.controller_scope == controller {
+                        handles.push(registered.handle.clone());
+                    }
+                }
+                handles
+            };
+            let mut live = Vec::new();
+            for handle in handles {
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                let targets = snapshot_retirement_targets(std::slice::from_ref(&handle)).await;
+                if let Some(target) = targets.into_iter().next() {
+                    record_retirement_target_in_report(&mut report, &target);
+                    live.push((handle, target.pgid));
+                }
+            }
+            let mut signaled = Vec::new();
+            for (handle, pgid) in live {
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                #[cfg(unix)]
+                let signal_result = handle.signal_live_incarnation(libc::SIGKILL).await;
+                #[cfg(not(unix))]
+                let signal_result = Err::<Option<i32>, _>(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "incarnation-bound process signaling is unavailable",
+                ));
+                match signal_result {
+                    Ok(Some(_)) => signaled.push((handle, pgid)),
+                    Ok(None) => {
+                        if handle.state().await.is_live() {
+                            let error = "no signalable incarnation remained; registered handle is still live";
+                            tracing::warn!(%controller, handle_id = %handle.handle_id, error);
+                            report.kill_failures.push((pgid, error.to_owned()));
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%controller, handle_id = %handle.handle_id, %error,
+                            "Bash controller incarnation-bound signal failed; handle retained");
+                        report.kill_failures.push((pgid, error.to_string()));
+                    }
+                }
+            }
+            for (handle, pgid) in signaled {
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                let mut exit = handle.exit_observer();
+                let terminal = matches!(exit.wait_for(Option::is_some).await,
+                    Ok(observation) if matches!(&*observation, Some(super::handle::ExitState::Exited)));
+                if !terminal {
+                    let error = "Bash controller exit observation did not verify terminal state";
+                    tracing::warn!(%controller, handle_id = %handle.handle_id, error);
+                    report.kill_failures.push((pgid, error.to_owned()));
+                }
+            }
+            true
+        };
+        if !matches!(tokio::time::timeout_at(deadline, cleanup).await, Ok(true)) {
+            report
+                .scope_uncertainty
+                .get_or_insert(BashScopeUncertainty::ControllerCleanupDeadline);
+            tracing::warn!(%controller, ?report,
+                "Bash controller cleanup deadline elapsed; remaining work unverified and handles retained");
+        }
+        report
     }
 
     /// Signals only while the handle remains registered under the same controller scope.
@@ -1243,14 +1439,16 @@ impl BashHandleRegistry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BashScopeUncertainty {
     UnregisteredLaunch,
+    /// The shared registered-handle cleanup budget expired before completion.
+    ControllerCleanupDeadline,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CascadeBashReport {
-    /// pids that were live at snapshot time (informational; kills target
-    /// the pgid). One per live handle.
+    /// Informational pids that were live at snapshot time. One per live handle.
     pub live_handle_pids: Vec<i32>,
-    /// pgids that were live at snapshot time and received a SIGKILL.
+    /// Informational pgids that were live at snapshot time. Presence does not
+    /// establish successful signaling, descendant absence, or completed reaping.
     pub live_handle_pgids: Vec<i32>,
     /// Subset of live pgids whose handle was in `kill_pending_kernel`
     /// status when the cascade ran (a prior kill had not been observed
@@ -1528,6 +1726,259 @@ mod tests {
     use crate::bash::handle::{BashLaunchIdentity, FinalCause, Handle};
     use phoenix_core::process_identity::ProcessIdentity;
     use std::time::Duration;
+
+    async fn poll_pending<F: std::future::Future>(future: std::pin::Pin<&mut F>) {
+        let mut future = future;
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                future.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+    }
+
+    fn controller_handle(controller: &ResourceScopeKey, id: &HandleId, pgid: i32) -> Arc<Handle> {
+        Handle::new_live(
+            controller.clone(),
+            id.clone(),
+            "invalid incarnation".into(),
+            None,
+            std::path::PathBuf::from("/tmp"),
+            pgid,
+            u32::MAX,
+            1024,
+        )
+    }
+
+    #[tokio::test]
+    async fn controller_retirement_joins_late_registration_and_gated_release() {
+        let registry = Arc::new(BashHandleRegistry::new());
+        let owner = scope("controller-late");
+        let controller = ResourceScopeKey::Unattached("late-child".into());
+        let mut reservation = registry
+            .reserve_spawn_for_controller(&owner, &controller)
+            .await
+            .unwrap();
+        let close = registry.retire_unattached_controller("late-child");
+        tokio::pin!(close);
+        poll_pending(close.as_mut()).await;
+        let entry = registry.get_existing(&controller).await.unwrap();
+        let admission = entry.read().await.admission.clone();
+        assert!(entry.read().await.controller_retirement.is_some());
+        let handle = controller_handle(&controller, reservation.handle_id(), 12345);
+        reservation.mark_launched();
+        registry
+            .commit_spawn_gated(&mut reservation, handle.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            admission.pending.load(Ordering::Acquire),
+            1,
+            "registration cannot settle gate custody"
+        );
+        poll_pending(close.as_mut()).await;
+        registry.abort_spawn(reservation);
+        let report = close.await.unwrap();
+        assert_eq!(report.live_handle_pgids, vec![12345]);
+        assert_eq!(report.kill_failures.len(), 1);
+        assert!(registry.get_by_id(&handle.handle_id).await.is_some());
+        assert!(registry
+            .get_existing(&owner)
+            .await
+            .unwrap()
+            .read()
+            .await
+            .get(&handle.handle_id)
+            .is_some());
+        assert_eq!(
+            registry
+                .retire_unattached_controller("late-child")
+                .await
+                .unwrap(),
+            report
+        );
+        assert!(registry.reserve_spawn(&owner).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn controller_retirement_isolates_siblings_and_coordinator_across_targets() {
+        let registry = Arc::new(BashHandleRegistry::new());
+        let controller = ResourceScopeKey::Unattached("selected-child".into());
+        for (owner, control, pgid) in [
+            (scope("controller-target-a"), controller.clone(), 101),
+            (scope("controller-target-b"), controller.clone(), 102),
+            (
+                scope("controller-target-a"),
+                ResourceScopeKey::Unattached("sibling-child".into()),
+                103,
+            ),
+            (
+                scope("controller-target-a"),
+                ResourceScopeKey::Coordinator,
+                104,
+            ),
+        ] {
+            let mut reservation = registry
+                .reserve_spawn_for_controller(&owner, &control)
+                .await
+                .unwrap();
+            let handle = controller_handle(&control, reservation.handle_id(), pgid);
+            registry
+                .commit_spawn(&mut reservation, handle)
+                .await
+                .unwrap();
+        }
+        let mut report = registry
+            .retire_unattached_controller("selected-child")
+            .await
+            .unwrap();
+        report.live_handle_pgids.sort_unstable();
+        assert_eq!(report.live_handle_pgids, vec![101, 102]);
+        assert_eq!(report.kill_failures.len(), 2);
+        assert_eq!(registry.snapshot_handles_for_shutdown().await.len(), 4);
+        assert!(registry
+            .reserve_spawn_for_controller(
+                &scope("controller-target-b"),
+                &ResourceScopeKey::Unattached("sibling-child".into())
+            )
+            .await
+            .is_ok());
+        assert!(registry
+            .reserve_spawn_for_controller(
+                &scope("controller-target-a"),
+                &ResourceScopeKey::Coordinator
+            )
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn controller_retirement_closes_all_future_targets_without_closing_owners() {
+        let registry = Arc::new(BashHandleRegistry::new());
+        let controller = ResourceScopeKey::Unattached("closed-child".into());
+        assert!(!registry
+            .retire_unattached_controller("closed-child")
+            .await
+            .unwrap()
+            .has_failures());
+        for owner in [scope("closed-target-one"), scope("closed-target-two")] {
+            assert!(matches!(
+                registry
+                    .reserve_spawn_for_controller(&owner, &controller)
+                    .await,
+                Err(BashHandleError::SpawnFenced)
+            ));
+            assert!(registry.reserve_spawn(&owner).await.is_ok());
+        }
+        assert!(matches!(
+            registry.reserve_spawn(&controller).await,
+            Err(BashHandleError::SpawnFenced)
+        ));
+        let fence = registry.begin_teardown(&controller).await.unwrap();
+        registry
+            .reopen_spawn_admission(&controller, fence.generation())
+            .await;
+        assert!(matches!(
+            registry
+                .reserve_spawn_for_controller(&scope("reopened-owner"), &controller)
+                .await,
+            Err(BashHandleError::SpawnFenced)
+        ));
+    }
+
+    #[tokio::test]
+    async fn controller_retirement_survives_dropped_requester_and_reports_unregistered_launch() {
+        let registry = Arc::new(BashHandleRegistry::new());
+        let owner = scope("dropped-controller-owner");
+        let controller = ResourceScopeKey::Unattached("dropped-controller".into());
+        let mut reservation = registry
+            .reserve_spawn_for_controller(&owner, &controller)
+            .await
+            .unwrap();
+        {
+            let close = registry.retire_unattached_controller("dropped-controller");
+            tokio::pin!(close);
+            poll_pending(close.as_mut()).await;
+        }
+        let entry = registry.get_existing(&controller).await.unwrap();
+        let mut observation = entry.read().await.controller_retirement.clone().unwrap();
+        reservation.mark_unregistered();
+        drop(reservation);
+        let completed = tokio::time::timeout(
+            Duration::from_secs(5),
+            observation.wait_for(Option::is_some),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let report = completed.as_ref().unwrap();
+        assert_eq!(
+            report.scope_uncertainty,
+            Some(BashScopeUncertainty::UnregisteredLaunch)
+        );
+        assert!(report.live_handle_pgids.is_empty());
+        assert!(report.kill_failures.is_empty());
+        assert!(registry.reserve_spawn(&owner).await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn controller_retirement_snapshot_deadline_is_shared_by_joiners() {
+        let registry = Arc::new(BashHandleRegistry::new());
+        let index = registry.handles_by_id.write().await;
+        let first = registry.retire_unattached_controller("deadline-child");
+        let second = registry.retire_unattached_controller("deadline-child");
+        tokio::pin!(first, second);
+        poll_pending(first.as_mut()).await;
+        poll_pending(second.as_mut()).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(
+            super::super::reaper::SHUTDOWN_KILL_GRACE_SECONDS,
+        ))
+        .await;
+        let report = first.await.unwrap();
+        assert_eq!(
+            report.scope_uncertainty,
+            Some(BashScopeUncertainty::ControllerCleanupDeadline)
+        );
+        assert_eq!(second.await.unwrap(), report);
+        drop(index);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn controller_retirement_invalid_incarnation_never_falls_back_to_raw_group() {
+        let registry = Arc::new(BashHandleRegistry::new());
+        let controller = ResourceScopeKey::Unattached("invalid-controller".into());
+        let owner = scope("invalid-controller-owner");
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("600")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pgid = i32::try_from(child.id().unwrap()).unwrap();
+        let mut reservation = registry
+            .reserve_spawn_for_controller(&owner, &controller)
+            .await
+            .unwrap();
+        let handle = controller_handle(&controller, reservation.handle_id(), pgid);
+        registry
+            .commit_spawn(&mut reservation, handle.clone())
+            .await
+            .unwrap();
+        let report = registry
+            .retire_unattached_controller("invalid-controller")
+            .await
+            .unwrap();
+        assert_eq!(report.kill_failures.len(), 1);
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "raw PGID fallback killed a process without incarnation authority"
+        );
+        assert!(registry.get_by_id(&handle.handle_id).await.is_some());
+        assert!(handle.state().await.is_live());
+        child.kill().await.unwrap();
+    }
 
     fn scope(name: &str) -> ResourceScopeKey {
         ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse(name).unwrap())
