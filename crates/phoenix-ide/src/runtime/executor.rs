@@ -4828,6 +4828,9 @@ where
                 )
                 .await?;
         } else if let Some(child_id) = self.pending_sub_agent_acceptance.take() {
+            if self.context.is_coordinator {
+                super::retire_inline_child_bash_controller(&self.bash_handles, &child_id).await;
+            }
             self.storage
                 .update_state_and_accept_sub_agent(
                     &self.context.conversation_id,
@@ -7573,6 +7576,15 @@ where
             ControlEffect::NotifyParent { outcome } => {
                 tracing::info!(?outcome, "Notifying parent of sub-agent completion");
                 let child_conversation_id = self.context.conversation_id.clone();
+                if self.context.is_sub_agent
+                    && self.context.execution_environment.working_dir().is_none()
+                {
+                    super::retire_inline_child_bash_controller(
+                        &self.bash_handles,
+                        &child_conversation_id,
+                    )
+                    .await;
+                }
                 if let Some((parent_conversation_id, dispatcher)) = &self.parent_dispatch {
                     let event = Event::SubAgentResult {
                         agent_id: child_conversation_id.clone(),
@@ -24236,6 +24248,192 @@ mod steer_drain_detector_tests {
         rt.handle_cancelling_sub_agents_timeout().await;
         assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
         assert_cancellation_fan_in(&storage, "conv-cancel-backstop");
+    }
+
+    async fn assert_controller_join_pending<F: std::future::Future>(
+        mut future: std::pin::Pin<&mut F>,
+    ) {
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(future.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_child_notify_parent_joins_controller_before_delivery() {
+        use phoenix_core::domain::sm_state::ConversationExecutionEnvironment;
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+        let (mut rt, _) = build_runtime_with_state_and_queue(
+            "inline-controller-child",
+            ConvState::Completed {
+                result: "done".into(),
+            },
+            vec![],
+        );
+        rt.context.is_sub_agent = true;
+        rt.context.execution_environment = ConversationExecutionEnvironment::NoFilesystem;
+        let (parent_tx, mut parent_rx) = mpsc::channel(1);
+        rt.parent_dispatch = Some((
+            "parent".into(),
+            Arc::new(crate::runtime::TestConversationEventDispatcher::new(
+                parent_tx,
+            )),
+        ));
+        let registry = rt.bash_handles.clone();
+        let owner = ResourceScopeKey::Work(WorkScopeId::new());
+        let controller = ResourceScopeKey::Unattached(rt.context.conversation_id.clone());
+        let lease = registry
+            .reserve_spawn_for_controller(&owner, &controller)
+            .await
+            .unwrap();
+        let delivery = rt.execute_control_effect(ControlEffect::NotifyParent {
+            outcome: SubAgentOutcome::Success {
+                result: "done".into(),
+            },
+        });
+        tokio::pin!(delivery);
+        assert_controller_join_pending(delivery.as_mut()).await;
+        assert!(parent_rx.try_recv().is_err());
+        assert!(registry
+            .reserve_spawn_for_controller(&owner, &controller)
+            .await
+            .is_err());
+        drop(lease);
+        delivery.await.unwrap();
+        assert!(
+            matches!(parent_rx.try_recv(), Ok(Event::SubAgentResult { agent_id, .. }) if agent_id == "inline-controller-child")
+        );
+        assert!(registry.reserve_spawn(&owner).await.is_ok());
+        assert!(registry
+            .reserve_spawn_for_controller(&owner, &ResourceScopeKey::Unattached("sibling".into()))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn coordinator_acceptance_and_cancellation_backstop_join_child_controller() {
+        use crate::runtime::traits::MessageStore;
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+        for backstop in [false, true] {
+            let (mut rt, storage) = cancelling_runtime(
+                "coordinator-controller-parent",
+                &["silent"],
+                crate::state_machine::event::CancelCause::UserRequested,
+            )
+            .await;
+            rt.context.is_coordinator = true;
+            storage
+                .record_sub_agent_terminal(
+                    "silent",
+                    phoenix_db::SubAgentTerminalCause::Cancelled,
+                    Utc::now(),
+                )
+                .await
+                .unwrap();
+            let registry = rt.bash_handles.clone();
+            let owner = ResourceScopeKey::Work(WorkScopeId::new());
+            let controller = ResourceScopeKey::Unattached("silent".into());
+            let lease = registry
+                .reserve_spawn_for_controller(&owner, &controller)
+                .await
+                .unwrap();
+            let accept = async {
+                if backstop {
+                    rt.handle_cancelling_sub_agents_timeout().await;
+                } else {
+                    rt.process_event(Event::SubAgentResult {
+                        agent_id: "silent".into(),
+                        outcome: SubAgentOutcome::Failure {
+                            error: "cancelled".into(),
+                            error_kind: crate::db::ErrorKind::Cancelled,
+                        },
+                    })
+                    .await
+                    .unwrap();
+                }
+            };
+            tokio::pin!(accept);
+            assert_controller_join_pending(accept.as_mut()).await;
+            assert_eq!(storage.sub_agent_acceptance_count(), 0);
+            assert!(registry
+                .reserve_spawn_for_controller(&owner, &controller)
+                .await
+                .is_err());
+            drop(lease);
+            accept.await;
+            assert_eq!(storage.sub_agent_acceptance_count(), 1);
+            assert_cancellation_fan_in(&storage, "coordinator-controller-parent");
+            assert!(registry.reserve_spawn(&owner).await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_child_delivery_and_unrelated_results_preserve_controller_admission() {
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+        let (mut child, _) = build_runtime_with_state_and_queue(
+            "ordinary-child",
+            ConvState::Completed {
+                result: "done".into(),
+            },
+            vec![],
+        );
+        child.context.is_sub_agent = true;
+        let owner = ResourceScopeKey::Work(WorkScopeId::new());
+        let controller = ResourceScopeKey::Unattached("ordinary-child".into());
+        let registry = child.bash_handles.clone();
+        let lease = registry
+            .reserve_spawn_for_controller(&owner, &controller)
+            .await
+            .unwrap();
+        let (sender, mut receiver) = mpsc::channel(1);
+        child.parent_dispatch = Some((
+            "ordinary-parent".into(),
+            Arc::new(crate::runtime::TestConversationEventDispatcher::new(sender)),
+        ));
+        child
+            .execute_control_effect(ControlEffect::NotifyParent {
+                outcome: SubAgentOutcome::Success {
+                    result: "done".into(),
+                },
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::SubAgentResult { .. })
+        ));
+        assert!(registry
+            .reserve_spawn_for_controller(&owner, &controller)
+            .await
+            .is_ok());
+        drop(lease);
+
+        let (mut parent, storage) = build_runtime_with_state_and_queue(
+            "coordinator-unrelated-result",
+            mk_awaiting_sub_agents(),
+            vec![],
+        );
+        parent.context.is_coordinator = true;
+        assert!(parent
+            .process_event(Event::SubAgentResult {
+                agent_id: "unrelated-child".into(),
+                outcome: SubAgentOutcome::Success {
+                    result: "unrelated".into()
+                },
+            })
+            .await
+            .is_err());
+        assert_eq!(storage.sub_agent_acceptance_count(), 0);
+        assert!(parent
+            .bash_handles
+            .reserve_spawn_for_controller(
+                &owner,
+                &ResourceScopeKey::Unattached("unrelated-child".into()),
+            )
+            .await
+            .is_ok());
     }
 
     /// Entering `Idle` with an empty queue produces no drain event.

@@ -48,6 +48,18 @@ use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
 pub type ProductionRuntime =
     ConversationRuntime<DatabaseStorage, RegistryLlmClient, ToolRegistryExecutor>;
 
+async fn retire_inline_child_bash_controller(registry: &Arc<BashHandleRegistry>, child_id: &str) {
+    match registry.retire_unattached_controller(child_id).await {
+        Ok(report) if report.has_failures() => {
+            tracing::warn!(%child_id, ?report, "Inline child Bash controller cleanup observation incomplete");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%child_id, %error, "Inline child Bash controller cleanup failed");
+        }
+    }
+}
+
 use crate::db::{ConvMode, Database, ExecutionOccurrenceTerminal};
 use crate::state_machine::{ConvContext, ConvState, Event};
 use crate::system_prompt::ModeContext;
@@ -4656,6 +4668,21 @@ impl RuntimeManager {
             barrier.wait().await;
             barrier.wait().await;
         }
+        if conv.attached_work_scope_id.is_none() {
+            if let Some(parent_id) = &conv.parent_conversation_id {
+                match self.db.get_conversation(parent_id).await {
+                    Ok(parent)
+                        if parent.runtime_role == crate::work_scope::RuntimeRole::Coordinator =>
+                    {
+                        retire_inline_child_bash_controller(&self.bash_handles, &conv.id).await;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(conv_id = %conv.id, %parent_id, %error, "Cannot classify terminal child Bash controller cleanup");
+                    }
+                }
+            }
+        }
         let deleting_conversation_ids = std::collections::HashSet::from([conv.id.clone()]);
         if let Err(error) = crate::api::handlers::run_runtime_resource_cleanup_cascade(
             self,
@@ -5418,6 +5445,47 @@ impl RuntimeManager {
         }
     }
 
+    async fn retire_coordinator_children_before_reconciliation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(), DatabaseTerminalRecoveryError> {
+        let parent = match self.db.get_conversation(conversation_id).await {
+            Ok(parent) => parent,
+            Err(crate::db::DbError::ConversationNotFound(_)) => return Ok(()),
+            Err(error) => return Err(DatabaseTerminalRecoveryError::Retryable(error.to_string())),
+        };
+        if parent.runtime_role != crate::work_scope::RuntimeRole::Coordinator {
+            return Ok(());
+        }
+        let pending = match &parent.state {
+            ConvState::AwaitingSubAgents { pending, .. }
+            | ConvState::CancellingSubAgents { pending, .. } => pending,
+            ConvState::ToolExecuting {
+                pending_sub_agents, ..
+            }
+            | ConvState::CancellingTool {
+                pending_sub_agents, ..
+            } => pending_sub_agents,
+            _ => return Ok(()),
+        };
+        for pending_child in pending {
+            let child = match self.db.get_conversation(&pending_child.agent_id).await {
+                Ok(child) => child,
+                Err(crate::db::DbError::ConversationNotFound(_)) => continue,
+                Err(error) => {
+                    return Err(DatabaseTerminalRecoveryError::Retryable(error.to_string()))
+                }
+            };
+            if child.runtime_role == crate::work_scope::RuntimeRole::SubAgent
+                && child.parent_conversation_id.as_deref() == Some(conversation_id)
+                && child.attached_work_scope_id.is_none()
+            {
+                retire_inline_child_bash_controller(&self.bash_handles, &child.id).await;
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn reconcile_startup_obligated_parents(
         self: &Arc<Self>,
@@ -5427,6 +5495,8 @@ impl RuntimeManager {
             let Ok(_owner) = self.acquire_local_authority_pass() else {
                 return Ok(());
             };
+            self.retire_coordinator_children_before_reconciliation(&conversation_id)
+                .await?;
             let ids = HashSet::from([conversation_id]);
             let reconciled = self
                 .db
@@ -5484,6 +5554,8 @@ impl RuntimeManager {
                 let conversation_id = action_record.conversation_id.clone();
                 match action_record.action {
                     phoenix_db::StartupParentAction::Reconcile => {
+                        self.retire_coordinator_children_before_reconciliation(&conversation_id)
+                            .await?;
                         let ids = HashSet::from([conversation_id.clone()]);
                         let reconciled = self
                             .db
@@ -10751,10 +10823,18 @@ mod scope_liveness_tests {
         let scope = ResourceScopeKey::Unattached(child.id.clone());
         let _ = manager.bash_handles().get_or_create(&scope).await;
 
-        manager
-            .handle_runtime_exit(&child, executor::RuntimeExitDisposition::Interrupted)
-            .await;
-        assert!(manager.bash_handles().reserve_spawn(&scope).await.is_ok());
+        let owner = ResourceScopeKey::Work(WorkScopeId::new());
+        for disposition in [
+            executor::RuntimeExitDisposition::Interrupted,
+            executor::RuntimeExitDisposition::RecreateFromDatabase,
+        ] {
+            manager.handle_runtime_exit(&child, disposition).await;
+            assert!(manager
+                .bash_handles()
+                .reserve_spawn_for_controller(&owner, &scope)
+                .await
+                .is_ok());
+        }
 
         manager
             .handle_runtime_exit(&child, executor::RuntimeExitDisposition::Terminal)
@@ -10763,6 +10843,150 @@ mod scope_liveness_tests {
             manager.bash_handles().reserve_spawn(&scope).await,
             Err(phoenix_tools::bash::BashHandleError::SpawnFenced)
         ));
+        assert!(matches!(
+            manager
+                .bash_handles()
+                .reserve_spawn_for_controller(&owner, &scope)
+                .await,
+            Err(phoenix_tools::bash::BashHandleError::SpawnFenced)
+        ));
+        assert!(manager.bash_handles().reserve_spawn(&owner).await.is_ok());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn durable_coordinator_fan_in_joins_child_controller_before_db_acceptance() {
+        for startup_ids in [false, true] {
+            let manager = Arc::new(test_manager().await);
+            let parent = manager
+                .db()
+                .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+                .await
+                .unwrap();
+            let child_id = "durable-controller-child";
+            let spec = SubAgentSpec {
+                agent_id: child_id.into(),
+                task: "durable research".into(),
+                environment:
+                    phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem,
+                timeout: std::time::Duration::from_secs(60),
+                mode: SubAgentMode::Explore,
+                model_id: "gpt-6-astra".into(),
+                connection: "mock".into(),
+                effort: None,
+                max_turns: 1,
+                agent_name: None,
+                persona: None,
+            };
+            manager
+                .admit_sub_agent_batch(
+                    "durable-controller-batch",
+                    &[spec],
+                    &parent.id,
+                    parent.attached_work_scope_id.clone(),
+                    false,
+                )
+                .await
+                .unwrap();
+            manager
+                .db()
+                .update_conversation_state(
+                    child_id,
+                    &ConvState::Completed {
+                        result: "durable exact result".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            let parent_state = ConvState::CancellingSubAgents {
+                pending: vec![phoenix_core::domain::sm_state::PendingSubAgent {
+                    agent_id: child_id.into(),
+                    task: "durable research".into(),
+                    mode: SubAgentMode::Explore,
+                }],
+                completed_results: vec![],
+                spawn_tool_id: None,
+                cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
+            };
+            manager
+                .db()
+                .update_conversation_state(&parent.id, &parent_state)
+                .await
+                .unwrap();
+            if startup_ids {
+                manager
+                    .startup_obligated_conversations
+                    .write()
+                    .await
+                    .insert(parent.id.clone());
+            } else {
+                manager
+                    .db()
+                    .establish_parent_reconcile_action(&parent.id)
+                    .await
+                    .unwrap();
+            }
+            let owner = ResourceScopeKey::Work(WorkScopeId::new());
+            let controller = ResourceScopeKey::Unattached(child_id.into());
+            let registry = manager.bash_handles().clone();
+            let lease = registry
+                .reserve_spawn_for_controller(&owner, &controller)
+                .await
+                .unwrap();
+            let reconciliation = tokio::spawn({
+                let manager = manager.clone();
+                async move { manager.reconcile_startup_obligated_parents().await }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    match registry
+                        .reserve_spawn_for_controller(&owner, &controller)
+                        .await
+                    {
+                        Err(phoenix_tools::bash::BashHandleError::SpawnFenced) => break,
+                        Ok(reservation) => drop(reservation),
+                        Err(error) => panic!("unexpected admission error: {error}"),
+                    }
+                    assert!(
+                        !reconciliation.is_finished(),
+                        "reconciliation bypassed controller retirement"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("reconciliation closes the exact controller gate");
+            assert!(!reconciliation.is_finished());
+            assert_eq!(
+                manager
+                    .db()
+                    .get_conversation(&parent.id)
+                    .await
+                    .unwrap()
+                    .state,
+                parent_state
+            );
+            let accepted: Option<i64> = sqlx::query_scalar(
+                "SELECT parent_accepted_at_unix_micros FROM sub_agent_runs WHERE child_conversation_id = ?1",
+            ).bind(child_id).fetch_one(manager.db().pool()).await.unwrap();
+            assert!(accepted.is_none());
+            drop(lease);
+            reconciliation.await.unwrap().unwrap();
+            assert_eq!(
+                manager
+                    .db()
+                    .get_conversation(&parent.id)
+                    .await
+                    .unwrap()
+                    .state,
+                ConvState::Idle
+            );
+            let accepted: Option<i64> = sqlx::query_scalar(
+                "SELECT parent_accepted_at_unix_micros FROM sub_agent_runs WHERE child_conversation_id = ?1",
+            ).bind(child_id).fetch_one(manager.db().pool()).await.unwrap();
+            assert!(accepted.is_some());
+            assert!(registry.reserve_spawn(&owner).await.is_ok());
+        }
     }
 
     #[tokio::test]
@@ -10997,25 +11221,32 @@ mod scope_liveness_tests {
     struct CoordinatorResearchLlm {
         requests: Mutex<Vec<phoenix_llm::LlmRequest>>,
         work_scope_id: String,
+        background_error: Option<bool>,
+        bash_registry: Mutex<Option<Arc<BashHandleRegistry>>>,
+        background_handle: Mutex<Option<(String, Arc<phoenix_tools::bash::handle::Handle>)>>,
     }
 
     #[async_trait::async_trait]
     impl phoenix_llm::LlmService for CoordinatorResearchLlm {
+        #[allow(clippy::too_many_lines)] // Scripted real-tool journey and its ordering assertions.
         async fn complete(
             &self,
             request: &phoenix_llm::LlmRequest,
         ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
             use phoenix_llm::ContentBlock;
             let conv_id = &request.telemetry.as_ref().unwrap().conversation_id;
-            let mut requests = self.requests.lock().unwrap();
-            let turn = requests
-                .iter()
-                .filter(|prior| &prior.telemetry.as_ref().unwrap().conversation_id == conv_id)
-                .count();
+            let turn = {
+                let mut requests = self.requests.lock().unwrap();
+                let turn = requests
+                    .iter()
+                    .filter(|prior| &prior.telemetry.as_ref().unwrap().conversation_id == conv_id)
+                    .count();
+                requests.push(request.clone());
+                turn
+            };
             let research = request.system[0]
                 .text
                 .starts_with("You are an inline research agent");
-            requests.push(request.clone());
             let content = match (research, turn) {
                 (false, 0) => ContentBlock::tool_use(
                     "delegate",
@@ -11034,27 +11265,84 @@ mod scope_liveness_tests {
                     ContentBlock::tool_use(
                         "research-bash",
                         "bash",
-                        serde_json::json!({"op":"run","cmd":"pwd; printf delegated > evidence.txt","work_scope_id":self.work_scope_id,"wait_seconds":10}),
+                        serde_json::json!({"op":"run","cmd": if self.background_error.is_some() { "sleep 300" } else { "pwd; printf delegated > evidence.txt" },"work_scope_id":self.work_scope_id,"wait_seconds": if self.background_error.is_some() { 0 } else { 10 }}),
                     )
                 }
                 (true, 2) => {
-                    assert!(request.messages.iter().flat_map(|message| &message.content).any(|block| matches!(block,
+                    if let Some(error) = self.background_error {
+                        let content = request
+                            .messages
+                            .iter()
+                            .flat_map(|message| &message.content)
+                            .find_map(|block| match block {
+                                ContentBlock::ToolResult {
+                                    tool_use_id,
+                                    content,
+                                    is_error: false,
+                                    ..
+                                } if tool_use_id == "research-bash" => Some(content),
+                                _ => None,
+                            })
+                            .expect("background Bash result");
+                        let value: serde_json::Value = serde_json::from_str(content).unwrap();
+                        assert_eq!(value["status"], "still_running");
+                        let registry = self.bash_registry.lock().unwrap().clone().unwrap();
+                        let registered = registry
+                            .get_by_id(&phoenix_tools::bash::handle::HandleId(
+                                value["handle"].as_str().unwrap().into(),
+                            ))
+                            .await
+                            .unwrap();
+                        assert!(registered.handle.state().await.is_live());
+                        *self.background_handle.lock().unwrap() =
+                            Some((conv_id.clone(), registered.handle));
+                        ContentBlock::tool_use(
+                            "research-result",
+                            if error {
+                                "submit_error"
+                            } else {
+                                "submit_result"
+                            },
+                            if error {
+                                serde_json::json!({"error":"research-evidence-42"})
+                            } else {
+                                serde_json::json!({"result":"research-evidence-42"})
+                            },
+                        )
+                    } else {
+                        assert!(request.messages.iter().flat_map(|message| &message.content).any(|block| matches!(block,
                         ContentBlock::ToolResult { tool_use_id, content, is_error: false, .. }
                         if tool_use_id == "research-bash" && content.contains("exited") && content.contains("evidence.txt"))), "child request: {request:#?}");
-                    ContentBlock::tool_use(
-                        "research-result",
-                        "submit_result",
-                        serde_json::json!({"result":"research-evidence-42"}),
-                    )
+                        ContentBlock::tool_use(
+                            "research-result",
+                            "submit_result",
+                            serde_json::json!({"result":"research-evidence-42"}),
+                        )
+                    }
                 }
                 (false, 1) => {
+                    if self.background_error.is_some() {
+                        let (child_id, handle) =
+                            self.background_handle.lock().unwrap().clone().unwrap();
+                        let stopped_before_resume = handle.state().await.is_terminal();
+                        let registry = self.bash_registry.lock().unwrap().clone().unwrap();
+                        // Settle the fixture's process before a regression assertion can panic.
+                        registry
+                            .retire_unattached_controller(&child_id)
+                            .await
+                            .unwrap();
+                        assert!(
+                            stopped_before_resume,
+                            "parent resumed while exact child Bash process remained live"
+                        );
+                    }
                     assert!(
                         request
                             .messages
                             .iter()
                             .flat_map(|message| &message.content)
                             .any(|block| matches!(block,
-                        ContentBlock::ToolResult { tool_use_id, content, is_error: false, .. }
+                        ContentBlock::ToolResult { tool_use_id, content, .. }
                         if tool_use_id == "delegate" && content.contains("research-evidence-42"))),
                         "parent request: {request:#?}"
                     );
@@ -11076,8 +11364,21 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)] // One fixture proves delegation, tool execution, and fan-in.
     async fn coordinator_inline_research_queries_runs_bash_and_returns_through_normal_fan_in() {
+        coordinator_inline_research_round_trip(None).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn coordinator_inline_research_result_and_error_stop_background_bash_before_parent_resumes(
+    ) {
+        for error in [false, true] {
+            coordinator_inline_research_round_trip(Some(error)).await;
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // One fixture proves delegation, tool execution, and fan-in.
+    async fn coordinator_inline_research_round_trip(background_error: Option<bool>) {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().canonicalize().unwrap();
         let db = Database::open_in_memory().await.unwrap();
@@ -11088,6 +11389,9 @@ mod scope_liveness_tests {
         let llm = Arc::new(CoordinatorResearchLlm {
             requests: Mutex::new(Vec::new()),
             work_scope_id: scope.work_scope_id.to_string(),
+            background_error,
+            bash_registry: Mutex::new(None),
+            background_handle: Mutex::new(None),
         });
         let manager = Arc::new(RuntimeManager::new(
             db,
@@ -11098,6 +11402,7 @@ mod scope_liveness_tests {
             Arc::new(McpClientManager::new()),
             None,
         ));
+        *llm.bash_registry.lock().unwrap() = Some(manager.bash_handles().clone());
         manager.start_sub_agent_handler().await;
         let parent = manager
             .db()
@@ -11124,20 +11429,45 @@ mod scope_liveness_tests {
             .await
             .unwrap();
         let mut states = handle.state_rx.clone();
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let completion = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             states
                 .wait_for(|state| matches!(state, ConvState::Idle | ConvState::Error { .. }))
                 .await
-                .unwrap();
+                .map(|_| ())
         })
-        .await
-        .expect("research and parent fan-in complete");
+        .await;
+        if background_error.is_some() {
+            let child_ids: HashSet<_> = llm
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| {
+                    request.system[0]
+                        .text
+                        .starts_with("You are an inline research agent")
+                })
+                .map(|request| request.telemetry.as_ref().unwrap().conversation_id.clone())
+                .collect();
+            for child_id in child_ids {
+                manager
+                    .bash_handles()
+                    .retire_unattached_controller(&child_id)
+                    .await
+                    .unwrap();
+            }
+        }
+        completion
+            .expect("research and parent fan-in complete")
+            .expect("parent runtime remains available");
         assert_eq!(*states.borrow(), ConvState::Idle);
         let requests = llm.requests.lock().unwrap().clone();
-        assert_eq!(
-            std::fs::read_to_string(home.join("evidence.txt")).unwrap(),
-            "delegated"
-        );
+        if background_error.is_none() {
+            assert_eq!(
+                std::fs::read_to_string(home.join("evidence.txt")).unwrap(),
+                "delegated"
+            );
+        }
         assert_eq!(requests.len(), 5);
         let child_requests: Vec<_> = requests
             .iter()
@@ -11183,7 +11513,11 @@ mod scope_liveness_tests {
         );
         assert!(child.attached_work_scope_id.is_none());
         assert!(child.cwd.is_empty());
-        assert!(matches!(child.state, ConvState::Completed { .. }));
+        if background_error == Some(true) {
+            assert!(matches!(child.state, ConvState::Failed { .. }));
+        } else {
+            assert!(matches!(child.state, ConvState::Completed { .. }));
+        }
         manager.begin_process_shutdown();
         manager.drain_process_shutdown().await;
     }
