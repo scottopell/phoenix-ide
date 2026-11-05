@@ -9080,7 +9080,11 @@ where
                     self.llm_registry.clone(),
                     self.terminals.clone(),
                     self.tmux_registry.clone(),
-                    self.context.resource_scope.clone(),
+                    if self.context.is_coordinator {
+                        phoenix_core::work_scope::ResourceScopeKey::Coordinator
+                    } else {
+                        self.context.resource_scope.clone()
+                    },
                     self.context.resource_authority,
                 )
             }

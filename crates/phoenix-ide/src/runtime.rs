@@ -11218,6 +11218,193 @@ mod scope_liveness_tests {
 
     struct FailingLlm;
 
+    struct CoordinatorParentBashLlm {
+        work_scope_id: String,
+        result: Mutex<Option<serde_json::Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl phoenix_llm::LlmService for CoordinatorParentBashLlm {
+        async fn complete(
+            &self,
+            request: &phoenix_llm::LlmRequest,
+        ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
+            use phoenix_llm::ContentBlock;
+            let result = request
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .find_map(|block| match block {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } if tool_use_id == "parent-bash" => {
+                        Some(serde_json::from_str(content).unwrap())
+                    }
+                    _ => None,
+                });
+            let end_turn = result.is_some();
+            let content = if let Some(result) = result {
+                *self.result.lock().unwrap() = Some(result);
+                ContentBlock::text("Parent command started")
+            } else {
+                ContentBlock::tool_use(
+                    "parent-bash",
+                    "bash",
+                    serde_json::json!({
+                        "op":"run",
+                        "cmd":"for ((i=0; i<600; i++)); do test -e release-parent-bash && break; sleep 0.1; done",
+                        "work_scope_id":self.work_scope_id,
+                        "wait_seconds":0
+                    }),
+                )
+            };
+            Ok(phoenix_llm::LlmResponse::non_streaming(
+                vec![content],
+                end_turn,
+                phoenix_llm::Usage::default(),
+            ))
+        }
+
+        fn model_id(&self) -> &'static str {
+            "claude-sonnet-5"
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // Real parent launch, discovery, inspection, and cleanup.
+    #[tokio::test]
+    async fn coordinator_parent_bash_keeps_coordinator_control_with_initialized_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = db
+            .initialize_coordinator_work_scope(home.to_str().unwrap())
+            .await
+            .unwrap();
+        let llm = Arc::new(CoordinatorParentBashLlm {
+            work_scope_id: scope.work_scope_id.to_string(),
+            result: Mutex::new(None),
+        });
+        let manager = Arc::new(RuntimeManager::new(
+            db,
+            Arc::new(ModelRegistry::for_test_with_sonnet(llm.clone())),
+            PlatformCapability::None {
+                details: "Coordinator Bash does not require a sandbox".into(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        ));
+        let parent = manager
+            .db()
+            .get_or_create_coordinator(
+                Some("claude-sonnet-5"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        let owner = ResourceScopeKey::Work(scope.work_scope_id.clone());
+        assert_eq!(parent.attached_work_scope_id, Some(scope.work_scope_id));
+        let runtime = manager.get_or_create(&parent.id).await.unwrap();
+        manager
+            .send_event(
+                &parent.id,
+                Event::UserMessage {
+                    text: "Start a parent-owned command".into(),
+                    llm_text: None,
+                    images: vec![],
+                    files: vec![],
+                    message_id: "parent-bash-user".into(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut states = runtime.state_rx.clone();
+        let completion = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            states
+                .wait_for(|state| matches!(state, ConvState::Idle | ConvState::Error { .. }))
+                .await
+                .map(|_| ())
+        })
+        .await;
+        let result = llm.result.lock().unwrap().clone();
+        let registered =
+            if let Some(id) = result.as_ref().and_then(|result| result["handle"].as_str()) {
+                manager
+                    .bash_handles()
+                    .get_by_id(&phoenix_tools::bash::handle::HandleId::new(id))
+                    .await
+            } else {
+                None
+            };
+        let discovered = manager.bash_handles().live_coordinator_handles().await;
+        let inspection = if let Some(registered) = &registered {
+            phoenix_tools::process_inspection::assemble_inspection(
+                &registered.handle.handle_id.0,
+                Some(&ResourceScopeKey::Coordinator),
+                None,
+                Some(&phoenix_core::work_scope::EffectiveResourceAccess::new(
+                    parent.id.clone(),
+                    crate::work_scope::ResourceAuthority::Restricted,
+                )),
+                None,
+                manager.bash_handles(),
+            )
+            .await
+        } else {
+            None
+        };
+        #[cfg(target_os = "linux")]
+        let stop = if let Some(registered) = &registered {
+            Some(
+                phoenix_tools::bash::stop_exact_handle_for_scope(
+                    manager.bash_handles(),
+                    &ResourceScopeKey::Coordinator,
+                    &registered.handle.handle_id.0,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        // Release the bounded command before any regression assertion can panic.
+        std::fs::write(home.join("release-parent-bash"), "release").unwrap();
+        if let Some(registered) = &registered {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                registered
+                    .handle
+                    .exit_observer()
+                    .wait_for(Option::is_some)
+                    .await
+                    .map(|_| ())
+            })
+            .await
+            .expect("parent command exits after release")
+            .expect("exit lifecycle remains available");
+        }
+        manager.begin_process_shutdown();
+        manager.drain_process_shutdown().await;
+
+        completion.unwrap().unwrap();
+        assert_eq!(*states.borrow(), ConvState::Idle);
+        assert_eq!(result.unwrap()["status"], "still_running");
+        let registered = registered.expect("real parent Bash handle registered");
+        assert_eq!(registered.owner, owner);
+        assert_eq!(
+            registered.handle.controller_scope,
+            ResourceScopeKey::Coordinator
+        );
+        assert_eq!(registered.handle.working_dir, home);
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].handle_id, registered.handle.handle_id);
+        assert_eq!(inspection.unwrap().owner, owner);
+        #[cfg(target_os = "linux")]
+        stop.unwrap()
+            .expect("Coordinator can stop its exact live handle");
+    }
+
     struct CoordinatorResearchLlm {
         requests: Mutex<Vec<phoenix_llm::LlmRequest>>,
         work_scope_id: String,
