@@ -132,6 +132,11 @@ AND SHALL make clear that Explore spawn mode does not impose a read-only sandbox
 AND SHALL use the normal sub-agent limits, cancellation, terminal submission, and parent fan-in
 AND SHALL restore the research capability from the child's durable Coordinator parent identity when recreating its runtime
 
+WHEN a filesystem-free inline Coordinator child terminates, including cancellation or timeout
+THE SYSTEM SHALL close that child's ephemeral Bash controller and observe its bounded cleanup before delivering or parent-accepting its terminal outcome, including durable-result reconciliation, as defined by `../bash/requirements.md` REQ-BASH-018
+AND SHALL retain a parent-cancellation backstop that joins the same cleanup if the child's ordinary terminal path is interrupted
+AND SHALL preserve selected WorkScope ownership and the child's exclusive handle-control identity without granting the Coordinator control of child-created handles
+
 THE Coordinator SHALL be instructed to delegate context-intensive research and authorized shell work to focused inline agents, state each assignment's action authority, request concise evidence and citations, and retain synthesis, decisions, and responsibility for actions
 AND SHALL have access to the configured worker and execution-tier catalog and usable model routes for cost-appropriate selection
 AND its children SHALL be instructed to act only within the parent's assignment and existing user authority, without treating Bash access as authorization for messaging, Authority changes, or lifecycle operations

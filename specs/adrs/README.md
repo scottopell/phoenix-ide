@@ -216,6 +216,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [221](221_coordinator-authority-uses-conversational-approval-and-direct-tools.md) | Coordinator Authority uses conversational approval and direct tools | Accepted | REQ-AUTH-001–006, REQ-GR-007/013/022 |
 | [222](222_coordinator-research-uses-explicit-file-targets.md) | Coordinator research agents use explicit file targets | Superseded by 223 | REQ-GR-007, REQ-SA-001, REQ-SA-002, REQ-SA-007 |
 | [223](223_coordinator-inline-agents-reuse-targeted-bash.md) | Coordinator inline agents reuse targeted Bash | Accepted | REQ-GR-007, REQ-SA-002, REQ-SA-007, REQ-BASH-012, REQ-BASH-013 |
+| [224](224_coordinator-inline-child-bash-controller-retirement.md) | Coordinator inline children retire their Bash controllers before parent acceptance | Accepted | REQ-GR-007, REQ-BASH-017, REQ-BASH-018, REQ-SA-003, REQ-SA-004, REQ-SA-005 |
 
 ## For agents: which decisions bind your task
 
@@ -243,6 +244,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006 |
 | Specifying bash command execution / wait-window semantics | 001 |
 | Specifying Global Coordinator Bash authorization or sandbox policy | 047, then 027 and 001 |
+| Specifying filesystem-free Coordinator inline-child Bash ownership, launch admission, terminal cleanup, or parent acceptance | 224 for controller retirement, preserving 223's explicitly targeted write capability |
 | Specifying bash handle state observation or response shaping | 002 |
 | Specifying bash process cleanup, shutdown cleanup, or kill escalation policy | 003 |
 | Specifying inline-terminal history commit, per-command rounds, or user-origin attribution | 004 |

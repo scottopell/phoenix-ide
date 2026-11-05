@@ -31,6 +31,7 @@
 -- read_first injection is outside this spawn-resolution model.
 
 use "../bedrock/bedrock.allium" as bedrock
+use "../bash/bash.allium" as bash
 
 -- Required classification and diagnostics of the native unactivated-batch
 -- boundary. A classified reconciliation receipt also establishes exact parent
@@ -642,10 +643,23 @@ rule TerminalEvidencePrecedesParentDelivery {
         SubAgentAdmission{child: child}.parent.id, child.id, result)
 }
 
+rule CoordinatorInlineChildTerminalClosesBashController {
+    when: SubAgentReachesTerminal(child, result)
+    requires: filesystem_free_coordinator_child(child)
+    ensures: bash/CloseInlineChildBashController(child)
+}
+
+rule CoordinatorInlineChildCancellationBackstopClosesBashController {
+    when: SubAgentCancellationRequested(child)
+    requires: filesystem_free_coordinator_child(child)
+    ensures: bash/CloseInlineChildBashController(child)
+}
+
 rule DurableParentIdentityDeliversTerminal {
     when: ParentDeliveryAttempted(child, result)
     requires: SubAgentAdmission{child: child}.terminal_evidence_persisted
     requires: SubAgentAdmission{child: child}.parent_terminal_disposition = owed
+    requires: inline_child_bash_cleanup_observed(child)
     ensures: CurrentParentRuntimeResolved(SubAgentAdmission{child: child}.parent.id)
     ensures: bedrock/ParentTerminalTransportArrived(
         SubAgentAdmission{child: child}.parent, parent_terminal_result(child, result))
@@ -655,6 +669,7 @@ rule ActualParentAcceptanceAcknowledgesTerminal {
     when: bedrock/SubAgentParentAcceptanceCommitted(parent, result)
     let admission = admission_for_parent_result(parent, result)
     requires: admission.terminal_evidence_persisted
+    requires: inline_child_bash_cleanup_observed(admission.child)
     ensures: admission.parent_terminal_disposition = fan_in_accepted
 
     @guidance
@@ -767,6 +782,12 @@ invariant ParentAcceptsChildTerminalAtMostOnce {
     for admission in SubAgentAdmission:
         ParentResultCount(admission.child) <= 1
         and ParentResumeCountForChild(admission.child) <= 1
+}
+
+invariant ParentAcceptanceFollowsInlineChildBashCleanup {
+    for admission in SubAgentAdmissions:
+        ParentResultCount(admission.child) > 0
+            implies inline_child_bash_cleanup_observed(admission.child)
 }
 
 invariant EveryAdmissionRemainsPendingOrParentAccepted {
@@ -917,6 +938,16 @@ surface NativeSpawnAdoptionBoundary {
 --   WorkScope, to preserve unrelated edits, and to report overlap or conflict.
 -- coordinator_parent(parent: Conversation) -> Boolean
 --   True exactly when the durable parent's runtime role is Coordinator.
+-- filesystem_free_coordinator_child(child: Conversation) -> Boolean
+--   True exactly for an inline Coordinator child whose resolved execution
+--   environment is no_filesystem and which has no WorkScope attachment.
+-- inline_child_bash_cleanup_observed(child: Conversation) -> Boolean
+--   True for other children. For filesystem-free Coordinator children, requires
+--   joining bash/InlineChildBashLifecycle through its bounded observation before
+--   live transport OR parent acceptance, including durable-result reconciliation.
+--   An incomplete observation satisfies this ordering prerequisite without
+--   certifying cleanup success or discarding outstanding custody/handle evidence.
+--   A persisted terminal row alone does not satisfy the prerequisite.
 -- any_task_supplies_cwd(tasks: List<SubAgentTask>) -> Boolean
 --   True when any task supplies a non-null cwd, including a blank string.
 -- coordinator_research registry:
