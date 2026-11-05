@@ -1,5 +1,6 @@
 import io
 import importlib.util
+import json
 import os
 import tempfile
 import threading
@@ -19,6 +20,16 @@ def load_devpy():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def launcher_artifact(root, executable, *, fresh=False):
+    return {
+        "reason": "compiler-artifact",
+        "manifest_path": str(root / "crates" / "phoenix-ide" / "Cargo.toml"),
+        "target": {"name": "phoenix_ide", "kind": ["bin"]},
+        "executable": str(executable) if executable is not None else None,
+        "fresh": fresh,
+    }
 
 
 class CheckPlanTests(unittest.TestCase):
@@ -168,7 +179,10 @@ class CheckPlanTests(unittest.TestCase):
             ("success", 0, 0, False, 0, 0),
             ("default target", 0, 0, False, 0, 0),
             ("absolute target", 0, 0, False, 0, 0),
-            ("launcher failure", 1, 0, False, 0, 0),
+            ("environment target", 0, 0, False, 0, 0),
+            ("cargo config target", 0, 0, False, 0, 0),
+            ("fresh configured target", 0, 0, False, 0, 0),
+            ("launcher failure", 17, 0, False, 0, 0),
             ("codegen failure", 0, 1, False, 2, 3),
             ("stale export", 0, 0, True, 2, 3),
             ("compile failure", 0, 0, False, 1, 0),
@@ -185,7 +199,8 @@ class CheckPlanTests(unittest.TestCase):
                     compile_cmd, test_cmd, codegen_cmd = self.dev._rust_check_commands(
                         nextest, [], [], [], 1, [],
                     )
-                    commands = [["cargo", "build", "-p", "phoenix_ide", "--bin", "phoenix_ide"]]
+                    commands = [["cargo", "build", "-p", "phoenix_ide", "--bin", "phoenix_ide",
+                                 "--message-format=json-render-diagnostics"]]
                     returncodes = [launcher_rc]
                     if launcher_rc == 0:
                         commands += [codegen_cmd, compile_cmd, test_cmd]
@@ -195,9 +210,20 @@ class CheckPlanTests(unittest.TestCase):
                                       str(root / "absolute-target") if label == "absolute target" else
                                       "custom-target")
                     target_dir = root / (target_setting or "target")
-                    launcher = target_dir / "debug" / "phoenix_ide"
-                    launcher.parent.mkdir(parents=True)
-                    launcher.write_text("stale fixture must not skip cargo build")
+                    stale_launcher = target_dir / "debug" / "phoenix_ide"
+                    stale_launcher.parent.mkdir(parents=True)
+                    stale_launcher.write_text("stale fixture must not skip cargo build")
+                    stale_launcher.chmod(0o755)
+                    configured_target = label in ("environment target", "cargo config target", "fresh configured target")
+                    launcher = (target_dir / "host-triple" / "debug" / "phoenix_ide"
+                                if configured_target else stale_launcher)
+                    launcher.parent.mkdir(parents=True, exist_ok=True)
+                    launcher.write_text("current native launcher")
+                    launcher.chmod(0o755)
+                    launcher_stat = launcher.stat()
+                    if label == "cargo config target":
+                        (root / ".cargo").mkdir()
+                        (root / ".cargo" / "config.toml").write_text('[build]\ntarget = "host-triple"\n')
                     inherited_fixture = {
                         "PHOENIX_BASH_LAUNCH_TEST_EXE": "/stale/elsewhere/phoenix_ide",
                         "PHOENIX_BASH_LAUNCH_TEST_REQUIRED": "0",
@@ -214,14 +240,17 @@ class CheckPlanTests(unittest.TestCase):
                         for key in ("CARGO_BUILD_JOBS", "RAYON_NUM_THREADS", "RUST_TEST_THREADS"):
                             self.assertEqual("1", env[key])
                         if index > 0:
-                            self.assertEqual(str(launcher.resolve()), env["PHOENIX_BASH_LAUNCH_TEST_EXE"])
+                            self.assertEqual(str(launcher), env["PHOENIX_BASH_LAUNCH_TEST_EXE"])
                             self.assertEqual("1", env["PHOENIX_BASH_LAUNCH_TEST_REQUIRED"])
                         if index == 1:
                             base = Path(env["TS_RS_EXPORT_DIR"])
                             (base.parents[2] / "Binding.ts").write_text(
                                 content + ("// stale\n" if stale else "")
                             )
-                        proc = mock.Mock(stdout=io.StringIO(""))
+                        artifact = launcher_artifact(root, launcher, fresh=label == "fresh configured target")
+                        # Metadata must survive the bounded console tail and rendered diagnostics.
+                        build_output = json.dumps(artifact) + "\n" + "warning: rendered diagnostic\n" * 205
+                        proc = mock.Mock(stdout=io.StringIO(build_output if index == 0 else ""))
                         proc.wait.return_value = returncodes[index]
                         return proc
 
@@ -233,6 +262,8 @@ class CheckPlanTests(unittest.TestCase):
                              **inherited_fixture,
                              **({"CARGO_TARGET_DIR": target_setting} if target_setting else {}),
                              "PHOENIX_CHECK_WORKERS": "1",
+                             **({"CARGO_BUILD_TARGET": "host-triple"}
+                                if label in ("environment target", "fresh configured target") else {}),
                          }), \
                          mock.patch.object(self.dev, "ROOT", root), \
                          mock.patch.object(self.dev, "_resolve_check_lanes", return_value=({"rust"}, {})), \
@@ -251,6 +282,7 @@ class CheckPlanTests(unittest.TestCase):
                         for key, value in inherited_fixture.items():
                             self.assertEqual(value, os.environ[key])
 
+                    self.assertEqual(launcher_stat, launcher.stat())
                     probe.assert_called_once_with(
                         ["cargo", "nextest", "--version"], capture_output=True, timeout=30,
                     )
@@ -273,9 +305,77 @@ class CheckPlanTests(unittest.TestCase):
                                else f"All {len(steps)} checks passed")
                     self.assertIn(summary, output.getvalue())
 
+    def test_launcher_metadata_fails_closed_before_normal_or_split_consumers(self):
+        cases = (
+            "missing", "malformed", "unrelated", "duplicate", "no executable", "missing executable field",
+            "missing executable", "relative executable", "non-executable", "directory", "build failure",
+        )
+        for split_build in (False, True):
+            for case in cases:
+                with self.subTest(split_build=split_build, case=case), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    stale = root / "target" / "debug" / "phoenix_ide"
+                    stale.parent.mkdir(parents=True)
+                    stale.write_text("stale default executable must not be used")
+                    stale.chmod(0o755)
+                    artifact = launcher_artifact(root, stale)
+                    if case in ("missing", "build failure"):
+                        records = []
+                    elif case == "missing executable field":
+                        artifact.pop("executable")
+                        records = [json.dumps(artifact)]
+                    elif case == "malformed":
+                        records = ["{malformed JSON", "null", '[]']
+                    elif case == "unrelated":
+                        records = [json.dumps({**artifact, "manifest_path": "/dependency/Cargo.toml"}),
+                                   json.dumps({**artifact, "target": {"name": "phoenix_ide", "kind": ["lib"]}}),
+                                   json.dumps({**artifact, "target": {"name": "other", "kind": ["bin"]}}),
+                                   json.dumps({**artifact, "reason": "compiler-message"})]
+                    elif case == "duplicate":
+                        records = [json.dumps(artifact)] * 2
+                    else:
+                        executable = {
+                            "no executable": None,
+                            "missing executable": root / "missing",
+                            "relative executable": "target/debug/phoenix_ide",
+                            "non-executable": root / "non-executable",
+                            "directory": stale.parent,
+                        }[case]
+                        if case == "non-executable":
+                            executable.write_text("not executable")
+                            executable.chmod(0o644)
+                        records = [json.dumps(launcher_artifact(root, executable))]
+                    proc = mock.Mock(stdout=io.StringIO("\n".join(records) + "\nwarning: rendered diagnostic\n"))
+                    build_rc = 17 if case == "build failure" else 0
+                    proc.wait.return_value = build_rc
+                    reporter = mock.Mock()
+                    output = io.StringIO()
+                    split = self.dev.RustSplit(self.dev.RustPhase.BUILD) if split_build else None
+                    with mock.patch.dict(os.environ, {"PHOENIX_CHECK_WORKERS": "1"}), \
+                         mock.patch.object(self.dev, "ROOT", root), \
+                         mock.patch.object(self.dev, "_resolve_check_lanes", return_value=({"rust"}, {})), \
+                         mock.patch.object(self.dev, "_make_reporter", return_value=reporter), \
+                         mock.patch.object(self.dev, "_classify_browser_env"), \
+                         mock.patch.object(self.dev, "_write_rust_split_scope"), \
+                         mock.patch.object(self.dev.subprocess, "Popen", return_value=proc) as launch, \
+                         mock.patch.object(self.dev.subprocess, "run", return_value=mock.Mock(returncode=0)), \
+                         mock.patch.object(self.dev.sys, "stdout", output):
+                        with self.assertRaises(SystemExit) as raised:
+                            self.dev.cmd_check(gate=False, lanes="rust", rust_split=split,
+                                               compiler_cache_setup=("none", {}))
+                    self.assertEqual(1, raised.exception.code)
+                    launch.assert_called_once()
+                    reporter.step_done.assert_called_once_with("rust", "native bash launcher", build_rc or 1, mock.ANY)
+                    if build_rc:
+                        self.assertNotIn("OUTPUT VALIDATION FAILED", output.getvalue())
+                    else:
+                        self.assertIn("OUTPUT VALIDATION FAILED", output.getvalue())
+                    self.assertIn("warning: rendered diagnostic", output.getvalue())
+                    self.assertIn("1 of 1 checks failed", output.getvalue())
+
     def test_split_rust_launcher_build_and_consumer_phases(self):
         for phase in self.dev.RustPhase:
-            for launcher_rc in ((0, 1) if phase is self.dev.RustPhase.BUILD else (0,)):
+            for launcher_rc in ((0, 17) if phase is self.dev.RustPhase.BUILD else (0,)):
                 with self.subTest(phase=phase.value, launcher_rc=launcher_rc), \
                      tempfile.TemporaryDirectory() as tmp:
                     root = Path(tmp)
@@ -298,7 +398,8 @@ class CheckPlanTests(unittest.TestCase):
                         if "TS_RS_EXPORT_DIR" in env:
                             base = Path(env["TS_RS_EXPORT_DIR"])
                             (base.parents[2] / "Binding.ts").write_text(content)
-                        proc = mock.Mock(stdout=io.StringIO(""))
+                        artifact = launcher_artifact(root, fixture)
+                        proc = mock.Mock(stdout=io.StringIO(json.dumps(artifact) + "\n"))
                         proc.wait.return_value = launcher_rc if cmd[:2] == ["cargo", "build"] else 0
                         return proc
 
@@ -307,7 +408,8 @@ class CheckPlanTests(unittest.TestCase):
                         split_cmds = self.dev._rust_split_commands(split, [], None, 1, [])
                     expected = list(split_cmds.values())
                     if phase is self.dev.RustPhase.BUILD:
-                        expected.insert(0, ["cargo", "build", "-p", "phoenix_ide", "--bin", "phoenix_ide"])
+                        expected.insert(0, ["cargo", "build", "-p", "phoenix_ide", "--bin", "phoenix_ide",
+                                            "--message-format=json-render-diagnostics"])
                         if launcher_rc:
                             expected = expected[:1]
                     with mock.patch.dict(os.environ, {

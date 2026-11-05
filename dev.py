@@ -6364,7 +6364,8 @@ def cmd_check(
             out += ["-p", c]
         return out
 
-    def run_step(name, cmd, cwd=ROOT, env_extra=None, *, timeout=CHECK_TIMEOUT):
+    def run_step(name, cmd, cwd=ROOT, env_extra=None, *, timeout=CHECK_TIMEOUT,
+                 output_observer=None, output_validator=None):
         # Stream stdout+stderr line-by-line into a bounded buffer so that on
         # timeout we keep the last N lines of output instead of throwing it
         # away. Process is launched in its own session so SIGKILL can target
@@ -6448,15 +6449,18 @@ def cmd_check(
             raise
 
         reader_cpu_ms = 0.0
+        reader_error = ""
 
         stop_reader = threading.Event()
 
         def observe_qualification(text):
             clean = _CONTROL_SEQ_RE.sub("", text).replace("\x1b", "").rstrip("\n")
             lock_timer.observe_line(clean, time.monotonic())
+            if output_observer is not None:
+                output_observer(clean)
 
         def reader():
-            nonlocal truncated, reader_cpu_ms
+            nonlocal truncated, reader_cpu_ms, reader_error
             started_reader_ns = time.thread_time_ns()
             try:
                 assert proc.stdout is not None
@@ -6474,8 +6478,11 @@ def cmd_check(
                         # tool-agnostic backstop so the reprinted buffer stays clean.
                         clean = _CONTROL_SEQ_RE.sub("", line).rstrip("\n")
                         lock_timer.observe_line(clean, now)
+                        if output_observer is not None:
+                            output_observer(clean)
                         buf.append(clean)
             except Exception as error:
+                reader_error = str(error)
                 if output_log is not None:
                     output_log.error = f"output reader failed: {error}; payload INCOMPLETE"
                 raise
@@ -6561,6 +6568,14 @@ def cmd_check(
                 output += f"QUALIFICATION FAILED: {capture_error}\n"
                 if rc == 0:
                     rc = 1
+        if rc == 0 and output_validator is not None:
+            validation_error = (
+                "output capture incomplete" if rt.is_alive() or reader_error
+                else output_validator()
+            )
+            if validation_error:
+                output += f"\nOUTPUT VALIDATION FAILED: {validation_error}\n"
+                rc = 1
         with results_lock:
             results.append((name, rc, elapsed, output))
         reporter.step_done(lane, name, rc, elapsed)
@@ -6657,14 +6672,41 @@ def cmd_check(
         run_step("cargo test", test_cmd, env_extra=launcher_env, timeout=CARGO_TEST_TIMEOUT)
 
     def build_native_bash_launcher():
+        executables = []
+
+        def observe_artifact(line):
+            try:
+                artifact = json.loads(line)
+            except json.JSONDecodeError:
+                return
+            if not isinstance(artifact, dict):
+                return
+            target = artifact.get("target")
+            if (artifact.get("reason") == "compiler-artifact"
+                    and artifact.get("manifest_path") == str(ROOT / "crates" / "phoenix-ide" / "Cargo.toml")
+                    and isinstance(target, dict)
+                    and target.get("name") == "phoenix_ide"
+                    and target.get("kind") == ["bin"]):
+                executables.append(artifact.get("executable"))
+
+        def validate_artifact():
+            if len(executables) != 1:
+                return f"expected one phoenix_ide binary compiler-artifact; got {len(executables)}"
+            executable = executables[0]
+            if not isinstance(executable, str) or not executable:
+                return "phoenix_ide compiler-artifact has no executable"
+            path = Path(executable)
+            if not (path.is_absolute() and path.is_file() and os.access(path, os.X_OK)):
+                return f"phoenix_ide compiler-artifact must name an existing absolute executable file: {executable!r}"
+            return None
+
         if run_step("native bash launcher", [
             "cargo", "build", "-p", "phoenix_ide", "--bin", "phoenix_ide",
-        ]) != 0:
+            "--message-format=json-render-diagnostics",
+        ], output_observer=observe_artifact, output_validator=validate_artifact) != 0:
             return None
         return {
-            "PHOENIX_BASH_LAUNCH_TEST_EXE": str(
-                (_cargo_target_dir(ROOT, os.environ) / "debug" / "phoenix_ide").resolve()
-            ),
+            "PHOENIX_BASH_LAUNCH_TEST_EXE": executables[0],
             "PHOENIX_BASH_LAUNCH_TEST_REQUIRED": "1",
         }
 
