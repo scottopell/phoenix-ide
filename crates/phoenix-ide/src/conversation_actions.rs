@@ -351,7 +351,8 @@ mod tests {
             ..LlmConfig::default()
         });
         let manager = runtime(Database::open_in_memory().await.unwrap(), registry);
-        let mut req = request(dir.path().to_str().unwrap());
+        let cwd = dir.path().canonicalize().unwrap();
+        let mut req = request(cwd.to_str().unwrap());
         req.model = Some("gpt-5.6-sol".into());
         // This fixture must falsify materializing the catalog native default into the intent.
         assert!(manager
