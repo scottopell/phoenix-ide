@@ -456,6 +456,7 @@ enum RequiredSettlementBoundary {
     Tool,
     Child,
     ChildBackstop,
+    TerminalFollowup,
 }
 
 impl RequiredSettlementBoundary {
@@ -465,6 +466,7 @@ impl RequiredSettlementBoundary {
             Self::Tool => "ordinary_tool_outcome_settlement",
             Self::Child => "sub_agent_result_settlement",
             Self::ChildBackstop => "cancellation_backstop_settlement",
+            Self::TerminalFollowup => "direct_turn_terminal_followup_settlement",
         }
     }
 
@@ -474,6 +476,7 @@ impl RequiredSettlementBoundary {
             Self::Tool => "ordinary_tool_outcome_owner_disappeared",
             Self::Child => "sub_agent_result_owner_disappeared",
             Self::ChildBackstop => "cancellation_backstop_owner_disappeared",
+            Self::TerminalFollowup => "direct_turn_terminal_followup_owner_disappeared",
         }
     }
 }
@@ -3828,10 +3831,7 @@ where
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
         match event {
             Event::SubAgentResult { agent_id, outcome }
-                if matches!(&self.state,
-                    ConvState::AwaitingSubAgents { pending, .. }
-                    | ConvState::CancellingSubAgents { pending, .. }
-                    if pending.iter().any(|child| child.agent_id == agent_id)) =>
+                if self.sub_agent_result_is_pending(&agent_id) =>
             {
                 match self
                     .settle_required_completion(RequiredCompletion::Child { agent_id, outcome })
@@ -4166,7 +4166,10 @@ where
             let generated = match application {
                 Ok(generated) => generated,
                 Err(error) => {
-                    if accepted_sub_agent.is_some() {
+                    if accepted_sub_agent.as_ref().is_some_and(|agent_id| {
+                        self.pending_sub_agent_acceptance.as_deref() == Some(agent_id.as_str())
+                            && self.sub_agent_result_is_pending(agent_id)
+                    }) {
                         self.sub_agent_result_buffer.push(terminal_event.clone());
                         let event_tx = self.event_tx.clone();
                         tokio::spawn(async move {
@@ -5050,12 +5053,15 @@ where
         }
 
         if terminal_direct_turn_transition {
-            if let Some((drain_event, projection_guard)) =
-                Box::pin(self.prepare_steering_drain(&old_state, false)).await?
-            {
-                Box::pin(self.process_event(drain_event)).await?;
-                drop(projection_guard);
-            }
+            Box::pin(
+                self.finish_terminal_direct_turn_followup(
+                    &old_state,
+                    terminal_unit_admission
+                        .as_deref_mut()
+                        .expect("terminal transition is admitted"),
+                ),
+            )
+            .await?;
         }
 
         if self.pending_direct_turn_terminal.is_some() {
@@ -5279,7 +5285,7 @@ where
                 );
             }
         }
-        if let Some(cause) = self.pending_sub_agent_terminal.take() {
+        let state_persisted = if let Some(cause) = self.pending_sub_agent_terminal.take() {
             self.storage
                 .update_state_and_record_sub_agent_terminal(
                     &self.context.conversation_id,
@@ -5289,45 +5295,53 @@ where
                     Utc::now(),
                 )
                 .await?;
-        } else if let Some(child_id) = self.pending_sub_agent_acceptance.take() {
+            true
+        } else if let Some(child_id) = self.pending_sub_agent_acceptance.as_deref() {
             if self.context.is_coordinator {
-                super::retire_inline_child_bash_controller(&self.bash_handles, &child_id).await;
+                super::retire_inline_child_bash_controller(&self.bash_handles, child_id).await;
             }
             self.storage
                 .update_state_and_accept_sub_agent(
                     &self.context.conversation_id,
                     &self.state,
                     self.state_updated_at,
-                    &child_id,
+                    child_id,
                     Utc::now(),
                 )
                 .await?;
             if let Some(scope) = &mut self.required_settlement_authority {
-                scope.record_child_acceptance(&child_id);
+                scope.record_child_acceptance(child_id);
             }
-        } else if let (Some(turn), Some(terminal)) = (
+            self.pending_sub_agent_acceptance = None;
+            true
+        } else {
+            false
+        };
+        if let (Some(turn), Some(terminal)) = (
             self.active_direct_turn.as_deref().cloned(),
             self.pending_direct_turn_terminal.as_deref().cloned(),
         ) {
             self.settle_pending_direct_turn(turn, Box::new(terminal))
                 .await?;
-        } else if let Some(update) = self.pending_provider_replay_update.take() {
-            self.storage
-                .update_state_and_provider_replay(
-                    &self.context.conversation_id,
-                    &self.state,
-                    self.state_updated_at,
-                    &update,
-                )
-                .await?;
-        } else {
-            self.storage
-                .update_state(
-                    &self.context.conversation_id,
-                    &self.state,
-                    self.state_updated_at,
-                )
-                .await?;
+        } else if !state_persisted {
+            if let Some(update) = self.pending_provider_replay_update.take() {
+                self.storage
+                    .update_state_and_provider_replay(
+                        &self.context.conversation_id,
+                        &self.state,
+                        self.state_updated_at,
+                        &update,
+                    )
+                    .await?;
+            } else {
+                self.storage
+                    .update_state(
+                        &self.context.conversation_id,
+                        &self.state,
+                        self.state_updated_at,
+                    )
+                    .await?;
+            }
         }
         if let Some(activation) = activation {
             let _ = activation.sender.send(());
@@ -5344,6 +5358,51 @@ where
                 );
         }
         Ok(None)
+    }
+
+    async fn finish_terminal_direct_turn_followup(
+        &mut self,
+        old_state: &ConvState,
+        admission: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<(), String> {
+        let owns_scope = self.required_settlement_authority.is_none();
+        let mut local_authority = if owns_scope {
+            let mut owner = admission.reborrow();
+            self.required_settlement_authority = Some(RequiredSettlementScope::new(
+                owner.reborrow(),
+                RequiredSettlementBoundary::TerminalFollowup,
+            ));
+            Some(RuntimeSettlementAuthority {
+                owner: Some(owner),
+                abandoned_reason: RequiredSettlementBoundary::TerminalFollowup.owner_disappeared(),
+            })
+        } else {
+            None
+        };
+        let result = async {
+            if let Some((event, projection_guard)) =
+                self.prepare_steering_drain(old_state, false).await?
+            {
+                Box::pin(self.process_event_with_authority(
+                    event,
+                    TransitionAuthority::OwnedCompletionFollowup,
+                ))
+                .await?;
+                drop(projection_guard);
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+        if result.is_err() {
+            self.close_failed_required_steering_drain(TransitionAuthority::OwnedCompletionFollowup);
+        }
+        if owns_scope {
+            self.required_settlement_authority = None;
+        }
+        if let Some(authority) = &mut local_authority {
+            authority.owner = None;
+        }
+        result
     }
 
     async fn prepare_immediate_steering_drain(
@@ -5763,6 +5822,16 @@ where
             self.state,
             ConvState::AwaitingSubAgents { .. } | ConvState::CancellingSubAgents { .. }
         )
+    }
+
+    fn sub_agent_result_is_pending(&self, agent_id: &str) -> bool {
+        match &self.state {
+            ConvState::AwaitingSubAgents { pending, .. }
+            | ConvState::CancellingSubAgents { pending, .. } => {
+                pending.iter().any(|child| child.agent_id == agent_id)
+            }
+            _ => false,
+        }
     }
 
     /// Handle the `AwaitingSubAgents` completion timeout (REQ-SA-006) by routing
@@ -24199,6 +24268,200 @@ mod steer_drain_detector_tests {
             assert_eq!(storage.get_current_state(id), Some(runtime.state.clone()));
             assert!(!runtime.fatal_local_authority_fence.is_closed());
             assert!(runtime.llm_client.recorded_requests().is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::too_many_lines)]
+    async fn final_cancelled_child_settles_active_parent_or_retains_exact_terminal_retry() {
+        for queued in [false, true] {
+            for (retry_terminal, shutdown_during_retry) in
+                [(false, false), (true, false), (true, true)]
+            {
+                let id = "final-child-active-parent";
+                let (mut runtime, storage) = cancelling_runtime(
+                    id,
+                    &["child"],
+                    crate::state_machine::event::CancelCause::UserRequested,
+                )
+                .await;
+                let turn = crate::runtime::traits::ActiveDirectTurn {
+                    turn_id: phoenix_workflow::TurnAuthorityId(914),
+                    generation: 3,
+                };
+                storage.set_active_direct_turn(Some(turn.clone()));
+                runtime.active_direct_turn = Some(Box::new(turn));
+                runtime.direct_turn_cancellation_initiated = true;
+                let (watch_tx, watch_rx) = watch::channel(runtime.state.clone());
+                runtime = runtime.with_state_watcher(watch_tx);
+                if queued {
+                    let entry = mk_entry("after-active-parent-cancel", "queued next turn");
+                    runtime.steering_queue = vec![entry.clone()];
+                    storage.set_steering_queue(id, vec![entry]);
+                }
+                storage.set_fail_prompt_projection_load(true);
+                storage.set_settle_active_direct_turn_failures(usize::from(retry_terminal));
+                runtime
+                    .process_event(Event::SubAgentResult {
+                        agent_id: "child".into(),
+                        outcome: SubAgentOutcome::Failure {
+                            error: "cancelled".into(),
+                            error_kind: crate::db::ErrorKind::Cancelled,
+                        },
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(storage.sub_agent_acceptance_count(), 1);
+                assert!(!runtime.fatal_local_authority_fence.is_closed());
+                assert!(
+                    runtime.sub_agent_result_buffer.is_empty(),
+                    "an accepted child cannot own a new acceptance retry"
+                );
+                if retry_terminal {
+                    assert!(runtime.terminal_transition_retry.is_some());
+                    assert!(runtime.active_direct_turn.is_some());
+                    assert!(runtime.pending_direct_turn_terminal.is_some());
+                    if shutdown_during_retry {
+                        let fence = runtime.fatal_local_authority_fence.clone();
+                        let (started, release) = storage.gate_active_direct_turn_settlement();
+                        let task = tokio::spawn(async move {
+                            runtime.retry_terminal_transition().await;
+                            runtime
+                        });
+                        tokio::time::timeout(Duration::from_secs(30), started)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        fence.close_for_process_shutdown();
+                        release.send(()).unwrap();
+                        runtime = task.await.unwrap();
+                    } else {
+                        runtime.retry_terminal_transition().await;
+                    }
+                }
+                assert!(runtime.terminal_transition_retry.is_none());
+                assert!(runtime.active_direct_turn.is_none());
+                assert!(runtime.pending_direct_turn_terminal.is_none());
+                assert_eq!(
+                    storage.recorded_settle_active_direct_turn_calls().len(),
+                    1 + usize::from(retry_terminal)
+                );
+                assert!(storage
+                    .recorded_settle_active_direct_turn_calls()
+                    .iter()
+                    .all(|settlement| matches!(
+                        settlement.terminal,
+                        crate::runtime::traits::ActiveDirectTurnTerminal::Cancelled
+                    )));
+                if queued {
+                    assert!(matches!(runtime.state, ConvState::Error { .. }));
+                } else {
+                    assert!(matches!(runtime.state, ConvState::Idle));
+                }
+                assert_eq!(*watch_rx.borrow(), runtime.state);
+                assert_eq!(storage.get_current_state(id), Some(runtime.state.clone()));
+                assert!(
+                    crate::runtime::traits::MessageStore::load_active_direct_turn(&storage, id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(storage.get_steering_queue(id).is_empty());
+                assert!(runtime.llm_client.recorded_requests().is_empty());
+                assert_eq!(
+                    runtime.fatal_local_authority_fence.is_closed(),
+                    shutdown_during_retry
+                );
+                assert!(!runtime
+                    .fatal_local_authority_fence
+                    .fatal_authority_loss_is_latched());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_child_followup_failure_keeps_established_receipts_and_stops_authority() {
+        for (read_failure, queued) in [(true, false), (true, true), (false, true)] {
+            for retry_terminal in [false, true] {
+                let id = "terminal-child-followup-failure";
+                let (mut runtime, storage) = cancelling_runtime(
+                    id,
+                    &["child"],
+                    crate::state_machine::event::CancelCause::UserRequested,
+                )
+                .await;
+                let turn = crate::runtime::traits::ActiveDirectTurn {
+                    turn_id: phoenix_workflow::TurnAuthorityId(915),
+                    generation: 4,
+                };
+                storage.set_active_direct_turn(Some(turn.clone()));
+                runtime.active_direct_turn = Some(Box::new(turn));
+                runtime.direct_turn_cancellation_initiated = true;
+                if queued {
+                    let entry = mk_entry("terminal-followup-steer", "queued next turn");
+                    runtime.steering_queue = vec![entry.clone()];
+                    storage.set_steering_queue(id, vec![entry]);
+                }
+                let (watch_tx, watch_rx) = watch::channel(runtime.state.clone());
+                runtime = runtime.with_state_watcher(watch_tx);
+                let event = Event::SubAgentResult {
+                    agent_id: "child".into(),
+                    outcome: SubAgentOutcome::Failure {
+                        error: "cancelled".into(),
+                        error_kind: crate::db::ErrorKind::Cancelled,
+                    },
+                };
+                if retry_terminal {
+                    storage.set_settle_active_direct_turn_failures(1);
+                    runtime.process_event(event.clone()).await.unwrap();
+                    assert!(runtime.terminal_transition_retry.is_some());
+                    assert!(runtime.sub_agent_result_buffer.is_empty());
+                    assert!(!runtime.fatal_local_authority_fence.is_closed());
+                }
+                if read_failure {
+                    storage.set_fail_load_active_direct_turn(true);
+                } else {
+                    storage.set_steering_drain_failures(1);
+                }
+                if retry_terminal {
+                    runtime.retry_terminal_transition().await;
+                } else {
+                    runtime.process_event(event).await.unwrap_err();
+                }
+                assert_eq!(storage.sub_agent_acceptance_count(), 1);
+                assert!(runtime.active_direct_turn.is_none());
+                assert!(runtime.pending_direct_turn_terminal.is_none());
+                assert!(runtime.terminal_transition_retry.is_none());
+                assert!(runtime.sub_agent_result_buffer.is_empty());
+                assert!(runtime
+                    .fatal_local_authority_fence
+                    .fatal_authority_loss_is_latched());
+                assert_eq!(
+                    *runtime.fatal_local_authority_fence.tx.borrow(),
+                    Some(if retry_terminal {
+                        "direct_turn_terminal_followup_settlement"
+                    } else {
+                        "sub_agent_result_settlement"
+                    })
+                );
+                assert!(matches!(
+                    *watch_rx.borrow(),
+                    ConvState::CancellingSubAgents { .. }
+                ));
+                assert!(matches!(
+                    storage.get_current_state(id),
+                    Some(ConvState::Idle)
+                ));
+                storage.set_fail_load_active_direct_turn(false);
+                assert!(
+                    crate::runtime::traits::MessageStore::load_active_direct_turn(&storage, id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(storage.get_steering_queue(id).len(), usize::from(queued));
+                assert!(runtime.llm_client.recorded_requests().is_empty());
+            }
         }
     }
 
