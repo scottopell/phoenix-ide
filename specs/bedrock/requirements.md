@@ -422,7 +422,7 @@ WHEN server restarts after an accepted steering batch has committed its user or 
 THE SYSTEM SHALL preserve the awaiting-LLM state
 AND resume exactly one LLM request from the committed transcript
 AND SHALL settle a synchronous failure to start that request as a persisted typed error
-AND if that error cannot be persisted, SHALL retire the executor so reconnect reconstructs from unchanged database truth
+AND if the required durable settlement cannot be established, SHALL apply REQ-BED-033 rather than leave recovery dependent on reconnect
 AND SHALL derive this bounded ownership from the immutable accepted steering identity, the latest transcript user or skill message, and absence of that exact pending queue entry
 AND SHALL NOT introduce a second steering lifecycle or queue authority
 

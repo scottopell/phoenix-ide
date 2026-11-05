@@ -3624,7 +3624,7 @@ rule ServerRestartCommittedSteeringTurn {
     requires: not close_execution_admission_sealed(conversation.product_conversation)
     requires: conversation.core_status = llm_requesting
     requires: committed_steering_turn_awaiting_first_response(conversation)
-    ensures: LlmRequestDispatched(conversation) or conversation.core_status = error
+    ensures: LlmRequestDispatched(conversation) or conversation.core_status = error or ProcessLocalAuthorityClosed(conversation)
 
     @guidance
         -- The bounded owner is true only when the latest transcript row is a
@@ -3635,9 +3635,8 @@ rule ServerRestartCommittedSteeringTurn {
         -- A synchronous failure to start the resumed request is reduced through
         -- LlmErrors into the persisted non-retryable Error branch; it is not
         -- left as a busy LlmRequesting row without a provider task.
-        -- If persisting that Error fails, the executor exits and releases its
-        -- runtime handle so reconnect reconstructs from the unchanged database
-        -- owner. It never remains live and busy without a provider task.
+        -- If required durable settlement cannot be established, REQ-BED-033
+        -- closes process authority. Reconnect is not an authority classifier.
 }
 
 rule ServerRestartPendingContinuation {

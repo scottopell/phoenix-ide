@@ -251,8 +251,9 @@ rule DrainOnIdleEntry {
         -- Startup routes the durable queue through this same reducer arm. A
         -- matching pre-transaction message is a typed legacy partial and is
         -- consumed without duplication. A mismatched identity or stale batch
-        -- fails once, leaves the durable queue intact, and stops that runtime so
-        -- a later reconstruction retries from database truth.
+        -- cannot authorize provider dispatch. When the required durable fact
+        -- cannot be established, REQ-BED-033 closes process authority; an
+        -- ordinary storage error alone does not prove rollback or commit.
         -- Once the transaction has committed LlmRequesting and removed the
         -- exact queue row, the immutable acceptance identity plus the latest
         -- transcript user message form bounded restart ownership until the
@@ -260,8 +261,8 @@ rule DrainOnIdleEntry {
         -- one request without adding a steering lifecycle or queue authority.
         -- A synchronous failure to start that recovered request is reduced into
         -- the same persisted typed Error used by live drain dispatch failures.
-        -- If Error persistence fails, the executor retires so reconnect can
-        -- reconstruct from the unchanged database owner.
+        -- If required Error settlement cannot be established, REQ-BED-033
+        -- closes process authority before further semantic publication.
         --
         -- FIFO is preserved: entries are stored in a Vec with append-at-tail
         -- enqueue. std::mem::take preserves Vec order; iteration in the bedrock

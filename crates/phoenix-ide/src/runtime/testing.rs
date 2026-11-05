@@ -615,6 +615,14 @@ type StoredSvgArtifacts = HashMap<
     (crate::tools::present_svg::SvgArtifactReference, Vec<u8>),
 >;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ToolRoundPersistenceFault {
+    Write,
+    Replay,
+    Commit,
+    CommitAcknowledgement,
+}
+
 /// In-memory storage for testing
 #[allow(dead_code)]
 pub struct InMemoryStorage {
@@ -691,6 +699,8 @@ pub struct InMemoryStorage {
     state_update_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     state_update_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     fail_tool_round_persist: Mutex<bool>,
+    tool_round_persistence_fault: Mutex<Option<ToolRoundPersistenceFault>>,
+    fail_steering_load: AtomicBool,
     tool_round_persist_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     tool_round_persist_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     fail_sub_agent_acceptance_once: Mutex<bool>,
@@ -797,6 +807,8 @@ impl InMemoryStorage {
             state_update_started: Mutex::new(None),
             state_update_release: Mutex::new(None),
             fail_tool_round_persist: Mutex::new(false),
+            tool_round_persistence_fault: Mutex::new(None),
+            fail_steering_load: AtomicBool::new(false),
             tool_round_persist_started: Mutex::new(None),
             tool_round_persist_release: Mutex::new(None),
             fail_sub_agent_acceptance_once: Mutex::new(false),
@@ -863,6 +875,14 @@ impl InMemoryStorage {
 
     pub fn set_fail_tool_round_persist(&self, fail: bool) {
         *self.fail_tool_round_persist.lock().unwrap() = fail;
+    }
+
+    pub fn set_tool_round_persistence_fault(&self, fault: ToolRoundPersistenceFault) {
+        *self.tool_round_persistence_fault.lock().unwrap() = Some(fault);
+    }
+
+    pub fn set_fail_steering_load(&self, fail: bool) {
+        self.fail_steering_load.store(fail, Ordering::SeqCst);
     }
 
     pub fn fail_sub_agent_acceptance_once(&self) {
@@ -1280,6 +1300,44 @@ impl InMemoryStorage {
             .lock()
             .unwrap()
             .clone()
+    }
+}
+
+impl InMemoryStorage {
+    async fn persist_tool_round(
+        &self,
+        conv_id: &str,
+        assistant: &Message,
+        tool_results: &[FinalizedToolResult],
+    ) -> Result<(), String> {
+        if *self.fail_tool_round_persist.lock().unwrap() {
+            return Err("injected tool round persist failure".to_string());
+        }
+        if let Some(started) = self.tool_round_persist_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.tool_round_persist_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+        let mut messages = self.messages.lock().unwrap();
+        let fault = *self.tool_round_persistence_fault.lock().unwrap();
+        let mut bucket = messages.get(conv_id).cloned().unwrap_or_default();
+        bucket.push(assistant.clone());
+        if fault == Some(ToolRoundPersistenceFault::Write) {
+            return Err("injected tool round row write failure".to_string());
+        }
+        for result in tool_results {
+            bucket.push(result.row().clone());
+        }
+        if fault == Some(ToolRoundPersistenceFault::Commit) {
+            return Err("injected tool round commit failure".to_string());
+        }
+        messages.insert(conv_id.to_string(), bucket);
+        if fault == Some(ToolRoundPersistenceFault::CommitAcknowledgement) {
+            return Err("injected lost tool round commit acknowledgement".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -2018,31 +2076,6 @@ impl MessageStore for InMemoryStorage {
         Ok(())
     }
 
-    async fn persist_tool_round(
-        &self,
-        conv_id: &str,
-        assistant: &Message,
-        tool_results: &[FinalizedToolResult],
-    ) -> Result<(), String> {
-        if *self.fail_tool_round_persist.lock().unwrap() {
-            return Err("injected tool round persist failure".to_string());
-        }
-        if let Some(started) = self.tool_round_persist_started.lock().unwrap().take() {
-            let _ = started.send(());
-        }
-        let release = self.tool_round_persist_release.lock().unwrap().take();
-        if let Some(release) = release {
-            let _ = release.await;
-        }
-        let mut messages = self.messages.lock().unwrap();
-        let bucket = messages.entry(conv_id.to_string()).or_default();
-        bucket.push(assistant.clone());
-        for result in tool_results {
-            bucket.push(result.row().clone());
-        }
-        Ok(())
-    }
-
     async fn persist_tool_round_and_state(
         &self,
         conv_id: &str,
@@ -2051,9 +2084,20 @@ impl MessageStore for InMemoryStorage {
         state: &ConvState,
         state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), String> {
-        self.persist_tool_round(conv_id, assistant, tool_results)
-            .await?;
-        self.update_state(conv_id, state, state_updated_at).await
+        if *self.fail_state_update.lock().unwrap() {
+            return Err("injected state update failure".to_string());
+        }
+        let persisted = self
+            .persist_tool_round(conv_id, assistant, tool_results)
+            .await;
+        if persisted.is_err()
+            && *self.tool_round_persistence_fault.lock().unwrap()
+                != Some(ToolRoundPersistenceFault::CommitAcknowledgement)
+        {
+            return persisted;
+        }
+        self.update_state(conv_id, state, state_updated_at).await?;
+        persisted
     }
 
     async fn persist_tool_round_with_terminal_obligation(
@@ -2537,6 +2581,11 @@ impl StateStore for InMemoryStorage {
         state_updated_at: chrono::DateTime<chrono::Utc>,
         _update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> Result<(), String> {
+        if *self.tool_round_persistence_fault.lock().unwrap()
+            == Some(ToolRoundPersistenceFault::Replay)
+        {
+            return Err("injected tool round provider replay failure".to_string());
+        }
         self.persist_tool_round_and_state(
             conversation_id,
             assistant,
@@ -2622,6 +2671,9 @@ impl StateStore for InMemoryStorage {
         &self,
         conv_id: &str,
     ) -> Result<Vec<crate::state_machine::event::SteerEntry>, String> {
+        if self.fail_steering_load.load(Ordering::SeqCst) {
+            return Err("injected steering authority read failure".to_string());
+        }
         Ok(self
             .steering_queues
             .lock()
