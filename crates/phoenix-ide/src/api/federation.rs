@@ -1130,7 +1130,6 @@ pub async fn resolve_saved_peer_id(
     db: &crate::db::Database,
     selector: &str,
 ) -> Result<InstanceId, FederationClientError> {
-    let selector = selector.trim();
     if selector.is_empty() {
         return Err(FederationClientError::InvalidPeerSelector);
     }
@@ -2185,7 +2184,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn saved_peer_selection_accepts_uuid_or_unique_name_and_refuses_ambiguity() {
+    async fn saved_peer_selection_uses_exact_uuid_or_unique_name_and_refuses_ambiguity() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         let token = |byte: &str| {
             phoenix_core::domain::instance_identity::PeerBearerCredential::parse(format!(
@@ -2268,6 +2267,16 @@ mod tests {
         ));
         assert!(matches!(
             resolve_saved_peer_id(&state.db, "missing").await,
+            Err(FederationClientError::PeerNotFound)
+        ));
+        for selector in [" unique", "unique ", " unique "] {
+            assert!(matches!(
+                resolve_saved_peer_id(&state.db, selector).await,
+                Err(FederationClientError::PeerNotFound)
+            ));
+        }
+        assert!(matches!(
+            resolve_saved_peer_id(&state.db, &format!(" {first} ")).await,
             Err(FederationClientError::PeerNotFound)
         ));
     }

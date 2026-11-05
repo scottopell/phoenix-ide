@@ -24,7 +24,7 @@ Related contracts remain authoritative for their domains:
 
 When `send_conversation_message`, federated `read_conversation`, `resolve_reference`, `read_goal`, or Coordinator `query_database` receives the exact, case-sensitive `instance` string `"local"` or omits the selector, the system shall execute the local operation through its existing local service with the same authority checks, validation, result shape, provenance, pagination, waits, message retry identity, SQL policy, budgets, and error semantics applicable to that tool.
 
-When one of these tools receives another string selector, the system shall select the remote destination through saved-peer UUID or unambiguous display-name resolution. Recognizing the local selector shall not trim whitespace or fold case. The literal `"local"` shall be reserved for the instance executing the tool.
+When one of these tools receives another string selector, the system shall select the remote destination through saved-peer UUID or unambiguous display-name resolution. Local recognition and remote peer matching shall use the selector exactly as supplied, without trimming whitespace or folding case. The literal `"local"` shall be reserved for the instance executing the tool.
 
 An explicit `null` selector shall select local routing on the read tools, including Coordinator `query_database`; `send_conversation_message` shall reject an explicit `null`. Tools without an optional `instance` parameter shall retain their own input and authority contracts. In particular, non-Coordinator `query_database` registrations shall remain local-only and shall reject an `instance` field.
 
