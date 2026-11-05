@@ -1134,7 +1134,7 @@ pub async fn resolve_saved_peer_id(
         return Err(FederationClientError::InvalidPeerSelector);
     }
     if let Ok(id) = InstanceId::from_str(selector) {
-        if db.federation_peer_connection(id).await?.is_some() {
+        if selector == id.to_string() && db.federation_peer_connection(id).await?.is_some() {
             return Ok(id);
         }
     }
@@ -2193,10 +2193,11 @@ mod tests {
             ))
             .unwrap()
         };
-        let first = InstanceId::new();
+        let first = InstanceId::from_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
         let second = InstanceId::new();
         let shadow = InstanceId::new();
         let first_id = first.to_string();
+        let uppercase_first_id = first_id.to_uppercase();
         for (id, name, url) in [
             (first, "unique", "https://first.example"),
             (second, "duplicate", "https://second.example"),
@@ -2220,6 +2221,18 @@ mod tests {
                 .await
                 .unwrap();
         }
+        let uppercase_uuid_alias = InstanceId::new();
+        state
+            .db
+            .save_federation_peer_connection(
+                uppercase_uuid_alias,
+                &uppercase_first_id.parse().unwrap(),
+                &"https://uppercase-uuid-name.example".parse().unwrap(),
+                &token("f"),
+                &PeerTlsTrust::PlatformRoots,
+            )
+            .await
+            .unwrap();
         let uuid_shaped_name = InstanceId::new().to_string();
         let uuid_named_peer = InstanceId::new();
         state
@@ -2269,16 +2282,27 @@ mod tests {
             resolve_saved_peer_id(&state.db, "missing").await,
             Err(FederationClientError::PeerNotFound)
         ));
-        for selector in [" unique", "unique ", " unique "] {
+        for selector in [" unique", "unique ", " unique ", "Unique", "UNIQUE"] {
             assert!(matches!(
                 resolve_saved_peer_id(&state.db, selector).await,
                 Err(FederationClientError::PeerNotFound)
             ));
         }
-        assert!(matches!(
-            resolve_saved_peer_id(&state.db, &format!(" {first} ")).await,
-            Err(FederationClientError::PeerNotFound)
-        ));
+        for selector in [
+            format!(" {first} "),
+            first.to_string().replace('-', ""),
+        ] {
+            assert!(matches!(
+                resolve_saved_peer_id(&state.db, &selector).await,
+                Err(FederationClientError::PeerNotFound)
+            ));
+        }
+        assert_eq!(
+            resolve_saved_peer_id(&state.db, &uppercase_first_id)
+                .await
+                .unwrap(),
+            uppercase_uuid_alias
+        );
     }
 
     #[tokio::test]
