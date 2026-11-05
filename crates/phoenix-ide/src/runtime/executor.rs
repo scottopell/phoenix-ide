@@ -10339,8 +10339,12 @@ where
                     result?
                 }
                 phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                    let boundary = self
+                        .required_settlement_authority
+                        .as_ref()
+                        .map_or(RequiredSettlementBoundary::Child, |scope| scope.boundary);
                     self.fatal_local_authority_fence
-                        .close("sub_agent_result_settlement");
+                        .close(boundary.settlement());
                     return Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: standalone sub-agent summary could not be classified".into());
                 }
             }
@@ -24270,35 +24274,46 @@ mod steer_drain_detector_tests {
 
     #[tokio::test]
     async fn unclassified_standalone_summary_closes_authority_before_raw_child_replay() {
-        let initial = ConvState::AwaitingSubAgents {
-            pending: vec![PendingSubAgent {
-                agent_id: "child".into(),
-                task: "work".into(),
-                mode: SubAgentMode::Explore,
-            }],
-            completed_results: vec![],
-            spawn_tool_id: None,
-        };
-        let (mut runtime, storage) =
-            build_runtime_with_state_and_queue("summary-unknown", initial.clone(), vec![]);
-        storage.set_unclassified_sub_agent_summary(true);
-        let result = runtime
-            .process_event(Event::SubAgentResult {
-                agent_id: "child".into(),
-                outcome: SubAgentOutcome::Success {
-                    result: "authentic".into(),
-                },
-            })
-            .await;
-        assert!(result.is_err());
-        assert!(runtime.fatal_local_authority_fence.is_closed());
-        assert!(storage.get_all_messages("summary-unknown").is_empty());
-        assert_eq!(storage.sub_agent_acceptance_count(), 0);
-        assert!(runtime.llm_client.recorded_requests().is_empty());
-        assert!(runtime
-            .process_event(Event::RetryBufferedSubAgentResults)
-            .await
-            .is_err());
+        for backstop in [false, true] {
+            let mut initial = cancelling_state(
+                &["child"],
+                crate::state_machine::event::CancelCause::UserRequested,
+            );
+            if let ConvState::CancellingSubAgents { spawn_tool_id, .. } = &mut initial {
+                *spawn_tool_id = None;
+            }
+            let (mut runtime, storage) =
+                build_runtime_with_state_and_queue("summary-unknown", initial, vec![]);
+            storage.set_unclassified_sub_agent_summary(true);
+            if backstop {
+                runtime.handle_cancelling_sub_agents_timeout().await;
+            } else {
+                let result = runtime
+                    .process_event(Event::SubAgentResult {
+                        agent_id: "child".into(),
+                        outcome: SubAgentOutcome::Success {
+                            result: "authentic".into(),
+                        },
+                    })
+                    .await;
+                assert!(result.is_err());
+            }
+            assert_eq!(
+                *runtime.fatal_local_authority_fence.tx.borrow(),
+                Some(if backstop {
+                    "cancellation_backstop_settlement"
+                } else {
+                    "sub_agent_result_settlement"
+                })
+            );
+            assert!(storage.get_all_messages("summary-unknown").is_empty());
+            assert_eq!(storage.sub_agent_acceptance_count(), 0);
+            assert!(runtime.llm_client.recorded_requests().is_empty());
+            assert!(runtime
+                .process_event(Event::RetryBufferedSubAgentResults)
+                .await
+                .is_err());
+        }
     }
 
     #[tokio::test]

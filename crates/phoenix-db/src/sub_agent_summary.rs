@@ -1,5 +1,9 @@
-use super::*;
+use super::{
+    insert_message_tx, schema, ConvState, Database, DbError, DbResult, Message, MessageContent,
+    MessageType, TerminalEvidenceTransactionCut,
+};
 use crate::workflow::LocalAuthorityResult;
+use chrono::{DateTime, Utc};
 
 impl Database {
     #[cfg(any(test, feature = "test-support"))]
@@ -173,6 +177,10 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        SubAgentBatchAdmission, SubAgentExecutionAuthority, SubAgentRunAdmission,
+        SubAgentTerminalCause,
+    };
 
     #[tokio::test]
     async fn standalone_summary_classifies_lost_ack_rollback_and_unavailable_evidence() {
@@ -233,6 +241,8 @@ mod tests {
             match cut {
                 TerminalEvidenceTransactionCut::AfterCommit => {
                     result.established().unwrap().unwrap();
+                    assert!(db.sub_agent_terminal_is_accepted("child").await.unwrap());
+                    assert_eq!(db.get_conversation("parent").await.unwrap().state, state);
                     db.persist_sub_agent_summary_and_accept(&message, &state, at, "child", at)
                         .await
                         .established()
@@ -261,6 +271,11 @@ mod tests {
                 TerminalEvidenceTransactionCut::BeforeCommit => {
                     assert!(result.established().unwrap().is_err());
                     assert!(db.get_messages("parent").await.unwrap().is_empty());
+                    assert!(!db.sub_agent_terminal_is_accepted("child").await.unwrap());
+                    assert_eq!(
+                        db.get_conversation("parent").await.unwrap().state,
+                        ConvState::Idle
+                    );
                     db.persist_sub_agent_summary_and_accept(&message, &state, at, "child", at)
                         .await
                         .established()
