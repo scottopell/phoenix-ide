@@ -6131,6 +6131,7 @@ where
     /// }`), so this handler does not hardcode the label. Releasing the one-writer
     /// reservation as each result drains is safe because the agent is presumed
     /// dead. The last pending result resolves `CancellingSubAgents -> Idle`.
+    #[allow(clippy::too_many_lines)]
     async fn handle_cancelling_sub_agents_timeout(&mut self) {
         let (pending_ids, cause): (Vec<String>, crate::state_machine::event::CancelCause) =
             if let ConvState::CancellingSubAgents { pending, cause, .. } = &self.state {
@@ -10200,6 +10201,7 @@ where
     /// originating `spawn_agents` tool message's content and `display_data`.
     /// Without one, persist a standalone meta-user summary — never a fabricated
     /// `tool_result`, which would be an orphan with no matching `tool_use`.
+    #[allow(clippy::too_many_lines)]
     async fn persist_sub_agent_results(
         &mut self,
         results: Vec<SubAgentResult>,
@@ -10336,7 +10338,7 @@ where
                 .await
             {
                 phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
-                    result?
+                    result?;
                 }
                 phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
                     let boundary = self
