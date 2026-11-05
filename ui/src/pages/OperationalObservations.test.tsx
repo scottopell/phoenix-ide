@@ -48,6 +48,20 @@ describe('operational observations', () => {
     expect(observe).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    { direction: 'behind', browserNow: '2026-11-01T10:00:00Z' },
+    { direction: 'ahead', browserNow: '2026-12-01T10:00:00Z' },
+  ])('uses server observation time when the browser clock is $direction', async ({ browserNow }) => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.parse(browserNow));
+    try {
+      observe.mockResolvedValue(sample({ observed_at: '2026-11-05T10:02:00Z' }));
+      render(<OperationalObservations />);
+      expect(await screen.findByText(/Sample age at refresh: 2m old/)).toBeInTheDocument();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
   it('shows low-space warning, sampled ancestor, and per-location measurement failure', async () => {
     const data = sample();
     data.filesystems[0]!.available_bytes = 0;

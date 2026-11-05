@@ -16,8 +16,8 @@ const LABELS: Record<FailureBoundary, string> = {
   trace_export: 'Trace export',
 };
 
-function age(sampledAt: string): string {
-  const seconds = Math.max(0, Math.floor((Date.now() - Date.parse(sampledAt)) / 1000));
+function age(sampledAt: string, observedAt: string): string {
+  const seconds = Math.max(0, Math.floor((Date.parse(observedAt) - Date.parse(sampledAt)) / 1000));
   return seconds < 60 ? `${seconds}s old` : `${Math.floor(seconds / 60)}m old`;
 }
 
@@ -76,7 +76,7 @@ export function OperationalObservations() {
           {sample.filesystems.map((filesystem) => (
             <div className="deploy-space-observation" key={filesystem.locations.map((location) => location.path).join('|')}>
               <strong>{availableBytes(filesystem.available_bytes)}</strong>
-              <span className="settings-section__hint">Sample age at refresh: {age(filesystem.sampled_at)} · {new Date(filesystem.sampled_at).toLocaleString()}</span>
+              <span className="settings-section__hint">Sample age at refresh: {age(filesystem.sampled_at, sample.observed_at)} · {new Date(filesystem.sampled_at).toLocaleString()}</span>
               {filesystem.low_space && <p className="settings-section__hint settings-section__hint--warning">Low space observed on this server filesystem.</p>}
               <ul className="deploy-space-locations">
                 {filesystem.locations.map((location) => <li key={`${location.label}:${location.path}`}>
