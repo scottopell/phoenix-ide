@@ -6612,7 +6612,7 @@ def cmd_check(
         return rc
 
     def lane_rust():
-        """Rust lane: codegen export → staleness diff → test compile → test run.
+        """Rust lane: native launcher → codegen → staleness → compile → test run.
 
         This lane does not generate a Linux-musl cross-target artifact tree.
 
@@ -6646,20 +6646,54 @@ def cmd_check(
         if rust_split is not None:
             lane_rust_split()
             return
+        launcher_env = build_native_bash_launcher()
+        if launcher_env is None:
+            return
         rc = run_step("codegen", codegen_cmd,
-                      env_extra={"TS_RS_EXPORT_DIR": str(codegen_export_base)})
+                      env_extra={**launcher_env, "TS_RS_EXPORT_DIR": str(codegen_export_base)})
         if rc == 0:
             codegen_stale_step()
-        run_step("cargo test compile", compile_cmd)
-        run_step("cargo test", test_cmd, timeout=CARGO_TEST_TIMEOUT)
+        run_step("cargo test compile", compile_cmd, env_extra=launcher_env)
+        run_step("cargo test", test_cmd, env_extra=launcher_env, timeout=CARGO_TEST_TIMEOUT)
+
+    def build_native_bash_launcher():
+        if run_step("native bash launcher", [
+            "cargo", "build", "-p", "phoenix_ide", "--bin", "phoenix_ide",
+        ]) != 0:
+            return None
+        return {
+            "PHOENIX_BASH_LAUNCH_TEST_EXE": str(
+                (_cargo_target_dir(ROOT, os.environ) / "debug" / "phoenix_ide").resolve()
+            ),
+            "PHOENIX_BASH_LAUNCH_TEST_REQUIRED": "1",
+        }
 
     def lane_rust_split():
         phase = rust_split.phase
         if phase is RustPhase.BUILD:
+            if build_native_bash_launcher() is None:
+                return
             # Archiving compresses every test binary after the compile.
             run_step("cargo test compile", split_cmds["cargo test compile"],
                      timeout=CHECK_TIMEOUT + 300)
             return
+        if phase is RustPhase.TEST:
+            step = "native bash launcher validation"
+            reporter.step_start("rust", step)
+            started = time.monotonic()
+            launcher = os.environ.get("PHOENIX_BASH_LAUNCH_TEST_EXE", "")
+            path = Path(launcher)
+            valid = bool(launcher) and path.is_absolute() and path.is_file() and os.access(path, os.X_OK)
+            detail = ("" if valid else
+                      "PHOENIX_BASH_LAUNCH_TEST_EXE must name an existing absolute executable file "
+                      f"for split TEST (got {launcher!r}); download and chmod +x the native launcher fixture.")
+            elapsed = time.monotonic() - started
+            rc = 0 if valid else 1
+            with results_lock:
+                results.append((step, rc, elapsed, detail))
+            reporter.step_done("rust", step, rc, elapsed)
+            if not valid:
+                return
         if run_step("extract test archive", split_cmds["extract test archive"]) != 0:
             return
         if phase is RustPhase.CODEGEN:
@@ -6668,7 +6702,9 @@ def cmd_check(
             if rc == 0:
                 codegen_stale_step()
         else:
-            run_step("cargo test", split_cmds["cargo test"], timeout=CARGO_TEST_TIMEOUT)
+            run_step("cargo test", split_cmds["cargo test"],
+                     env_extra={"PHOENIX_BASH_LAUNCH_TEST_REQUIRED": "1"},
+                     timeout=CARGO_TEST_TIMEOUT)
 
     def lane_clippy():
         """Clippy in a bounded, non-incremental target directory.
@@ -7453,9 +7489,8 @@ def cmd_check(
     # Python therefore cannot leave every later lane parked on a lock or multiply
     # the join timeout. daemon=True lets the interpreter exit after recording the
     # one stuck lane; subprocess steps have their own CHECK_TIMEOUT kill budget.
-    # The rust lane runs compile and codegen (CHECK_TIMEOUT each) before the
-    # cargo-test step, so a raised cargo-test budget must raise the join too.
-    LANE_JOIN_TIMEOUT = max(CHECK_TIMEOUT * 6, CHECK_TIMEOUT * 2 + CARGO_TEST_TIMEOUT) + 30
+    # Launcher build, codegen, and test compilation each have CHECK_TIMEOUT.
+    LANE_JOIN_TIMEOUT = max(CHECK_TIMEOUT * 6, CHECK_TIMEOUT * 3 + CARGO_TEST_TIMEOUT) + 30
     with _check_interrupt_handlers(interrupted):
         stuck = _run_check_threads_sequentially(
             threads, LANE_JOIN_TIMEOUT, interrupted=interrupted
@@ -8260,7 +8295,7 @@ def _build_pipeline_model(with_timings: bool = False):
 # Per-lane step lists mirror the lane_* / check_* functions in cmd_check; shown
 # in node tooltips. Kept beside _LANE_DEFS conceptually — update both together.
 _GRAPH_LANE_STEPS = {
-    "rust": ["codegen export", "codegen-stale diff", "cargo test (compile)",
+    "rust": ["native bash launcher", "codegen export", "codegen-stale diff", "cargo test (compile)",
              "cargo test (run)"],
     "clippy": ["cargo clippy --all-targets -D warnings"],
     "tsc": ["tsc -b --noEmit"],
