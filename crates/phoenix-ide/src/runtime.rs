@@ -473,7 +473,6 @@ pub(crate) fn is_invalid_runtime_cwd_error(error: &str) -> bool {
 /// Manager for all conversation runtimes
 struct FatalLocalAuthorityFenceState {
     closed: bool,
-    boundary: Option<&'static str>,
     fatal_deadline: Option<tokio::time::Instant>,
     owners: usize,
 }
@@ -499,7 +498,6 @@ impl FatalLocalAuthorityFence {
         Arc::new(Self {
             state: Mutex::new(FatalLocalAuthorityFenceState {
                 closed: false,
-                boundary: None,
                 fatal_deadline: None,
                 owners: 0,
             }),
@@ -535,7 +533,6 @@ impl FatalLocalAuthorityFence {
     fn close_inner(&self, boundary: &'static str, signal_fatal_authority_loss: bool) {
         let mut state = self.state.lock().expect("fatal authority fence poisoned");
         state.closed = true;
-        let boundary = *state.boundary.get_or_insert(boundary);
         state
             .fatal_deadline
             .get_or_insert_with(|| tokio::time::Instant::now() + crate::tls::SHUTDOWN_GRACE);
@@ -546,8 +543,15 @@ impl FatalLocalAuthorityFence {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
-        let first_fatal_notification =
-            signal_fatal_authority_loss && self.tx.send_replace(Some(boundary)).is_none();
+        let first_fatal_notification = signal_fatal_authority_loss
+            && self.tx.send_if_modified(|first_fatal_boundary| {
+                if first_fatal_boundary.is_some() {
+                    false
+                } else {
+                    *first_fatal_boundary = Some(boundary);
+                    true
+                }
+            });
         self.external_effect_cancellation.cancel();
         drop(state);
         if first_fatal_notification {
@@ -12638,20 +12642,52 @@ mod scope_liveness_tests {
         assert_eq!(fence.owner_count(), 0);
     }
 
-    #[test]
-    fn fatal_observation_records_once_even_with_repeated_close_and_shutdown_promotion() {
+    #[tokio::test(start_paused = true)]
+    async fn fatal_observation_records_once_even_with_repeated_close_and_shutdown_promotion() {
+        use crate::operational_observations::{counter, FailureBoundary};
+
         let fence = FatalLocalAuthorityFence::new();
         fence.close("ordinary_tool_outcome_settlement");
         fence.close("startup_settlement_owner_disappeared");
         assert_eq!(fence.diagnostic_recordings.load(Ordering::Relaxed), 1);
         assert_eq!(*fence.tx.borrow(), Some("ordinary_tool_outcome_settlement"));
 
-        let fence = FatalLocalAuthorityFence::new();
-        fence.close_for_process_shutdown();
-        assert_eq!(fence.diagnostic_recordings.load(Ordering::Relaxed), 0);
-        fence.close("startup_steering_authority");
-        fence.close("startup_settlement_owner_disappeared");
-        assert_eq!(fence.diagnostic_recordings.load(Ordering::Relaxed), 1);
+        for (boundary, category) in [
+            (
+                "startup_steering_authority",
+                FailureBoundary::StartupRequiredAuthority,
+            ),
+            (
+                "ordinary_tool_outcome_settlement",
+                FailureBoundary::OrdinaryToolSettlement,
+            ),
+            (
+                "startup_settlement_owner_disappeared",
+                FailureBoundary::SettlementOwnerDisappeared,
+            ),
+        ] {
+            let before = counter(category).count();
+            let fence = FatalLocalAuthorityFence::new();
+            let owner = fence.try_acquire().unwrap();
+            fence.close_for_process_shutdown();
+            let deadline = fence.fatal_deadline();
+            assert_eq!(*fence.tx.borrow(), None);
+            assert_eq!(fence.diagnostic_recordings.load(Ordering::Relaxed), 0);
+            assert_eq!(fence.owners_at_first_close(), Some(1));
+            assert!(fence.try_acquire().is_err());
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            fence.close(boundary);
+            assert_eq!(*fence.tx.borrow(), Some(boundary));
+            assert!(counter(category).count() > before);
+            fence.close("a_later_unclassified_boundary");
+            fence.close_for_process_shutdown();
+            assert_eq!(*fence.tx.borrow(), Some(boundary));
+            assert_eq!(fence.diagnostic_recordings.load(Ordering::Relaxed), 1);
+            assert_eq!(fence.fatal_deadline(), deadline);
+            assert_eq!(fence.owners_at_first_close(), Some(1));
+            drop(owner);
+            assert_eq!(fence.owner_count(), 0);
+        }
     }
 
     #[tokio::test]

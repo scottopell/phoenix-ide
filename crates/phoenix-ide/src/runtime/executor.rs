@@ -23227,26 +23227,35 @@ mod steer_drain_detector_tests {
 
     #[tokio::test]
     async fn cancellation_backstop_owner_cancellation_closes_authority() {
-        let (mut runtime, storage) = build_runtime_with_state_and_queue(
-            "backstop-owner-cancel",
-            ordinary_completion_state(),
-            vec![],
-        );
-        runtime
-            .process_event(Event::UserCancel {
-                reason: None,
-                cause: crate::state_machine::event::CancelCause::UserRequested,
-            })
-            .await
-            .unwrap();
-        let fence = runtime.fatal_local_authority_fence.clone();
-        let (started, _release) = storage.gate_tool_round_persist();
-        let task = tokio::spawn(async move { runtime.handle_cancelling_tool_timeout().await });
-        started.await.unwrap();
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        assert!(fence.is_closed());
-        assert_eq!(fence.owner_count(), 0);
+        for during_shutdown in [false, true] {
+            let (mut runtime, storage) = build_runtime_with_state_and_queue(
+                "backstop-owner-cancel",
+                ordinary_completion_state(),
+                vec![],
+            );
+            runtime
+                .process_event(Event::UserCancel {
+                    reason: None,
+                    cause: crate::state_machine::event::CancelCause::UserRequested,
+                })
+                .await
+                .unwrap();
+            let fence = runtime.fatal_local_authority_fence.clone();
+            let (started, _release) = storage.gate_tool_round_persist();
+            let task = tokio::spawn(async move { runtime.handle_cancelling_tool_timeout().await });
+            started.await.unwrap();
+            if during_shutdown {
+                fence.close_for_process_shutdown();
+            }
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert!(fence.is_closed());
+            assert_eq!(
+                *fence.tx.borrow(),
+                Some("ordinary_tool_outcome_owner_disappeared")
+            );
+            assert_eq!(fence.owner_count(), 0);
+        }
     }
 
     #[tokio::test]
@@ -23318,6 +23327,10 @@ mod steer_drain_detector_tests {
                 }
             );
             assert_eq!(fence.fatal_authority_loss_is_latched(), fail_write);
+            assert_eq!(
+                *fence.tx.borrow(),
+                fail_write.then_some("startup_llm_settlement_authority")
+            );
             if !fail_write {
                 assert!(matches!(
                     storage.get_current_state("startup-shutdown-write"),
@@ -23421,6 +23434,10 @@ mod steer_drain_detector_tests {
                 }
             );
             assert_eq!(fence.fatal_authority_loss_is_latched(), fail_write);
+            assert_eq!(
+                *fence.tx.borrow(),
+                fail_write.then_some("ordinary_tool_outcome_settlement")
+            );
             assert!(llm.recorded_requests().is_empty());
             if !fail_write {
                 assert!(matches!(
