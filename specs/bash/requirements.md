@@ -128,6 +128,42 @@ THE SYSTEM SHALL preserve output and the no-handle, descendant-uncertainty and i
 
 ---
 
+### REQ-BASH-018: Filesystem-Free Coordinator Child Controller Retirement
+
+WHEN a filesystem-free inline child of the Global Coordinator terminates by result, error, cancellation, or timeout
+THE SYSTEM SHALL atomically close that child's ephemeral Bash-controller admission gate before selecting its handles for cleanup
+AND SHALL reject later Bash runs from that controller before process creation, including runs targeting another WorkScope or using an in-process recreated child runtime
+AND SHALL retain the closed controller gate for the remaining Phoenix process lifetime.
+
+THE SYSTEM SHALL admit each such Bash launch under both the selected WorkScope's existing admission gate and the child's controller gate
+AND SHALL retain controller launch custody until registration and gated command-payload release finish, or bounded unregistered settlement finishes under REQ-BASH-017
+AND SHALL wait for that admitted custody before selecting the controller's registered handles for cleanup.
+
+WHEN retiring the controller
+THE SYSTEM SHALL start or join one cancellation-resistant, idempotent cleanup operation for that exact child identity
+AND SHALL attempt SIGKILL only through retained incarnation-bound authority for that controller's registered live handles, across their selected WorkScopes
+AND SHALL use the existing Bash launch-settlement bounds and one `SHUTDOWN_KILL_GRACE_SECONDS` budget for registered-handle snapshot, signal attempts, and available exit observation, without resetting the budget for joiners or individual handles
+AND SHALL preserve cleanup custody if a requesting future or child runtime is cancelled
+AND SHALL provide a parent-cancellation backstop that starts or joins the same operation.
+
+BEFORE delivering or parent-accepting that child's terminal outcome, including durable-result reconciliation
+THE SYSTEM SHALL join the controller cleanup operation through its bounded observation
+AND SHALL permit parent fan-in to proceed after an incomplete cleanup observation without reporting resource absence or successful cleanup
+AND SHALL log signaling errors, unsupported signaling, launch uncertainty, and deadline-incomplete work.
+
+THE SYSTEM SHALL retain each registered handle under its selected WorkScope through normal waiter-driven terminalization and tombstone retention, including when signaling fails
+AND SHALL preserve owning WorkScope inventory, inspection, lifecycle broadcasts, health attribution, live-handle cap, and existing owner-admission rules
+AND SHALL NOT remove an owning WorkScope's handle table, close its admission gate, transfer handle control to the Coordinator, or affect handles controlled by another child or the Coordinator through this controller retirement
+AND SHALL preserve ordinary filesystem-backed Work-child Bash lifecycle behavior.
+
+THE SYSTEM SHALL NOT infer complete descendant absence or process-group reaping from successful signaling or leader exit
+AND SHALL NOT infer signal authority from a raw PID, process-group ID, cwd, or historical handle identifier
+AND SHALL NOT persist controller gates or cleanup authority across Phoenix restart.
+
+**Rationale:** Explicit WorkScope targeting separates resource ownership from an inline child's controller identity. Closing and draining the controller before cleanup prevents a late admitted launch from escaping its child's terminal boundary while retaining observable evidence when bounded cleanup cannot verify exit.
+
+---
+
 ### REQ-BASH-002: Wait Semantics
 
 WHEN agent calls `bash(op="run", cmd=<command>, wait_seconds=N)`
@@ -842,15 +878,16 @@ ring buffer output as the command saw it
 AND the tool description SHALL include a clear explanation of sandbox
 constraints
 
-WHEN the singleton Global Coordinator exposes `bash`
+WHEN the singleton Global Coordinator or its inline child exposes `bash`
 THE SYSTEM SHALL reuse the existing write-capable Bash execution path without applying the Explore `nono` sandbox
 AND SHALL require each `op="run"` call to provide an active persisted `WorkScope` ID
 AND SHALL resolve and canonicalize that `WorkScope`'s execution directory server-side
 AND SHALL reject the call without spawning a process when the `WorkScope` ID is missing, blank, stale, invalid, or resolves to no live owner
 AND SHALL NOT assign the Coordinator a default cwd
+AND SHALL NOT assign its inline children a default cwd or infer a Bash sandbox from their Explore spawn mode
 AND SHALL store the process solely under the selected `WorkScope`
-AND SHALL retain Coordinator continuation control as handle authorization metadata
-AND SHALL keep background-command handles available to Coordinator continuations for manual `peek`, `wait`, and `kill`
+AND SHALL retain caller control as handle authorization metadata, using Coordinator continuation control for Coordinator calls and the child's own resource identity for inline child calls
+AND SHALL keep background-command handles available to the authorized caller for manual `peek`, `wait`, and `kill`
 AND SHALL keep Coordinator-controlled terminal events from triggering branch-observation reconciliation
 AND SHALL include the process in the owning WorkScope's inventory, lifecycle broadcasts, inspection, health attribution, and teardown
 AND SHALL preserve the same command, wait, label, output, process-count, handle-control, cancellation, teardown, and audit bounds as other Bash execution
@@ -882,7 +919,7 @@ WHEN `nono::Sandbox::support_info()` reports that no enforceable sandbox backend
 with network-block and unrelated-process isolation support is available
 THE SYSTEM SHALL detect this at startup
 AND SHALL NOT expose `bash` in top-level Explore mode
-AND SHALL continue to expose the singleton Global Coordinator's unsandboxed, explicitly WorkScope-targeted Bash path
+AND SHALL continue to expose the singleton Global Coordinator's and its inline children's unsandboxed, explicitly WorkScope-targeted Bash path
 AND SHALL continue to expose the remaining read-only/planning tools for those modes
 
 WHEN degraded mode is active

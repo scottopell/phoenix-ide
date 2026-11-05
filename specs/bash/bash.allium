@@ -26,7 +26,7 @@
 --     within a ResourceScope but do NOT survive a Phoenix restart (see
 --     specs/tmux-integration/ for the persistent path)
 --
--- Requirement traceability: REQ-BASH-001 through REQ-BASH-017,
+-- Requirement traceability: REQ-BASH-001 through REQ-BASH-018,
 --   REQ-BASH-WS-001, REQ-BASH-WS-002. REQ-BASH-011 (command safety) is
 --   enforced by the permission seam (specs/permissions/) and is not modelled
 --   as a bash run-path rule here. REQ-BASH-010a..010c (terminal-edge
@@ -65,12 +65,17 @@ external entity ChildProcess {
     pgid: Integer
 }
 
+-- Established bounded cleanup observation, including incomplete/uncertain
+-- outcomes. This is not proof of descendant absence or restart authority.
+external entity InlineChildBashCleanupObservation {}
+
 ------------------------------------------------------------
 -- Value Types
 ------------------------------------------------------------
 
 -- The owner key for bash handles. Work carries a durable WorkScope id;
 -- Coordinator is the singleton scope shared by Coordinator continuations;
+-- Unattached carries the inline child's own controller identity;
 -- GlobalTerminal is reserved for host terminal resources. The namespaces are
 -- disjoint, so ordinary conversations cannot address Coordinator handles.
 value ResourceScope {
@@ -79,7 +84,7 @@ value ResourceScope {
 }
 
 -- Validated execution target selected before Bash process creation. Coordinator
--- targets are resolved from a persisted WorkScope with a live owner; callers
+-- and its inline-child targets are resolved from a persisted WorkScope with a live owner; callers
 -- cannot supply a working directory directly.
 value BashSpawnTarget {
     owner_scope: ResourceScope
@@ -142,12 +147,72 @@ value ExitInformation {
 }
 
 ------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract InlineChildBashLifecycle {
+    CloseInlineChildBashController: (child: bedrock/Conversation) -> InlineChildBashCleanupObservation
+
+    @invariant FilesystemFreeCoordinatorChildrenOnly
+        -- REQ-BASH-018 / REQ-GR-007. This lifecycle applies only to inline
+        -- Coordinator children with no filesystem environment or WorkScope
+        -- attachment. The child's own Unattached identity remains its controller;
+        -- explicit target WorkScopes remain the sole owners of its handles.
+        -- Ordinary filesystem-backed Work children keep their existing lifecycle.
+
+    @invariant ClosedControllerCannotAdmitAnotherLaunch
+        -- Close atomically fences new runs before selecting handles for cleanup.
+        -- Every launch requires both owner-WorkScope and controller admission.
+        -- Keep the closed controller gate for this Phoenix process lifetime,
+        -- across target changes and in-process child-runtime recreation.
+
+    @invariant AdmittedLaunchCustodyPrecedesHandleSelection
+        -- Controller admission remains pending through registration AND gated
+        -- payload release, or bounded unregistered settlement under REQ-BASH-017.
+        -- Registration alone cannot release custody. Close waits for this
+        -- custody before snapshotting that controller's registered live handles.
+
+    @invariant OneCancellationResistantCleanupPerController
+        -- Terminal result/error, child cancellation/timeout, and the parent's
+        -- cancellation backstop atomically start or join one operation for the
+        -- exact child identity. Repeated joins neither replay cleanup nor reopen
+        -- admission. Cancelling a requester cannot cancel the owned operation.
+        -- Use existing launch-settlement bounds, then one shared registered-
+        -- handle shutdown deadline; joins and handles do not restart its budget.
+
+    @invariant BoundedIncarnationBoundCleanupPreservesEvidence
+        -- After launch custody settles, snapshot only this controller's live
+        -- handles across owner WorkScopes and attempt SIGKILL with retained
+        -- incarnation-bound authority. Release registry locks before signaling
+        -- and exit observation. Bound snapshot, attempts, and available exit
+        -- observation together by config.shutdown_kill_grace_seconds.
+        -- Unsupported signaling, signal failures, launch uncertainty, or deadline
+        -- exhaustion produce logged incomplete observations, never raw PID/PGID
+        -- fallback or a claim of complete descendant absence. Successful signals
+        -- and leader exit likewise do not prove complete process-group reaping.
+        -- Retain cleanup/waiter custody and registered handles in their owning
+        -- WorkScope through normal waiter terminalization and tombstone retention,
+        -- especially on signaling failure. Do not remove owner tables or close
+        -- owner gates, change owner caps/inventory, affect another controller's
+        -- handles, or grant the Coordinator control of child handles.
+
+    @invariant ParentDeliveryAndAcceptanceJoinCleanup
+        -- Both live terminal transport and durable-result reconciliation join
+        -- this operation before delivering or parent-accepting the child outcome.
+        -- An incomplete bounded observation permits fan-in without claiming
+        -- successful cleanup; it does not discard handles or outstanding custody.
+        -- Terminal evidence may already be persisted while this join is pending.
+        -- Gates and cleanup authority are process-local with no restart recovery.
+}
+
+------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
 
 enum ResourceScopeKind {
     work
     | coordinator
+    | unattached
     | global_terminal
 }
 
@@ -390,6 +455,11 @@ config {
 --       label becomes its first 47 Unicode scalar values, U+2026, and its last
 --       16 Unicode scalar values, for exactly 64 scalar values. The helper reads
 --       and changes no command, path, scope, operation, handle, or wait value.
+--   inline_controller_admission_open(conversation) -> Boolean
+--       True for conversations outside InlineChildBashLifecycle. For a
+--       filesystem-free Coordinator child, true only while its process-local
+--       controller gate admits launches. Admission and closure are atomic;
+--       no target change or child-runtime recreation can reopen a closed gate.
 --
 
 deferred BashPostLaunchSettlement
@@ -488,6 +558,7 @@ rule HandleSpawned {
               < config.live_handle_cap
     requires: 0 <= wait_seconds
     requires: wait_seconds <= config.max_wait_seconds
+    requires: inline_controller_admission_open(conversation)
     let stored_label = shorten_label(label, config.max_label_length)
     -- shorten_label counts Unicode scalar values; over-bound values use a
     -- 47-scalar prefix, U+2026, and a 16-scalar suffix.
@@ -518,7 +589,7 @@ rule HandleSpawned {
     @guidance
         -- Run sequence (in src/tools/bash/operations.rs):
         --   1. Validate inputs and spawn_target. Ordinary runs derive the
-        --      target from the conversation; Coordinator runs resolve a
+        --      target from the conversation; Coordinator and its inline-child runs resolve a
         --      persisted WorkScope with a live owner by work_scope_id and
         --      canonicalize its worktree_path (preferred) or cwd server-side.
         --      There is no ambient/default cwd.
@@ -534,6 +605,9 @@ rule HandleSpawned {
         --      failure invokes BashPostLaunchSettlement without releasing the
         --      command or creating a controllable Handle. Registered pending
         --      gates count once against capacity, but retain teardown custody.
+        --      Filesystem-free Coordinator children also retain controller
+        --      admission through registration AND payload release or bounded
+        --      unregistered settlement (InlineChildBashLifecycle).
         --   6. Spawn two reader tasks (stdout, stderr) feeding the same ring
         --      under a mutex. Each task ingests bytes, splits on '\n', and
         --      appends RingLine entries with monotonically increasing
@@ -578,7 +652,15 @@ rule BashIsolationMatchesWorkScopeAuthority {
     @guidance
         -- Restricted WorkScope authority selects the Explore OS sandbox.
         -- Work authority selects unsandboxed Bash.
+        -- Explicit Coordinator and inline-child targets use Work Bash authority
+        -- after active WorkScope resolution, without an ambient cwd or sandbox.
         -- Conversation mode otherwise remains provenance, not authority.
+}
+
+rule RunRejectedByClosedInlineController {
+    when: AgentCallsBashRun(conversation, cmd, wait_seconds, label, spawn_target)
+    requires: not inline_controller_admission_open(conversation)
+    ensures: BashRunRejectedBeforeProcessCreation(conversation)
 }
 
 rule RunRejectedByCap {
@@ -1281,6 +1363,23 @@ invariant KillPendingKernelImpliesAlive {
 ------------------------------------------------------------
 -- Surfaces
 ------------------------------------------------------------
+
+actor InlineChildLifecycleOwner {
+    identified_by: String
+}
+
+surface InlineChildBashRetirement {
+    facing owner: InlineChildLifecycleOwner
+
+    contracts:
+        fulfils InlineChildBashLifecycle
+
+    @guarantee NativeLifecycleOnly
+        -- The runtime's child-terminal and parent-cancellation paths own this
+        -- boundary. It is not an agent tool or a grant of handle control to the
+        -- Coordinator; it selects only the exact filesystem-free child's
+        -- controller. Closed controller gates do not close owner WorkScopes.
+}
 
 surface AgentBashAccess {
     facing agent: LlmAgent

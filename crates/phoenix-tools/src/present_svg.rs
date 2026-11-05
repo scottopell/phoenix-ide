@@ -624,6 +624,8 @@ mod tests {
             Arc::new(crate::NoLlm),
             phoenix_terminal::ActiveTerminals::new(),
             Arc::new(crate::TmuxRegistry::new()),
+            phoenix_core::work_scope::ResourceScopeKey::Coordinator,
+            phoenix_core::work_scope::ResourceAuthority::Work,
         )
         .with_tool_use_id(id)
         .with_svg_assistant_message_id("global-assistant")

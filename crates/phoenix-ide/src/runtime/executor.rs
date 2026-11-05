@@ -4828,6 +4828,9 @@ where
                 )
                 .await?;
         } else if let Some(child_id) = self.pending_sub_agent_acceptance.take() {
+            if self.context.is_coordinator {
+                super::retire_inline_child_bash_controller(&self.bash_handles, &child_id).await;
+            }
             self.storage
                 .update_state_and_accept_sub_agent(
                     &self.context.conversation_id,
@@ -5883,8 +5886,8 @@ where
             .iter()
             .map(|task| task.mode.unwrap_or_default())
             .collect();
-        let parent_allows_work =
-            self.context.resource_authority == crate::work_scope::ResourceAuthority::Work;
+        let parent_allows_work = !self.context.is_coordinator
+            && self.context.resource_authority == crate::work_scope::ResourceAuthority::Work;
 
         let mut work_count_in_batch = 0u32;
         for &mode in &resolved_tasks {
@@ -5947,53 +5950,72 @@ where
         let mut specs: Vec<SubAgentSpec> = Vec::with_capacity(input.tasks.len());
 
         for (task, &mode) in input.tasks.iter().zip(&resolved_tasks) {
+            use phoenix_core::domain::sm_state::ConversationExecutionEnvironment;
             let cwd_override = nonblank(task.cwd.as_deref());
-            let cwd_path = cwd_override.map_or_else(
-                || self.context.filesystem_root().to_path_buf(),
-                |cwd| {
-                    let path = std::path::Path::new(cwd);
-                    if path.is_absolute() {
-                        path.to_path_buf()
-                    } else {
-                        self.context.filesystem_root().join(path)
+            let environment = if self.context.is_coordinator {
+                if task.cwd.is_some() {
+                    return Ok(Some(Event::ToolComplete {
+                        tool_use_id: tool_use_id.clone(),
+                        result: ToolResult::error(
+                            tool_use_id,
+                            "Coordinator inline agents have no default directory; omit cwd and target an active WorkScope in file reads and Bash runs".into(),
+                        ),
+                    }));
+                }
+                ConversationExecutionEnvironment::NoFilesystem
+            } else {
+                let cwd_path = cwd_override.map_or_else(
+                    || self.context.filesystem_root().to_path_buf(),
+                    |cwd| {
+                        let path = std::path::Path::new(cwd);
+                        if path.is_absolute() {
+                            path.to_path_buf()
+                        } else {
+                            self.context.filesystem_root().join(path)
+                        }
+                    },
+                );
+                let cwd = match crate::conversation_cwd::validate_conversation_cwd(
+                    cwd_path.to_string_lossy(),
+                ) {
+                    Ok(valid) => valid.into_raw(),
+                    Err(e) => {
+                        let result = ToolResult::error(
+                            tool_use_id.clone(),
+                            format!("Invalid sub-agent working directory: {e}"),
+                        );
+                        return Ok(Some(Event::ToolComplete {
+                            tool_use_id,
+                            result,
+                        }));
                     }
-                },
-            );
-            let cwd = match crate::conversation_cwd::validate_conversation_cwd(
-                cwd_path.to_string_lossy(),
-            ) {
-                Ok(valid) => valid.into_raw(),
-                Err(e) => {
+                };
+
+                if mode == SubAgentMode::Work
+                    && parent_worktree_path
+                        .as_deref()
+                        .is_some_and(|root| !path_is_within(&cwd, root))
+                {
+                    let worktree_root =
+                        parent_worktree_path.as_deref().expect("checked as present");
                     let result = ToolResult::error(
                         tool_use_id.clone(),
-                        format!("Invalid sub-agent working directory: {e}"),
+                        format!(
+                            "Work sub-agent cwd '{cwd}' must be inside the parent's worktree \
+                         '{worktree_root}'. Omit `cwd` to inherit the worktree, or pass a path \
+                         that resolves under it."
+                        ),
                     );
                     return Ok(Some(Event::ToolComplete {
                         tool_use_id,
                         result,
                     }));
                 }
-            };
 
-            if mode == SubAgentMode::Work
-                && parent_worktree_path
-                    .as_deref()
-                    .is_some_and(|root| !path_is_within(&cwd, root))
-            {
-                let worktree_root = parent_worktree_path.as_deref().expect("checked as present");
-                let result = ToolResult::error(
-                    tool_use_id.clone(),
-                    format!(
-                        "Work sub-agent cwd '{cwd}' must be inside the parent's worktree \
-                         '{worktree_root}'. Omit `cwd` to inherit the worktree, or pass a path \
-                         that resolves under it."
-                    ),
-                );
-                return Ok(Some(Event::ToolComplete {
-                    tool_use_id,
-                    result,
-                }));
-            }
+                ConversationExecutionEnvironment::Filesystem {
+                    working_dir: cwd.into(),
+                }
+            };
 
             let selected = match catalog.select(
                 task.agent_type.as_deref(),
@@ -6036,7 +6058,7 @@ where
             specs.push(SubAgentSpec {
                 agent_id: uuid::Uuid::new_v4().to_string(),
                 task: task.task.clone(),
-                cwd,
+                environment,
                 timeout: DEFAULT_SUBAGENT_TIMEOUT,
                 mode,
                 model_id: selected.execution.model,
@@ -7554,6 +7576,15 @@ where
             ControlEffect::NotifyParent { outcome } => {
                 tracing::info!(?outcome, "Notifying parent of sub-agent completion");
                 let child_conversation_id = self.context.conversation_id.clone();
+                if self.context.is_sub_agent
+                    && self.context.execution_environment.working_dir().is_none()
+                {
+                    super::retire_inline_child_bash_controller(
+                        &self.bash_handles,
+                        &child_conversation_id,
+                    )
+                    .await;
+                }
                 if let Some((parent_conversation_id, dispatcher)) = &self.parent_dispatch {
                     let event = Event::SubAgentResult {
                         agent_id: child_conversation_id.clone(),
@@ -8253,7 +8284,8 @@ where
             "Resolved output budget cannot be represented by provider APIs".to_string()
         })?;
         let is_sub_agent = self.context.is_sub_agent;
-        let is_coordinator = self.context.is_coordinator;
+        let uses_work_scope_targets = self.context.is_coordinator
+            || (is_sub_agent && self.context.execution_environment.working_dir().is_none());
         let request_tool_surface = tool_surface;
 
         // Token streaming channel (REQ-BED-025).
@@ -8651,7 +8683,7 @@ where
                         .tool_uses()
                         .into_iter()
                         .map(|(id, name, input)| {
-                            let typed_input = if is_coordinator {
+                            let typed_input = if uses_work_scope_targets {
                                 ToolInput::from_name_and_value_with_work_scope_target(
                                     name,
                                     input.clone(),
@@ -8948,6 +8980,7 @@ where
             let definition = catalog.tool_definition(
                 &self.context.model_id,
                 self.llm_registry.is_builtin_model(&self.context.model_id),
+                self.context.is_coordinator,
             );
             if !advertised || definition.input_schema != request_schema {
                 return Ok(Some(Event::ToolComplete {
@@ -9047,6 +9080,12 @@ where
                     self.llm_registry.clone(),
                     self.terminals.clone(),
                     self.tmux_registry.clone(),
+                    if self.context.is_coordinator {
+                        phoenix_core::work_scope::ResourceScopeKey::Coordinator
+                    } else {
+                        self.context.resource_scope.clone()
+                    },
+                    self.context.resource_authority,
                 )
             }
         }
@@ -9743,6 +9782,7 @@ where
             *tool = catalog.tool_definition(
                 &self.context.model_id,
                 self.llm_registry.is_builtin_model(&self.context.model_id),
+                is_coordinator,
             );
             self.spawn_catalog = Some(catalog);
             self.spawn_parent_parallel_work_qualified = Some(
@@ -9770,6 +9810,11 @@ where
                 llm_language,
                 tool_executor.coordinator_skill_catalog().as_ref(),
                 &authority,
+            )
+        } else if is_sub_agent && working_dir.is_none() {
+            crate::system_prompt::build_coordinator_research_prompt(
+                llm_language,
+                persona.as_deref(),
             )
         } else {
             let turn_context = self.ordinary_turn_context.get_or_insert_with(|| {
@@ -24209,6 +24254,192 @@ mod steer_drain_detector_tests {
         assert_cancellation_fan_in(&storage, "conv-cancel-backstop");
     }
 
+    async fn assert_controller_join_pending<F: std::future::Future>(
+        mut future: std::pin::Pin<&mut F>,
+    ) {
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(future.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_child_notify_parent_joins_controller_before_delivery() {
+        use phoenix_core::domain::sm_state::ConversationExecutionEnvironment;
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+        let (mut rt, _) = build_runtime_with_state_and_queue(
+            "inline-controller-child",
+            ConvState::Completed {
+                result: "done".into(),
+            },
+            vec![],
+        );
+        rt.context.is_sub_agent = true;
+        rt.context.execution_environment = ConversationExecutionEnvironment::NoFilesystem;
+        let (parent_tx, mut parent_rx) = mpsc::channel(1);
+        rt.parent_dispatch = Some((
+            "parent".into(),
+            Arc::new(crate::runtime::TestConversationEventDispatcher::new(
+                parent_tx,
+            )),
+        ));
+        let registry = rt.bash_handles.clone();
+        let owner = ResourceScopeKey::Work(WorkScopeId::new());
+        let controller = ResourceScopeKey::Unattached(rt.context.conversation_id.clone());
+        let lease = registry
+            .reserve_spawn_for_controller(&owner, &controller)
+            .await
+            .unwrap();
+        let delivery = rt.execute_control_effect(ControlEffect::NotifyParent {
+            outcome: SubAgentOutcome::Success {
+                result: "done".into(),
+            },
+        });
+        tokio::pin!(delivery);
+        assert_controller_join_pending(delivery.as_mut()).await;
+        assert!(parent_rx.try_recv().is_err());
+        assert!(registry
+            .reserve_spawn_for_controller(&owner, &controller)
+            .await
+            .is_err());
+        drop(lease);
+        delivery.await.unwrap();
+        assert!(
+            matches!(parent_rx.try_recv(), Ok(Event::SubAgentResult { agent_id, .. }) if agent_id == "inline-controller-child")
+        );
+        assert!(registry.reserve_spawn(&owner).await.is_ok());
+        assert!(registry
+            .reserve_spawn_for_controller(&owner, &ResourceScopeKey::Unattached("sibling".into()))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn coordinator_acceptance_and_cancellation_backstop_join_child_controller() {
+        use crate::runtime::traits::MessageStore;
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+        for backstop in [false, true] {
+            let (mut rt, storage) = cancelling_runtime(
+                "coordinator-controller-parent",
+                &["silent"],
+                crate::state_machine::event::CancelCause::UserRequested,
+            )
+            .await;
+            rt.context.is_coordinator = true;
+            storage
+                .record_sub_agent_terminal(
+                    "silent",
+                    phoenix_db::SubAgentTerminalCause::Cancelled,
+                    Utc::now(),
+                )
+                .await
+                .unwrap();
+            let registry = rt.bash_handles.clone();
+            let owner = ResourceScopeKey::Work(WorkScopeId::new());
+            let controller = ResourceScopeKey::Unattached("silent".into());
+            let lease = registry
+                .reserve_spawn_for_controller(&owner, &controller)
+                .await
+                .unwrap();
+            let accept = async {
+                if backstop {
+                    rt.handle_cancelling_sub_agents_timeout().await;
+                } else {
+                    rt.process_event(Event::SubAgentResult {
+                        agent_id: "silent".into(),
+                        outcome: SubAgentOutcome::Failure {
+                            error: "cancelled".into(),
+                            error_kind: crate::db::ErrorKind::Cancelled,
+                        },
+                    })
+                    .await
+                    .unwrap();
+                }
+            };
+            tokio::pin!(accept);
+            assert_controller_join_pending(accept.as_mut()).await;
+            assert_eq!(storage.sub_agent_acceptance_count(), 0);
+            assert!(registry
+                .reserve_spawn_for_controller(&owner, &controller)
+                .await
+                .is_err());
+            drop(lease);
+            accept.await;
+            assert_eq!(storage.sub_agent_acceptance_count(), 1);
+            assert_cancellation_fan_in(&storage, "coordinator-controller-parent");
+            assert!(registry.reserve_spawn(&owner).await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_child_delivery_and_unrelated_results_preserve_controller_admission() {
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+        let (mut child, _) = build_runtime_with_state_and_queue(
+            "ordinary-child",
+            ConvState::Completed {
+                result: "done".into(),
+            },
+            vec![],
+        );
+        child.context.is_sub_agent = true;
+        let owner = ResourceScopeKey::Work(WorkScopeId::new());
+        let controller = ResourceScopeKey::Unattached("ordinary-child".into());
+        let registry = child.bash_handles.clone();
+        let lease = registry
+            .reserve_spawn_for_controller(&owner, &controller)
+            .await
+            .unwrap();
+        let (sender, mut receiver) = mpsc::channel(1);
+        child.parent_dispatch = Some((
+            "ordinary-parent".into(),
+            Arc::new(crate::runtime::TestConversationEventDispatcher::new(sender)),
+        ));
+        child
+            .execute_control_effect(ControlEffect::NotifyParent {
+                outcome: SubAgentOutcome::Success {
+                    result: "done".into(),
+                },
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::SubAgentResult { .. })
+        ));
+        assert!(registry
+            .reserve_spawn_for_controller(&owner, &controller)
+            .await
+            .is_ok());
+        drop(lease);
+
+        let (mut parent, storage) = build_runtime_with_state_and_queue(
+            "coordinator-unrelated-result",
+            mk_awaiting_sub_agents(),
+            vec![],
+        );
+        parent.context.is_coordinator = true;
+        assert!(parent
+            .process_event(Event::SubAgentResult {
+                agent_id: "unrelated-child".into(),
+                outcome: SubAgentOutcome::Success {
+                    result: "unrelated".into()
+                },
+            })
+            .await
+            .is_err());
+        assert_eq!(storage.sub_agent_acceptance_count(), 0);
+        assert!(parent
+            .bash_handles
+            .reserve_spawn_for_controller(
+                &owner,
+                &ResourceScopeKey::Unattached("unrelated-child".into()),
+            )
+            .await
+            .is_ok());
+    }
+
     /// Entering `Idle` with an empty queue produces no drain event.
     #[tokio::test]
     async fn no_drain_when_queue_empty_idle() {
@@ -26756,7 +26987,7 @@ mod work_subagent_cwd_guard_tests {
                 &template.agent_config,
                 template.llm_registry.available_execution_routes(),
             )
-            .tool_definition("gpt-5.6-sol", true);
+            .tool_definition("gpt-5.6-sol", true, false);
             let call = spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
                     task: "implement the fix".into(),
@@ -27370,9 +27601,84 @@ mod work_subagent_cwd_guard_tests {
         assert_eq!(specs[0].effort, rt.context.effort);
         assert_eq!(specs[0].mode, SubAgentMode::Explore);
         assert_eq!(
-            std::fs::canonicalize(&specs[0].cwd).unwrap(),
+            std::fs::canonicalize(specs[0].environment.working_dir().unwrap()).unwrap(),
             std::fs::canonicalize(parent.path()).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn coordinator_spawns_parallel_research_without_a_cwd() {
+        let parent = TempDir::new().unwrap();
+        let (spawn_tx, spawn_rx) = mpsc::channel(1);
+        let (cancel_tx, _) = mpsc::channel(1);
+        let mut rt = runtime_in_direct_mode(parent.path()).with_spawn_channels(spawn_tx, cancel_tx);
+        rt.context = ConvContext::coordinator("coordinator", "gpt-5.6-sol", 200_000, 16_384);
+        let responder = tokio::spawn(accept_spawn_batch(spawn_rx));
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: (0..2)
+                    .map(|i| SubAgentTask {
+                        task: format!("Research question {i}"),
+                        cwd: None,
+                        mode: None,
+                        execution: None,
+                        max_turns: None,
+                        agent_type: None,
+                    })
+                    .collect(),
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(result, Some(Event::SpawnAgentsComplete { .. })));
+        let specs = responder.await.unwrap();
+        assert_eq!(specs.len(), 2);
+        for spec in specs {
+            assert_eq!(
+                spec.environment,
+                phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem
+            );
+            assert_eq!(spec.mode, SubAgentMode::Explore);
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_rejects_work_and_cwd_before_any_batch_admission() {
+        let parent = TempDir::new().unwrap();
+        for (mode, cwd) in [
+            (Some(SubAgentMode::Work), None),
+            (None, Some("/tmp".into())),
+            (None, Some(String::new())),
+        ] {
+            let (spawn_tx, mut spawn_rx) = mpsc::channel(1);
+            let (cancel_tx, _) = mpsc::channel(1);
+            let mut rt =
+                runtime_in_direct_mode(parent.path()).with_spawn_channels(spawn_tx, cancel_tx);
+            rt.context = ConvContext::coordinator("coordinator", "gpt-5.6-sol", 200_000, 16_384);
+            let result = rt
+                .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                    tasks: vec![SubAgentTask {
+                        task: "Research".into(),
+                        cwd,
+                        mode,
+                        execution: None,
+                        max_turns: None,
+                        agent_type: None,
+                    }],
+                }))
+                .await
+                .unwrap();
+            assert!(matches!(
+                result,
+                Some(Event::ToolComplete {
+                    result: ToolResult {
+                        outcome: ToolOutcome::Error { .. },
+                        ..
+                    },
+                    ..
+                })
+            ));
+            assert!(spawn_rx.try_recv().is_err());
+        }
     }
 
     #[tokio::test]

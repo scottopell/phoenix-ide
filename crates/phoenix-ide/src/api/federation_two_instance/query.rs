@@ -48,6 +48,8 @@ fn test_context() -> ToolContext {
         Arc::new(NoLlm),
         phoenix_terminal::ActiveTerminals::new(),
         Arc::new(crate::tools::TmuxRegistry::new()),
+        crate::work_scope::ResourceScopeKey::Coordinator,
+        crate::work_scope::ResourceAuthority::Work,
     )
 }
 

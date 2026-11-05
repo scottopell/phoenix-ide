@@ -2617,7 +2617,7 @@ pub struct SubAgentResult {
 pub struct SubAgentSpec {
     pub agent_id: String,
     pub task: String,
-    pub cwd: String,
+    pub environment: ConversationExecutionEnvironment,
     /// Mandatory timeout — caller must make a conscious decision (REQ-SA-006)
     pub timeout: Duration,
     /// Sub-agent execution mode (REQ-PROJ-008)
@@ -2661,7 +2661,7 @@ pub enum ExploreBashCapability {
     Unavailable,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ConversationExecutionEnvironment {
     Filesystem { working_dir: PathBuf },
     NoFilesystem,
@@ -2823,7 +2823,7 @@ impl ConvContext {
     /// Return the conversation's filesystem root.
     ///
     /// # Panics
-    /// Panics when called for a filesystem-free Coordinator context.
+    /// Panics when called for a filesystem-free context.
     #[must_use]
     pub fn filesystem_root(&self) -> &std::path::Path {
         self.execution_environment
@@ -2844,10 +2844,28 @@ impl ConvContext {
         output_budget: usize,
         root_conversation_id: impl Into<String>,
     ) -> Self {
+        Self::sub_agent_with_environment(
+            conversation_id,
+            ConversationExecutionEnvironment::Filesystem { working_dir },
+            model_id,
+            context_window,
+            output_budget,
+            root_conversation_id,
+        )
+    }
+
+    pub fn sub_agent_with_environment(
+        conversation_id: impl Into<String>,
+        execution_environment: ConversationExecutionEnvironment,
+        model_id: impl Into<String>,
+        context_window: usize,
+        output_budget: usize,
+        root_conversation_id: impl Into<String>,
+    ) -> Self {
         Self {
             conversation_id: conversation_id.into(),
             root_conversation_id: root_conversation_id.into(),
-            execution_environment: ConversationExecutionEnvironment::Filesystem { working_dir },
+            execution_environment,
             model_id: model_id.into(),
             is_sub_agent: true,
             effort: None,

@@ -665,7 +665,10 @@ async fn run_run_with_identity_probe_mode(
     }
 
     let registry = ctx.bash_handle_registry().clone();
-    let mut reservation = match registry.reserve_spawn(&spawn_context.lifecycle_scope).await {
+    let mut reservation = match registry
+        .reserve_spawn_for_controller(&spawn_context.lifecycle_scope, &ctx.work_scope)
+        .await
+    {
         Ok(reservation) => reservation,
         Err(BashHandleError::HandleCapReached { cap, live_handles }) => {
             return BashError::HandleCapReached(BashHandleError::HandleCapReached {
@@ -2692,6 +2695,169 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn native_controller_retirement_waits_for_registered_payload_release() {
+        if !native_launcher_available() {
+            return;
+        }
+        let controller = ResourceScopeKey::Unattached("native-gated-controller".into());
+        let owner = scope("native-controller-target");
+        let mut ctx = test_context(&owner);
+        ctx.work_scope = controller.clone();
+        let registry = ctx.bash_handle_registry().clone();
+        let dir = tempfile::tempdir().unwrap();
+        let command_release = dir.path().join("release-command");
+        let command = format!(
+            "while [ ! -e '{}' ]; do sleep 0.01; done",
+            command_release.display()
+        );
+        let context = SpawnContext {
+            working_dir: ctx.working_dir().to_path_buf(),
+            lifecycle_scope: owner.clone(),
+            terminal_effect: BashTerminalEffect::InventoryOnly,
+        };
+        let mut reservation = registry
+            .reserve_spawn_for_controller(&owner, &controller)
+            .await
+            .unwrap();
+        let (handle, spawned) = spawn_child_with_identity_probe_protocol(
+            &command,
+            None,
+            &ctx,
+            &context,
+            reservation.handle_id().clone(),
+            RING_BUFFER_BYTES,
+            &BashSpawnMode::Direct,
+            SpawnProtocol::Gated,
+            |pid| observe_process_identity(pid).ok(),
+        )
+        .unwrap();
+        reservation.mark_launched();
+        registry
+            .commit_spawn_gated(&mut reservation, handle.clone())
+            .await
+            .unwrap();
+        let (child, gate, scratch) = spawned.into_waiter_parts();
+        start_io_tasks(
+            &handle,
+            owner.clone(),
+            child,
+            registry.lifecycle_sink(),
+            BashTerminalEffect::InventoryOnly,
+            scratch,
+            None,
+        );
+        let close = registry.retire_unattached_controller("native-gated-controller");
+        tokio::pin!(close);
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(close.as_mut().poll(cx).is_pending()))
+                .await
+        );
+        release_registered_gate(gate.unwrap(), reservation, &registry, handle.clone())
+            .await
+            .unwrap();
+        let report = close.await.unwrap();
+        #[cfg(not(target_os = "linux"))]
+        assert!(report.has_failures());
+        #[cfg(target_os = "linux")]
+        assert!(!report.has_failures(), "{report:?}");
+        std::fs::write(command_release, "").unwrap();
+        let mut exit = handle.exit_observer();
+        tokio::time::timeout(Duration::from_secs(10), exit.wait_for(Option::is_some))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            registry.get_by_id(&handle.handle_id).await.unwrap().owner,
+            owner
+        );
+        assert!(registry
+            .get_existing(&owner)
+            .await
+            .unwrap()
+            .read()
+            .await
+            .get(&handle.handle_id)
+            .is_some());
+        assert!(registry.reserve_spawn(&owner).await.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_controller_retirement_fences_run_before_process_creation() {
+        if !native_launcher_available() {
+            return;
+        }
+        let owner = scope("native-closed-target");
+        let mut ctx = test_context(&owner);
+        ctx.work_scope = ResourceScopeKey::Unattached("native-closed-controller".into());
+        let registry = ctx.bash_handle_registry().clone();
+        registry
+            .retire_unattached_controller("native-closed-controller")
+            .await
+            .unwrap();
+        let target = ValidatedBashSpawnTarget {
+            working_dir: ctx.working_dir().to_path_buf(),
+            lifecycle_scope: owner.work_scope_id().unwrap().clone(),
+        };
+        let output = dispatch_explicit_target(
+            serde_json::json!({
+                "op": "run", "cmd": "exit 0", "wait_seconds": 0
+            }),
+            target,
+            ctx,
+        )
+        .await;
+        assert_eq!(response_json(&output)["error"], "spawn_failed");
+        assert!(registry.snapshot_handles_for_shutdown().await.is_empty());
+        assert!(registry.reserve_spawn(&owner).await.is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn native_controller_retirement_kills_background_and_retains_target_tombstone() {
+        if !native_launcher_available() {
+            return;
+        }
+        let owner = scope("native-background-target");
+        let mut ctx = test_context(&owner);
+        ctx.work_scope = ResourceScopeKey::Unattached("native-background-child".into());
+        let registry = ctx.bash_handle_registry().clone();
+        let target = ValidatedBashSpawnTarget {
+            working_dir: ctx.working_dir().to_path_buf(),
+            lifecycle_scope: owner.work_scope_id().unwrap().clone(),
+        };
+        let output = dispatch_explicit_target(
+            serde_json::json!({
+                "op": "run", "cmd": "exec sleep 600", "wait_seconds": 0
+            }),
+            target,
+            ctx,
+        )
+        .await;
+        let response = response_json(&output);
+        assert_eq!(response["status"], "still_running");
+        let id = HandleId::new(response["handle"].as_str().unwrap());
+        let handle = registry.get_by_id(&id).await.unwrap().handle;
+        let report = registry
+            .retire_unattached_controller("native-background-child")
+            .await
+            .unwrap();
+        assert!(!report.has_failures(), "{report:?}");
+        assert!(handle.state().await.is_terminal());
+        assert_eq!(registry.get_by_id(&id).await.unwrap().owner, owner);
+        assert!(registry
+            .get_existing(&owner)
+            .await
+            .unwrap()
+            .read()
+            .await
+            .get(&id)
+            .is_some());
+        assert!(registry.reserve_spawn(&owner).await.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn native_raw_launcher_rejects_empty_truncated_and_oversized_eof_payloads() {
         if !native_launcher_available() {
             return;
@@ -2828,20 +2994,26 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One native launch/release-failure fixture owns its child and transport.
     async fn native_registered_gate_release_failure_preserves_handle_and_marks_uncertainty() {
         if !native_launcher_available() {
             return;
         }
 
         let scope = scope("native-registered-gate-release-failure");
-        let ctx = test_context(&scope);
+        let mut ctx = test_context(&scope);
+        ctx.work_scope = ResourceScopeKey::Unattached("release-failed-controller".into());
         let registry = ctx.bash_handle_registry().clone();
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("executed");
         let command = format!("printf executed > {}", marker.display());
         let mut context = spawn_context_for(&ctx);
         context.working_dir = dir.path().to_path_buf();
-        let mut reservation = registry.reserve_spawn(&scope).await.unwrap();
+        context.lifecycle_scope = scope.clone();
+        let mut reservation = registry
+            .reserve_spawn_for_controller(&scope, &ctx.work_scope)
+            .await
+            .unwrap();
         let (handle, spawned) = spawn_child_with_identity_probe_protocol(
             &command,
             None,
@@ -2925,6 +3097,14 @@ mod tests {
             registry.reserve_spawn(&scope).await,
             Err(BashHandleError::SpawnFenced)
         ));
+        let controller_report = registry
+            .retire_unattached_controller("release-failed-controller")
+            .await
+            .unwrap();
+        assert_eq!(
+            controller_report.scope_uncertainty,
+            Some(crate::bash::registry::BashScopeUncertainty::UnregisteredLaunch)
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

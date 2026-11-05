@@ -48,6 +48,18 @@ use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
 pub type ProductionRuntime =
     ConversationRuntime<DatabaseStorage, RegistryLlmClient, ToolRegistryExecutor>;
 
+async fn retire_inline_child_bash_controller(registry: &Arc<BashHandleRegistry>, child_id: &str) {
+    match registry.retire_unattached_controller(child_id).await {
+        Ok(report) if report.has_failures() => {
+            tracing::warn!(%child_id, ?report, "Inline child Bash controller cleanup observation incomplete");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%child_id, %error, "Inline child Bash controller cleanup failed");
+        }
+    }
+}
+
 use crate::db::{ConvMode, Database, ExecutionOccurrenceTerminal};
 use crate::state_machine::{ConvContext, ConvState, Event};
 use crate::system_prompt::ModeContext;
@@ -150,6 +162,19 @@ impl AddressedConversationEventDispatcher {
 #[async_trait::async_trait]
 impl ConversationEventDispatcher for AddressedConversationEventDispatcher {
     async fn dispatch(&self, conversation_id: &str, event: Event) -> Result<(), String> {
+        #[cfg(test)]
+        if matches!(event, Event::UserCancel { .. }) {
+            let barrier = self
+                .manager
+                .subagent_cancel_dispatch_barriers
+                .lock()
+                .await
+                .remove(conversation_id);
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+        }
         let handle = self.resolve(conversation_id).await?;
         self.dispatch_resolved(&handle, event).await
     }
@@ -694,6 +719,8 @@ pub struct RuntimeManager {
     runtime_materialization_panics: AsyncMutex<HashSet<String>>,
     #[cfg(test)]
     runtime_materialization_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    subagent_cancel_dispatch_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     steering_enqueue_handle_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
@@ -2575,6 +2602,8 @@ impl RuntimeManager {
             runtime_materialization_panics: AsyncMutex::new(HashSet::new()),
             #[cfg(test)]
             runtime_materialization_barriers: AsyncMutex::new(HashMap::new()),
+            #[cfg(test)]
+            subagent_cancel_dispatch_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
             steering_enqueue_handle_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
@@ -4656,6 +4685,21 @@ impl RuntimeManager {
             barrier.wait().await;
             barrier.wait().await;
         }
+        if conv.attached_work_scope_id.is_none() {
+            if let Some(parent_id) = &conv.parent_conversation_id {
+                match self.db.get_conversation(parent_id).await {
+                    Ok(parent)
+                        if parent.runtime_role == crate::work_scope::RuntimeRole::Coordinator =>
+                    {
+                        retire_inline_child_bash_controller(&self.bash_handles, &conv.id).await;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(conv_id = %conv.id, %parent_id, %error, "Cannot classify terminal child Bash controller cleanup");
+                    }
+                }
+            }
+        }
         let deleting_conversation_ids = std::collections::HashSet::from([conv.id.clone()]);
         if let Err(error) = crate::api::handlers::run_runtime_resource_cleanup_cascade(
             self,
@@ -4792,7 +4836,7 @@ impl RuntimeManager {
                         },
                     },
                     slug: format!("sub-{}", spec.agent_id),
-                    cwd: spec.cwd.clone(),
+                    environment: spec.environment.clone(),
                     model: spec.model_id.clone(),
                     conv_mode,
                     llm_language: parent.llm_language,
@@ -4970,7 +5014,6 @@ impl RuntimeManager {
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(dispatch.timeout_millis)).await;
             match manager
-                .db
                 .request_sub_agent_cancellation(
                     &agent_id,
                     phoenix_db::SubAgentTerminalCause::TimedOut,
@@ -4978,7 +5021,7 @@ impl RuntimeManager {
                 )
                 .await
             {
-                Ok(phoenix_db::SubAgentCancellationOutcome::DeliverToRuntime(cause)) => {
+                Ok((phoenix_db::SubAgentCancellationOutcome::DeliverToRuntime(cause), _)) => {
                     let _ = AddressedConversationEventDispatcher::new(Arc::clone(&manager))
                         .dispatch(
                             &agent_id,
@@ -5003,13 +5046,48 @@ impl RuntimeManager {
         Ok(())
     }
 
+    async fn request_sub_agent_cancellation(
+        &self,
+        agent_id: &str,
+        cause: phoenix_db::SubAgentTerminalCause,
+        requested_at: DateTime<Utc>,
+    ) -> Result<(phoenix_db::SubAgentCancellationOutcome, bool), crate::db::DbError> {
+        let inline_child = self.is_inline_coordinator_child(agent_id).await?;
+        let outcome = self
+            .db
+            .request_sub_agent_cancellation(agent_id, cause, requested_at)
+            .await?;
+        if inline_child {
+            self.bash_handles
+                .begin_unattached_controller_retirement(agent_id)
+                .await;
+        }
+        Ok((outcome, inline_child))
+    }
+
+    async fn is_inline_coordinator_child(
+        &self,
+        agent_id: &str,
+    ) -> Result<bool, crate::db::DbError> {
+        let child = self.db.get_conversation(agent_id).await?;
+        if child.runtime_role != crate::work_scope::RuntimeRole::SubAgent
+            || child.attached_work_scope_id.is_some()
+        {
+            return Ok(false);
+        }
+        let Some(parent_id) = child.parent_conversation_id else {
+            return Ok(false);
+        };
+        let parent = self.db.get_conversation(&parent_id).await?;
+        Ok(parent.runtime_role == crate::work_scope::RuntimeRole::Coordinator)
+    }
+
     /// Handle a sub-agent cancel request
     async fn handle_cancel_request(self: &Arc<Self>, req: SubAgentCancelRequest) {
         let dispatcher = AddressedConversationEventDispatcher::new(Arc::clone(self));
         let mut dispositions = Vec::with_capacity(req.ids.len());
         for agent_id in req.ids {
             let outcome = self
-                .db
                 .request_sub_agent_cancellation(
                     &agent_id,
                     match req.cause {
@@ -5028,33 +5106,44 @@ impl RuntimeManager {
         let mut runtime_deliveries = Vec::new();
         for (agent_id, outcome) in dispositions {
             match outcome {
-                Ok(phoenix_db::SubAgentCancellationOutcome::CancelledBeforeDispatch) => {
-                    if let Err(error) = dispatcher
-                        .dispatch(
-                            &req.parent_conversation_id,
-                            Event::SubAgentResult {
-                                agent_id,
-                                outcome: match req.cause {
-                                    crate::state_machine::event::CancelCause::Timeout => {
-                                        SubAgentOutcome::TimedOut
-                                    }
-                                    crate::state_machine::event::CancelCause::UserRequested => {
-                                        SubAgentOutcome::Failure {
-                                            error: "Sub-agent cancelled before initial dispatch"
-                                                .to_string(),
-                                            error_kind: crate::db::ErrorKind::Cancelled,
+                Ok((
+                    phoenix_db::SubAgentCancellationOutcome::CancelledBeforeDispatch,
+                    inline_child,
+                )) => {
+                    let dispatcher = dispatcher.clone();
+                    let registry = self.bash_handles.clone();
+                    let parent_id = req.parent_conversation_id.clone();
+                    runtime_deliveries.push(tokio::spawn(async move {
+                        if inline_child {
+                            retire_inline_child_bash_controller(&registry, &agent_id).await;
+                        }
+                        if let Err(error) = dispatcher
+                            .dispatch(
+                                &parent_id,
+                                Event::SubAgentResult {
+                                    agent_id,
+                                    outcome: match req.cause {
+                                        crate::state_machine::event::CancelCause::Timeout => {
+                                            SubAgentOutcome::TimedOut
                                         }
-                                    }
+                                        crate::state_machine::event::CancelCause::UserRequested => {
+                                            SubAgentOutcome::Failure {
+                                                error: "Sub-agent cancelled before initial dispatch"
+                                                    .to_string(),
+                                                error_kind: crate::db::ErrorKind::Cancelled,
+                                            }
+                                        }
+                                    },
                                 },
-                            },
-                        )
-                        .await
-                    {
-                        tracing::warn!(%error, parent_id = %req.parent_conversation_id, "pre-dispatch cancellation delivery deferred to durable reconciliation");
-                        let _ = dispatcher.reconcile(&req.parent_conversation_id).await;
-                    }
+                            )
+                            .await
+                        {
+                            tracing::warn!(%error, %parent_id, "pre-dispatch cancellation delivery deferred to durable reconciliation");
+                            let _ = dispatcher.reconcile(&parent_id).await;
+                        }
+                    }));
                 }
-                Ok(phoenix_db::SubAgentCancellationOutcome::DeliverToRuntime(cause)) => {
+                Ok((phoenix_db::SubAgentCancellationOutcome::DeliverToRuntime(cause), _)) => {
                     let dispatcher = dispatcher.clone();
                     runtime_deliveries.push(tokio::spawn(async move {
                         if let Err(error) = dispatcher
@@ -5074,10 +5163,11 @@ impl RuntimeManager {
                         }
                     }));
                 }
-                Ok(
+                Ok((
                     phoenix_db::SubAgentCancellationOutcome::AlreadyRequested
                     | phoenix_db::SubAgentCancellationOutcome::AlreadyTerminal,
-                ) => {}
+                    _,
+                )) => {}
                 Err(error) => {
                     tracing::error!(%error, %agent_id, "failed to request sub-agent cancellation");
                 }
@@ -5418,6 +5508,47 @@ impl RuntimeManager {
         }
     }
 
+    async fn retire_coordinator_children_before_reconciliation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(), DatabaseTerminalRecoveryError> {
+        let parent = match self.db.get_conversation(conversation_id).await {
+            Ok(parent) => parent,
+            Err(crate::db::DbError::ConversationNotFound(_)) => return Ok(()),
+            Err(error) => return Err(DatabaseTerminalRecoveryError::Retryable(error.to_string())),
+        };
+        if parent.runtime_role != crate::work_scope::RuntimeRole::Coordinator {
+            return Ok(());
+        }
+        let pending = match &parent.state {
+            ConvState::AwaitingSubAgents { pending, .. }
+            | ConvState::CancellingSubAgents { pending, .. } => pending,
+            ConvState::ToolExecuting {
+                pending_sub_agents, ..
+            }
+            | ConvState::CancellingTool {
+                pending_sub_agents, ..
+            } => pending_sub_agents,
+            _ => return Ok(()),
+        };
+        for pending_child in pending {
+            let child = match self.db.get_conversation(&pending_child.agent_id).await {
+                Ok(child) => child,
+                Err(crate::db::DbError::ConversationNotFound(_)) => continue,
+                Err(error) => {
+                    return Err(DatabaseTerminalRecoveryError::Retryable(error.to_string()))
+                }
+            };
+            if child.runtime_role == crate::work_scope::RuntimeRole::SubAgent
+                && child.parent_conversation_id.as_deref() == Some(conversation_id)
+                && child.attached_work_scope_id.is_none()
+            {
+                retire_inline_child_bash_controller(&self.bash_handles, &child.id).await;
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn reconcile_startup_obligated_parents(
         self: &Arc<Self>,
@@ -5427,6 +5558,8 @@ impl RuntimeManager {
             let Ok(_owner) = self.acquire_local_authority_pass() else {
                 return Ok(());
             };
+            self.retire_coordinator_children_before_reconciliation(&conversation_id)
+                .await?;
             let ids = HashSet::from([conversation_id]);
             let reconciled = self
                 .db
@@ -5484,6 +5617,8 @@ impl RuntimeManager {
                 let conversation_id = action_record.conversation_id.clone();
                 match action_record.action {
                     phoenix_db::StartupParentAction::Reconcile => {
+                        self.retire_coordinator_children_before_reconciliation(&conversation_id)
+                            .await?;
                         let ids = HashSet::from([conversation_id.clone()]);
                         let reconciled = self
                             .db
@@ -5887,7 +6022,17 @@ impl RuntimeManager {
         let is_sub_agent = conv.parent_conversation_id.is_some();
         let is_coordinator =
             !is_sub_agent && conv.runtime_role == crate::work_scope::RuntimeRole::Coordinator;
-        let conv_cwd = if is_coordinator {
+        let is_coordinator_research = if let Some(parent_id) = &conv.parent_conversation_id {
+            self.db
+                .get_conversation(parent_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .runtime_role
+                == crate::work_scope::RuntimeRole::Coordinator
+        } else {
+            false
+        };
+        let conv_cwd = if is_coordinator || is_coordinator_research {
             None
         } else {
             Some(
@@ -5934,12 +6079,12 @@ impl RuntimeManager {
         let mode_context = conv_mode_to_context(&conv.conv_mode);
         let mut context = if is_sub_agent {
             let root_id = find_root_conversation_id(&self.db, conversation_id).await;
-            ConvContext::sub_agent(
+            ConvContext::sub_agent_with_environment(
                 &conv.id,
                 conv_cwd
                     .as_ref()
-                    .expect("sub-agent has filesystem environment")
-                    .path_buf(),
+                    .map_or(phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem,
+                        |cwd| phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem { working_dir: cwd.path_buf() }),
                 &model_id,
                 context_window,
                 output_budget,
@@ -6065,12 +6210,7 @@ impl RuntimeManager {
         let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), model_id)
             .with_connection(pinned_connection);
 
-        // Tool registry selection -- sub-agents get a restricted tool set
-        // (no spawn_agents, no ask_user_question, no skill); parent
-        // conversations get the mode-appropriate registry. Both layers wrap
-        // their registry with `with_mcp` so MCP tool defs resolve live from
-        // the manager on every `definitions()` call.
-        let agent_config = if is_sub_agent || is_coordinator {
+        let agent_config = if is_sub_agent {
             phoenix_agents::AgentConfig::default()
         } else {
             phoenix_agents::load_user_config().unwrap_or_else(|error| {
@@ -6083,15 +6223,28 @@ impl RuntimeManager {
         context.is_coordinator = is_coordinator;
 
         let tool_executor = if is_sub_agent {
-            let registry = sub_agent_registry_for_authority(
-                context.resource_authority,
-                ExploreToolPolicy::from_platform(&self.platform),
-            );
-            ToolRegistryExecutor::with_mcp(
-                registry,
-                self.mcp_manager.clone(),
-                agent_catalog.clone(),
-            )
+            if is_coordinator_research {
+                ToolRegistryExecutor::builtin_only(
+                    ToolRegistry::coordinator_research(crate::coordinator_tools::research_tools(
+                        crate::api::global_read::GlobalReadService::new(
+                            self.db.clone(),
+                            self.message_retriever.clone(),
+                        ),
+                        self.db.clone(),
+                    )),
+                    agent_catalog.clone(),
+                )
+            } else {
+                let registry = sub_agent_registry_for_authority(
+                    context.resource_authority,
+                    ExploreToolPolicy::from_platform(&self.platform),
+                );
+                ToolRegistryExecutor::with_mcp(
+                    registry,
+                    self.mcp_manager.clone(),
+                    agent_catalog.clone(),
+                )
+            }
         } else {
             use crate::db::ConvMode;
             if is_coordinator {
@@ -6807,6 +6960,16 @@ impl RuntimeManager {
         event: Event,
     ) -> Result<AcknowledgedEventOutcome, String> {
         let handle = self.get_or_create(conversation_id).await?;
+        if matches!(event, Event::UserCancel { .. })
+            && self
+                .is_inline_coordinator_child(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?
+        {
+            self.bash_handles
+                .begin_unattached_controller_retirement(conversation_id)
+                .await;
+        }
         deposit_turn_trigger(&handle);
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         let (retirement_tx, retirement_rx) = tokio::sync::oneshot::channel();
@@ -10312,7 +10475,10 @@ mod scope_liveness_tests {
         let mut spec = SubAgentSpec {
             agent_id: "direct-work-child".to_string(),
             task: "inherit the unowned cwd".to_string(),
-            cwd: "/tmp/direct-cwd".to_string(),
+            environment:
+                phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
+                    working_dir: "/tmp/direct-cwd".into(),
+                },
             timeout: std::time::Duration::from_secs(60),
             mode: SubAgentMode::Work,
             model_id: "gpt-5.6-sol".to_string(),
@@ -10377,7 +10543,10 @@ mod scope_liveness_tests {
         let spec = SubAgentSpec {
             agent_id: "trusted-work-child".into(),
             task: "implement assigned work".into(),
-            cwd: subdir.to_str().unwrap().into(),
+            environment:
+                phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
+                    working_dir: subdir.clone(),
+                },
             timeout: std::time::Duration::from_secs(60),
             mode: SubAgentMode::Work,
             model_id: "gpt-6-astra".into(),
@@ -10483,7 +10652,7 @@ mod scope_liveness_tests {
                         specs: vec![SubAgentSpec {
                             agent_id: agent_id.to_string(),
                             task: "persist all child semantics".to_string(),
-                            cwd: "/tmp".to_string(),
+                            environment: phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem,
                             timeout: std::time::Duration::from_secs(60),
                             mode: SubAgentMode::Explore,
                             model_id: "gpt-5.6-sol".to_string(),
@@ -10562,7 +10731,8 @@ mod scope_liveness_tests {
         let spec = SubAgentSpec {
             agent_id: agent_id.to_string(),
             task: "must never begin".to_string(),
-            cwd: "/tmp".to_string(),
+            environment:
+                phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem,
             timeout: std::time::Duration::from_secs(60),
             mode: SubAgentMode::Explore,
             model_id: "gpt-5.6-sol".to_string(),
@@ -10690,6 +10860,453 @@ mod scope_liveness_tests {
             .is_some());
     }
 
+    fn cancellation_boundary_spec(agent_id: &str) -> SubAgentSpec {
+        SubAgentSpec {
+            agent_id: agent_id.into(),
+            task: "cancellation admission boundary".into(),
+            environment:
+                phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem,
+            timeout: std::time::Duration::from_millis(1),
+            mode: SubAgentMode::Explore,
+            model_id: "gpt-5.6-sol".into(),
+            connection: "openai_responses".into(),
+            effort: None,
+            max_turns: 1,
+            agent_name: None,
+            persona: None,
+        }
+    }
+
+    async fn cancellation_boundary_fixture(
+        ids: &[&str],
+    ) -> (
+        Arc<RuntimeManager>,
+        crate::db::Conversation,
+        Vec<SubAgentSpec>,
+    ) {
+        let mut manager = test_manager().await;
+        manager.llm_registry = Arc::new(ModelRegistry::new(&phoenix_llm::LlmConfig {
+            openai_api_key: Some("test-key".into()),
+            ..Default::default()
+        }));
+        let manager = Arc::new(manager);
+        let parent = manager
+            .db()
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let specs: Vec<_> = ids
+            .iter()
+            .map(|id| cancellation_boundary_spec(id))
+            .collect();
+        manager
+            .admit_sub_agent_batch(
+                "cancellation-boundary-batch",
+                &specs,
+                &parent.id,
+                parent.attached_work_scope_id.clone(),
+                false,
+            )
+            .await
+            .unwrap();
+        (manager, parent, specs)
+    }
+
+    async fn insert_cancellation_boundary_handle(
+        manager: &RuntimeManager,
+        conversation_id: &str,
+    ) -> (
+        mpsc::Receiver<Event>,
+        mpsc::Receiver<AcknowledgedEventRequest>,
+    ) {
+        let (event_tx, event_rx) = mpsc::channel(4);
+        let (acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(4);
+        let (_state_tx, state_rx) = watch::channel(ConvState::Idle);
+        manager.runtimes.write().await.insert(
+            conversation_id.into(),
+            ConversationHandle {
+                event_tx,
+                acknowledged_event_tx,
+                handoff_review_tx: None,
+                turn_trigger: TurnTriggerSlot::default(),
+                broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
+                identity: Arc::new(()),
+                state_rx,
+                startup_llm_recovery_ack: Arc::new(AsyncMutex::new(None)),
+            },
+        );
+        (event_rx, acknowledged_event_rx)
+    }
+
+    async fn assert_controller_fenced(
+        manager: &RuntimeManager,
+        owner: &ResourceScopeKey,
+        child_id: &str,
+    ) {
+        assert!(
+            matches!(
+                manager
+                    .bash_handles()
+                    .reserve_spawn_for_controller(
+                        owner,
+                        &ResourceScopeKey::Unattached(child_id.into()),
+                    )
+                    .await,
+                Err(phoenix_tools::bash::BashHandleError::SpawnFenced)
+            ),
+            "cancellation must fence {child_id} before event dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_cancellation_boundary_fences_entire_batch_before_dispatch_and_cleanup() {
+        let (manager, parent, specs) = cancellation_boundary_fixture(&[
+            "cancel-first",
+            "cancel-second",
+            "uncancelled-sibling",
+        ])
+        .await;
+        let owner = ResourceScopeKey::Work(WorkScopeId::new());
+        let mut leases = Vec::new();
+        let mut receivers = Vec::new();
+        for spec in &specs[..2] {
+            leases.push(
+                manager
+                    .bash_handles()
+                    .reserve_spawn_for_controller(
+                        &owner,
+                        &ResourceScopeKey::Unattached(spec.agent_id.clone()),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            assert!(matches!(
+                manager.db().claim_sub_agent_initial_dispatch(&spec.agent_id, Utc::now()).await,
+                phoenix_db::SubAgentInitialDispatchAuthority::Established(dispatch)
+                    if dispatch.outcome == phoenix_db::SubAgentInitialDispatchOutcome::Claimed
+            ));
+            receivers.push(insert_cancellation_boundary_handle(&manager, &spec.agent_id).await);
+        }
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .subagent_cancel_dispatch_barriers
+            .lock()
+            .await
+            .insert(specs[0].agent_id.clone(), barrier.clone());
+        let cancel = tokio::spawn({
+            let manager = manager.clone();
+            let parent_id = parent.id.clone();
+            async move {
+                manager
+                    .handle_cancel_request(SubAgentCancelRequest {
+                        ids: vec!["cancel-first".into(), "cancel-second".into()],
+                        parent_conversation_id: parent_id,
+                        cause: crate::state_machine::event::CancelCause::UserRequested,
+                    })
+                    .await;
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), barrier.wait())
+            .await
+            .expect("production child cancellation reaches dispatch");
+        for spec in &specs[..2] {
+            assert_controller_fenced(&manager, &owner, &spec.agent_id).await;
+        }
+        manager
+            .handle_cancel_request(SubAgentCancelRequest {
+                ids: vec![specs[0].agent_id.clone(), specs[1].agent_id.clone()],
+                parent_conversation_id: parent.id,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await;
+        assert!(manager.bash_handles().reserve_spawn(&owner).await.is_ok());
+        for controller in [
+            ResourceScopeKey::Unattached(specs[2].agent_id.clone()),
+            ResourceScopeKey::Coordinator,
+        ] {
+            assert!(manager
+                .bash_handles()
+                .reserve_spawn_for_controller(&owner, &controller)
+                .await
+                .is_ok());
+        }
+        barrier.wait().await;
+        cancel.await.unwrap();
+        for (receiver, _) in &mut receivers {
+            assert!(matches!(receiver.try_recv(), Ok(Event::UserCancel { .. })));
+            assert!(
+                receiver.try_recv().is_err(),
+                "repeat requests do not redeliver"
+            );
+        }
+        let cleanup = manager
+            .bash_handles()
+            .retire_unattached_controller(&specs[0].agent_id);
+        tokio::pin!(cleanup);
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(cleanup.as_mut(), cx).is_pending()
+            ))
+            .await,
+            "UserCancel delivery must not await pending launch custody"
+        );
+        drop(leases);
+        assert!(!cleanup.await.unwrap().has_failures());
+    }
+
+    #[tokio::test]
+    async fn timeout_cancellation_boundary_fences_before_real_timeout_dispatch() {
+        let (manager, _parent, mut specs) = cancellation_boundary_fixture(&["timeout-child"]).await;
+        let spec = specs.pop().unwrap();
+        let owner = ResourceScopeKey::Work(WorkScopeId::new());
+        let lease = manager
+            .bash_handles()
+            .reserve_spawn_for_controller(
+                &owner,
+                &ResourceScopeKey::Unattached(spec.agent_id.clone()),
+            )
+            .await
+            .unwrap();
+        let (mut events, _acknowledged) =
+            insert_cancellation_boundary_handle(&manager, &spec.agent_id).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .subagent_cancel_dispatch_barriers
+            .lock()
+            .await
+            .insert(spec.agent_id.clone(), barrier.clone());
+        manager
+            .kick_admitted_sub_agent(spec.clone(), opentelemetry::trace::SpanContext::NONE)
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Some(Event::PersistedSubAgentBootstrap)
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(30), barrier.wait())
+            .await
+            .expect("real per-child timeout reaches dispatch");
+        assert_controller_fenced(&manager, &owner, &spec.agent_id).await;
+        barrier.wait().await;
+        assert!(matches!(
+            events.recv().await,
+            Some(Event::UserCancel {
+                cause: crate::state_machine::event::CancelCause::Timeout,
+                ..
+            })
+        ));
+        let cleanup = manager
+            .bash_handles()
+            .retire_unattached_controller(&spec.agent_id);
+        tokio::pin!(cleanup);
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(cleanup.as_mut(), cx).is_pending()
+            ))
+            .await
+        );
+        drop(lease);
+        assert!(!cleanup.await.unwrap().has_failures());
+    }
+
+    #[tokio::test]
+    async fn direct_cancellation_boundary_fences_before_acknowledged_dispatch() {
+        let (manager, _parent, specs) =
+            cancellation_boundary_fixture(&["direct-cancel-child"]).await;
+        let child_id = &specs[0].agent_id;
+        let owner = ResourceScopeKey::Work(WorkScopeId::new());
+        let lease = manager
+            .bash_handles()
+            .reserve_spawn_for_controller(&owner, &ResourceScopeKey::Unattached(child_id.clone()))
+            .await
+            .unwrap();
+        let (_events, mut acknowledged) =
+            insert_cancellation_boundary_handle(&manager, child_id).await;
+        let cancel = tokio::spawn({
+            let manager = manager.clone();
+            let child_id = child_id.clone();
+            async move {
+                manager
+                    .send_event(
+                        &child_id,
+                        Event::UserCancel {
+                            reason: None,
+                            cause: crate::state_machine::event::CancelCause::UserRequested,
+                        },
+                    )
+                    .await
+            }
+        });
+        let request = tokio::time::timeout(std::time::Duration::from_secs(30), acknowledged.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(request.event, Event::UserCancel { .. }));
+        assert_controller_fenced(&manager, &owner, child_id).await;
+        assert!(!cancel.is_finished(), "runtime settlement remains required");
+        request
+            .acknowledgement
+            .send(Ok(AcknowledgedEventOutcome::StaleAuthority))
+            .unwrap();
+        assert_eq!(cancel.await.unwrap(), Ok(()));
+        assert!(!manager.runtimes.read().await.contains_key(child_id));
+        assert_controller_fenced(&manager, &owner, child_id).await;
+        drop(lease);
+        assert!(!manager
+            .bash_handles()
+            .retire_unattached_controller(child_id)
+            .await
+            .unwrap()
+            .has_failures());
+    }
+
+    #[tokio::test]
+    async fn idempotent_cancellation_boundary_fences_all_established_db_outcomes() {
+        for prepared in ["before-dispatch", "already-requested", "already-terminal"] {
+            let (manager, parent, specs) = cancellation_boundary_fixture(&[prepared]).await;
+            let owner = ResourceScopeKey::Work(WorkScopeId::new());
+            let (mut parent_events, _acknowledged) =
+                insert_cancellation_boundary_handle(&manager, &parent.id).await;
+            if prepared == "already-requested" {
+                assert!(matches!(
+                    manager
+                        .db()
+                        .claim_sub_agent_initial_dispatch(prepared, Utc::now())
+                        .await,
+                    phoenix_db::SubAgentInitialDispatchAuthority::Established(_)
+                ));
+                assert_eq!(
+                    manager
+                        .db()
+                        .request_sub_agent_cancellation(
+                            prepared,
+                            phoenix_db::SubAgentTerminalCause::Cancelled,
+                            Utc::now(),
+                        )
+                        .await
+                        .unwrap(),
+                    phoenix_db::SubAgentCancellationOutcome::DeliverToRuntime(
+                        phoenix_db::SubAgentTerminalCause::Cancelled,
+                    )
+                );
+            } else if prepared == "already-terminal" {
+                manager
+                    .db()
+                    .record_sub_agent_terminal(
+                        prepared,
+                        phoenix_db::SubAgentTerminalCause::SubmitResult,
+                        Utc::now(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert!(manager
+                .bash_handles()
+                .reserve_spawn_for_controller(
+                    &owner,
+                    &ResourceScopeKey::Unattached(prepared.into()),
+                )
+                .await
+                .is_ok());
+            manager
+                .handle_cancel_request(SubAgentCancelRequest {
+                    ids: vec![specs[0].agent_id.clone()],
+                    parent_conversation_id: parent.id,
+                    cause: crate::state_machine::event::CancelCause::UserRequested,
+                })
+                .await;
+            assert_controller_fenced(&manager, &owner, prepared).await;
+            if prepared == "before-dispatch" {
+                assert!(matches!(
+                    parent_events.try_recv(),
+                    Ok(Event::SubAgentResult { .. })
+                ));
+            } else {
+                assert!(parent_events.try_recv().is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_work_cancellation_boundary_preserves_owner_and_controller_admission() {
+        let manager = Arc::new(test_manager().await);
+        let owner = create_handleless_work_conv(&manager, "ordinary-parent", "/tmp", None).await;
+        let mut spec = cancellation_boundary_spec("ordinary-child");
+        spec.environment =
+            phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
+                working_dir: "/tmp".into(),
+            };
+        manager
+            .admit_sub_agent_batch(
+                "ordinary-cancel-batch",
+                std::slice::from_ref(&spec),
+                "ordinary-parent",
+                owner.work_scope_id().cloned(),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager
+                .db()
+                .claim_sub_agent_initial_dispatch(&spec.agent_id, Utc::now())
+                .await,
+            phoenix_db::SubAgentInitialDispatchAuthority::Established(_)
+        ));
+        let (mut events, _acknowledged) =
+            insert_cancellation_boundary_handle(&manager, &spec.agent_id).await;
+        manager
+            .handle_cancel_request(SubAgentCancelRequest {
+                ids: vec![spec.agent_id.clone()],
+                parent_conversation_id: "ordinary-parent".into(),
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await;
+        assert!(matches!(events.try_recv(), Ok(Event::UserCancel { .. })));
+        assert!(manager.bash_handles().reserve_spawn(&owner).await.is_ok());
+        assert!(manager
+            .bash_handles()
+            .reserve_spawn_for_controller(
+                &owner,
+                &ResourceScopeKey::Unattached(spec.agent_id.clone()),
+            )
+            .await
+            .is_ok());
+        let (_events, mut acknowledged) =
+            insert_cancellation_boundary_handle(&manager, &spec.agent_id).await;
+        let cancel = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .send_event(
+                        "ordinary-child",
+                        Event::UserCancel {
+                            reason: None,
+                            cause: crate::state_machine::event::CancelCause::UserRequested,
+                        },
+                    )
+                    .await
+            }
+        });
+        let request = tokio::time::timeout(std::time::Duration::from_secs(30), acknowledged.recv())
+            .await
+            .expect("ordinary child cancellation reaches acknowledged dispatch")
+            .unwrap();
+        assert!(manager
+            .bash_handles()
+            .reserve_spawn_for_controller(
+                &owner,
+                &ResourceScopeKey::Unattached("ordinary-child".into()),
+            )
+            .await
+            .is_ok());
+        request
+            .acknowledgement
+            .send(Ok(AcknowledgedEventOutcome::Settled))
+            .unwrap();
+        assert_eq!(cancel.await.unwrap(), Ok(()));
+    }
+
     #[tokio::test]
     async fn terminal_subagent_cleanup_is_gated_by_typed_exit_disposition() {
         let manager = test_manager().await;
@@ -10726,10 +11343,18 @@ mod scope_liveness_tests {
         let scope = ResourceScopeKey::Unattached(child.id.clone());
         let _ = manager.bash_handles().get_or_create(&scope).await;
 
-        manager
-            .handle_runtime_exit(&child, executor::RuntimeExitDisposition::Interrupted)
-            .await;
-        assert!(manager.bash_handles().reserve_spawn(&scope).await.is_ok());
+        let owner = ResourceScopeKey::Work(WorkScopeId::new());
+        for disposition in [
+            executor::RuntimeExitDisposition::Interrupted,
+            executor::RuntimeExitDisposition::RecreateFromDatabase,
+        ] {
+            manager.handle_runtime_exit(&child, disposition).await;
+            assert!(manager
+                .bash_handles()
+                .reserve_spawn_for_controller(&owner, &scope)
+                .await
+                .is_ok());
+        }
 
         manager
             .handle_runtime_exit(&child, executor::RuntimeExitDisposition::Terminal)
@@ -10738,6 +11363,150 @@ mod scope_liveness_tests {
             manager.bash_handles().reserve_spawn(&scope).await,
             Err(phoenix_tools::bash::BashHandleError::SpawnFenced)
         ));
+        assert!(matches!(
+            manager
+                .bash_handles()
+                .reserve_spawn_for_controller(&owner, &scope)
+                .await,
+            Err(phoenix_tools::bash::BashHandleError::SpawnFenced)
+        ));
+        assert!(manager.bash_handles().reserve_spawn(&owner).await.is_ok());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn durable_coordinator_fan_in_joins_child_controller_before_db_acceptance() {
+        for startup_ids in [false, true] {
+            let manager = Arc::new(test_manager().await);
+            let parent = manager
+                .db()
+                .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+                .await
+                .unwrap();
+            let child_id = "durable-controller-child";
+            let spec = SubAgentSpec {
+                agent_id: child_id.into(),
+                task: "durable research".into(),
+                environment:
+                    phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem,
+                timeout: std::time::Duration::from_secs(60),
+                mode: SubAgentMode::Explore,
+                model_id: "gpt-6-astra".into(),
+                connection: "mock".into(),
+                effort: None,
+                max_turns: 1,
+                agent_name: None,
+                persona: None,
+            };
+            manager
+                .admit_sub_agent_batch(
+                    "durable-controller-batch",
+                    &[spec],
+                    &parent.id,
+                    parent.attached_work_scope_id.clone(),
+                    false,
+                )
+                .await
+                .unwrap();
+            manager
+                .db()
+                .update_conversation_state(
+                    child_id,
+                    &ConvState::Completed {
+                        result: "durable exact result".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            let parent_state = ConvState::CancellingSubAgents {
+                pending: vec![phoenix_core::domain::sm_state::PendingSubAgent {
+                    agent_id: child_id.into(),
+                    task: "durable research".into(),
+                    mode: SubAgentMode::Explore,
+                }],
+                completed_results: vec![],
+                spawn_tool_id: None,
+                cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
+            };
+            manager
+                .db()
+                .update_conversation_state(&parent.id, &parent_state)
+                .await
+                .unwrap();
+            if startup_ids {
+                manager
+                    .startup_obligated_conversations
+                    .write()
+                    .await
+                    .insert(parent.id.clone());
+            } else {
+                manager
+                    .db()
+                    .establish_parent_reconcile_action(&parent.id)
+                    .await
+                    .unwrap();
+            }
+            let owner = ResourceScopeKey::Work(WorkScopeId::new());
+            let controller = ResourceScopeKey::Unattached(child_id.into());
+            let registry = manager.bash_handles().clone();
+            let lease = registry
+                .reserve_spawn_for_controller(&owner, &controller)
+                .await
+                .unwrap();
+            let reconciliation = tokio::spawn({
+                let manager = manager.clone();
+                async move { manager.reconcile_startup_obligated_parents().await }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    match registry
+                        .reserve_spawn_for_controller(&owner, &controller)
+                        .await
+                    {
+                        Err(phoenix_tools::bash::BashHandleError::SpawnFenced) => break,
+                        Ok(reservation) => drop(reservation),
+                        Err(error) => panic!("unexpected admission error: {error}"),
+                    }
+                    assert!(
+                        !reconciliation.is_finished(),
+                        "reconciliation bypassed controller retirement"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("reconciliation closes the exact controller gate");
+            assert!(!reconciliation.is_finished());
+            assert_eq!(
+                manager
+                    .db()
+                    .get_conversation(&parent.id)
+                    .await
+                    .unwrap()
+                    .state,
+                parent_state
+            );
+            let accepted: Option<i64> = sqlx::query_scalar(
+                "SELECT parent_accepted_at_unix_micros FROM sub_agent_runs WHERE child_conversation_id = ?1",
+            ).bind(child_id).fetch_one(manager.db().pool()).await.unwrap();
+            assert!(accepted.is_none());
+            drop(lease);
+            reconciliation.await.unwrap().unwrap();
+            assert_eq!(
+                manager
+                    .db()
+                    .get_conversation(&parent.id)
+                    .await
+                    .unwrap()
+                    .state,
+                ConvState::Idle
+            );
+            let accepted: Option<i64> = sqlx::query_scalar(
+                "SELECT parent_accepted_at_unix_micros FROM sub_agent_runs WHERE child_conversation_id = ?1",
+            ).bind(child_id).fetch_one(manager.db().pool()).await.unwrap();
+            assert!(accepted.is_some());
+            assert!(registry.reserve_spawn(&owner).await.is_ok());
+        }
     }
 
     #[tokio::test]
@@ -10968,6 +11737,497 @@ mod scope_liveness_tests {
     }
 
     struct FailingLlm;
+
+    struct CoordinatorParentBashLlm {
+        work_scope_id: String,
+        result: Mutex<Option<serde_json::Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl phoenix_llm::LlmService for CoordinatorParentBashLlm {
+        async fn complete(
+            &self,
+            request: &phoenix_llm::LlmRequest,
+        ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
+            use phoenix_llm::ContentBlock;
+            let result = request
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .find_map(|block| match block {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } if tool_use_id == "parent-bash" => {
+                        Some(serde_json::from_str(content).unwrap())
+                    }
+                    _ => None,
+                });
+            let end_turn = result.is_some();
+            let content = if let Some(result) = result {
+                *self.result.lock().unwrap() = Some(result);
+                ContentBlock::text("Parent command started")
+            } else {
+                ContentBlock::tool_use(
+                    "parent-bash",
+                    "bash",
+                    serde_json::json!({
+                        "op":"run",
+                        "cmd":"for ((i=0; i<600; i++)); do test -e release-parent-bash && break; sleep 0.1; done",
+                        "work_scope_id":self.work_scope_id,
+                        "wait_seconds":0
+                    }),
+                )
+            };
+            Ok(phoenix_llm::LlmResponse::non_streaming(
+                vec![content],
+                end_turn,
+                phoenix_llm::Usage::default(),
+            ))
+        }
+
+        fn model_id(&self) -> &'static str {
+            "claude-sonnet-5"
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // Real parent launch, discovery, inspection, and cleanup.
+    #[tokio::test]
+    async fn coordinator_parent_bash_keeps_coordinator_control_with_initialized_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = db
+            .initialize_coordinator_work_scope(home.to_str().unwrap())
+            .await
+            .unwrap();
+        let llm = Arc::new(CoordinatorParentBashLlm {
+            work_scope_id: scope.work_scope_id.to_string(),
+            result: Mutex::new(None),
+        });
+        let manager = Arc::new(RuntimeManager::new(
+            db,
+            Arc::new(ModelRegistry::for_test_with_sonnet(llm.clone())),
+            PlatformCapability::None {
+                details: "Coordinator Bash does not require a sandbox".into(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        ));
+        let parent = manager
+            .db()
+            .get_or_create_coordinator(
+                Some("claude-sonnet-5"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        let owner = ResourceScopeKey::Work(scope.work_scope_id.clone());
+        assert_eq!(parent.attached_work_scope_id, Some(scope.work_scope_id));
+        let runtime = manager.get_or_create(&parent.id).await.unwrap();
+        manager
+            .send_event(
+                &parent.id,
+                Event::UserMessage {
+                    text: "Start a parent-owned command".into(),
+                    llm_text: None,
+                    images: vec![],
+                    files: vec![],
+                    message_id: "parent-bash-user".into(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut states = runtime.state_rx.clone();
+        let completion = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            states
+                .wait_for(|state| matches!(state, ConvState::Idle | ConvState::Error { .. }))
+                .await
+                .map(|_| ())
+        })
+        .await;
+        let result = llm.result.lock().unwrap().clone();
+        let registered =
+            if let Some(id) = result.as_ref().and_then(|result| result["handle"].as_str()) {
+                manager
+                    .bash_handles()
+                    .get_by_id(&phoenix_tools::bash::handle::HandleId::new(id))
+                    .await
+            } else {
+                None
+            };
+        let discovered = manager.bash_handles().live_coordinator_handles().await;
+        let inspection = if let Some(registered) = &registered {
+            phoenix_tools::process_inspection::assemble_inspection(
+                &registered.handle.handle_id.0,
+                Some(&ResourceScopeKey::Coordinator),
+                None,
+                Some(&phoenix_core::work_scope::EffectiveResourceAccess::new(
+                    parent.id.clone(),
+                    crate::work_scope::ResourceAuthority::Restricted,
+                )),
+                None,
+                manager.bash_handles(),
+            )
+            .await
+        } else {
+            None
+        };
+        #[cfg(target_os = "linux")]
+        let stop = if let Some(registered) = &registered {
+            Some(
+                phoenix_tools::bash::stop_exact_handle_for_scope(
+                    manager.bash_handles(),
+                    &ResourceScopeKey::Coordinator,
+                    &registered.handle.handle_id.0,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        // Release the bounded command before any regression assertion can panic.
+        std::fs::write(home.join("release-parent-bash"), "release").unwrap();
+        if let Some(registered) = &registered {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                registered
+                    .handle
+                    .exit_observer()
+                    .wait_for(Option::is_some)
+                    .await
+                    .map(|_| ())
+            })
+            .await
+            .expect("parent command exits after release")
+            .expect("exit lifecycle remains available");
+        }
+        manager.begin_process_shutdown();
+        manager.drain_process_shutdown().await;
+
+        completion.unwrap().unwrap();
+        assert_eq!(*states.borrow(), ConvState::Idle);
+        assert_eq!(result.unwrap()["status"], "still_running");
+        let registered = registered.expect("real parent Bash handle registered");
+        assert_eq!(registered.owner, owner);
+        assert_eq!(
+            registered.handle.controller_scope,
+            ResourceScopeKey::Coordinator
+        );
+        assert_eq!(registered.handle.working_dir, home);
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].handle_id, registered.handle.handle_id);
+        assert_eq!(inspection.unwrap().owner, owner);
+        #[cfg(target_os = "linux")]
+        stop.unwrap()
+            .expect("Coordinator can stop its exact live handle");
+    }
+
+    struct CoordinatorResearchLlm {
+        requests: Mutex<Vec<phoenix_llm::LlmRequest>>,
+        work_scope_id: String,
+        background_error: Option<bool>,
+        bash_registry: Mutex<Option<Arc<BashHandleRegistry>>>,
+        background_handle: Mutex<Option<(String, Arc<phoenix_tools::bash::handle::Handle>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl phoenix_llm::LlmService for CoordinatorResearchLlm {
+        #[allow(clippy::too_many_lines)] // Scripted real-tool journey and its ordering assertions.
+        async fn complete(
+            &self,
+            request: &phoenix_llm::LlmRequest,
+        ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
+            use phoenix_llm::ContentBlock;
+            let conv_id = &request.telemetry.as_ref().unwrap().conversation_id;
+            let turn = {
+                let mut requests = self.requests.lock().unwrap();
+                let turn = requests
+                    .iter()
+                    .filter(|prior| &prior.telemetry.as_ref().unwrap().conversation_id == conv_id)
+                    .count();
+                requests.push(request.clone());
+                turn
+            };
+            let research = request.system[0]
+                .text
+                .starts_with("You are an inline research agent");
+            let content = match (research, turn) {
+                (false, 0) => ContentBlock::tool_use(
+                    "delegate",
+                    "spawn_agents",
+                    serde_json::json!({"tasks":[{"task":format!("Query SELECT 42 AS evidence, run pwd and write delegated to evidence.txt using WorkScope {}, and report research-evidence-42", self.work_scope_id)}]}),
+                ),
+                (true, 0) => ContentBlock::tool_use(
+                    "research-query",
+                    "query_database",
+                    serde_json::json!({"sql":"SELECT 42 AS evidence"}),
+                ),
+                (true, 1) => {
+                    assert!(request.messages.iter().flat_map(|message| &message.content).any(|block| matches!(block,
+                        ContentBlock::ToolResult { tool_use_id, content, is_error: false, .. }
+                        if tool_use_id == "research-query" && content.contains("42") && content.contains("evidence"))));
+                    ContentBlock::tool_use(
+                        "research-bash",
+                        "bash",
+                        serde_json::json!({"op":"run","cmd": if self.background_error.is_some() { "sleep 300" } else { "pwd; printf delegated > evidence.txt" },"work_scope_id":self.work_scope_id,"wait_seconds": if self.background_error.is_some() { 0 } else { 10 }}),
+                    )
+                }
+                (true, 2) => {
+                    if let Some(error) = self.background_error {
+                        let content = request
+                            .messages
+                            .iter()
+                            .flat_map(|message| &message.content)
+                            .find_map(|block| match block {
+                                ContentBlock::ToolResult {
+                                    tool_use_id,
+                                    content,
+                                    is_error: false,
+                                    ..
+                                } if tool_use_id == "research-bash" => Some(content),
+                                _ => None,
+                            })
+                            .expect("background Bash result");
+                        let value: serde_json::Value = serde_json::from_str(content).unwrap();
+                        assert_eq!(value["status"], "still_running");
+                        let registry = self.bash_registry.lock().unwrap().clone().unwrap();
+                        let registered = registry
+                            .get_by_id(&phoenix_tools::bash::handle::HandleId(
+                                value["handle"].as_str().unwrap().into(),
+                            ))
+                            .await
+                            .unwrap();
+                        assert!(registered.handle.state().await.is_live());
+                        *self.background_handle.lock().unwrap() =
+                            Some((conv_id.clone(), registered.handle));
+                        ContentBlock::tool_use(
+                            "research-result",
+                            if error {
+                                "submit_error"
+                            } else {
+                                "submit_result"
+                            },
+                            if error {
+                                serde_json::json!({"error":"research-evidence-42"})
+                            } else {
+                                serde_json::json!({"result":"research-evidence-42"})
+                            },
+                        )
+                    } else {
+                        assert!(request.messages.iter().flat_map(|message| &message.content).any(|block| matches!(block,
+                        ContentBlock::ToolResult { tool_use_id, content, is_error: false, .. }
+                        if tool_use_id == "research-bash" && content.contains("exited") && content.contains("evidence.txt"))), "child request: {request:#?}");
+                        ContentBlock::tool_use(
+                            "research-result",
+                            "submit_result",
+                            serde_json::json!({"result":"research-evidence-42"}),
+                        )
+                    }
+                }
+                (false, 1) => {
+                    if self.background_error.is_some() {
+                        let (child_id, handle) =
+                            self.background_handle.lock().unwrap().clone().unwrap();
+                        let stopped_before_resume = handle.state().await.is_terminal();
+                        let registry = self.bash_registry.lock().unwrap().clone().unwrap();
+                        // Settle the fixture's process before a regression assertion can panic.
+                        registry
+                            .retire_unattached_controller(&child_id)
+                            .await
+                            .unwrap();
+                        assert!(
+                            stopped_before_resume,
+                            "parent resumed while exact child Bash process remained live"
+                        );
+                    }
+                    assert!(
+                        request
+                            .messages
+                            .iter()
+                            .flat_map(|message| &message.content)
+                            .any(|block| matches!(block,
+                        ContentBlock::ToolResult { tool_use_id, content, .. }
+                        if tool_use_id == "delegate" && content.contains("research-evidence-42"))),
+                        "parent request: {request:#?}"
+                    );
+                    ContentBlock::text("Research received")
+                }
+                _ => panic!("unexpected research round trip"),
+            };
+            let end_turn = matches!(content, ContentBlock::Text { .. });
+            Ok(phoenix_llm::LlmResponse::non_streaming(
+                vec![content],
+                end_turn,
+                phoenix_llm::Usage::default(),
+            ))
+        }
+
+        fn model_id(&self) -> &'static str {
+            "claude-sonnet-5"
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_inline_research_queries_runs_bash_and_returns_through_normal_fan_in() {
+        coordinator_inline_research_round_trip(None).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn coordinator_inline_research_result_and_error_stop_background_bash_before_parent_resumes(
+    ) {
+        for error in [false, true] {
+            coordinator_inline_research_round_trip(Some(error)).await;
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // One fixture proves delegation, tool execution, and fan-in.
+    async fn coordinator_inline_research_round_trip(background_error: Option<bool>) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = db
+            .initialize_coordinator_work_scope(home.to_str().unwrap())
+            .await
+            .unwrap();
+        let llm = Arc::new(CoordinatorResearchLlm {
+            requests: Mutex::new(Vec::new()),
+            work_scope_id: scope.work_scope_id.to_string(),
+            background_error,
+            bash_registry: Mutex::new(None),
+            background_handle: Mutex::new(None),
+        });
+        let manager = Arc::new(RuntimeManager::new(
+            db,
+            Arc::new(ModelRegistry::for_test_with_sonnet(llm.clone())),
+            PlatformCapability::None {
+                details: "no sandbox needed for research".into(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        ));
+        *llm.bash_registry.lock().unwrap() = Some(manager.bash_handles().clone());
+        manager.start_sub_agent_handler().await;
+        let parent = manager
+            .db()
+            .get_or_create_coordinator(
+                Some("claude-sonnet-5"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        let handle = manager.get_or_create(&parent.id).await.unwrap();
+        manager
+            .send_event(
+                &parent.id,
+                Event::UserMessage {
+                    text: "Delegate this research".into(),
+                    llm_text: None,
+                    images: vec![],
+                    files: vec![],
+                    message_id: "research-user".into(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut states = handle.state_rx.clone();
+        let completion = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            states
+                .wait_for(|state| matches!(state, ConvState::Idle | ConvState::Error { .. }))
+                .await
+                .map(|_| ())
+        })
+        .await;
+        if background_error.is_some() {
+            let child_ids: HashSet<_> = llm
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| {
+                    request.system[0]
+                        .text
+                        .starts_with("You are an inline research agent")
+                })
+                .map(|request| request.telemetry.as_ref().unwrap().conversation_id.clone())
+                .collect();
+            for child_id in child_ids {
+                manager
+                    .bash_handles()
+                    .retire_unattached_controller(&child_id)
+                    .await
+                    .unwrap();
+            }
+        }
+        completion
+            .expect("research and parent fan-in complete")
+            .expect("parent runtime remains available");
+        assert_eq!(*states.borrow(), ConvState::Idle);
+        let requests = llm.requests.lock().unwrap().clone();
+        if background_error.is_none() {
+            assert_eq!(
+                std::fs::read_to_string(home.join("evidence.txt")).unwrap(),
+                "delegated"
+            );
+        }
+        assert_eq!(requests.len(), 5);
+        let child_requests: Vec<_> = requests
+            .iter()
+            .filter(|request| {
+                request.system[0]
+                    .text
+                    .starts_with("You are an inline research agent")
+            })
+            .collect();
+        assert_eq!(child_requests.len(), 3);
+        for request in &child_requests {
+            let tools: std::collections::BTreeSet<_> = request
+                .tool_availability
+                .declarations()
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect();
+            assert_eq!(
+                tools,
+                std::collections::BTreeSet::from([
+                    "think",
+                    "query_database",
+                    "search_conversations",
+                    "read_conversation",
+                    "resolve_reference",
+                    "read_file",
+                    "bash",
+                    "submit_result",
+                    "submit_error"
+                ])
+            );
+        }
+        let child_id = &child_requests[0]
+            .telemetry
+            .as_ref()
+            .unwrap()
+            .conversation_id;
+        let child = manager.db().get_conversation(child_id).await.unwrap();
+        assert_eq!(child.runtime_role, crate::work_scope::RuntimeRole::SubAgent);
+        assert_eq!(
+            child.parent_conversation_id.as_deref(),
+            Some(parent.id.as_str())
+        );
+        assert!(child.attached_work_scope_id.is_none());
+        assert!(child.cwd.is_empty());
+        if background_error == Some(true) {
+            assert!(matches!(child.state, ConvState::Failed { .. }));
+        } else {
+            assert!(matches!(child.state, ConvState::Completed { .. }));
+        }
+        manager.begin_process_shutdown();
+        manager.drain_process_shutdown().await;
+    }
 
     #[async_trait::async_trait]
     impl phoenix_llm::LlmService for FailingLlm {

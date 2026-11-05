@@ -2,7 +2,7 @@
 
 ## Requirements Summary
 
-Phoenix Coordinator is one durable, chat-first Phoenix-wide conversation for surveying unrelated work, inspecting relevant history, and sending useful text guidance to existing conversations. The Coordinator obtains fresh relational facts on demand through `query_database`; ordinary requests contain no automatically injected activity snapshot. Both the Coordinator and write-capable ordinary ProductConversations receive bounded natural-language history search, conversation reading, read-only operational SQLite, and singular cross-conversation messaging; stable reference resolution remains Coordinator-only.
+Phoenix Coordinator is one durable, chat-first Phoenix-wide conversation for surveying unrelated work, inspecting relevant history, and sending useful text guidance to existing conversations. The Coordinator obtains fresh relational facts on demand through `query_database`; ordinary requests contain no automatically injected activity snapshot. Both the Coordinator and write-capable ordinary ProductConversations receive bounded natural-language history search, conversation reading, read-only operational SQLite, and singular cross-conversation messaging; stable reference resolution also serves inline Coordinator research children.
 
 The Coordinator has host capabilities that can perform mutations: singular text-message delivery to an existing non-Coordinator conversation, unsandboxed Bash targeted to an explicit active WorkScope, and durable static-SVG publication from a contained regular file staged beneath that same server-resolved WorkScope root. A Coordinator-only built-in skill provides non-exhaustive best-practice recipes for user-authorized public Phoenix HTTP API actions through scoped Bash. Other supported public operations require inspected current deployment/source contracts applicable to the destination and user authority. Those calls preserve normal destination authentication, transport, credential, scoped execution, target/intent, endpoint-specific retry, and server-enforcement boundaries and require fresh-read plus response/resulting-state verification. Message delivery reuses the normal chat acceptance authority, so each target independently reports delivered, queued as steering, or rejected. Acceptance never implies that the receiving agent understood, acknowledged, executed, or completed the instruction.
 
@@ -12,11 +12,37 @@ Standing Coordinator Authority is specified separately in `specs/coordinator-aut
 
 ## Technical Summary
 
+Ember exposes `spawn_agents` with configured workers, tiers, and model routes.
+Inline research children receive bounded SQL, history search, transcript reads,
+reference resolution, explicit WorkScope-targeted file reads and unsandboxed
+write-capable Coordinator Bash, thinking, and terminal submission. Bash runs
+require an explicit active scope: the Coordinator home for general shell work,
+or a selected project scope. Explore spawn mode does not sandbox this tool.
+The assignment and existing user authority govern permitted actions. Children have no default filesystem,
+WorkScope, MCP, messaging, watches, Authority tools, or lifecycle actions. Durable
+Coordinator parent identity restores this capability on runtime recreation.
+ADR-227 records the boundary, superseding ADR-226.
+
+Each filesystem-free inline child's Bash controller closes before terminal
+delivery and parent acceptance, including durable-result reconciliation. One
+cancellation-resistant cleanup joins admitted launches through payload release
+or bounded unregistered settlement, then attempts bounded incarnation-bound
+cleanup of that child's handles across selected WorkScopes. A parent-cancellation
+backstop joins the same operation. Parent requests, per-child timeouts and direct
+child cancellation fence admission before event dispatch without waiting for
+pending launch custody. Terminal recreation closes the controller,
+while nonterminal recreation preserves admission. WorkScopes retain ownership,
+inventory and tombstones; sibling and parent commands are unaffected. Safe
+signaling is Linux-only; unsupported hosts report incomplete cleanup without a
+raw PID fallback. Neither full descendant reaping nor restart cleanup is promised
+(ADR-228). Parent, child and spawn-tool guidance requires needed command results
+before submission and assigns persistent services to parent or ordinary Work ownership.
+
 Coordinator LLM requests contain the stable language-specific system prompt without an automatic current-activity capsule. The Check in & drive composer action requests a fresh, broad check but selective intervention: leave healthy progress alone, do not treat idle owners as stalled, and avoid redundant nudges or re-planning to show activity. It asks the Coordinator to recover unanswered user decisions from history and verify they remain unresolved and material, advancing independent authorized work before asking the user with context and a recommendation. Repeated check-ins do not expand authority or reset decisions, pauses or gates. The requested briefing puts still-needed user input first, then material changes as problem, intervention and direction, without a mandatory template or announcements for factual watch events. ADR-149 records selective check-ins; ADR-150 refines blocked-work recovery and concrete reporting. Both system variants now distinguish blocked waiting from healthy progress, reconcile later decisions and completed work before replaying answers, and illustrate plain language with hypothetical bad/good pairs. Unsolicited reports require user action, a meaningful goal-level result or a changed blocker/risk; hypothetical examples explicitly choose silence for routine checks and sends. Requested check-ins retain an executive view. The button carries the same recovery policy without duplicating examples. The recovery/reporting base retains its pre-refinement word and character ceilings. The proposed outcome-delegation addition is bounded separately and increases both overall prompt variants; the user accepted that tradeoff as an exception to the earlier same-size request. These are prompt instructions, not guarantees of model behavior; the action adds no authority or indefinite polling. The Coordinator receives its stable instance-owned home scope ID/path as server-generated context; selected worker scope facts are still requested through `query_database`. ADR-066 records removal of the per-request snapshot and its dedicated runtime wiring.
 
 The host-bound `query_database` tool provides operator-level forensic reads of Phoenix application tables, including hidden messages and sensitive records that may not be visible in normal UI, while denying known credential-bearing columns for owner sessions, share tokens, MCP OAuth secrets and tokens, and federation credential verifiers. This is not a general security sandbox. The database still exposes legacy project-named rows and fields; normative orientation identifies ProductConversation and WorkScope, with repository context derived through WorkScope rather than a Project grouping. It executes one statement on a separate read-only connection. SQLite authorization denies mutation, connection-changing operations, internal and FTS shadow storage, filesystem and extension functions, while SQL/column/row/serialized-output/time bounds protect system stability. Results use typed cells and report truncation.
 
-Natural-language message search, bounded transcript reads, and the shared cross-conversation message service are available to write-capable ordinary ProductConversations and the Coordinator. The Coordinator also receives the existing parent-conversation `ask_user_question` tool and uses the shared request-bound web question panel. Durable reference resolution remains Coordinator-only. Restricted planning conversations and sub-agents receive none of these global tools. Coordinator also receives unsandboxed Bash with an explicit active WorkScope ID whose canonical cwd Phoenix resolves server-side. It may publish a static SVG staged beneath that same active root; this grants only a descriptor-relative no-follow source read, while the existing durable publisher retains the Coordinator transcript and exact invocation as owner. The Coordinator registry remains builtin-only. Dedicated `create_conversation` and `rename_conversation` adapters use shared application actions with durable request identity, trusted provenance, and naming revision fences (ADR-191). Bounded integrated qualification is recorded below by revision; source review alone does not establish a test pass. Ambient/default filesystem access, browser, MCP, task, repository, workspace, approval, and other lifecycle mutation tools remain excluded.
+Natural-language message search, bounded transcript reads, and the shared cross-conversation message service are available to write-capable ordinary ProductConversations and the Coordinator. The Coordinator also receives the existing parent-conversation `ask_user_question` tool and uses the shared request-bound web question panel. Durable reference resolution also serves inline Coordinator research children. Restricted planning conversations and ordinary sub-agents receive none of these global tools. Coordinator also receives unsandboxed Bash with an explicit active WorkScope ID whose canonical cwd Phoenix resolves server-side. It may publish a static SVG staged beneath that same active root; this grants only a descriptor-relative no-follow source read, while the existing durable publisher retains the Coordinator transcript and exact invocation as owner. The Coordinator registry remains builtin-only. Dedicated `create_conversation` and `rename_conversation` adapters use shared application actions with durable request identity, trusted provenance, and naming revision fences (ADR-191). Bounded integrated qualification is recorded below by revision; source review alone does not establish a test pass. Ambient/default filesystem access, browser, MCP, task, repository, workspace, approval, and other lifecycle mutation tools remain excluded.
 
 The separately specified ordinary-parent predecessor capability (REQ-RET-009,
 ADR-051) does not grant global authority to restricted planning parents. It is
@@ -61,6 +87,35 @@ The failed `8f10d54d` packet was correctly stopped by the host; the earlier stat
 
 ## Verification Summary
 
+The inline-research regression exercises delegation, real bounded SQLite and Bash
+tool dispatch, terminal submission, and normal parent fan-in using a deterministic
+model. It asserts the exact nine-tool child surface, a real file write beneath the
+explicit Coordinator home target, and persisted absence of ambient cwd and
+WorkScope attachment. Companion regressions cover missing/invalid Bash targets,
+child handle inspection, explicit file paging, parallel research, rejected
+Work/cwd requests before admission, and model selection in the Coordinator schema.
+Reducer regressions cover mixed result/error submissions and stale task proposals
+from children without a default directory: each rejected round persists matching
+error results and requests another model turn without executing tools or notifying
+the parent prematurely.
+
+Local macOS qualification passed 57 registry tests, 11 native-launcher tests
+using the required existing launcher, and 11 focused runtime tests. Runtime
+coverage includes causal live delivery and common acceptance ordering,
+parent-cancellation cleanup, durable database acceptance, ordinary/unrelated
+isolation, terminal versus Interrupted/Recreate behavior, and real foreground
+Bash delegation. Two ordering regressions failed before the cleanup hooks were
+added. Linux real-background SIGKILL/tombstone and result/error-before-parent-resume
+regressions run in hosted CI; [PR #1027](https://github.com/scottopell/phoenix-ide/pull/1027)
+carries exact-head Linux and macOS results.
+The earlier mixed-terminal/task-proposal fix passed 210 state-machine tests.
+Five cancellation-boundary regressions pass locally; disabling the start hooks
+makes four fail while ordinary Work isolation still passes. The initialized-home
+parent regression fails with WorkScope controller identity and passes with
+Coordinator control; the real child Bash round-trip and cleanup-order regressions
+also pass. These local results do not establish Linux signaling, deployment or
+measured token savings.
+
 The bounded API-guidance candidate (ADR-113) replaces an accidental recipe allowlist with non-exhaustive contract-grounded guidance and documents submitting exact user-provided answers or decisions made within explicit delegated decision scope through the existing structured-question response endpoint. Generic inspect/unblock instructions are not decision authority; approvals must never be fabricated or delegation extended. Gap inventories are illustrative and qualified by inspected deployment/source, permitting verified supported alternatives and bounded state reads, not invented guarantees/receipts, database/private-handler bypasses, or background monitors. It does not add tool or runtime capabilities. The recipe distinguishes current request freshness from idempotency, requires complete answers despite the backend's lack of completeness enforcement, posts once, and reconciles uncertainty against the original target without treating conflicts as success. Source/wire/UI anchors and offline Python drift checks are described in `../builtin-skills/executive.md`. Prompt/built-in/continuation Rust regressions are authored but intentionally unrun locally; no live API/question calls, instruction activation, merge or deployment are claimed.
 
 The Coordinator dispatch regression checks that successive requests with changing transcript evidence retain exactly one stable system block and the same conversation cache key. Shared global-query and Bash-target tests retain coverage of explicit fact discovery and authoritative scope validation.
@@ -84,7 +139,7 @@ The Coordinator runs on user turns and explicit watch notifications. Watches fol
 ## Out of Scope
 
 - Database writes, attached databases, extensions, filesystem functions, or SQLite internal and FTS shadow storage.
-- Phoenix-wide tools for restricted planning conversations or sub-agents.
+- Phoenix-wide tools for restricted planning conversations or ordinary sub-agents; Coordinator children receive bounded global readers and explicitly targeted Bash.
 - Images, files, skills, user-agent metadata, or lifecycle commands in cross-conversation messages.
 - Batch-action transactions or atomic fan-out.
 - Dedicated conversation-creation, task-lifecycle, approval, repository, filesystem, or workspace mutation tools for the Coordinator; user-authorized supported HTTP APIs remain available only through explicitly targeted Bash. The inspected source's recipe gaps include aggregate-targeted lifecycle operations, uniform operation receipts, general conversation retry, and caller-idempotent cancel; this illustrative inventory is not a deployment-wide denylist. Verify the selected deployment/source contract before relying on a gap or a supported alternative.

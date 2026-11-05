@@ -78,7 +78,7 @@ pub struct SubAgentRunAdmission {
 pub struct SubAgentChildAdmission {
     pub run: SubAgentRunAdmission,
     pub slug: String,
-    pub cwd: String,
+    pub environment: phoenix_core::domain::sm_state::ConversationExecutionEnvironment,
     pub model: String,
     pub conv_mode: ConvMode,
     pub llm_language: phoenix_core::llm_language::LlmLanguage,
@@ -456,7 +456,10 @@ impl Database {
         validate_batch_input(&lifecycle)?;
         if batch.children.iter().any(|child| {
             child.slug.trim().is_empty()
-                || child.cwd.trim().is_empty()
+                || child
+                    .environment
+                    .working_dir()
+                    .is_some_and(|cwd| cwd.as_os_str().is_empty())
                 || child.model.trim().is_empty()
                 || child.connection.trim().is_empty()
                 || child.initial_message_id.trim().is_empty()
@@ -482,7 +485,7 @@ impl Database {
         }
 
         let parent = sqlx::query(
-            "SELECT work_scope_id, product_conversation_id FROM conversations WHERE id = ?1",
+            "SELECT work_scope_id, product_conversation_id, runtime_role FROM conversations WHERE id = ?1",
         )
         .bind(&batch.parent_conversation_id)
         .fetch_optional(&mut *tx)
@@ -499,6 +502,22 @@ impl Database {
             ));
         }
         let product_conversation_id: String = parent.try_get("product_conversation_id")?;
+        let coordinator_parent = parent.try_get::<String, _>("runtime_role")? == "coordinator";
+        for child in &batch.children {
+            if child.environment.working_dir().is_none() != coordinator_parent
+                || (coordinator_parent
+                    && (child.run.execution_authority != SubAgentExecutionAuthority::ReadOnly
+                        || !matches!(
+                            child.conv_mode,
+                            ConvMode::Explore {
+                                worktree_path: None,
+                                ..
+                            }
+                        )))
+            {
+                return Err(lifecycle_conflict("Coordinator children require Explore mode without an ambient filesystem or WorkScope; ordinary children require a filesystem"));
+            }
+        }
         let now = Utc::now();
         let now_text = now.to_rfc3339();
         let idle = serde_json::to_string(&ConvState::Idle)
@@ -566,8 +585,20 @@ impl Database {
             .bind(cm.task_id)
             .bind(cm.task_title)
             .bind(cm.next_taskmd_id_hint)
-            .bind(batch.parent_scope.as_ref().map(WorkScopeId::as_str))
-            .bind(&child.cwd)
+            .bind(match &child.environment {
+                phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem => {
+                    None
+                }
+                phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
+                    ..
+                } => batch.parent_scope.as_ref().map(WorkScopeId::as_str),
+            })
+            .bind(
+                child
+                    .environment
+                    .working_dir()
+                    .map(|cwd| cwd.to_string_lossy().into_owned()),
+            )
             .bind(ServiceTier::Standard.as_wire_name())
             .execute(&mut *tx)
             .await?;
@@ -1577,7 +1608,10 @@ mod tests {
                     execution_authority: SubAgentExecutionAuthority::WriteCapable,
                 },
                 slug: "child".to_string(),
-                cwd: "/tmp".to_string(),
+                environment:
+                    phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
+                        working_dir: "/tmp".into(),
+                    },
                 model: "gpt-5.6-luna".to_string(),
                 conv_mode: ConvMode::Explore {
                     worktree_path: None,
@@ -1600,6 +1634,93 @@ mod tests {
             .await
             .unwrap()
             .attached_work_scope_id
+    }
+
+    #[tokio::test]
+    async fn coordinator_research_admission_persists_no_filesystem_or_scope() {
+        for with_home in [false, true] {
+            let db = Database::open_in_memory().await.unwrap();
+            if with_home {
+                db.initialize_coordinator_work_scope("/owned/coordinator")
+                    .await
+                    .unwrap();
+            }
+            let parent = db
+                .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+                .await
+                .unwrap();
+            assert_eq!(parent.attached_work_scope_id.is_some(), with_home);
+            let mut batch = atomic_batch("research", parent.attached_work_scope_id);
+            batch.parent_conversation_id = parent.id;
+            batch.children[0].run.execution_authority = SubAgentExecutionAuthority::ReadOnly;
+            batch.children[0].environment =
+                phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem;
+            db.admit_sub_agent_batch_atomically(&batch)
+                .await
+                .established()
+                .unwrap()
+                .unwrap();
+            let child = db.get_conversation("child").await.unwrap();
+            assert!(child.cwd.is_empty());
+            assert!(child.attached_work_scope_id.is_none());
+            let cwd: Option<String> = sqlx::query_scalar(
+                "SELECT sub_agent_cwd_override FROM conversations WHERE id = 'child'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(cwd, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn research_admission_rejects_ordinary_parent_or_coordinator_workspace_overrides() {
+        use phoenix_core::domain::sm_state::ConversationExecutionEnvironment;
+        for invalid in ["ordinary", "filesystem", "work", "direct"] {
+            let db = Database::open_in_memory().await.unwrap();
+            let mut batch = if invalid == "ordinary" {
+                let scope = atomic_parent(&db).await;
+                atomic_batch("invalid", scope)
+            } else {
+                let parent = db
+                    .get_or_create_coordinator(
+                        None,
+                        phoenix_core::llm_language::LlmLanguage::default(),
+                    )
+                    .await
+                    .unwrap();
+                let mut batch = atomic_batch("invalid", None);
+                batch.parent_conversation_id = parent.id;
+                batch
+            };
+            batch.children[0].environment = if invalid == "filesystem" {
+                ConversationExecutionEnvironment::Filesystem {
+                    working_dir: "/tmp".into(),
+                }
+            } else {
+                ConversationExecutionEnvironment::NoFilesystem
+            };
+            batch.children[0].run.execution_authority = if invalid == "work" {
+                SubAgentExecutionAuthority::WriteCapable
+            } else {
+                SubAgentExecutionAuthority::ReadOnly
+            };
+            if invalid == "direct" {
+                batch.children[0].conv_mode = ConvMode::Direct;
+            }
+            assert!(
+                db.admit_sub_agent_batch_atomically(&batch)
+                    .await
+                    .established()
+                    .unwrap()
+                    .is_err(),
+                "{invalid}"
+            );
+            assert!(
+                db.get_conversation("child").await.is_err(),
+                "no partial child: {invalid}"
+            );
+        }
     }
 
     #[tokio::test]

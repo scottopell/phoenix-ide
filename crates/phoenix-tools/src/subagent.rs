@@ -111,6 +111,7 @@ pub struct SpawnAgentsTool {
     tiers: Vec<String>,
     models: Vec<SpawnModelChoice>,
     parallel_work_subagents: bool,
+    coordinator_research: bool,
 }
 
 impl SpawnAgentsTool {
@@ -139,6 +140,7 @@ impl SpawnAgentsTool {
             tiers,
             models,
             parallel_work_subagents: false,
+            coordinator_research: false,
         }
     }
 
@@ -149,6 +151,27 @@ impl SpawnAgentsTool {
                 resolved_parent_model_id,
             );
         self
+    }
+
+    #[must_use]
+    pub fn for_coordinator(mut self) -> Self {
+        self.coordinator_research = true;
+        self
+    }
+
+    fn configure_task_schema(&self, task_props: &mut Value) {
+        if self.coordinator_research {
+            task_props
+                .as_object_mut()
+                .expect("task properties")
+                .remove("cwd");
+            task_props["mode"] = json!({
+                "type": "string", "enum": ["explore"],
+                "description": "Coordinator delegation (default). Includes unsandboxed Bash with explicit WorkScope targets; no ambient filesystem or Work-mode workspace."
+            });
+            task_props["max_turns"]["description"] =
+                json!("Maximum LLM turns before forced completion. Defaults to 20.");
+        }
     }
 
     fn work_guidance(&self) -> &'static str {
@@ -167,6 +190,9 @@ impl Tool for SpawnAgentsTool {
     }
 
     fn description(&self) -> String {
+        if self.coordinator_research {
+            return "Delegate bounded research, analysis, and authorized shell work to trusted inline agents and receive their results in this conversation. Children can query_database, search_conversations, read_conversation, resolve_reference, read_file, and bash. File reads and Bash runs require an explicit active work_scope_id; supply the Coordinator home scope for general work or a project scope for project work. Bash is unsandboxed and write-capable, even though the spawn mode is explore. Children have no default directory, MCP, messaging, watches, Authority, or lifecycle tools and cannot spawn children. Define the assignment and authorized actions explicitly; request concise evidence and citations. Require children to wait for and collect needed command results before terminal submission. Do not rely on child background commands surviving termination; keep persistent services under parent or ordinary Work ownership. Use an available execution tier or model connection to control cost. Omit execution to inherit the selected worker's preferences or the parent model. Mode is explore only; cwd is not supported. Up to 10 tasks run in parallel; the parent resumes after all finish.".into();
+        }
         format!(
             "Spawn sub-agents to execute tasks. Explore sub-agents may run in parallel. {} Each sub-agent has an independent conversation and returns its own result. Work sub-agents use the resolved task cwd directly. An omitted or blank cwd inherits the parent cwd; Work/Branch overrides stay within the parent worktree, while Direct overrides are unscoped. Phoenix does not create a separate child worktree or merge child changes. Omit agent_type for a generic Phoenix sub-agent, or set agent_type to one of the available named personas. Omit execution to use the named worker's preferences, or otherwise inherit the parent's model, connection, and effort. Choose a configured tier or an explicit model connection to override execution. Execution selection is independent of permissions. Use for: multiple perspectives on code review, exploring unfamiliar parts of a codebase, parallel research or analysis tasks, or divide-and-conquer problem solving.",
             self.work_guidance()
@@ -198,6 +224,8 @@ impl Tool for SpawnAgentsTool {
                 "description": "Maximum LLM turns before forced completion. Defaults to 20 (explore) or 50 (work)."
             }
         });
+
+        self.configure_task_schema(&mut task_props);
 
         let mut execution_options = Vec::new();
         if !self.tiers.is_empty() {

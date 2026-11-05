@@ -127,6 +127,8 @@ pub(super) fn native_context(transcript: &str) -> ToolContext {
         Arc::new(Offline),
         phoenix_terminal::ActiveTerminals::new(),
         Arc::new(phoenix_tools::TmuxRegistry::new()),
+        phoenix_core::work_scope::ResourceScopeKey::Coordinator,
+        phoenix_core::work_scope::ResourceAuthority::Work,
     )
     .with_svg_assistant_message_id("native-message")
     .with_tool_use_id("native-call")
@@ -172,6 +174,8 @@ pub(super) fn native_context_without_source_identity(transcript: &str) -> ToolCo
         Arc::new(Offline),
         phoenix_terminal::ActiveTerminals::new(),
         Arc::new(phoenix_tools::TmuxRegistry::new()),
+        phoenix_core::work_scope::ResourceScopeKey::Coordinator,
+        phoenix_core::work_scope::ResourceAuthority::Work,
     )
 }
 
