@@ -10,6 +10,7 @@ mod browser_view;
 mod chains;
 pub mod codex_login;
 mod deployment;
+mod deployment_observations;
 mod discovery;
 mod event_presentation;
 pub(crate) mod federation;

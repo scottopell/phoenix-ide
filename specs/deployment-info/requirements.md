@@ -433,6 +433,31 @@ database."
 
 ---
 
+### REQ-DEPLOY-005A: Observe available filesystem space independently
+
+THE SYSTEM SHALL provide an authenticated observation surface for available bytes
+on the server filesystems used by its database, data directory, temporary
+directory, and configured structured-log and fatal-diagnostic destinations.
+
+THE SYSTEM SHALL sample available-to-process space without querying SQLite or
+walking directory contents, deduplicate observations of the same filesystem, and
+preserve every represented server-local location. WHEN a destination does not
+exist, THE SYSTEM SHALL identify the existing ancestor actually sampled. WHEN a
+location or filesystem measurement fails, THE SYSTEM SHALL report that location's
+measurement as unavailable with a bounded error category rather than zero bytes.
+
+THE SYSTEM SHALL expose each filesystem's sample time separately from the
+response observation time, show its sample age, and provide an independent manual
+refresh. WHEN refresh fails, THE SYSTEM SHALL retain the last successful sample
+with a stale label, or label the observation unavailable if no sample exists.
+
+WHEN available space is below the displayed warning threshold, THE SYSTEM SHALL
+show an observation-only low-space warning. THE SYSTEM SHALL state that available
+space provides no write-success guarantee. These observations SHALL NOT control
+admission, draining, reopening, cleanup, retries, or readiness.
+
+---
+
 ### REQ-DEPLOY-006: Surface logging destinations, never their contents
 
 THE SYSTEM SHALL report every configured structured-log sink and the bounded
@@ -468,6 +493,30 @@ process-owned sink; it exists only for failures such as loader rejection that
 happen before the process can install its hook. The reported destinations are
 derived from the same immutable configuration that drives their writers, so the
 report and the wiring cannot disagree.
+
+---
+
+### REQ-DEPLOY-006A: Observe persistence-boundary and diagnostic-sink failures
+
+THE SYSTEM SHALL retain bounded process-local failure counts and latest observed
+times for required ordinary tool settlement, required startup authority,
+disappearing settlement owners, and other local-authority failure boundaries.
+These observations SHALL identify bounded boundary categories without claiming
+an exact failed SQL statement or storage error provenance unavailable there.
+
+THE SYSTEM SHALL separately observe structured-log and stdout write and flush
+errors, fatal-diagnostic write failures, nonblocking structured-log queue drops,
+and supported configured trace-export results. THE SYSTEM SHALL distinguish
+unconfigured sinks and unavailable exporter observation capabilities from sinks
+with no observed failure. THE SYSTEM SHALL NOT imply that no observed failure
+proves successful persistence, logging, export, or process health.
+
+Failure observations SHALL require no database or file writes, retain no payloads,
+transcripts, secrets, or unbounded error strings, emit no recursive diagnostics,
+and introduce no wait before the existing fatal authority close or cutoff.
+They SHALL be readable through the authenticated observation surface, survive
+failure of diagnostic sinks within that process, and reset on process replacement.
+They SHALL NOT own or repair runtime correctness.
 
 ---
 

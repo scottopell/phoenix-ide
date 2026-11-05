@@ -12,6 +12,7 @@ const { apiMock } = vi.hoisted(() => ({
   apiMock: {
     deploymentInfo: vi.fn(),
     deploymentDiskInfo: vi.fn(),
+    deploymentObservations: vi.fn().mockRejectedValue(new Error('observations unavailable')),
     deploymentResources: vi.fn(),
     deploymentSqliteWorkload: vi.fn(),
     cleanupManagedWorktree: vi.fn(),
@@ -313,6 +314,7 @@ describe('AboutDeploymentPage resource helpers', () => {
 describe('AboutDeploymentPage disk usage health', () => {
   beforeEach(() => {
     apiMock.deploymentInfo.mockReset();
+    apiMock.deploymentObservations.mockReset().mockRejectedValue(new Error('observations unavailable'));
     apiMock.deploymentDiskInfo.mockReset();
     apiMock.deploymentResources.mockReset();
     apiMock.deploymentSqliteWorkload.mockReset().mockResolvedValue(sqliteReport());
@@ -336,6 +338,23 @@ describe('AboutDeploymentPage disk usage health', () => {
     vi.clearAllTimers();
     vi.useRealTimers();
     vi.clearAllMocks();
+  });
+
+  it('shows operational observations independently of failed deployment and disk inventory requests', async () => {
+    apiMock.deploymentInfo.mockRejectedValue(new Error('facts offline'));
+    apiMock.deploymentDiskInfo.mockRejectedValue(new Error('inventory offline'));
+    apiMock.deploymentResources.mockResolvedValue(resourcesSnapshot());
+    apiMock.deploymentObservations.mockResolvedValue({
+      observed_at: '2026-11-05T10:00:01Z', filesystems: [], measurement_errors: [], failures: [],
+      low_space_warning_bytes: 1024 ** 3,
+      local_authority_failure_boundary: null,
+      sinks: { structured_queue_drops: null, trace_failure_coverage: 'not_configured', stdout_configured: false, structured_file_configured: false, fatal_diagnostic_configured: false },
+    });
+    render(<MemoryRouter><AboutDeploymentPage /></MemoryRouter>);
+    expect(await screen.findByText(/Deployment facts unavailable — facts offline/)).toBeInTheDocument();
+    expect(await screen.findByText(/Disk inventory unavailable — inventory offline/)).toBeInTheDocument();
+    expect(await screen.findByText(/Counts reset when the process is replaced/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Refresh observations' })).toBeInTheDocument();
   });
 
   it('loads SQLite workload and switches fixed report windows', async () => {
