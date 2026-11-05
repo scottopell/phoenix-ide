@@ -4557,6 +4557,12 @@ mod tests {
         };
         repo.persist_terminal_obligation(&original).await.unwrap();
         repo.persist_terminal_obligation(&original).await.unwrap();
+        let mut different_timestamp = original.clone();
+        different_timestamp.projection.state_updated_at += chrono::Duration::microseconds(1);
+        assert!(repo
+            .persist_terminal_obligation(&different_timestamp)
+            .await
+            .is_err());
         let differing = DirectTurnTerminalObligationInput {
             terminal: TurnTerminal::Failed {
                 reason: "second".to_string(),

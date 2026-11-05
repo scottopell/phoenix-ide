@@ -6116,27 +6116,51 @@ where
                     phoenix_db::SubAgentTerminalCause::Cancelled
                 }
             };
-            if let Err(error) = self
+            let outcome = match self
                 .storage
                 .terminalize_sub_agent_cancellation_backstop(&agent_id, terminal_cause, Utc::now())
                 .await
             {
-                tracing::warn!(%error, %agent_id, "failed to persist cancellation backstop terminal evidence");
-                self.required_settlement_authority = enclosing_authority;
-                self.fatal_local_authority_fence
-                    .close(RequiredSettlementBoundary::ChildBackstop.settlement());
-                authority.owner = None;
-                return;
-            }
-            let event = Event::SubAgentResult {
-                agent_id,
-                outcome: SubAgentOutcome::Failure {
-                    error: "sub-agent did not report within the cancellation deadline \
-                            (presumed terminated)"
-                        .to_string(),
-                    error_kind: crate::db::ErrorKind::Cancelled,
-                },
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(outcome)) => {
+                    outcome
+                }
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+                    tracing::warn!(%error, %agent_id, "cancellation backstop terminal evidence rejected");
+                    let new_state = ConvState::Error {
+                        message: error,
+                        error_kind: crate::db::ErrorKind::SubAgentError,
+                        resets_at: None,
+                    };
+                    self.classify_active_direct_turn_state_terminal(&new_state);
+                    let transition = crate::state_machine::transition::TransitionResult {
+                        new_state,
+                        effects: vec![Effect::PersistState, Effect::notify_state_change()],
+                    };
+                    if let Err(error) = self
+                        .apply_transition_result_with_authority(
+                            transition,
+                            None,
+                            TransitionAuthority::OwnedCompletionFollowup,
+                        )
+                        .await
+                    {
+                        tracing::error!(%error, "failed to establish cancellation backstop error settlement");
+                        self.fatal_local_authority_fence
+                            .close(RequiredSettlementBoundary::ChildBackstop.settlement());
+                    }
+                    self.required_settlement_authority = enclosing_authority;
+                    authority.owner = None;
+                    return;
+                }
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                    self.required_settlement_authority = enclosing_authority;
+                    self.fatal_local_authority_fence
+                        .close(RequiredSettlementBoundary::ChildBackstop.settlement());
+                    authority.owner = None;
+                    return;
+                }
             };
+            let event = Event::SubAgentResult { agent_id, outcome };
             if let Err(e) = self
                 .process_event_with_authority(event, TransitionAuthority::OwnedCompletionFollowup)
                 .await
@@ -10201,17 +10225,27 @@ where
             let content =
                 crate::db::MessageContent::User(crate::db::UserContent::meta(&llm_content));
             let seq = self.broadcast_tx.next_seq();
-            let message = self
-                .storage
-                .add_message_with_seq(
-                    &summary_message_id,
-                    &self.context.conversation_id,
-                    seq,
-                    &content,
-                    Some(&display_data),
-                    None,
-                )
-                .await?;
+            let message = crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
+                message_id: summary_message_id,
+                conversation_id: self.context.conversation_id.clone(),
+                sequence_id: seq,
+                message_type: content.message_type(),
+                content,
+                display_data: Some(display_data),
+                usage_data: None,
+                created_at: Utc::now(),
+            };
+            match self.storage.persist_sub_agent_summary(&message).await {
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                    result?
+                }
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                    self.fatal_local_authority_fence
+                        .close("sub_agent_result_settlement");
+                    return Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: standalone sub-agent summary could not be classified".into());
+                }
+            }
 
             // Broadcast the new message (meta user observation, no bash enrichment needed)
             let _ = self
@@ -23884,6 +23918,411 @@ mod steer_drain_detector_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn standalone_summary_lost_commit_ack_is_classified_before_child_retry_and_survives_reopen(
+    ) {
+        use phoenix_db::{
+            SubAgentBatchAdmission, SubAgentExecutionAuthority, SubAgentRunAdmission,
+            SubAgentTerminalCause,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("summary-ack.db");
+        let db = crate::db::Database::open(path.to_str().unwrap())
+            .await
+            .unwrap();
+        crate::db::run_pending_migrations(db.pool()).await.unwrap();
+        let id = "summary-parent";
+        db.create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation("child", "child", "/tmp", false, Some(id), None)
+            .await
+            .unwrap();
+        db.admit_sub_agent_batch(&SubAgentBatchAdmission {
+            batch_id: "batch".into(),
+            parent_conversation_id: id.into(),
+            parallel_work_qualified: false,
+            runs: vec![SubAgentRunAdmission {
+                child_conversation_id: "child".into(),
+                execution_authority: SubAgentExecutionAuthority::ReadOnly,
+            }],
+        })
+        .await
+        .unwrap();
+        let mut initial = ordinary_completion_state();
+        if let ConvState::ToolExecuting {
+            pending_sub_agents,
+            assistant_message,
+            completed_results,
+            ..
+        } = &mut initial
+        {
+            pending_sub_agents.push(PendingSubAgent {
+                agent_id: "child".into(),
+                task: "authentic work".into(),
+                mode: SubAgentMode::Explore,
+            });
+            assistant_message.content.insert(
+                0,
+                ContentBlock::tool_use("spawn-1", "spawn_agents", serde_json::json!({"tasks": []})),
+            );
+            completed_results.push(ToolResult::success(
+                "spawn-1".into(),
+                "Spawning sub-agents".into(),
+            ));
+        }
+        db.update_conversation_state(id, &initial).await.unwrap();
+        let (event_tx, event_rx) = mpsc::channel(16);
+        let storage = crate::runtime::traits::DatabaseStorage::new(db.clone());
+        storage.lose_summary_ack_once();
+        let mut runtime = ConversationRuntime::new(
+            ConvContext::new(id, PathBuf::from("/tmp"), "test-model", 200_000, 16_384),
+            initial,
+            storage,
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            SseBroadcaster::new(128, 0),
+        );
+        runtime
+            .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Completed(
+                ToolResult::success("tool-1".into(), "bash complete".into()),
+            )))
+            .await
+            .unwrap();
+        assert!(matches!(
+            runtime.state,
+            ConvState::AwaitingSubAgents {
+                spawn_tool_id: None,
+                ..
+            }
+        ));
+        let at = Utc::now();
+        db.update_child_state_and_record_sub_agent_terminal(
+            "child",
+            &ConvState::Completed {
+                result: "authentic result".into(),
+            },
+            at,
+            SubAgentTerminalCause::SubmitResult,
+            at,
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+        let original = Event::SubAgentResult {
+            agent_id: "child".into(),
+            outcome: SubAgentOutcome::Success {
+                result: "authentic result".into(),
+            },
+        };
+        runtime.process_event(original.clone()).await.unwrap();
+        assert!(runtime.sub_agent_result_buffer.is_empty());
+        assert!(!runtime.fatal_local_authority_fence.is_closed());
+        assert!(db.sub_agent_terminal_is_accepted("child").await.unwrap());
+        let messages = db.get_messages(id).await.unwrap();
+        let summaries = messages
+            .iter()
+            .filter(|m| {
+                m.display_data
+                    .as_ref()
+                    .and_then(|v| v.get("type"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("subagent_summary")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(summaries.len(), 1);
+        let summary_id = summaries[0].message_id.clone();
+        let mut broadcasts = runtime.broadcast_tx.subscribe();
+        runtime.process_event(original).await.unwrap();
+        runtime
+            .process_event(Event::RetryBufferedSubAgentResults)
+            .await
+            .unwrap();
+        assert!(runtime.sub_agent_result_buffer.is_empty());
+        assert!(broadcasts.try_recv().is_err());
+        let expected_history = serde_json::to_value(&messages).unwrap();
+        assert_eq!(
+            serde_json::to_value(db.get_messages(id).await.unwrap()).unwrap(),
+            expected_history
+        );
+        runtime.abort_external_effects().await;
+        drop(runtime);
+        db.pool().close().await;
+        let reopened = crate::db::Database::open(path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(reopened.get_messages(id).await.unwrap()).unwrap(),
+            expected_history
+        );
+        assert_eq!(
+            reopened
+                .get_message_by_id(&summary_id)
+                .await
+                .unwrap()
+                .message_id,
+            summary_id
+        );
+    }
+
+    #[tokio::test]
+    async fn unclassified_standalone_summary_closes_authority_before_raw_child_replay() {
+        let initial = ConvState::AwaitingSubAgents {
+            pending: vec![PendingSubAgent {
+                agent_id: "child".into(),
+                task: "work".into(),
+                mode: SubAgentMode::Explore,
+            }],
+            completed_results: vec![],
+            spawn_tool_id: None,
+        };
+        let (mut runtime, storage) =
+            build_runtime_with_state_and_queue("summary-unknown", initial.clone(), vec![]);
+        storage.set_unclassified_sub_agent_summary(true);
+        let result = runtime
+            .process_event(Event::SubAgentResult {
+                agent_id: "child".into(),
+                outcome: SubAgentOutcome::Success {
+                    result: "authentic".into(),
+                },
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(runtime.fatal_local_authority_fence.is_closed());
+        assert!(storage.get_all_messages("summary-unknown").is_empty());
+        assert_eq!(storage.sub_agent_acceptance_count(), 0);
+        assert!(runtime.llm_client.recorded_requests().is_empty());
+        assert!(runtime
+            .process_event(Event::RetryBufferedSubAgentResults)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn definite_backstop_domain_failure_settles_sub_agent_error_without_completion_notice() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let id = "backstop-domain-failure";
+        db.create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let initial = cancelling_state(
+            &["missing-lifecycle"],
+            crate::state_machine::event::CancelCause::UserRequested,
+        );
+        db.update_conversation_state(id, &initial).await.unwrap();
+        let (event_tx, event_rx) = mpsc::channel(16);
+        let mut runtime = ConversationRuntime::new(
+            ConvContext::new(id, PathBuf::from("/tmp"), "test-model", 200_000, 16_384),
+            initial,
+            crate::runtime::traits::DatabaseStorage::new(db.clone()),
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            SseBroadcaster::new(128, 0),
+        );
+        runtime.handle_cancelling_sub_agents_timeout().await;
+        assert!(!runtime.fatal_local_authority_fence.is_closed());
+        assert!(matches!(
+            db.get_conversation(id).await.unwrap().state,
+            ConvState::Error {
+                error_kind: crate::db::ErrorKind::SubAgentError,
+                ..
+            }
+        ));
+        assert!(db.get_messages(id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn native_backstop_racing_authentic_terminal_preserves_outcome_and_accepts_once() {
+        use phoenix_db::{
+            SubAgentBatchAdmission, SubAgentExecutionAuthority, SubAgentRunAdmission,
+            SubAgentTerminalCause,
+        };
+        for (child_state, terminal_cause, expected) in [
+            (
+                ConvState::Completed {
+                    result: "authentic success".into(),
+                },
+                SubAgentTerminalCause::SubmitResult,
+                SubAgentOutcome::Success {
+                    result: "authentic success".into(),
+                },
+            ),
+            (
+                ConvState::Completed {
+                    result: "implicit result".into(),
+                },
+                SubAgentTerminalCause::ImplicitCompletion,
+                SubAgentOutcome::ImplicitCompletion {
+                    result: "implicit result".into(),
+                },
+            ),
+            (
+                ConvState::Failed {
+                    error: "cooperative cancellation".into(),
+                    error_kind: crate::db::ErrorKind::Cancelled,
+                },
+                SubAgentTerminalCause::Cancelled,
+                SubAgentOutcome::Failure {
+                    error: "cooperative cancellation".into(),
+                    error_kind: crate::db::ErrorKind::Cancelled,
+                },
+            ),
+            (
+                ConvState::Failed {
+                    error: "actual timeout".into(),
+                    error_kind: crate::db::ErrorKind::TimedOut,
+                },
+                SubAgentTerminalCause::TimedOut,
+                SubAgentOutcome::TimedOut,
+            ),
+        ] {
+            for cause in [
+                crate::state_machine::event::CancelCause::UserRequested,
+                crate::state_machine::event::CancelCause::Timeout,
+            ] {
+                let db = crate::db::Database::open_in_memory().await.unwrap();
+                let id = "native-backstop-parent";
+                db.create_conversation(id, id, "/tmp", true, None, None)
+                    .await
+                    .unwrap();
+                db.create_conversation("child", "child", "/tmp", false, Some(id), None)
+                    .await
+                    .unwrap();
+                db.admit_sub_agent_batch(&SubAgentBatchAdmission {
+                    batch_id: "batch".into(),
+                    parent_conversation_id: id.into(),
+                    parallel_work_qualified: false,
+                    runs: vec![SubAgentRunAdmission {
+                        child_conversation_id: "child".into(),
+                        execution_authority: SubAgentExecutionAuthority::ReadOnly,
+                    }],
+                })
+                .await
+                .unwrap();
+                let initial = cancelling_state(&["child"], cause);
+                db.update_conversation_state(id, &initial).await.unwrap();
+                let child_at = Utc::now() - chrono::Duration::seconds(1);
+                db.update_child_state_and_record_sub_agent_terminal(
+                    "child",
+                    &child_state,
+                    child_at,
+                    terminal_cause,
+                    child_at,
+                )
+                .await
+                .established()
+                .unwrap()
+                .unwrap();
+                let (event_tx, event_rx) = mpsc::channel(16);
+                let mut runtime = ConversationRuntime::new(
+                    ConvContext::new(id, PathBuf::from("/tmp"), "test-model", 200_000, 16_384),
+                    initial,
+                    crate::runtime::traits::DatabaseStorage::new(db.clone()),
+                    Arc::new(MockLlmClient::new("test-model")),
+                    Arc::new(MockToolExecutor::new()),
+                    Arc::new(BrowserSessionManager::default()),
+                    Arc::new(crate::tools::BashHandleRegistry::new()),
+                    Arc::new(crate::tools::TmuxRegistry::new()),
+                    Arc::new(ModelRegistry::new_empty()),
+                    crate::terminal::ActiveTerminals::new(),
+                    event_rx,
+                    event_tx,
+                    SseBroadcaster::new(128, 0),
+                );
+                let checkpoint = CheckpointData::tool_round(
+                    AssistantMessage::new(
+                        "spawn-assistant".into(),
+                        vec![ContentBlock::tool_use(
+                            "spawn-1",
+                            "spawn_agents",
+                            serde_json::json!({"tasks": []}),
+                        )],
+                        None,
+                        None,
+                    ),
+                    vec![ToolResult::success(
+                        "spawn-1".into(),
+                        "Spawning sub-agents".into(),
+                    )],
+                )
+                .unwrap();
+                runtime
+                    .execute_effect(Effect::PersistCheckpoint { data: checkpoint })
+                    .await
+                    .unwrap();
+                runtime.handle_cancelling_sub_agents_timeout().await;
+                assert!(!runtime.fatal_local_authority_fence.is_closed());
+                assert!(db.sub_agent_terminal_is_accepted("child").await.unwrap());
+                assert!(!matches!(
+                    runtime.state,
+                    ConvState::CancellingSubAgents { .. }
+                ));
+                let messages = db.get_messages(id).await.unwrap();
+                let summary = messages
+                    .iter()
+                    .find(|m| {
+                        m.display_data
+                            .as_ref()
+                            .and_then(|v| v.get("type"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some("subagent_summary")
+                    })
+                    .unwrap();
+                let results: Vec<SubAgentResult> = serde_json::from_value(
+                    summary.display_data.as_ref().unwrap()["results"].clone(),
+                )
+                .unwrap();
+                let recorded = if cause == crate::state_machine::event::CancelCause::Timeout {
+                    SubAgentOutcome::TimedOut
+                } else {
+                    expected.clone()
+                };
+                assert_eq!(results[0].outcome, recorded);
+                let notices = messages.iter().filter(|m| matches!(&m.content, MessageContent::System(c) if c.text.starts_with("Cancellation completed."))).count();
+                assert_eq!(
+                    notices,
+                    usize::from(cause == crate::state_machine::event::CancelCause::UserRequested)
+                );
+                let accepted: i64 = sqlx::query_scalar("SELECT parent_accepted_at_unix_micros FROM sub_agent_runs WHERE child_conversation_id = 'child'").fetch_one(db.pool()).await.unwrap();
+                runtime
+                    .process_event(Event::SubAgentResult {
+                        agent_id: "child".into(),
+                        outcome: expected.clone(),
+                    })
+                    .await
+                    .unwrap();
+                runtime.handle_cancelling_sub_agents_timeout().await;
+                assert_eq!(
+                    serde_json::to_value(db.get_messages(id).await.unwrap()).unwrap(),
+                    serde_json::to_value(&messages).unwrap()
+                );
+                assert_eq!(sqlx::query_scalar::<_, i64>("SELECT parent_accepted_at_unix_micros FROM sub_agent_runs WHERE child_conversation_id = 'child'").fetch_one(db.pool()).await.unwrap(), accepted);
+                assert_eq!(
+                    db.get_conversation("child").await.unwrap().state,
+                    child_state
+                );
+                runtime.abort_external_effects().await;
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn cancellation_backstop_notice_follows_accepted_drain_after_inline_steering() {
         for cause in [
             crate::state_machine::event::CancelCause::UserRequested,
@@ -24269,6 +24708,57 @@ mod steer_drain_detector_tests {
             assert!(!runtime.fatal_local_authority_fence.is_closed());
             assert!(runtime.llm_client.recorded_requests().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn accepted_child_terminal_retry_preserves_canonical_obligation_projection() {
+        let (mut runtime, storage) = cancelling_runtime(
+            "terminal-projection-retry",
+            &["child"],
+            crate::state_machine::event::CancelCause::UserRequested,
+        )
+        .await;
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(914),
+            generation: 3,
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        runtime.active_direct_turn = Some(Box::new(turn));
+        runtime.direct_turn_cancellation_initiated = true;
+        runtime.state_updated_at = chrono::DateTime::from_timestamp(1, 0).unwrap();
+        storage.set_settle_active_direct_turn_failures(1);
+        runtime
+            .process_event(Event::SubAgentResult {
+                agent_id: "child".into(),
+                outcome: SubAgentOutcome::Failure {
+                    error: "cancelled".into(),
+                    error_kind: crate::db::ErrorKind::Cancelled,
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(storage.sub_agent_acceptance_count(), 1);
+        assert!(runtime.terminal_transition_retry.is_some());
+        assert!(runtime.sub_agent_result_buffer.is_empty());
+        let first = storage
+            .recorded_terminal_obligations()
+            .first()
+            .unwrap()
+            .clone();
+        runtime.retry_terminal_transition().await;
+        assert!(runtime.active_direct_turn.is_none());
+        let recorded = storage.recorded_terminal_obligations();
+        assert!(
+            recorded.len() >= 3,
+            "evidence, failed settlement, and retry must all carry canonical projections"
+        );
+        for obligation in recorded {
+            assert_eq!(
+                obligation, first,
+                "the native obligation rejects a different first durable payload"
+            );
+        }
+        assert!(!runtime.fatal_local_authority_fence.is_closed());
     }
 
     #[tokio::test(start_paused = true)]

@@ -4,6 +4,7 @@
 
 use super::traits::*;
 use crate::db::{Message, MessageContent, MessageType, UsageData};
+use crate::state_machine::state::SubAgentOutcome;
 use crate::state_machine::ConvState;
 use crate::tools::browser::BrowserSessionManager;
 use crate::tools::{ToolContext, ToolOutput};
@@ -696,6 +697,7 @@ pub struct InMemoryStorage {
     settle_active_direct_turn_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     settle_active_direct_turn_commit_error_once: Mutex<bool>,
     settle_active_direct_turn_failures: Mutex<usize>,
+    terminal_obligation_calls: Mutex<Vec<phoenix_db::workflow::DirectTurnTerminalObligationInput>>,
     terminal_obligation_establishment_failures: Mutex<usize>,
     terminal_obligation_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     terminal_obligation_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -716,6 +718,7 @@ pub struct InMemoryStorage {
     tool_round_persist_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     fail_sub_agent_acceptance_once: Mutex<bool>,
     fail_sub_agent_backstop: AtomicBool,
+    unclassified_sub_agent_summary: AtomicBool,
     fail_message_add: Mutex<bool>,
     message_add_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     message_add_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -807,6 +810,7 @@ impl InMemoryStorage {
             settle_active_direct_turn_release: Mutex::new(None),
             settle_active_direct_turn_commit_error_once: Mutex::new(false),
             settle_active_direct_turn_failures: Mutex::new(0),
+            terminal_obligation_calls: Mutex::new(Vec::new()),
             terminal_obligation_establishment_failures: Mutex::new(0),
             terminal_obligation_started: Mutex::new(None),
             terminal_obligation_release: Mutex::new(None),
@@ -826,6 +830,7 @@ impl InMemoryStorage {
             tool_round_persist_release: Mutex::new(None),
             fail_sub_agent_acceptance_once: Mutex::new(false),
             fail_sub_agent_backstop: AtomicBool::new(false),
+            unclassified_sub_agent_summary: AtomicBool::new(false),
             fail_message_add: Mutex::new(false),
             message_add_started: Mutex::new(None),
             message_add_release: Mutex::new(None),
@@ -885,6 +890,11 @@ impl InMemoryStorage {
 
     pub fn set_fail_state_update(&self, fail: bool) {
         *self.fail_state_update.lock().unwrap() = fail;
+    }
+
+    pub fn set_unclassified_sub_agent_summary(&self, unclassified: bool) {
+        self.unclassified_sub_agent_summary
+            .store(unclassified, Ordering::Relaxed);
     }
 
     pub fn set_fail_sub_agent_backstop(&self, fail: bool) {
@@ -1059,6 +1069,12 @@ impl InMemoryStorage {
         *self.terminal_obligation_started.lock().unwrap() = Some(started_tx);
         *self.terminal_obligation_release.lock().unwrap() = Some(release_rx);
         (started_rx, release_tx)
+    }
+
+    pub fn recorded_terminal_obligations(
+        &self,
+    ) -> Vec<phoenix_db::workflow::DirectTurnTerminalObligationInput> {
+        self.terminal_obligation_calls.lock().unwrap().clone()
     }
 
     pub fn set_terminal_obligation_establishment_failures(&self, failures: usize) {
@@ -1375,14 +1391,45 @@ impl MessageStore for InMemoryStorage {
     async fn terminalize_sub_agent_cancellation_backstop(
         &self,
         _child_conversation_id: &str,
-        _cause: phoenix_db::SubAgentTerminalCause,
+        cause: phoenix_db::SubAgentTerminalCause,
         _terminal_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), String> {
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<SubAgentOutcome, String>> {
+        use phoenix_db::workflow::LocalAuthorityResult;
         if self.fail_sub_agent_backstop.load(Ordering::Relaxed) {
-            Err("injected child backstop terminal evidence failure".into())
+            LocalAuthorityResult::DurableFactUnclassified
         } else {
-            Ok(())
+            let outcome = if cause == phoenix_db::SubAgentTerminalCause::TimedOut {
+                SubAgentOutcome::TimedOut
+            } else {
+                SubAgentOutcome::Failure {
+                    error: "Sub-agent did not report within the cancellation deadline".into(),
+                    error_kind: crate::db::ErrorKind::Cancelled,
+                }
+            };
+            LocalAuthorityResult::DurableFactEstablished(Ok(outcome))
         }
+    }
+
+    async fn persist_sub_agent_summary(
+        &self,
+        message: &Message,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<(), String>> {
+        if self.unclassified_sub_agent_summary.load(Ordering::Relaxed) {
+            return phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified;
+        }
+        let result = self
+            .add_message_with_seq_at(
+                &message.message_id,
+                &message.conversation_id,
+                message.sequence_id,
+                &message.content,
+                message.display_data.as_ref(),
+                message.usage_data.as_ref(),
+                message.created_at,
+            )
+            .await
+            .map(|_| ());
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result)
     }
 
     async fn coordinator_authority(
@@ -1905,8 +1952,8 @@ impl MessageStore for InMemoryStorage {
 
     async fn persist_active_direct_turn_terminal_obligation(
         &self,
-        _settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
-        _response_message_id: Option<&str>,
+        settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
+        response_message_id: Option<&str>,
     ) -> crate::runtime::traits::TerminalMutationEstablishment {
         if let Some(started) = self.terminal_obligation_started.lock().unwrap().take() {
             let _ = started.send(());
@@ -1915,6 +1962,13 @@ impl MessageStore for InMemoryStorage {
         if let Some(release) = release {
             let _ = release.await;
         }
+        self.terminal_obligation_calls
+            .lock()
+            .unwrap()
+            .push(super::traits::terminal_obligation(
+                settlement,
+                response_message_id.map(str::to_owned),
+            ));
         crate::runtime::traits::TerminalMutationEstablishment::Established {
             transcript_generation: None,
         }

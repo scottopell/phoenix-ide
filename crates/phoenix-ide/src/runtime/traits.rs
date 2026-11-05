@@ -238,25 +238,19 @@ pub trait MessageStore: Send + Sync {
         created_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<Message, String>;
 
-    /// Persist a child terminal fact before its outcome enters the parent fan-in.
-    async fn record_sub_agent_terminal(
-        &self,
-        _child_conversation_id: &str,
-        _cause: phoenix_db::SubAgentTerminalCause,
-        _terminal_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
     async fn terminalize_sub_agent_cancellation_backstop(
         &self,
         child_conversation_id: &str,
         cause: phoenix_db::SubAgentTerminalCause,
         terminal_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), String> {
-        self.record_sub_agent_terminal(child_conversation_id, cause, terminal_at)
-            .await
-    }
+    ) -> phoenix_db::workflow::LocalAuthorityResult<
+        Result<crate::state_machine::state::SubAgentOutcome, String>,
+    >;
+
+    async fn persist_sub_agent_summary(
+        &self,
+        message: &Message,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<(), String>>;
 
     async fn sub_agent_terminal_is_accepted(
         &self,
@@ -816,26 +810,24 @@ impl<T: SvgArtifactRepository + ?Sized> SvgArtifactRepository for Arc<T> {
 
 #[async_trait]
 impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
-    async fn record_sub_agent_terminal(
-        &self,
-        child_conversation_id: &str,
-        cause: phoenix_db::SubAgentTerminalCause,
-        terminal_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), String> {
-        (**self)
-            .record_sub_agent_terminal(child_conversation_id, cause, terminal_at)
-            .await
-    }
-
     async fn terminalize_sub_agent_cancellation_backstop(
         &self,
         child_conversation_id: &str,
         cause: phoenix_db::SubAgentTerminalCause,
         terminal_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), String> {
+    ) -> phoenix_db::workflow::LocalAuthorityResult<
+        Result<crate::state_machine::state::SubAgentOutcome, String>,
+    > {
         (**self)
             .terminalize_sub_agent_cancellation_backstop(child_conversation_id, cause, terminal_at)
             .await
+    }
+
+    async fn persist_sub_agent_summary(
+        &self,
+        message: &Message,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<(), String>> {
+        (**self).persist_sub_agent_summary(message).await
     }
 
     async fn sub_agent_terminal_is_accepted(
@@ -1607,11 +1599,23 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct DatabaseStorage {
     db: Database,
+    #[cfg(test)]
+    summary_lost_ack_once: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DatabaseStorage {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            #[cfg(test)]
+            summary_lost_ack_once: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn lose_summary_ack_once(&self) {
+        self.summary_lost_ack_once
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[allow(dead_code)] // Useful for tests
@@ -1910,29 +1914,57 @@ impl MessageStore for DatabaseStorage {
             .map_err(|e| e.to_string())
     }
 
-    async fn record_sub_agent_terminal(
-        &self,
-        child_conversation_id: &str,
-        cause: phoenix_db::SubAgentTerminalCause,
-        terminal_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), String> {
-        self.db
-            .record_sub_agent_terminal(child_conversation_id, cause, terminal_at)
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-    }
-
     async fn terminalize_sub_agent_cancellation_backstop(
         &self,
         child_conversation_id: &str,
         cause: phoenix_db::SubAgentTerminalCause,
         terminal_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), String> {
-        self.db
+    ) -> phoenix_db::workflow::LocalAuthorityResult<
+        Result<crate::state_machine::state::SubAgentOutcome, String>,
+    > {
+        match self
+            .db
             .terminalize_sub_agent_cancellation_backstop(child_conversation_id, cause, terminal_at)
             .await
-            .map_err(|error| error.to_string())
+        {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(
+                    result.map_err(|error| error.to_string()),
+                )
+            }
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified
+            }
+        }
+    }
+
+    async fn persist_sub_agent_summary(
+        &self,
+        message: &Message,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<(), String>> {
+        #[cfg(test)]
+        let result = if self
+            .summary_lost_ack_once
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.db
+                .persist_sub_agent_summary_with_lost_ack_for_test(message)
+                .await
+        } else {
+            self.db.persist_sub_agent_summary(message).await
+        };
+        #[cfg(not(test))]
+        let result = self.db.persist_sub_agent_summary(message).await;
+        match result {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(
+                    result.map_err(|error| error.to_string()),
+                )
+            }
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified
+            }
+        }
     }
 
     async fn sub_agent_terminal_is_accepted(
@@ -2389,7 +2421,7 @@ impl MessageStore for DatabaseStorage {
     }
 }
 
-fn terminal_obligation(
+pub(super) fn terminal_obligation(
     settlement: &ActiveDirectTurnSettlement,
     response_message_id: Option<String>,
 ) -> phoenix_db::workflow::DirectTurnTerminalObligationInput {
