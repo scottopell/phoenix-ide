@@ -22566,6 +22566,7 @@ mod steer_drain_detector_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn ordinary_tool_completion_failure_selects_fatal_caller_disposition() {
         for failure in [
             "checkpoint",
@@ -22737,6 +22738,7 @@ mod steer_drain_detector_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn ordinary_tool_completion_sqlite_full_fails_stop_and_reopens_without_replay() {
         let temp = tempfile::TempDir::new().unwrap();
         let path = temp.path().join("full-checkpoint.db");

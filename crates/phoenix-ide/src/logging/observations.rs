@@ -137,17 +137,17 @@ mod tests {
     fn writer_records_write_and_flush_errors_without_a_logger() {
         let writes = Box::leak(Box::new(FailureCounter::new()));
         let flushes = Box::leak(Box::new(FailureCounter::new()));
-        let mut writer = ObservedWriter {
+        let mut observed_sink = ObservedWriter {
             inner: FailingSink,
             write_errors: writes,
             flush_errors: flushes,
         };
         assert_eq!(
-            writer.write(b"private data").unwrap_err().kind(),
+            observed_sink.write(b"private data").unwrap_err().kind(),
             io::ErrorKind::StorageFull
         );
         assert_eq!(
-            writer.flush().unwrap_err().kind(),
+            observed_sink.flush().unwrap_err().kind(),
             io::ErrorKind::BrokenPipe
         );
         assert_eq!(writes.count(), 1);
