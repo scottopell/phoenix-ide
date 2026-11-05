@@ -20398,6 +20398,7 @@ mod lifecycle_handler_tests {
         );
         state.db.pool().close().await;
         let runtime = Arc::clone(&state.runtime);
+        let temporary_root = state.runtime_env.tmp_root().to_string_lossy().into_owned();
         let router = create_router(state);
         let unauthorized = router
             .clone()
@@ -20432,6 +20433,13 @@ mod lifecycle_handler_tests {
             let payload: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(payload["failures"].as_array().unwrap().len(), 10);
             assert!(payload["filesystems"].is_array());
+            assert!(payload["filesystems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|filesystem| filesystem["locations"].as_array().unwrap())
+                .any(|location| location["label"] == "Temporary directory"
+                    && location["path"].as_str() == Some(temporary_root.as_str())));
             assert!(payload["measurement_errors"].is_array());
             assert!(payload["local_authority_failure_boundary"].is_null());
             assert!(!runtime.fatal_local_authority_is_latched());

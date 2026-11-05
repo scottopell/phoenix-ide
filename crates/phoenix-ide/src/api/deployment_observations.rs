@@ -79,7 +79,7 @@ pub struct DiskSpaceMeasurementError {
 pub async fn deployment_observations(
     State(state): State<AppState>,
 ) -> Json<DeploymentObservations> {
-    let targets = targets(&state.deployment);
+    let targets = targets(&state.deployment, state.runtime_env.tmp_root());
     let (filesystems, measurement_errors) = tokio::task::spawn_blocking(move || {
         sample_space(targets, resolve_filesystem, available_space)
     })
@@ -96,7 +96,7 @@ pub async fn deployment_observations(
     })
 }
 
-fn targets(config: &DeploymentConfig) -> Vec<(String, PathBuf)> {
+fn targets(config: &DeploymentConfig, temporary_root: &Path) -> Vec<(String, PathBuf)> {
     let mut targets: Vec<_> = config
         .locations
         .iter()
@@ -108,7 +108,7 @@ fn targets(config: &DeploymentConfig) -> Vec<(String, PathBuf)> {
         })
         .map(|location| (location.label.clone(), location.path.clone()))
         .collect();
-    targets.push(("Temporary directory".into(), std::env::temp_dir()));
+    targets.push(("Temporary directory".into(), temporary_root.to_path_buf()));
     if let Some(path) = &config.log.file {
         targets.push(("Structured log".into(), PathBuf::from(path)));
     }
