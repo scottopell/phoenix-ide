@@ -2117,12 +2117,10 @@ mod tests {
         url: &str,
         credential_byte: &str,
     ) {
-        let credential =
-            phoenix_core::domain::instance_identity::PeerBearerCredential::parse(format!(
-                "phx_peer_{}",
-                credential_byte.repeat(43)
-            ))
-            .unwrap();
+        let credential = phoenix_core::domain::instance_identity::PeerBearerCredential::parse(
+            format!("phx_peer_{}", credential_byte.repeat(43)),
+        )
+        .unwrap();
         state
             .db
             .save_federation_peer_connection(
@@ -2282,10 +2280,7 @@ mod tests {
                 Err(FederationClientError::PeerNotFound)
             ));
         }
-        for selector in [
-            format!(" {first} "),
-            first.to_string().replace('-', ""),
-        ] {
+        for selector in [format!(" {first} "), first.to_string().replace('-', "")] {
             assert!(matches!(
                 resolve_saved_peer_id(&state.db, &selector).await,
                 Err(FederationClientError::PeerNotFound)
