@@ -79,6 +79,10 @@ explicit Coordinator home target, and persisted absence of ambient cwd and
 WorkScope attachment. Companion regressions cover missing/invalid Bash targets,
 child handle inspection, explicit file paging, parallel research, rejected
 Work/cwd requests before admission, and model selection in the Coordinator schema.
+Reducer regressions cover mixed result/error submissions and stale task proposals
+from children without a default directory: each rejected round persists matching
+error results and requests another model turn without executing tools or notifying
+the parent prematurely.
 
 The bounded API-guidance candidate (ADR-113) replaces an accidental recipe allowlist with non-exhaustive contract-grounded guidance and documents submitting exact user-provided answers or decisions made within explicit delegated decision scope through the existing structured-question response endpoint. Generic inspect/unblock instructions are not decision authority; approvals must never be fabricated or delegation extended. Gap inventories are illustrative and qualified by inspected deployment/source, permitting verified supported alternatives and bounded state reads, not invented guarantees/receipts, database/private-handler bypasses, or background monitors. It does not add tool or runtime capabilities. The recipe distinguishes current request freshness from idempotency, requires complete answers despite the backend's lack of completeness enforcement, posts once, and reconciles uncertainty against the original target without treating conflicts as success. Source/wire/UI anchors and offline Python drift checks are described in `../builtin-skills/executive.md`. Prompt/built-in/continuation Rust regressions are authored but intentionally unrun locally; no live API/question calls, instruction activation, merge or deployment are claimed.
 

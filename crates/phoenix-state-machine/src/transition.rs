@@ -3924,8 +3924,10 @@ pub fn transition_sub_agent(
                 if tool_calls.len() > 1 {
                     let msg =
                         "submit_result/submit_error must be the only tool in response".to_string();
-                    let display_data =
-                        compute_bash_display_data(&content, context.filesystem_root());
+                    let display_data = context
+                        .execution_environment
+                        .working_dir()
+                        .and_then(|cwd| compute_bash_display_data(&content, cwd));
                     let assistant_message = AssistantMessage::new(
                         request_id.clone(),
                         content,
@@ -4015,7 +4017,10 @@ pub fn transition_sub_agent(
                     "propose_task is not available to sub-agents — task management is the \
                      parent conversation's job."
                         .to_string();
-                let display_data = compute_bash_display_data(&content, context.filesystem_root());
+                let display_data = context
+                    .execution_environment
+                    .working_dir()
+                    .and_then(|cwd| compute_bash_display_data(&content, cwd));
                 let assistant_message = AssistantMessage::new(
                     request_id.clone(),
                     content,
@@ -4676,6 +4681,102 @@ mod tests {
                 )));
             }
         }
+    }
+
+    fn assert_child_rejection_without_directory(tool_calls: Vec<ToolCall>, expected: &str) {
+        let ctx = ConvContext::sub_agent_with_environment(
+            "research-child",
+            crate::state::ConversationExecutionEnvironment::NoFilesystem,
+            "test-model",
+            200_000,
+            16_384,
+            "coordinator",
+        );
+        let content = tool_calls
+            .iter()
+            .map(|call| ContentBlock::tool_use(&call.id, call.name(), call.input.to_value()))
+            .collect();
+        let result = handle_outcome(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &ctx,
+            EffectOutcome::Llm(LlmOutcome::Response {
+                content,
+                tool_calls: tool_calls.clone(),
+                provider_replay: None,
+                end_turn: false,
+                usage: UsageData::default(),
+                request_id: "rejected-child-response".into(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(result.new_state, ConvState::LlmRequesting { attempt: 1 });
+        assert!(result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestLlm)));
+        assert!(result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistState)));
+        assert!(!result.effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ExecuteTool { .. } | Effect::NotifyParent { .. }
+        )));
+        let round = result
+            .effects
+            .iter()
+            .find_map(|effect| {
+                if let Effect::PersistCheckpoint {
+                    data: CheckpointData::ToolRound(round),
+                } = effect
+                {
+                    Some(round)
+                } else {
+                    None
+                }
+            })
+            .expect("rejected round must retain its assistant calls and error results");
+        assert!(round.assistant_message().display_data.is_none());
+        assert_eq!(round.results().len(), tool_calls.len());
+        for (error, call) in round.results().iter().zip(&tool_calls) {
+            assert_eq!(error.tool_use_id, call.id);
+            assert!(error.is_error());
+            assert!(error.output().contains(expected), "{}", error.output());
+        }
+    }
+
+    #[test]
+    fn coordinator_child_rejects_mixed_terminal_tools_without_directory() {
+        for (name, input) in [
+            ("submit_result", serde_json::json!({"result":"premature"})),
+            ("submit_error", serde_json::json!({"error":"premature"})),
+        ] {
+            assert_child_rejection_without_directory(
+                vec![
+                    ToolCall::new("terminal", ToolInput::from_name_and_value(name, input)),
+                    ToolCall::new(
+                        "think",
+                        ToolInput::Think(crate::state::ThinkInput {
+                            thoughts: "still reasoning".into(),
+                        }),
+                    ),
+                ],
+                "must be the only tool",
+            );
+        }
+    }
+
+    #[test]
+    fn coordinator_child_rejects_task_proposal_without_directory() {
+        assert_child_rejection_without_directory(
+            vec![ToolCall::new(
+                "proposal",
+                ToolInput::ProposeTask(crate::state::ProposeTaskInput {
+                    task_file: "tasks/example.md".into(),
+                }),
+            )],
+            "propose_task is not available to sub-agents",
+        );
     }
 
     #[test]
