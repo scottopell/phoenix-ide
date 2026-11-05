@@ -29,13 +29,11 @@ jobs:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
+      - uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
       - name: Focused command-construction regressions (no compiler)
         run: |
-          python -m unittest discover -s tests/devpy -p test_check_plan.py
-          PHOENIX_CHECK_WORKERS=1 python -m unittest discover -s tests/devpy -p test_check_plan.py
+          uv run --no-project --managed-python --python 3.13 python -m unittest discover -s tests/devpy -p test_check_plan.py
+          PHOENIX_CHECK_WORKERS=1 uv run --no-project --managed-python --python 3.13 python -m unittest discover -s tests/devpy -p test_check_plan.py
 
   plan_check:
     name: plan check lanes

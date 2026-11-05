@@ -1,3 +1,4 @@
+import { RemindersPanel } from '../reminders/RemindersPanel';
 import { conversationGroundingContext } from '../components/FileExplorer/groundingContext';
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
@@ -2239,6 +2240,7 @@ function ConversationPageContent({
       <ConversationReturnBreadcrumb />
       {seedBreadcrumb}
       {parentConvBreadcrumb}
+      {!conversation.parent_conversation_id && <RemindersPanel conversationId={conversation.id} readOnly={isArchived || readOnly} />}
       {viewerSlot.browserSessionActive && !isArchived && !browserOpen && (
         <div className="browser-view-launcher">
           <button

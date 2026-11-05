@@ -121,26 +121,26 @@ THE SYSTEM SHALL stop driving the model and surface the condition to the human.
 escalate rather than loop. The consecutive trigger catches a stuck model; the
 total trigger catches slow grinding across a long session.
 
-### REQ-PERM-007: Reducer-intercepted tool calls are a structural exception
+### REQ-PERM-007: Typed internal tool calls are a structural exception
 
-Some LLM tool calls are intercepted by the conversation state-machine reducer
-and handled as typed state transitions, never becoming an "execute this tool"
-effect and so never reaching the runtime tool-executor boundary the seam gates.
+Some LLM tool calls are handled by named internal operations with their own typed
+validation, in the reducer or its owning runtime, and never reach the generic
+runtime tool-executor boundary (`ToolExecutor::execute`) or arbitrary tool `run`.
 This class is: subagent delegation (`spawn_agents`), task proposal
 (`propose_task`), user questioning (`ask_user_question`), and subagent terminal
 submission (`submit_result` / `submit_error`).
 
 THE SYSTEM SHALL treat these as a structural exception to REQ-PERM-001 — they are
-not gate-cleared by Layer 0 — AND each SHALL carry its own enforcement contract
-in the spec that owns it (the reducer validates the typed transition; e.g.
+not gate-cleared by Layer 0 — AND each SHALL carry its own typed enforcement contract
+in the spec that owns it (the owning internal operation validates the transition; e.g.
 `propose_task` is validated against the task file, subagent submission against
 sub-agent state).
 
 **Rationale:** These calls do not invoke a tool's `run` to take an arbitrary
-action; they drive a specific, typed transition the reducer already validates.
+action; they drive a specific, typed operation validated by its owning layer.
 Layer 0's question — "is this action intrinsically dangerous?" — does not apply.
 A future permission layer must not assume the seam covers them; their gate is the
-typed transition, not Layer 0. (Delegation specifically is also intent-relative —
+typed internal operation, not Layer 0. (Delegation specifically is also intent-relative —
 whether a delegated task is authorized is a Tier B judgment, not an intrinsic
 one — which is a second reason it sits outside intent-agnostic Layer 0.)
 

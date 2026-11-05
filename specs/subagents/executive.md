@@ -80,8 +80,8 @@ only the architectural seams.
 | **REQ-SA-001:** Parallel Task Execution | ✅ Complete | Explore parallelism and bounds remain live; qualified Work batches are admitted atomically before child startup |
 | **REQ-SA-002:** Sub-Agent Isolation | ✅ Complete | Tool registries exclude `spawn_agents`, `ask_user_question`, `skill`, `propose_task`; sub-agents tagged `user_initiated = false` |
 | **REQ-SA-003:** Result Submission | ✅ Complete | Terminal evidence precedes addressed parent delivery; acceptance is idempotent and atomic with parent state persistence |
-| **REQ-SA-004:** Parent Fan-In | ✅ Complete | Durable lifecycle rows fence admission; parent transitions remove exact children and accepted duplicate delivery converges |
-| **REQ-SA-005:** Cancellation Propagation | ✅ Complete | Durable cancellation covers admitted, materializing, and installed children; materialization joins the existing single-flight |
+| **REQ-SA-004:** Parent Fan-In | Partially implemented | Normal parent-state/child-acceptance commits remove exact children and accepted duplicates converge. Native unactivated-batch cleanup suppresses delivery without a matching parent outcome; all-admitted cancellation reconciliation remains incomplete (task 75011). |
+| **REQ-SA-005:** Cancellation Propagation | Partially implemented | Durable cancellation and the activation barrier prevent initial work, but unactivated cleanup does not classify its result back to the parent owner or reconcile every admitted cancellation through parent fan-in. Task 75011 captures that seam; parent preparation priority remains task 75010. |
 | **REQ-SA-006:** Timeout Enforcement | ✅ Complete | `DEFAULT_SUBAGENT_TIMEOUT = 20 min`; deadline races in executor `select!` |
 | **REQ-SA-007:** Model Selection | ✅ Complete | `generic_omission_inherits_parent_execution`, `override_replaces_execution_and_keeps_persona`, and `explicit_connection_is_exact_and_never_falls_back`; persisted selection verified by `unattached_sub_agent_persists_selection_without_parent_effort_leak` |
 | **REQ-SA-008:** Context Injection via Read-First | ❌ Not Started | `read_first` field not yet on `SubAgentTask`; deferred |

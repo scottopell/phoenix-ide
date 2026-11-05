@@ -34,12 +34,12 @@ tool.
 | **REQ-PERM-001:** Single enforced seam | ✅ Delivered | `CheckedToolCall` sole mint = `DenyGate::check`; consumed by `ToolExecutor::execute`. Scoped to the executor boundary; raw `ToolRegistry::execute` shortcut removed |
 | **REQ-PERM-002:** Proof carries payload | ✅ Delivered | Parse-don't-validate; proof holds the validated `(name, input)` |
 | **REQ-PERM-003:** MCP coverage | ✅ Delivered | Gate runs upstream of the registry/MCP split in `dispatch_tool_execution` |
-| **REQ-PERM-004:** Layer 0 deterministic deny | ✅ Delivered | 3 bash rules relocated to the gate (`bash_check` AST walk) |
+| **REQ-PERM-004:** Layer 0 deterministic deny | Partially implemented | Typed deterministic rules and no denied tool-task launch are live. The dispatcher allocates generation/channel/token/context/metrics and publishes start before denial, contradicting the no-resource clause; target ordering is tracked in task 75010. |
 | **REQ-PERM-005:** Denials as tool results | ✅ Delivered | Deny-and-continue via the existing outcome channel |
 | **REQ-PERM-006:** Counting + escalation | ⬜ Planned (phase 2) | 3 consecutive OR 20 total → human; needs a net-new state-machine halt state |
-| **REQ-PERM-007:** Reducer-intercepted exception | ✅ Delivered | `spawn_agents` / `propose_task` / `ask_user_question` / `submit_result` / `submit_error` handled as typed transitions, never reach the gate |
+| **REQ-PERM-007:** Typed internal exception | ✅ Delivered | The exact named class retains its own typed validation and never enters generic `ToolExecutor::execute`/arbitrary `Tool::run`. `spawn_agents` is runtime-owned admission; proposal/question/terminal submission are reducer-owned. The owner-neutral requirement corrects the implementation description without expanding the exception policy. |
 
-**Progress:** 6 of 7 delivered; REQ-PERM-006 (counting + escalation) is phase 2.
+**Progress:** 5 of 7 delivered; REQ-PERM-004 has a resource-ordering gap and REQ-PERM-006 (counting + escalation) is planned.
 
 ## Scope Boundaries
 

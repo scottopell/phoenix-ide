@@ -12,7 +12,7 @@ use phoenix_db::workflow::{
 };
 use phoenix_db::LocalAttemptAuthority;
 use phoenix_workflow::{ClaimOutcome, LeaseExpiry, ProcessIncarnation, Timestamp};
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex};
 
 use crate::runtime::{AddressedConversationEventDispatcher, RuntimeManager};
 use crate::state_machine::Event;
@@ -20,7 +20,7 @@ use crate::state_machine::Event;
 const DISCOVERY_BATCH_LIMIT: usize = 64;
 const LEASE_DURATION: Duration = Duration::from_secs(30);
 const EMPTY_RESCAN_INTERVAL: Duration = Duration::from_secs(5);
-const ERROR_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+pub(crate) const ERROR_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TerminalObligationSettlement {
     NoObligation,
@@ -85,7 +85,7 @@ pub(crate) async fn run(
         Arc::new(SystemClock),
         fresh_process_incarnation(),
     )
-    .with_watch_delivery(manager);
+    .with_input_discovery(manager);
     if let Err(error) = worker.run_loop(kick_rx, ready_tx).await {
         match error {
             StartupReconciliationError::Retryable(error) => {
@@ -142,7 +142,8 @@ pub(crate) struct DirectTurnWorker<D: DirectTurnDispatcher, C: DirectTurnClock> 
     dispatcher: Arc<D>,
     clock: Arc<C>,
     process_incarnation: ProcessIncarnation,
-    watch_delivery: Option<Arc<RuntimeManager>>,
+    input_discovery: Option<Arc<RuntimeManager>>,
+    subscription_sync: Arc<Mutex<crate::api::federation::subscriptions::SubscriptionSync>>,
     #[cfg(test)]
     pre_dispatch_hook: Option<PreDispatchHook>,
 }
@@ -166,20 +167,29 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
             dispatcher,
             clock,
             process_incarnation,
-            watch_delivery: None,
+            input_discovery: None,
+            subscription_sync: Arc::new(Mutex::new(
+                crate::api::federation::subscriptions::SubscriptionSync::default(),
+            )),
             #[cfg(test)]
             pre_dispatch_hook: None,
         }
     }
 
-    fn with_watch_delivery(mut self, manager: Arc<RuntimeManager>) -> Self {
-        self.watch_delivery = Some(manager);
+    fn with_input_discovery(mut self, manager: Arc<RuntimeManager>) -> Self {
+        self.input_discovery = Some(manager);
         self
     }
 
-    async fn deliver_watch_events(&self) {
-        if let Some(manager) = &self.watch_delivery {
+    async fn discover_inputs(&self) {
+        if let Some(manager) = &self.input_discovery {
             crate::coordinator_watch_delivery::deliver_pass(manager).await;
+            if let Ok(now) = phoenix_core::domain::reminder::ReminderTimestampUs::parse(
+                chrono::Utc::now().timestamp_micros(),
+            ) {
+                crate::reminder_delivery::deliver_pass(manager, now).await;
+            }
+            self.subscription_sync.lock().await.sync_pass(manager).await;
         }
     }
 
@@ -231,9 +241,18 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
                 fatal @ StartupReconciliationError::Unclassifiable(_) => return Err(fatal),
             },
         };
-        self.deliver_watch_events().await;
+        self.discover_inputs().await;
         loop {
-            let sleep = self.clock.sleep(wait);
+            let sleep_duration = if let Some(manager) = &self.input_discovery {
+                let now = phoenix_core::domain::reminder::ReminderTimestampUs::parse(
+                    chrono::Utc::now().timestamp_micros(),
+                )
+                .map_err(|e| StartupReconciliationError::Unclassifiable(e.to_string()))?;
+                crate::reminder_delivery::next_wait(manager, now, wait).await
+            } else {
+                wait
+            };
+            let sleep = self.clock.sleep(sleep_duration);
             tokio::pin!(sleep);
             tokio::select! {
                 () = &mut sleep => {}
@@ -254,7 +273,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
                     fatal @ StartupReconciliationError::Unclassifiable(_) => return Err(fatal),
                 },
             };
-            self.deliver_watch_events().await;
+            self.discover_inputs().await;
         }
     }
 
@@ -1142,6 +1161,8 @@ mod tests {
                 accepted_at: Timestamp(1),
             })
             .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = step.outcome else {
             panic!("expected created turn")
@@ -1695,6 +1716,8 @@ mod tests {
                 accepted_at: Timestamp(1),
             })
             .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = step.outcome else {
             panic!("expected created turn")

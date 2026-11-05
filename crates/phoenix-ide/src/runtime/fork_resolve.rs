@@ -1641,6 +1641,8 @@ fn map_db_resolve_error(e: DbError) -> ForkResolveError {
         | DbError::MessageConflict(_)
         | DbError::TranscriptSnapshotChanged
         | DbError::SlugExists(_)
+        | DbError::ReminderInvalid(_)
+        | DbError::ReminderRequestConflict
         | DbError::CoordinatorWorkScope(_)
         | DbError::ConversationTitleInvalid
         | DbError::CurrentCoordinatorRequired
@@ -1660,6 +1662,11 @@ fn map_db_resolve_error(e: DbError) -> ForkResolveError {
         | DbError::ConversationAlreadyExists(_)
         | DbError::DirectTurnConflict(_)
         | DbError::GitRepositoryWorkScopeProjectConflict { .. }
+        | DbError::FederationSendAuthorityInactive
+        | DbError::FederationSendIdentityConflict
+        | DbError::FederationPeerNotFound
+        | DbError::FederationPeerAmbiguous
+        | DbError::FederationSteeringDuplicate
         | DbError::DormantGitRepositoryCatchupPermitTargetMismatch
         | DbError::DormantGitRepositoryCatchupStaleOperation
         | DbError::DormantGitRepositoryCatchupBlockedByReadinessClaim

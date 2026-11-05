@@ -618,6 +618,8 @@ type StoredSvgArtifacts = HashMap<
 /// In-memory storage for testing
 #[allow(dead_code)]
 pub struct InMemoryStorage {
+    coordinator_authority:
+        Mutex<Result<phoenix_core::domain::coordinator_authority::CoordinatorAuthority, String>>,
     pub handoff_candidates: Mutex<Vec<crate::db::ContinuationHandoffCandidate>>,
 
     svg_artifacts: Mutex<StoredSvgArtifacts>,
@@ -714,6 +716,16 @@ pub struct InMemoryStorage {
 
 #[allow(dead_code)]
 impl InMemoryStorage {
+    pub fn set_coordinator_authority(
+        &self,
+        authority: Result<
+            phoenix_core::domain::coordinator_authority::CoordinatorAuthority,
+            String,
+        >,
+    ) {
+        *self.coordinator_authority.lock().unwrap() = authority;
+    }
+
     pub fn seed_tool_admission_policy(
         &self,
         conversation_id: &str,
@@ -727,6 +739,9 @@ impl InMemoryStorage {
 
     pub fn new() -> Self {
         Self {
+            coordinator_authority: Mutex::new(Ok(
+                phoenix_core::domain::coordinator_authority::CoordinatorAuthority::default(),
+            )),
             handoff_candidates: Mutex::new(Vec::new()),
             svg_artifacts: Mutex::new(HashMap::new()),
             tool_admission_policies: Mutex::new(HashMap::new()),
@@ -1276,6 +1291,12 @@ impl Default for InMemoryStorage {
 
 #[async_trait]
 impl MessageStore for InMemoryStorage {
+    async fn coordinator_authority(
+        &self,
+    ) -> Result<phoenix_core::domain::coordinator_authority::CoordinatorAuthority, String> {
+        self.coordinator_authority.lock().unwrap().clone()
+    }
+
     async fn save_continuation_handoff_candidate(
         &self,
         candidate: &crate::db::ContinuationHandoffCandidate,

@@ -34,7 +34,7 @@ def step_shell(name):
     return textwrap.dedent(step.split("        run: |\n", 1)[1])
 
 
-class CandidateGateTests(unittest.TestCase):
+class CandidateGateFixture:
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -66,6 +66,8 @@ class CandidateGateTests(unittest.TestCase):
         self.git("commit", "-qm", message)
         return self.git("rev-parse", "HEAD")
 
+
+class CandidateGateTests(CandidateGateFixture, unittest.TestCase):
     def test_gate_uses_git_objects_not_controller_worktree_and_returns_candidate(self):
         self.cargo.write_text('[package]\nversion = "99.99.99"\n')
         self.registry.write_text("different controller registry")
@@ -114,7 +116,7 @@ class CandidateGateTests(unittest.TestCase):
         with self.assertRaises(subprocess.CalledProcessError):
             controller.gate_outputs(self.repo)
 
-class LinuxArtifactGateTests(CandidateGateTests):
+class LinuxArtifactGateTests(CandidateGateFixture, unittest.TestCase):
     def test_linux_gate_fixes_source_registry_version_and_target(self):
         self.assertEqual(controller.linux_gate_outputs(self.repo), {
             "preparation": "true", "release": "false", "create_tag": "false", "tag": "",

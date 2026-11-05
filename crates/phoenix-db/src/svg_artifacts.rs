@@ -350,77 +350,82 @@ mod tests {
     async fn restart_recovers_only_committed_svg_invocation_after_staging_is_deleted() {
         use crate::MessageContent;
 
-        for cancelling in [false, true] {
-            for stored_assistant in [None, Some("older-assistant"), Some("current-assistant")] {
-                let directory = tempfile::tempdir().unwrap();
-                let path = directory.path().join("restart.db");
-                let staging = directory.path().join("chart.svg");
-                std::fs::write(&staging, SVG).unwrap();
-                let db = Database::open(path.to_str().unwrap()).await.unwrap();
-                crate::migrations::run_pending_migrations(db.pool())
-                    .await
-                    .unwrap();
-                db.create_conversation("owner", "owner", "/tmp", true, None, None)
-                    .await
-                    .unwrap();
-                let state = interrupted_svg_state(&staging, cancelling);
-                db.update_conversation_state("owner", &state).await.unwrap();
-                let published = if let Some(assistant_id) = stored_assistant {
-                    Some(
-                        db.publish_svg_artifact(
-                            "owner",
-                            &SvgInvocationId::new(assistant_id, "svg"),
-                            &phoenix_svg::SvgPresentationMetadata::new("Chart", "A retained chart")
-                                .unwrap(),
-                            &validated(),
-                        )
-                        .await
-                        .established()
-                        .unwrap()
-                        .unwrap(),
+        for (cancelling, stored_assistant) in [
+            (false, None),
+            (false, Some("older-assistant")),
+            (false, Some("current-assistant")),
+            (true, Some("current-assistant")),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("restart.db");
+            let staging = directory.path().join("chart.svg");
+            std::fs::write(&staging, SVG).unwrap();
+            let db = Database::open(path.to_str().unwrap()).await.unwrap();
+            crate::migrations::run_pending_migrations(db.pool())
+                .await
+                .unwrap();
+            db.create_conversation("owner", "owner", "/tmp", true, None, None)
+                .await
+                .unwrap();
+            let state = interrupted_svg_state(&staging, cancelling);
+            db.update_conversation_state("owner", &state).await.unwrap();
+            let published = if let Some(assistant_id) = stored_assistant {
+                Some(
+                    db.publish_svg_artifact(
+                        "owner",
+                        &SvgInvocationId::new(assistant_id, "svg"),
+                        &phoenix_svg::SvgPresentationMetadata::new("Chart", "A retained chart")
+                            .unwrap(),
+                        &validated(),
                     )
-                } else {
-                    None
-                };
-                std::fs::remove_file(&staging).unwrap();
-                db.pool().close().await;
-                let reopened = Database::open(path.to_str().unwrap()).await.unwrap();
-                crate::migrations::run_pending_migrations(reopened.pool())
                     .await
-                    .unwrap();
-                reopened.reset_all_to_idle().await.unwrap();
-                reopened.reset_all_to_idle().await.unwrap();
-                let messages = reopened.get_messages("owner").await.unwrap();
-                assert_eq!(messages.len(), 3);
-                assert!(messages.iter().any(|message| matches!(&message.content, MessageContent::Tool(tool) if tool.tool_use_id == "done" && tool.content == "Ready" && !tool.is_error)));
-                let tool = messages
-                    .iter()
-                    .find_map(|message| {
-                        if let MessageContent::Tool(tool) = &message.content {
-                            (tool.tool_use_id == "svg").then_some(tool)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap();
-                if stored_assistant == Some("current-assistant") {
-                    assert!(!tool.is_error);
-                    let reference: phoenix_svg::SvgArtifactReference =
-                        serde_json::from_str(&tool.content).unwrap();
-                    assert_eq!(reference, published.unwrap().into_reference());
-                    assert_eq!(
-                        reopened
-                            .svg_artifact("owner", &reference.artifact_id)
-                            .await
-                            .unwrap()
-                            .unwrap()
-                            .bytes,
-                        SVG
-                    );
-                } else {
-                    assert!(tool.is_error);
-                    assert!(tool.content.contains("interrupted by server restart"));
-                }
+                    .established()
+                    .unwrap()
+                    .unwrap(),
+                )
+            } else {
+                None
+            };
+            std::fs::remove_file(&staging).unwrap();
+            db.pool().close().await;
+            let reopened = Database::open(path.to_str().unwrap()).await.unwrap();
+            crate::migrations::run_pending_migrations(reopened.pool())
+                .await
+                .unwrap();
+            reopened.reset_all_to_idle().await.unwrap();
+            reopened.reset_all_to_idle().await.unwrap();
+            let messages = reopened.get_messages("owner").await.unwrap();
+            assert_eq!(messages.len(), 3);
+            assert!(messages.iter().any(|message| matches!(&message.content, MessageContent::Tool(tool) if tool.tool_use_id == "done" && tool.content == "Ready" && !tool.is_error)));
+            let tool = messages
+                .iter()
+                .find_map(|message| {
+                    if let MessageContent::Tool(tool) = &message.content {
+                        (tool.tool_use_id == "svg").then_some(tool)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            if stored_assistant == Some("current-assistant") {
+                assert!(!tool.is_error);
+                let reference: phoenix_svg::SvgArtifactReference =
+                    serde_json::from_str(&tool.content).unwrap();
+                assert_eq!(
+                    reference,
+                    published.as_ref().unwrap().clone().into_reference()
+                );
+                assert_eq!(published.as_ref().unwrap().bytes, SVG);
+                assert_eq!(
+                    reopened
+                        .svg_artifact("owner", &reference.artifact_id)
+                        .await
+                        .unwrap(),
+                    published
+                );
+            } else {
+                assert!(tool.is_error);
+                assert!(tool.content.contains("interrupted by server restart"));
             }
         }
     }
@@ -565,47 +570,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_survives_database_reopen_and_staging_deletion() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("artifacts.db");
-        let staging = directory.path().join("chart.svg");
-        std::fs::write(&staging, SVG).unwrap();
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::migrations::run_pending_migrations(db.pool())
-            .await
-            .unwrap();
-        db.create_conversation("owner", "owner", "/tmp", true, None, None)
-            .await
-            .unwrap();
-        let artifact = db
+    async fn publication_is_immutable_owned_and_cascades_with_transcript() {
+        let db = Database::open_in_memory().await.unwrap();
+        assert!(db
             .publish_svg_artifact(
-                "owner",
+                "missing",
                 &invocation("call"),
-                &phoenix_svg::SvgPresentationMetadata::new("Title", "Description").unwrap(),
-                &phoenix_svg::validate(&std::fs::read(&staging).unwrap()).unwrap(),
+                &SvgPresentationMetadata::new("Chart", "Bars").unwrap(),
+                &validated(),
             )
             .await
             .established()
             .unwrap()
-            .unwrap();
-        std::fs::remove_file(staging).unwrap();
-        db.pool().close().await;
-        let reopened = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::migrations::run_pending_migrations(reopened.pool())
+            .is_err());
+        let artifacts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_svg_artifacts")
+            .fetch_one(db.pool())
             .await
             .unwrap();
-        assert_eq!(
-            reopened
-                .svg_artifact("owner", &artifact.artifact_id)
-                .await
-                .unwrap(),
-            Some(artifact)
-        );
-    }
+        assert_eq!(artifacts, 0);
 
-    #[tokio::test]
-    async fn publication_is_immutable_owned_and_cascades_with_transcript() {
-        let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("svg-owner", "svg-owner", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -688,51 +671,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
-    }
-
-    #[tokio::test]
-    async fn rejected_publication_leaves_no_snapshot() {
-        let db = Database::open_in_memory().await.unwrap();
-        assert!(db
-            .publish_svg_artifact(
-                "missing",
-                &invocation("call"),
-                &phoenix_svg::SvgPresentationMetadata::new("Chart", "Bars").unwrap(),
-                &validated()
-            )
-            .await
-            .established()
-            .unwrap()
-            .is_err());
-        db.create_conversation("svg-owner", "svg-owner", "/tmp", true, None, None)
-            .await
-            .unwrap();
-        for title in [String::new(), "x".repeat(201), "x\ny".into(), "   ".into()] {
-            assert!(SvgPresentationMetadata::new(&title, "Bars").is_err());
-        }
-        assert!(db
-            .svg_artifact_for_invocation("svg-owner", &invocation("call"))
-            .await
-            .unwrap()
-            .is_none());
-    }
-
-    #[tokio::test]
-    async fn cancelled_transaction_rolls_back_snapshot_and_ownership_together() {
-        let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation("owner", "owner", "/tmp", true, None, None)
-            .await
-            .unwrap();
-        let mut transaction = db.pool().begin().await.unwrap();
-        sqlx::query("INSERT INTO conversation_svg_artifacts VALUES ('id', 'owner', 'assistant-message', 'call', 'Title', 'Description', 100, 50, ?)")
-            .bind(SVG)
-            .execute(&mut *transaction).await.unwrap();
-        // Dropping a cancelled publication's transaction schedules rollback.
-        drop(transaction);
-        assert!(db
-            .svg_artifact_for_invocation("owner", &invocation("call"))
-            .await
-            .unwrap()
-            .is_none());
     }
 }

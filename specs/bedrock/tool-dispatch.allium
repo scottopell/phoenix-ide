@@ -1,0 +1,891 @@
+-- allium: 3
+-- Serial tool-dispatch ownership (REQ-BED-004, REQ-BED-005a, REQ-BED-007,
+-- REQ-BED-033, REQ-LLM-004i, REQ-PERM-001 through REQ-PERM-005).
+--
+-- Scope: the ordinary tool-executor boundary between Bedrock's selection of
+-- one active call and submission of its outcome to the reducer. ToolInvocation
+-- describes process-local ownership, not another conversation state or durable
+-- schedule. Layer 0 precedes call-resource admission. Cleared preparation then
+-- includes the start-time broadcast, context and metrics setup; it is not pure.
+--
+-- spawn_agents uses the sub-agent admission/materialization rules instead of
+-- this ordinary invocation lifecycle. Reducer-intercepted approval, question,
+-- and child-terminal calls do not enter this boundary. Scheduling, tool internals,
+-- permission escalation, and restarting unknown-effect tools are outside scope.
+
+use "./bedrock.allium" as bedrock
+use "../llm/llm.allium" as llm
+use "../permissions/permissions.allium" as permissions
+use "../subagents/subagents.allium" as subagents
+
+given {
+    process_authority: ProcessExecutionAuthority
+}
+
+external entity ProcessExecutionAuthority {
+    open: Boolean
+}
+
+external entity ToolRuntime {
+    conversation: bedrock/Conversation
+    generation: Integer
+}
+
+-- The typed runtime outcome owns its complete payload; this boundary observes
+-- its identity and variant. Completed payloads and failure diagnostics remain
+-- lossless when converted to Bedrock results.
+external entity InvocationOutcome {
+    tool_use_id: String
+    kind: completed | failed | aborted
+}
+
+-- Captured before a preparation read; no ordinary generation need exist yet.
+-- This is the owned selection's origin, not another mutable activity store.
+value DispatchSelection {
+    runtime: ToolRuntime
+    assistant_message_id: String
+    call: bedrock/ToolCall
+}
+
+contract SerialToolDispatch {
+    forward: (invocation: ToolInvocation, outcome: InvocationOutcome) -> InvocationOutcome
+    spawn_cancellation_resolution: (conversation: bedrock/Conversation) -> SpawnCancellationResolution
+
+    @invariant SerialOwnership
+        -- Bedrock owns the active call and remaining queue. The ordinary
+        -- executor owns one dispatch generation, cancellation token, and retained
+        -- task handle. A generation is process-local; neither it nor a handle
+        -- creates restart authority. REQ-BED-007 and ToolRoundAdmission govern
+        -- recovery without re-executing in-flight or unknown-effect tools.
+
+    @invariant CompletionNeedsThreeGuards
+        -- Only an open local-authority fence, the current dispatch generation,
+        -- and an accepting reducer state with the expected tool identity permit
+        -- an outcome to mutate conversation state. ID equality alone is not
+        -- ownership: later rounds may reuse the same provider tool ID. Normal
+        -- completion need not advance generation or abort the retained handle.
+
+    @invariant ReceiverSettlesOnce
+        -- A launched invocation's one-shot receiver yields either its one sent
+        -- outcome or sender loss. Sender loss supplies Failed for the expected
+        -- call. A foreign identity is replaced with Failed for that expected
+        -- call; foreign output is not attributed or retried. Forwarding does not
+        -- promise reducer acceptance or a durable result after authority closes.
+
+    @invariant PreparationCannotHoldCancellation
+        -- REQ-BED-005's immediate interruption and priority apply while request
+        -- policy, scope, context, or intercepted admission is being prepared,
+        -- including before an ordinary generation exists. Cancellation is not
+        -- queued behind a preparation read or admission response. Once accepted,
+        -- that preparation cannot launch the cancelled call. Local persistence
+        -- authority must still be established under REQ-BED-033 before semantic
+        -- settlement or publication; cancellation never fabricates a write result.
+}
+
+enum SpawnCancellationResolution { established | failed | indeterminate }
+
+entity ToolInvocation {
+    runtime: ToolRuntime
+    call: bedrock/ToolCall
+    generation: Integer
+    phase: preparing | launched | cancelling | settled | retired
+
+    transitions phase {
+        preparing -> launched
+        preparing -> retired
+        launched -> cancelling
+        launched -> settled
+        launched -> retired
+        cancelling -> settled
+        cancelling -> retired
+        terminal: settled, retired
+    }
+}
+
+-- REQ-LLM-004i: early request-policy and terminal-surface rejection precedes
+-- ordinary dispatch ownership. Failure to read authority is an executor error,
+-- not a fabricated unavailable result or permission to execute.
+rule RejectUnavailableCallBeforeOwnership {
+    when: bedrock/ToolExecutionStarted(conversation, call)
+    let runtime = runtime_for(conversation)
+    requires: conversation.core_status = executing_tools
+    requires: call = conversation.current_tool
+    requires: not has_active_ordinary_invocation(conversation)
+    requires: process_authority.open
+    requires: request_policy_read_succeeded(runtime)
+    requires: not originating_policy_allows(runtime, call)
+    ensures: bedrock/ToolCompletes(runtime.conversation, unavailable_result(call))
+    ensures: not OrdinaryGenerationOpened(runtime, call)
+    ensures: not ToolTaskLaunched(runtime, call)
+}
+
+rule RequestPolicyReadFails {
+    when: ToolRequestPolicyReadFailed(selection)
+    let runtime = selection.runtime
+    let call = selection.call
+    requires: process_authority.open
+    requires: selection_is_current(selection)
+    ensures: ExecutorErrorReturned(runtime, call)
+    ensures: not OrdinaryGenerationOpened(runtime, call)
+    ensures: not ToolTaskLaunched(runtime, call)
+}
+
+rule PreparationScopeReadFails {
+    when: ToolPreparationScopeReadFailed(selection)
+    let runtime = selection.runtime
+    let call = selection.call
+    requires: process_authority.open
+    requires: selection_is_current(selection)
+    requires: originating_policy_allows(runtime, call)
+    requires: call.name != "spawn_agents"
+    ensures: ExecutorErrorReturned(runtime, call)
+    ensures: not OrdinaryGenerationOpened(runtime, call)
+    ensures: not ToolTaskLaunched(runtime, call)
+}
+
+rule StaleRequestPolicyFailureCannotFailAnotherSelection {
+    when: ToolRequestPolicyReadFailed(selection)
+    requires: not process_authority.open or not selection_is_current(selection)
+    ensures: not ExecutorErrorReturned(selection.runtime, selection.call)
+    ensures: not ConversationMutation(selection.runtime.conversation)
+}
+
+rule StaleScopeFailureCannotFailAnotherSelection {
+    when: ToolPreparationScopeReadFailed(selection)
+    requires: not process_authority.open or not selection_is_current(selection)
+    ensures: not ExecutorErrorReturned(selection.runtime, selection.call)
+    ensures: not ConversationMutation(selection.runtime.conversation)
+}
+
+rule RouteSpawnToItsAdmissionBoundary {
+    when: bedrock/ToolExecutionStarted(conversation, call)
+    let runtime = runtime_for(conversation)
+    requires: conversation.core_status = executing_tools
+    requires: call = conversation.current_tool
+    requires: not has_active_ordinary_invocation(conversation)
+    requires: process_authority.open
+    requires: originating_policy_allows(runtime, call)
+    requires: call.name = "spawn_agents"
+    requires: spawn_catalog_matches_originating_schema(runtime, call)
+    requires: spawn_input_decodes(call)
+    let invocation = subagents/SpawnInvocation{
+        parent: conversation,
+        assistant_message_id: held_assistant_message_id(conversation),
+        tool_use_id: call.tool_use_id,
+        batch_id: new_spawn_batch_id()
+    }
+    ensures: subagents/SpawnAgentsToolInvoked(invocation, decoded_spawn_tasks(call))
+    ensures: not OrdinaryGenerationOpened(runtime, call)
+
+    @guidance
+        -- Recheck advertisement and the originating spawn schema before invoking
+        -- the sub-agent handler. Rejection returns its paired unavailable result.
+        -- Successful routing uses subagents/InvalidBatchAdmitsNoChildren,
+        -- SubAgentSpecsResolved, cancellation-before-initial-work, and joined
+        -- materialization rules; routing is not proof that children were admitted.
+}
+
+rule RejectChangedSpawnCatalog {
+    when: bedrock/ToolExecutionStarted(conversation, call)
+    let runtime = runtime_for(conversation)
+    requires: process_authority.open
+    requires: conversation.core_status = executing_tools
+    requires: call = conversation.current_tool
+    requires: not has_active_ordinary_invocation(conversation)
+    requires: originating_policy_allows(runtime, call)
+    requires: call.name = "spawn_agents"
+    requires: not spawn_catalog_matches_originating_schema(runtime, call)
+    ensures: bedrock/ToolCompletes(conversation, unavailable_result(call))
+}
+
+rule RejectUndecodableSpawnInput {
+    when: bedrock/ToolExecutionStarted(conversation, call)
+    let runtime = runtime_for(conversation)
+    requires: process_authority.open
+    requires: conversation.core_status = executing_tools
+    requires: call = conversation.current_tool
+    requires: not has_active_ordinary_invocation(conversation)
+    requires: originating_policy_allows(runtime, call)
+    requires: call.name = "spawn_agents"
+    requires: spawn_catalog_matches_originating_schema(runtime, call)
+    requires: not spawn_input_decodes(call)
+    ensures: bedrock/ToolCompletes(conversation, invalid_spawn_input_result(call))
+}
+
+rule SpawnRejectionReturnsToItsExactCall {
+    when: subagents/SpawnAgentsRejected(invocation, reason)
+    let runtime = runtime_for(invocation.parent)
+    requires: process_authority.open
+    requires: spawn_invocation_is_current(invocation)
+    ensures: bedrock/ToolCompletes(
+        invocation.parent, spawn_rejection_result(invocation, reason)
+    )
+
+    @guidance
+        -- Correlation checking and Bedrock admission form the same owned return
+        -- step, not an untagged completion queued for a later active selection.
+        -- Several validation predicates may reject one batch; repeated rejection
+        -- observations still address this same original call. After its first
+        -- accepted completion advances Bedrock, the old invocation is not current.
+}
+
+rule SpawnAdmissionReturnsToItsExactCall {
+    when: subagents/SpawnAgentsCompletes(invocation, spawned_agents)
+    let runtime = runtime_for(invocation.parent)
+    requires: process_authority.open
+    requires: spawn_invocation_is_current(invocation)
+    ensures: bedrock/SpawnAgentsCompletes(
+        invocation.parent, spawn_success_result(invocation, spawned_agents), spawned_agents
+    )
+
+    @guidance
+        -- Preserve that same origin correlation through reducer admission.
+        -- Receiving an admission response is not permission to use another
+        -- current call or another assistant round that reused the provider ID.
+}
+
+rule CancelTheOwnedSpawnHandoff {
+    when: bedrock/ToolAbortRequested(conversation)
+    requires: has_owned_spawn_handoff_for_cancellation(conversation)
+    let invocation = owned_spawn_handoff_for_cancellation(conversation)
+    requires: process_authority.open
+    ensures: subagents/SpawnBatchCancellationRequested(invocation)
+}
+
+rule AdmittedSpawnReturnsToItsCancellingOrigin {
+    when: subagents/SpawnAgentsCompletes(invocation, spawned_agents)
+    requires: process_authority.open
+    requires: spawn_invocation_is_cancelling(invocation)
+    ensures: subagents/SpawnBatchCancellationRequested(invocation)
+
+    @guidance
+        -- Cancellation does not make this admission receipt stale. Keep its
+        -- response/activation owner, withhold activation, and reconcile every
+        -- admitted child into pending with terminal cancellation evidence before
+        -- acknowledging the tool abort. Parent cancellation still waits for fan-in.
+        -- If ToolAbortRequested already requested reconciliation, join that same
+        -- exact invocation's operation; do not initiate another native cleanup.
+}
+
+rule RejectedSpawnReturnsToItsCancellingOrigin {
+    when: subagents/SpawnAgentsRejected(invocation, reason)
+    requires: process_authority.open
+    requires: spawn_invocation_is_cancelling(invocation)
+    requires: spawn_cancellation_resolution(invocation.parent) = established
+    ensures: bedrock/ToolCompletes(invocation.parent, spawn_rejection_result(invocation, reason))
+}
+
+rule AbnormallyReplacedSpawnOriginCannotAffectSuccessor {
+    when: subagents/SpawnAgentsCompletes(invocation, spawned_agents)
+    requires: process_authority.open
+    requires: not spawn_invocation_is_current(invocation)
+    requires: not spawn_invocation_is_cancelling(invocation)
+    requires: activation_is_unreleased_and_membership_unadopted(invocation)
+    ensures: subagents/SpawnActivationWithheld(invocation)
+    ensures: OriginatingSpawnEvidenceRetained(invocation)
+    ensures: SpawnOriginInvariantViolationReported(invocation)
+    ensures: not ConversationMutation(invocation.parent)
+    ensures: not bedrock/ToolAborted(invocation.parent)
+
+    @guidance
+        -- The live retained-owner invariant excludes this shape from ordinary
+        -- advancement and settlement. An abnormal interruption is not permission
+        -- to rewrite a later round, invent historical fan-in or claim cleanup
+        -- success. Retain its durable admission/diagnostics and keep activation
+        -- withheld. This report alone is not unclassified SQLite authority;
+        -- only actual local-authority classification can close that global fence.
+}
+
+rule AdoptedSpawnDuplicateCannotAffectSuccessor {
+    when: subagents/SpawnAgentsCompletes(invocation, spawned_agents)
+    requires: not spawn_invocation_is_current(invocation)
+    requires: not spawn_invocation_is_cancelling(invocation)
+    requires: exact_batch_already_adopted(invocation)
+    ensures: not ConversationMutation(invocation.parent)
+    ensures: not subagents/UnactivatedSpawnBatchClosureRequested(invocation)
+}
+
+rule ReconciledSpawnAllowsToolCancellationToDrain {
+    when: subagents/UnactivatedSpawnBatchReconciled(invocation)
+    requires: process_authority.open
+    requires: spawn_invocation_is_cancelling(invocation)
+    requires: spawn_cancellation_resolution(invocation.parent) = established
+    ensures: bedrock/ToolAborted(invocation.parent)
+}
+
+rule FailedSpawnClosureDoesNotClaimCancellationSuccess {
+    when: subagents/SpawnBatchClosureFailed(invocation, reason)
+    requires: process_authority.open
+    requires: spawn_invocation_is_current(invocation)
+        or spawn_invocation_is_cancelling(invocation)
+    ensures: ExecutorErrorReturned(runtime_for(invocation.parent), originating_spawn_call(invocation))
+    ensures: not bedrock/ToolAborted(invocation.parent)
+}
+
+rule StaleSpawnClosureFailureCannotFailSuccessor {
+    when: subagents/SpawnBatchClosureFailed(invocation, reason)
+    requires: not spawn_invocation_is_current(invocation)
+        and not spawn_invocation_is_cancelling(invocation)
+    ensures: OriginatingSpawnEvidenceRetained(invocation)
+    ensures: SpawnOriginInvariantViolationReported(invocation)
+    ensures: not ConversationMutation(invocation.parent)
+}
+
+rule UnclassifiedSpawnAuthorityClosesTheProcessFence {
+    when: subagents/SpawnBatchAuthorityUnclassified(invocation)
+    ensures: FatalLocalAuthorityLost()
+}
+
+rule RequestOrdinaryPermissionBeforeResources {
+    when: bedrock/ToolExecutionStarted(conversation, call)
+    let runtime = runtime_for(conversation)
+    requires: conversation.core_status = executing_tools
+    requires: call = conversation.current_tool
+    requires: not has_active_ordinary_invocation(conversation)
+    requires: process_authority.open
+    requires: originating_policy_allows(runtime, call)
+    requires: call.name != "spawn_agents"
+    requires: preparation_scope_read_succeeded(runtime, call)
+    let selection = DispatchSelection{
+        runtime: runtime,
+        assistant_message_id: held_assistant_message_id(conversation),
+        call: call
+    }
+    ensures: OrdinaryPermissionCheckRequested(selection)
+
+    @guidance
+        -- Evaluate the pure deterministic deny decision before ordinary dispatch
+        -- generation/token/channel, start publication, context or metrics-writer
+        -- allocation. Authority reads do not reserve tool execution resources.
+        -- No gate return can suspend cancellation priority under REQ-BED-005.
+}
+
+rule DeniedSelectionReturnsWithoutCallResources {
+    when: PermissionDenied(selection, denial)
+    requires: process_authority.open
+    requires: selection_is_current(selection)
+    ensures: bedrock/ToolCompletes(selection.runtime.conversation,
+        denied_selection_result(selection, denial))
+    ensures: not OrdinaryGenerationOpened(selection.runtime, selection.call)
+    ensures: not CallResourcesReserved(selection)
+    ensures: not ToolTaskLaunched(selection.runtime, selection.call)
+
+    @guidance
+        -- Return an ordinary error paired to the original selected call. No
+        -- invocation/generation or tool task is needed to deliver this denial.
+        -- Permission counting/escalation remains outside CheckedToolExecution.
+}
+
+rule StaleDeniedSelectionCannotCompleteLaterWork {
+    when: PermissionDenied(selection, denial)
+    requires: not process_authority.open or not selection_is_current(selection)
+    ensures: not ConversationMutation(selection.runtime.conversation)
+    ensures: not ToolTaskLaunched(selection.runtime, selection.call)
+}
+
+rule ClearedSelectionAdmitsOrdinaryPreparation {
+    when: PermissionCleared(selection, checked_call)
+    let runtime = selection.runtime
+    let call = selection.call
+    requires: process_authority.open
+    requires: selection_is_current(selection)
+    requires: not has_active_ordinary_invocation(runtime.conversation)
+    requires: checked_payload_matches(checked_call, call)
+    let generation = runtime.generation + 1
+    ensures: runtime.generation = generation
+    ensures: ToolInvocation.created(
+        runtime: runtime, call: call,
+        generation: generation, phase: preparing
+    )
+    ensures: OrdinaryPreparationRequested(runtime, call, generation, checked_call)
+
+    @guidance
+        -- Only the cleared proof admits generation/token/channel, start-time
+        -- publication, context and metrics setup. Keep the original selection
+        -- and checked payload through preparation; cancellation may retire it.
+}
+
+rule StaleClearedSelectionCannotReserveCallResources {
+    when: PermissionCleared(selection, checked_call)
+    requires: not process_authority.open or not selection_is_current(selection)
+    ensures: not OrdinaryGenerationOpened(selection.runtime, selection.call)
+    ensures: not CallResourcesReserved(selection)
+    ensures: not ToolTaskLaunched(selection.runtime, selection.call)
+}
+
+rule PreparedClearedCallLaunches {
+    when: OrdinaryPreparationCompleted(invocation, checked_call)
+    requires: invocation.phase = preparing
+    requires: process_authority.open
+    requires: invocation.runtime.conversation.core_status = executing_tools
+    requires: invocation.call = invocation.runtime.conversation.current_tool
+    requires: checked_payload_matches(checked_call, invocation.call)
+    ensures: invocation.phase = launched
+    ensures: ToolTaskLaunched(invocation.runtime, invocation.call)
+
+    @guidance
+        -- Transfer the same checked call and context into the retained tool task.
+        -- Immediately before ToolExecutor::execute, recheck the live callable
+        -- definition against the originating schema under ToolHistoryIntegrity.
+        -- Revoked or changed admission returns Failed without running the tool.
+        -- Live-MCP resolution consumes the same checked name, payload and schema.
+}
+
+rule ForwardTaskOutcome {
+    when: ToolReceiverResolved(invocation, outcome)
+    requires: invocation.phase in { launched, cancelling, retired }
+    ensures: OutcomeForwarded(invocation, owned_outcome(invocation, outcome))
+}
+
+rule ForwardSenderLoss {
+    when: ToolReceiverLostSender(invocation)
+    requires: invocation.phase in { launched, cancelling, retired }
+    ensures: OutcomeForwarded(invocation, failed_outcome(invocation))
+}
+
+rule DiscardStaleOrFencedOutcome {
+    when: OutcomeForwarded(invocation, outcome)
+    requires: not process_authority.open
+        or invocation.generation != invocation.runtime.generation
+    ensures: not ConversationMutatedByOutcome(invocation, outcome)
+}
+
+rule SubmitOwnedCompletionOrFailure {
+    when: OutcomeForwarded(invocation, outcome)
+    requires: process_authority.open
+    requires: invocation.generation = invocation.runtime.generation
+    requires: outcome.kind in { completed, failed }
+    requires: reducer_accepts(invocation, outcome)
+    ensures: invocation.phase = settled
+    ensures: bedrock/ToolCompletes(
+        invocation.runtime.conversation, tool_result_for(invocation, outcome)
+    )
+
+    @guidance
+        -- Completed and Failed become the expected call's ToolComplete.
+        -- Bedrock's cancellation rules
+        -- checkpoint synthetic results rather than adopting a late real result.
+        -- Reducer rejection leaves conversation state unchanged; it does not
+        -- convert a current generation into permission to use another state.
+}
+
+rule SubmitOwnedAbortDuringCancellation {
+    when: OutcomeForwarded(invocation, outcome)
+    requires: process_authority.open
+    requires: invocation.generation = invocation.runtime.generation
+    requires: outcome.kind = aborted
+    requires: reducer_accepts(invocation, outcome)
+    ensures: invocation.phase = settled
+    ensures: bedrock/ToolAborted(invocation.runtime.conversation)
+}
+
+rule RejectCurrentOutcomeOutsideReducerState {
+    when: OutcomeForwarded(invocation, outcome)
+    requires: process_authority.open
+    requires: invocation.generation = invocation.runtime.generation
+    requires: not reducer_accepts(invocation, outcome)
+    ensures: not ConversationMutatedByOutcome(invocation, outcome)
+}
+
+rule CooperativeCancellationPreservesGeneration {
+    when: bedrock/ToolAbortRequested(conversation)
+    requires: has_active_ordinary_invocation(conversation)
+    let invocation = active_invocation_for(conversation)
+    requires: invocation.phase = launched
+    requires: process_authority.open
+    requires: invocation.runtime.conversation.core_status = cancelling_tool
+    ensures: invocation.phase = cancelling
+    ensures: CancellationTokenSignalled(invocation)
+    ensures: invocation.runtime.generation = previous(invocation.runtime.generation)
+
+    @guidance
+        -- Keep the retained task and generation so its cooperative outcome can
+        -- reach CancellingTool. A cancelled pre-gate selection starts no task.
+}
+
+rule CancellationBeforeCallEffectsSettlesTheOwnedSelection {
+    when: bedrock/ToolAbortRequested(conversation)
+    requires: process_authority.open
+    requires: conversation.core_status = cancelling_tool
+    requires: not has_active_ordinary_invocation(conversation)
+    requires: not has_owned_spawn_handoff_for_cancellation(conversation)
+    let selection = retained_selection_for_cancellation(conversation)
+    requires: selection_is_cancelling(selection)
+    requires: selection_has_issued_no_call_effects(selection)
+    ensures: bedrock/ToolAborted(conversation)
+    ensures: not OrdinaryGenerationOpened(selection.runtime, selection.call)
+    ensures: not CallResourcesReserved(selection)
+    ensures: not ToolTaskLaunched(selection.runtime, selection.call)
+
+    @guidance
+        -- A policy/scope read or pure gate decision need not return before
+        -- acknowledging this no-effects cancellation. Bedrock checkpoints its
+        -- synthetic results immediately through the normal cancellation path.
+        -- This also covers a spawn-named selection BEFORE any native admission
+        -- command was issued. A missing handoff alone proves nothing: the exact
+        -- retained selection must establish that no admission/effect was issued.
+        -- Once a spawn command was issued, its classified ownership/reconciliation
+        -- path applies instead. Late classified read/clear/deny returns remain
+        -- stale; actual unknown local authority still closes the shared fence.
+}
+
+rule CancellationDuringOrdinaryPreparationPreventsLaunch {
+    when: bedrock/ToolAbortRequested(conversation)
+    requires: has_active_ordinary_invocation(conversation)
+    let invocation = active_invocation_for(conversation)
+    requires: invocation.phase = preparing
+    requires: process_authority.open
+    requires: conversation.core_status = cancelling_tool
+    ensures: invocation.phase = retired
+    ensures: invocation.runtime.generation = invocation.runtime.generation + 1
+    ensures: CancellationTokenSignalled(invocation)
+    ensures: bedrock/ToolAborted(conversation)
+
+    @guidance
+        -- No tool task was launched. Settle the cancellation using Bedrock's
+        -- existing synthetic current/queued results; a late preparation return
+        -- cannot pass the active-state, phase, and generation launch guards.
+}
+
+rule CancellationBackstopRetiresGeneration {
+    when: bedrock/ToolCancellationRetirementRequested(conversation)
+    let owner = runtime_for(conversation)
+    let retiring = ToolInvocations where runtime = owner
+        and phase in { preparing, launched, cancelling }
+    requires: process_authority.open
+    requires: conversation.core_status = cancelling_tool
+    requires: spawn_cancellation_resolution(conversation) = established
+    ensures: owner.generation = owner.generation + 1
+    ensures: RetainedToolTaskAbortRequested(owner)
+    ensures:
+        for invocation in retiring:
+            invocation.phase = retired
+    ensures: bedrock/ToolCancellationRetired(conversation)
+
+    @guidance
+        -- The runtime slot is retired even if no ordinary invocation or task
+        -- exists, including a reducer-selected intercepted call. A retained
+        -- handle is aborted if present; acknowledgement does not wait for it.
+        -- Bedrock owns synthetic current/queued results and any remaining child
+        -- cancellation. A sender-loss outcome from this abort carries the retired
+        -- generation and cannot settle a later call, including reused tool IDs.
+}
+
+rule CancellationBackstopCannotInventASpawnResolution {
+    when: bedrock/ToolCancellationRetirementRequested(conversation)
+    requires: process_authority.open
+    requires: conversation.core_status = cancelling_tool
+    requires: spawn_cancellation_resolution(conversation) = indeterminate
+    ensures: FatalLocalAuthorityLost()
+
+    @guidance
+        -- The required local admission/closure fact was not established by the
+        -- owning bounded operation. Apply REQ-BED-033; do not infer no children
+        -- from a missing callback or race a still-running admission with a query.
+}
+
+rule CancellationBackstopReportsKnownSpawnFailure {
+    when: bedrock/ToolCancellationRetirementRequested(conversation)
+    requires: process_authority.open
+    requires: conversation.core_status = cancelling_tool
+    requires: spawn_cancellation_resolution(conversation) = failed
+    let invocation = owned_spawn_handoff_for_cancellation(conversation)
+    ensures: ExecutorErrorReturned(runtime_for(conversation), originating_spawn_call(invocation))
+    ensures: not bedrock/ToolCancellationRetired(conversation)
+}
+
+rule RuntimeTeardownRetiresGeneration {
+    when: RuntimeToolTeardown(runtime)
+    let owner = runtime
+    let retiring = ToolInvocations where phase in { preparing, launched, cancelling }
+        and runtime = owner
+    ensures: runtime.generation = runtime.generation + 1
+    ensures: SlotCancellationTokenSignalledIfPresent(runtime)
+    ensures: RetainedToolTaskAbortRequested(runtime)
+    ensures:
+        for invocation in retiring:
+            invocation.phase = retired
+
+    @guidance
+        -- Fatal local-authority loss follows REQ-BED-033: suppress admission and
+        -- semantic publication, cancel/abort in memory, and fail stop. Do not
+        -- manufacture persistence success or run database-backed cleanup.
+}
+
+rule FatalLocalAuthorityClosesAdmission {
+    when: FatalLocalAuthorityLost()
+    let owners = ToolRuntimes
+    ensures: process_authority.open = false
+    ensures:
+        for owner in owners:
+            RuntimeToolTeardown(owner)
+
+    @guidance
+        -- Close the one process-wide authority fence before releasing any owner.
+        -- Already-queued current-generation outcomes cannot reopen it or publish
+        -- semantic state. Teardown supplies in-memory cancellation and abort;
+        -- REQ-BED-033 owns process exit rather than database-backed repair.
+}
+
+rule BedrockAuthorityCutoffClosesRuntimeFence {
+    when: bedrock/ProcessLocalAuthorityClosed(_)
+    ensures: FatalLocalAuthorityLost()
+}
+
+rule BashWaitFallbackRetiresTaskOutcome {
+    when: bedrock/ToolTaskRetirementRequested(conversation, call)
+    requires: has_active_ordinary_invocation(conversation)
+    let invocation = active_invocation_for(conversation)
+    requires: invocation.phase = launched
+    requires: process_authority.open
+    requires: invocation.runtime.conversation.core_status = executing_tools
+    requires: invocation.call = invocation.runtime.conversation.current_tool
+    requires: invocation.call = call
+    requires: bedrock/is_bash_wait(invocation.call)
+    ensures: invocation.phase = retired
+    ensures: invocation.runtime.generation = invocation.runtime.generation + 1
+    ensures: RetainedToolTaskAbortRequested(invocation.runtime)
+    ensures: bedrock/ToolTaskRetired(conversation, call)
+
+    @guidance
+        -- Bedrock's BashWaitRetiredTaskSettles acknowledges this completed
+        -- retirement with one synthetic Failed outcome for the expected call.
+        -- Only the wait task is
+        -- aborted; its token/process handle is not cancelled by this fallback.
+        -- The original receiver's later outcome carries the retired generation.
+        -- The absolute persistence cutoff remains governed by REQ-BED-033.
+}
+
+invariant ActiveInvocationUsesCurrentGeneration {
+    for invocation in ToolInvocations:
+        invocation.phase in { preparing, launched, cancelling }
+            implies invocation.generation = invocation.runtime.generation
+}
+
+surface OrdinaryToolDispatch {
+    facing runtime: ToolRuntime
+
+    contracts:
+        demands llm/ToolHistoryIntegrity
+        demands permissions/CheckedToolExecution
+        demands bedrock/ToolRoundAdmission
+        demands bedrock/ParentTerminalAcceptance
+        demands subagents/SpawnParentAdoption
+        fulfils SerialToolDispatch
+
+    provides:
+        bedrock/ToolExecutionStarted(runtime.conversation, runtime.conversation.current_tool)
+            when runtime.conversation.core_status = executing_tools
+                 and not has_active_ordinary_invocation(runtime.conversation)
+
+    @guarantee SelectionOwnsOneStartEffect
+        -- ToolExecutionStarted is Bedrock's one effect when selecting an active
+        -- call or advancing to its successor, not a repeatable dispatch API.
+        -- Each selection consumes that effect once. Cancellation may preempt
+        -- preparation; single consumption does not require waiting for a read
+        -- or admission response before accepting cancellation. A resumed
+        -- preparation retains its original selection identity and cannot adopt
+        -- a later round's same-valued call. No second generation opens for a
+        -- still-active ordinary invocation, and launch requires the uncancelled
+        -- original active selection.
+
+    @guarantee NoImplicitReplay
+        -- Recreating this runtime does not recreate process-local invocations.
+        -- Committed transcript and accepted-turn authority govern recovery;
+        -- an interrupted task's unknown external effects are not repeated.
+}
+
+-- These are observations of the synchronous gate return and one-shot receiver,
+-- not independent requests that may invent a verdict or complete another call.
+surface PreparationReadObservations {
+    facing runtime: ToolRuntime
+    context selection: DispatchSelection
+
+    provides:
+        ToolRequestPolicyReadFailed(selection)
+            when selection.runtime = runtime
+        ToolPreparationScopeReadFailed(selection)
+            when selection.runtime = runtime
+
+    @guarantee ClassifiedFailureKeepsItsReadOrigin
+        -- Capture the runtime, held assistant identity and selected call before
+        -- starting the read; carry that immutable origin through its classified
+        -- failed return and preserve the original diagnostics. Never reconstruct
+        -- it from the latest call or held round. A stale classified failure is
+        -- observational only and cannot fail or launch later work. Unclassified
+        -- local persistence authority is not one of these ordinary failures:
+        -- it closes the shared process fence even if its selection became stale.
+}
+
+surface PermissionBoundaryObservations {
+    facing runtime: ToolRuntime
+    context selection: DispatchSelection
+
+    contracts:
+        demands permissions/CheckedToolExecution
+
+    provides:
+        PermissionCleared(selection, checked_call)
+            when selection.runtime = runtime
+        PermissionDenied(selection, denial)
+            when selection.runtime = runtime
+
+    @guarantee ExactGateReturnPrecedesCallResourceAdmission
+        -- OrdinaryPermissionCheckRequested invokes the deterministic gate once
+        -- for the captured selection, before reserving any tool-call resources.
+        -- Return exactly one proof or denial with that same immutable origin.
+        -- Cleared carries the exact gate-minted name/input; Denied reserves no
+        -- generation/task/context/start/metrics resources. A late return cannot
+        -- borrow the latest selection. These returns do not fulfil escalation.
+}
+
+surface InvocationBoundaryObservations {
+    facing runtime: ToolRuntime
+    context invocation: ToolInvocation
+
+    contracts:
+        demands permissions/CheckedToolExecution
+
+    provides:
+        OrdinaryPreparationCompleted(invocation, checked_call)
+            when invocation.runtime = runtime and invocation.phase = preparing
+        ToolReceiverResolved(invocation, outcome)
+            when invocation.runtime = runtime
+                 and invocation.phase in { launched, cancelling, retired }
+        ToolReceiverLostSender(invocation)
+            when invocation.runtime = runtime
+                 and invocation.phase in { launched, cancelling, retired }
+
+    @guarantee PreparationRetainsTheClearedProof
+        -- OrdinaryPreparationRequested supplies the exact runtime/call/generation
+        -- identifying the newly created invocation and its gate-minted call.
+        -- Successful preparation returns that same proof for this exact owned
+        -- invocation; it does not mint a new payload or read the latest selection.
+
+    @guarantee ReceiverObservationIsExclusive
+        -- Only an invocation with a launched tool task has a receiver here.
+        -- Its first outcome or sender loss resolves that receiver once, even
+        -- after retirement. The two observations are mutually exclusive. Denial
+        -- is settled before an ordinary invocation exists and starts no tool task.
+}
+
+surface RuntimeAuthorityObservations {
+    facing runtime: ToolRuntime
+
+    provides:
+        RuntimeToolTeardown(runtime)
+        FatalLocalAuthorityLost()
+
+    @guarantee FenceClosureDoesNotRequireAnActiveInvocation
+        -- Fatal authority loss is a process/runtime fact, including while an
+        -- invocation is retired or settled or no ordinary call exists. The
+        -- observed process_authority.open is the shared process-wide fence, not a
+        -- permission each invocation can retain independently.
+}
+
+-- Operation marker RetainedToolTaskAbortRequested(runtime):
+--   invoke the slot's task-only abort;
+--   abort its retained handle if present and do nothing to a missing handle.
+--   This operation does not assert that an invocation launched a task or that
+--   aborted resources have finished cleanup before the caller continues.
+-- SlotCancellationTokenSignalledIfPresent(runtime): cancel the slot's retained
+--   token if one exists; a missing token does not prevent teardown or fence closure.
+
+-- Helpers (pure observations; none mints execution authority)
+-- runtime_for(conversation: bedrock/Conversation) -> ToolRuntime: the live owned
+--   executor for that conversation; this lookup does not create a runtime.
+-- has_active_ordinary_invocation(conversation: bedrock/Conversation) -> Boolean:
+--   its runtime owns a preparing, launched, or cancelling invocation.
+-- CallResourcesReserved(selection): generation/token/channel, context,
+--   tool-start publication and metrics-writer resources admitted for that call.
+--   Immutable selection and authority reads are not execution-resource admission.
+-- active_invocation_for(conversation: bedrock/Conversation) -> ToolInvocation:
+--   that exact current-generation ordinary invocation. Requires the preceding
+--   presence predicate; intercepted sub-agent dispatch does not fabricate one.
+-- request_policy_read_succeeded(runtime): the originating policy read returned.
+-- originating_policy_allows(runtime, call): the retained request policy declares
+--   this call callable with its authentic schema and permits its current tool
+--   surface. Absence, withdrawal, and terminal-surface restrictions deny it.
+-- held_assistant_message_id(conversation) -> String: the immutable message ID of
+--   the assistant round holding the selected call; never the latest durable row.
+-- selection_is_current(selection) -> Boolean: the same runtime still holds the
+--   captured assistant message in ExecutingTools and its current tool equals the
+--   captured exact call. Cancellation, round replacement, another selection or a
+--   later round reusing a provider ID is false. This check and error acceptance
+--   are one owned step; no ordinary generation is required before preparation.
+-- retained_selection_for_cancellation(conversation) -> DispatchSelection: the
+--   immutable origin retained by the native policy/scope/gate preparation owner,
+--   not a reconstruction from the latest call or an absent invocation lookup.
+-- selection_is_cancelling(selection) -> Boolean: the same runtime/held assistant
+--   and CancellingTool tool ID still identify this exact captured selection.
+-- selection_has_issued_no_call_effects(selection) -> Boolean: that exact retained
+--   preparation owner establishes no native admission command, ordinary resource
+--   admission/generation or tool-task request was issued. Mere in-memory absence,
+--   a missing reply or a query racing a spawn command is not this disposition.
+-- new_spawn_batch_id() -> String: the native request's fresh opaque batch identity,
+--   captured once with the original call and reused by its admission/closure owner.
+-- spawn_catalog_matches_originating_schema(runtime, call) -> Boolean: spawn is
+--   still advertised and its resolved schema equals the authentic request schema,
+--   under llm/ToolHistoryIntegrity. This does not evaluate sub-agent admission.
+-- spawn_input_decodes(call) -> Boolean: the serialized input decodes into typed
+--   spawn tasks; empty/oversized or otherwise inadmissible batches still decode
+--   and are rejected by subagents' existing validation rules.
+-- decoded_spawn_tasks(call) -> List<subagents/SubAgentTask>: the decoded task
+--   values, preserving each field before the imported defaulting/validation rules.
+-- invalid_spawn_input_result(call) -> bedrock/ToolResult: a concrete input error
+--   paired to the selected call's original ID, without admitting children.
+-- spawn_invocation_is_current(invocation) -> Boolean: its parent is executing
+--   its selected spawn call, the held assistant message equals the captured
+--   assistant_message_id, and that call's ID equals the captured tool_use_id.
+--   Recheck at reducer admission in the same owned step; stale, cancelled, or
+--   duplicate returns cannot settle another call or a later assistant round.
+-- spawn_invocation_is_cancelling(invocation) -> Boolean: the exact held assistant
+--   and cancelling tool ID still identify this invocation in CancellingTool.
+--   Cancellation is not evidence that its native admission response is stale.
+-- has_owned_spawn_handoff_for_cancellation(conversation) -> Boolean: the original
+--   selected spawn's native response/activation owner exists for this exact
+--   cancelling assistant/tool identity. It is not another runtime or durable store.
+-- owned_spawn_handoff_for_cancellation(conversation) -> subagents/SpawnInvocation:
+--   that retained origin, including the existing native batch ID.
+-- activation_is_unreleased_and_membership_unadopted(invocation) -> Boolean:
+--   the native handoff proves neither activation nor parent membership adoption
+--   occurred for this exact batch. A later active selection or absent current
+--   membership alone cannot establish it; an already-adopted duplicate is not
+--   authority to abandon running children.
+-- exact_batch_already_adopted(invocation) -> Boolean: established native evidence
+--   proves exact admitted membership was committed to the captured parent round;
+--   neither a later selected call nor absence of an in-memory owner is proof.
+-- originating_spawn_call(invocation) -> bedrock/ToolCall: the actual call retained
+--   by that native owner, not a reconstructed/latest call with a reused ID.
+-- spawn_cancellation_resolution(conversation) -> SpawnCancellationResolution:
+--   established only if the exact owner proves no admission command was issued,
+--   its finished command classified a rejection without children, or the admitted
+--   unadopted batch has classified cancellation terminal evidence and committed
+--   exact parent pending membership. All admitted children still require actual
+--   parent acceptance before ordinary settlement. An outstanding
+--   command/closure cannot be classified by racing it with an absence query.
+--   failed is a classified concrete native error, not cancellation success;
+--   indeterminate means the authority needed at the bounded settlement cutoff
+--   cannot be established and selects REQ-BED-033. No outstanding spawn defaults
+--   to established only from the owned operation's proof, never missing memory.
+-- spawn_rejection_result(invocation, reason) -> bedrock/ToolResult: preserve the
+--   rejection reason and use invocation.tool_use_id, never a newly selected ID.
+-- spawn_success_result(invocation, spawned_agents) -> bedrock/ToolResult: preserve
+--   the admitted child identities in the spawn receipt paired to that same ID.
+-- preparation_scope_read_succeeded(runtime, call): the context's required scope
+--   lookup returned; a failed lookup propagates an executor error before launch.
+-- unavailable_result(call): an error paired to call.tool_use_id, preserving its
+--   assistant turn under llm/ToolHistoryIntegrity.
+-- checked_payload_matches(checked_call, call): the checked name and serialized
+--   input are exactly the active call's name and input, under CheckedToolExecution.
+-- denied_selection_result(selection, denial): ordinary error with the denial
+--   diagnostics and captured call ID, never a later selected provider ID.
+-- failed_outcome(invocation): failed outcome for the owned call ID on sender loss.
+-- owned_outcome(invocation, outcome): outcome when its ID matches; otherwise a
+--   Failed outcome for the expected ID that discards the foreign output.
+-- reducer_accepts(invocation, outcome): the expected ID matches the active
+--   executing call for Completed/Failed, or the cancelling call for any outcome.
+--   A current generation alone does not satisfy these state and identity guards.
+-- tool_result_for(invocation, outcome) -> bedrock/ToolResult: preserve the entire
+--   completed result; for Failed, retain its error as a concrete error result.
+--   Both use the owned call ID. Aborted never enters this conversion.

@@ -1,13 +1,13 @@
-# ADR-212: Kache default waits for an identifiable isolation fix
+# ADR-223: Kache default waits for an identifiable isolation fix
 
-- **Status:** Selection conclusion superseded by ADR-213; historical v1.0.0 evidence retained
+- **Status:** Selection conclusion superseded by ADR-224; historical v1.0.0 evidence retained
 - **Date:** 2026-10-11
-- **Supersedes:** ADR-211
+- **Supersedes:** ADR-222
 - **Affects:** development methodology; REQ-COMP-001, REQ-COMP-008
 
 ## Context
 
-ADR-211 qualified released Kache 1.0.0 for restored debug fidelity and selected it automatically on macOS arm64. Managed-remote review then established that the same release fails open to an unscoped primary store when a requested trust-domain directory is unusable and does not scope configured volume shards. Its pre-configuration compiler-family probe cache is also unscoped.
+ADR-222 qualified released Kache 1.0.0 for restored debug fidelity and selected it automatically on macOS arm64. Managed-remote review then established that the same release fails open to an unscoped primary store when a requested trust-domain directory is unusable and does not scope configured volume shards. Its pre-configuration compiler-family probe cache is also unscoped.
 
 A bounded correction in the user-owned fork makes requested trust domains fail closed and scopes primary stores, configured volume destinations, compiler-family probes, and durable upload queues. Focused executable regressions and independent exact-head review qualify that source candidate. The candidate remains unpublished and reports the same `kache 1.0.0` version as the vulnerable official artifact, so Phoenix cannot distinguish the two through Kache's version contract.
 
@@ -37,7 +37,7 @@ A future Kache release may restore automatic and explicit selection only after i
 
 ## References
 
-- ADR-211, ADR-079, and ADR-078
+- ADR-222, ADR-079, and ADR-078
 - `dev.py::_configure_compiler_cache`
 - `specs/compatibility/requirements.md`
 - `docs/development/compiler-cache.md`

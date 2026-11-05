@@ -1,6 +1,6 @@
-# ADR-211: Qualified Kache v1 restores automatic compiler-cache selection
+# ADR-222: Qualified Kache v1 restores automatic compiler-cache selection
 
-- **Status:** Superseded by ADR-212 (selection); v1.0.0 debugger evidence remains historical
+- **Status:** Superseded by ADR-223 (selection); v1.0.0 debugger evidence remains historical
 - **Date:** 2026-10-07
 - **Supersedes:** ADR-079
 - **Affects:** development methodology; REQ-COMP-001, REQ-COMP-008

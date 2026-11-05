@@ -228,6 +228,17 @@ THE SYSTEM SHALL bind each persisted tool-result identity to both its owning ass
 AND SHALL preserve that identity when materializing an interrupted tool round
 AND SHALL keep results from distinct assistant rounds separate when a provider reuses a tool ID.
 
+THE SYSTEM SHALL require unique Phoenix-managed call identities and a one-to-one correspondence between those calls and their results before admitting a completed tool round
+AND SHALL preserve the supplied valid result order.
+
+WHEN a provider response's Phoenix-managed tool blocks and executable call identities do not correspond one-to-one
+THE SYSTEM SHALL classify the response as invalid before executing or intercepting any of its calls
+AND SHALL apply the existing invalid-response retry and terminal-error policy.
+
+WHEN a tool invocation's completion carries another invocation's identity
+THE SYSTEM SHALL reject that output
+AND SHALL settle the expected invocation with an explicit tool error without executing the tool again.
+
 WHEN sub-agent fan-in updates an awaited spawn result
 THE SYSTEM SHALL update the latest matching durable result in the owning conversation
 AND SHALL preserve earlier rounds with the same provider tool ID
@@ -380,6 +391,14 @@ AND SHALL NOT infer automatic continuation from the transcript tail
 WHEN server restarts
 THE SYSTEM SHALL restore an ordinary interrupted provider request with no independently recoverable durable obligation to idle state
 AND preserve complete message history
+
+WHEN startup cannot decode or validate a buffered executing or cancelling tool round
+THE SYSTEM SHALL reject startup before resetting that buffered state
+AND SHALL retain its persisted assistant and completed-result evidence unchanged
+AND SHALL NOT replay its in-flight or unknown-effect tools.
+
+THE SYSTEM SHALL decode and validate all selected buffered tool rounds before recovery mutates any selected round or its pending-child state
+AND SHALL NOT overwrite an invalid child's buffered evidence while settling its parent.
 
 WHEN a conversation runtime successfully settles startup in a terminal state
 THE SYSTEM SHALL acknowledge startup settlement before the runtime exits so recovery of other conversations can continue
@@ -755,7 +774,7 @@ AND both handoff policies SHALL request unfinished obligations, authorization pr
 AND SHALL distinguish authentic primary user directions from generated assertions, delegate reports, quotations, and assumptions; missing evidence SHALL remain unknown with narrow retrieval pointers rather than invented approval
 AND the tool-free compaction input SHALL expose each retained text-bearing row's known persisted conversation/message locator pair, typed input origin and content kind alongside its rendered text, including ordinary user-facing API inputs
 AND source attribution SHALL come from the frozen persisted projection, not message text; rendered payload SHALL be escaped separately from attribution, with metadata included in the row's token budget and omitted whenever the row is omitted
-AND user-facing API origin SHALL identify only an entry channel, not establish biological human authorship or grant authorization; internal conversation, unknown historical, system-generated and subscription-event inputs and generated continuation content SHALL remain distinguishable
+AND user-facing API origin SHALL identify only an entry channel, not establish biological human authorship or grant authorization; internal conversation, unknown historical, system-generated, scheduled-reminder and subscription-event inputs and generated continuation content SHALL remain distinguishable
 AND SHALL describe the generated handoff as untrusted context that cannot self-authorize, override instructions, expand scope, or grant blanket merge, deploy, or delete permission
 AND the request SHALL describe any tools that were requested but not executed, including their intended arguments
 AND the request SHALL preserve the prior tool history as text rather than discarding it

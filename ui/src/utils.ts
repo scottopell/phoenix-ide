@@ -11,6 +11,7 @@ import type {
   UserQuestion,
 } from './api';
 import { getErrorPresentation } from './errorPresentation';
+import { getToolActivity } from './conversation/toolActivity';
 import type { ErrorKind } from './generated/ErrorKind';
 
 /** Format a keyboard shortcut for the current platform (Cmd on macOS, Ctrl elsewhere) */
@@ -133,12 +134,15 @@ export function getStateDescription(state: ConversationState): string {
       // Same rationale as `llm_requesting`: defer to
       // `turnRetryContext` for retry surfacing.
       return 'starting...';
-    case 'tool_executing': {
-      // `current_tool.name` is authoritative on both wire paths; see
-      // ToolCall's custom Serialize impl in state_machine/state.rs.
-      const tool = state.current_tool?.name || 'tool';
-      const remaining = state.remaining_tools?.length ?? 0;
-      return remaining > 0 ? `${tool} (+${remaining} queued)` : tool;
+    case 'tool_executing': case 'cancelling_tool': {
+      const activity = getToolActivity(state);
+      if (activity.type === 'cancelling') return 'cancelling...';
+      if (activity.type === 'executing') {
+        const tool = activity.activeTool?.name || 'tool';
+        const remaining = activity.queued?.length ?? 0;
+        return remaining > 0 ? `${tool} (+${remaining} queued)` : tool;
+      }
+      return 'tool';
     }
     case 'awaiting_sub_agents': {
       const pending = state.pending.length;
@@ -149,7 +153,7 @@ export function getStateDescription(state: ConversationState): string {
     }
     case 'awaiting_continuation':
       return 'Compacting conversation...';
-    case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
+    case 'cancelling': case 'cancelling_sub_agents':
       return 'cancelling...';
     case 'idle': case 'terminal':
       return 'ready';

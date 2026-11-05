@@ -14,6 +14,14 @@ const chapters: Chapter[] = [
   { unitIndex: 3, kind: 'prompt', target: { kind: 'persisted', messageId: 'chapter-3', transcriptId: 'fixture' }, label: 'Event prompt', sequenceId: 4, origin: { kind: 'subscription_event', event_id: 'event-1' } },
   { unitIndex: 4, kind: 'prompt', target: { kind: 'persisted', messageId: 'chapter-4', transcriptId: 'fixture' }, label: 'Automatic prompt', sequenceId: 5, origin: { kind: 'system_generated' } },
   { unitIndex: 5, kind: 'prompt', target: { kind: 'persisted', messageId: 'chapter-5', transcriptId: 'fixture' }, label: 'Old prompt', sequenceId: 6 },
+  { unitIndex: 6, kind: 'prompt', target: { kind: 'persisted', messageId: 'chapter-6', transcriptId: 'fixture' }, label: 'Remote API prompt', sequenceId: 7, origin: { kind: 'remote_api', instance_id: 'peer-1' } },
+  { unitIndex: 7, kind: 'prompt', target: { kind: 'persisted', messageId: 'chapter-7', transcriptId: 'fixture' }, label: 'Remote conversation prompt', sequenceId: 8, origin: {
+    kind: 'remote_conversation', instance_id: 'peer-1', product_conversation_id: 'remote-product', transcript_id: 'remote-row',
+    source_call: { message_id: 'remote-message', tool_use_id: 'remote-call' },
+  } },
+  { unitIndex: 8, kind: 'prompt', target: { kind: 'persisted', messageId: 'chapter-8', transcriptId: 'fixture' }, label: 'Remote Coordinator prompt', sequenceId: 9, origin: {
+    kind: 'remote_coordinator', instance_id: 'peer-2', product_conversation_id: 'coordinator-product', transcript_id: 'coordinator-row', source_call: null,
+  } },
 ];
 
 describe('ConversationNav input provenance', () => {
@@ -37,6 +45,12 @@ describe('ConversationNav input provenance', () => {
     expect(units).toHaveLength(3);
   });
 
+  it('identifies persisted reminder inputs in chapter navigation', () => {
+    render(<ConversationNav chapters={[{ unitIndex: 3, sequenceId: 4, kind: 'prompt', target: { kind: 'persisted', messageId: 'reminder-input', transcriptId: 'c' }, label: 'Inspect Safari', origin: { kind: 'scheduled_reminder', reminder_id: 'saved-id' } }]} activeUnitIndex={3} onJump={vi.fn()} />);
+    expect(screen.getByRole('button', { name: 'Saved reminder saved-id: Inspect Safari' })).toHaveClass('meta');
+    expect(screen.getByText('Scheduled reminder · Inspect Safari')).toBeInTheDocument();
+  });
+
   it('distinguishes channels visually and accessibly without shifting the unit jump target', () => {
     const onJump = vi.fn();
     render(<ConversationNav chapters={chapters} activeUnitIndex={2} onJump={onJump} />);
@@ -48,6 +62,9 @@ describe('ConversationNav input provenance', () => {
     expect(screen.getByRole('button', { name: 'Conversation event: Event prompt' })).toHaveClass('meta');
     expect(screen.getByRole('button', { name: 'System input: Automatic prompt' })).toHaveClass('meta');
     expect(screen.getByRole('button', { name: 'Unknown input: Old prompt' })).toHaveClass('meta');
+    expect(screen.getByRole('button', { name: 'Remote API · instance ID peer-1: Remote API prompt' })).toHaveClass('meta');
+    expect(screen.getByRole('button', { name: 'From remote conversation · instance ID peer-1 · conversation ID remote-product · transcript ID remote-row · source message remote-message · tool call remote-call: Remote conversation prompt' })).toHaveClass('meta');
+    expect(screen.getByRole('button', { name: 'From remote Coordinator · instance ID peer-2 · conversation ID coordinator-product · transcript ID coordinator-row · source call unavailable: Remote Coordinator prompt' })).toHaveClass('meta');
     expect(screen.getByRole('button', { name: 'Assistant: Response' })).toHaveClass('assistant');
     fireEvent.keyDown(forwarded, { key: 'Enter' });
     expect(onJump).toHaveBeenCalledWith(expect.objectContaining({ unitIndex: 2 }));

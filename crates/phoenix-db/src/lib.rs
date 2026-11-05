@@ -10,18 +10,26 @@ use phoenix_core::domain::tool_round::{tool_result_message, ToolRoundAssembly, T
 mod slack_gateway;
 pub use slack_gateway::*;
 mod close_foundation;
+mod coordinator_authority;
 mod coordinator_query;
 mod coordinator_watches;
 mod coordinator_work_scope;
 mod federation_enrollment;
+pub use federation_enrollment::FederationSendAuthority;
 mod federation_peers;
+pub mod federation_subscriptions;
 pub use coordinator_watches::{
     append_mandatory_close_failure_event_tx, CloseFailureStop, MandatoryCloseFailureSubject,
     PendingWatchEvent, WatchEventPresentation, WatchEventProvenance, WatchEventRoute, WatchOutcome,
     WatchSnapshot,
 };
+pub use federation_peers::FederationPeerConnection;
 mod ddl;
+mod reminders;
 mod request_capacity;
+pub use reminders::{
+    CreateReminderInput, DueReminder, DueReminderCursor, ReminderChange, RescheduleReminderInput,
+};
 pub use request_capacity::CapacityDiagnosticRow;
 mod git_repository_reconciliation;
 mod message_attachments;
@@ -41,8 +49,17 @@ pub use prompt_projection::{
     GenerationFencedPromptPosition, HydratedPromptSnapshot, HydratedPromptTail,
     PersistedMessageSequence, PromptProjectionPosition, PromptTranscriptGeneration,
 };
+mod automatic_continuation_settings;
 pub mod conversation_goals;
 mod conversation_name;
+pub use automatic_continuation_settings::{
+    AutomaticContinuationSettings, AutomaticContinuationTarget,
+    ResolvedAutomaticContinuationAggregate,
+};
+mod native_continuation;
+pub use native_continuation::{
+    CoordinatorContinuationOpening, CurrentCoordinatorContinuationRequest,
+};
 mod product_conversation_rename;
 pub use product_conversation_rename::{
     NormalizedConversationTitle, ProductConversationRenameCommand, ProductConversationRenameDetail,
@@ -346,6 +363,10 @@ impl std::error::Error for ProjectSeedIdError {}
 
 #[derive(Error, Debug)]
 pub enum DbError {
+    #[error("Invalid reminder request: {0}")]
+    ReminderInvalid(String),
+    #[error("reminder create identity was already used with different input")]
+    ReminderRequestConflict,
     #[error("Coordinator WorkScope: {0}")]
     CoordinatorWorkScope(String),
     #[error("Database error: {0}")]
@@ -380,6 +401,16 @@ pub enum DbError {
     ProductConversationUnavailable(
         phoenix_core::domain::product_conversation::ProductConversationId,
     ),
+    #[error("federation send authority is no longer active")]
+    FederationSendAuthorityInactive,
+    #[error("federation send identity is already owned by another conversation")]
+    FederationSendIdentityConflict,
+    #[error("saved federation peer not found")]
+    FederationPeerNotFound,
+    #[error("saved federation peer name is ambiguous")]
+    FederationPeerAmbiguous,
+    #[error("federation steering send exactly replays a prior admission")]
+    FederationSteeringDuplicate,
     #[error("steering queue is full")]
     SteeringQueueFull,
     #[error("product creation delivery claim was lost or is required")]
@@ -1706,6 +1737,8 @@ impl SteeringCapacityTestControl {
 pub struct Database {
     pool: SqlitePool,
     slack_gateway_wakeup: std::sync::Arc<tokio::sync::Notify>,
+    goal_version_committed:
+        tokio::sync::broadcast::Sender<conversation_goals::GoalVersionCommittedNotification>,
     goal_control_installation: conversation_goals::control::GoalControlInstallation,
     goal_execution_installation: conversation_goals::execution::GoalExecutionInstallation,
     goal_control_runtime: std::sync::Arc<conversation_goals::control::dispatch::GoalControlRuntime>,
@@ -1726,6 +1759,10 @@ pub struct Database {
     #[cfg(test)]
     steering_drain_test_latch: Option<std::sync::Arc<SteeringDrainTestLatch>>,
     #[cfg(any(test, feature = "test-support"))]
+    native_settings_commit_test_pause: std::sync::Arc<
+        std::sync::Mutex<Option<automatic_continuation_settings::SettingsCommitTestPause>>,
+    >,
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) steering_capacity_test_control: SteeringCapacityTestControl,
 }
 
@@ -1734,6 +1771,7 @@ impl Clone for Database {
         Self {
             pool: self.pool.clone(),
             slack_gateway_wakeup: self.slack_gateway_wakeup.clone(),
+            goal_version_committed: self.goal_version_committed.clone(),
             goal_control_installation: self.goal_control_installation,
             goal_execution_installation: self.goal_execution_installation,
             goal_control_runtime: self.goal_control_runtime.clone(),
@@ -1752,6 +1790,8 @@ impl Clone for Database {
             steering_begin_test_latch: self.steering_begin_test_latch.clone(),
             #[cfg(test)]
             steering_drain_test_latch: self.steering_drain_test_latch.clone(),
+            #[cfg(any(test, feature = "test-support"))]
+            native_settings_commit_test_pause: self.native_settings_commit_test_pause.clone(),
             #[cfg(any(test, feature = "test-support"))]
             steering_capacity_test_control: self.steering_capacity_test_control.clone(),
         }
@@ -1858,12 +1898,12 @@ fn parent_creation_values(
 }
 
 const PROMPT_TAIL_EMPTY_SQL: &str =
-    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
      FROM messages
      WHERE conversation_id = ?1
      ORDER BY sequence_id ASC";
 const PROMPT_TAIL_AFTER_SQL: &str =
-    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
      FROM messages
      WHERE conversation_id = ?1 AND sequence_id > ?2
      ORDER BY sequence_id ASC";
@@ -1969,6 +2009,7 @@ impl Database {
         Self {
             pool,
             slack_gateway_wakeup: std::sync::Arc::new(tokio::sync::Notify::new()),
+            goal_version_committed: tokio::sync::broadcast::channel(128).0,
             sqlite_workload_collector,
             path,
             goal_control_installation:
@@ -1989,6 +2030,8 @@ impl Database {
             steering_begin_test_latch: None,
             #[cfg(test)]
             steering_drain_test_latch: None,
+            #[cfg(any(test, feature = "test-support"))]
+            native_settings_commit_test_pause: std::sync::Arc::default(),
             #[cfg(any(test, feature = "test-support"))]
             steering_capacity_test_control: SteeringCapacityTestControl::default(),
         }
@@ -3718,6 +3761,7 @@ impl Database {
                 "notify_question" => settings.events.question = parsed.into(),
                 "notify_error" => settings.events.error = parsed.into(),
                 "notify_idle" => settings.events.idle = parsed.into(),
+                "notify_reminder" => settings.events.reminder = parsed.into(),
                 _ => {}
             }
         }
@@ -3738,6 +3782,7 @@ impl Database {
             ("notify_question", settings.events.question.as_bool()),
             ("notify_error", settings.events.error.as_bool()),
             ("notify_idle", settings.events.idle.as_bool()),
+            ("notify_reminder", settings.events.reminder.as_bool()),
         ];
         for (key, enabled) in pairs {
             sqlx::query(
@@ -4833,13 +4878,23 @@ impl Database {
         &self,
         parent_id: &str,
     ) -> DbResult<Option<ContinuationDispatchIntent>> {
+        Self::continuation_dispatch_intent_on(&self.pool, parent_id).await
+    }
+
+    async fn continuation_dispatch_intent_on<'e, E>(
+        executor: E,
+        parent_id: &str,
+    ) -> DbResult<Option<ContinuationDispatchIntent>>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
         let row = sqlx::query(
             "SELECT parent_conversation_id, successor_conversation_id, message_id,
                     handoff, user_agent, opening_authority
              FROM continuation_dispatch_intents WHERE parent_conversation_id = ?1",
         )
         .bind(parent_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(executor)
         .await?;
         row.map(|row| {
             Ok(ContinuationDispatchIntent {
@@ -4902,7 +4957,15 @@ impl Database {
         let observation = self
             .sqlite_workload_collector
             .start_read_family(SqliteReadFamily::ConversationGet);
-        let result = sqlx::query(
+        let result = Self::get_conversation_on(&self.pool, id).await;
+        observation.complete(result)
+    }
+
+    async fn get_conversation_on<'e, E>(executor: E, id: &str) -> DbResult<Conversation>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
+        sqlx::query(
             "SELECT c.id, c.product_conversation_id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
@@ -4914,7 +4977,7 @@ impl Database {
         )
         .bind(id)
         .try_map(parse_conversation_row)
-        .fetch_one(&self.pool)
+        .fetch_one(executor)
         .await
         .map_err(|e| {
             if matches!(e, sqlx::Error::RowNotFound) {
@@ -4922,8 +4985,7 @@ impl Database {
             } else {
                 DbError::Sqlx(e)
             }
-        });
-        observation.complete(result)
+        })
     }
 
     /// Get conversation by slug
@@ -6999,16 +7061,12 @@ impl Database {
         &self,
         product_conversation_id: &ProductConversationId,
     ) -> DbResult<AutoContinueOnContextExhaustion> {
-        let enabled: Option<i64> = sqlx::query_scalar(
-            "SELECT auto_continue_on_context_exhaustion
-             FROM product_conversations WHERE id = ?1",
+        let mut connection = self.pool.acquire().await?;
+        automatic_continuation_settings::read_preference_on(
+            &mut connection,
+            product_conversation_id,
         )
-        .bind(product_conversation_id.as_str())
-        .fetch_optional(&self.pool)
-        .await?;
-        enabled
-            .map(|value| AutoContinueOnContextExhaustion::from(value != 0))
-            .ok_or_else(|| DbError::ProductConversationUnavailable(product_conversation_id.clone()))
+        .await
     }
 
     /// Persist the aggregate-scoped automatic-continuation preference.
@@ -7022,21 +7080,13 @@ impl Database {
         product_conversation_id: &ProductConversationId,
         preference: AutoContinueOnContextExhaustion,
     ) -> DbResult<()> {
-        let updated = sqlx::query(
-            "UPDATE product_conversations
-             SET auto_continue_on_context_exhaustion = ?1
-             WHERE id = ?2",
+        let mut connection = self.pool.acquire().await?;
+        automatic_continuation_settings::write_preference_on(
+            &mut connection,
+            product_conversation_id,
+            preference,
         )
-        .bind(i64::from(bool::from(preference)))
-        .bind(product_conversation_id.as_str())
-        .execute(&self.pool)
-        .await?;
-        if updated.rows_affected() == 0 {
-            return Err(DbError::ProductConversationUnavailable(
-                product_conversation_id.clone(),
-            ));
-        }
-        Ok(())
+        .await
     }
 
     /// Return the automatic continuation admitted for this predecessor, if any.
@@ -7749,11 +7799,13 @@ impl Database {
         for (ordinal, entry) in queue.iter().enumerate() {
             sqlx::query(
                 "INSERT OR IGNORE INTO steering_acceptance_receipts
-                    (conversation_id, message_id, request_fingerprint)
-                 VALUES (?1, ?2, NULL)",
+                    (conversation_id, message_id, request_fingerprint, origin_reminder_id)
+                 SELECT ?1, ?2, NULL, ?3 WHERE NOT EXISTS (
+                     SELECT 1 FROM steering_acceptance_receipts WHERE conversation_id=?1 AND message_id=?2)",
             )
             .bind(id)
             .bind(&entry.message_id)
+            .bind(entry.origin.reminder_id())
             .execute(&mut *tx)
             .await?;
             insert_steering_entry_tx(
@@ -7819,6 +7871,40 @@ impl Database {
         entry: &phoenix_core::domain::sm_event::SteerEntry,
         request_fingerprint: &str,
     ) -> DbResult<usize> {
+        self.append_steering_entry_with_federation_authority(id, entry, request_fingerprint, None)
+            .await
+    }
+
+    /// Append one peer-authenticated steering entry atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the peer authority is inactive, the admitted
+    /// message identity conflicts with another journal or conversation, the
+    /// request is a durable replay, or the transaction cannot be committed.
+    pub async fn append_federated_steering_entry(
+        &self,
+        id: &str,
+        entry: &phoenix_core::domain::sm_event::SteerEntry,
+        request_fingerprint: &str,
+        authority: &FederationSendAuthority,
+    ) -> DbResult<usize> {
+        self.append_steering_entry_with_federation_authority(
+            id,
+            entry,
+            request_fingerprint,
+            Some(authority),
+        )
+        .await
+    }
+
+    async fn append_steering_entry_with_federation_authority(
+        &self,
+        id: &str,
+        entry: &phoenix_core::domain::sm_event::SteerEntry,
+        request_fingerprint: &str,
+        authority: Option<&FederationSendAuthority>,
+    ) -> DbResult<usize> {
         #[cfg(test)]
         if let Some(latch) = &self.steering_begin_test_latch {
             latch.before_begin.notify_waiters();
@@ -7826,6 +7912,32 @@ impl Database {
             latch.begin_called.notify_waiters();
         }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(authority) = authority {
+            federation_enrollment::require_federation_send_identity_owner_tx(
+                &mut tx,
+                &entry.message_id,
+                id,
+                federation_enrollment::FederationSendIdentityJournal::SteeringReceipt,
+            )
+            .await?;
+            let existing_fingerprint: Option<Option<String>> = sqlx::query_scalar(
+                "SELECT request_fingerprint
+                 FROM steering_acceptance_receipts
+                 WHERE conversation_id = ?1 AND message_id = ?2",
+            )
+            .bind(id)
+            .bind(&entry.message_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(existing_fingerprint) = existing_fingerprint {
+                return if existing_fingerprint.as_deref() == Some(request_fingerprint) {
+                    Err(DbError::FederationSteeringDuplicate)
+                } else {
+                    Err(DbError::FederationSendIdentityConflict)
+                };
+            }
+            federation_enrollment::require_federation_send_authority_tx(&mut tx, authority).await?;
+        }
         let requires_claim: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM product_creation_jobs creation
              JOIN conversations c ON c.product_conversation_id = creation.product_conversation_id
@@ -7881,12 +7993,13 @@ impl Database {
 
         sqlx::query(
             "INSERT INTO steering_acceptance_receipts
-                (conversation_id, message_id, request_fingerprint)
-             VALUES (?1, ?2, ?3)",
+                (conversation_id, message_id, request_fingerprint, origin_reminder_id)
+             VALUES (?1, ?2, ?3, ?4)",
         )
         .bind(id)
         .bind(&entry.message_id)
         .bind(request_fingerprint)
+        .bind(entry.origin.reminder_id())
         .execute(&mut **tx)
         .await?;
         insert_steering_entry_tx(tx, id, ordinal, entry).await?;
@@ -8132,24 +8245,7 @@ impl Database {
             ExecutionOccurrenceTerminal::Completed => ("Completed", None),
             ExecutionOccurrenceTerminal::Failed { reason } => ("Failed", Some(reason.as_str())),
         };
-        crate::coordinator_watches::record_steering_event_tx(
-            &mut tx,
-            source_kind,
-            source_message_id,
-            conversation_id,
-            terminal_kind,
-            terminal_reason,
-        )
-        .await?;
-        sqlx::query(
-            "DELETE FROM steering_execution_occurrences
-             WHERE conversation_id = ?1 AND message_id = ?2",
-        )
-        .bind(conversation_id)
-        .bind(source_message_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
+        let projection_changed = sqlx::query(
             "UPDATE conversations
              SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
              WHERE id = ?4
@@ -8178,7 +8274,27 @@ impl Database {
         .bind(conversation_id)
         .bind(source_message_id)
         .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        sqlx::query(
+            "DELETE FROM steering_execution_occurrences
+             WHERE conversation_id = ?1 AND message_id = ?2",
+        )
+        .bind(conversation_id)
+        .bind(source_message_id)
+        .execute(&mut *tx)
         .await?;
+        if projection_changed == 1 {
+            crate::coordinator_watches::record_steering_event_tx(
+                &mut tx,
+                source_kind,
+                source_message_id,
+                conversation_id,
+                terminal_kind,
+                terminal_reason,
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok(true)
     }
@@ -8474,6 +8590,22 @@ impl Database {
         .map_err(Into::into)
     }
 
+    /// Find a remote send's admitted message in the existing turn/steering journals.
+    ///
+    /// # Errors
+    /// Returns a database error if the lookup fails.
+    pub async fn remote_send_message_owner(
+        &self,
+        admitted_message_id: &str,
+    ) -> DbResult<Option<String>> {
+        sqlx::query_scalar(
+            "SELECT owner FROM (
+                SELECT conversation_id AS owner FROM durable_turns WHERE client_turn_key = ?1
+                UNION SELECT conversation_id AS owner FROM steering_acceptance_receipts WHERE message_id = ?1
+             ) LIMIT 1"
+        ).bind(admitted_message_id).fetch_optional(&self.pool).await.map_err(Into::into)
+    }
+
     /// Report whether a conversation has any durable pending steering work.
     ///
     /// # Errors
@@ -8511,7 +8643,7 @@ impl Database {
 
         let rows = sqlx::query(
             "SELECT message_id, text, llm_text, user_agent, skill_name, skill_body, skill_dir,
-                    origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                    origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM steering_messages WHERE conversation_id = ?1 ORDER BY ordinal ASC",
         )
         .bind(id)
@@ -8563,12 +8695,14 @@ impl Database {
                     });
             queue.push(SteerEntry {
                 text: row.try_get("text")?,
-                origin: phoenix_core::domain::db_schema::InputOrigin::from_db_parts_with_slack(
+                origin: phoenix_core::domain::db_schema::InputOrigin::from_db_source_columns(
                     &row.try_get::<String, _>("origin_kind")?,
                     row.try_get("origin_product_conversation_id")?,
                     row.try_get("origin_transcript_id")?,
                     row.try_get("origin_subscription_event_id")?,
+                    row.try_get("origin_source_instance_id")?,
                     row.try_get("origin_slack_request_id")?,
+                    row.try_get("origin_reminder_id")?,
                 )
                 .and_then(|origin| {
                     origin.with_source_call_columns(
@@ -9473,22 +9607,76 @@ impl Database {
         Ok((outcome, accepted))
     }
 
-    #[allow(clippy::too_many_lines)] // one transaction owns creation, transfer, and intent
     async fn continue_conversation_inner(
         &self,
         parent_id: &str,
         intent: Option<&NewContinuationDispatchIntent>,
     ) -> DbResult<ContinueOutcome> {
-        // Fetch parent outside the transaction — the subsequent INSERT+UPDATE
-        // guards against concurrent continuation via the parent's
-        // `continued_in_conv_id` still being NULL at UPDATE time.
-        let parent = self.get_conversation(parent_id).await?;
+        #[cfg(test)]
+        if let Some(ContinuationTestHook::PreReservationBarrier(barrier)) =
+            self.continuation_test_hook.as_deref()
+        {
+            let parent = self.get_conversation(parent_id).await?;
+            if parent.continued_in_conv_id.is_none()
+                && parent.runtime_role != RuntimeRole::SubAgent
+                && (matches!(parent.state, ConvState::ContextExhausted { .. })
+                    || (intent.is_some()
+                        && matches!(&parent.state,
+                            ConvState::RecoverableContinuationFailure { failure }
+                                if failure.error_kind == ErrorKind::ContextCapacityConflict)))
+            {
+                barrier.wait().await;
+            }
+        }
+        let mut conn = self.pool.acquire().await?;
+        let begin_immediate = Box::pin(conn.begin_with("BEGIN IMMEDIATE"));
+        #[cfg(test)]
+        let mut begin_immediate = begin_immediate;
+        #[cfg(test)]
+        if let Some(ContinuationTestHook::ContendedBeginImmediate { attempted }) =
+            self.continuation_test_hook.as_deref()
+        {
+            std::future::poll_fn(|cx| match begin_immediate.as_mut().poll(cx) {
+                std::task::Poll::Pending => {
+                    attempted.notify_waiters();
+                    std::task::Poll::Ready(())
+                }
+                std::task::Poll::Ready(_) => {
+                    panic!("test expected BEGIN IMMEDIATE to contend with Close")
+                }
+            })
+            .await;
+        }
+        let mut tx = begin_immediate.await?;
+        match self
+            .continue_conversation_tx(&mut tx, parent_id, intent)
+            .await
+        {
+            Ok(outcome) => {
+                tx.commit().await?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                tx.rollback().await?;
+                Err(error)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // one transaction owns creation, transfer, and intent
+    async fn continue_conversation_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        parent_id: &str,
+        intent: Option<&NewContinuationDispatchIntent>,
+    ) -> DbResult<ContinueOutcome> {
+        let parent = Self::get_conversation_on(&mut **tx, parent_id).await?;
 
         let lifecycle = sqlx::query_scalar::<_, Option<String>>(
             "SELECT ordinary_lifecycle FROM product_conversations WHERE id = ?1",
         )
         .bind(parent.product_conversation_id.as_str())
-        .fetch_one(&self.pool)
+        .fetch_one(&mut **tx)
         .await?;
         if matches!(lifecycle.as_deref(), Some("history")) {
             return Err(DbError::ProductConversationUnavailable(
@@ -9503,7 +9691,7 @@ impl Database {
                 existing_continuation = %existing_id,
                 "continue_conversation: idempotent return of existing continuation",
             );
-            let existing = self.get_conversation(existing_id).await?;
+            let existing = Self::get_conversation_on(&mut **tx, existing_id).await?;
             return Ok(ContinueOutcome::AlreadyContinued(existing));
         }
 
@@ -9525,13 +9713,6 @@ impl Database {
             ));
         }
 
-        #[cfg(test)]
-        if let Some(ContinuationTestHook::PreReservationBarrier(barrier)) =
-            self.continuation_test_hook.as_deref()
-        {
-            barrier.wait().await;
-        }
-
         let new_id = uuid::Uuid::new_v4().to_string();
 
         // Sequential slug: walk to chain root, count existing members, then
@@ -9540,12 +9721,13 @@ impl Database {
         // handled by the UNIQUE-violation retry loop below (mirroring
         // `create_conversation`); `rows_affected() == 0` on the UPDATE remains
         // the definitive TOCTOU guard.
-        let root_id = self
-            .chain_root_of(parent_id)
+        let root_id = Self::chain_root_of_on(&mut **tx, parent_id)
             .await?
             .unwrap_or_else(|| parent_id.to_string());
-        let root = self.get_conversation(&root_id).await?;
-        let chain_len = self.chain_members_forward(&root_id).await?.len();
+        let root = Self::get_conversation_on(&mut **tx, &root_id).await?;
+        let chain_len = Self::chain_members_forward_on(&mut **tx, &root_id)
+            .await?
+            .len();
         let root_slug = root.slug.as_deref().unwrap_or("conversation");
         let base_n = chain_len + 1;
         let mut candidate_slug = format!("{root_slug}-{base_n}");
@@ -9556,30 +9738,7 @@ impl Database {
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
         let cm = conv_mode_columns(&parent.conv_mode);
 
-        // Atomic INSERT + UPDATE. On any error before `commit()`, the
-        // transaction guard drops and SQLite rolls back.
-        let mut conn = self.pool.acquire().await?;
-        let begin_immediate = Box::pin(conn.begin_with("BEGIN IMMEDIATE"));
-        #[cfg(test)]
-        let mut begin_immediate = begin_immediate;
-        #[cfg(test)]
-        if let Some(ContinuationTestHook::ContendedBeginImmediate { attempted }) =
-            self.continuation_test_hook.as_deref()
-        {
-            std::future::poll_fn(|cx| match begin_immediate.as_mut().poll(cx) {
-                std::task::Poll::Pending => {
-                    attempted.notify_waiters();
-                    std::task::Poll::Ready(())
-                }
-                std::task::Poll::Ready(_) => {
-                    panic!("test expected BEGIN IMMEDIATE to contend with Close")
-                }
-            })
-            .await;
-        }
-        let mut tx = begin_immediate.await?;
-
-        require_product_conversation_admission_tx(&mut tx, parent_id).await?;
+        require_product_conversation_admission_tx(tx, parent_id).await?;
         if revised_capacity_handoff {
             let intent = intent.expect("revised capacity handoff requires explicit intent");
             let ConvState::RecoverableContinuationFailure { failure } = &parent.state else {
@@ -9589,7 +9748,7 @@ impl Database {
                 "SELECT COALESCE(MAX(sequence_id), 0) + 1 FROM messages WHERE conversation_id = ?1",
             )
             .bind(parent_id)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?;
             let content = MessageContent::continuation(intent.handoff.clone());
             let boundary = Message {
@@ -9601,10 +9760,10 @@ impl Database {
                 },
                 message_type: content.message_type(), content, display_data: None, usage_data: None, created_at: now,
             };
-            insert_message_tx(&mut tx, &boundary).await?;
+            insert_message_tx(tx, &boundary).await?;
         }
         sqlx::query("PRAGMA defer_foreign_keys = ON")
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         let reservation = sqlx::query(
             "INSERT INTO product_continuation_reservations (
@@ -9619,15 +9778,13 @@ impl Database {
         .bind(parent_id)
         .bind(&new_id)
         .bind(parent.product_conversation_id.as_str())
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         if reservation.rows_affected() == 0 {
-            drop(tx);
-            drop(conn);
-            let refetched = self.get_conversation(parent_id).await?;
+            let refetched = Self::get_conversation_on(&mut **tx, parent_id).await?;
             if let Some(existing_id) = refetched.continued_in_conv_id {
                 return Ok(ContinueOutcome::AlreadyContinued(
-                    self.get_conversation(&existing_id).await?,
+                    Self::get_conversation_on(&mut **tx, &existing_id).await?,
                 ));
             }
             return Err(DbError::ContinuationPrecondition(
@@ -9643,7 +9800,7 @@ impl Database {
             .bind(&new_id)
             .bind(&now_str)
             .bind(parent_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?
         } else {
             sqlx::query(
@@ -9653,23 +9810,17 @@ impl Database {
             .bind(&new_id)
             .bind(&now_str)
             .bind(parent_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?
         };
         if reserved.rows_affected() == 0 {
-            drop(tx);
-            drop(conn);
-            let refetched = self.get_conversation(parent_id).await?;
-            if let Some(existing_id) = refetched.continued_in_conv_id {
-                return Ok(ContinueOutcome::AlreadyContinued(
-                    self.get_conversation(&existing_id).await?,
-                ));
-            }
-            return Err(DbError::ConversationNotFound(parent_id.to_string()));
+            return Err(DbError::ContinuationPrecondition(
+                "continuation predecessor was not reserved".to_string(),
+            ));
         }
 
         let continuation_work_scope_id = if parent.runtime_role == RuntimeRole::Coordinator {
-            let owned = Self::coordinator_work_scope_tx(&mut tx)
+            let owned = Self::coordinator_work_scope_tx(tx)
                 .await?
                 .map(|record| record.work_scope_id);
             if owned != parent.attached_work_scope_id {
@@ -9720,7 +9871,7 @@ impl Database {
             .bind::<Option<&str>>(None)
             .bind(parent.service_tier.as_wire_name())
             .bind(parent.product_conversation_id.as_str())
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await;
 
             match result {
@@ -9744,7 +9895,7 @@ impl Database {
              WHERE predecessor_conversation_id = ?1",
         )
         .bind(parent_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
         sqlx::query(
@@ -9754,7 +9905,7 @@ impl Database {
         )
         .bind(parent_id)
         .bind(&new_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         sqlx::query(
             "UPDATE steering_acceptance_receipts
@@ -9767,7 +9918,7 @@ impl Database {
         )
         .bind(parent_id)
         .bind(&new_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
         if let Some(intent) = intent {
@@ -9784,11 +9935,9 @@ impl Database {
             .bind(intent.user_agent.as_deref())
             .bind(intent.opening_authority.as_str())
             .bind(&now_str)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
-
-        tx.commit().await?;
 
         let title_str = schema::title_from_slug(&actual_slug);
         let new_conversation = Conversation {
@@ -9842,6 +9991,13 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn chain_members_forward(&self, root_id: &str) -> DbResult<Vec<String>> {
+        Self::chain_members_forward_on(&self.pool, root_id).await
+    }
+
+    async fn chain_members_forward_on<'e, E>(executor: E, root_id: &str) -> DbResult<Vec<String>>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
         let rows = sqlx::query_scalar::<_, String>(
             "WITH RECURSIVE chain(id, next_id, depth) AS (
                 SELECT id, continued_in_conv_id, 0
@@ -9855,7 +10011,7 @@ impl Database {
             SELECT id FROM chain ORDER BY depth",
         )
         .bind(root_id)
-        .fetch_all(&self.pool)
+        .fetch_all(executor)
         .await?;
         Ok(rows)
     }
@@ -9999,6 +10155,13 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn chain_root_of(&self, conv_id: &str) -> DbResult<Option<String>> {
+        Self::chain_root_of_on(&self.pool, conv_id).await
+    }
+
+    async fn chain_root_of_on<'e, E>(executor: E, conv_id: &str) -> DbResult<Option<String>>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
         let row = sqlx::query_scalar::<_, String>(
             "WITH RECURSIVE chain(id, depth) AS (
                 SELECT id, 0
@@ -10012,7 +10175,7 @@ impl Database {
             SELECT id FROM chain ORDER BY depth DESC LIMIT 1",
         )
         .bind(conv_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(executor)
         .await?;
         Ok(row)
     }
@@ -10451,7 +10614,11 @@ impl Database {
                 ));
             }
         }
-        let (results, replayed) = round::write_round_tx(
+        let round::RoundWriteOutcome {
+            results,
+            replayed,
+            committed_goals,
+        } = round::write_round_tx(
             &mut tx,
             conversation_id,
             assistant,
@@ -10488,6 +10655,7 @@ impl Database {
             ));
         }
         tx.commit().await?;
+        self.notify_goal_versions_committed(&committed_goals);
         if cut == TerminalEvidenceTransactionCut::AfterCommit {
             return Err(DbError::Serialization(
                 "injected after-commit cut".to_string(),
@@ -10577,7 +10745,7 @@ impl Database {
                     return Err(DbError::MessageNotFound(message_id.clone()));
                 }
                 let updated_message = sqlx::query(
-                    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
                      FROM messages WHERE message_id = ?1",
                 )
                 .bind(message_id)
@@ -12358,46 +12526,12 @@ impl Database {
         Ok(())
     }
 
-    /// Materialize the assistant message and completed tool results that an
-    /// in-flight `ToolExecuting` or `CancellingTool` round carries only in its
-    /// `ConvState` JSON, so they survive the startup reset that overwrites the
-    /// state with idle.
-    ///
-    /// Both states bundle the un-persisted round for atomic end-of-round
-    /// persistence and hold the same recoverable data, differing only in how
-    /// the unfinished tools are named:
-    ///   - `assistant_message`: the LLM turn (with one `tool_use` block per
-    ///     dispatched tool) — broadcast over SSE and seen by the user, but not
-    ///     yet in `messages`;
-    ///   - `completed_results`: real outputs of tools that already finished;
-    ///   - the unfinished tools: `ToolExecuting` carries the running tool as
-    ///     `current_tool` (a `ToolCall`) plus `remaining_tools`; `CancellingTool`
-    ///     carries the tool being aborted as `tool_use_id` (just the id) plus
-    ///     `skipped_tools`. Both are normalized to a flat list of interrupted
-    ///     `tool_use` ids — that's all the builder needs to pair a synthetic
-    ///     result.
-    ///
-    /// Each `tool_use` needs exactly one paired `tool_result` or the next LLM
-    /// request 400s. We write the assistant message, then one result per
-    /// `tool_use`: completed tools contribute their real result, and every
-    /// unfinished tool gets a synthetic interrupted error. The whole round
-    /// commits atomically via [`Database::persist_tool_round`].
-    ///
-    /// The pairing count is checked before any write: if the materialized
-    /// results don't match the assistant's `tool_use` count, we skip this
-    /// conversation rather than persist a mis-paired chain — the subsequent
-    /// reset + `repair_orphaned_tool_use` then handles it the legacy way.
+    /// Read typed persisted terminal outcomes for pending child conversations.
+    /// Missing and nonterminal child rows are omitted.
     ///
     /// # Errors
     ///
-    /// Returns a [`DbError`] if the underlying database operation fails.
-    /// Resolve the real terminal outcome of each pending sub-agent by reading
-    /// its child conversation row (created with `id == agent_id`). A sub-agent
-    /// that reached `Completed`/`Failed` before the restart is returned with its
-    /// real `Success`/`Failure` outcome; one still running (or whose row is
-    /// missing or non-terminal) is omitted, so the caller falls back to the
-    /// "interrupted by server restart" synthetic outcome. Query and decode
-    /// failures remain errors because they cannot prove the child nonterminal.
+    /// Returns [`DbError`] when a child query or state decoding fails.
     async fn resolve_pending_sub_agent_outcomes(
         &self,
         pending: &[phoenix_core::domain::sm_state::PendingSubAgent],
@@ -12487,22 +12621,16 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        let mut materialized = std::collections::HashSet::new();
+        let mut plans = Vec::new();
         for (conv_id, state_json, state_updated_at) in conv_rows {
             if only_conversations.is_some_and(|ids| !ids.contains(&conv_id)) {
                 continue;
             }
-            let state: ConvState = match serde_json::from_str(&state_json) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(
-                        conv_id = %conv_id, error = %e,
-                        "could not parse in-flight tool round state for materialization; \
-                         leaving to reset + orphan repair",
-                    );
-                    continue;
-                }
-            };
+            let state: ConvState = serde_json::from_str(&state_json).map_err(|error| {
+                DbError::Serialization(format!(
+                    "cannot recover in-flight tool round for {conv_id}; persisted state retained: {error}"
+                ))
+            })?;
 
             // Normalize both states to the assistant message, completed
             // results, interrupted tool ids, and pending sub-agents. The
@@ -12517,7 +12645,9 @@ impl Database {
                 pending_sub_agents,
             }) = normalize_in_flight_round(state)
             else {
-                continue;
+                return Err(DbError::Serialization(format!(
+                    "in-flight tool round state kind differs for {conv_id}; persisted state retained"
+                )));
             };
 
             // A sub-agent can have reached its own terminal state (persisted in
@@ -12573,20 +12703,31 @@ impl Database {
                 &sub_agent_outcomes,
             );
 
-            let (agent_msg, tool_msgs) = match round {
-                Ok(messages) => messages,
-                Err(ToolRoundError::ResultCountMismatch { tool_uses, results }) => {
-                    tracing::warn!(
-                        conv_id = %conv_id,
-                        tool_uses,
-                        results,
-                        "in-flight tool round has mismatched tool_use/result counts; \
-                         skipping materialization, leaving to orphan repair",
-                    );
-                    continue;
-                }
-            };
+            let (agent_msg, tool_msgs) = round.map_err(|error| {
+                DbError::Serialization(format!(
+                    "cannot recover in-flight tool round for {conv_id}; persisted state retained: {error}"
+                ))
+            })?;
 
+            plans.push(RestartToolRoundPlan {
+                assistant: agent_msg,
+                results: tool_msgs,
+                pending_sub_agents,
+                sub_agent_outcomes,
+                completed_count: completed_results.len(),
+            });
+        }
+
+        let mut materialized = std::collections::HashSet::new();
+        for RestartToolRoundPlan {
+            assistant: agent_msg,
+            results: tool_msgs,
+            pending_sub_agents,
+            sub_agent_outcomes,
+            completed_count,
+        } in plans
+        {
+            let conv_id = agent_msg.conversation_id.clone();
             let interrupted = ConvState::Failed {
                 error: "Sub-agent interrupted by server restart".to_string(),
                 error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
@@ -12671,8 +12812,8 @@ impl Database {
 
             tracing::info!(
                 conv_id = %conv_id,
-                completed = completed_results.len(),
-                interrupted = tool_msgs.len() - completed_results.len(),
+                completed = completed_count,
+                interrupted = tool_msgs.len() - completed_count,
                 "materialized in-flight tool round on restart",
             );
         }
@@ -12695,7 +12836,7 @@ impl Database {
         let mut tx = self.pool.begin().await?;
         if let Some(tool_id) = spawn_tool_id {
             let messages = sqlx::query(
-                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
                  FROM messages WHERE conversation_id = ?1 AND message_type = 'tool'",
             )
             .bind(conversation_id)
@@ -12733,7 +12874,7 @@ impl Database {
             }
             let updated_message = sqlx::query(
                 "SELECT message_id, conversation_id, sequence_id, message_type,
-                        content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                        content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
                  FROM messages WHERE message_id = ?1",
             )
             .bind(message_id)
@@ -13410,7 +13551,7 @@ impl Database {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(mut existing) = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content,
-                    display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                    display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages WHERE message_id = ?1",
         )
         .bind(message_id)
@@ -13626,8 +13767,8 @@ impl Database {
 
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         )
         .bind(message_id)
         .bind(conversation_id)
@@ -13641,9 +13782,11 @@ impl Database {
         .bind(origin.db_parts().1)
         .bind(origin.db_parts().2)
         .bind(origin.db_parts().3)
+        .bind(origin.db_parts().4)
     .bind(origin.source_call().map(|call| call.message_id.as_str()))
     .bind(origin.source_call().map(|call| call.tool_use_id.as_str()))
     .bind(origin.slack_request_id())
+    .bind(origin.reminder_id())
         .execute(&mut *tx)
         .await?;
         if matches!(
@@ -13778,7 +13921,7 @@ impl Database {
     pub async fn get_messages(&self, conversation_id: &str) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::FullHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC",
         )
         .bind(conversation_id)
@@ -13814,7 +13957,7 @@ impl Database {
             .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))
             .and_then(PromptTranscriptGeneration::from_persisted)?;
         let mut messages = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC",
         )
         .bind(conversation_id)
@@ -13889,7 +14032,7 @@ impl Database {
     ) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
             let mut rows = sqlx::query(
-                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
                  FROM messages
                  WHERE conversation_id = ?1
                    AND sequence_id >= (
@@ -13926,7 +14069,7 @@ impl Database {
     pub async fn get_recovery_messages(&self, conversation_id: &str) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages
              WHERE conversation_id = ?1
                AND (
@@ -14012,7 +14155,7 @@ impl Database {
     ) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages WHERE conversation_id = ?1 AND sequence_id > ?2 ORDER BY sequence_id ASC",
         )
         .bind(conversation_id)
@@ -14042,7 +14185,7 @@ impl Database {
     ) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::LatestBoundedHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages
              WHERE conversation_id = ?1
              ORDER BY sequence_id DESC
@@ -14118,7 +14261,7 @@ impl Database {
         limit: i64,
     ) -> DbResult<Vec<Message>> {
         let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages
              WHERE conversation_id = ?1 AND sequence_id < ?2
              ORDER BY sequence_id DESC
@@ -14149,7 +14292,7 @@ impl Database {
     ) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::LatestBoundedHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages
              WHERE conversation_id = ?1 AND sequence_id > ?2
              ORDER BY sequence_id ASC
@@ -14187,10 +14330,11 @@ impl Database {
             sqlx::query(
                 "SELECT m.message_id, m.sequence_id, m.message_type, \
                         substr(CAST(m.content AS BLOB), 1, ?4) AS content_prefix, \
-                        m.created_at, m.origin_kind, m.origin_product_conversation_id, \
-                        m.origin_transcript_id, m.origin_subscription_event_id, \
+                        m.created_at, m.origin_kind, m.origin_source_instance_id, \
+                        m.origin_product_conversation_id, m.origin_transcript_id, \
+                        m.origin_subscription_event_id, \
                         m.origin_source_message_id, m.origin_source_tool_use_id, \
-                        m.origin_slack_request_id, \
+                        m.origin_slack_request_id, m.origin_reminder_id, \
                         CASE WHEN json_valid(m.display_data) \
                                   AND json_type(m.display_data, '$.hidden') = 'true' \
                              THEN 1 ELSE 0 END AS hidden, \
@@ -14225,7 +14369,7 @@ impl Database {
     ) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages
              WHERE conversation_id = ?1 AND sequence_id >= ?2 AND sequence_id <= ?3
              ORDER BY sequence_id ASC",
@@ -14259,7 +14403,7 @@ impl Database {
     ) -> DbResult<(Vec<Message>, Vec<Message>)> {
         self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
             let mut before = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages
              WHERE conversation_id = ?1 AND sequence_id < ?2
              ORDER BY sequence_id DESC
@@ -14274,7 +14418,7 @@ impl Database {
         before.reverse();
 
         let mut after = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages
              WHERE conversation_id = ?1 AND sequence_id > ?2
              ORDER BY sequence_id ASC
@@ -14335,10 +14479,11 @@ impl Database {
         sqlx::query(
             "SELECT m.message_id, m.sequence_id, m.message_type, \
                     substr(CAST(m.content AS BLOB), 1, ?3) AS content_prefix, \
-                    m.created_at, m.origin_kind, m.origin_product_conversation_id, \
-                    m.origin_transcript_id, m.origin_subscription_event_id, \
+                    m.created_at, m.origin_kind, m.origin_source_instance_id, \
+                    m.origin_product_conversation_id, m.origin_transcript_id, \
+                    m.origin_subscription_event_id, \
                     m.origin_source_message_id, m.origin_source_tool_use_id, \
-                    m.origin_slack_request_id, \
+                    m.origin_slack_request_id, m.origin_reminder_id, \
                     CASE WHEN json_valid(m.display_data) \
                               AND json_type(m.display_data, '$.hidden') = 'true' \
                          THEN 1 ELSE 0 END AS hidden, \
@@ -14361,7 +14506,7 @@ impl Database {
         message_id: &str,
     ) -> DbResult<Message> {
         let mut message = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages
              WHERE message_id = ?1 AND (?2 IS NULL OR conversation_id = ?2)",
         )
@@ -14439,7 +14584,7 @@ impl Database {
         let body = async {
             let mut message = sqlx::query(
                 "SELECT message_id, conversation_id, sequence_id, message_type, content,
-                        display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                        display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
                  FROM messages WHERE message_id = ?1",
             )
             .bind(message_id)
@@ -14549,7 +14694,7 @@ impl Database {
         // Re-index the mutated message so the retrieval index reflects the new
         // content (specs/conversation-retrieval/ REQ-RET-003).
         let updated: Option<Message> = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages WHERE message_id = ?1",
         )
         .bind(message_id)
@@ -15575,8 +15720,8 @@ async fn insert_steering_entry_tx(
     sqlx::query(
         "INSERT INTO steering_messages
             (message_id, conversation_id, ordinal, text, llm_text, user_agent,
-             skill_name, skill_body, skill_dir, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             skill_name, skill_body, skill_dir, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
     )
     .bind(&entry.message_id)
     .bind(conversation_id)
@@ -15591,9 +15736,11 @@ async fn insert_steering_entry_tx(
     .bind(entry.origin.db_parts().1)
     .bind(entry.origin.db_parts().2)
     .bind(entry.origin.db_parts().3)
+    .bind(entry.origin.db_parts().4)
     .bind(entry.origin.source_call().map(|call| call.message_id.as_str()))
     .bind(entry.origin.source_call().map(|call| call.tool_use_id.as_str()))
     .bind(entry.origin.slack_request_id())
+    .bind(entry.origin.reminder_id())
     .execute(&mut **tx)
     .await?;
     for (file_ordinal, file) in entry.files.iter().enumerate() {
@@ -15790,6 +15937,15 @@ struct NormalizedRound {
     completed_results: Vec<ToolResult>,
     interrupted_tool_ids: Vec<String>,
     pending_sub_agents: Vec<phoenix_core::domain::sm_state::PendingSubAgent>,
+}
+
+struct RestartToolRoundPlan {
+    assistant: Message,
+    results: Vec<Message>,
+    pending_sub_agents: Vec<phoenix_core::domain::sm_state::PendingSubAgent>,
+    sub_agent_outcomes:
+        std::collections::HashMap<String, phoenix_core::domain::sm_state::SubAgentOutcome>,
+    completed_count: usize,
 }
 
 /// Normalize a recovered in-flight tool round (`ToolExecuting` or
@@ -16128,8 +16284,8 @@ async fn insert_message_tx(
         .map_err(|e| DbError::Serialization(e.to_string()))?;
 
     let inserted = sqlx::query(
-        "INSERT OR IGNORE INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        "INSERT OR IGNORE INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
     )
     .bind(&msg.message_id)
     .bind(&msg.conversation_id)
@@ -16143,14 +16299,16 @@ async fn insert_message_tx(
     .bind(msg.origin.db_parts().1)
     .bind(msg.origin.db_parts().2)
     .bind(msg.origin.db_parts().3)
+    .bind(msg.origin.db_parts().4)
     .bind(msg.origin.source_call().map(|call| call.message_id.as_str()))
     .bind(msg.origin.source_call().map(|call| call.tool_use_id.as_str()))
     .bind(msg.origin.slack_request_id())
+    .bind(msg.origin.reminder_id())
     .execute(&mut **tx)
     .await?;
     if inserted.rows_affected() == 0 {
         let Some(mut existing) = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages WHERE message_id = ?1",
         )
         .bind(&msg.message_id)
@@ -16207,7 +16365,7 @@ async fn steering_message_matches_tx(
     message: &Message,
 ) -> DbResult<Option<bool>> {
     let row = sqlx::query(
-        "SELECT conversation_id, message_type, content, display_data, usage_data, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+        "SELECT conversation_id, message_type, content, display_data, usage_data, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
          FROM messages WHERE message_id = ?1",
     )
     .bind(&message.message_id)
@@ -16564,12 +16722,14 @@ fn prompt_decode_error(error: impl std::fmt::Display) -> sqlx::Error {
 fn decode_origin(
     row: &SqliteRow,
 ) -> Result<phoenix_core::domain::db_schema::InputOrigin, sqlx::Error> {
-    phoenix_core::domain::db_schema::InputOrigin::from_db_parts_with_slack(
+    phoenix_core::domain::db_schema::InputOrigin::from_db_source_columns(
         &row.try_get::<String, _>("origin_kind")?,
         row.try_get("origin_product_conversation_id")?,
         row.try_get("origin_transcript_id")?,
         row.try_get("origin_subscription_event_id")?,
+        row.try_get("origin_source_instance_id")?,
         row.try_get("origin_slack_request_id")?,
+        row.try_get("origin_reminder_id")?,
     )
     .and_then(|origin| {
         origin.with_source_call_columns(
@@ -19071,18 +19231,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_llm_language_unset_returns_phoenix_native() {
+    async fn default_llm_language_defaults_roundtrips_and_falls_back_for_unknown_values() {
         let db = Database::open_in_memory().await.unwrap();
         assert_eq!(
             db.get_default_llm_language().await.unwrap(),
             LlmLanguage::PhoenixNative
         );
-    }
-
-    #[tokio::test]
-    async fn default_llm_language_set_persists_and_reads_back() {
-        let db = Database::open_in_memory().await.unwrap();
-
         db.set_default_llm_language(LlmLanguage::Caveman)
             .await
             .unwrap();
@@ -19091,7 +19245,6 @@ mod tests {
             LlmLanguage::Caveman
         );
 
-        // Switch back.
         db.set_default_llm_language(LlmLanguage::PhoenixNative)
             .await
             .unwrap();
@@ -19099,14 +19252,6 @@ mod tests {
             db.get_default_llm_language().await.unwrap(),
             LlmLanguage::PhoenixNative
         );
-    }
-
-    #[tokio::test]
-    async fn default_llm_language_falls_back_when_value_unknown() {
-        let db = Database::open_in_memory().await.unwrap();
-        // Forge a value this build doesn't recognize (forward-compat: an
-        // older binary reading a DB written by a newer one). Should fall
-        // back to the default rather than poison startup.
         db.set_app_setting("default_llm_language", "klingon")
             .await
             .unwrap();
@@ -19189,6 +19334,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reopened.instance_id().await.unwrap(), first_id);
+        let error = sqlx::query(
+            "INSERT INTO instance_identity (singleton_key, instance_id) VALUES (1, ?1)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .execute(reopened.pool())
+        .await
+        .expect_err("a second identity with the singleton key must be rejected");
+        assert!(
+            error
+                .as_database_error()
+                .is_some_and(sqlx::error::DatabaseError::is_unique_violation),
+            "{error}"
+        );
         assert!(sqlx::query(
             "INSERT INTO instance_identity (singleton_key, instance_id) VALUES (2, ?1)",
         )
@@ -19202,32 +19360,9 @@ mod tests {
         .execute(reopened.pool())
         .await
         .is_err());
-    }
-
-    #[tokio::test]
-    async fn concurrent_initializers_commit_one_instance_identity() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("concurrent-instance-identity.sqlite");
-        let db_path = db_path.to_string_lossy().into_owned();
-        let first = Database::open(&db_path).await.unwrap();
-        let second = Database::open(&db_path).await.unwrap();
-
-        let _concurrent_results = tokio::join!(
-            migrations::run_pending_migrations(first.pool()),
-            migrations::run_pending_migrations(second.pool()),
-        );
-
-        migrations::run_pending_migrations(first.pool())
-            .await
-            .unwrap();
-        migrations::run_pending_migrations(second.pool())
-            .await
-            .unwrap();
-        let first_id = first.instance_id().await.unwrap();
-        assert_eq!(second.instance_id().await.unwrap(), first_id);
         let identities: Vec<String> =
             sqlx::query_scalar("SELECT instance_id FROM instance_identity")
-                .fetch_all(first.pool())
+                .fetch_all(reopened.pool())
                 .await
                 .unwrap();
         assert_eq!(identities, vec![first_id.to_string()]);
@@ -19267,7 +19402,7 @@ mod tests {
 
         db.replace_federation_enrollment(
             InstanceId::new(),
-            "peer",
+            &"peer".parse().unwrap(),
             &phoenix_core::domain::instance_identity::FederationCredentialVerifier::from_bearer(
                 b"peer-secret",
             ),
@@ -23074,6 +23209,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_reads_preserve_remote_origin() {
+        use phoenix_core::domain::instance_identity::InstanceId;
+
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("remote-bounded", "remote-bounded", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let instance_id = InstanceId::new();
+        db.add_message_with_seq_and_origin(
+            "remote-bounded-message",
+            "remote-bounded",
+            1,
+            &MessageContent::user("remote body"),
+            None,
+            None,
+            &InputOrigin::RemoteApi { instance_id },
+        )
+        .await
+        .unwrap();
+
+        let rows = db
+            .get_bounded_read_messages_after_limited(
+                "remote-bounded",
+                0,
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1_024).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].origin, InputOrigin::RemoteApi { instance_id });
+
+        let exact = db
+            .get_bounded_read_message_by_id_in_conversation(
+                "remote-bounded",
+                "remote-bounded-message",
+                NonZeroUsize::new(1_024).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact.origin, InputOrigin::RemoteApi { instance_id });
+    }
+
+    #[tokio::test]
     async fn bounded_exact_message_lookup_is_scoped_to_its_conversation() {
         let db = Database::open_in_memory().await.unwrap();
         for conversation in ["scope-a", "scope-b"] {
@@ -23491,7 +23670,7 @@ mod tests {
 
         let mut parents = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content,
-                    display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                    display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, origin_reminder_id
              FROM messages WHERE conversation_id = 'snapshot-tx' ORDER BY sequence_id",
         )
         .try_map(parse_prompt_message_row)
@@ -23783,27 +23962,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn steady_state_prompt_tail_has_constant_statement_shape_and_no_full_history_read() {
-        async fn measure(
-            user_count: usize,
-        ) -> (
-            Vec<crate::sqlite_workload::NativeStatementShape>,
-            Vec<crate::sqlite_workload::NativeStatementShape>,
+    #[allow(clippy::too_many_lines)]
+    async fn prompt_reads_batch_attachments_and_bound_tail_work() {
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        };
+
+        async fn append_rows(
+            db: &Database,
+            conversation: &str,
+            sequences: std::ops::Range<i64>,
+            prefix: &str,
         ) {
-            let db = Database::open_in_memory().await.unwrap();
-            let conversation_id = format!("projection-shape-{user_count}");
-            db.create_conversation(&conversation_id, &conversation_id, "/tmp", true, None, None)
-                .await
-                .unwrap();
-            for index in 0..user_count {
+            for sequence in sequences {
+                let id = format!("{prefix}-{sequence}");
                 db.add_message_with_seq(
-                    &format!("history-{index}"),
-                    &conversation_id,
-                    i64::try_from(index + 1).unwrap(),
+                    &id,
+                    conversation,
+                    sequence,
                     &MessageContent::user_with_attachments(
-                        format!("history {index}"),
-                        vec![image_attachment(&format!("image-{index}"))],
-                        vec![file_attachment(&format!("file-{index}"))],
+                        &id,
+                        vec![image_attachment(&format!("image-{id}"))],
+                        vec![file_attachment(&format!("file-{id}"))],
                     ),
                     None,
                     None,
@@ -23811,68 +23992,129 @@ mod tests {
                 .await
                 .unwrap();
             }
-            db.sqlite_workload_collector
-                .take_native_statement_shapes_for_test();
-            let snapshot = db
-                .load_hydrated_prompt_snapshot(&conversation_id)
-                .await
-                .unwrap();
-            let snapshot_statements = db
-                .sqlite_workload_collector
-                .take_native_statement_shapes_for_test();
-            db.add_message_with_seq(
-                "new-tail-row",
-                &conversation_id,
-                i64::try_from(user_count + 1).unwrap(),
-                &MessageContent::user_with_attachments(
-                    "new tail row",
-                    vec![image_attachment("tail-image")],
-                    vec![file_attachment("tail-file")],
-                ),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-            db.sqlite_workload_collector
-                .take_native_statement_shapes_for_test();
-            let tail = db
-                .load_hydrated_prompt_tail(&conversation_id, snapshot.fenced_position())
-                .await
-                .unwrap();
+        }
+
+        fn assert_read_shape(statements: &[crate::sqlite_workload::NativeStatementShape]) {
+            use crate::sqlite_workload::NativeStatementShape;
+            assert_eq!(statements.len(), 6, "prompt statements: {statements:#?}");
+            assert_eq!(statements[0], NativeStatementShape::Begin);
+            assert!(statements[1..5]
+                .iter()
+                .all(|statement| *statement == NativeStatementShape::OrdinaryRead));
+        }
+
+        fn assert_tail(tail: &HydratedPromptTail, expected_ids: &[String]) {
             let HydratedPromptTail::Current(rows) = tail else {
                 panic!("append must return a current tail");
             };
-            assert_eq!(rows.messages().len(), 1);
-            assert_eq!(rows.messages()[0].message_id, "new-tail-row");
-            let (images, files) = rows.messages()[0].content.attachments();
-            assert_eq!((images.len(), files.len()), (1, 1));
-            let tail_statements = db
-                .sqlite_workload_collector
-                .take_native_statement_shapes_for_test();
-            (snapshot_statements, tail_statements)
-        }
-
-        fn assert_prompt_read_shape(statements: &[crate::sqlite_workload::NativeStatementShape]) {
-            assert_eq!(statements.len(), 6, "prompt statements: {statements:#?}");
             assert_eq!(
-                statements[0],
-                crate::sqlite_workload::NativeStatementShape::Begin,
-                "prompt statements: {statements:#?}"
+                rows.messages()
+                    .iter()
+                    .map(|message| &message.message_id)
+                    .collect::<Vec<_>>(),
+                expected_ids.iter().collect::<Vec<_>>()
             );
-            assert!(statements[1..5].iter().all(|statement| *statement
-                == crate::sqlite_workload::NativeStatementShape::OrdinaryRead));
-            // The final statement is the transaction boundary. Native metadata may
-            // conservatively classify it as an ordinary read after a cache collision;
-            // its bracket position, not that degraded category, excludes it.
+            for message in rows.messages() {
+                let (images, files) = message.content.attachments();
+                assert_eq!((images.len(), files.len()), (1, 1));
+            }
         }
 
-        for _ in 0..3 {
-            let (zero, eight, twenty_seven) = tokio::join!(measure(0), measure(8), measure(27));
-            for (snapshot_statements, tail_statements) in [zero, eight, twenty_seven] {
-                assert_prompt_read_shape(&snapshot_statements);
-                assert_prompt_read_shape(&tail_statements);
+        for history_count in [0_i64, 2] {
+            let db = Database::open_in_memory().await.unwrap();
+            let conversation = "prompt-read-contract";
+            db.create_conversation(conversation, conversation, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            append_rows(&db, conversation, 1..history_count + 1, "history").await;
+            db.sqlite_workload_collector
+                .take_native_statement_shapes_for_test();
+            let snapshot = db
+                .load_hydrated_prompt_snapshot(conversation)
+                .await
+                .unwrap();
+            assert_eq!(
+                snapshot.messages().len(),
+                usize::try_from(history_count).unwrap()
+            );
+            assert_read_shape(
+                &db.sqlite_workload_collector
+                    .take_native_statement_shapes_for_test(),
+            );
+
+            let first = history_count + 1;
+            append_rows(&db, conversation, first..first + 2, "tail").await;
+            let steps = Arc::new(AtomicU64::new(0));
+            {
+                let mut connection = db.pool().acquire().await.unwrap();
+                let mut handle = connection.lock_handle().await.unwrap();
+                let observed = Arc::clone(&steps);
+                handle.set_progress_handler(1, move || {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    true
+                });
             }
+            db.sqlite_workload_collector
+                .take_native_statement_shapes_for_test();
+            let tail = db
+                .load_hydrated_prompt_tail(conversation, snapshot.fenced_position())
+                .await
+                .unwrap();
+            let small_tail_steps = steps.load(Ordering::Relaxed);
+            assert_tail(
+                &tail,
+                &[format!("tail-{first}"), format!("tail-{}", first + 1)],
+            );
+            assert_read_shape(
+                &db.sqlite_workload_collector
+                    .take_native_statement_shapes_for_test(),
+            );
+
+            if history_count > 0 {
+                append_rows(&db, conversation, first + 2..first + 66, "older-prefix").await;
+                db.sqlite_workload_collector
+                    .take_native_statement_shapes_for_test();
+                let later_snapshot = db
+                    .load_hydrated_prompt_snapshot(conversation)
+                    .await
+                    .unwrap();
+                assert_read_shape(
+                    &db.sqlite_workload_collector
+                        .take_native_statement_shapes_for_test(),
+                );
+                append_rows(&db, conversation, first + 66..first + 68, "later-tail").await;
+                db.sqlite_workload_collector
+                    .take_native_statement_shapes_for_test();
+                steps.store(0, Ordering::Relaxed);
+                let later_tail = db
+                    .load_hydrated_prompt_tail(conversation, later_snapshot.fenced_position())
+                    .await
+                    .unwrap();
+                let large_tail_steps = steps.load(Ordering::Relaxed);
+                assert_tail(
+                    &later_tail,
+                    &[
+                        format!("later-tail-{}", first + 66),
+                        format!("later-tail-{}", first + 67),
+                    ],
+                );
+                assert_read_shape(
+                    &db.sqlite_workload_collector
+                        .take_native_statement_shapes_for_test(),
+                );
+                assert!(small_tail_steps > 0);
+                assert!(large_tail_steps <= small_tail_steps + 32,
+                    "tail work grew with 64 older parents: {small_tail_steps} -> {large_tail_steps} VM steps");
+            }
+            db.pool()
+                .acquire()
+                .await
+                .unwrap()
+                .lock_handle()
+                .await
+                .unwrap()
+                .remove_progress_handler();
+            db.pool().close().await;
         }
     }
 
@@ -24232,6 +24474,195 @@ mod tests {
         .await
         .unwrap();
         assert_eq!((parent_count, file_count, image_count), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn remote_origins_survive_peer_deletion_restart_and_steering_drain() {
+        use phoenix_core::domain::{
+            db_schema::{InputOrigin, SourceToolCall},
+            instance_identity::InstanceId,
+            product_conversation::ProductConversationId,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remote-origins.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        run_pending_migrations(db.pool()).await.unwrap();
+        let target = db
+            .create_conversation("remote-target", "remote-target", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let instance_id = InstanceId::new();
+        sqlx::query(
+            "INSERT INTO federation_peer_connections (peer_instance_id, peer_display_name, domain_or_ipv4_host, port, bearer_credential, created_at_us)
+             VALUES (?1, 'sender', 'peer.example', 443, ?2, 1)",
+        )
+        .bind(instance_id.to_string())
+        .bind(format!("phx_peer_{}", "a".repeat(43)))
+        .execute(db.pool()).await.unwrap();
+        let origins = [
+            InputOrigin::RemoteApi { instance_id },
+            InputOrigin::RemoteConversation {
+                instance_id,
+                product_conversation_id: ProductConversationId::parse("remote-product").unwrap(),
+                transcript_id: "remote-transcript".into(),
+                source_call: None,
+            },
+            InputOrigin::RemoteConversation {
+                instance_id,
+                product_conversation_id: ProductConversationId::parse("remote-product-with-call")
+                    .unwrap(),
+                transcript_id: "remote-transcript-with-call".into(),
+                source_call: Some(Box::new(SourceToolCall {
+                    message_id: "remote-conversation-assistant".into(),
+                    tool_use_id: "remote-conversation-send".into(),
+                })),
+            },
+            InputOrigin::RemoteCoordinator {
+                instance_id,
+                product_conversation_id: ProductConversationId::parse("remote-coordinator")
+                    .unwrap(),
+                transcript_id: "remote-coordinator-transcript".into(),
+                source_call: Some(Box::new(SourceToolCall {
+                    message_id: "remote-assistant".into(),
+                    tool_use_id: "remote-call".into(),
+                })),
+            },
+        ];
+        let mut entries = Vec::new();
+        let mut expected_messages = Vec::new();
+        for (index, origin) in origins.iter().enumerate() {
+            let message = db
+                .add_message_with_seq_and_origin(
+                    &format!("remote-message-{index}"),
+                    &target.id,
+                    i64::try_from(index + 1).unwrap(),
+                    &MessageContent::user("remote input"),
+                    None,
+                    None,
+                    origin,
+                )
+                .await
+                .unwrap();
+            let mut tx = db.pool().begin().await.unwrap();
+            insert_message_tx(&mut tx, &message).await.unwrap();
+            let mut changed = message.clone();
+            match &mut changed.origin {
+                InputOrigin::RemoteApi { instance_id }
+                | InputOrigin::RemoteConversation { instance_id, .. }
+                | InputOrigin::RemoteCoordinator { instance_id, .. } => {
+                    *instance_id = InstanceId::new();
+                }
+                InputOrigin::UnknownHistorical
+                | InputOrigin::UserApi
+                | InputOrigin::InternalConversation { .. }
+                | InputOrigin::SystemGenerated
+                | InputOrigin::SlackGateway { .. }
+                | InputOrigin::ScheduledReminder { .. }
+                | InputOrigin::SubscriptionEvent { .. } => unreachable!(),
+            }
+            assert!(matches!(
+                insert_message_tx(&mut tx, &changed).await,
+                Err(DbError::Serialization(_))
+            ));
+            tx.rollback().await.unwrap();
+            expected_messages.push((format!("remote-message-{index}"), origin.clone()));
+            let mut entry = steering_entry(&format!("remote-steer-{index}"));
+            entry.origin = origin.clone();
+            entries.push(entry);
+        }
+        db.update_steering_queue(&target.id, &entries)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(db.get_steering_queue(&target.id).await.unwrap()).unwrap(),
+            serde_json::to_value(&entries).unwrap()
+        );
+        sqlx::query("DELETE FROM federation_peer_connections WHERE peer_instance_id = ?1")
+            .bind(instance_id.to_string())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.pool().close().await;
+        drop(db);
+
+        let restarted = Database::open(path.to_str().unwrap()).await.unwrap();
+        let stored = restarted.get_messages(&target.id).await.unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .map(|message| (message.message_id.clone(), message.origin.clone()))
+                .collect::<Vec<_>>(),
+            expected_messages
+        );
+        assert_eq!(
+            serde_json::to_value(restarted.get_steering_queue(&target.id).await.unwrap()).unwrap(),
+            serde_json::to_value(&entries).unwrap()
+        );
+        let drained: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let mut message = steering_drain_message(
+                    &target.id,
+                    &entry.message_id,
+                    i64::try_from(origins.len() + index + 1).unwrap(),
+                );
+                message.origin = entry.origin.clone();
+                message
+            })
+            .collect();
+        restarted
+            .commit_steering_drain(
+                &target.id,
+                &drained,
+                &ConvState::LlmRequesting { attempt: 0 },
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert!(restarted
+            .get_steering_queue(&target.id)
+            .await
+            .unwrap()
+            .is_empty());
+        let snapshot = restarted
+            .load_hydrated_prompt_snapshot(&target.id)
+            .await
+            .unwrap();
+        let product_page = restarted
+            .get_product_conversation_messages_page(&target.product_conversation_id, None, 20)
+            .await
+            .unwrap();
+        expected_messages.extend(
+            drained
+                .iter()
+                .map(|message| (message.message_id.clone(), message.origin.clone())),
+        );
+        assert_eq!(expected_messages.len(), origins.len() * 2);
+        let stored = restarted.get_messages(&target.id).await.unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .map(|message| (message.message_id.clone(), message.origin.clone()))
+                .collect::<Vec<_>>(),
+            expected_messages
+        );
+        assert_eq!(
+            snapshot
+                .messages()
+                .iter()
+                .map(|message| (message.message_id.clone(), message.origin.clone()))
+                .collect::<Vec<_>>(),
+            expected_messages
+        );
+        assert_eq!(
+            product_page
+                .iter()
+                .map(|(_, message)| (message.message_id.clone(), message.origin.clone()))
+                .collect::<Vec<_>>(),
+            expected_messages.iter().rev().cloned().collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
@@ -30728,6 +31159,8 @@ mod tests {
                 accepted_at: phoenix_workflow::Timestamp(1),
             })
             .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let phoenix_workflow::TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
             panic!("expected created turn")
@@ -30775,6 +31208,8 @@ mod tests {
                 accepted_at: phoenix_workflow::Timestamp(1),
             })
             .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let phoenix_workflow::TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
             panic!("expected created turn")

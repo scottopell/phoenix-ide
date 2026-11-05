@@ -1,8 +1,107 @@
 use std::str::FromStr;
 
 use chrono::Utc;
-use phoenix_core::domain::instance_identity::{FederationCredentialVerifier, InstanceId};
-use sqlx::Row;
+use phoenix_core::domain::instance_identity::{
+    FederationCredentialVerifier, InstanceId, PeerDisplayName,
+};
+use sqlx::{Row, Sqlite, Transaction};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederationSendAuthority {
+    caller_instance_id: InstanceId,
+    credential_verifier: FederationCredentialVerifier,
+}
+
+impl FederationSendAuthority {
+    #[must_use]
+    pub fn new(
+        caller_instance_id: InstanceId,
+        credential_verifier: FederationCredentialVerifier,
+    ) -> Self {
+        Self {
+            caller_instance_id,
+            credential_verifier,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FederationSendIdentityJournal {
+    DirectTurn,
+    SteeringReceipt,
+}
+
+pub(crate) async fn require_federation_send_authority_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    authority: &FederationSendAuthority,
+) -> DbResult<()> {
+    federation_send_enrollment_id_tx(tx, authority)
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn federation_send_enrollment_id_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    authority: &FederationSendAuthority,
+) -> DbResult<uuid::Uuid> {
+    let enrollment_id: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM federation_enrollments
+         WHERE caller_instance_id = ?1 AND credential_verifier = ?2 AND revoked_at_us IS NULL",
+    )
+    .bind(authority.caller_instance_id.to_string())
+    .bind(authority.credential_verifier.to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    enrollment_id
+        .ok_or(DbError::FederationSendAuthorityInactive)
+        .and_then(|id| {
+            uuid::Uuid::parse_str(&id).map_err(|error| DbError::Serialization(error.to_string()))
+        })
+}
+
+pub(crate) async fn require_federation_send_identity_owner_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    admitted_message_id: &str,
+    conversation_id: &str,
+    journal: FederationSendIdentityJournal,
+) -> DbResult<()> {
+    let identity_conflict: bool = match journal {
+        FederationSendIdentityJournal::DirectTurn => {
+            sqlx::query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1 FROM durable_turns
+                     WHERE client_turn_key = ?1 AND conversation_id <> ?2
+                     UNION ALL
+                     SELECT 1 FROM steering_acceptance_receipts
+                     WHERE message_id = ?1
+                 )",
+            )
+            .bind(admitted_message_id)
+            .bind(conversation_id)
+            .fetch_one(&mut **tx)
+            .await?
+        }
+        FederationSendIdentityJournal::SteeringReceipt => {
+            sqlx::query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1 FROM durable_turns
+                     WHERE client_turn_key = ?1
+                     UNION ALL
+                     SELECT 1 FROM steering_acceptance_receipts
+                     WHERE message_id = ?1 AND conversation_id <> ?2
+                 )",
+            )
+            .bind(admitted_message_id)
+            .bind(conversation_id)
+            .fetch_one(&mut **tx)
+            .await?
+        }
+    };
+    if identity_conflict {
+        return Err(DbError::FederationSendIdentityConflict);
+    }
+    Ok(())
+}
 
 use crate::{Database, DbError, DbResult};
 
@@ -60,7 +159,7 @@ impl Database {
     pub async fn replace_federation_enrollment(
         &self,
         caller_instance_id: InstanceId,
-        caller_display_name: &str,
+        caller_display_name: &PeerDisplayName,
         credential_verifier: &FederationCredentialVerifier,
     ) -> DbResult<FederationEnrollment> {
         self.replace_federation_enrollment_with_commit(
@@ -76,7 +175,7 @@ impl Database {
     async fn replace_federation_enrollment_with_commit(
         &self,
         caller_instance_id: InstanceId,
-        caller_display_name: &str,
+        caller_display_name: &PeerDisplayName,
         credential_verifier: &FederationCredentialVerifier,
         commit: EnrollmentCommit,
         observed_clock_us: Option<i64>,
@@ -108,7 +207,7 @@ impl Database {
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(caller_instance_id.to_string())
-        .bind(caller_display_name)
+        .bind(caller_display_name.as_str())
         .bind(credential_verifier.to_string())
         .bind(now)
         .execute(&mut *tx)
@@ -130,7 +229,7 @@ impl Database {
             {
                 Ok(Some(committed))
                     if committed.caller_instance_id == caller_instance_id
-                        && committed.caller_display_name == caller_display_name =>
+                        && committed.caller_display_name == caller_display_name.as_str() =>
                 {
                     Ok(committed)
                 }
@@ -234,6 +333,173 @@ mod tests {
         db
     }
 
+    fn steering_entry(message_id: &str) -> phoenix_core::domain::sm_event::SteerEntry {
+        phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
+            text: "steer".into(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: message_id.into(),
+            user_agent: None,
+            skill_invocation: None,
+        }
+    }
+
+    async fn assert_initial_and_concurrent_admissions(
+        db: &Database,
+        old: &FederationSendAuthority,
+    ) {
+        assert_eq!(
+            db.append_federated_steering_entry(
+                "federated-steering",
+                &steering_entry("accepted"),
+                "fp-accepted",
+                old
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        let concurrent_a = steering_entry("concurrent");
+        let concurrent_b = steering_entry("concurrent");
+        let (first_outcome, second_outcome) = tokio::join!(
+            db.append_federated_steering_entry(
+                "federated-steering",
+                &concurrent_a,
+                "fp-concurrent",
+                old
+            ),
+            db.append_federated_steering_entry(
+                "federated-steering",
+                &concurrent_b,
+                "fp-concurrent",
+                old
+            )
+        );
+        let outcomes = [first_outcome, second_outcome];
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, Err(DbError::FederationSteeringDuplicate)))
+                .count(),
+            1
+        );
+    }
+
+    async fn assert_revoked_authority_rejections(
+        db: &Database,
+        caller: InstanceId,
+        old: &FederationSendAuthority,
+    ) {
+        db.revoke_federation_enrollment(caller).await.unwrap();
+        assert!(matches!(
+            db.append_federated_steering_entry(
+                "federated-steering",
+                &steering_entry("accepted"),
+                "fp-accepted",
+                old
+            )
+            .await,
+            Err(DbError::FederationSteeringDuplicate)
+        ));
+        assert!(matches!(
+            db.append_federated_steering_entry(
+                "federated-steering",
+                &steering_entry("accepted"),
+                "changed-fingerprint",
+                old
+            )
+            .await,
+            Err(DbError::FederationSendIdentityConflict)
+        ));
+        assert!(matches!(
+            db.append_federated_steering_entry(
+                "federated-steering",
+                &steering_entry("rejected"),
+                "fp-rejected",
+                old
+            )
+            .await,
+            Err(DbError::FederationSendAuthorityInactive)
+        ));
+        assert!(db
+            .get_steering_acceptance_fingerprint("federated-steering", "rejected")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.get_steering_queue("federated-steering")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(db
+            .get_steering_acceptance_fingerprint("federated-steering", "concurrent")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(db
+            .get_steering_acceptance_fingerprint("federated-steering", "accepted")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    async fn assert_replacement_authority(
+        db: &Database,
+        caller: InstanceId,
+        old: &FederationSendAuthority,
+        second: FederationCredentialVerifier,
+    ) {
+        db.replace_federation_enrollment(caller, &"peer".parse().unwrap(), &second)
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.append_federated_steering_entry(
+                "federated-steering",
+                &steering_entry("old-after-replacement"),
+                "fp-old",
+                old
+            )
+            .await,
+            Err(DbError::FederationSendAuthorityInactive)
+        ));
+        let current = FederationSendAuthority::new(caller, second);
+        assert_eq!(
+            db.append_federated_steering_entry(
+                "federated-steering",
+                &steering_entry("new"),
+                "fp-new",
+                &current
+            )
+            .await
+            .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn steering_admission_checks_exact_credential_in_write_transaction() {
+        let db = test_db().await;
+        db.create_conversation("federated-steering", "steering", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let caller = InstanceId::new();
+        let first = FederationCredentialVerifier::from_bearer(b"first-steering-token");
+        let second = FederationCredentialVerifier::from_bearer(b"second-steering-token");
+        db.replace_federation_enrollment(caller, &"peer".parse().unwrap(), &first)
+            .await
+            .unwrap();
+        let old = FederationSendAuthority::new(caller, first);
+
+        assert_initial_and_concurrent_admissions(&db, &old).await;
+        assert_revoked_authority_rejections(&db, caller, &old).await;
+        assert_replacement_authority(&db, caller, &old, second).await;
+    }
+
     #[tokio::test]
     async fn committed_replacement_is_classified_by_exact_verifier() {
         let db = test_db().await;
@@ -243,7 +509,7 @@ mod tests {
         let enrollment = db
             .replace_federation_enrollment_with_commit(
                 caller,
-                "peer",
+                &"peer".parse().unwrap(),
                 &verifier,
                 EnrollmentCommit::CommittedAckLost,
                 None,
@@ -264,10 +530,10 @@ mod tests {
         let caller = InstanceId::new();
         let first = FederationCredentialVerifier::from_bearer(b"bearer-one");
         let second = FederationCredentialVerifier::from_bearer(b"bearer-two");
-        db.replace_federation_enrollment(caller, "peer", &first)
+        db.replace_federation_enrollment(caller, &"peer".parse().unwrap(), &first)
             .await
             .unwrap();
-        db.replace_federation_enrollment(caller, "renamed peer", &second)
+        db.replace_federation_enrollment(caller, &"renamed peer".parse().unwrap(), &second)
             .await
             .unwrap();
 
@@ -301,15 +567,19 @@ mod tests {
         let second_caller = InstanceId::new();
         let first = FederationCredentialVerifier::from_bearer(b"first-bearer");
         let duplicate = FederationCredentialVerifier::from_bearer(b"duplicate-bearer");
-        db.replace_federation_enrollment(first_caller, "first peer", &first)
+        db.replace_federation_enrollment(first_caller, &"first peer".parse().unwrap(), &first)
             .await
             .unwrap();
-        db.replace_federation_enrollment(second_caller, "second peer", &duplicate)
-            .await
-            .unwrap();
+        db.replace_federation_enrollment(
+            second_caller,
+            &"second peer".parse().unwrap(),
+            &duplicate,
+        )
+        .await
+        .unwrap();
 
         assert!(db
-            .replace_federation_enrollment(first_caller, "first peer", &duplicate)
+            .replace_federation_enrollment(first_caller, &"first peer".parse().unwrap(), &duplicate)
             .await
             .is_err());
         assert_eq!(
@@ -330,7 +600,7 @@ mod tests {
         assert!(db
             .replace_federation_enrollment_with_commit(
                 caller,
-                "peer",
+                &"peer".parse().unwrap(),
                 &verifier,
                 EnrollmentCommit::Normal,
                 Some(-1),
@@ -351,7 +621,7 @@ mod tests {
         let second = FederationCredentialVerifier::from_bearer(b"second");
         db.replace_federation_enrollment_with_commit(
             caller,
-            "peer",
+            &"peer".parse().unwrap(),
             &first,
             EnrollmentCommit::Normal,
             Some(100),
@@ -361,7 +631,7 @@ mod tests {
 
         db.replace_federation_enrollment_with_commit(
             caller,
-            "peer",
+            &"peer".parse().unwrap(),
             &second,
             EnrollmentCommit::Normal,
             Some(1),
@@ -382,7 +652,7 @@ mod tests {
         let verifier = FederationCredentialVerifier::from_bearer(b"bearer");
         db.replace_federation_enrollment_with_commit(
             caller,
-            "peer",
+            &"peer".parse().unwrap(),
             &verifier,
             EnrollmentCommit::Normal,
             Some(100),
@@ -406,7 +676,7 @@ mod tests {
         let db = test_db().await;
         let caller = InstanceId::new();
         let verifier = FederationCredentialVerifier::from_bearer(b"bearer");
-        db.replace_federation_enrollment(caller, "peer", &verifier)
+        db.replace_federation_enrollment(caller, &"peer".parse().unwrap(), &verifier)
             .await
             .unwrap();
 
@@ -459,7 +729,7 @@ mod tests {
         let caller = InstanceId::new();
         db.replace_federation_enrollment(
             caller,
-            "peer",
+            &"peer".parse().unwrap(),
             &FederationCredentialVerifier::from_bearer(b"bearer-one"),
         )
         .await

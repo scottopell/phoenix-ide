@@ -421,7 +421,7 @@ const ORIGINAL_PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL: &str = "WITH RECURSIVE tra
             json_extract(value, '$.tail_sequence_id') AS tail_sequence_id,
             json_extract(value, '$.tail_message_id') AS tail_message_id
      FROM json_each(?2)
- ) SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_slack_request_id, origin_source_message_id, origin_source_tool_use_id, transcript.ordinal
+ ) SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_slack_request_id, origin_reminder_id, origin_source_message_id, origin_source_tool_use_id, transcript.ordinal
  FROM transcript
  CROSS JOIN messages INDEXED BY messages_conversation_sequence
    ON messages.conversation_id = transcript.id
@@ -447,7 +447,7 @@ const PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL: &str = "WITH RECURSIVE transcript(i
      WHERE (?2 IS NULL OR EXISTS (SELECT 1 FROM snapshot_ceiling ceiling WHERE ceiling.transcript_row_id = transcript.id AND (messages.sequence_id < ceiling.tail_sequence_id OR (messages.sequence_id = ceiling.tail_sequence_id AND messages.message_id <= ceiling.tail_message_id))))
        AND (?3 IS NULL OR transcript.ordinal < ?3 OR (transcript.ordinal = ?3 AND (messages.sequence_id < ?4 OR (messages.sequence_id = ?4 AND messages.message_id < ?5))))
      ORDER BY transcript.ordinal DESC, messages.sequence_id DESC, messages.message_id DESC LIMIT ?6
- ) SELECT m.message_id, m.conversation_id, m.sequence_id, m.message_type, m.content, m.display_data, m.usage_data, m.created_at, m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id, m.origin_subscription_event_id, m.origin_slack_request_id, m.origin_source_message_id, m.origin_source_tool_use_id, selected.ordinal
+ ) SELECT m.message_id, m.conversation_id, m.sequence_id, m.message_type, m.content, m.display_data, m.usage_data, m.created_at, m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id, m.origin_subscription_event_id, m.origin_source_instance_id, m.origin_slack_request_id, m.origin_reminder_id, m.origin_source_message_id, m.origin_source_tool_use_id, selected.ordinal
  FROM selected JOIN messages m ON m.message_id = selected.message_id
  ORDER BY selected.ordinal DESC, selected.sequence_id DESC, selected.message_id DESC";
 
@@ -1264,7 +1264,7 @@ impl Database {
         for row in rows {
             let id: String = row.try_get("id")?;
             transcript_rows.push(ProductConversationTranscriptRow {
-                conversation: Self::get_conversation_on(connection, &id).await?,
+                conversation: Self::get_conversation_on(&mut *connection, &id).await?,
                 segment_ordinal: row.try_get("ordinal")?,
                 tail_sequence_id: row.try_get("tail_sequence_id")?,
                 tail_message_id: row.try_get("tail_message_id")?,
@@ -1313,22 +1313,6 @@ impl Database {
             updated_at,
             segments,
             source,
-        })
-    }
-
-    async fn get_conversation_on(
-        connection: &mut SqliteConnection,
-        id: &str,
-    ) -> DbResult<crate::Conversation> {
-        sqlx::query(
-            "SELECT c.id, c.product_conversation_id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier, c.project_id, c.desired_base_branch,
-                    c.runtime_role, c.work_scope_id, c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.llm_language, c.spawned_from_conversation_id,
-                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
-             FROM conversations c LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id WHERE c.id = ?1",
-        ).bind(id).try_map(super::parse_conversation_row).fetch_one(&mut *connection).await.map_err(|error| {
-            if matches!(error, sqlx::Error::RowNotFound) { DbError::ConversationNotFound(id.to_string()) } else { DbError::Sqlx(error) }
         })
     }
 
@@ -1466,7 +1450,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn read_continuation_opening_on(
+    pub(super) async fn read_continuation_opening_on(
         connection: &mut SqliteConnection,
         successor: &str,
     ) -> DbResult<ContinuationOpeningRead> {
@@ -1791,7 +1775,7 @@ impl Database {
                    AND successor.parent_conversation_id IS NULL
              )
              SELECT message_id, conversation_id, sequence_id, message_type, content,
-                    display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_slack_request_id, origin_source_message_id, origin_source_tool_use_id, transcript.ordinal
+                    display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_slack_request_id, origin_reminder_id, origin_source_message_id, origin_source_tool_use_id, transcript.ordinal
              FROM transcript
              JOIN messages ON messages.conversation_id = transcript.id
              WHERE (?2 IS NULL
@@ -1912,9 +1896,8 @@ mod tests {
             .unwrap()
             .iter()
             .map(|row| {
-                assert_eq!(row.len(), 16);
                 let mut value = serde_json::Map::new();
-                for column in [
+                let text_columns = [
                     "message_id",
                     "conversation_id",
                     "message_type",
@@ -1926,17 +1909,22 @@ mod tests {
                     "origin_product_conversation_id",
                     "origin_transcript_id",
                     "origin_subscription_event_id",
+                    "origin_source_instance_id",
                     "origin_slack_request_id",
+                    "origin_reminder_id",
                     "origin_source_message_id",
                     "origin_source_tool_use_id",
-                ] {
+                ];
+                let integer_columns = ["sequence_id", "ordinal"];
+                assert_eq!(row.len(), text_columns.len() + integer_columns.len());
+                for column in text_columns {
                     value.insert(
                         column.into(),
                         serde_json::to_value(row.try_get::<Option<String>, _>(column).unwrap())
                             .unwrap(),
                     );
                 }
-                for column in ["sequence_id", "ordinal"] {
+                for column in integer_columns {
                     value.insert(column.into(), row.try_get::<i64, _>(column).unwrap().into());
                 }
                 serde_json::Value::Object(value)
@@ -1964,7 +1952,7 @@ mod tests {
                 message_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, sequence_id INTEGER NOT NULL,
                 message_type TEXT NOT NULL, content TEXT NOT NULL, display_data TEXT, usage_data TEXT,
                 created_at TEXT NOT NULL, origin_kind TEXT NOT NULL, origin_product_conversation_id TEXT,
-                origin_transcript_id TEXT, origin_subscription_event_id TEXT, origin_slack_request_id TEXT,
+                origin_transcript_id TEXT, origin_subscription_event_id TEXT, origin_source_instance_id TEXT, origin_slack_request_id TEXT, origin_reminder_id TEXT,
                 origin_source_message_id TEXT, origin_source_tool_use_id TEXT
              );
              CREATE INDEX messages_conversation_sequence ON messages(conversation_id, sequence_id);
@@ -1986,8 +1974,13 @@ mod tests {
                 let id = format!("{segment}-{index}");
                 let optional = |field| (index % 2 == 0).then(|| format!("{field}-{id}"));
                 sqlx::query(
-                    "INSERT INTO messages VALUES (?1, ?2, ?3, 'user', ?4, ?5, ?6,
-                     '2026-01-01T00:00:00Z', 'internal_conversation', ?7, ?8, ?9, NULL, ?10, ?11)",
+                    "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type,
+                     content, display_data, usage_data, created_at, origin_kind,
+                     origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id,
+                     origin_source_instance_id, origin_slack_request_id, origin_reminder_id,
+                     origin_source_message_id, origin_source_tool_use_id)
+                     VALUES (?1, ?2, ?3, 'user', ?4, ?5, ?6,
+                     '2026-01-01T00:00:00Z', 'internal_conversation', ?7, ?8, ?9, NULL, NULL, ?10, ?11, ?12)",
                 )
                 .bind(&id)
                 .bind(segment)
@@ -1998,6 +1991,7 @@ mod tests {
                 .bind(optional("product"))
                 .bind(optional("transcript"))
                 .bind(optional("subscription"))
+                .bind(optional("reminder"))
                 .bind(optional("source-message"))
                 .bind(optional("source-tool"))
                 .execute(&mut connection)
@@ -2097,6 +2091,7 @@ mod tests {
         .await;
         assert_eq!(complete.len(), 15);
         assert_eq!(complete[0]["message_id"], "s2-4");
+        assert_eq!(complete[0]["origin_reminder_id"], "reminder-s2-4");
         assert_eq!(complete[0]["sequence_id"].as_i64(), Some(i64::MAX));
         assert_eq!(
             complete[1]["sequence_id"].as_i64(),

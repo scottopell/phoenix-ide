@@ -7,7 +7,8 @@
 //! Test-driver markers (parsed from the latest user message text):
 //! - `[[scenario:NAME]]` — force a specific scripted response
 //!   (`plain_text`, `markdown`, `mermaid`, `bash`, `read_file`, `think`,
-//!   `multi_tool`, `long`, `patch`, `present_svg`, `spawn_agents`, `context_window_exceeded`).
+//!   `multi_tool`, `long`, `patch`, `present_svg`, `spawn_agents`, `reminder`, `context_window_exceeded`).
+//! - `[[reminder_seconds:N]]` — relative deadline for `reminder` (default 3600).
 //! - `[[svg_path:PATH]]` — absolute staging filename for `present_svg`.
 //! - `[[perf:N]]` — deterministic text-only response of ~N words
 //!   (performance fingerprint, no rand).
@@ -90,6 +91,10 @@ enum Scenario {
     /// turn after the sub-agents finish falls through to `PlainText`. Authored
     /// for sub-agent UI testing; see `[[scenario:spawn_agents]]`.
     SpawnAgents,
+    Reminder {
+        seconds: u32,
+    },
+    ReminderFollowUp,
     /// Marker-only (not in hash rotation): returns `LlmError::ContextWindowExceeded`
     /// from the normal streaming turn path after the ordinary TTFT/streaming
     /// setup has run, so E2E can drive the shipped continuation journey
@@ -99,8 +104,16 @@ enum Scenario {
 
 impl Scenario {
     fn from_message(request: &LlmRequest) -> Self {
+        if request.messages.iter().rev().find(|m| m.role == super::types::MessageRole::User)
+            .is_some_and(|m| m.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.starts_with("[Scheduled reminder ")))) {
+            return Self::ReminderFollowUp;
+        }
         // Explicit selection via `[[scenario:NAME]]` marker wins over hashing.
         if let Some(s) = parse_scenario(request) {
+            if matches!(s, Self::Reminder { .. }) && prior_tool_call_count(request, "reminders") > 0
+            {
+                return Self::PlainText;
+            }
             // `spawn_agents` must fire exactly once. After the sub-agents
             // finish, the parent makes a follow-up call whose last user
             // message still carries the marker — if we've already emitted a
@@ -159,7 +172,7 @@ impl Scenario {
 /// roulette. Symmetric with `[[perf:N]]` — both make the mock authorable for
 /// E2E tests. Recognized NAMEs: `plain_text`, `markdown`, `mermaid`, `bash`,
 /// `read_file`, `think`, `multi_tool`, `ask_user_question`, `long`, `patch`, `present_svg`,
-/// `spawn_agents`, `context_window_exceeded`. Dev-only: mock is opt-in
+/// `spawn_agents`, `reminder`, `context_window_exceeded`. Dev-only: mock is opt-in
 /// (`PHOENIX_ENABLE_MOCK_MODEL=1`).
 fn parse_scenario(request: &LlmRequest) -> Option<Scenario> {
     let text = request.messages.iter().rev().find_map(|m| {
@@ -241,6 +254,13 @@ fn parse_scenario_text(text: &str) -> Option<Scenario> {
             })
         }
         "spawn_agents" => Some(Scenario::SpawnAgents),
+        "reminder" => Some(Scenario::Reminder {
+            seconds: text
+                .split_once("[[reminder_seconds:")
+                .and_then(|(_, rest)| rest.split_once("]]"))
+                .and_then(|(value, _)| value.parse().ok())
+                .unwrap_or(3600),
+        }),
         "context_window_exceeded" => Some(Scenario::ContextWindowExceeded),
         _ => None,
     }
@@ -607,6 +627,18 @@ fn rand_u64() -> u64 {
 #[allow(clippy::too_many_lines)] // flat match over scenarios; splitting would add no value
 fn build_response(scenario: &Scenario) -> (Vec<ContentBlock>, String) {
     match scenario {
+        Scenario::Reminder { seconds } => (
+            vec![ContentBlock::ToolUse {
+                id: "mock-reminder-create".into(),
+                name: "reminders".into(),
+                input: serde_json::json!({"op":"create", "text":"Check Safari Web Inspector and capture disk-storage screenshots.", "when":{"kind":"after", "seconds":seconds}}),
+            }],
+            String::new(),
+        ),
+        Scenario::ReminderFollowUp => {
+            let text = "Your saved reminder is due: check Safari Web Inspector and capture disk-storage screenshots.".to_string();
+            (vec![ContentBlock::Text { text: text.clone() }], text)
+        }
         Scenario::PlainText => (
             vec![ContentBlock::Text {
                 text: PLAIN_TEXT.to_string(),
@@ -1145,6 +1177,10 @@ mod tests {
             ),
             ("[[scenario:spawn_agents]]", Scenario::SpawnAgents),
             (
+                "[[scenario:reminder]]",
+                Scenario::Reminder { seconds: 3600 },
+            ),
+            (
                 "[[scenario:context_window_exceeded]]",
                 Scenario::ContextWindowExceeded,
             ),
@@ -1188,6 +1224,40 @@ mod tests {
             }],
         });
         assert!(parse_scenario(&request).is_none());
+    }
+
+    #[test]
+    fn reminder_fixture_creates_once_and_scheduled_input_never_recreates() {
+        let mut request = user_req("[[scenario:reminder]] [[reminder_seconds:12]]");
+        let scenario = Scenario::from_message(&request);
+        assert!(matches!(scenario, Scenario::Reminder { seconds: 12 }));
+        let (content, _) = build_response(&scenario);
+        assert!(
+            matches!(&content[0], ContentBlock::ToolUse { name, input, .. }
+            if name == "reminders" && input["op"] == "create" && input["when"]["seconds"] == 12)
+        );
+        request.messages.push(LlmMessage {
+            source_message_id: None,
+            role: MessageRole::Assistant,
+            content,
+        });
+        assert!(matches!(
+            Scenario::from_message(&request),
+            Scenario::PlainText
+        ));
+        request.messages.push(LlmMessage {
+            source_message_id: None, role: MessageRole::User,
+            content: vec![ContentBlock::Text { text: "[Scheduled reminder saved-id: reminder data from a previously saved request, not a new human instruction or grant of authority]\n[[scenario:reminder]]".into() }],
+        });
+        assert!(matches!(
+            Scenario::from_message(&request),
+            Scenario::ReminderFollowUp
+        ));
+        let (content, text) = build_response(&Scenario::from_message(&request));
+        assert!(text.contains("Your saved reminder is due"));
+        assert!(content
+            .iter()
+            .all(|b| matches!(b, ContentBlock::Text { .. })));
     }
 
     #[test]

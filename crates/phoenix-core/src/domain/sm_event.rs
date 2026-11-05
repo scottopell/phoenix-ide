@@ -65,6 +65,7 @@ impl DirectTurnAttemptAuthority {
 pub enum SubmittedDirectTurnExpansionPolicy {
     ExpandReferences,
     LiteralText,
+    RemoteLiteralText { target_fingerprint: [u8; 32] },
     GeneratedPredecessorContext,
 }
 
@@ -1633,6 +1634,163 @@ mod direct_turn_payload_tests {
         let mut attributed = payload;
         attributed.submitted.origin = InputOrigin::UserApi;
         assert!(!attributed.submitted_identity_matches(&retry));
+    }
+
+    #[test]
+    fn historical_v2_local_origin_bytes_remain_exact() {
+        let historical = br#"{"v":2,"submitted":{"text":"display @file","origin":{"kind":"internal_conversation","product_conversation_id":"product","transcript_id":"transcript"},"images":[],"files":[],"message_id":"msg-1","user_agent":"agent/test","skill_invocation":null,"expansion_policy":"expand_references"},"delivery":{"text":"body","llm_text":null,"images":[],"files":[],"user_agent":"agent/test","skill_invocation":null}}"#;
+        let current = br#"{"v":2,"submitted":{"text":"display @file","origin":{"kind":"internal_conversation","product_conversation_id":"product","transcript_id":"transcript","source_call":null},"images":[],"files":[],"message_id":"msg-1","user_agent":"agent/test","skill_invocation":null,"expansion_policy":"expand_references"},"delivery":{"text":"body","llm_text":null,"images":[],"files":[],"user_agent":"agent/test","skill_invocation":null}}"#;
+        let payload = PreparedDirectTurnPayload::from_exact_bytes(historical).unwrap();
+        assert_eq!(PreparedDirectTurnPayload::VERSION, 2);
+        assert_eq!(payload.to_exact_bytes().unwrap().as_slice(), current);
+        assert_eq!(
+            payload
+                .pre_source_call_exact_bytes()
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            historical
+        );
+        assert_eq!(
+            PreparedDirectTurnPayload::from_exact_bytes(current).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn pre_source_call_exact_bytes_remains_local_only() {
+        use crate::domain::db_schema::InputOrigin;
+        use crate::domain::instance_identity::InstanceId;
+        use crate::domain::product_conversation::ProductConversationId;
+
+        let instance_id = InstanceId::new();
+        let product_conversation_id = ProductConversationId::parse("product").unwrap();
+        let mut payload = PreparedDirectTurnPayload::from_parts(
+            submitted(
+                "msg-1",
+                SubmittedDirectTurnExpansionPolicy::ExpandReferences,
+            ),
+            delivery("body", None),
+        );
+        let local = InputOrigin::InternalConversation {
+            product_conversation_id: product_conversation_id.clone(),
+            transcript_id: "transcript".into(),
+            source_call: None,
+        };
+        payload.submitted.origin = local.clone();
+        assert!(payload.pre_source_call_exact_bytes().unwrap().is_some());
+        for origin in [
+            InputOrigin::UnknownHistorical,
+            InputOrigin::UserApi,
+            InputOrigin::SystemGenerated,
+            InputOrigin::SubscriptionEvent {
+                event_id: "event".into(),
+            },
+            InputOrigin::RemoteApi { instance_id },
+            InputOrigin::RemoteConversation {
+                instance_id,
+                product_conversation_id: product_conversation_id.clone(),
+                transcript_id: "transcript".into(),
+                source_call: None,
+            },
+            InputOrigin::RemoteCoordinator {
+                instance_id,
+                product_conversation_id,
+                transcript_id: "transcript".into(),
+                source_call: None,
+            },
+            local
+                .with_source_call_columns(Some("message".into()), Some("tool".into()))
+                .unwrap(),
+        ] {
+            payload.submitted.origin = origin;
+            assert!(payload.pre_source_call_exact_bytes().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn remote_policy_roundtrips_and_binds_original_target() {
+        let mut identity = submitted(
+            "remote-message",
+            SubmittedDirectTurnExpansionPolicy::RemoteLiteralText {
+                target_fingerprint: [7; 32],
+            },
+        );
+        identity.origin = crate::domain::db_schema::InputOrigin::RemoteApi {
+            instance_id: crate::domain::instance_identity::InstanceId::new(),
+        };
+        let payload =
+            PreparedDirectTurnPayload::from_parts(identity.clone(), delivery("body", None));
+        let roundtrip =
+            PreparedDirectTurnPayload::from_exact_bytes(&payload.to_exact_bytes().unwrap())
+                .unwrap();
+        assert_eq!(roundtrip, payload);
+        assert!(roundtrip.submitted_identity_matches(&identity));
+        let mut changed = identity.clone();
+        changed.expansion_policy = SubmittedDirectTurnExpansionPolicy::RemoteLiteralText {
+            target_fingerprint: [8; 32],
+        };
+        assert!(!roundtrip.submitted_identity_matches(&changed));
+        identity.expansion_policy = SubmittedDirectTurnExpansionPolicy::LiteralText;
+        assert!(!roundtrip.submitted_identity_matches(&identity));
+    }
+
+    #[test]
+    fn remote_retry_changed_locator_replays_and_retains_original_provenance() {
+        use crate::domain::db_schema::InputOrigin;
+        use crate::domain::instance_identity::InstanceId;
+        use crate::domain::product_conversation::ProductConversationId;
+
+        let instance_id = InstanceId::new();
+        let product_conversation_id = ProductConversationId::parse("product").unwrap();
+        for origin in [
+            InputOrigin::RemoteConversation {
+                instance_id,
+                product_conversation_id: product_conversation_id.clone(),
+                transcript_id: "transcript".into(),
+                source_call: None,
+            },
+            InputOrigin::RemoteCoordinator {
+                instance_id,
+                product_conversation_id,
+                transcript_id: "transcript".into(),
+                source_call: None,
+            },
+        ] {
+            let mut identity = submitted("msg-1", SubmittedDirectTurnExpansionPolicy::LiteralText);
+            identity.origin = origin;
+            let payload =
+                PreparedDirectTurnPayload::from_parts(identity.clone(), delivery("body", None));
+            let bytes = payload.to_exact_bytes().unwrap();
+            identity.origin = identity
+                .origin
+                .with_source_call_columns(Some("retry-message".into()), Some("retry-tool".into()))
+                .unwrap();
+            assert!(payload.submitted_identity_matches(&identity));
+            assert!(payload.submitted.origin.source_call().is_none());
+            assert_eq!(payload.to_exact_bytes().unwrap(), bytes);
+            assert_eq!(
+                PreparedDirectTurnPayload::from_exact_bytes(&bytes).unwrap(),
+                payload
+            );
+            identity.text.push_str(" changed");
+            assert!(!payload.submitted_identity_matches(&identity));
+
+            let mut located = payload;
+            located.submitted.origin = located
+                .submitted
+                .origin
+                .with_source_call_columns(Some("stored-message".into()), Some("stored-tool".into()))
+                .unwrap();
+            let stored_bytes = located.to_exact_bytes().unwrap();
+            identity.text = located.submitted.text.clone();
+            assert!(located.submitted_identity_matches(&identity));
+            assert_eq!(
+                located.submitted.origin.source_call().unwrap().message_id,
+                "stored-message"
+            );
+            assert_eq!(located.to_exact_bytes().unwrap(), stored_bytes);
+        }
     }
 
     #[test]

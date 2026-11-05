@@ -25,6 +25,7 @@ pub(crate) mod pr_monitoring;
 mod process_sample;
 pub(crate) mod product_conversations;
 mod release_updates;
+mod reminders;
 pub(crate) mod resource_monitor;
 mod share_svg_artifacts;
 mod spa_routes;
@@ -91,6 +92,7 @@ pub struct AppState {
     #[allow(dead_code)] // Consumed by the chain Q&A agent loop (REQ-CHN-009, Phase 2)
     pub message_retriever: Arc<dyn MessageRetriever>,
     pub federation_tls_trust: phoenix_core::domain::instance_identity::PeerTlsTrust,
+    pub(crate) remote_message_admission: Arc<federation::RemoteMessageAdmissionGates>,
     /// In-flight Codex/ChatGPT login flows. See [`codex_login`].
     pub codex_login: Arc<codex_login::CodexLoginManager>,
     /// Static deployment facts (binding, TLS, on-disk layout) resolved once at
@@ -328,6 +330,7 @@ impl AppState {
             chain_qa,
             message_retriever,
             federation_tls_trust,
+            remote_message_admission: Arc::default(),
             codex_login,
             deployment,
             runtime_env,
@@ -337,3 +340,6 @@ impl AppState {
         })
     }
 }
+
+#[cfg(test)]
+mod federation_two_instance;

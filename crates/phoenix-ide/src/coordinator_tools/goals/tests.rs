@@ -56,6 +56,8 @@ impl Fixture {
             .workflow_repository()
             .accept_authoritative_turn(&runtime_input(&caller, "native-goal-source"))
             .await
+            .established()
+            .expect("native Goal fixture turn admission must have an established durable fact")
             .unwrap();
         let phoenix_workflow::TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
             panic!("fresh runtime turn");
@@ -163,6 +165,56 @@ fn value(output: &ToolOutput) -> Value {
 }
 
 #[tokio::test]
+async fn explicit_local_goal_read_preserves_snapshot_wait_and_authority() {
+    let f = Fixture::new().await;
+    let prepared = f
+        .prepare(json!({"operation":"create","objective":"Local selector parity"}))
+        .await;
+    let applied = value(&f.apply(&prepared).await);
+    assert_eq!(applied["receipt"]["result"]["outcome"], "accepted");
+    let before = f.work_counts().await;
+    for mut input in [
+        json!({"target":f.target(),"after_version":0}),
+        json!({"target":f.target(),"after_version":1}),
+        json!({"target":f.target(),"wait":{"minimum_version":1,"timeout_seconds":1}}),
+    ] {
+        let omitted = value(&f.invoke("read_goal", input.clone()).await);
+        input["instance"] = json!("local");
+        let explicit = value(&f.invoke("read_goal", input.clone()).await);
+        assert_eq!(omitted, explicit);
+        input["instance"] = Value::Null;
+        assert_eq!(omitted, value(&f.invoke("read_goal", input.clone()).await));
+        input["instance"] = json!("local");
+        let unauthorized = GoalTool {
+            service: GoalCommandService::new(f.runtime.clone()),
+            runtime: f.runtime.clone(),
+            operation: Operation::Read,
+        }
+        .run(input, super::super::tests::context(&f.target_transcript))
+        .await;
+        assert!(!unauthorized.is_success());
+        assert!(unauthorized.output().contains("Coordinator"));
+    }
+    for selector in [
+        json!("missing-peer"),
+        json!("Local"),
+        json!(" local "),
+        json!(""),
+        json!(false),
+        json!({}),
+    ] {
+        assert!(!f
+            .invoke(
+                "read_goal",
+                json!({"target":f.target(), "instance":selector})
+            )
+            .await
+            .is_success());
+    }
+    assert_eq!(before, f.work_counts().await);
+}
+
+#[tokio::test]
 async fn native_goal_discovery_prepare_apply_read_and_replay_without_dispatch() {
     let f = Fixture::new().await;
     let definitions = f.executor.definitions().await;
@@ -180,7 +232,9 @@ async fn native_goal_discovery_prepare_apply_read_and_replay_without_dispatch() 
             (146, "retain_product_conversation_rename_receipts".into()),
             (147, "retain_product_creation_receipts".into()),
             (148, "product_creation_initial_execution_receipts".into()),
-            (149, "product_creation_image_retirement".into())
+            (149, "product_creation_image_retirement".into()),
+            (150, "federated_subscription_terminal_cancellation".into()),
+            (151, "one_shot_conversation_reminders".into())
         ]
     );
     for name in [
@@ -189,6 +243,9 @@ async fn native_goal_discovery_prepare_apply_read_and_replay_without_dispatch() 
         "apply_goal",
         "create_conversation",
         "rename_conversation",
+        "continue_conversation",
+        "read_automatic_continuation",
+        "set_automatic_continuation",
     ] {
         assert_eq!(
             definitions.iter().filter(|tool| tool.name == name).count(),
@@ -374,7 +431,7 @@ async fn native_goal_tools_refuse_raw_ids_authority_override_and_missing_turn() 
         )
         .await
         .is_success());
-    let prepare = tools(f.runtime.clone())
+    let prepare = tools(&f.runtime)
         .into_iter()
         .find(|t| t.name() == "prepare_goal")
         .unwrap();
@@ -417,7 +474,7 @@ async fn native_goal_tools_recheck_coordinator_role_on_every_operation() {
     let f = Fixture::new().await;
     let ordinary = "goal-native-target";
     for name in ["read_goal", "prepare_goal", "apply_goal"] {
-        let tool = tools(f.runtime.clone())
+        let tool = tools(&f.runtime)
             .into_iter()
             .find(|t| t.name() == name)
             .unwrap();

@@ -129,6 +129,35 @@ value ApprovedTaskWriteAuthority {
     objective: ApprovedTaskObjective
 }
 
+contract ToolRoundAdmission {
+    @invariant ToolRoundIdentityCorrespondence
+        -- REQ-BED-004: A checkpoint has unique Phoenix-managed call identities
+        -- paired one-to-one with result identities. Valid supplied result order
+        -- is preserved; identity matching does not require request-order sorting.
+        -- Malformed provider call identities select invalid-response handling
+        -- before ordinary execution, approval/question interception, or child completion.
+        -- A completion bearing another invocation's identity settles the expected
+        -- invocation as a concrete error without attributing the unowned output to it.
+
+    @invariant InvalidBufferedRoundPreservesEvidence
+        -- REQ-BED-007: An undecodable or invalid buffered executing/cancelling
+        -- round prevents startup admission before its persisted state is reset.
+        -- Its held assistant and completed results remain unchanged; unknown-effect
+        -- tools are not replayed and malformed data is not silently repaired.
+        -- Every selected held round is decoded and paired before any recovery
+        -- mutation, including a parent's settlement of pending child state.
+}
+
+contract ParentTerminalAcceptance {
+    @invariant AcceptanceIsOneEstablishedCommit
+        -- REQ-BED-008 / REQ-SA-004: adopting the exact pending child into
+        -- completed and its normal parent-acceptance marker is one established
+        -- native transaction. SubAgentParentAcceptanceCommitted observes that
+        -- transaction; it is not emitted by raw transport, buffering, or merely
+        -- evaluating a pure reducer proposal. Failed establishment leaves
+        -- delivery owed; unclassified local authority follows REQ-BED-033.
+}
+
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
@@ -375,6 +404,7 @@ entity Conversation {
         awaiting_sub_agents -> llm_requesting
         awaiting_sub_agents -> cancelling_sub_agents
         cancelling_sub_agents -> idle
+        cancelling_sub_agents -> error
         idle -> awaiting_continuation
         awaiting_continuation -> recoverable_continuation_failure
         recoverable_continuation_failure -> awaiting_continuation
@@ -389,14 +419,19 @@ entity Conversation {
     -- Core state-dependent fields
     retry_attempt: Integer when core_status = llm_requesting | awaiting_continuation | recoverable_continuation_failure
     overload_retry: ServerOverloadIncident when core_status = server_overload_retrying
+    current_tool: ToolCall when core_status = executing_tools
     tool_queue: List<ToolCall> when core_status = executing_tools
+    cancelling_tool_use_id: String when core_status = cancelling_tool
     tool_results: List<ToolResult> when core_status = executing_tools | cancelling_tool
     accumulated_sub_agents: Set<Conversation> when core_status = executing_tools
     skipped_tools: List<ToolCall> when core_status = cancelling_tool
     sub_agents_pending: Set<Conversation>
-        when core_status = awaiting_sub_agents | cancelling_sub_agents
+        when core_status = awaiting_sub_agents | cancelling_tool | cancelling_sub_agents
     sub_agents_completed: List<SubAgentResult>
         when core_status = awaiting_sub_agents | cancelling_sub_agents
+    -- A fact about this live cancellation chain, not an independent delivery
+    -- obligation that can attach to another chain after restart or error.
+    forced_tool_retirement_observed: Boolean when core_status = cancelling_sub_agents
     rejected_tool_calls: List<ToolCall> when core_status = awaiting_continuation | recoverable_continuation_failure
     continuation_operation_id: String when core_status = awaiting_continuation | recoverable_continuation_failure
     continuation_error_message: String when core_status = recoverable_continuation_failure
@@ -620,14 +655,30 @@ rule RejectMessageWhenRowDoesNotAcceptInput {
 -- CORE 2. LLM RESPONSE — TOOL DISPATCH (REQ-BED-003)
 -- ===========================================================
 
+rule RejectMalformedToolResponse {
+    when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: conversation.core_status = llm_requesting
+        or (conversation.core_status = server_overload_retrying
+            and conversation.overload_retry.target_kind = ordinary
+            and conversation.overload_retry.phase = in_flight)
+    requires: not valid_tool_identities(content, tool_calls)
+    ensures: LlmErrors(conversation, "Invalid provider tool identities", retryable, conversation.retry_attempt)
+
+    @guidance
+        -- Classify as invalid_response before ordinary or special-tool handling.
+        -- Existing bounded retry and parent/child terminal-error rules apply.
+}
+
 rule LlmRespondsWithTools {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count > 0
     requires: not is_sole_intercepted_tool(tool_calls)
     requires: not conversation.context_at_threshold
     ensures: conversation.core_status = executing_tools
-    ensures: conversation.tool_queue = tool_calls
+    ensures: conversation.current_tool = tool_calls.first
+    ensures: conversation.tool_queue = remaining_tool_calls(tool_calls)
     ensures: conversation.tool_results = {}
     ensures: conversation.accumulated_sub_agents = {}
     ensures: conversation.context_usage_ratio = usage_ratio(usage, conversation)
@@ -637,6 +688,7 @@ rule LlmRespondsWithTools {
 -- Intercepted tool mixed with other tools -> error results fed back to LLM
 rule InterceptedToolNotSole {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count > 1
     requires: tool_calls.any(t => is_intercepted_tool(t.name))
@@ -659,12 +711,25 @@ rule BashWaitSettlementDeadlineFires {
     when: BashWaitSettlementDeadlineReached(conversation, tool_call)
     requires: conversation.core_status = executing_tools
     requires: tool_call = conversation.current_tool
-    requires: tool_call.name = "bash"
-    requires: tool_call.input.op = "wait"
-    ensures: ToolTaskAborted(conversation, tool_call)
+    requires: is_bash_wait(tool_call)
+    ensures: ToolTaskRetirementRequested(conversation, tool_call)
+    ensures: not CommandReexecuted(tool_call)
+
+    @guidance
+        -- The serial dispatcher invalidates and aborts the wait task before
+        -- acknowledging ToolTaskRetired. Only that acknowledgement admits the
+        -- synthetic completion, so a successor call cannot open before the
+        -- old receiver's generation has been retired.
+}
+
+rule BashWaitRetiredTaskSettles {
+    when: ToolTaskRetired(conversation, tool_call)
+    requires: conversation.core_status = executing_tools
+    requires: tool_call = conversation.current_tool
+    requires: is_bash_wait(tool_call)
     ensures: ToolCompletes(
         conversation,
-        error_result(tool_call.id, "bash wait exceeded its bounded settlement deadline")
+        error_result(tool_call.tool_use_id, "bash wait exceeded its bounded settlement deadline")
     )
     ensures: not CommandReexecuted(tool_call)
 
@@ -681,8 +746,7 @@ rule BashWaitSettlementPersistenceCutoffFires {
     when: BashWaitSettlementPersistenceCutoffReached(conversation, tool_call)
     requires: conversation.core_status = executing_tools
     requires: tool_call = conversation.current_tool
-    requires: tool_call.name = "bash"
-    requires: tool_call.input.op = "wait"
+    requires: is_bash_wait(tool_call)
     ensures: ProcessLocalAuthorityClosed(conversation)
     ensures: not PersistenceReceiptFabricated(tool_call)
     ensures: not AmbiguousPersistenceRetried(tool_call)
@@ -699,8 +763,12 @@ rule ToolCompletesWithMoreRemaining {
     when: ToolCompletes(conversation, result)
     requires: conversation.core_status = executing_tools
     requires: conversation.tool_queue.count > 0
+    requires: result.tool_use_id = conversation.current_tool.tool_use_id
+    let next_tool = conversation.tool_queue.first
     ensures: conversation.tool_results.add(result)
-    ensures: ToolExecutionStarted(conversation, conversation.tool_queue.first)
+    ensures: conversation.current_tool = next_tool
+    ensures: conversation.tool_queue = remaining_tool_calls(conversation.tool_queue)
+    ensures: ToolExecutionStarted(conversation, next_tool)
 }
 
 rule LastToolCompletesNoSubAgents {
@@ -708,8 +776,11 @@ rule LastToolCompletesNoSubAgents {
     requires: conversation.core_status = executing_tools
     requires: conversation.tool_queue.count = 0
     requires: conversation.accumulated_sub_agents.count = 0
+    requires: result.tool_use_id = conversation.current_tool.tool_use_id
     ensures: conversation.tool_results.add(result)
     ensures: conversation.core_status = llm_requesting
+    ensures: conversation.current_tool = null
+    ensures: conversation.tool_queue = null
     ensures: conversation.retry_attempt = 1
     ensures: ToolRoundCheckpointed(conversation)
     ensures: LlmRequestDispatched(conversation)
@@ -720,9 +791,13 @@ rule LastToolCompletesWithSubAgents {
     requires: conversation.core_status = executing_tools
     requires: conversation.tool_queue.count = 0
     requires: conversation.accumulated_sub_agents.count > 0
+    requires: result.tool_use_id = conversation.current_tool.tool_use_id
+    let pending_children = conversation.accumulated_sub_agents
     ensures: conversation.tool_results.add(result)
     ensures: conversation.core_status = awaiting_sub_agents
-    ensures: conversation.sub_agents_pending = conversation.accumulated_sub_agents
+    ensures: conversation.current_tool = null
+    ensures: conversation.tool_queue = null
+    ensures: conversation.sub_agents_pending = pending_children
     ensures: conversation.sub_agents_completed = {}
     ensures: ToolRoundCheckpointed(conversation)
 }
@@ -731,27 +806,34 @@ rule SpawnAgentsCompletesWithMoreTools {
     when: SpawnAgentsCompletes(conversation, result, spawned_agents)
     requires: conversation.core_status = executing_tools
     requires: conversation.tool_queue.count > 0
+    requires: result.tool_use_id = conversation.current_tool.tool_use_id
+    let next_tool = conversation.tool_queue.first
     ensures: conversation.tool_results.add(result)
     ensures:
         for agent in spawned_agents:
             conversation.accumulated_sub_agents.add(agent)
             agent.product_conversation = conversation.product_conversation
             agent.parent = conversation
-    ensures: ToolExecutionStarted(conversation, conversation.tool_queue.first)
+    ensures: conversation.current_tool = next_tool
+    ensures: conversation.tool_queue = remaining_tool_calls(conversation.tool_queue)
+    ensures: ToolExecutionStarted(conversation, next_tool)
 }
 
 rule SpawnAgentsCompletesAsLastTool {
     when: SpawnAgentsCompletes(conversation, result, spawned_agents)
     requires: conversation.core_status = executing_tools
     requires: conversation.tool_queue.count = 0
+    requires: result.tool_use_id = conversation.current_tool.tool_use_id
+    let pending_children = conversation.accumulated_sub_agents + spawned_agents
     ensures: conversation.tool_results.add(result)
     ensures:
         for agent in spawned_agents:
-            conversation.accumulated_sub_agents.add(agent)
             agent.product_conversation = conversation.product_conversation
             agent.parent = conversation
     ensures: conversation.core_status = awaiting_sub_agents
-    ensures: conversation.sub_agents_pending = conversation.accumulated_sub_agents
+    ensures: conversation.current_tool = null
+    ensures: conversation.tool_queue = null
+    ensures: conversation.sub_agents_pending = pending_children
     ensures: conversation.sub_agents_completed = {}
     ensures: ToolRoundCheckpointed(conversation)
 }
@@ -763,41 +845,61 @@ rule SpawnAgentsCompletesAsLastTool {
 rule CancelDuringToolExecution {
     when: UserCancels(conversation)
     requires: conversation.core_status = executing_tools
+    let active_id = conversation.current_tool.tool_use_id
+    let queued = conversation.tool_queue
+    let pending_children = conversation.accumulated_sub_agents
     ensures: conversation.core_status = cancelling_tool
-    ensures: conversation.skipped_tools = conversation.tool_queue
+    ensures: conversation.cancelling_tool_use_id = active_id
+    ensures: conversation.current_tool = null
+    ensures: conversation.skipped_tools = queued
+    ensures: conversation.tool_queue = null
+    ensures: conversation.sub_agents_pending = pending_children
     ensures: ToolAbortRequested(conversation)
+    ensures:
+        if pending_children.count > 0:
+            SubAgentsCancelRequested(conversation)
 }
 
 rule ToolAbortConfirmed {
     when: ToolAborted(conversation)
     requires: conversation.core_status = cancelling_tool
+    let pending_children = conversation.sub_agents_pending
     ensures: CancellationCheckpointed(conversation)
+    ensures: conversation.cancelling_tool_use_id = null
     ensures:
-        if conversation.sub_agents_pending?.count = 0:
+        if pending_children.count = 0:
             conversation.core_status = idle
+            conversation.sub_agents_pending = null
             AgentDone(conversation)
         else:
             conversation.core_status = cancelling_sub_agents
-            SubAgentsCancelRequested(conversation)
+            conversation.sub_agents_completed = {}
+            conversation.forced_tool_retirement_observed = false
 }
 
 rule ToolCompletesDuringCancellation {
     when: ToolCompletes(conversation, result)
     requires: conversation.core_status = cancelling_tool
+    requires: result.tool_use_id = conversation.cancelling_tool_use_id
+    let pending_children = conversation.sub_agents_pending
     ensures: CancellationCheckpointed(conversation)
+    ensures: conversation.cancelling_tool_use_id = null
     ensures:
-        if conversation.sub_agents_pending?.count = 0:
+        if pending_children.count = 0:
             conversation.core_status = idle
+            conversation.sub_agents_pending = null
             AgentDone(conversation)
         else:
             conversation.core_status = cancelling_sub_agents
-            SubAgentsCancelRequested(conversation)
+            conversation.sub_agents_completed = {}
+            conversation.forced_tool_retirement_observed = false
 }
 
 rule CancelDuringSubAgentWait {
     when: UserCancels(conversation)
     requires: conversation.core_status = awaiting_sub_agents
     ensures: conversation.core_status = cancelling_sub_agents
+    ensures: conversation.forced_tool_retirement_observed = false
     ensures: SubAgentsCancelRequested(conversation)
 }
 
@@ -806,10 +908,23 @@ rule LastSubAgentDuringCancellation {
     requires: conversation.core_status = cancelling_sub_agents
     requires: result.agent_id in conversation.sub_agents_pending
     requires: conversation.sub_agents_pending.count = 1
+    let forced_tool_retired = conversation.forced_tool_retirement_observed
     ensures: conversation.sub_agents_pending.remove(result.agent_id)
     ensures: conversation.sub_agents_completed.add(result)
     ensures: conversation.core_status = idle
+    ensures: conversation.forced_tool_retirement_observed = null
     ensures: AgentDone(conversation)
+    ensures:
+        if forced_tool_retired:
+            SystemMessageInjected(conversation,
+                "Cancellation completed. Aborted work may still be reclaiming resources in the background.")
+
+    @guidance
+        -- Publish the one mandatory forced-tool notice only after the final child
+        -- result and settlement state are durably accepted. Ordinary cooperative
+        -- cancellation owes no degraded notice. Clearing the chain-scoped fact and
+        -- leaving CancellingSubAgents prevent a late/duplicate child from emitting
+        -- it again; the child deadline and cooperative drain are alternative exits.
 }
 
 rule SubAgentResultDuringCancellation {
@@ -819,33 +934,44 @@ rule SubAgentResultDuringCancellation {
     requires: conversation.sub_agents_pending.count > 1
     ensures: conversation.sub_agents_pending.remove(result.agent_id)
     ensures: conversation.sub_agents_completed.add(result)
+    ensures: conversation.forced_tool_retirement_observed = previous(conversation.forced_tool_retirement_observed)
 }
 
 -- REQ-BED-005a: Bounded cancellation liveness — forced teardown backstop.
 --
--- cancelling_tool's only cooperative exits (ToolAbortConfirmed,
--- ToolCompletesDuringCancellation) both require the tool task to return. A tool
--- that never observes its cancellation token and never returns would otherwise
--- wedge the conversation here forever. The deadline backstop forces the
--- cancellation to completion without waiting for the task.
+-- Cooperative outcomes or an already-queued denial settle through
+-- ToolAbortConfirmed / ToolCompletesDuringCancellation. The deadline requests
+-- synchronous runtime-slot retirement even when an intercepted call has no
+-- ordinary tool task. Its acknowledgement admits settlement without waiting
+-- for task cooperation or resource cleanup.
 rule CancellingToolDeadlineFires {
     when: CancellationDeadlineExpires(conversation)
     requires: conversation.core_status = cancelling_tool
-    ensures: CancellationCheckpointed(conversation)
+    ensures: ToolCancellationRetirementRequested(conversation)
     ensures: CancellationDeadlineExceeded(conversation)
-    ensures: SystemMessageInjected(conversation,
-        "Cancellation completed. Aborted work may still be reclaiming resources in the background.")
+}
+
+rule RetiredToolCancellationSettles {
+    when: ToolCancellationRetired(conversation)
+    requires: conversation.core_status = cancelling_tool
+    let pending_children = conversation.sub_agents_pending
+    ensures: CancellationCheckpointed(conversation)
+    ensures: conversation.cancelling_tool_use_id = null
     -- Mirror the conditional next-state of the cooperative ToolAbortConfirmed:
     -- if sub-agents were spawned earlier in this tool round they must still be
     -- cancelled, so the backstop drains into cancelling_sub_agents (which has
     -- its own deadline backstop) rather than skipping straight to idle.
     ensures:
-        if conversation.sub_agents_pending?.count = 0:
+        if pending_children.count = 0:
             conversation.core_status = idle
+            conversation.sub_agents_pending = null
             AgentDone(conversation)
+            SystemMessageInjected(conversation,
+                "Cancellation completed. Aborted work may still be reclaiming resources in the background.")
         else:
             conversation.core_status = cancelling_sub_agents
-            SubAgentsCancelRequested(conversation)
+            conversation.sub_agents_completed = {}
+            conversation.forced_tool_retirement_observed = true
 
     @guidance
         -- Sequence on deadline expiry: abort the tool's executing task (do not
@@ -871,18 +997,74 @@ rule CancellingToolDeadlineFires {
 rule CancellingSubAgentsDeadlineFires {
     when: CancellationDeadlineExpires(conversation)
     requires: conversation.core_status = cancelling_sub_agents
-    ensures: conversation.core_status = idle
-    ensures: AgentDone(conversation)
+    let pending_children = conversation.sub_agents_pending
     ensures: CancellationDeadlineExceeded(conversation)
+    ensures: SubAgentCancellationBackstopRequested(conversation, pending_children)
+
+    @guidance
+        -- Mirror of CancellingToolDeadlineFires for the sub-agent fan-in:
+        -- Snapshot exact pending children, establish terminal cancellation
+        -- evidence per child, then submit each established outcome through the
+        -- ordinary atomic parent-acceptance path. The final accepted child, not
+        -- deadline expiry by itself, settles to Idle. This does not wait for a
+        -- worker to cooperate and does not bypass admitted-child conservation.
+        -- A completed notice is owed only after the entire requested drain is
+        -- established. Definite failure is an error, not cancellation success;
+        -- unclassified local write authority selects REQ-BED-033.
+}
+
+rule BackstopTerminalEvidenceEntersNormalFanIn {
+    when: SubAgentBackstopTerminalEvidenceEstablished(conversation, result)
+    requires: live_runtime_authority_open(conversation)
+    requires: conversation.core_status = cancelling_sub_agents
+    requires: result.agent_id in conversation.sub_agents_pending
+    ensures: ParentTerminalTransportArrived(conversation, result)
+}
+
+rule BackstopCompletedNoticeFollowsAcceptedDrain {
+    when: SubAgentBackstopDrainCommitted(conversation)
+    requires: exact_requested_backstop_drain_committed(conversation)
+    requires: live_runtime_authority_open(conversation)
+    requires: not forced_notice_already_published_for_owned_chain(conversation)
     ensures: SystemMessageInjected(conversation,
         "Cancellation completed. Aborted work may still be reclaiming resources in the background.")
 
     @guidance
-        -- Mirror of CancellingToolDeadlineFires for the sub-agent fan-in:
-        -- abort still-pending sub-agents without waiting for them to report,
-        -- settle to idle, WARN via CancellationDeadlineExceeded, and inject the
-        -- user-visible message. Same liveness family as specs/subagents/
-        -- REQ-SA-006 (a wedged worker must not hold its supervisor indefinitely).
+        -- This is the completed chain captured by the still-owned native
+        -- backstop call, not a predicate over the latest conversation state.
+        -- Inline steering may enter LlmRequesting after the last child settles
+        -- and before this call returns; it cannot invalidate the old chain's
+        -- established drain proof or retarget this notice to the new turn.
+        -- The same owned chain's already-published forced-tool notice suppresses
+        -- a second publication. No durable notice store or replay is implied.
+}
+
+rule BackstopDefiniteWriteFailureCannotReportCompletion {
+    when: SubAgentBackstopWriteFailed(conversation, message)
+    requires: conversation.core_status = cancelling_sub_agents
+    requires: live_runtime_authority_open(conversation)
+    ensures: conversation.core_status = error
+    ensures: conversation.forced_tool_retirement_observed = null
+    ensures: conversation.sub_agents_pending = null
+    ensures: conversation.sub_agents_completed = null
+    ensures: conversation.error_message = message
+    ensures: conversation.error_class = non_retryable
+    ensures: conversation.error_kind = sub_agent_error
+    ensures: not AgentDone(conversation)
+
+    @guidance
+        -- Retain existing durable admission/terminal evidence; this interrupts
+        -- the cancellation chain without claiming that pending children were
+        -- accepted. The existing non-user-resumable sub_agent_error prevents
+        -- send/dismiss from bypassing that unresolved admission evidence.
+        -- No automatic replay or recovery promise follows this error.
+}
+
+rule BackstopUnknownWriteAuthorityClosesTheFence {
+    when: SubAgentBackstopWriteUnclassified(conversation)
+    ensures: ProcessLocalAuthorityClosed(conversation)
+    ensures: not FurtherWorkAdmitted(conversation)
+    ensures: not FurtherSemanticStatePublished(conversation)
 }
 
 -- ===========================================================
@@ -1008,6 +1190,20 @@ rule UserDismissesError {
 -- CORE 6. SUB-AGENT FAN-IN (REQ-BED-008)
 -- ===========================================================
 
+rule ReadyParentReceivesTerminalTransport {
+    when: ParentTerminalTransportArrived(conversation, result)
+    requires: live_runtime_authority_open(conversation)
+    requires: conversation.core_status in { awaiting_sub_agents, cancelling_sub_agents }
+    ensures: SubAgentReportsResult(conversation, result)
+}
+
+rule UnreadyParentRetainsTerminalTransport {
+    when: ParentTerminalTransportArrived(conversation, result)
+    requires: live_runtime_authority_open(conversation)
+    requires: conversation.core_status not in { awaiting_sub_agents, cancelling_sub_agents }
+    ensures: TerminalTransportBuffered(conversation, result)
+}
+
 rule SubAgentReportsResultMorePending {
     when: SubAgentReportsResult(conversation, result)
     requires: conversation.core_status = awaiting_sub_agents
@@ -1075,6 +1271,7 @@ rule RejectMessageContextExhausted {
 
 rule ParentLlmRespondsTextOnly {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count = 0
     ensures: conversation.core_status = idle
@@ -1088,6 +1285,7 @@ rule ParentLlmRespondsTextOnly {
 -- not split by mode, and writing-capable parents do not get a parallel non-blocking path.
 rule ProposeTaskIntercepted {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: conversation.kind = Parent
     requires: tool_calls.count = 1
@@ -1131,6 +1329,7 @@ rule ApprovalSnapshotMismatchRequiresRequestChanges {
 -- proposal-eligibility predicate.
 rule ProposeTaskInvalid {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: conversation.kind = Parent
     requires: tool_calls.count = 1
@@ -1154,6 +1353,7 @@ rule ProposeTaskInvalid {
 -- so without this arm a sub-agent's sole propose_task matches no rule.
 rule SubAgentProposeTaskRejected {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: conversation.kind = SubAgent
     requires: tool_calls.count = 1
@@ -1172,6 +1372,7 @@ rule SubAgentProposeTaskRejected {
 
 rule AskUserQuestionIntercepted {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count = 1
     requires: tool_calls.first.name = "ask_user_question"
@@ -1185,6 +1386,7 @@ rule AskUserQuestionIntercepted {
 -- REQ-BED-019: Context threshold reached (parent -> continuation)
 rule ContextThresholdReachedParent {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: conversation.context_at_threshold
     ensures: conversation.core_status = awaiting_continuation
@@ -2676,6 +2878,7 @@ rule UnsafeRetryRequiresConcreteProposal {
 
 rule SubAgentImplicitCompletion {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count = 0
     requires: content = null
@@ -2687,6 +2890,7 @@ rule SubAgentImplicitCompletion {
 -- Sub-agent text-only with content -> also implicit completion
 rule SubAgentTextOnlyCompletion {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count = 0
     requires: content != null
@@ -2701,6 +2905,7 @@ rule SubAgentTextOnlyCompletion {
 
 rule SubAgentSubmitsResult {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count = 1
     requires: tool_calls.first.name = "submit_result"
@@ -2711,6 +2916,7 @@ rule SubAgentSubmitsResult {
 
 rule SubAgentSubmitsError {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count = 1
     requires: tool_calls.first.name = "submit_error"
@@ -2751,6 +2957,7 @@ rule SubAgentLlmError {
 
 rule SubAgentContextExhausted {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: valid_tool_identities(content, tool_calls)
     requires: conversation.core_status = llm_requesting
     requires: conversation.context_at_threshold
     ensures: conversation.sub_agent_status = failed
@@ -2966,6 +3173,56 @@ rule ModeChangeNotification {
 ------------------------------------------------------------
 -- Helpers (pure predicates referenced by rules)
 ------------------------------------------------------------
+
+--   admitted_sub_agent_count(conversation: Conversation) -> Integer
+--       Every child admitted for this parent's fan-in round, including those
+--       already accepted and those cancelled before activation or parent adoption.
+--       No administrative cleanup disposition exempts an admitted child.
+
+--   live_runtime_authority_open(conversation: Conversation) -> Boolean
+--       The conversation's executor has current admission under the shared
+--       process-wide local-authority fence; this is not another stored flag.
+--   exact_parent_child_commit_established(conversation: Conversation, result: SubAgentResult) -> Boolean
+--       The owning native operation established the transaction containing this
+--       exact parent pending -> completed transition and child acceptance marker.
+--       A proposed transition, buffered event, or administrative unadopted-batch
+--       suppression is not this receipt; every admitted cancellation still owes
+--       its exact parent fan-in outcome.
+--   backstop_terminal_evidence_matches_owned_request(conversation, result) -> Boolean
+--       The native backstop captured this exact pending child in its current
+--       owned request and established terminal evidence before producing result.
+--       If the child was already terminal, result retains that exact persisted
+--       payload/cause; otherwise atomic cancellation establishment supplies it.
+--       Parent timeout presentation policy is distinct from this raw evidence.
+--   exact_requested_backstop_drain_committed(conversation) -> Boolean
+--       Every child captured by that same owned backstop request has an established
+--       parent-state/child-acceptance commit. Neither a later Idle state, partial
+--       drain, worker absence nor a failed write supplies this proof.
+--       The owned call retains its exact completed-chain binding even if inline
+--       steering advances the conversation before the call returns. Reading the
+--       latest state or borrowing a different cancellation chain is not proof.
+--   forced_notice_already_published_for_owned_chain(conversation) -> Boolean
+--       The same native operation observed the live forced-tool notice already
+--       durably published by the last-child transition. It does not infer receipt
+--       from Idle or an earlier cancellation chain and is not a new durable store.
+
+--   executor_owns_conversation(executor: RuntimeExecutor, conversation: Conversation) -> Boolean
+--       The acknowledgement comes from the live executor owning this exact
+--       conversation. A runtime for another conversation cannot retire its slot.
+
+--   remaining_tool_calls(calls: List<ToolCall>) -> List<ToolCall>
+--       The ordered tail after removing exactly the first call. Requires a
+--       nonempty input. The active call is not part of tool_queue; completed
+--       calls move to tool_results and are never started again by advancement.
+--   is_bash_wait(call: ToolCall) -> Boolean
+--       True exactly when call.name is bash and its serialized input represents
+--       a supported Bash wait invocation. Input is opaque outside this predicate.
+
+--   valid_tool_identities(content: Content, tool_calls: List<ToolCall>) -> Boolean
+--       True exactly when Phoenix-managed tool-use identities in content and
+--       executable call identities are unique and correspond one-to-one.
+--       Provider-managed server tool blocks do not require Phoenix results.
+--       This predicate does not impose ordering on completed results.
 --
 -- Allium has no formal helper-function declaration; rules call these
 -- predicates by bare identifier. This block defines their complete semantics.
@@ -3313,6 +3570,9 @@ rule ServerRestartOrdinaryConversation {
     requires: conversation.parent_status != awaiting_recovery
         or conversation.recovery_resume_target = conversation_turn
     ensures: conversation.core_status = idle
+    ensures: conversation.current_tool = null
+    ensures: conversation.cancelling_tool_use_id = null
+    ensures: conversation.forced_tool_retirement_observed = null
 }
 
 rule ServerRestartOwedDirectTurn {
@@ -3341,6 +3601,9 @@ rule ServerRestartExhaustedDirectTurn {
     requires: not pending_approval_owns_next_transition(conversation)
     requires: restart_recovery_exhausted(conversation)
     ensures: conversation.core_status = error
+    ensures: conversation.current_tool = null
+    ensures: conversation.cancelling_tool_use_id = null
+    ensures: conversation.forced_tool_retirement_observed = null
     ensures: not active_materialized_turn_owns_conversation(conversation)
 }
 
@@ -3351,6 +3614,9 @@ rule ServerRestartWithoutDurableOwner {
     requires: not durable_execution_occurrence_owns_first_response(conversation)
     requires: transcript_suggests_unfinished_work(conversation)
     ensures: conversation.core_status = idle
+    ensures: conversation.current_tool = null
+    ensures: conversation.cancelling_tool_use_id = null
+    ensures: conversation.forced_tool_retirement_observed = null
 }
 
 rule ServerRestartCommittedSteeringTurn {
@@ -3415,9 +3681,6 @@ invariant GraceTurnOutcome {
 
 -- REQ-BED-001: Pure state transitions
 -- Enforced by construction: transitions are pure functions.
-
--- REQ-BED-004: Tool round atomicity
--- tool_use count = tool_result count at checkpoint time.
 
 -- REQ-BED-008: Sub-agent fan-in conservation. Every accepted result removes
 -- the same durable child identity from pending and adds one completed outcome;
@@ -3603,13 +3866,15 @@ invariant ContinuationBoundarySummaryLivesOnHandedOffPredecessor {
 
 -- REQ-BED-005a: Bounded cancellation liveness.
 -- cancelling_tool and cancelling_sub_agents are never livelocks: each has a
--- deadline-driven exit to idle (CancellingToolDeadlineFires,
--- CancellingSubAgentsDeadlineFires) that does not depend on the running task or
--- a pending sub-agent ever returning. The time from a cancellation request to a
--- terminal-direction state is bounded by config.cancellation_deadline regardless
--- of tool cooperation. Enforced by construction: the deadline rules' `when:`
--- (CancellationDeadlineExpires) fires unconditionally on every conversation in a
--- cancellation status, so neither status can persist past the deadline.
+-- deadline-driven terminal-direction settlement that does not depend on the
+-- running task or a pending sub-agent ever returning. The tool deadline invokes
+-- synchronous slot retirement, whose acknowledgement admits the checkpoint;
+-- it does not wait for task completion. An intercepted spawn also requires its
+-- exact native admission/closure classification; a known failure takes the
+-- executor-error boundary and indeterminate local authority takes REQ-BED-033,
+-- rather than acknowledging successful cancellation. The time to this classified
+-- terminal direction is bounded by config.cancellation_deadline regardless of
+-- tool cooperation. Absence of an ordinary task cannot suppress slot retirement.
 
 ------------------------------------------------------------
 -- Actor Declarations
@@ -3619,9 +3884,117 @@ actor User {
     identified_by: Parent
 }
 
+actor RuntimeExecutor {
+    identified_by: Conversation
+}
+
 ------------------------------------------------------------
 -- Surfaces
 ------------------------------------------------------------
+
+-- Internal synchronous acknowledgements from the conversation's owned executor.
+-- These are lifecycle steps, not a new public API or independent retry queue.
+surface ToolRetirementAcknowledgements {
+    facing runtime: RuntimeExecutor
+    context conversation: Conversation
+
+    provides:
+        ToolTaskRetired(conversation, tool_call)
+            when executor_owns_conversation(runtime, conversation)
+                 and conversation.core_status = executing_tools
+                 and tool_call = conversation.current_tool
+                 and is_bash_wait(tool_call)
+        ToolCancellationRetired(conversation)
+            when executor_owns_conversation(runtime, conversation)
+                 and conversation.core_status = cancelling_tool
+
+    @guarantee RetirementPrecedesSettlement
+        -- Each acknowledgement answers the matching retirement request from
+        -- this same owned execution step, after dispatch-generation invalidation
+        -- and abort of the retained task handle if present. It is emitted without
+        -- waiting for task/resource cleanup and before synthetic settlement can
+        -- advance the conversation. No ordinary task or invocation is required
+        -- to acknowledge cancellation-slot retirement.
+}
+
+surface RuntimeChildResultObservations {
+    facing runtime: RuntimeExecutor
+    context conversation: Conversation
+
+    contracts:
+        fulfils ParentTerminalAcceptance
+
+    provides:
+        ParentTerminalTransportArrived(conversation, result)
+            when executor_owns_conversation(runtime, conversation)
+        SubAgentParentAcceptanceCommitted(conversation, result)
+            when executor_owns_conversation(runtime, conversation)
+                 and exact_parent_child_commit_established(conversation, result)
+
+    @guarantee DurableParentAndChildCorrelation
+        -- The delivered result retains the admitted child's exact identity and
+        -- durable parent destination, under the sub-agent terminal-evidence and
+        -- delivery contracts. Bedrock's pending/completed membership guards own
+        -- acceptance and duplicate handling; delivery alone is not acceptance.
+
+    @guarantee NativeCommitIsTheOnlyAcceptanceReceiptProducer
+        -- The ready event evaluates a fan-in transition, but does not itself
+        -- acknowledge delivery. Only the established native transaction adopting
+        -- that exact parent state together with the child's acceptance marker
+        -- provides SubAgentParentAcceptanceCommitted. A failed write keeps the
+        -- raw result owed/buffered; an unclassified write follows REQ-BED-033.
+        -- A pure transition proposal remains private until this establishment.
+
+    @guarantee EarlyChildResultsWaitForFanInReadiness
+        -- A transport arrival while the ordinary tool is executing or cancelling
+        -- is retained unchanged in the executor's existing result buffer. It
+        -- does not remove the child from parent pending or mark it parent-accepted.
+        -- On entering AwaitingSubAgents or CancellingSubAgents, redeliver each
+        -- buffered result belonging to that exact pending child set through
+        -- ParentTerminalTransportArrived. Buffering may retain duplicates; the acceptance
+        -- guards then move each child pending -> completed once. Results from
+        -- another round are not reattributed to this round. The process-local
+        -- buffer is not independent durable delivery or restart authority.
+}
+
+surface RuntimeCancellationBackstopObservations {
+    facing runtime: RuntimeExecutor
+    context conversation: Conversation
+
+    provides:
+        SubAgentBackstopTerminalEvidenceEstablished(conversation, result)
+            when executor_owns_conversation(runtime, conversation)
+                 and backstop_terminal_evidence_matches_owned_request(conversation, result)
+        SubAgentBackstopDrainCommitted(conversation)
+            when executor_owns_conversation(runtime, conversation)
+                 and exact_requested_backstop_drain_committed(conversation)
+        SubAgentBackstopWriteFailed(conversation, message)
+            when executor_owns_conversation(runtime, conversation)
+        SubAgentBackstopWriteUnclassified(conversation)
+            when executor_owns_conversation(runtime, conversation)
+
+    @guarantee NativeBackstopDrainsThroughActualParentAcceptance
+        -- SubAgentCancellationBackstopRequested invokes this owned native step,
+        -- not an independent queue. Snapshot pending identities once; for each,
+        -- atomically classify terminal evidence: reuse an already established
+        -- authentic payload/cause, or establish cancellation only if nonterminal.
+        -- A racing terminal commit wins by that same atomic classification;
+        -- it cannot be replaced by a fabricated cancellation payload. Process
+        -- the selected raw outcome through the existing parent acceptance
+        -- transaction, preserving the owning parent's separate timeout policy.
+        -- Only after every target was
+        -- accepted may that same step provide its one DrainCommitted observation.
+        -- Earlier arrivals/duplicates may already have accepted a target; its
+        -- exact durable acceptance still supplies proof, not another result.
+
+    @guarantee FailureDoesNotMintCompletionOrRetryUnknownEffects
+        -- Stop the owned drain on definite failure and report its actual error;
+        -- do not emit DrainCommitted or a completed notice for a partial drain.
+        -- Unclassified local authority closes the shared process fence before
+        -- further semantic work. These observations retain their original owned
+        -- request and cannot be reattributed to a later cancellation chain.
+        -- No callback queue, worker-cooperation wait or restart policy is added.
+}
 
 surface UserConversation {
     facing user: User
@@ -3659,12 +4032,10 @@ surface UserConversation {
                  }
         BashWaitSettlementDeadlineReached(conversation, conversation.current_tool)
             when conversation.core_status = executing_tools
-             and conversation.current_tool.name = "bash"
-             and conversation.current_tool.input.op = "wait"
+             and is_bash_wait(conversation.current_tool)
         BashWaitSettlementPersistenceCutoffReached(conversation, conversation.current_tool)
             when conversation.core_status = executing_tools
-             and conversation.current_tool.name = "bash"
-             and conversation.current_tool.input.op = "wait"
+             and is_bash_wait(conversation.current_tool)
         TaskApprovalDecided(conversation, decision)
             when conversation.parent_status = awaiting_task_approval
         UserAnswersQuestion(conversation, request_id?, answers, annotations?)

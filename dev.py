@@ -1,9 +1,12 @@
 #!/usr/bin/env -S uv run
 # /// script
-# requires-python = ">=3.12"
+# requires-python = ">=3.13,<3.14"
 # dependencies = [
 #   "taskmd>=1.0,<2",
 # ]
+#
+# [tool.uv]
+# python-preference = "only-managed"
 # ///
 """Development tasks for phoenix-ide."""
 
@@ -517,7 +520,7 @@ def _bootstrap_dev_tracing(environ: dict[str, str] | None = None) -> None:
 
     probe = subprocess.run(
         [
-            "uv", "run", "--offline", *_dev_trace_uv_args(),
+            "uv", "run", "--offline", "--python", sys.executable, *_dev_trace_uv_args(),
             "python", "-c",
             "import opentelemetry.sdk; "
             "import opentelemetry.exporter.otlp.proto.http.trace_exporter",
@@ -6409,7 +6412,7 @@ def cmd_check(
         return rc
 
     def lane_rust():
-        """Rust lane: test compile → codegen export → staleness diff → test run.
+        """Rust lane: codegen export → staleness diff → test compile → test run.
 
         This lane does not generate a Linux-musl cross-target artifact tree.
 
@@ -6443,14 +6446,11 @@ def cmd_check(
         if rust_split is not None:
             lane_rust_split()
             return
-        compile_rc = run_step("cargo test compile", compile_cmd)
-        if compile_rc == 0:
-            # TS_RS_EXPORT_DIR is read at test runtime (not macro expansion),
-            # so this run reuses the harnesses compiled above verbatim.
-            rc = run_step("codegen", codegen_cmd,
-                          env_extra={"TS_RS_EXPORT_DIR": str(codegen_export_base)})
-            if rc == 0:
-                codegen_stale_step()
+        rc = run_step("codegen", codegen_cmd,
+                      env_extra={"TS_RS_EXPORT_DIR": str(codegen_export_base)})
+        if rc == 0:
+            codegen_stale_step()
+        run_step("cargo test compile", compile_cmd)
         run_step("cargo test", test_cmd, timeout=CARGO_TEST_TIMEOUT)
 
     def lane_rust_split():
@@ -6984,18 +6984,6 @@ def cmd_check(
     # Environment classification and Git subprocess safety only matter when a
     # cargo lane runs.
     if cargo_active:
-        # Classify browser availability before running the Rust suite.
-        #
-        # Contract for `./dev.py check`:
-        #   - Red == broken code. Never "your network is broken" or
-        #     "you don't have Chrome installed".
-        #   - The internal signal env vars (PHOENIX_CHROME_EXECUTABLE,
-        #     PHOENIX_SKIP_BROWSER_TESTS,
-        #     GIT_CONFIG_*) are MECHANISM — users never set them by hand.
-        #   - Probes print iff classification CHANGES test behavior:
-        #     auto-skipping a class, overriding a config, etc. Happy paths
-        #     (Chromium found, fetcher reachable, signing works, deps
-        #     present) stay silent so a normal-env run is clean.
         _classify_browser_env()
 
         # Tests create temporary commits and must never consult an interactive
@@ -8072,7 +8060,7 @@ def _build_pipeline_model(with_timings: bool = False):
 # Per-lane step lists mirror the lane_* / check_* functions in cmd_check; shown
 # in node tooltips. Kept beside _LANE_DEFS conceptually — update both together.
 _GRAPH_LANE_STEPS = {
-    "rust": ["cargo test (compile)", "codegen export", "codegen-stale diff",
+    "rust": ["codegen export", "codegen-stale diff", "cargo test (compile)",
              "cargo test (run)"],
     "clippy": ["cargo clippy --all-targets -D warnings"],
     "tsc": ["tsc -b --noEmit"],

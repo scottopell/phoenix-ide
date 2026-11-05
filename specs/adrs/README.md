@@ -19,7 +19,7 @@ Creation terminal evidence and image delivery lifetime are governed by [ADR-207]
 
 Codex reset-credit visibility and manual redemption, including resuming the stopped conversation after a redemption from its quota error, are governed by [ADR-208](208_codex-reset-credits-are-manual-and-resume-the-stopped-conversation.md), affecting REQ-CRR-001–010.
 
-Strict local-only selection of Kache v1.2.2 on macOS arm64 is governed by [ADR-213](213_kache-v1-2-2-strict-local-only-selection.md), superseding only ADR-212's selection conclusion; ADR-211 and ADR-212 retain their historical v1.0.0 evidence. Remote caching remains deferred.
+Strict local-only selection of Kache v1.2.2 on macOS arm64 is governed by [ADR-224](224_kache-v1-2-2-strict-local-only-selection.md), superseding only ADR-223's selection conclusion; ADR-222 and ADR-223 retain their historical v1.0.0 evidence. Remote caching remains deferred.
 
 ## Numbering and validation
 
@@ -189,6 +189,8 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [144](144_output-budget-is-declared-model-maximum-and-exhaustion-is-terminal.md) | Output budget is the declared model maximum, and output exhaustion is a distinct terminal error | Accepted | REQ-LLM-003, REQ-LLM-004f, REQ-LLM-006c |
 | [190](190_generic-ordinary-forward-proof-begins-after-quiescence.md) | Generic ordinary forward proof begins after quiescence | Accepted | REQ-COMP-013/019, REQ-LDD-023/028 |
 | [191](191_native-create-and-rename-use-shared-application-actions.md) | Native create and rename use shared application actions | Accepted | REQ-GR-007, REQ-CCR-013, REQ-CID-007 |
+| [211](211_native-continue-reuses-generated-handoff-admission.md) | Native Continue reuses generated handoff admission | Accepted | REQ-GR-007/019, REQ-BED-020/021/020b/030 |
+| [209](209_native-automatic-continuation-is-preference-only.md) | Native automatic continuation is preference-only | Accepted | REQ-GR-007/020, REQ-BED-020, REQ-API-029 |
 | [192](192_goal-admission-requires-explicit-auto-continue.md) | Goal admission requires explicit automatic continuation | Accepted | REQ-GOAL-AC-001–004 |
 | [149](149_selective-coordinator-checkins.md) | Selective coordinator check-ins and attention-first briefings | Accepted | REQ-GR-011 |
 | [150](150_concrete-coordinator-reporting-and-blocker-recovery.md) | Concrete Coordinator reporting and blocked-work recovery | Accepted | REQ-GR-011 |
@@ -204,9 +206,19 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [155](155_slack-signals-are-best-effort-and-questions-stay-native.md) | Slack signals are best effort and questions stay native | Prototype compatibility superseded by ADR-188 | REQ-SG-005/006/012/013/014/015/016/017 |
 | [188](188_slack-gateway-supports-only-its-final-public-schema.md) | Slack gateway supports only its final public schema | Accepted | REQ-SG-005/011/012/015/017; REQ-COMP-002/020 |
 | [210](210_original-target-touch-routing-follows-contact-ownership.md) | Original-target touch routing follows contact ownership | Accepted | REQ-MLRU-014, REQ-MLRU-017 |
-| [211](211_kache-v1-restores-automatic-selection.md) | Qualified Kache v1 restores automatic compiler-cache selection | Superseded by ADR-212 (selection); v1.0.0 debugger evidence remains historical | development methodology; REQ-COMP-001, REQ-COMP-008 |
-| [212](212_kache-default-waits-for-identifiable-isolation-fix.md) | Kache default waits for an identifiable isolation fix | Selection conclusion superseded by ADR-213; historical v1.0.0 evidence retained | development methodology; REQ-COMP-001, REQ-COMP-008 |
-| [213](213_kache-v1-2-2-strict-local-only-selection.md) | Select Kache v1.2.2 only behind a Phoenix-owned local-only boundary | Accepted | development methodology; REQ-COMP-001, REQ-COMP-008 |
+| [212](212_outcome-delegation-with-owner-method-autonomy.md) | Outcome delegation with owner method autonomy | Proposed | REQ-GR-011 |
+| [213](213_macos-bash-launch-qualification-is-the-only-hosted-launch-ci.md) | macOS Bash launch qualification is the only separate hosted launch CI | Accepted | REQ-BASH-017 |
+| [214](214_coordinator-speaks-as-ember.md) | The Coordinator speaks as Ember, the phoenix on the user's shoulder | Accepted | REQ-GR-021, REQ-GR-011 |
+| [215](215_tool-round-identities-are-validated-before-dispatch-and-reset.md) | Tool-round identities are validated before dispatch and reset | Accepted | REQ-BED-004, REQ-BED-007 |
+| [216](216_explicit-local-tool-selector-reuses-local-admission.md) | Explicit local tool selection reuses local admission | Accepted | REQ-FED-001, REQ-FED-002, REQ-FED-019 |
+| [217](217_reminders-submit-through-standard-input-admission.md) | Reminders submit through standard input admission | Accepted | REQ-REM-001–009 |
+| [218](218_reminder-occurrence-identities-are-reserved.md) | Reminder occurrence identities are reserved at fresh input admission | Accepted | REQ-REM-005/008, REQ-API-033 |
+| [219](219_reminder-reservations-cover-canonical-aliases-and-fresh-openings.md) | Reminder reservations cover canonical aliases and fresh openings | Accepted | REQ-API-033, REQ-REM-005 |
+| [220](220_reminder-management-errors-use-existing-fail-stop.md) | Reminder management errors use existing fail-stop authority | Accepted | REQ-REM-006, REQ-DWF-043, REQ-BED-033 |
+| [221](221_coordinator-authority-uses-conversational-approval-and-direct-tools.md) | Coordinator Authority uses conversational approval and direct tools | Accepted | REQ-AUTH-001–006, REQ-GR-007/013/022 |
+| [222](222_kache-v1-restores-automatic-selection.md) | Qualified Kache v1 restores automatic compiler-cache selection | Superseded by ADR-223 (selection); v1.0.0 debugger evidence remains historical | development methodology; REQ-COMP-001, REQ-COMP-008 |
+| [223](223_kache-default-waits-for-identifiable-isolation-fix.md) | Kache default waits for an identifiable isolation fix | Selection conclusion superseded by ADR-224; historical v1.0.0 evidence retained | development methodology; REQ-COMP-001, REQ-COMP-008 |
+| [224](224_kache-v1-2-2-strict-local-only-selection.md) | Select Kache v1.2.2 only behind a Phoenix-owned local-only boundary | Accepted | development methodology; REQ-COMP-001, REQ-COMP-008 |
 
 ## For agents: which decisions bind your task
 
@@ -214,12 +226,13 @@ Consult the relevant ADRs before starting work of each kind.
 
 | Task type | Relevant ADRs |
 | --- | --- |
+| Changing reminder occurrence identity, time eligibility, management or ordinary input acceptance | 217, 218, 219, 220 |
 | Changing navigation console attribution or CDP context ownership | 110/111, superseding 109, with 107/108 |
 | Changing conversation Markdown disclosures, their source ranges, streaming selection, or find interpretation | 099 |
 | Changing Codex model discovery, availability, or account-bound routing | 062, then 052 and 034 |
 | Changing Codex reset-credit listing, redemption, or post-redemption resume | 208, then 062 and 085 |
 | Configuring named workers, tiers, or sub-agent model routes | 052, within 034's compatibility scope |
-| Selecting or qualifying development compiler-cache defaults | 079, then 078 and 034 |
+| Selecting or qualifying development compiler-cache defaults | 224, then 223/222/079/078 and 034 |
 | Changing pending-question identity compatibility or legacy tokenless settlement | 082, then 034 |
 | Specifying parallel Work-child qualification, admission, shared WorkScope collaboration, cancellation/start, or parent-result delivery | 059, then 052 and 026 |
 | Implementing federation instance identity or bounded known-credential SQL exclusions | 083, within 034's compatibility scope |
@@ -277,6 +290,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying modern build identity or role-bound legacy predecessor rollback | 064, then 034, 017, and 010 |
 | Working on stable/RC release version parsing, Apple bundle mapping, or prerelease publication classification | 065, then proposed 063 and 018 |
 | Specifying the Coordinator surface, current-activity orientation, or database read boundary | 066 for on-demand activity, 027 for tool eligibility, then 022 and 021 for Coordinator-specific evidence and UI history |
+| Specifying standing Coordinator Authority, conversational approval or read/set tools | 221, with 066 for stable prompt context and 070 for input provenance |
 | Specifying projects task-file shapes, proposal classification, or managed approval behavior across taskmd and plain markdown briefs | 023 |
 | Specifying continuation summary retry, restart recovery, or exactly-once commit | 025 |
 | Specifying provider prompt persistence authority, bounded transcript projection, or continuation prompt freezing | 045, then 025 and 031 |

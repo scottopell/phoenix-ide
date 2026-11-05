@@ -80,7 +80,7 @@ enum AuthoritativeEffect {
         origin: phoenix_core::domain::db_schema::InputOrigin,
     },
     PersistAuthoritativeUserMessage {
-        payload: phoenix_core::domain::sm_event::PreparedDirectTurnPayload,
+        payload: Box<phoenix_core::domain::sm_event::PreparedDirectTurnPayload>,
         authority: phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
         idempotent: bool,
     },
@@ -759,7 +759,7 @@ async fn forward_tool_outcome(
     tool_outcome_tx: mpsc::Sender<(u64, ToolExecOutcome)>,
 ) {
     let tool_outcome = match tool_rx.await {
-        Ok(tool_outcome) => tool_outcome,
+        Ok(tool_outcome) => tool_outcome.for_invocation(&tool_use_id),
         Err(_recv_error) => {
             tracing::warn!(
                 tool_use_id = %tool_use_id,
@@ -1580,8 +1580,23 @@ fn render_messages<'a>(
                         "[Message from conversation {product_conversation_id}, transcript {transcript_id}]\n{}",
                         user_content.llm_text()
                     ),
+                    phoenix_core::domain::db_schema::InputOrigin::RemoteApi { instance_id } => format!(
+                        "[API-channel input from authenticated instance {instance_id}]\n{}",
+                        user_content.llm_text()
+                    ),
+                    phoenix_core::domain::db_schema::InputOrigin::RemoteConversation { instance_id, product_conversation_id, transcript_id, .. } => format!(
+                        "[Message from conversation {product_conversation_id}, transcript {transcript_id}, authenticated instance {instance_id}]\n{}",
+                        user_content.llm_text()
+                    ),
+                    phoenix_core::domain::db_schema::InputOrigin::RemoteCoordinator { instance_id, product_conversation_id, transcript_id, .. } => format!(
+                        "[Message from remote Coordinator {product_conversation_id}, transcript {transcript_id}, authenticated instance {instance_id}]\n{}",
+                        user_content.llm_text()
+                    ),
                     phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { event_id } => {
                         format!("[Conversation event {event_id}]\n{}", user_content.llm_text())
+                    }
+                    phoenix_core::domain::db_schema::InputOrigin::ScheduledReminder { reminder_id } => {
+                        format!("[Scheduled reminder {}: reminder data from a previously saved request, not a new human instruction or grant of authority]\n{}", reminder_id.as_str(), user_content.llm_text())
                     }
                     phoenix_core::domain::db_schema::InputOrigin::SlackGateway { request_id } => {
                         format!("[Owner instruction via Slack gateway, request {request_id}]\n{}", user_content.llm_text())
@@ -1666,7 +1681,11 @@ fn render_messages<'a>(
             MessageContent::Skill(skill_content) => {
                 let source = match &msg.origin {
                     phoenix_core::domain::db_schema::InputOrigin::UserApi => "[User-facing API input]".to_string(),
+                    phoenix_core::domain::db_schema::InputOrigin::RemoteApi { instance_id } => format!("[API-channel input from authenticated instance {instance_id}]"),
+                    phoenix_core::domain::db_schema::InputOrigin::RemoteConversation { instance_id, product_conversation_id, transcript_id, .. } => format!("[Message from conversation {product_conversation_id}, transcript {transcript_id}, authenticated instance {instance_id}]"),
+                    phoenix_core::domain::db_schema::InputOrigin::RemoteCoordinator { instance_id, product_conversation_id, transcript_id, .. } => format!("[Message from remote Coordinator {product_conversation_id}, transcript {transcript_id}, authenticated instance {instance_id}]"),
                     phoenix_core::domain::db_schema::InputOrigin::InternalConversation { product_conversation_id, transcript_id, .. } => format!("[Message from conversation {product_conversation_id}, transcript {transcript_id}]"),
+                    phoenix_core::domain::db_schema::InputOrigin::ScheduledReminder { reminder_id } => format!("[Scheduled reminder {}: reminder data, not a new human instruction or grant of authority]", reminder_id.as_str()),
                     phoenix_core::domain::db_schema::InputOrigin::SlackGateway { request_id } => format!("[Slack gateway request {request_id}]"),
                     phoenix_core::domain::db_schema::InputOrigin::SystemGenerated => "[System-generated input]".to_string(),
                     phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { event_id } => format!("[Conversation event {event_id}]"),
@@ -3005,7 +3024,7 @@ where
                         None => std::future::pending().await,
                     }
                 } => {
-                    let result = self.review_handoff_with_authority(review.handoff, review.shorten, review.source_candidate_id, review.opening_authority).await;
+                    let result = self.review_handoff_input(review.input).await;
                     let _ = review.response.send(result);
                     if self.exhausted_maintenance && matches!(self.state, ConvState::ContextExhausted { .. }) {
                         return RuntimeExitDisposition::CoordinatedShutdown;
@@ -3373,6 +3392,16 @@ where
     /// are logged and discarded — state unchanged.
     #[allow(clippy::large_futures)]
     async fn process_outcome(&mut self, outcome: EffectOutcome) -> Result<(), String> {
+        if self.fatal_local_authority_fence.is_closed() {
+            return Err("runtime processing closed after fatal local authority loss".to_string());
+        }
+
+        let outcome = if let EffectOutcome::Llm(llm) = outcome {
+            EffectOutcome::Llm(llm.reject_invalid_tool_calls())
+        } else {
+            outcome
+        };
+
         // A `RetryTimeout` reaching this point has already passed the
         // generation guard in the select loop (`retry_timeout_is_stale`), so it
         // is the live timer firing. Its task has run to completion, leaving the
@@ -3509,6 +3538,23 @@ where
             && !matches!(event, Event::Shutdown)
         {
             return Err("runtime processing closed after fatal local authority loss".to_string());
+        }
+        if let Event::LlmResponse {
+            content,
+            tool_calls,
+            ..
+        } = &event
+        {
+            if let Err(error) =
+                phoenix_core::domain::tool_round::validate_response_tool_calls(content, tool_calls)
+            {
+                return Box::pin(self.process_outcome(EffectOutcome::Llm(
+                    LlmOutcome::InvalidResponse {
+                        message: format!("Invalid provider tool identities: {error}"),
+                    },
+                )))
+                .await;
+            }
         }
         self.creation_settlement_disposition = CreationSettlementDisposition::Continue;
         let owes_parent_direct_turn_terminal = !self.context.is_sub_agent
@@ -6311,7 +6357,7 @@ where
                 let _reserved_broadcast_range = reserved_broadcast_range;
                 let input = crate::runtime::traits::AuthoritativeUserMessageAdoptionInput {
                     authority,
-                    payload,
+                    payload: *payload,
                     sequence_id: reserved_seqs[0],
                     created_at: phoenix_workflow::Timestamp(now),
                     accepted_state: self
@@ -9719,9 +9765,11 @@ where
             explore_bash,
         );
         let mut system_prompt = if is_coordinator {
+            let authority = self.storage.coordinator_authority().await?;
             crate::system_prompt::build_coordinator_system_prompt(
                 llm_language,
                 tool_executor.coordinator_skill_catalog().as_ref(),
+                &authority,
             )
         } else {
             let turn_context = self.ordinary_turn_context.get_or_insert_with(|| {
@@ -9795,7 +9843,7 @@ where
         self.review_handoff_with_authority(handoff, shorten, source_candidate_id, phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext).await
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[cfg(test)]
     async fn review_handoff_with_authority(
         &mut self,
         handoff: String,
@@ -9803,24 +9851,69 @@ where
         source_candidate_id: Option<String>,
         opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
     ) -> Result<super::HandoffReviewResponse, String> {
-        if !matches!(
-            self.state,
-            ConvState::ContextExhausted { .. } | ConvState::RecoverableContinuationFailure { .. }
-        ) {
+        self.review_handoff_input(super::HandoffReviewInput::ProspectiveSuccessor {
+            handoff,
+            shorten,
+            source_candidate_id,
+            opening_authority,
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn review_handoff_input(
+        &mut self,
+        input: super::HandoffReviewInput,
+    ) -> Result<super::HandoffReviewResponse, String> {
+        use phoenix_core::domain::product_conversation::ContinuationOpeningAuthority;
+
+        let reserved_opening = matches!(
+            &input,
+            super::HandoffReviewInput::ReservedGeneratedOpening(_)
+        );
+        let (handoff, shorten, source_candidate_id, opening_authority) = match input {
+            super::HandoffReviewInput::ProspectiveSuccessor {
+                handoff,
+                shorten,
+                source_candidate_id,
+                opening_authority,
+            } => (handoff, shorten, source_candidate_id, opening_authority),
+            super::HandoffReviewInput::ReservedGeneratedOpening(intent) => {
+                if intent.successor_conversation_id != self.context.conversation_id
+                    || intent.opening_authority
+                        != ContinuationOpeningAuthority::GeneratedPredecessorContext
+                    || intent.user_agent.is_some()
+                    || !matches!(self.state, ConvState::Idle)
+                {
+                    return Err(
+                        "Generated opening review requires its idle reserved successor".to_string(),
+                    );
+                }
+                (intent.handoff, false, None, intent.opening_authority)
+            }
+        };
+        if !reserved_opening
+            && !matches!(
+                self.state,
+                ConvState::ContextExhausted { .. }
+                    | ConvState::RecoverableContinuationFailure { .. }
+            )
+        {
             return Err("Handoff review requires an exhausted conversation or retained continuation failure".to_string());
         }
         let source_revision = match &self.state {
             ConvState::RecoverableContinuationFailure { failure } => {
-                crate::db::ContinuationSourceRevision::Operation {
+                Some(crate::db::ContinuationSourceRevision::Operation {
                     operation_id: failure.request.operation_id.clone(),
                     attempt: failure.request.attempt,
-                }
+                })
             }
             ConvState::ContextExhausted { .. } => {
-                crate::db::ContinuationSourceRevision::ExhaustedState {
+                Some(crate::db::ContinuationSourceRevision::ExhaustedState {
                     state_updated_at: self.state_updated_at,
-                }
+                })
             }
+            _ if reserved_opening => None,
             _ => unreachable!("review state guarded above"),
         };
         let retained_source = if shorten && !handoff.trim().is_empty() {
@@ -9855,7 +9948,9 @@ where
                         id: id.clone(),
                         conversation_id: self.context.conversation_id.clone(),
                         origin: crate::db::ContinuationCandidateOrigin::ReviewInput {
-                            revision: source_revision.clone(),
+                            revision: source_revision
+                                .clone()
+                                .ok_or("shortening requires a predecessor revision")?,
                         },
                         source,
                         text: handoff.clone(),
@@ -9868,7 +9963,11 @@ where
         } else {
             crate::db::ContinuationCandidateSource::UnattributedInput
         };
-        let (system, tools) = self.prepare_successor_overhead().await?;
+        let (system, tools) = if reserved_opening {
+            self.prepare_ordinary_overhead().await?
+        } else {
+            self.prepare_successor_overhead().await?
+        };
         let client = self
             .llm_client
             .clone()
@@ -10092,7 +10191,8 @@ where
                                 id: candidate_id.clone(),
                                 conversation_id: self.context.conversation_id.clone(),
                                 origin: crate::db::ContinuationCandidateOrigin::AiShortening {
-                                    revision: source_revision,
+                                    revision: source_revision
+                                        .ok_or("shortening requires a predecessor revision")?,
                                 },
                                 source: retained_source,
                                 text: candidate.clone(),
@@ -14401,10 +14501,211 @@ mod dispatch_context_budget_tests {
     use crate::runtime::traits::MessageStore;
     use crate::state_machine::ConvContext;
     use crate::tools::BrowserSessionManager;
+    use phoenix_core::llm_language::LlmLanguage;
     use phoenix_llm::{ContentBlock, LlmResponse, ModelRegistry, Usage};
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
+
+    type AuthorityRuntime =
+        ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>;
+
+    fn authority_runtime(
+        id: &str,
+        cwd: &Path,
+        storage: Arc<InMemoryStorage>,
+        llm: Arc<MockLlmClient>,
+        coordinator: bool,
+        sub_agent: bool,
+    ) -> AuthorityRuntime {
+        let mut context = ConvContext::new(id, cwd.to_path_buf(), "test-model", 200_000, 16_384);
+        context.is_coordinator = coordinator;
+        context.is_sub_agent = sub_agent;
+        let (event_tx, event_rx) = mpsc::channel(8);
+        ConversationRuntime::new(
+            context,
+            ConvState::LlmRequesting { attempt: 1 },
+            storage,
+            llm,
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            SseBroadcaster::new(16, 0),
+        )
+    }
+
+    async fn dispatch_authority_request(runtime: &mut AuthorityRuntime, llm: &MockLlmClient) {
+        llm.queue_response(LlmResponse {
+            provider_replay: None,
+            content: vec![ContentBlock::text("done")],
+            end_turn: true,
+            usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+        runtime.execute_effect(Effect::RequestLlm).await.unwrap();
+        runtime.llm_task_handle.take().unwrap().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn coordinator_authority_refreshes_each_dispatch_and_successor_without_restart() {
+        use phoenix_core::domain::coordinator_authority::CoordinatorAuthority;
+
+        let cwd = TempDir::new().unwrap();
+        let storage = Arc::new(InMemoryStorage::new());
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        let mut runtime = authority_runtime(
+            "authority-current",
+            cwd.path(),
+            storage.clone(),
+            llm.clone(),
+            true,
+            false,
+        );
+        storage
+            .add_message(
+                "initial",
+                "authority-current",
+                &MessageContent::user("Work within scope"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let first = "  User allows unused cache cleanup.\n\n";
+        let replacement = "User allows unused caches; preserve active artifacts. 🐦\n";
+        for text in ["", first, first, replacement, ""] {
+            let authority = CoordinatorAuthority::try_from(text.to_owned()).unwrap();
+            storage.set_coordinator_authority(Ok(authority.clone()));
+            dispatch_authority_request(&mut runtime, &llm).await;
+            let requests = llm.recorded_requests();
+            let request = requests.last().unwrap();
+            assert_eq!(request.system.len(), 1);
+            assert_eq!(
+                request.system[0].text,
+                crate::system_prompt::build_coordinator_system_prompt(
+                    LlmLanguage::default(),
+                    None,
+                    &authority
+                )
+            );
+            assert_eq!(request.cache_key.as_str(), "authority-current");
+        }
+        let requests = llm.recorded_requests();
+        assert_eq!(requests[0].system[0].text, requests[4].system[0].text);
+        assert_eq!(requests[1].system[0].text, requests[2].system[0].text);
+        assert_ne!(requests[2].system[0].text, requests[3].system[0].text);
+        storage.set_coordinator_authority(Err("Authority read failed after prior dispatch".into()));
+        assert!(runtime.execute_effect(Effect::RequestLlm).await.is_err());
+        assert_eq!(llm.recorded_requests().len(), 5);
+        assert!(runtime.llm_task_handle.is_none());
+
+        storage
+            .set_coordinator_authority(Ok(
+                CoordinatorAuthority::try_from(replacement.to_owned()).unwrap()
+            ));
+        let mut successor = authority_runtime(
+            "authority-successor",
+            cwd.path(),
+            storage.clone(),
+            llm.clone(),
+            true,
+            false,
+        );
+        storage
+            .add_message(
+                "handoff",
+                "authority-successor",
+                &MessageContent::user("Continue commissioned work"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let (successor_context, _) = successor.prepare_successor_overhead().await.unwrap();
+        assert_eq!(successor_context, requests[3].system[0].text);
+        let newest =
+            CoordinatorAuthority::try_from("Newly approved successor scope.\n".to_owned()).unwrap();
+        storage.set_coordinator_authority(Ok(newest.clone()));
+        dispatch_authority_request(&mut successor, &llm).await;
+        let requests = llm.recorded_requests();
+        assert_eq!(
+            requests.last().unwrap().system[0].text,
+            crate::system_prompt::build_coordinator_system_prompt(
+                LlmLanguage::default(),
+                None,
+                &newest
+            )
+        );
+        assert_ne!(requests.last().unwrap().system[0].text, successor_context);
+        assert_eq!(
+            requests.last().unwrap().cache_key.as_str(),
+            "authority-successor"
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_authority_read_failure_prevents_dispatch_but_ordinary_contexts_do_not_read_it(
+    ) {
+        let cwd = TempDir::new().unwrap();
+        let storage = Arc::new(InMemoryStorage::new());
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        storage.set_coordinator_authority(Err("Authority storage unavailable".into()));
+        let mut coordinator = authority_runtime(
+            "authority-failure",
+            cwd.path(),
+            storage.clone(),
+            llm.clone(),
+            true,
+            false,
+        );
+        storage
+            .add_message(
+                "request",
+                "authority-failure",
+                &MessageContent::user("Continue"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let error = coordinator
+            .execute_effect(Effect::RequestLlm)
+            .await
+            .unwrap_err();
+        assert!(error.contains("Authority storage unavailable"));
+        assert!(llm.recorded_requests().is_empty());
+        assert!(coordinator.llm_task_handle.is_none());
+        assert!(coordinator.prepare_successor_overhead().await.is_err());
+
+        for sub_agent in [false, true] {
+            let mut ordinary = authority_runtime(
+                "ordinary",
+                cwd.path(),
+                storage.clone(),
+                llm.clone(),
+                false,
+                sub_agent,
+            );
+            let (prompt, _) = ordinary.prepare_ordinary_overhead().await.unwrap();
+            assert!(!prompt.contains("Current Coordinator Authority"));
+            storage.set_coordinator_authority(Ok(
+                phoenix_core::domain::coordinator_authority::CoordinatorAuthority::try_from(
+                    "UNIQUE_SAVED_STANDING_GRANT".to_owned(),
+                )
+                .unwrap(),
+            ));
+            let (prompt, _) = ordinary.prepare_successor_overhead().await.unwrap();
+            assert!(!prompt.contains("UNIQUE_SAVED_STANDING_GRANT"));
+            assert!(!prompt.contains("Current Coordinator Authority"));
+            storage.set_coordinator_authority(Err("Authority storage unavailable".into()));
+        }
+    }
 
     #[test]
     fn provider_context_attributes_internal_sender_without_changing_user_role() {
@@ -14427,6 +14728,58 @@ mod dispatch_context_budget_tests {
         );
         assert!(
             matches!(&rendered[1].content[0], ContentBlock::Text { text } if text == "user request")
+        );
+    }
+
+    #[test]
+    fn provider_context_preserves_authenticated_remote_origin_for_user_and_skill() {
+        use phoenix_core::domain::{
+            db_schema::{InputOrigin, SkillContent},
+            instance_identity::InstanceId,
+            product_conversation::ProductConversationId,
+        };
+        let instance_id = InstanceId::new();
+        let product_conversation_id = ProductConversationId::parse("same-local-product").unwrap();
+        for (origin, expected) in [
+            (InputOrigin::RemoteApi { instance_id }, format!("[API-channel input from authenticated instance {instance_id}]")),
+            (InputOrigin::RemoteConversation {
+                instance_id, product_conversation_id: product_conversation_id.clone(),
+                transcript_id: "same-local-transcript".into(), source_call: None,
+            }, format!("[Message from conversation {product_conversation_id}, transcript same-local-transcript, authenticated instance {instance_id}]")),
+            (InputOrigin::RemoteCoordinator {
+                instance_id, product_conversation_id: product_conversation_id.clone(),
+                transcript_id: "same-local-transcript".into(), source_call: None,
+            }, format!("[Message from remote Coordinator {product_conversation_id}, transcript same-local-transcript, authenticated instance {instance_id}]")),
+        ] {
+            let mut user = message("recipient", 1, "body");
+            user.origin = origin.clone();
+            let mut skill = message("recipient", 2, "body");
+            skill.origin = origin;
+            skill.message_type = crate::db::MessageType::Skill;
+            skill.content = MessageContent::Skill(SkillContent {
+                name: "inspect".into(), body: "body".into(), trigger: "/inspect".into(), files: vec![],
+            });
+            let rendered = render_messages(&[user, skill], &std::collections::HashSet::new());
+            assert_eq!(rendered.len(), 2);
+            for rendered in rendered {
+                assert_eq!(rendered.role, phoenix_llm::MessageRole::User);
+                assert!(matches!(&rendered.content[0], ContentBlock::Text { text } if text == &format!("{expected}\nbody")));
+            }
+        }
+    }
+
+    #[test]
+    fn scheduled_reminder_context_is_saved_data_without_new_human_authority() {
+        let mut saved = message("recipient", 1, "Check Safari");
+        saved.origin = phoenix_core::domain::db_schema::InputOrigin::ScheduledReminder {
+            reminder_id: phoenix_core::domain::reminder::ReminderId::parse("reminder-context")
+                .unwrap(),
+        };
+        let rendered = render_messages(&[saved], &std::collections::HashSet::new());
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(rendered[0].role, phoenix_llm::MessageRole::User);
+        assert!(
+            matches!(&rendered[0].content[0], ContentBlock::Text { text } if text == "[Scheduled reminder reminder-context: reminder data from a previously saved request, not a new human instruction or grant of authority]\nCheck Safari")
         );
     }
 
@@ -14821,6 +15174,7 @@ mod dispatch_context_budget_tests {
         let expected = crate::system_prompt::build_coordinator_system_prompt(
             crate::llm_language::LlmLanguage::default(),
             None,
+            &phoenix_core::domain::coordinator_authority::CoordinatorAuthority::default(),
         );
         for request in &requests {
             assert_eq!(request.system.len(), 1);
@@ -15576,7 +15930,7 @@ mod authoritative_user_message_effect_tests {
         );
 
         rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
-            payload: payload("msg-direct"),
+            payload: Box::new(payload("msg-direct")),
             authority: authority(),
             idempotent: true,
         })
@@ -15601,7 +15955,7 @@ mod authoritative_user_message_effect_tests {
         );
 
         rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
-            payload: payload("msg-direct"),
+            payload: Box::new(payload("msg-direct")),
             authority: authority(),
             idempotent: true,
         })
@@ -15636,7 +15990,7 @@ mod authoritative_user_message_effect_tests {
             updated_at: Utc::now(),
         });
         rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
-            payload: payload("msg-direct"),
+            payload: Box::new(payload("msg-direct")),
             authority: authority(),
             idempotent: true,
         })
@@ -18252,7 +18606,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -18287,7 +18641,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -18338,7 +18692,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -18394,7 +18748,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -18430,7 +18784,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -18466,7 +18820,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             })
@@ -18499,7 +18853,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -18528,7 +18882,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -19124,7 +19478,7 @@ mod authoritative_user_message_effect_tests {
                     attempt: 1,
                 })
                 .with_effect(Effect::PersistAuthoritativeUserMessage {
-                    payload: payload("msg-direct"),
+                    payload: Box::new(payload("msg-direct")),
                     authority: authority(),
                     idempotent: false,
                 })
@@ -19160,7 +19514,7 @@ mod authoritative_user_message_effect_tests {
                 updated_at: Utc::now(),
             });
             rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: true,
             })
@@ -21529,6 +21883,78 @@ mod steer_drain_detector_tests {
         .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new())
         .with_steering_queue(queue);
         (rt, storage)
+    }
+
+    #[tokio::test]
+    async fn malformed_provider_tool_identities_settle_both_runtime_entry_points() {
+        use crate::runtime::traits::MessageStore;
+        use phoenix_core::domain::db_schema::UsageData;
+        use phoenix_core::domain::retry_policy::GENERIC_MAX_ATTEMPTS;
+        for typed_outcome in [false, true] {
+            let conversation_id = if typed_outcome {
+                "typed-invalid-round"
+            } else {
+                "event-invalid-round"
+            };
+            let (mut runtime, storage) = build_runtime_with_state_and_queue(
+                conversation_id,
+                ConvState::LlmRequesting {
+                    attempt: GENERIC_MAX_ATTEMPTS,
+                },
+                vec![],
+            );
+            let tool = ToolCall::new(
+                "duplicate",
+                ToolInput::Think(crate::state_machine::state::ThinkInput {
+                    thoughts: "must not run".into(),
+                }),
+            );
+            let content =
+                vec![ContentBlock::tool_use("duplicate", "think", serde_json::json!({})); 2];
+            let tool_calls = vec![tool.clone(), tool];
+            if typed_outcome {
+                runtime
+                    .process_outcome(EffectOutcome::Llm(LlmOutcome::Response {
+                        content,
+                        tool_calls,
+                        end_turn: false,
+                        usage: UsageData::default(),
+                        request_id: "rejected".into(),
+                        provider_replay: None,
+                    }))
+                    .await
+                    .unwrap();
+            } else {
+                runtime
+                    .process_event(Event::LlmResponse {
+                        content,
+                        tool_calls,
+                        end_turn: false,
+                        usage: UsageData::default(),
+                        request_id: "rejected".into(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            assert!(matches!(
+                runtime.state,
+                ConvState::Error {
+                    error_kind: crate::db::ErrorKind::InvalidResponse,
+                    ..
+                }
+            ));
+            assert_eq!(
+                storage.get_current_state(conversation_id),
+                Some(runtime.state.clone())
+            );
+            assert!(runtime.tool_executor.recorded_executions().is_empty());
+            assert!(storage
+                .get_messages(conversation_id)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(runtime.llm_client.recorded_requests().is_empty());
+        }
     }
 
     /// Filter generated events down to `SteerDrainedUserMessages` payloads.
@@ -27325,7 +27751,7 @@ mod sender_drop_forwarder_tests {
             })
             .expect("send should succeed");
 
-        forward_tool_outcome(tool_rx, "forwarder-id".to_string(), 3, tool_outcome_tx).await;
+        forward_tool_outcome(tool_rx, "real-id".to_string(), 3, tool_outcome_tx).await;
 
         match tool_outcome_rx.try_recv() {
             Ok((generation, ToolExecOutcome::Failed { tool_use_id, error })) => {
@@ -27339,6 +27765,40 @@ mod sender_drop_forwarder_tests {
                 assert_eq!(error, "real error");
             }
             other => panic!("expected the real outcome forwarded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_channel_rejects_outcomes_for_a_different_invocation() {
+        use crate::state_machine::outcome::AbortReason;
+        use phoenix_core::domain::db_schema::ToolResult;
+
+        for outcome in [
+            ToolExecOutcome::Completed(ToolResult::success(
+                "wrong".into(),
+                "unowned output".into(),
+            )),
+            ToolExecOutcome::Failed {
+                tool_use_id: "wrong".into(),
+                error: "unowned error".into(),
+            },
+            ToolExecOutcome::Aborted {
+                tool_use_id: "wrong".into(),
+                reason: AbortReason::CancellationRequested,
+            },
+        ] {
+            let (tool_tx, tool_rx) = oneshot::channel();
+            let (outcome_tx, mut outcome_rx) = mpsc::channel(1);
+            tool_tx.send(outcome).unwrap();
+            forward_tool_outcome(tool_rx, "expected".into(), 7, outcome_tx).await;
+            let (generation, outcome) = outcome_rx.try_recv().unwrap();
+            assert_eq!(generation, 7);
+            let ToolExecOutcome::Failed { tool_use_id, error } = outcome else {
+                panic!("mismatched tool outcome was accepted");
+            };
+            assert_eq!(tool_use_id, "expected");
+            assert!(error.contains("different invocation"));
+            assert!(!error.contains("unowned"));
         }
     }
 
@@ -29446,6 +29906,12 @@ mod overload_startup_tests {
     }
 }
 
+#[cfg(test)]
+mod native_action_fatal_tests;
+
+#[cfg(test)]
+mod native_setting_uncertainty_tests;
+
 /// The tool path's generation guard mirrors the LLM path's. An intentional
 /// `Effect::AbortTool` / `CancellingTool` backstop teardown drops the aborted
 /// tool task's outcome sender; the forwarder maps that drop to a synthetic
@@ -29525,6 +29991,99 @@ mod tool_generation_guard_tests {
             event_tx_dup,
             broadcaster,
         )
+    }
+
+    #[tokio::test]
+    async fn queued_tool_outcomes_are_rejected_after_fatal_authority_close() {
+        assert_queued_tool_outcomes_rejected(false).await;
+    }
+
+    #[tokio::test]
+    async fn queued_tool_outcomes_cannot_borrow_retained_handoff_authority() {
+        assert_queued_tool_outcomes_rejected(true).await;
+    }
+
+    async fn assert_queued_tool_outcomes_rejected(retain_handoff_owner: bool) {
+        let mut rt = runtime_tool_executing("X");
+        let generation = rt.tool_execution.begin_dispatch(CancellationToken::new());
+        let fence = Arc::clone(&rt.fatal_local_authority_fence);
+        rt.broadcast_tx = rt
+            .broadcast_tx
+            .clone()
+            .with_fatal_local_authority_fence(Arc::clone(&fence));
+        let mut broadcast_rx = rt.broadcast_tx.subscribe();
+        if retain_handoff_owner {
+            // Construct a retained owner beside a tool round to test the entry boundary.
+            rt.handoff_completion_authority = Some(fence.try_acquire().unwrap());
+        }
+        let (state_tx, state_rx) = watch::channel(rt.state.clone());
+        rt.state_watcher = Some(state_tx);
+
+        // These current-generation outcomes are already queued when fatal authority closes.
+        for outcome in [
+            ToolExecOutcome::Completed(ToolResult::success("X".to_string(), "ok".to_string())),
+            ToolExecOutcome::Completed(ToolResult::error("X".to_string(), "refused".to_string())),
+        ] {
+            rt.tool_outcome_tx
+                .send((generation, outcome))
+                .await
+                .expect("outcome queue remains open");
+        }
+        fence.close("test_queued_tool_outcomes");
+
+        let initial_state = rt.state.clone();
+        assert!(rt.storage.recorded_messages().is_empty());
+        assert!(rt.llm_client.recorded_requests().is_empty());
+        for _ in 0..2 {
+            let (received_generation, outcome) = rt
+                .tool_outcome_rx
+                .try_recv()
+                .expect("previously sent outcome is already queued");
+            assert_eq!(received_generation, generation);
+            assert!(!rt.tool_outcome_is_stale(received_generation));
+            assert_eq!(
+                rt.process_outcome(EffectOutcome::Tool(outcome)).await,
+                Err("runtime processing closed after fatal local authority loss".to_string())
+            );
+        }
+
+        assert_eq!(rt.state, initial_state);
+        assert_eq!(*state_rx.borrow(), initial_state);
+        assert!(rt.storage.recorded_messages().is_empty());
+        assert!(rt.storage.get_current_state("conv-tool-gen").is_none());
+        assert!(rt.llm_client.recorded_requests().is_empty());
+        assert!(rt.llm_task_handle.is_none());
+        assert!(!state_rx.has_changed().unwrap());
+        assert!(matches!(
+            broadcast_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            rt.handoff_completion_authority.is_some(),
+            retain_handoff_owner
+        );
+        assert_eq!(
+            fence.owners_at_first_close(),
+            Some(usize::from(retain_handoff_owner))
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_tool_result_persistence_is_rejected_after_fatal_authority_close() {
+        let mut rt = runtime_tool_executing("X");
+        let fence = Arc::clone(&rt.fatal_local_authority_fence);
+        fence.close("test_fresh_tool_result_persistence");
+
+        let result = rt
+            .execute_effect(Effect::PersistToolResults {
+                results: vec![ToolResult::success("X".to_string(), "fresh".to_string())],
+            })
+            .await;
+
+        assert!(result
+            .expect_err("fresh persistence must not borrow closed authority")
+            .contains("runtime persistence closed after fatal local authority loss"));
+        assert!(rt.storage.get_all_messages("conv-tool-gen").is_empty());
     }
 
     /// `Effect::AbortTool` must NOT bump the tool generation: it only cancels

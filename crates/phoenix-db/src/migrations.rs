@@ -782,6 +782,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "product_creation_image_retirement",
         sql: include_str!("migrations/product_creation_image_retirement.sql"),
     },
+    Migration {
+        version: 150,
+        name: "federated_subscription_terminal_cancellation",
+        sql: include_str!("migrations/federated_subscription_terminal_cancellation.sql"),
+    },
+    Migration {
+        version: 151,
+        name: "one_shot_conversation_reminders",
+        sql: include_str!("migrations/reminders.sql"),
+    },
 ];
 
 const MIGRATION_138: &str = concat!(
@@ -12138,6 +12148,11 @@ async fn apply_migration_body(
     if migration.version == 120 {
         index_outbox_children_before_rebuild(tx).await?;
     }
+    if migration.version == 150 {
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut **tx)
+            .await?;
+    }
     if migration.version == 113 {
         settle_historical_continuation::run(tx).await?;
     } else {
@@ -12160,6 +12175,17 @@ async fn apply_migration_body(
             .bind(phoenix_core::domain::instance_identity::InstanceId::new().to_string())
             .execute(&mut **tx)
             .await?;
+        }
+    }
+    if migration.version == 150 {
+        let violating_table: Option<String> =
+            sqlx::query_scalar("SELECT \"table\" FROM pragma_foreign_key_check LIMIT 1")
+                .fetch_optional(&mut **tx)
+                .await?;
+        if let Some(table) = violating_table {
+            return Err(DbError::Serialization(format!(
+                "migration 150 left a foreign-key violation in {table}"
+            )));
         }
     }
     Ok(())
@@ -13553,7 +13579,7 @@ mod tests {
                 .is_empty());
         }
 
-        async fn historical_tables(pool: &SqlitePool) -> Vec<String> {
+        pub(super) async fn historical_tables(pool: &SqlitePool) -> Vec<String> {
             sqlx::query_scalar(
                 "SELECT name FROM sqlite_schema
                  WHERE type = 'table' AND name <> '_migrations' ORDER BY name",
@@ -13563,7 +13589,7 @@ mod tests {
             .unwrap()
         }
 
-        async fn snapshot_tables(
+        pub(super) async fn snapshot_tables(
             pool: &SqlitePool,
             tables: &[String],
         ) -> Vec<(String, Vec<Vec<String>>)> {
@@ -14955,7 +14981,10 @@ mod tests {
         }
     }
 
-    fn validate_current_schema_with_controller(database_path: &std::path::Path, migrated: bool) {
+    fn validate_current_schema_with_controller(
+        database_path: &std::path::Path,
+        through: u32,
+    ) -> Result<(), String> {
         let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -14965,21 +14994,48 @@ mod tests {
         let registry = repository.join("crates/phoenix-db/src/migrations.rs");
         let script = r#"
 import importlib.util
+import sqlite3
 import sys
 import tempfile
+from contextlib import closing
 from pathlib import Path
 
+database = Path(sys.argv[2])
+through = int(sys.argv[4])
+print(f"schema={through} python={sys.executable} python_version={sys.version} "
+      f"sqlite={sqlite3.sqlite_version} database={database}", file=sys.stderr)
+with database.open("rb") as fixture:
+    fixture.seek(18)
+    if fixture.read(2) != b"\x02\x02":
+        raise AssertionError("closed Rust fixture must retain WAL read/write format")
+
+def report_exception(kind, error, traceback):
+    cause = error
+    while cause is not None:
+        if isinstance(cause, sqlite3.Error):
+            print(f"sqlite_errorcode={getattr(cause, 'sqlite_errorcode', None)} "
+                  f"sqlite_errorname={getattr(cause, 'sqlite_errorname', None)}",
+                  file=sys.stderr)
+        cause = cause.__cause__
+    for path in (database, Path(str(database) + "-wal"), Path(str(database) + "-shm")):
+        print(f"{path}: size={path.stat().st_size if path.exists() else 'absent'}",
+              file=sys.stderr)
+    sys.__excepthook__(kind, error, traceback)
+
+sys.excepthook = report_exception
 spec = importlib.util.spec_from_file_location("migration_contract_helper", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 source = Path(sys.argv[3])
 ledger = module.migration_registry(source, qualified_current_target=False)
-assert ledger[-1][0] > 128
+if ledger[-1][0] <= 128:
+    raise AssertionError("fixture requires a registry newer than the qualified target")
 try:
     module.migration_registry(source)
 except module.ActivationError as error:
-    assert "newer than the qualified target" in str(error)
+    if "newer than the qualified target" not in str(error):
+        raise
 else:
     raise AssertionError("incident controller accepted an unqualified newer registry")
 with tempfile.TemporaryDirectory() as directory:
@@ -14987,35 +15043,47 @@ with tempfile.TemporaryDirectory() as directory:
     entries = "".join(f'    Migration {{ version: {version}, name: "{name}", sql: "" }},\n'
                       for version, name in ledger if version <= 128)
     registry.write_text("const MIGRATIONS: &[Migration] = &[\n" + entries + "];\n")
-    module.validate_current_schema_database(
-        Path(sys.argv[2]), registry, migrated=sys.argv[4] == "target"
-    )
+    expected = tuple(entry for entry in ledger if entry[0] <= through)
+    for migrated in ((False, True) if through == 128 else (False,)):
+        actual = module.validate_current_schema_database(database, registry, migrated=migrated)
+        if actual != expected:
+            raise AssertionError(f"schema={through} migrated={migrated}: "
+                                 f"expected ledger {expected!r}, got {actual!r}")
+    if through == 128:
+        with closing(sqlite3.connect(database)) as connection:
+            connection.execute("DROP TABLE product_conversation_sources")
+            connection.commit()
+        try:
+            module.validate_current_schema_database(database, registry, migrated=True)
+        except module.ActivationError as error:
+            expected_error = "ProductConversation schema: missing table(s) product_conversation_sources"
+            if expected_error not in str(error):
+                raise
+        else:
+            raise AssertionError("controller accepted a schema missing product_conversation_sources")
 "#;
-        let output = std::process::Command::new("python3")
-            .env("PYTHONDONTWRITEBYTECODE", "1")
-            .arg("-c")
+        let output = std::process::Command::new("uv")
+            .args(["run", "--no-project", "--managed-python"])
+            .args(["--python", "3.13", "python", "-I", "-B", "-c"])
             .arg(script)
             .arg(helper)
             .arg(database_path)
             .arg(registry)
-            .arg(if migrated { "target" } else { "baseline" })
+            .arg(through.to_string())
             .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "controller rejected compiled migration schema: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    async fn seal_current_schema_snapshot_fixture(path: &std::path::Path) {
-        let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(path)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete);
-        let connection = sqlx::SqliteConnection::connect_with(&options)
-            .await
-            .unwrap();
-        connection.close().await.unwrap();
+            .map_err(|error| {
+                format!("could not launch controller through uv for schema {through}: {error}")
+            })?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "controller rejected compiled schema {through} ({}):\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ))
+        }
     }
 
     #[tokio::test]
@@ -15050,15 +15118,18 @@ with tempfile.TemporaryDirectory() as directory:
         .await
         .unwrap();
         assert_eq!(fictional_members, 0);
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(db.pool())
+        let checkpoint: (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(db.pool())
             .await
             .unwrap();
+        assert_eq!(checkpoint, (0, 0, 0));
         db.pool().close().await;
         drop(db);
-        seal_current_schema_snapshot_fixture(&path).await;
 
-        validate_current_schema_with_controller(&path, false);
+        if let Err(error) = validate_current_schema_with_controller(&path, 123) {
+            let preserved = directory.keep();
+            panic!("{error}\nfixture retained at {}", preserved.display());
+        }
 
         let db = crate::Database::open(path_text).await.unwrap();
         let target_count = MIGRATIONS
@@ -15069,16 +15140,18 @@ with tempfile.TemporaryDirectory() as directory:
             run_through_for_test(db.pool(), 128).await.unwrap() as usize,
             target_count
         );
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(db.pool())
+        let checkpoint: (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(db.pool())
             .await
             .unwrap();
+        assert_eq!(checkpoint, (0, 0, 0));
         db.pool().close().await;
         drop(db);
-        seal_current_schema_snapshot_fixture(&path).await;
 
-        validate_current_schema_with_controller(&path, false);
-        validate_current_schema_with_controller(&path, true);
+        if let Err(error) = validate_current_schema_with_controller(&path, 128) {
+            let preserved = directory.keep();
+            panic!("{error}\nfixture retained at {}", preserved.display());
+        }
     }
 
     #[tokio::test]
@@ -15140,11 +15213,633 @@ with tempfile.TemporaryDirectory() as directory:
         );
     }
 
+    async fn migration_150_fixture(with_legacy_facts: bool) -> (crate::Database, String) {
+        let db = crate::Database::from_pool_for_tests(test_pool().await, String::new());
+        db.run_migrations().await.unwrap();
+        assert!(run_through_for_test(db.pool(), 149).await.unwrap() > 0);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _migrations WHERE version=149")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            1
+        );
+        let source = db
+            .create_conversation("source", "source", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO federation_enrollments
+             (id, caller_instance_id, caller_display_name, credential_verifier, created_at_us)
+             VALUES ('enrollment', 'peer', 'peer', ?1, 1)",
+        )
+        .bind("a".repeat(64))
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO federation_subscriptions
+             (id, enrollment_id, product_id, last_sequence, acknowledged_through,
+              pruned_through, created_at_us)
+             VALUES ('source-sub', 'enrollment', ?1, 2, 1, 1, 2)",
+        )
+        .bind(source.product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO federation_terminal_identities
+             (event_id, subscription_id, occurrence_kind, occurrence_id, generation,
+              sequence, continuation_state) VALUES
+             ('event-one', 'source-sub', 'direct_turn', 'turn-one', 0, 1, 'none'),
+             ('event-two', 'source-sub', 'steering', 'turn-two', 0, 2, 'awaiting');
+             INSERT INTO federation_terminal_payloads
+             (event_id, source_transcript_id, outcome, context_exhausted, occurred_at_us)
+             VALUES ('event-one', 'transcript-é', 'completed', 0, 3),
+                    ('event-two', 'transcript-二', 'failed', 1, 4);
+             INSERT INTO federation_delivery_authorizations
+             (authorization_id, subscription_id, after_cursor, through_cursor, kind, event_id)
+             VALUES ('source-auth', 'source-sub', 0, 1, 'fact', 'event-one');
+             INSERT INTO federation_remote_subscriptions
+             (destination_instance_id, subscription_id, product_id, admitted_cursor,
+              enrolled, last_sync_at_us) VALUES
+             ('peer', 'remote-sub', 'remote-product', 1, 1, 15),
+             ('peer', 'active-sub', 'active-product', 0, 1, 16);
+             INSERT INTO federation_pending_unsubscribes
+             VALUES ('peer', 'remote-sub');
+             INSERT INTO federation_remote_admissions
+             (admission_id, destination_instance_id, subscription_id, kind, after_cursor,
+              through_cursor, accepted_transcript_id, authorization_requested, authorization_id)
+             VALUES ('federation:accepted', 'peer', 'remote-sub', 'fact', 0, 1,
+                     'accepted-transcript', 1, 'accepted-auth'),
+                    ('federation:pending', 'peer', 'remote-sub', 'fact', 1, 2,
+                     NULL, 1, 'pending-auth'),
+                    ('federation:active', 'peer', 'active-sub', 'fact', 0, 1,
+                     NULL, 1, 'active-auth');
+             INSERT INTO federation_remote_navigation VALUES
+             ('federation:accepted', '/c/accepted', '/c/accepted?source_transcript=one'),
+             ('federation:pending', '/c/pending', '/c/pending?source_transcript=two'),
+             ('federation:active', '/c/active', '/c/active?source_transcript=three');",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        if with_legacy_facts {
+            sqlx::raw_sql(
+                "INSERT INTO federation_received_facts
+                 (admission_id, destination_instance_id, event_id, source_transcript_id,
+                  outcome, occurred_at_us) VALUES
+                 ('federation:accepted', 'peer', 'remote-one', 'transcript-é', 'completed', 3),
+                 ('federation:pending', 'peer', 'remote-two', 'transcript-二', 'failed', 4),
+                 ('federation:active', 'peer', 'remote-three', 'transcript-three', 'completed', 5);",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        (db, source.product_conversation_id.to_string())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
+    async fn migration_150_preserves_populated_graphs_and_terminal_delivery_rules() {
+        let (db, source_product) = migration_150_fixture(false).await;
+        let coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE migration_150_identity_refs (
+                 identity_id TEXT PRIMARY KEY REFERENCES subscription_delivery_identities(id)
+             );
+             INSERT INTO migration_150_identity_refs (identity_id)
+             SELECT id FROM subscription_delivery_identities ORDER BY id LIMIT 1;",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(run_through_for_test(db.pool(), 150).await.unwrap(), 1);
+        let pool = db.pool();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM migration_150_identity_refs")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let source: (String, String, i64, i64, i64, i64, Option<i64>) = sqlx::query_as(
+            "SELECT enrollment_id, state, last_sequence, acknowledged_through,
+                    pruned_through, created_at_us, last_contact_at_us
+             FROM federation_subscriptions WHERE id = 'source-sub'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            source,
+            ("enrollment".into(), "active".into(), 2, 1, 1, 2, None)
+        );
+        let identities: Vec<(String, i64, String)> = sqlx::query_as(
+            "SELECT event_id, sequence, continuation_state
+             FROM federation_terminal_identities ORDER BY sequence",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            identities,
+            vec![
+                ("event-one".into(), 1, "none".into()),
+                ("event-two".into(), 2, "awaiting".into())
+            ]
+        );
+        let payloads: Vec<(String, String, String, i64, i64, i64)> = sqlx::query_as(
+            "SELECT event_id, source_transcript_id, outcome, context_exhausted,
+                    occurred_at_us, payload_bytes
+             FROM federation_terminal_payloads ORDER BY event_id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            payloads,
+            vec![
+                (
+                    "event-one".into(),
+                    "transcript-é".into(),
+                    "completed".into(),
+                    0,
+                    3,
+                    i64::try_from("transcript-é".len() + "completed".len() + 96).unwrap()
+                ),
+                (
+                    "event-two".into(),
+                    "transcript-二".into(),
+                    "failed".into(),
+                    1,
+                    4,
+                    i64::try_from("transcript-二".len() + "failed".len() + 96).unwrap()
+                ),
+            ]
+        );
+        let authorization: (String, i64, i64, String, String) = sqlx::query_as(
+            "SELECT subscription_id, after_cursor, through_cursor, kind, event_id
+             FROM federation_delivery_authorizations WHERE authorization_id = 'source-auth'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            authorization,
+            ("source-sub".into(), 0, 1, "fact".into(), "event-one".into())
+        );
+        let remotes: Vec<(String, String, String, i64, i64, i64)> = sqlx::query_as(
+            "SELECT subscription_id, product_id, state, admitted_cursor, enrolled, last_sync_at_us
+             FROM federation_remote_subscriptions ORDER BY subscription_id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            remotes,
+            vec![
+                (
+                    "active-sub".into(),
+                    "active-product".into(),
+                    "active".into(),
+                    0,
+                    1,
+                    16
+                ),
+                (
+                    "remote-sub".into(),
+                    "remote-product".into(),
+                    "active".into(),
+                    1,
+                    1,
+                    15
+                )
+            ]
+        );
+        for table in [
+            "federation_pending_unsubscribes",
+            "federation_received_facts",
+            "federation_remote_navigation",
+            "subscription_delivery_identities",
+        ] {
+            let count: i64 =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                count,
+                if table == "federation_pending_unsubscribes" {
+                    1
+                } else if table == "federation_received_facts" {
+                    0
+                } else {
+                    3
+                },
+                "{table}"
+            );
+        }
+        let admissions: Vec<(
+            String,
+            Option<String>,
+            Option<String>,
+            i64,
+            Option<String>,
+            i64,
+        )> = sqlx::query_as(
+            "SELECT admission_id, accepted_transcript_id, suppression_reason,
+                    authorization_requested, authorization_id, terminal_settlement_attempts
+             FROM federation_remote_admissions ORDER BY admission_id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            admissions,
+            vec![
+                (
+                    "federation:accepted".into(),
+                    Some("accepted-transcript".into()),
+                    None,
+                    1,
+                    Some("accepted-auth".into()),
+                    0
+                ),
+                (
+                    "federation:active".into(),
+                    None,
+                    None,
+                    1,
+                    Some("active-auth".into()),
+                    0
+                ),
+                (
+                    "federation:pending".into(),
+                    None,
+                    None,
+                    1,
+                    Some("pending-auth".into()),
+                    0
+                ),
+            ]
+        );
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+            .is_empty());
+        let temporary: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_temp_schema WHERE name GLOB '_m150*'")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(temporary, 0);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _migrations WHERE version=150")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            1
+        );
+
+        sqlx::query(
+            "UPDATE federation_subscriptions SET state='unsubscribed' WHERE id='source-sub'",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let surviving_payloads: Vec<String> = sqlx::query_scalar(
+            "SELECT event_id FROM federation_terminal_payloads ORDER BY event_id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert!(surviving_payloads.is_empty());
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM federation_subscriptions WHERE product_id=?1")
+                .bind(&source_product)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "unsubscribed");
+
+        sqlx::query(
+            "UPDATE federation_remote_subscriptions SET state='unsubscribed'
+                     WHERE destination_instance_id='peer' AND subscription_id='remote-sub'",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let pending: (Option<String>, i64, Option<String>) = sqlx::query_as(
+            "SELECT suppression_reason, authorization_requested, authorization_id
+             FROM federation_remote_admissions WHERE admission_id='federation:pending'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, (Some("subscription_ended".into()), 0, None));
+        let retained: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT accepted_transcript_id, suppression_reason, authorization_id
+             FROM federation_remote_admissions WHERE admission_id='federation:accepted'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            retained,
+            (
+                Some("accepted-transcript".into()),
+                None,
+                Some("accepted-auth".into())
+            )
+        );
+        let pending_navigation: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM federation_remote_navigation WHERE admission_id='federation:pending'",
+        ).fetch_one(pool).await.unwrap();
+        assert_eq!(pending_navigation, 0);
+        let cursor: i64 = sqlx::query_scalar(
+            "SELECT admitted_cursor FROM federation_remote_subscriptions WHERE subscription_id='remote-sub'",
+        ).fetch_one(pool).await.unwrap();
+        assert_eq!(cursor, 1);
+
+        sqlx::query(
+            "INSERT INTO federation_received_facts
+             (admission_id, destination_instance_id, event_id, occurrence_kind,
+              occurrence_id, occurrence_generation, source_transcript_id, outcome, occurred_at_us)
+             VALUES ('federation:active', 'peer', 'remote-three', 'steering',
+                     'active-steering', 0, 'transcript-three', 'completed', 5)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO steering_messages
+                     (message_id, conversation_id, ordinal, text, origin_kind, origin_subscription_event_id)
+                     VALUES ('active-steering', ?1, 0, 'accepted', 'subscription_event', 'federation:active')")
+            .bind(&coordinator.id).execute(pool).await.unwrap();
+        let active: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT accepted_transcript_id, suppression_reason FROM federation_remote_admissions
+             WHERE admission_id='federation:active'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(active, (Some(coordinator.id.clone()), None));
+        let active_cursor: i64 = sqlx::query_scalar(
+            "SELECT admitted_cursor FROM federation_remote_subscriptions WHERE subscription_id='active-sub'",
+        ).fetch_one(pool).await.unwrap();
+        assert_eq!(active_cursor, 1);
+        assert!(sqlx::query("INSERT INTO steering_messages
+                             (message_id, conversation_id, ordinal, text, origin_kind, origin_subscription_event_id)
+                             VALUES ('stopped-steering', ?1, 1, 'rejected', 'subscription_event', 'federation:pending')")
+            .bind(&coordinator.id).execute(pool).await.is_err());
+
+        sqlx::raw_sql(
+            "INSERT INTO federation_remote_subscriptions
+             (destination_instance_id, subscription_id, product_id)
+             VALUES ('peer', 'gap-sub', 'gap-product');
+             INSERT INTO federation_remote_admissions
+             (admission_id, destination_instance_id, subscription_id, kind, after_cursor,
+              through_cursor, authorization_requested)
+             VALUES ('federation:gap', 'peer', 'gap-sub', 'gap', 0, 3, 0);
+             INSERT INTO federation_received_gaps
+             (admission_id, last_acknowledged, last_produced, reason, failed_at_us,
+              terminal_evidence_expires_at_us, source_transcript_id, current_outcome)
+             VALUES ('federation:gap', 0, 3, 'event_count', 17, 18, 'gap-transcript', 'failed');
+             UPDATE federation_remote_subscriptions SET state='failed_gap'
+             WHERE subscription_id='gap-sub';",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO steering_messages
+                     (message_id, conversation_id, ordinal, text, origin_kind, origin_subscription_event_id)
+                     VALUES ('gap-steering', ?1, 1, 'gap', 'subscription_event', 'federation:gap')")
+            .bind(&coordinator.id).execute(pool).await.unwrap();
+        let gap: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT accepted_transcript_id, suppression_reason FROM federation_remote_admissions
+             WHERE admission_id='federation:gap'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(gap, (Some(coordinator.id.clone()), None));
+        let gap_cursor: (String, i64) = sqlx::query_as(
+            "SELECT state, admitted_cursor FROM federation_remote_subscriptions
+             WHERE subscription_id='gap-sub'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(gap_cursor, ("failed_gap".into(), 0));
+    }
+
+    #[tokio::test]
+    async fn migration_150_rejects_received_facts_without_occurrence_identity() {
+        let (db, _) = migration_150_fixture(true).await;
+        let original_schema: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, sql FROM sqlite_schema
+             WHERE name LIKE 'federation_%' OR name='subscription_delivery_identities'
+             ORDER BY name",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        let result = run_through_for_test(db.pool(), 150).await;
+        assert!(result.is_err(), "{result:?}");
+        let unchanged_schema: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, sql FROM sqlite_schema
+             WHERE name LIKE 'federation_%' OR name='subscription_delivery_identities'
+             ORDER BY name",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(unchanged_schema, original_schema);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM federation_received_facts")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_temp_schema WHERE name GLOB '_m150*'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _migrations WHERE version=150")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_150_rejects_old_resumable_gaps_before_rebuilding_tables() {
+        for table in [
+            "federation_delivery_authorizations",
+            "federation_remote_admissions",
+        ] {
+            let (db, _) = migration_150_fixture(false).await;
+            if table == "federation_delivery_authorizations" {
+                sqlx::query(
+                    "INSERT INTO federation_delivery_authorizations
+                             (authorization_id, subscription_id, after_cursor, through_cursor,
+                              kind, gap_transcript_id)
+                             VALUES ('old-gap', 'source-sub', 1, 2, 'gap', 'transcript-old')",
+                )
+                .execute(db.pool())
+                .await
+                .unwrap();
+            } else {
+                sqlx::query(
+                    "INSERT INTO federation_remote_admissions
+                             (admission_id, destination_instance_id, subscription_id, kind,
+                              after_cursor, through_cursor)
+                             VALUES ('federation:old-gap', 'peer', 'active-sub', 'gap', 0, 2)",
+                )
+                .execute(db.pool())
+                .await
+                .unwrap();
+            }
+            let original_schema: Vec<(String, String)> = sqlx::query_as(
+                "SELECT name, sql FROM sqlite_schema
+                 WHERE name LIKE 'federation_%' OR name='subscription_delivery_identities'
+                 ORDER BY name",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+            let result = run_through_for_test(db.pool(), 150).await;
+            assert!(result.is_err(), "{table}: {result:?}");
+            let unchanged_schema: Vec<(String, String)> = sqlx::query_as(
+                "SELECT name, sql FROM sqlite_schema
+                 WHERE name LIKE 'federation_%' OR name='subscription_delivery_identities'
+                 ORDER BY name",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(unchanged_schema, original_schema, "{table}");
+            let gap_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table} WHERE kind='gap'"
+            )))
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(gap_count, 1, "{table}");
+            let old_payload: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM federation_terminal_payloads")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(old_payload, 2);
+            let temporary: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_temp_schema WHERE name GLOB '_m150*'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(temporary, 0);
+            let applied: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM _migrations WHERE version=150")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(applied, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_151_preserves_provenance_federation_and_retired_wake_history() {
+        let (db, _) = migration_150_fixture(false).await;
+        assert_eq!(run_through_for_test(db.pool(), 150).await.unwrap(), 1);
+        sqlx::raw_sql(
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type,
+                 content, created_at, origin_kind, origin_subscription_event_id)
+             VALUES ('received-message', 'source', 1, 'user', '{\"text\":\"event\"}', '2026-11-03',
+                     'subscription_event', 'federation:accepted');
+             INSERT INTO steering_messages (message_id, conversation_id, ordinal, text,
+                 origin_kind, origin_product_conversation_id, origin_transcript_id,
+                 origin_source_message_id, origin_source_tool_use_id)
+             VALUES ('queued-message', 'source', 1, 'conversation input',
+                     'internal_conversation', 'parent-product', 'parent-transcript',
+                     'parent-message', 'parent-tool');
+             INSERT INTO steering_acceptance_receipts (conversation_id, message_id, request_fingerprint)
+             VALUES ('source', 'queued-message', 'saved-steering-fingerprint');
+             INSERT INTO workflows (workflow_id, profile_kind, profile_version,
+                 runtime_acceptance_enabled, external_acceptance_enabled, version, generation,
+                 status, snapshot_codec_family, snapshot_codec_version, snapshot_payload,
+                 created_at, updated_at)
+             VALUES (1000, 'wake', 1, 1, 0, 1, 0, 'Completed', 'wake.snapshot', 1, X'00FF01', 10, 20),
+                    (1001, 'direct_turn', 1, 0, 1, 1, 0, 'Active', 'direct_turn.snapshot', 1, X'00FE02', 10, 20);
+             INSERT INTO workflow_feature_retirements (workflow_id, reason)
+             VALUES (1000, 'WakeFeatureRetired');
+             INSERT INTO durable_turns (turn_id, workflow_id, conversation_id, client_turn_key,
+                 prepared_fingerprint, prepared_payload, disposition, generation,
+                 owns_conversation, origin_kind)
+             VALUES (1001, 1001, 'source', 'human-turn', 'saved-fingerprint', X'FF000A',
+                     'Runtime', 0, 1, 'user_api');",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let tables = wake_feature_retirement_tests::historical_tables(db.pool()).await;
+        let before = wake_feature_retirement_tests::snapshot_tables(db.pool(), &tables).await;
+
+        assert_eq!(run_through_for_test(db.pool(), 151).await.unwrap(), 1);
+        let mut after = wake_feature_retirement_tests::snapshot_tables(db.pool(), &tables).await;
+        for (table, rows) in &mut after {
+            if matches!(
+                table.as_str(),
+                "messages" | "steering_messages" | "durable_turns" | "steering_acceptance_receipts"
+            ) {
+                for row in rows {
+                    assert_eq!(row.pop().as_deref(), Some("null:"));
+                }
+            }
+        }
+        assert_eq!(after, before);
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
+        let ledger: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT version, name FROM _migrations WHERE version >= 150 ORDER BY version",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            ledger,
+            vec![
+                (150, "federated_subscription_terminal_cancellation".into()),
+                (151, "one_shot_conversation_reminders".into()),
+            ]
+        );
+    }
+
     #[test]
     fn capability_migrations_are_forward_only_and_unique() {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (151, "one_shot_conversation_reminders"),
+            (150, "federated_subscription_terminal_cancellation"),
             (149, "product_creation_image_retirement"),
             (148, "product_creation_initial_execution_receipts"),
             (147, "retain_product_creation_receipts"),
@@ -19396,6 +20091,8 @@ with tempfile.TemporaryDirectory() as directory:
                 (147, "retain_product_creation_receipts"),
                 (148, "product_creation_initial_execution_receipts"),
                 (149, "product_creation_image_retirement"),
+                (150, "federated_subscription_terminal_cancellation"),
+                (151, "one_shot_conversation_reminders"),
             ]
         );
         let goal = MIGRATIONS
@@ -19409,7 +20106,7 @@ with tempfile.TemporaryDirectory() as directory:
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 148);
+        assert_eq!(MIGRATIONS.len(), 150);
     }
 
     #[tokio::test]
@@ -19425,7 +20122,7 @@ with tempfile.TemporaryDirectory() as directory:
         }
         sqlx::query("UPDATE product_creation_jobs SET status = 'published', published_product_id = 'deleted-product', published_conversation_id = 'deleted-transcript' WHERE request_id = 'orphan-image'")
             .execute(&pool).await.unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
         let identity: Vec<(String, String)> = sqlx::query_as(
             "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
         ).fetch_all(&pool).await.unwrap();
@@ -19479,7 +20176,7 @@ with tempfile.TemporaryDirectory() as directory:
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
         let retained: (String, String, String) = sqlx::query_as(
             "SELECT status, published_product_id, published_conversation_id
              FROM product_creation_jobs WHERE request_id = 'orphan-text'",
@@ -20365,26 +21062,66 @@ with tempfile.TemporaryDirectory() as directory:
         );
     }
 
-    /// Migration 35: creates the durable async conversation-creation job table.
     #[tokio::test]
-    async fn migration_035_creates_conversation_creation_jobs_table() {
+    async fn creation_job_migrations_install_schema_and_claim_constraints() {
         let pool = test_pool().await;
         setup_conversations_table(&pool).await;
-
+        for parent in ["claim-valid-parent", "claim-invalid-parent"] {
+            sqlx::query(
+                "INSERT INTO conversations (id, conv_mode, state, cwd, user_initiated,
+                     state_updated_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, '/tmp',
+                         1, '2025-01-01', '2025-01-01', '2025-01-01')",
+            )
+            .bind(parent)
+            .bind(r#"{"mode":"Explore"}"#)
+            .bind(r#"{"type":"idle"}"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
         run_pending_migrations(&pool).await.unwrap();
 
-        let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversation_creation_jobs)")
-            .fetch_all(&pool)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|row| row.get::<String, _>("name"))
-            .collect();
-        assert!(
-            columns.iter().any(|c| c == "conversation_id"),
-            "Expected conversation_creation_jobs table to exist after migration 35; got {columns:?}"
-        );
-
+        for (table, expected) in [
+            (
+                "conversation_creation_jobs",
+                &[
+                    "conversation_id",
+                    "status",
+                    "stage",
+                    "attempt",
+                    "generation",
+                    "claim_worker_id",
+                    "claim_token",
+                    "lease_until",
+                    "next_attempt_at",
+                ][..],
+            ),
+            ("conversation_creation_job_files", &["stored_path"][..]),
+            ("conversation_creation_job_images", &["data"][..]),
+            (
+                "conversation_creation_resource_reservations",
+                &[
+                    "job_id",
+                    "generation",
+                    "repository_identity",
+                    "resource_identity",
+                    "status",
+                ][..],
+            ),
+        ] {
+            let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info(?1)")
+                .bind(table)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            for column in expected {
+                assert!(
+                    columns.iter().any(|actual| actual == column),
+                    "{table} missing {column}: {columns:?}"
+                );
+            }
+        }
         let due_index: Vec<String> = sqlx::query_scalar(
             "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_creation_jobs_due'",
         )
@@ -20392,114 +21129,40 @@ with tempfile.TemporaryDirectory() as directory:
         .await
         .unwrap();
         assert_eq!(due_index, vec!["idx_creation_jobs_due".to_string()]);
-    }
 
-    #[tokio::test]
-    async fn migration_036_creates_creation_job_files_table() {
-        let pool = test_pool().await;
-        setup_conversations_table(&pool).await;
-
-        run_pending_migrations(&pool).await.unwrap();
-
-        let columns: Vec<String> =
-            sqlx::query("PRAGMA table_info(conversation_creation_job_files)")
-                .fetch_all(&pool)
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|row| row.get::<String, _>("name"))
-                .collect();
-        assert!(
-            columns.iter().any(|c| c == "stored_path"),
-            "Expected conversation_creation_job_files table to exist after migration 36; got {columns:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn migration_037_creates_creation_job_images_table() {
-        let pool = test_pool().await;
-        setup_conversations_table(&pool).await;
-
-        run_pending_migrations(&pool).await.unwrap();
-
-        let columns: Vec<String> =
-            sqlx::query("PRAGMA table_info(conversation_creation_job_images)")
-                .fetch_all(&pool)
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|row| row.get::<String, _>("name"))
-                .collect();
-        assert!(
-            columns.iter().any(|c| c == "data"),
-            "Expected conversation_creation_job_images table to exist after migration 37; got {columns:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn migration_035_adds_fenced_creation_protocol_constraints() {
-        let pool = test_pool().await;
-        setup_conversations_table(&pool).await;
-        run_pending_migrations(&pool).await.unwrap();
-
-        let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversation_creation_jobs)")
-            .fetch_all(&pool)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|row| row.get::<String, _>("name"))
-            .collect();
-        for expected in [
-            "status",
-            "stage",
-            "attempt",
-            "generation",
-            "claim_worker_id",
-            "claim_token",
-            "lease_until",
-            "next_attempt_at",
-        ] {
-            assert!(columns.iter().any(|column| column == expected));
-        }
-
-        let invalid = sqlx::query(
+        sqlx::query(
             "INSERT INTO conversation_creation_jobs (
-                id, conversation_id, status, stage, attempt, generation,
-                intent_json, accepted_at, created_at, updated_at
-             ) VALUES ('job-invalid', 'missing-conversation', 'claimed',
-                       'validate_intent', 1, 1, '{}', 'now', 'now', 'now')",
+                 id, conversation_id, status, stage, attempt, generation,
+                 claim_worker_id, claim_token, lease_until, intent_json,
+                 accepted_at, created_at, updated_at)
+             VALUES ('job-valid', 'claim-valid-parent', 'claimed', 'validate_intent', 1, 1,
+                     'worker', 'token', 'now', '{}', 'now', 'now', 'now')",
         )
         .execute(&pool)
-        .await;
-        assert!(
-            invalid.is_err(),
-            "claimed row without authority must be rejected"
-        );
-    }
-
-    #[tokio::test]
-    async fn migration_036_adds_creation_resource_reservations() {
-        let pool = test_pool().await;
-        setup_conversations_table(&pool).await;
-        run_pending_migrations(&pool).await.unwrap();
-
-        let columns: Vec<String> =
-            sqlx::query("PRAGMA table_info(conversation_creation_resource_reservations)")
-                .fetch_all(&pool)
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|row| row.get::<String, _>("name"))
-                .collect();
-        for expected in [
-            "job_id",
-            "generation",
-            "repository_identity",
-            "resource_identity",
-            "status",
-        ] {
-            assert!(columns.iter().any(|column| column == expected));
-        }
+        .await
+        .expect("a claimed job with complete authority must be accepted");
+        let error = sqlx::query(
+            "INSERT INTO conversation_creation_jobs (
+                 id, conversation_id, status, stage, attempt, generation,
+                 intent_json, accepted_at, created_at, updated_at)
+             VALUES ('job-invalid', 'claim-invalid-parent', 'claimed', 'validate_intent',
+                     1, 1, '{}', 'now', 'now', 'now')",
+        )
+        .execute(&pool)
+        .await
+        .expect_err("claimed row without authority must be rejected");
+        let sqlx::Error::Database(error) = error else {
+            panic!("expected a SQLite CHECK failure, got {error:?}");
+        };
+        assert!(error.is_check_violation(), "{error}");
+        assert!(error.message().contains("claim_worker_id"), "{error}");
+        let persisted: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_creation_jobs WHERE id = 'job-invalid'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(persisted, 0);
     }
 
     /// Migration 003 (REQ-BED-030): adds a nullable `continued_in_conv_id`

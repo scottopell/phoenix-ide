@@ -12,7 +12,7 @@ pub enum InstanceIdParseError {
     NotRfc4122,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, schemars::JsonSchema)]
 pub struct InstanceId(uuid::Uuid);
 
 impl InstanceId {
@@ -65,6 +65,84 @@ impl<'de> serde::Deserialize<'de> for InstanceId {
     {
         let value = <String as serde::Deserialize>::deserialize(deserializer)?;
         Self::from_str(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(transparent)]
+pub struct PeerDisplayName(String);
+
+#[derive(Debug, thiserror::Error)]
+pub enum PeerDisplayNameError {
+    #[error("peer display name must not be blank")]
+    Blank,
+    #[error("peer display name 'local' is reserved for this Phoenix instance")]
+    ReservedLocal,
+}
+
+impl FromStr for PeerDisplayName {
+    type Err = PeerDisplayNameError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(PeerDisplayNameError::Blank);
+        }
+        if value.eq_ignore_ascii_case("local") {
+            return Err(PeerDisplayNameError::ReservedLocal);
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl PeerDisplayName {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PeerDisplayName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::from_str(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstanceSelector {
+    Id(InstanceId),
+    Alias(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum InstanceSelectorParseError {
+    #[error("instance selector must not be empty")]
+    Empty,
+}
+
+impl InstanceSelector {
+    /// Parse an exact instance ID or a saved peer alias.
+    ///
+    /// # Errors
+    /// Returns an error when the selector is empty after trimming.
+    pub fn parse(value: impl AsRef<str>) -> Result<Self, InstanceSelectorParseError> {
+        value.as_ref().parse()
+    }
+}
+
+impl FromStr for InstanceSelector {
+    type Err = InstanceSelectorParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(InstanceSelectorParseError::Empty);
+        }
+        Ok(value
+            .parse::<InstanceId>()
+            .map(Self::Id)
+            .unwrap_or_else(|_| Self::Alias(value.to_owned())))
     }
 }
 
@@ -139,6 +217,23 @@ impl FederationQueryDatabaseEndpoint {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerNavigationUrl(url::Url);
+
+impl PeerNavigationUrl {
+    #[must_use]
+    pub fn as_url(&self) -> &url::Url {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PeerNavigationUrlError {
+    #[error("peer navigation locator must be an absolute application path")]
+    NotAbsolutePath,
+    #[error("peer navigation locator changed the selected peer origin")]
+    ChangedOrigin,
+}
 impl PeerBaseUrl {
     /// Return the typed normalized host.
     ///
@@ -183,6 +278,32 @@ impl PeerBaseUrl {
                 .join("/api/federation/peer/query-database")
                 .expect("fixed federation route is a valid URL path"),
         )
+    }
+
+    /// Bind a destination-generated application route to this selected peer origin.
+    ///
+    /// # Errors
+    /// Returns an error if the locator is not an absolute application path or changes origin.
+    pub fn navigation_url(
+        &self,
+        locator: &str,
+    ) -> Result<PeerNavigationUrl, PeerNavigationUrlError> {
+        if !locator.starts_with('/') || locator.starts_with("//") {
+            return Err(PeerNavigationUrlError::NotAbsolutePath);
+        }
+        let joined = self
+            .0
+            .join(locator)
+            .map_err(|_| PeerNavigationUrlError::NotAbsolutePath)?;
+        if joined.scheme() != self.0.scheme()
+            || joined.host() != self.0.host()
+            || joined.port_or_known_default() != self.0.port_or_known_default()
+            || !joined.username().is_empty()
+            || joined.password().is_some()
+        {
+            return Err(PeerNavigationUrlError::ChangedOrigin);
+        }
+        Ok(PeerNavigationUrl(joined))
     }
 
     /// Reconstruct a peer origin from normalized relational columns.
@@ -498,6 +619,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn peer_display_names_reject_reserved_local_and_blank_values() {
+        for value in [
+            "local",
+            "Local",
+            "LOCAL",
+            " \tLoCaL\n",
+            "\u{a0}local\u{a0}",
+            "",
+            " \t\n",
+        ] {
+            assert!(value.parse::<PeerDisplayName>().is_err(), "{value:?}");
+            assert!(serde_json::from_value::<PeerDisplayName>(serde_json::json!(value)).is_err());
+        }
+    }
+
+    #[test]
+    fn peer_display_names_trim_and_round_trip_without_reserving_substrings() {
+        for value in [
+            " remote-peer ",
+            "localhost",
+            "local-server",
+            "my local machine",
+        ] {
+            let name: PeerDisplayName = value.parse().unwrap();
+            assert_eq!(name.as_str(), value.trim());
+            let encoded = serde_json::to_value(&name).unwrap();
+            assert_eq!(encoded, serde_json::json!(value.trim()));
+            assert_eq!(
+                serde_json::from_value::<PeerDisplayName>(encoded).unwrap(),
+                name
+            );
+        }
+    }
+
+    #[test]
     fn peer_base_url_requires_a_bare_https_origin() {
         assert!(PeerBaseUrl::from_str("https://peer.example").is_ok());
         let endpoint = PeerBaseUrl::from_str("https://peer.example:8443")
@@ -531,6 +687,25 @@ mod tests {
             "https://peer.example:0",
         ] {
             assert!(PeerBaseUrl::from_str(value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn peer_navigation_binds_destination_routes_without_changing_origin() {
+        let base = PeerBaseUrl::from_str("https://peer.example:8443").unwrap();
+        let navigation = base
+            .navigation_url("/c/product-id?source_transcript=transcript-id#message-message-id")
+            .unwrap();
+        assert_eq!(
+            navigation.as_url().as_str(),
+            "https://peer.example:8443/c/product-id?source_transcript=transcript-id#message-message-id"
+        );
+        for locator in [
+            "c/product-id",
+            "//attacker.example/c/product-id",
+            "https://attacker.example/c/product-id",
+        ] {
+            assert!(base.navigation_url(locator).is_err(), "{locator}");
         }
     }
 
@@ -684,6 +859,31 @@ mod tests {
                 PeerCaCertificatePemError::Invalid
             );
         }
+    }
+
+    #[test]
+    fn instance_selector_distinguishes_exact_instance_ids_from_saved_peer_names() {
+        let id = InstanceId::new();
+        assert_eq!(
+            InstanceSelector::parse(format!("  {id}  ")).unwrap(),
+            InstanceSelector::Id(id)
+        );
+        assert_eq!(
+            InstanceSelector::parse("  Build Peer  ").unwrap(),
+            InstanceSelector::Alias("Build Peer".into())
+        );
+        assert_eq!(
+            InstanceSelector::parse("d9428888-122b-11e1-b85c-61cd3cbb3210").unwrap(),
+            InstanceSelector::Alias("d9428888-122b-11e1-b85c-61cd3cbb3210".into())
+        );
+        assert_eq!(
+            InstanceSelector::parse("not-a-uuid").unwrap(),
+            InstanceSelector::Alias("not-a-uuid".into())
+        );
+        assert_eq!(
+            InstanceSelector::parse("   ").unwrap_err(),
+            InstanceSelectorParseError::Empty
+        );
     }
 
     #[test]

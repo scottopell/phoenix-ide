@@ -10,6 +10,7 @@
 import { useCallback, useEffect, useSyncExternalStore } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ConflictError } from './api';
+import type { ReminderNotification } from './generated/ReminderNotification';
 import type { Conversation, ConversationState, NotificationSettings } from './api';
 import { parseConversationState } from './utils';
 import {
@@ -65,6 +66,10 @@ export function notifyConversationSnapshotChange(next: Conversation): void {
 
 export function registerCoordinatorForNotifications(conversationId: string): void {
   registerCoordinatorNotificationTarget(conversationId);
+}
+
+export function notifyReminderFeed(items: readonly ReminderNotification[]): void {
+  store.dispatch({ type: 'reminder_feed', items });
 }
 
 export function notifyCatchUp(conversations: readonly Conversation[]): void {

@@ -312,11 +312,18 @@ pub struct HandoffReviewResponse {
     pub shortening: HandoffShorteningResult,
 }
 
+pub(crate) enum HandoffReviewInput {
+    ProspectiveSuccessor {
+        handoff: String,
+        shorten: bool,
+        source_candidate_id: Option<String>,
+        opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
+    },
+    ReservedGeneratedOpening(phoenix_db::ContinuationDispatchIntent),
+}
+
 pub(crate) struct HandoffReviewRequest {
-    pub handoff: String,
-    pub shorten: bool,
-    pub source_candidate_id: Option<String>,
-    pub opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
+    pub input: HandoffReviewInput,
     pub response: oneshot::Sender<Result<HandoffReviewResponse, String>>,
 }
 
@@ -627,6 +634,12 @@ pub enum SteeringAdmissionError {
     CloseAdmissionFenced,
     #[error("conversation is permanently unavailable in History")]
     HistoryUnavailable,
+    #[error("federation send authority is no longer active")]
+    FederationSendAuthorityInactive,
+    #[error("federation send identity conflicts with a prior admission")]
+    FederationSendIdentityConflict,
+    #[error("federation steering send exactly replays a prior admission")]
+    FederationSteeringDuplicate,
     #[error("steering queue is full")]
     QueueFull,
     #[error("{0}")]
@@ -641,6 +654,7 @@ impl From<String> for SteeringAdmissionError {
 
 enum SteeringAppendAuthority<'a> {
     Ordinary,
+    Federation(&'a crate::db::FederationSendAuthority),
     ProductCreation(&'a crate::db::ClaimedProductCreationJob),
 }
 
@@ -3734,6 +3748,7 @@ impl RuntimeManager {
         self.fatal_local_authority_fence.owners_at_first_close()
     }
 
+    #[cfg(test)]
     pub(crate) async fn run_local_authority_pass<T>(
         &self,
         pass: impl std::future::Future<Output = T>,
@@ -5101,7 +5116,12 @@ impl RuntimeManager {
                 .await
                 .map_err(|error| error.to_string())?,
         );
-        coordinator_tools.extend(crate::coordinator_tools::goal_tools(self.clone()));
+        coordinator_tools.extend(crate::coordinator_tools::goal_tools(self));
+        coordinator_tools.extend(crate::coordinator_tools::authority_tools(self));
+        coordinator_tools.push(crate::reminder_service::tool(
+            self,
+            conversation_id.to_owned(),
+        ));
         Ok(ToolRegistry::coordinator(coordinator_tools, catalog))
     }
 
@@ -6147,7 +6167,10 @@ impl RuntimeManager {
                         None,
                     ),
                 };
-                let registry = registry.try_with_host_bound_tool(predecessor_tool.clone())?;
+                let reminder_tool = crate::reminder_service::tool(self, conv.id.clone());
+                let registry = registry
+                    .try_with_host_bound_tool(predecessor_tool.clone())?
+                    .try_with_host_bound_tool(reminder_tool.clone())?;
                 let registry = if crate::slack_gateway::has_explicit_binding(
                     &self.db,
                     conv.product_conversation_id.as_str(),
@@ -6168,6 +6191,7 @@ impl RuntimeManager {
                 )
                 .with_writing_tools(upgrade_writing_tools)
                 .with_predecessor_tool(predecessor_tool)
+                .with_host_bound_tool(reminder_tool)
             }
         };
 
@@ -6842,6 +6866,47 @@ impl RuntimeManager {
         Ok(outcome)
     }
 
+    pub(crate) async fn review_reserved_continuation_opening(
+        self: &Arc<Self>,
+        intent: phoenix_db::ContinuationDispatchIntent,
+    ) -> Result<HandoffReviewResponse, String> {
+        let _owner = self.acquire_local_authority_pass().map_err(|()| {
+            "runtime admission closed after fatal local authority loss".to_string()
+        })?;
+        let persisted = self
+            .db()
+            .continuation_dispatch_intent(&intent.parent_conversation_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or("reserved opening is no longer pending")?;
+        if persisted.successor_conversation_id != intent.successor_conversation_id
+            || persisted.message_id != intent.message_id
+            || persisted.handoff != intent.handoff
+            || persisted.opening_authority != intent.opening_authority
+            || persisted.user_agent != intent.user_agent
+        {
+            return Err("reserved opening changed before capacity review".to_string());
+        }
+        let handle = self
+            .get_or_create_continuation_maintenance(&intent.successor_conversation_id)
+            .await?;
+        let sender = handle
+            .handoff_review_tx
+            .as_ref()
+            .ok_or("handoff review unavailable")?;
+        let (response, receipt) = oneshot::channel();
+        sender
+            .send(HandoffReviewRequest {
+                input: HandoffReviewInput::ReservedGeneratedOpening(intent),
+                response,
+            })
+            .await
+            .map_err(|_| "handoff review runtime stopped".to_string())?;
+        receipt
+            .await
+            .map_err(|_| "handoff review runtime stopped".to_string())?
+    }
+
     /// Evaluate a continuation with the current ordinary successor projection.
     ///
     /// # Errors
@@ -6912,10 +6977,12 @@ impl RuntimeManager {
         let (response, receipt) = oneshot::channel();
         sender
             .send(HandoffReviewRequest {
-                handoff,
-                shorten,
-                source_candidate_id,
-                opening_authority,
+                input: HandoffReviewInput::ProspectiveSuccessor {
+                    handoff,
+                    shorten,
+                    source_candidate_id,
+                    opening_authority,
+                },
                 response,
             })
             .await
@@ -7010,6 +7077,22 @@ impl RuntimeManager {
             event,
             request_fingerprint,
             SteeringAppendAuthority::Ordinary,
+        )
+        .await
+    }
+
+    pub async fn enqueue_federated_steer_message(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        event: Event,
+        request_fingerprint: &str,
+        authority: &crate::db::FederationSendAuthority,
+    ) -> Result<(), SteeringAdmissionError> {
+        self.enqueue_steer_message_with_authority(
+            conversation_id,
+            event,
+            request_fingerprint,
+            SteeringAppendAuthority::Federation(authority),
         )
         .await
     }
@@ -7112,6 +7195,16 @@ impl RuntimeManager {
                         .append_steering_entry(conversation_id, &new_entry, request_fingerprint)
                         .await
                 }
+                SteeringAppendAuthority::Federation(authority) => {
+                    self.db()
+                        .append_federated_steering_entry(
+                            conversation_id,
+                            &new_entry,
+                            request_fingerprint,
+                            authority,
+                        )
+                        .await
+                }
                 SteeringAppendAuthority::ProductCreation(delivery) => {
                     self.db()
                         .append_product_creation_steering_entry(
@@ -7131,6 +7224,15 @@ impl RuntimeManager {
                 }
                 crate::db::DbError::ProductConversationUnavailable(_) => {
                     SteeringAdmissionError::HistoryUnavailable
+                }
+                crate::db::DbError::FederationSendAuthorityInactive => {
+                    SteeringAdmissionError::FederationSendAuthorityInactive
+                }
+                crate::db::DbError::FederationSendIdentityConflict => {
+                    SteeringAdmissionError::FederationSendIdentityConflict
+                }
+                crate::db::DbError::FederationSteeringDuplicate => {
+                    SteeringAdmissionError::FederationSteeringDuplicate
                 }
                 crate::db::DbError::SteeringQueueFull => SteeringAdmissionError::QueueFull,
                 error => SteeringAdmissionError::Internal(format!(
@@ -11448,6 +11550,79 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn federated_steering_exact_persisted_replay_maps_to_duplicate_without_new_effect() {
+        use phoenix_core::domain::instance_identity::{FederationCredentialVerifier, InstanceId};
+
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "federated-steering-replay";
+        manager
+            .db()
+            .create_conversation(conversation_id, "replay", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        manager
+            .inject_handle_for_test(conversation_id, ConvState::Idle)
+            .await;
+
+        let caller = InstanceId::new();
+        let verifier = FederationCredentialVerifier::from_bearer(b"steering-replay-token");
+        manager
+            .db()
+            .replace_federation_enrollment(caller, &"peer".parse().unwrap(), &verifier)
+            .await
+            .expect("enroll caller");
+        let authority = crate::db::FederationSendAuthority::new(caller, verifier);
+        let event = Event::SteerMessage {
+            origin: phoenix_core::domain::db_schema::InputOrigin::RemoteApi {
+                instance_id: caller,
+            },
+            text: "steer once".into(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: "federated-replay-message".into(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+        let fingerprint = "federated-replay-fingerprint";
+        manager
+            .enqueue_federated_steer_message(
+                conversation_id,
+                event.clone(),
+                fingerprint,
+                &authority,
+            )
+            .await
+            .expect("first steering admission");
+        assert!(matches!(
+            manager
+                .enqueue_federated_steer_message(conversation_id, event, fingerprint, &authority)
+                .await,
+            Err(SteeringAdmissionError::FederationSteeringDuplicate)
+        ));
+
+        assert_eq!(
+            manager
+                .db()
+                .get_steering_acceptance_fingerprint(conversation_id, "federated-replay-message",)
+                .await
+                .expect("read durable receipt"),
+            Some(phoenix_db::SteeringAcceptanceFingerprint::Exact(
+                fingerprint.to_string()
+            ))
+        );
+        assert_eq!(
+            manager
+                .db()
+                .get_steering_queue(conversation_id)
+                .await
+                .expect("read durable steering effects")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn steering_enqueue_holds_owner_across_persistence_and_executor_handoff() {
         let manager = Arc::new(test_manager().await);
         let conversation_id = "steering-fatal-owner";
@@ -13464,6 +13639,8 @@ mod scope_liveness_tests {
                 accepted_at: Timestamp(1),
             })
             .await
+            .established()
+            .expect("acceptance durability is established")
             .expect("accept direct turn");
         let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
             panic!("expected newly accepted turn")
@@ -13726,6 +13903,8 @@ mod scope_liveness_tests {
                 accepted_at: Timestamp(1),
             })
             .await
+            .established()
+            .expect("acceptance durability is established")
             .expect("accept direct turn");
         let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
             panic!("expected newly accepted turn")

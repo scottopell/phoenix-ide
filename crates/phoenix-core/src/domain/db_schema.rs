@@ -1,5 +1,6 @@
 //! Database schema and types
 
+use crate::domain::instance_identity::InstanceId;
 use crate::domain::llm_types::ContentBlock;
 use crate::domain::product_conversation::ProductConversationId;
 use crate::domain::retry_policy::{
@@ -63,6 +64,8 @@ pub struct NotificationEventSettings {
     pub error: NotificationToggle,
     #[serde(rename = "notify_idle")]
     pub idle: NotificationToggle,
+    #[serde(rename = "notify_reminder")]
+    pub reminder: NotificationToggle,
 }
 
 impl Default for NotificationEventSettings {
@@ -72,6 +75,7 @@ impl Default for NotificationEventSettings {
             question: NotificationToggle::Enabled,
             error: NotificationToggle::Enabled,
             idle: NotificationToggle::Enabled,
+            reminder: NotificationToggle::Enabled,
         }
     }
 }
@@ -1693,8 +1697,32 @@ pub enum InputOrigin {
     SlackGateway {
         request_id: String,
     },
+    RemoteApi {
+        #[ts(type = "string")]
+        instance_id: InstanceId,
+    },
+    RemoteConversation {
+        #[ts(type = "string")]
+        instance_id: InstanceId,
+        #[ts(type = "string")]
+        product_conversation_id: ProductConversationId,
+        transcript_id: String,
+        source_call: Option<Box<SourceToolCall>>,
+    },
+    RemoteCoordinator {
+        #[ts(type = "string")]
+        instance_id: InstanceId,
+        #[ts(type = "string")]
+        product_conversation_id: ProductConversationId,
+        transcript_id: String,
+        source_call: Option<Box<SourceToolCall>>,
+    },
     SubscriptionEvent {
         event_id: String,
+    },
+    ScheduledReminder {
+        #[ts(type = "string")]
+        reminder_id: super::reminder::ReminderId,
     },
 }
 
@@ -1715,6 +1743,14 @@ impl InputOrigin {
                     ..
                 },
             ) => a == c && b == d,
+            (
+                Self::RemoteApi { instance_id: a }
+                | Self::RemoteConversation { instance_id: a, .. }
+                | Self::RemoteCoordinator { instance_id: a, .. },
+                Self::RemoteApi { instance_id: b }
+                | Self::RemoteConversation { instance_id: b, .. }
+                | Self::RemoteCoordinator { instance_id: b, .. },
+            ) => a == b,
             _ => self == retry || matches!((self, retry), (Self::UnknownHistorical, Self::UserApi)),
         }
     }
@@ -1722,12 +1758,16 @@ impl InputOrigin {
     #[must_use]
     pub fn source_call(&self) -> Option<&SourceToolCall> {
         match self {
-            Self::InternalConversation { source_call, .. } => source_call.as_deref(),
+            Self::InternalConversation { source_call, .. }
+            | Self::RemoteConversation { source_call, .. }
+            | Self::RemoteCoordinator { source_call, .. } => source_call.as_deref(),
             Self::UnknownHistorical
             | Self::UserApi
+            | Self::RemoteApi { .. }
             | Self::SystemGenerated
             | Self::SlackGateway { .. }
-            | Self::SubscriptionEvent { .. } => None,
+            | Self::SubscriptionEvent { .. }
+            | Self::ScheduledReminder { .. } => None,
         }
     }
 
@@ -1740,7 +1780,9 @@ impl InputOrigin {
     ) -> Result<Self, String> {
         match (&mut self, message_id, tool_use_id) {
             (
-                Self::InternalConversation { source_call, .. },
+                Self::InternalConversation { source_call, .. }
+                | Self::RemoteConversation { source_call, .. }
+                | Self::RemoteCoordinator { source_call, .. },
                 Some(message_id),
                 Some(tool_use_id),
             ) if !message_id.is_empty() && !tool_use_id.is_empty() => {
@@ -1755,11 +1797,20 @@ impl InputOrigin {
         Ok(self)
     }
 
+    /// Returns kind, product conversation, transcript, subscription event, and source instance columns.
     #[must_use]
-    pub fn db_parts(&self) -> (&'static str, Option<&str>, Option<&str>, Option<&str>) {
+    pub fn db_parts(
+        &self,
+    ) -> (
+        &'static str,
+        Option<&str>,
+        Option<&str>,
+        Option<&str>,
+        Option<String>,
+    ) {
         match self {
-            Self::UnknownHistorical => ("unknown_historical", None, None, None),
-            Self::UserApi => ("user_api", None, None, None),
+            Self::UnknownHistorical => ("unknown_historical", None, None, None, None),
+            Self::UserApi => ("user_api", None, None, None, None),
             Self::InternalConversation {
                 product_conversation_id,
                 transcript_id,
@@ -1769,12 +1820,45 @@ impl InputOrigin {
                 Some(product_conversation_id.as_str()),
                 Some(transcript_id),
                 None,
+                None,
             ),
-            Self::SystemGenerated => ("system_generated", None, None, None),
-            Self::SlackGateway { .. } => ("slack_gateway", None, None, None),
+            Self::SystemGenerated => ("system_generated", None, None, None, None),
+            Self::SlackGateway { .. } => ("slack_gateway", None, None, None, None),
+            Self::ScheduledReminder { .. } => ("scheduled_reminder", None, None, None, None),
             Self::SubscriptionEvent { event_id } => {
-                ("subscription_event", None, None, Some(event_id))
+                ("subscription_event", None, None, Some(event_id), None)
             }
+            Self::RemoteApi { instance_id } => (
+                "remote_api",
+                None,
+                None,
+                None,
+                Some(instance_id.to_string()),
+            ),
+            Self::RemoteConversation {
+                instance_id,
+                product_conversation_id,
+                transcript_id,
+                ..
+            } => (
+                "remote_conversation",
+                Some(product_conversation_id.as_str()),
+                Some(transcript_id),
+                None,
+                Some(instance_id.to_string()),
+            ),
+            Self::RemoteCoordinator {
+                instance_id,
+                product_conversation_id,
+                transcript_id,
+                ..
+            } => (
+                "remote_coordinator",
+                Some(product_conversation_id.as_str()),
+                Some(transcript_id),
+                None,
+                Some(instance_id.to_string()),
+            ),
         }
     }
 
@@ -1786,11 +1870,70 @@ impl InputOrigin {
             | Self::UserApi
             | Self::InternalConversation { .. }
             | Self::SystemGenerated
-            | Self::SubscriptionEvent { .. } => None,
+            | Self::SubscriptionEvent { .. }
+            | Self::RemoteApi { .. }
+            | Self::RemoteConversation { .. }
+            | Self::RemoteCoordinator { .. }
+            | Self::ScheduledReminder { .. } => None,
         }
     }
 
-    /// Decode the independently normalized external source column.
+    #[must_use]
+    pub fn reminder_id(&self) -> Option<&str> {
+        match self {
+            Self::ScheduledReminder { reminder_id } => Some(reminder_id.as_str()),
+            Self::UnknownHistorical
+            | Self::UserApi
+            | Self::InternalConversation { .. }
+            | Self::SystemGenerated
+            | Self::SlackGateway { .. }
+            | Self::SubscriptionEvent { .. }
+            | Self::RemoteApi { .. }
+            | Self::RemoteConversation { .. }
+            | Self::RemoteCoordinator { .. } => None,
+        }
+    }
+
+    /// Decode normalized source columns, rejecting identities on another kind.
+    /// # Errors
+    /// Rejects malformed or mixed provenance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_db_source_columns(
+        kind: &str,
+        product: Option<String>,
+        transcript: Option<String>,
+        event: Option<String>,
+        source_instance_id: Option<String>,
+        slack: Option<String>,
+        reminder: Option<String>,
+    ) -> Result<Self, String> {
+        match (kind, reminder) {
+            ("scheduled_reminder", Some(id))
+                if product.is_none()
+                    && transcript.is_none()
+                    && event.is_none()
+                    && source_instance_id.is_none()
+                    && slack.is_none() =>
+            {
+                Ok(Self::ScheduledReminder {
+                    reminder_id: super::reminder::ReminderId::parse(id)
+                        .map_err(|error| error.to_string())?,
+                })
+            }
+            ("scheduled_reminder", _) => Err("invalid scheduled reminder origin".into()),
+            (_, None) => Self::from_db_parts_with_slack(
+                kind,
+                product,
+                transcript,
+                event,
+                source_instance_id,
+                slack,
+            ),
+            _ => Err("reminder source on another origin".into()),
+        }
+    }
+
+    /// Decode the independently normalized external source columns.
     /// # Errors
     /// Rejects missing Slack identity or identity on another origin.
     pub fn from_db_parts_with_slack(
@@ -1798,6 +1941,7 @@ impl InputOrigin {
         product: Option<String>,
         transcript: Option<String>,
         event: Option<String>,
+        source_instance_id: Option<String>,
         slack: Option<String>,
     ) -> Result<Self, String> {
         match (kind, slack) {
@@ -1805,12 +1949,13 @@ impl InputOrigin {
                 if !request_id.trim().is_empty()
                     && product.is_none()
                     && transcript.is_none()
-                    && event.is_none() =>
+                    && event.is_none()
+                    && source_instance_id.is_none() =>
             {
                 Ok(Self::SlackGateway { request_id })
             }
             ("slack_gateway", _) => Err("invalid Slack input origin".into()),
-            (_, None) => Self::from_db_parts(kind, product, transcript, event),
+            (_, None) => Self::from_db_parts(kind, product, transcript, event, source_instance_id),
             _ => Err("Slack source on non-Slack origin".into()),
         }
     }
@@ -1822,15 +1967,24 @@ impl InputOrigin {
         product_id: Option<String>,
         transcript_id: Option<String>,
         event_id: Option<String>,
+        source_instance_id: Option<String>,
     ) -> Result<Self, String> {
-        match (kind, product_id, transcript_id, event_id) {
-            ("unknown_historical", None, None, None) => Ok(Self::UnknownHistorical),
-            ("user_api", None, None, None) => Ok(Self::UserApi),
-            ("system_generated", None, None, None) => Ok(Self::SystemGenerated),
-            ("subscription_event", None, None, Some(event_id)) if !event_id.trim().is_empty() => {
+        match (
+            kind,
+            product_id,
+            transcript_id,
+            event_id,
+            source_instance_id,
+        ) {
+            ("unknown_historical", None, None, None, None) => Ok(Self::UnknownHistorical),
+            ("user_api", None, None, None, None) => Ok(Self::UserApi),
+            ("system_generated", None, None, None, None) => Ok(Self::SystemGenerated),
+            ("subscription_event", None, None, Some(event_id), None)
+                if !event_id.trim().is_empty() =>
+            {
                 Ok(Self::SubscriptionEvent { event_id })
             }
-            ("internal_conversation", Some(product_id), Some(transcript_id), None)
+            ("internal_conversation", Some(product_id), Some(transcript_id), None, None)
                 if !transcript_id.trim().is_empty() =>
             {
                 Ok(Self::InternalConversation {
@@ -1840,7 +1994,344 @@ impl InputOrigin {
                     source_call: None,
                 })
             }
+            ("remote_api", None, None, None, Some(instance_id)) => Ok(Self::RemoteApi {
+                instance_id: instance_id
+                    .parse::<InstanceId>()
+                    .map_err(|e| e.to_string())?,
+            }),
+            (
+                kind @ ("remote_conversation" | "remote_coordinator"),
+                Some(product_id),
+                Some(transcript_id),
+                None,
+                Some(instance_id),
+            ) if !transcript_id.trim().is_empty() => {
+                let instance_id = instance_id
+                    .parse::<InstanceId>()
+                    .map_err(|e| e.to_string())?;
+                let product_conversation_id =
+                    ProductConversationId::parse(product_id).map_err(|e| e.to_string())?;
+                Ok(if kind == "remote_conversation" {
+                    Self::RemoteConversation {
+                        instance_id,
+                        product_conversation_id,
+                        transcript_id,
+                        source_call: None,
+                    }
+                } else {
+                    Self::RemoteCoordinator {
+                        instance_id,
+                        product_conversation_id,
+                        transcript_id,
+                        source_call: None,
+                    }
+                })
+            }
             other => Err(format!("invalid input origin: {other:?}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod input_origin_tests {
+    use super::InputOrigin;
+
+    const INSTANCE: &str = "aabbccdd-1234-4abc-8def-0123456789ab";
+
+    fn fixtures() -> Vec<&'static str> {
+        vec![
+            r#"{"kind":"unknown_historical"}"#,
+            r#"{"kind":"user_api"}"#,
+            r#"{"kind":"internal_conversation","product_conversation_id":"product","transcript_id":"transcript","source_call":null}"#,
+            r#"{"kind":"system_generated"}"#,
+            r#"{"kind":"subscription_event","event_id":"event"}"#,
+            r#"{"kind":"remote_api","instance_id":"aabbccdd-1234-4abc-8def-0123456789ab"}"#,
+            r#"{"kind":"remote_conversation","instance_id":"aabbccdd-1234-4abc-8def-0123456789ab","product_conversation_id":"product","transcript_id":"transcript","source_call":null}"#,
+            r#"{"kind":"remote_coordinator","instance_id":"aabbccdd-1234-4abc-8def-0123456789ab","product_conversation_id":"product","transcript_id":"transcript","source_call":null}"#,
+        ]
+    }
+
+    #[test]
+    fn scheduled_reminder_origin_is_separate_from_other_sources() {
+        let origin = InputOrigin::ScheduledReminder {
+            reminder_id: super::super::reminder::ReminderId::parse("reminder-1").unwrap(),
+        };
+        let json = serde_json::to_string(&origin).unwrap();
+        assert_eq!(serde_json::from_str::<InputOrigin>(&json).unwrap(), origin);
+        assert_eq!(
+            InputOrigin::from_db_source_columns(
+                "scheduled_reminder",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("reminder-1".into())
+            )
+            .unwrap(),
+            origin
+        );
+        assert!(InputOrigin::from_db_source_columns(
+            "scheduled_reminder",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None
+        )
+        .is_err());
+        assert!(InputOrigin::from_db_source_columns(
+            "user_api",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("reminder-1".into())
+        )
+        .is_err());
+        assert!(InputOrigin::from_db_source_columns(
+            "scheduled_reminder",
+            None,
+            None,
+            Some("event".into()),
+            None,
+            None,
+            Some("reminder-1".into())
+        )
+        .is_err());
+    }
+
+    fn origins() -> Vec<InputOrigin> {
+        fixtures()
+            .into_iter()
+            .map(|json| serde_json::from_str(json).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn serde_and_column_round_trips_preserve_all_origin_kinds() {
+        for json in fixtures() {
+            let origin: InputOrigin = serde_json::from_str(json).unwrap();
+            assert_eq!(serde_json::to_string(&origin).unwrap(), json);
+            let (kind, product, transcript, event, instance) = origin.db_parts();
+            let restored = InputOrigin::from_db_parts(
+                kind,
+                product.map(str::to_owned),
+                transcript.map(str::to_owned),
+                event.map(str::to_owned),
+                instance,
+            )
+            .unwrap();
+            assert_eq!(restored, origin);
+        }
+    }
+
+    #[test]
+    fn remote_instance_is_required_and_validated_by_serde_and_columns() {
+        for origin in origins().into_iter().skip(5) {
+            let mut json = serde_json::to_value(&origin).unwrap();
+            json.as_object_mut().unwrap().remove("instance_id");
+            assert!(serde_json::from_value::<InputOrigin>(json.clone()).is_err());
+            json["instance_id"] = serde_json::Value::Null;
+            assert!(serde_json::from_value::<InputOrigin>(json.clone()).is_err());
+            let (kind, product, transcript, event, _) = origin.db_parts();
+            for invalid in [
+                None,
+                Some(""),
+                Some("not-a-uuid"),
+                Some("00000000-0000-0000-0000-000000000000"),
+                Some("aabbccdd-1234-1abc-8def-0123456789ab"),
+                Some("aabbccdd-1234-4abc-cdef-0123456789ab"),
+            ] {
+                assert!(InputOrigin::from_db_parts(
+                    kind,
+                    product.map(str::to_owned),
+                    transcript.map(str::to_owned),
+                    event.map(str::to_owned),
+                    invalid.map(str::to_owned),
+                )
+                .is_err());
+                if let Some(invalid) = invalid {
+                    json["instance_id"] = serde_json::json!(invalid);
+                    assert!(serde_json::from_value::<InputOrigin>(json.clone()).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn source_instance_columns_are_normalized_and_exclusive_to_remote_origins() {
+        for origin in origins() {
+            let (kind, product, transcript, event, instance) = origin.db_parts();
+            let decoded = InputOrigin::from_db_parts(
+                kind,
+                product.map(str::to_owned),
+                transcript.map(str::to_owned),
+                event.map(str::to_owned),
+                Some(INSTANCE.to_uppercase()),
+            );
+            if instance.is_some() {
+                let decoded = decoded.unwrap();
+                assert_eq!(decoded, origin);
+                assert_eq!(decoded.db_parts().4.as_deref(), Some(INSTANCE));
+            } else {
+                assert!(decoded.is_err());
+            }
+        }
+        for kind in ["remote_conversation", "remote_coordinator"] {
+            for (product, transcript, event) in [
+                (None, Some("transcript"), None),
+                (Some("product"), None, None),
+                (Some(" "), Some("transcript"), None),
+                (Some("product"), Some(" "), None),
+                (Some("product"), Some("transcript"), Some("event")),
+            ] {
+                assert!(InputOrigin::from_db_parts(
+                    kind,
+                    product.map(str::to_owned),
+                    transcript.map(str::to_owned),
+                    event.map(str::to_owned),
+                    Some(INSTANCE.to_owned()),
+                )
+                .is_err());
+            }
+        }
+        assert!(InputOrigin::from_db_parts(
+            "remote_api",
+            Some("product".into()),
+            Some("transcript".into()),
+            None,
+            Some(INSTANCE.into()),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn source_calls_round_trip_only_on_conversation_origins() {
+        for origin in origins() {
+            let is_conversation = matches!(
+                origin,
+                InputOrigin::InternalConversation { .. }
+                    | InputOrigin::RemoteConversation { .. }
+                    | InputOrigin::RemoteCoordinator { .. }
+            );
+            let located = origin
+                .clone()
+                .with_source_call_columns(Some("message".into()), Some("tool".into()));
+            if is_conversation {
+                let located = located.unwrap();
+                let source = located.source_call().unwrap();
+                assert_eq!(source.message_id, "message");
+                assert_eq!(source.tool_use_id, "tool");
+                assert_eq!(
+                    located
+                        .clone()
+                        .with_source_call_columns(None, None)
+                        .unwrap(),
+                    located
+                );
+                let json = serde_json::to_string(&located).unwrap();
+                assert_eq!(serde_json::from_str::<InputOrigin>(&json).unwrap(), located);
+                let (kind, product, transcript, event, instance) = located.db_parts();
+                let restored = InputOrigin::from_db_parts(
+                    kind,
+                    product.map(str::to_owned),
+                    transcript.map(str::to_owned),
+                    event.map(str::to_owned),
+                    instance,
+                )
+                .unwrap()
+                .with_source_call_columns(
+                    Some(source.message_id.clone()),
+                    Some(source.tool_use_id.clone()),
+                )
+                .unwrap();
+                assert_eq!(restored, located);
+            } else {
+                assert!(located.is_err());
+                assert!(origin.source_call().is_none());
+            }
+            for (message, tool) in [
+                (Some("message"), None),
+                (None, Some("tool")),
+                (Some(""), Some("tool")),
+                (Some("message"), Some("")),
+            ] {
+                assert!(origin
+                    .clone()
+                    .with_source_call_columns(message.map(str::to_owned), tool.map(str::to_owned))
+                    .is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn retry_origin_kind_and_instance_identity_cannot_be_changed() {
+        let origins = origins();
+        for stored in &origins {
+            for retry in &origins {
+                let same_remote_instance = match (stored, retry) {
+                    (
+                        InputOrigin::RemoteApi { instance_id: a }
+                        | InputOrigin::RemoteConversation { instance_id: a, .. }
+                        | InputOrigin::RemoteCoordinator { instance_id: a, .. },
+                        InputOrigin::RemoteApi { instance_id: b }
+                        | InputOrigin::RemoteConversation { instance_id: b, .. }
+                        | InputOrigin::RemoteCoordinator { instance_id: b, .. },
+                    ) => a == b,
+                    _ => false,
+                };
+                assert_eq!(
+                    stored.accepts_retry_origin(retry),
+                    stored == retry
+                        || same_remote_instance
+                        || matches!(
+                            (stored, retry),
+                            (InputOrigin::UnknownHistorical, InputOrigin::UserApi)
+                        ),
+                    "stored={stored:?}, retry={retry:?}"
+                );
+            }
+        }
+        for stored in origins.into_iter().skip(5) {
+            let mut json = serde_json::to_value(&stored).unwrap();
+            json["instance_id"] = serde_json::json!("aabbccdd-1234-4abc-8def-0123456789ac");
+            let retry: InputOrigin = serde_json::from_value(json).unwrap();
+            assert!(!stored.accepts_retry_origin(&retry));
+            assert!(!retry.accepts_retry_origin(&stored));
+        }
+    }
+
+    #[test]
+    fn conversation_retries_ignore_source_call_but_not_product_or_transcript() {
+        let stored = InputOrigin::InternalConversation {
+            product_conversation_id:
+                crate::domain::product_conversation::ProductConversationId::parse("source-product")
+                    .unwrap(),
+            transcript_id: "source-transcript".into(),
+            source_call: None,
+        };
+        let first = stored
+            .clone()
+            .with_source_call_columns(Some("first-message".into()), Some("first-tool".into()))
+            .unwrap();
+        let retry = stored
+            .clone()
+            .with_source_call_columns(Some("retry-message".into()), Some("retry-tool".into()))
+            .unwrap();
+        assert!(stored.accepts_retry_origin(&first));
+        assert!(first.accepts_retry_origin(&stored));
+        assert!(first.accepts_retry_origin(&retry));
+        assert_eq!(first.source_call().unwrap().message_id, "first-message");
+        assert!(stored.source_call().is_none());
+        for field in ["product_conversation_id", "transcript_id"] {
+            let mut json = serde_json::to_value(&retry).unwrap();
+            json[field] = serde_json::json!("changed");
+            let changed: InputOrigin = serde_json::from_value(json).unwrap();
+            assert!(!stored.accepts_retry_origin(&changed));
+            assert!(!first.accepts_retry_origin(&changed));
         }
     }
 }

@@ -9,6 +9,7 @@ mod opening_qualifier;
 
 mod analytics;
 mod api;
+mod automatic_continuation_settings;
 mod chain_qa;
 mod chain_runtime;
 mod continuation_service;
@@ -26,6 +27,8 @@ mod mcp_oauth_store;
 mod message_expander;
 mod phx_cli;
 mod project_opportunistic_build_warm;
+mod reminder_delivery;
+mod reminder_service;
 mod resolution_root;
 mod resource_authority;
 mod runtime;

@@ -145,7 +145,11 @@ impl ProductCreationOrigin {
             | InputOrigin::InternalConversation { .. }
             | InputOrigin::SystemGenerated
             | InputOrigin::SlackGateway { .. }
-            | InputOrigin::SubscriptionEvent { .. } => Err(sqlx::Error::Decode(
+            | InputOrigin::ScheduledReminder { .. }
+            | InputOrigin::SubscriptionEvent { .. }
+            | InputOrigin::RemoteApi { .. }
+            | InputOrigin::RemoteConversation { .. }
+            | InputOrigin::RemoteCoordinator { .. } => Err(sqlx::Error::Decode(
                 "internal creation origin requires a source-call locator".into(),
             )),
         }
@@ -3916,6 +3920,8 @@ mod product_creation_tests {
                 accepted_at: Timestamp(1),
             })
             .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
             panic!("expected new authoritative turn");

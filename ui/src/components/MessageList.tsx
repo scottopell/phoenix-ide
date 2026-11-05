@@ -58,6 +58,7 @@ import { useReactionSourceReturn } from './useReactionSourceReturn';
 import { MessageReviewEnabledContext } from './MessageReviewAction';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { useStreamingBuffer } from '../conversation/useConversationAtom';
+import { activeToolUseIdFromState } from '../conversation/toolActivity';
 import {
   buildHistoricalUnits,
   findHistoricalUnitIndexByMessageId,
@@ -262,12 +263,6 @@ function SkillFileChips({
 }
 
 type OnOpenFile = ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
-
-function activeToolUseIdFromState(convState: ConversationState): string | undefined {
-  if (convState.type !== 'tool_executing' && convState.type !== 'cancelling_tool') return undefined;
-  const id = convState.current_tool?.id;
-  return typeof id === 'string' && id.length > 0 ? id : undefined;
-}
 
 function LiveAgentTurn({ slug, message, ...props }: Omit<React.ComponentProps<typeof AgentMessage>, 'liveBashProgress' | 'message'> & { slug: string | null; message: Message }) {
   const toolUseIds = useMemo(
