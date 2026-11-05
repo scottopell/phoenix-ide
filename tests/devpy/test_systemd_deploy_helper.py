@@ -47,10 +47,9 @@ def stage_handoff(bundle, source_uid, policy, expected_preparation_receipt_sha25
 
 def write_manual_tls_fixture(directory: Path, stem: str = "manual") -> tuple[Path, Path]:
     cert, key = directory / f"{stem}.crt", directory / f"{stem}.key"
-    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-                    "-subj", "/CN=localhost", "-addext", "basicConstraints=critical,CA:TRUE",
-                    "-keyout", str(key), "-out", str(cert)],
-                   check=True, capture_output=True, text=True, timeout=30)
+    pair = json.loads((ROOT / "tests/devpy/fixtures/manual-tls.json").read_text())["pairs"][stem]
+    cert.write_text(pair["cert"])
+    key.write_text(pair["key"])
     return cert, key
 
 
@@ -128,14 +127,22 @@ class InstalledHealthUrlTests(unittest.TestCase):
                     self.assertEqual(f"{scheme}://{host}:8123/api/version", url)
                     helper.validate_health_url(url, "installed")
 
-    def test_ca_is_only_meaningful_with_manual_pair_and_valid_chain(self):
+    def test_ca_is_only_meaningful_with_manual_pair(self):
         ignored = {"PHOENIX_TLS_CA_CERT_PATH": "/missing-ca"}
         self.assertEqual(helper.InstalledHttp(), helper.installed_tls(ignored))
         self.assertEqual(helper.InstalledAutoTls(), helper.installed_tls({**ignored, "PHOENIX_TLS": "auto"}))
         environment = {"PHOENIX_TLS_CERT_PATH": str(self.cert), "PHOENIX_TLS_KEY_PATH": str(self.key),
                        "PHOENIX_TLS_CA_CERT_PATH": str(self.cert)}
         self.assertEqual(helper.InstalledManualTls(self.cert, self.key, self.cert), helper.installed_tls(environment))
-        self.assertEqual("https://[::1]:8123/api/version", helper.installed_health_url(environment, self.socket, self.user))
+        with mock.patch.object(helper, "preflight_executable", return_value=Path("/fixture/openssl")), \
+             mock.patch.object(helper.subprocess, "run", side_effect=[
+                 subprocess.CompletedProcess([], 0, "X509v3 Basic Constraints: critical\n    CA:TRUE\n", ""),
+                 subprocess.CompletedProcess([], 0, "OK", ""),
+             ]) as run:
+            self.assertEqual("https://[::1]:8123/api/version", helper.installed_health_url(environment, self.socket, self.user))
+        self.assertEqual(["/fixture/openssl", "verify", "-trusted", str(self.cert), "-partial_chain",
+                          "-untrusted", str(self.cert), "-purpose", "sslserver", str(self.cert)],
+                         run.call_args.args[0])
         with mock.patch.object(helper.shutil, "which", return_value=None):
             with self.assertRaisesRegex(helper.ValidationError, "openssl"):
                 helper.installed_health_url(environment, self.socket, self.user)
@@ -196,6 +203,62 @@ class InstalledHealthUrlTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(helper.ValidationError):
                 self.socket.write_text(text)
                 helper.installed_health_url({}, self.socket, self.user)
+
+
+class InstalledTlsCryptoDependencyTests(unittest.TestCase):
+    def test_missing_crypto_dependency_only_skips_implicit_non_linux_integration(self):
+        for platform, environment, error in (
+                ("linux", {}, AssertionError),
+                ("darwin", {}, unittest.SkipTest),
+                ("darwin", {"PHOENIX_TEST_OPENSSL": "/missing/openssl"}, AssertionError)):
+            with self.subTest(platform=platform, environment=environment), \
+                 mock.patch.object(sys, "platform", platform), \
+                 mock.patch.dict(os.environ, environment, clear=True), \
+                 mock.patch.object(shutil, "which", return_value=None), \
+                 self.assertRaisesRegex(error, "PHOENIX_TEST_OPENSSL"):
+                InstalledTlsCryptoIntegrationTests.setUpClass()
+
+
+class InstalledTlsCryptoIntegrationTests(unittest.TestCase):
+    """Linux requires compatible openssl; other hosts can set PHOENIX_TEST_OPENSSL."""
+
+    @classmethod
+    def setUpClass(cls):
+        configured = os.environ.get("PHOENIX_TEST_OPENSSL")
+        cls.openssl = shutil.which(configured if configured is not None else "openssl")
+        help_text = ""
+        if cls.openssl is not None:
+            probe = subprocess.run([cls.openssl, "verify", "-help"],
+                                   capture_output=True, text=True, timeout=10)
+            help_text = probe.stdout + probe.stderr
+        if not all(option in help_text for option in ("-trusted", "-partial_chain", "-untrusted", "-purpose")):
+            message = ("TLS crypto integration requires OpenSSL verify with -partial_chain; "
+                       "set PHOENIX_TEST_OPENSSL to a compatible executable")
+            if sys.platform == "linux" or configured is not None:
+                raise AssertionError(message)
+            raise unittest.SkipTest(message)
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name).resolve()
+        self.cert, self.key = write_manual_tls_fixture(self.base)
+        self.unrelated, self.wrong_key = write_manual_tls_fixture(self.base, "unrelated")
+        self.user = pwd.getpwuid(os.getuid()).pw_name
+        which = helper.shutil.which
+        patch = mock.patch.object(helper.shutil, "which", side_effect=lambda name: (
+            self.openssl if name == "openssl" else which(name)))
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_real_chain_accepts_configured_ca_and_rejects_unrelated_ca(self):
+        helper.validate_installed_tls(helper.InstalledManualTls(self.cert, self.key, self.cert), self.user)
+        with self.assertRaisesRegex(helper.ValidationError, "CA chain is invalid"):
+            helper.validate_installed_tls(helper.InstalledManualTls(self.cert, self.key, self.unrelated), self.user)
+
+    def test_real_ssl_rejects_mismatched_private_key(self):
+        with self.assertRaisesRegex(helper.ValidationError, "certificate/key/CA"):
+            helper.validate_installed_tls(helper.InstalledManualTls(self.cert, self.wrong_key), self.user)
 
 
 class InstalledTlsReadabilityTests(unittest.TestCase):
@@ -702,10 +765,16 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
                 bundle = self.protected_endpoint_bundle(policy, environment, "[Socket]\nListenStream=9443\n")
                 with mock.patch.object(helper, "copy_handoff_file", side_effect=lambda s, d, h, u, m: copy(s, d, h, os.getuid(), m)), \
                      mock.patch.object(helper, "installed_runtime_identity", return_value=helper.Identity("1.0.0", "a" * 12)), \
+                     mock.patch.object(helper, "preflight_executable", return_value=Path("/fixture/openssl")), \
+                     mock.patch.object(helper.subprocess, "run", side_effect=[
+                         subprocess.CompletedProcess([], 0, "X509v3 Basic Constraints: critical\n    CA:TRUE\n", ""),
+                         subprocess.CalledProcessError(1, ["/fixture/openssl", "verify"]),
+                     ]) as run, \
                      mock.patch.object(helper, "Systemctl") as controller, \
                      mock.patch.object(helper, "install_start_inhibit") as inhibit:
                     with self.assertRaises(helper.ValidationError):
                         stage_handoff(bundle, os.getuid(), policy)
+                self.assertEqual(2 if ca == unrelated else 0, run.call_count)
                 controller.assert_not_called()
                 inhibit.assert_not_called()
                 self.assertFalse(policy.active_path.exists())
