@@ -445,6 +445,76 @@ struct RuntimeSettlementAuthority {
     abandoned_reason: &'static str,
 }
 
+enum BackstopDrainReceipts {
+    Pending(Vec<String>),
+    Established,
+}
+
+#[derive(Clone, Copy)]
+enum RequiredSettlementBoundary {
+    Startup,
+    Tool,
+    Child,
+    ChildBackstop,
+}
+
+impl RequiredSettlementBoundary {
+    fn settlement(self) -> &'static str {
+        match self {
+            Self::Startup => "startup_steering_authority",
+            Self::Tool => "ordinary_tool_outcome_settlement",
+            Self::Child => "sub_agent_result_settlement",
+            Self::ChildBackstop => "cancellation_backstop_settlement",
+        }
+    }
+
+    fn owner_disappeared(self) -> &'static str {
+        match self {
+            Self::Startup => "startup_settlement_owner_disappeared",
+            Self::Tool => "ordinary_tool_outcome_owner_disappeared",
+            Self::Child => "sub_agent_result_owner_disappeared",
+            Self::ChildBackstop => "cancellation_backstop_owner_disappeared",
+        }
+    }
+}
+
+struct RequiredSettlementScope {
+    admission: crate::runtime::AdmittedOperation,
+    boundary: RequiredSettlementBoundary,
+    backstop_drain: Option<BackstopDrainReceipts>,
+}
+
+impl RequiredSettlementScope {
+    fn new(
+        admission: crate::runtime::AdmittedOperation,
+        boundary: RequiredSettlementBoundary,
+    ) -> Self {
+        Self {
+            admission,
+            boundary,
+            backstop_drain: None,
+        }
+    }
+
+    fn backstop(admission: crate::runtime::AdmittedOperation, children: Vec<String>) -> Self {
+        Self {
+            admission,
+            boundary: RequiredSettlementBoundary::ChildBackstop,
+            backstop_drain: (!children.is_empty())
+                .then_some(BackstopDrainReceipts::Pending(children)),
+        }
+    }
+
+    fn record_child_acceptance(&mut self, child_id: &str) {
+        if let Some(BackstopDrainReceipts::Pending(children)) = &mut self.backstop_drain {
+            children.retain(|pending| pending != child_id);
+            if children.is_empty() {
+                self.backstop_drain = Some(BackstopDrainReceipts::Established);
+            }
+        }
+    }
+}
+
 impl Drop for RuntimeSettlementAuthority {
     fn drop(&mut self) {
         if let Some(owner) = self.owner.take() {
@@ -2232,7 +2302,7 @@ where
     fatal_local_authority_fence: Arc<crate::runtime::FatalLocalAuthorityFence>,
     svg_publication_lifetime: Arc<super::svg_artifacts::SvgPublicationLifetime>,
     handoff_completion_authority: Option<crate::runtime::AdmittedOperation>,
-    required_settlement_authority: Option<crate::runtime::AdmittedOperation>,
+    required_settlement_authority: Option<RequiredSettlementScope>,
     handoff_completion_timestamp: Option<DateTime<Utc>>,
     continuation_effect_disposition: ContinuationEffectDisposition,
     recovery_disposition: RuntimeRecoveryDisposition,
@@ -2545,7 +2615,7 @@ where
             return Err("runtime state publication closed after fatal local authority loss".into());
         }
         if let Some(authority) = &mut self.required_settlement_authority {
-            return Ok(Some(authority.reborrow()));
+            return Ok(Some(authority.admission.reborrow()));
         }
         self.fatal_local_authority_fence
             .try_acquire()
@@ -2726,10 +2796,13 @@ where
         let Ok(mut owner) = self.admit_authoritative_effect() else {
             return self.closed_authority_exit().await;
         };
-        self.required_settlement_authority = Some(owner.reborrow());
+        self.required_settlement_authority = Some(RequiredSettlementScope::new(
+            owner.reborrow(),
+            RequiredSettlementBoundary::Startup,
+        ));
         let mut startup_authority = RuntimeSettlementAuthority {
             owner: Some(owner),
-            abandoned_reason: "startup_settlement_owner_disappeared",
+            abandoned_reason: RequiredSettlementBoundary::Startup.owner_disappeared(),
         };
 
         if matches!(
@@ -3491,14 +3564,22 @@ where
         &mut self,
         completion: RequiredCompletion,
     ) -> CompletionSettlement {
+        let boundary = match &completion {
+            RequiredCompletion::Tool(_) => RequiredSettlementBoundary::Tool,
+            RequiredCompletion::Child { .. } => RequiredSettlementBoundary::Child,
+        };
         let mut owner = match self.admit_authoritative_effect() {
             Ok(owner) => owner,
             Err(error) => return CompletionSettlement::DurableFactUnclassified(error),
         };
-        let enclosing_authority = self.required_settlement_authority.replace(owner.reborrow());
+        let owns_scope = self.required_settlement_authority.is_none();
+        if owns_scope {
+            self.required_settlement_authority =
+                Some(RequiredSettlementScope::new(owner.reborrow(), boundary));
+        }
         let mut authority = RuntimeSettlementAuthority {
             owner: Some(owner),
-            abandoned_reason: "ordinary_tool_outcome_owner_disappeared",
+            abandoned_reason: boundary.owner_disappeared(),
         };
         let settlement = async {
             let mut events = match completion {
@@ -3529,17 +3610,17 @@ where
             Ok::<(), String>(())
         }
         .await;
-        self.required_settlement_authority = enclosing_authority;
+        if owns_scope {
+            self.required_settlement_authority = None;
+        }
         match settlement {
             Ok(()) => {
                 authority.owner = None;
                 CompletionSettlement::DurableFactEstablished
             }
             Err(error) => {
-                // No command-scoped exact probe spans the checkpoint, replay,
-                // state, and steering mutations owned by this completion.
                 self.fatal_local_authority_fence
-                    .close("ordinary_tool_outcome_settlement");
+                    .close(boundary.settlement());
                 authority.owner = None;
                 CompletionSettlement::DurableFactUnclassified(error)
             }
@@ -4856,6 +4937,12 @@ where
                             )?;
                             self.manage_deadline(&failed_state);
                         }
+                        if is_steering_drain && authority.requires_committed_state() {
+                            if let Some(scope) = &self.required_settlement_authority {
+                                self.fatal_local_authority_fence
+                                    .close(scope.boundary.settlement());
+                            }
+                        }
                         if (terminal_subagent_transition || terminal_direct_turn_transition)
                             && !state_committed
                         {
@@ -5179,6 +5266,9 @@ where
                     Utc::now(),
                 )
                 .await?;
+            if let Some(scope) = &mut self.required_settlement_authority {
+                scope.record_child_acceptance(&child_id);
+            }
         } else if let (Some(turn), Some(terminal)) = (
             self.active_direct_turn.as_deref().cloned(),
             self.pending_direct_turn_terminal.as_deref().cloned(),
@@ -5888,10 +5978,15 @@ where
         let Ok(mut owner) = self.admit_authoritative_effect() else {
             return;
         };
-        let enclosing_authority = self.required_settlement_authority.replace(owner.reborrow());
+        let enclosing_authority =
+            self.required_settlement_authority
+                .replace(RequiredSettlementScope::backstop(
+                    owner.reborrow(),
+                    pending_ids.clone(),
+                ));
         let mut authority = RuntimeSettlementAuthority {
             owner: Some(owner),
-            abandoned_reason: "cancellation_backstop_settlement",
+            abandoned_reason: RequiredSettlementBoundary::ChildBackstop.owner_disappeared(),
         };
 
         tracing::warn!(
@@ -5923,6 +6018,9 @@ where
             {
                 tracing::warn!(%error, %agent_id, "failed to persist cancellation backstop terminal evidence");
                 self.required_settlement_authority = enclosing_authority;
+                self.fatal_local_authority_fence
+                    .close(RequiredSettlementBoundary::ChildBackstop.settlement());
+                authority.owner = None;
                 return;
             }
             let event = Event::SubAgentResult {
@@ -5940,34 +6038,30 @@ where
             {
                 tracing::warn!(error = %e, "Failed to process cancellation backstop SubAgentResult");
                 self.required_settlement_authority = enclosing_authority;
+                self.fatal_local_authority_fence
+                    .close(RequiredSettlementBoundary::ChildBackstop.settlement());
+                authority.owner = None;
                 return;
             }
         }
+        let drain_established = self
+            .required_settlement_authority
+            .as_ref()
+            .is_some_and(|scope| {
+                matches!(
+                    scope.backstop_drain.as_ref(),
+                    Some(BackstopDrainReceipts::Established)
+                )
+            });
         self.required_settlement_authority = enclosing_authority;
         authority.owner = None;
 
-        // Persist+broadcast the user-visible system message AFTER the drain
-        // loop commits the cancelled checkpoint, so its sequence is strictly
-        // after the work it describes. History replays by `sequence_id`; a
-        // lower sequence would make the notice appear before (or transiently
-        // instead of) the cancelled tool/sub-agent rounds on reconnect/replay.
-        //
-        // Only a user-requested cancel actually stops the conversation; a
-        // completion timeout drains and resumes the parent's LLM turn, so the
-        // "cancellation completed" notice would be wrong there.
-        if cause == crate::state_machine::event::CancelCause::UserRequested
-            && matches!(self.state, ConvState::Idle)
-        {
+        if cause == crate::state_machine::event::CancelCause::UserRequested && drain_established {
             self.broadcast_cancellation_backstop_message().await;
         }
     }
 
-    /// Persist+broadcast the user-visible "cancellation completed" system
-    /// message shared by both cancellation backstops. Keeps the user oriented:
-    /// the conversation is now Idle even though background resource reclamation
-    /// may still be in flight. Callers invoke this AFTER committing the
-    /// cancelled checkpoint so the message's sequence is strictly after the
-    /// work it describes (history replays by `sequence_id`).
+    /// Persist and broadcast the completed-cancellation notice.
     async fn broadcast_cancellation_backstop_message(&mut self) {
         let Ok(mut admitted) = self.admit_authoritative_effect() else {
             return;
@@ -6704,7 +6798,7 @@ where
             return Err("runtime persistence closed after fatal local authority loss".into());
         }
         if let Some(authority) = &mut self.required_settlement_authority {
-            return Ok(authority.reborrow());
+            return Ok(authority.admission.reborrow());
         }
         self.fatal_local_authority_fence
             .try_acquire()
@@ -14581,28 +14675,31 @@ mod unavailable_frozen_route_tests {
                     if failure.request == request && failure.error_kind == expected_error)
                 );
             } else {
-                assert!(runtime
+                let event = runtime
                     .execute_effect(Effect::RequestLlm)
                     .await
-                    .unwrap()
-                    .is_none());
-                let (generation, outcome) = runtime
-                    .llm_outcome_rx
-                    .try_recv()
-                    .expect("route failure queued");
-                assert_eq!(generation, 8);
-                match (&outcome, connection) {
-                    (LlmOutcome::RequestRejected { message }, Some(_)) => {
-                        assert!(message.contains("missing-connection"));
-                    }
-                    (LlmOutcome::NetworkError { message }, None) => {
-                        assert!(message.contains("missing-model"));
+                    .expect("route failure is a typed event")
+                    .expect("ordinary failure event");
+                assert_eq!(runtime.llm_request_generation, 8);
+                assert!(runtime.llm_outcome_rx.try_recv().is_err());
+                match &event {
+                    Event::LlmError {
+                        message,
+                        error_kind,
+                        attempt: actual_attempt,
+                        ..
+                    } => {
+                        assert_eq!(error_kind, &expected_error);
+                        assert_eq!(*actual_attempt, attempt);
+                        if connection.is_some() {
+                            assert!(message.contains("missing-connection"));
+                        } else {
+                            assert!(message.contains("missing-model"));
+                        }
                     }
                     other => panic!("wrong route failure classification: {other:?}"),
                 }
-                runtime
-                    .process_generation_tagged_llm_outcome(generation, outcome)
-                    .await;
+                runtime.process_event(event).await.unwrap();
                 assert!(matches!(
                     &runtime.state,
                     ConvState::Error { error_kind, .. } if error_kind == &expected_error
@@ -23515,6 +23612,10 @@ mod steer_drain_detector_tests {
                     .fatal_authority_loss_is_latched(),
                 evidence_failure
             );
+            assert_eq!(
+                *runtime.fatal_local_authority_fence.tx.borrow(),
+                evidence_failure.then_some("cancellation_backstop_settlement")
+            );
             assert_eq!(runtime.state, initial);
             assert_eq!(*watch_rx.borrow(), initial);
             assert_eq!(storage.get_all_messages(id).len(), messages_before);
@@ -23535,7 +23636,10 @@ mod steer_drain_detector_tests {
 
     #[tokio::test(start_paused = true)]
     async fn accepted_child_followup_failure_selects_fatal_caller_disposition() {
+        use crate::operational_observations::{counter, FailureBoundary};
+
         for cancelling in [false, true] {
+            let before = counter(FailureBoundary::OtherLocalAuthority).count();
             let id = "child-followup-failure";
             let (mut runtime, storage) = cancelling_runtime(
                 id,
@@ -23577,6 +23681,8 @@ mod steer_drain_detector_tests {
                 RuntimeExitDisposition::FatalLocalAuthorityLoss
             );
             assert!(fence.fatal_authority_loss_is_latched());
+            assert_eq!(*fence.tx.borrow(), Some("sub_agent_result_settlement"));
+            assert!(counter(FailureBoundary::OtherLocalAuthority).count() > before);
             assert!(matches!(
                 *watch_rx.borrow(),
                 ConvState::LlmRequesting { .. }
@@ -23669,6 +23775,238 @@ mod steer_drain_detector_tests {
                 storage.recorded_llm_request_metrics().len(),
                 usize::from(!fatal)
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_backstop_notice_follows_accepted_drain_after_inline_steering() {
+        for cause in [
+            crate::state_machine::event::CancelCause::UserRequested,
+            crate::state_machine::event::CancelCause::Timeout,
+        ] {
+            let id = "backstop-inline-steering-notice";
+            let (mut runtime, storage) = cancelling_runtime(id, &["child"], cause).await;
+            let entry = mk_entry("after-cancel", "continue after cancellation");
+            runtime.steering_queue = vec![entry.clone()];
+            storage.set_steering_queue(id, vec![entry]);
+            runtime.llm_client.queue_response(phoenix_llm::LlmResponse {
+                provider_replay: None,
+                content: vec![],
+                end_turn: true,
+                usage: phoenix_llm::Usage::default(),
+                usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            });
+            runtime.handle_cancelling_sub_agents_timeout().await;
+            assert!(!runtime.fatal_local_authority_fence.is_closed());
+            assert_eq!(storage.sub_agent_acceptance_count(), 1);
+            assert!(matches!(runtime.state, ConvState::LlmRequesting { .. }));
+            assert!(storage.get_steering_queue(id).is_empty());
+            let notices = storage.get_all_messages(id).into_iter().filter(|message| {
+                matches!(&message.content, MessageContent::System(content) if content.text.starts_with("Cancellation completed."))
+            }).collect::<Vec<_>>();
+            assert_eq!(
+                notices.len(),
+                usize::from(cause == crate::state_machine::event::CancelCause::UserRequested)
+            );
+            for notice in &notices {
+                let checkpoint = storage
+                    .get_all_messages(id)
+                    .into_iter()
+                    .find(|message| {
+                        matches!(&message.content,
+                    MessageContent::Tool(content) if content.tool_use_id == "spawn-1")
+                    })
+                    .unwrap();
+                assert!(checkpoint.sequence_id < notice.sequence_id);
+            }
+            runtime.handle_cancelling_sub_agents_timeout().await;
+            let repeated = storage.get_all_messages(id).into_iter().filter(|message| {
+                matches!(&message.content, MessageContent::System(content) if content.text.starts_with("Cancellation completed."))
+            }).count();
+            assert_eq!(repeated, notices.len());
+            runtime.abort_external_effects().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn child_completion_owner_loss_retains_its_own_boundary() {
+        let (mut runtime, storage) = build_runtime_with_state_and_queue(
+            "child-completion-owner-loss",
+            mk_awaiting_with_pending("child"),
+            vec![],
+        );
+        let fence = runtime.fatal_local_authority_fence.clone();
+        let (started, _release) = storage.gate_state_update();
+        let task = tokio::spawn(async move {
+            runtime
+                .process_event(Event::SubAgentResult {
+                    agent_id: "child".into(),
+                    outcome: SubAgentOutcome::Success {
+                        result: "done".into(),
+                    },
+                })
+                .await
+        });
+        started.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            *fence.tx.borrow(),
+            Some("sub_agent_result_owner_disappeared")
+        );
+        assert_eq!(fence.owner_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn child_backstop_does_not_repeat_its_completed_forced_tool_notice() {
+        let mut initial = ordinary_completion_state();
+        if let ConvState::ToolExecuting {
+            pending_sub_agents, ..
+        } = &mut initial
+        {
+            pending_sub_agents.push(PendingSubAgent {
+                agent_id: "child".into(),
+                task: "task".into(),
+                mode: SubAgentMode::Work,
+            });
+        }
+        let id = "forced-tool-child-notice";
+        let (mut runtime, storage) = build_runtime_with_state_and_queue(id, initial, vec![]);
+        runtime.sub_agent_result_buffer.push(Event::SubAgentResult {
+            agent_id: "child".into(),
+            outcome: SubAgentOutcome::Success {
+                result: "done".into(),
+            },
+        });
+        runtime
+            .process_event(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await
+            .unwrap();
+        runtime.handle_cancelling_tool_timeout().await;
+        assert!(matches!(runtime.state, ConvState::Idle));
+        assert_eq!(storage.sub_agent_acceptance_count(), 1);
+        let notices_before = storage
+            .get_all_messages(id)
+            .iter()
+            .filter(|message| {
+                matches!(&message.content,
+            MessageContent::System(content) if content.text.starts_with("Cancellation completed."))
+            })
+            .count();
+        assert_eq!(notices_before, 1);
+        runtime.handle_cancelling_sub_agents_timeout().await;
+        let notices_after = storage
+            .get_all_messages(id)
+            .iter()
+            .filter(|message| {
+                matches!(&message.content,
+            MessageContent::System(content) if content.text.starts_with("Cancellation completed."))
+            })
+            .count();
+        assert_eq!(notices_after, notices_before);
+    }
+
+    #[tokio::test]
+    async fn backstop_notice_is_not_published_when_inline_steering_commit_fails() {
+        let id = "backstop-inline-steering-failure";
+        let (mut runtime, storage) = cancelling_runtime(
+            id,
+            &["child"],
+            crate::state_machine::event::CancelCause::UserRequested,
+        )
+        .await;
+        let entry = mk_entry("after-cancel-failure", "continue after cancellation");
+        runtime.steering_queue = vec![entry.clone()];
+        storage.set_steering_queue(id, vec![entry]);
+        storage.set_steering_drain_failures(1);
+        runtime.handle_cancelling_sub_agents_timeout().await;
+        assert_eq!(storage.sub_agent_acceptance_count(), 1);
+        assert!(runtime.fatal_local_authority_fence.is_closed());
+        assert_eq!(
+            *runtime.fatal_local_authority_fence.tx.borrow(),
+            Some("cancellation_backstop_settlement")
+        );
+        assert!(runtime.llm_client.recorded_requests().is_empty());
+        assert!(!storage.get_all_messages(id).iter().any(|message| matches!(&message.content,
+            MessageContent::System(content) if content.text.starts_with("Cancellation completed."))));
+    }
+
+    #[tokio::test]
+    async fn nested_child_completion_preserves_exact_backstop_receipt_ownership() {
+        let id = "nested-child-backstop-receipts";
+        let (mut runtime, storage) = cancelling_runtime(
+            id,
+            &["child-a", "child-b"],
+            crate::state_machine::event::CancelCause::UserRequested,
+        )
+        .await;
+        let admission = runtime.admit_authoritative_effect().unwrap();
+        runtime.required_settlement_authority = Some(RequiredSettlementScope::backstop(
+            admission,
+            vec!["child-a".into(), "child-b".into()],
+        ));
+        for child_id in ["child-a", "child-b"] {
+            assert!(matches!(
+                runtime
+                    .settle_required_completion(RequiredCompletion::Child {
+                        agent_id: child_id.into(),
+                        outcome: SubAgentOutcome::Success {
+                            result: "done".into()
+                        },
+                    })
+                    .await,
+                CompletionSettlement::DurableFactEstablished
+            ));
+            let scope = runtime.required_settlement_authority.as_ref().unwrap();
+            if child_id == "child-a" {
+                assert!(matches!(&scope.backstop_drain,
+                    Some(BackstopDrainReceipts::Pending(children)) if children.iter().map(String::as_str).eq(["child-b"])));
+            } else {
+                assert!(matches!(
+                    scope.backstop_drain,
+                    Some(BackstopDrainReceipts::Established)
+                ));
+            }
+        }
+        assert_eq!(storage.sub_agent_acceptance_count(), 2);
+        assert!(matches!(runtime.state, ConvState::Idle));
+        runtime.required_settlement_authority = None;
+        assert_eq!(runtime.fatal_local_authority_fence.owner_count(), 0);
+        assert!(!runtime.fatal_local_authority_fence.is_closed());
+    }
+
+    #[tokio::test]
+    async fn native_child_backstop_owner_cancellation_uses_owner_disappeared_category() {
+        use crate::operational_observations::{counter, FailureBoundary};
+
+        for during_shutdown in [false, true] {
+            let (mut runtime, storage) = cancelling_runtime(
+                "native-child-backstop-owner-loss",
+                &["child"],
+                crate::state_machine::event::CancelCause::UserRequested,
+            )
+            .await;
+            let fence = runtime.fatal_local_authority_fence.clone();
+            let before = counter(FailureBoundary::SettlementOwnerDisappeared).count();
+            let (started, _release) = storage.gate_state_update();
+            let task =
+                tokio::spawn(async move { runtime.handle_cancelling_sub_agents_timeout().await });
+            started.await.unwrap();
+            if during_shutdown {
+                fence.close_for_process_shutdown();
+            }
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert_eq!(
+                *fence.tx.borrow(),
+                Some("cancellation_backstop_owner_disappeared")
+            );
+            assert!(counter(FailureBoundary::SettlementOwnerDisappeared).count() > before);
+            assert_eq!(fence.owner_count(), 0);
         }
     }
 

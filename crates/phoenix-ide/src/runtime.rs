@@ -14732,9 +14732,37 @@ mod scope_liveness_tests {
         transfer_barrier.wait().await;
         barrier.wait().await;
 
-        ordinary.await.unwrap().unwrap();
-        inherited.await.unwrap().unwrap();
-        assert!(mgr.try_get_handle(conversation_id).await.is_some());
+        let ordinary_handle = ordinary.await.unwrap().unwrap();
+        let inherited_handle = inherited.await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(
+            &ordinary_handle.identity,
+            &inherited_handle.identity
+        ));
+        assert!(ordinary_handle
+            .broadcast_tx
+            .same_channel(&inherited_handle.broadcast_tx));
+        assert!(ordinary_handle
+            .event_tx
+            .same_channel(&inherited_handle.event_tx));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            ordinary_handle.event_tx.closed(),
+        )
+        .await
+        .expect("the materialized runtime retires after fatal admission closure");
+        assert!(inherited_handle.event_tx.is_closed());
+        assert_eq!(
+            ordinary_handle.state_rx.borrow().presentation_mode(),
+            "idle"
+        );
+        assert_eq!(
+            inherited_handle.state_rx.borrow().presentation_mode(),
+            "idle"
+        );
+        assert_eq!(
+            mgr.observed_local_authority_failure_boundary(),
+            Some("test_late_inherited_materialization")
+        );
         assert!(!mgr
             .runtime_creations
             .lock()
