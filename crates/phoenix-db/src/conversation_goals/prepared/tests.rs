@@ -4,9 +4,10 @@ use crate::conversation_goals::writer_tests::{at, counts, fixture, ordinary};
 use phoenix_core::domain::db_schema::{InputOrigin, MessageContent};
 use phoenix_core::domain::llm_types::ContentBlock;
 use phoenix_core::domain::sm_event::{
-    DirectTurnTurnId, PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
+    CancelCause, DirectTurnTurnId, PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
     SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
 };
+use phoenix_core::domain::sm_state::{AssistantMessage, ToolCall, ToolInput};
 use phoenix_workflow::{
     AcceptedDisposition, ClientTurnKey, ConversationAuthority, PreparedTurn, Timestamp,
 };
@@ -88,6 +89,92 @@ async fn coordinator_source(
     (caller, owner, source_call, DirectTurnTurnId(turn_id.0))
 }
 
+fn source_tool(id: &str, name: &str) -> ToolCall {
+    ToolCall::new(
+        id,
+        ToolInput::Unknown {
+            name: name.into(),
+            input: serde_json::json!({"operation": "create"}),
+        },
+    )
+}
+
+fn source_assistant(
+    source_call: &SourceToolCall,
+    message_id: &str,
+    name: &str,
+) -> AssistantMessage {
+    AssistantMessage::new(
+        message_id.into(),
+        vec![ContentBlock::tool_use(
+            &source_call.tool_use_id,
+            name,
+            serde_json::json!({"operation": "create"}),
+        )],
+        None,
+        None,
+    )
+}
+
+fn executing_source_state(
+    current_tool: ToolCall,
+    remaining_tools: Vec<ToolCall>,
+    assistant_message_id: &str,
+    assistant_tool_id: &str,
+    assistant_tool_name: &str,
+) -> crate::ConvState {
+    crate::ConvState::ToolExecuting {
+        current_tool,
+        remaining_tools,
+        completed_results: vec![],
+        pending_sub_agents: vec![],
+        assistant_message: AssistantMessage::new(
+            assistant_message_id.into(),
+            vec![ContentBlock::tool_use(
+                assistant_tool_id,
+                assistant_tool_name,
+                serde_json::json!({"operation": "create"}),
+            )],
+            None,
+            None,
+        ),
+    }
+}
+
+async fn remove_source_message(db: &Database, caller: &str, source_call: &SourceToolCall) {
+    sqlx::query("DELETE FROM messages WHERE conversation_id=? AND message_id=?")
+        .bind(caller)
+        .bind(&source_call.message_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+}
+
+async fn assert_in_flight_source_refused(
+    db: &Database,
+    caller: &str,
+    owner: &ProductConversationId,
+    source_call: &SourceToolCall,
+    turn: DirectTurnTurnId,
+    state: &crate::ConvState,
+) {
+    db.update_conversation_state(caller, state).await.unwrap();
+    assert!(matches!(
+        db.prepare_coordinator_goal_action(
+            caller,
+            owner,
+            source_call,
+            turn,
+            create_intent("refused source"),
+        )
+        .await
+        .established()
+        .expect("preparation authority classified"),
+        Err(GoalDbError::TargetChanged)
+    ));
+    assert_eq!(preparation_count(db).await, 0);
+}
+
 fn create_intent(objective: &str) -> GoalPreparationIntent {
     GoalPreparationIntent::Create {
         objective: GoalText::parse(objective).unwrap(),
@@ -99,6 +186,118 @@ async fn preparation_count(db: &Database) -> i64 {
         .fetch_one(db.pool())
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn prepare_accepts_current_in_flight_prepare_goal_without_agent_message() {
+    let db = fixture().await;
+    let (caller, _, source_call, turn) = coordinator_source(&db, "prep-in-flight").await;
+    let (_, owner) = ordinary(&db, "prep-in-flight-owner").await;
+    remove_source_message(&db, &caller, &source_call).await;
+    let state = executing_source_state(
+        source_tool(&source_call.tool_use_id, "prepare_goal"),
+        vec![],
+        &source_call.message_id,
+        &source_call.tool_use_id,
+        "prepare_goal",
+    );
+    db.update_conversation_state(&caller, &state).await.unwrap();
+
+    let prepared = db
+        .prepare_coordinator_goal_action(
+            &caller,
+            &owner,
+            &source_call,
+            turn,
+            create_intent("in-flight source"),
+        )
+        .await
+        .established()
+        .expect("preparation authority classified")
+        .unwrap();
+
+    assert_eq!(prepared.source.message_id.as_str(), source_call.message_id);
+    assert_eq!(
+        prepared.source.tool_use_id.as_str(),
+        source_call.tool_use_id
+    );
+    assert_eq!(preparation_count(&db).await, 1);
+}
+
+#[tokio::test]
+async fn prepare_rejects_mismatched_or_non_current_in_flight_source() {
+    let db = fixture().await;
+    let (caller, _, source_call, turn) = coordinator_source(&db, "prep-invalid-flight").await;
+    let (_, owner) = ordinary(&db, "prep-invalid-flight-owner").await;
+    remove_source_message(&db, &caller, &source_call).await;
+
+    let wrong_name = executing_source_state(
+        source_tool(&source_call.tool_use_id, "apply_goal"),
+        vec![],
+        &source_call.message_id,
+        &source_call.tool_use_id,
+        "prepare_goal",
+    );
+    assert_in_flight_source_refused(&db, &caller, &owner, &source_call, turn, &wrong_name).await;
+
+    let queued_not_current = executing_source_state(
+        source_tool("other-current-tool", "prepare_goal"),
+        vec![source_tool(&source_call.tool_use_id, "prepare_goal")],
+        &source_call.message_id,
+        &source_call.tool_use_id,
+        "prepare_goal",
+    );
+    assert_in_flight_source_refused(
+        &db,
+        &caller,
+        &owner,
+        &source_call,
+        turn,
+        &queued_not_current,
+    )
+    .await;
+
+    let wrong_assistant = executing_source_state(
+        source_tool(&source_call.tool_use_id, "prepare_goal"),
+        vec![],
+        "other-assistant-message",
+        &source_call.tool_use_id,
+        "prepare_goal",
+    );
+    assert_in_flight_source_refused(&db, &caller, &owner, &source_call, turn, &wrong_assistant)
+        .await;
+
+    for (block_id, block_name) in [
+        ("other-tool-use", "prepare_goal"),
+        (source_call.tool_use_id.as_str(), "apply_goal"),
+    ] {
+        let mismatched_block = executing_source_state(
+            source_tool(&source_call.tool_use_id, "prepare_goal"),
+            vec![],
+            &source_call.message_id,
+            block_id,
+            block_name,
+        );
+        assert_in_flight_source_refused(
+            &db,
+            &caller,
+            &owner,
+            &source_call,
+            turn,
+            &mismatched_block,
+        )
+        .await;
+    }
+
+    let cancelling = crate::ConvState::CancellingTool {
+        tool_use_id: source_call.tool_use_id.clone(),
+        cause: CancelCause::UserRequested,
+        skipped_tools: vec![],
+        completed_results: vec![],
+        assistant_message: source_assistant(&source_call, &source_call.message_id, "prepare_goal"),
+        pending_sub_agents: vec![],
+    };
+    assert_in_flight_source_refused(&db, &caller, &owner, &source_call, turn, &cancelling).await;
 }
 
 #[tokio::test]
@@ -120,7 +319,8 @@ async fn goal_preparation_migration_follows_conversation_tool_migrations() {
             (148, "product_creation_initial_execution_receipts".into()),
             (149, "product_creation_image_retirement".into()),
             (150, "federated_subscription_terminal_cancellation".into()),
-            (151, "one_shot_conversation_reminders".into())
+            (151, "one_shot_conversation_reminders".into()),
+            (152, "goal_preparation_inflight_source".into())
         ]
     );
 }

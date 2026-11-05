@@ -190,6 +190,58 @@ pub(super) async fn require_retained_preparation(
     Ok(())
 }
 
+async fn require_source_tool_provenance(
+    tx: &mut GoalTx<'_>,
+    caller: &str,
+    source_call: &SourceToolCall,
+) -> Result<()> {
+    let message: Option<String> = sqlx::query_scalar(
+        "SELECT content FROM messages WHERE conversation_id=? AND message_id=? AND message_type='agent'",
+    )
+    .bind(caller)
+    .bind(&source_call.message_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(message) = message {
+        let blocks: Vec<phoenix_core::domain::llm_types::ContentBlock> =
+            serde_json::from_str(&message)
+                .map_err(|_| GoalDbError::Integrity("source tool message content"))?;
+        if blocks.iter().any(|block| {
+            matches!(block, phoenix_core::domain::llm_types::ContentBlock::ToolUse { id, .. } if id == &source_call.tool_use_id)
+        }) {
+            return Ok(());
+        }
+        return Err(GoalDbError::TargetChanged);
+    }
+
+    let state: Option<String> = sqlx::query_scalar("SELECT state FROM conversations WHERE id=?")
+        .bind(caller)
+        .fetch_optional(&mut **tx)
+        .await?;
+    let state: crate::ConvState =
+        serde_json::from_str(&state.ok_or(GoalDbError::TargetChanged)?)
+            .map_err(|_| GoalDbError::Integrity("source tool conversation state"))?;
+    let crate::ConvState::ToolExecuting {
+        current_tool,
+        assistant_message,
+        ..
+    } = state
+    else {
+        return Err(GoalDbError::TargetChanged);
+    };
+    if current_tool.name() != "prepare_goal"
+        || current_tool.id != source_call.tool_use_id
+        || assistant_message.message_id != source_call.message_id
+        || !assistant_message.content.iter().any(|block| {
+            matches!(block, phoenix_core::domain::llm_types::ContentBlock::ToolUse { id, name, .. }
+                if id == &source_call.tool_use_id && name == "prepare_goal")
+        })
+    {
+        return Err(GoalDbError::TargetChanged);
+    }
+    Ok(())
+}
+
 impl Database {
     /// Read the current Goal and history after the supplied version.
     ///
@@ -302,12 +354,7 @@ impl Database {
                 message_id: GoalText::parse(source_call.message_id.clone())?,
                 tool_use_id: GoalText::parse(source_call.tool_use_id.clone())?,
             };
-            let message: Option<String> = sqlx::query_scalar("SELECT content FROM messages WHERE conversation_id=? AND message_id=? AND message_type='agent'")
-                .bind(caller).bind(&source_call.message_id).fetch_optional(&mut *tx).await?;
-            let blocks: Vec<phoenix_core::domain::llm_types::ContentBlock> =
-                serde_json::from_str(&message.ok_or(GoalDbError::TargetChanged)?)
-                    .map_err(|_| GoalDbError::Integrity("source tool message content"))?;
-            if !blocks.iter().any(|block| matches!(block, phoenix_core::domain::llm_types::ContentBlock::ToolUse { id, .. } if id == &source_call.tool_use_id)) { return Err(GoalDbError::TargetChanged); }
+            require_source_tool_provenance(&mut tx, caller, source_call).await?;
             let live = Self::get_ordinary_product_conversation_on(&mut tx, owner).await?;
             super::admission::require_target_tx(&mut tx, owner, &live.latest_transcript_row_id).await?;
             let current = current_tx(&mut tx, owner).await?;
