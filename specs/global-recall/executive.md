@@ -28,7 +28,9 @@ delivery and parent acceptance, including durable-result reconciliation. One
 cancellation-resistant cleanup joins admitted launches through payload release
 or bounded unregistered settlement, then attempts bounded incarnation-bound
 cleanup of that child's handles across selected WorkScopes. A parent-cancellation
-backstop joins the same operation; terminal recreation closes the controller,
+backstop joins the same operation. Parent requests, per-child timeouts and direct
+child cancellation fence admission before event dispatch without waiting for
+pending launch custody. Terminal recreation closes the controller,
 while nonterminal recreation preserves admission. WorkScopes retain ownership,
 inventory and tombstones; sibling and parent commands are unaffected. Safe
 signaling is Linux-only; unsupported hosts report incomplete cleanup without a
@@ -104,9 +106,15 @@ parent-cancellation cleanup, durable database acceptance, ordinary/unrelated
 isolation, terminal versus Interrupted/Recreate behavior, and real foreground
 Bash delegation. Two ordering regressions failed before the cleanup hooks were
 added. Linux real-background SIGKILL/tombstone and result/error-before-parent-resume
-regressions are authored but unrun locally; hosted execution remains pending.
+regressions run in hosted CI; [PR #1027](https://github.com/scottopell/phoenix-ide/pull/1027)
+carries exact-head Linux and macOS results.
 The earlier mixed-terminal/task-proposal fix passed 210 state-machine tests.
-These are focused results, not full current-head CI, deployment or measured token savings.
+Five cancellation-boundary regressions pass locally; disabling the start hooks
+makes four fail while ordinary Work isolation still passes. The initialized-home
+parent regression fails with WorkScope controller identity and passes with
+Coordinator control; the real child Bash round-trip and cleanup-order regressions
+also pass. These local results do not establish Linux signaling, deployment or
+measured token savings.
 
 The bounded API-guidance candidate (ADR-113) replaces an accidental recipe allowlist with non-exhaustive contract-grounded guidance and documents submitting exact user-provided answers or decisions made within explicit delegated decision scope through the existing structured-question response endpoint. Generic inspect/unblock instructions are not decision authority; approvals must never be fabricated or delegation extended. Gap inventories are illustrative and qualified by inspected deployment/source, permitting verified supported alternatives and bounded state reads, not invented guarantees/receipts, database/private-handler bypasses, or background monitors. It does not add tool or runtime capabilities. The recipe distinguishes current request freshness from idempotency, requires complete answers despite the backend's lack of completeness enforcement, posts once, and reconciles uncertainty against the original target without treating conflicts as success. Source/wire/UI anchors and offline Python drift checks are described in `../builtin-skills/executive.md`. Prompt/built-in/continuation Rust regressions are authored but intentionally unrun locally; no live API/question calls, instruction activation, merge or deployment are claimed.
 

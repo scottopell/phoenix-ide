@@ -162,6 +162,19 @@ impl AddressedConversationEventDispatcher {
 #[async_trait::async_trait]
 impl ConversationEventDispatcher for AddressedConversationEventDispatcher {
     async fn dispatch(&self, conversation_id: &str, event: Event) -> Result<(), String> {
+        #[cfg(test)]
+        if matches!(event, Event::UserCancel { .. }) {
+            let barrier = self
+                .manager
+                .subagent_cancel_dispatch_barriers
+                .lock()
+                .await
+                .remove(conversation_id);
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+        }
         let handle = self.resolve(conversation_id).await?;
         self.dispatch_resolved(&handle, event).await
     }
@@ -706,6 +719,8 @@ pub struct RuntimeManager {
     runtime_materialization_panics: AsyncMutex<HashSet<String>>,
     #[cfg(test)]
     runtime_materialization_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    subagent_cancel_dispatch_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     steering_enqueue_handle_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
@@ -2587,6 +2602,8 @@ impl RuntimeManager {
             runtime_materialization_panics: AsyncMutex::new(HashSet::new()),
             #[cfg(test)]
             runtime_materialization_barriers: AsyncMutex::new(HashMap::new()),
+            #[cfg(test)]
+            subagent_cancel_dispatch_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
             steering_enqueue_handle_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
@@ -4997,7 +5014,6 @@ impl RuntimeManager {
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(dispatch.timeout_millis)).await;
             match manager
-                .db
                 .request_sub_agent_cancellation(
                     &agent_id,
                     phoenix_db::SubAgentTerminalCause::TimedOut,
@@ -5005,7 +5021,7 @@ impl RuntimeManager {
                 )
                 .await
             {
-                Ok(phoenix_db::SubAgentCancellationOutcome::DeliverToRuntime(cause)) => {
+                Ok((phoenix_db::SubAgentCancellationOutcome::DeliverToRuntime(cause), _)) => {
                     let _ = AddressedConversationEventDispatcher::new(Arc::clone(&manager))
                         .dispatch(
                             &agent_id,
@@ -5030,13 +5046,48 @@ impl RuntimeManager {
         Ok(())
     }
 
+    async fn request_sub_agent_cancellation(
+        &self,
+        agent_id: &str,
+        cause: phoenix_db::SubAgentTerminalCause,
+        requested_at: DateTime<Utc>,
+    ) -> Result<(phoenix_db::SubAgentCancellationOutcome, bool), crate::db::DbError> {
+        let inline_child = self.is_inline_coordinator_child(agent_id).await?;
+        let outcome = self
+            .db
+            .request_sub_agent_cancellation(agent_id, cause, requested_at)
+            .await?;
+        if inline_child {
+            self.bash_handles
+                .begin_unattached_controller_retirement(agent_id)
+                .await;
+        }
+        Ok((outcome, inline_child))
+    }
+
+    async fn is_inline_coordinator_child(
+        &self,
+        agent_id: &str,
+    ) -> Result<bool, crate::db::DbError> {
+        let child = self.db.get_conversation(agent_id).await?;
+        if child.runtime_role != crate::work_scope::RuntimeRole::SubAgent
+            || child.attached_work_scope_id.is_some()
+        {
+            return Ok(false);
+        }
+        let Some(parent_id) = child.parent_conversation_id else {
+            return Ok(false);
+        };
+        let parent = self.db.get_conversation(&parent_id).await?;
+        Ok(parent.runtime_role == crate::work_scope::RuntimeRole::Coordinator)
+    }
+
     /// Handle a sub-agent cancel request
     async fn handle_cancel_request(self: &Arc<Self>, req: SubAgentCancelRequest) {
         let dispatcher = AddressedConversationEventDispatcher::new(Arc::clone(self));
         let mut dispositions = Vec::with_capacity(req.ids.len());
         for agent_id in req.ids {
             let outcome = self
-                .db
                 .request_sub_agent_cancellation(
                     &agent_id,
                     match req.cause {
@@ -5055,33 +5106,44 @@ impl RuntimeManager {
         let mut runtime_deliveries = Vec::new();
         for (agent_id, outcome) in dispositions {
             match outcome {
-                Ok(phoenix_db::SubAgentCancellationOutcome::CancelledBeforeDispatch) => {
-                    if let Err(error) = dispatcher
-                        .dispatch(
-                            &req.parent_conversation_id,
-                            Event::SubAgentResult {
-                                agent_id,
-                                outcome: match req.cause {
-                                    crate::state_machine::event::CancelCause::Timeout => {
-                                        SubAgentOutcome::TimedOut
-                                    }
-                                    crate::state_machine::event::CancelCause::UserRequested => {
-                                        SubAgentOutcome::Failure {
-                                            error: "Sub-agent cancelled before initial dispatch"
-                                                .to_string(),
-                                            error_kind: crate::db::ErrorKind::Cancelled,
+                Ok((
+                    phoenix_db::SubAgentCancellationOutcome::CancelledBeforeDispatch,
+                    inline_child,
+                )) => {
+                    let dispatcher = dispatcher.clone();
+                    let registry = self.bash_handles.clone();
+                    let parent_id = req.parent_conversation_id.clone();
+                    runtime_deliveries.push(tokio::spawn(async move {
+                        if inline_child {
+                            retire_inline_child_bash_controller(&registry, &agent_id).await;
+                        }
+                        if let Err(error) = dispatcher
+                            .dispatch(
+                                &parent_id,
+                                Event::SubAgentResult {
+                                    agent_id,
+                                    outcome: match req.cause {
+                                        crate::state_machine::event::CancelCause::Timeout => {
+                                            SubAgentOutcome::TimedOut
                                         }
-                                    }
+                                        crate::state_machine::event::CancelCause::UserRequested => {
+                                            SubAgentOutcome::Failure {
+                                                error: "Sub-agent cancelled before initial dispatch"
+                                                    .to_string(),
+                                                error_kind: crate::db::ErrorKind::Cancelled,
+                                            }
+                                        }
+                                    },
                                 },
-                            },
-                        )
-                        .await
-                    {
-                        tracing::warn!(%error, parent_id = %req.parent_conversation_id, "pre-dispatch cancellation delivery deferred to durable reconciliation");
-                        let _ = dispatcher.reconcile(&req.parent_conversation_id).await;
-                    }
+                            )
+                            .await
+                        {
+                            tracing::warn!(%error, %parent_id, "pre-dispatch cancellation delivery deferred to durable reconciliation");
+                            let _ = dispatcher.reconcile(&parent_id).await;
+                        }
+                    }));
                 }
-                Ok(phoenix_db::SubAgentCancellationOutcome::DeliverToRuntime(cause)) => {
+                Ok((phoenix_db::SubAgentCancellationOutcome::DeliverToRuntime(cause), _)) => {
                     let dispatcher = dispatcher.clone();
                     runtime_deliveries.push(tokio::spawn(async move {
                         if let Err(error) = dispatcher
@@ -5101,10 +5163,11 @@ impl RuntimeManager {
                         }
                     }));
                 }
-                Ok(
+                Ok((
                     phoenix_db::SubAgentCancellationOutcome::AlreadyRequested
                     | phoenix_db::SubAgentCancellationOutcome::AlreadyTerminal,
-                ) => {}
+                    _,
+                )) => {}
                 Err(error) => {
                     tracing::error!(%error, %agent_id, "failed to request sub-agent cancellation");
                 }
@@ -6897,6 +6960,16 @@ impl RuntimeManager {
         event: Event,
     ) -> Result<AcknowledgedEventOutcome, String> {
         let handle = self.get_or_create(conversation_id).await?;
+        if matches!(event, Event::UserCancel { .. })
+            && self
+                .is_inline_coordinator_child(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?
+        {
+            self.bash_handles
+                .begin_unattached_controller_retirement(conversation_id)
+                .await;
+        }
         deposit_turn_trigger(&handle);
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         let (retirement_tx, retirement_rx) = tokio::sync::oneshot::channel();
@@ -10785,6 +10858,453 @@ mod scope_liveness_tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    fn cancellation_boundary_spec(agent_id: &str) -> SubAgentSpec {
+        SubAgentSpec {
+            agent_id: agent_id.into(),
+            task: "cancellation admission boundary".into(),
+            environment:
+                phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem,
+            timeout: std::time::Duration::from_millis(1),
+            mode: SubAgentMode::Explore,
+            model_id: "gpt-5.6-sol".into(),
+            connection: "openai_responses".into(),
+            effort: None,
+            max_turns: 1,
+            agent_name: None,
+            persona: None,
+        }
+    }
+
+    async fn cancellation_boundary_fixture(
+        ids: &[&str],
+    ) -> (
+        Arc<RuntimeManager>,
+        crate::db::Conversation,
+        Vec<SubAgentSpec>,
+    ) {
+        let mut manager = test_manager().await;
+        manager.llm_registry = Arc::new(ModelRegistry::new(&phoenix_llm::LlmConfig {
+            openai_api_key: Some("test-key".into()),
+            ..Default::default()
+        }));
+        let manager = Arc::new(manager);
+        let parent = manager
+            .db()
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let specs: Vec<_> = ids
+            .iter()
+            .map(|id| cancellation_boundary_spec(id))
+            .collect();
+        manager
+            .admit_sub_agent_batch(
+                "cancellation-boundary-batch",
+                &specs,
+                &parent.id,
+                parent.attached_work_scope_id.clone(),
+                false,
+            )
+            .await
+            .unwrap();
+        (manager, parent, specs)
+    }
+
+    async fn insert_cancellation_boundary_handle(
+        manager: &RuntimeManager,
+        conversation_id: &str,
+    ) -> (
+        mpsc::Receiver<Event>,
+        mpsc::Receiver<AcknowledgedEventRequest>,
+    ) {
+        let (event_tx, event_rx) = mpsc::channel(4);
+        let (acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(4);
+        let (_state_tx, state_rx) = watch::channel(ConvState::Idle);
+        manager.runtimes.write().await.insert(
+            conversation_id.into(),
+            ConversationHandle {
+                event_tx,
+                acknowledged_event_tx,
+                handoff_review_tx: None,
+                turn_trigger: TurnTriggerSlot::default(),
+                broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
+                identity: Arc::new(()),
+                state_rx,
+                startup_llm_recovery_ack: Arc::new(AsyncMutex::new(None)),
+            },
+        );
+        (event_rx, acknowledged_event_rx)
+    }
+
+    async fn assert_controller_fenced(
+        manager: &RuntimeManager,
+        owner: &ResourceScopeKey,
+        child_id: &str,
+    ) {
+        assert!(
+            matches!(
+                manager
+                    .bash_handles()
+                    .reserve_spawn_for_controller(
+                        owner,
+                        &ResourceScopeKey::Unattached(child_id.into()),
+                    )
+                    .await,
+                Err(phoenix_tools::bash::BashHandleError::SpawnFenced)
+            ),
+            "cancellation must fence {child_id} before event dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_cancellation_boundary_fences_entire_batch_before_dispatch_and_cleanup() {
+        let (manager, parent, specs) = cancellation_boundary_fixture(&[
+            "cancel-first",
+            "cancel-second",
+            "uncancelled-sibling",
+        ])
+        .await;
+        let owner = ResourceScopeKey::Work(WorkScopeId::new());
+        let mut leases = Vec::new();
+        let mut receivers = Vec::new();
+        for spec in &specs[..2] {
+            leases.push(
+                manager
+                    .bash_handles()
+                    .reserve_spawn_for_controller(
+                        &owner,
+                        &ResourceScopeKey::Unattached(spec.agent_id.clone()),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            assert!(matches!(
+                manager.db().claim_sub_agent_initial_dispatch(&spec.agent_id, Utc::now()).await,
+                phoenix_db::SubAgentInitialDispatchAuthority::Established(dispatch)
+                    if dispatch.outcome == phoenix_db::SubAgentInitialDispatchOutcome::Claimed
+            ));
+            receivers.push(insert_cancellation_boundary_handle(&manager, &spec.agent_id).await);
+        }
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .subagent_cancel_dispatch_barriers
+            .lock()
+            .await
+            .insert(specs[0].agent_id.clone(), barrier.clone());
+        let cancel = tokio::spawn({
+            let manager = manager.clone();
+            let parent_id = parent.id.clone();
+            async move {
+                manager
+                    .handle_cancel_request(SubAgentCancelRequest {
+                        ids: vec!["cancel-first".into(), "cancel-second".into()],
+                        parent_conversation_id: parent_id,
+                        cause: crate::state_machine::event::CancelCause::UserRequested,
+                    })
+                    .await;
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), barrier.wait())
+            .await
+            .expect("production child cancellation reaches dispatch");
+        for spec in &specs[..2] {
+            assert_controller_fenced(&manager, &owner, &spec.agent_id).await;
+        }
+        manager
+            .handle_cancel_request(SubAgentCancelRequest {
+                ids: vec![specs[0].agent_id.clone(), specs[1].agent_id.clone()],
+                parent_conversation_id: parent.id,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await;
+        assert!(manager.bash_handles().reserve_spawn(&owner).await.is_ok());
+        for controller in [
+            ResourceScopeKey::Unattached(specs[2].agent_id.clone()),
+            ResourceScopeKey::Coordinator,
+        ] {
+            assert!(manager
+                .bash_handles()
+                .reserve_spawn_for_controller(&owner, &controller)
+                .await
+                .is_ok());
+        }
+        barrier.wait().await;
+        cancel.await.unwrap();
+        for (receiver, _) in &mut receivers {
+            assert!(matches!(receiver.try_recv(), Ok(Event::UserCancel { .. })));
+            assert!(
+                receiver.try_recv().is_err(),
+                "repeat requests do not redeliver"
+            );
+        }
+        let cleanup = manager
+            .bash_handles()
+            .retire_unattached_controller(&specs[0].agent_id);
+        tokio::pin!(cleanup);
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(cleanup.as_mut(), cx).is_pending()
+            ))
+            .await,
+            "UserCancel delivery must not await pending launch custody"
+        );
+        drop(leases);
+        assert!(!cleanup.await.unwrap().has_failures());
+    }
+
+    #[tokio::test]
+    async fn timeout_cancellation_boundary_fences_before_real_timeout_dispatch() {
+        let (manager, _parent, mut specs) = cancellation_boundary_fixture(&["timeout-child"]).await;
+        let spec = specs.pop().unwrap();
+        let owner = ResourceScopeKey::Work(WorkScopeId::new());
+        let lease = manager
+            .bash_handles()
+            .reserve_spawn_for_controller(
+                &owner,
+                &ResourceScopeKey::Unattached(spec.agent_id.clone()),
+            )
+            .await
+            .unwrap();
+        let (mut events, _acknowledged) =
+            insert_cancellation_boundary_handle(&manager, &spec.agent_id).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .subagent_cancel_dispatch_barriers
+            .lock()
+            .await
+            .insert(spec.agent_id.clone(), barrier.clone());
+        manager
+            .kick_admitted_sub_agent(spec.clone(), opentelemetry::trace::SpanContext::NONE)
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Some(Event::PersistedSubAgentBootstrap)
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(30), barrier.wait())
+            .await
+            .expect("real per-child timeout reaches dispatch");
+        assert_controller_fenced(&manager, &owner, &spec.agent_id).await;
+        barrier.wait().await;
+        assert!(matches!(
+            events.recv().await,
+            Some(Event::UserCancel {
+                cause: crate::state_machine::event::CancelCause::Timeout,
+                ..
+            })
+        ));
+        let cleanup = manager
+            .bash_handles()
+            .retire_unattached_controller(&spec.agent_id);
+        tokio::pin!(cleanup);
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(cleanup.as_mut(), cx).is_pending()
+            ))
+            .await
+        );
+        drop(lease);
+        assert!(!cleanup.await.unwrap().has_failures());
+    }
+
+    #[tokio::test]
+    async fn direct_cancellation_boundary_fences_before_acknowledged_dispatch() {
+        let (manager, _parent, specs) =
+            cancellation_boundary_fixture(&["direct-cancel-child"]).await;
+        let child_id = &specs[0].agent_id;
+        let owner = ResourceScopeKey::Work(WorkScopeId::new());
+        let lease = manager
+            .bash_handles()
+            .reserve_spawn_for_controller(&owner, &ResourceScopeKey::Unattached(child_id.clone()))
+            .await
+            .unwrap();
+        let (_events, mut acknowledged) =
+            insert_cancellation_boundary_handle(&manager, child_id).await;
+        let cancel = tokio::spawn({
+            let manager = manager.clone();
+            let child_id = child_id.clone();
+            async move {
+                manager
+                    .send_event(
+                        &child_id,
+                        Event::UserCancel {
+                            reason: None,
+                            cause: crate::state_machine::event::CancelCause::UserRequested,
+                        },
+                    )
+                    .await
+            }
+        });
+        let request = tokio::time::timeout(std::time::Duration::from_secs(30), acknowledged.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(request.event, Event::UserCancel { .. }));
+        assert_controller_fenced(&manager, &owner, child_id).await;
+        assert!(!cancel.is_finished(), "runtime settlement remains required");
+        request
+            .acknowledgement
+            .send(Ok(AcknowledgedEventOutcome::StaleAuthority))
+            .unwrap();
+        assert_eq!(cancel.await.unwrap(), Ok(()));
+        assert!(!manager.runtimes.read().await.contains_key(child_id));
+        assert_controller_fenced(&manager, &owner, child_id).await;
+        drop(lease);
+        assert!(!manager
+            .bash_handles()
+            .retire_unattached_controller(child_id)
+            .await
+            .unwrap()
+            .has_failures());
+    }
+
+    #[tokio::test]
+    async fn idempotent_cancellation_boundary_fences_all_established_db_outcomes() {
+        for prepared in ["before-dispatch", "already-requested", "already-terminal"] {
+            let (manager, parent, specs) = cancellation_boundary_fixture(&[prepared]).await;
+            let owner = ResourceScopeKey::Work(WorkScopeId::new());
+            let (mut parent_events, _acknowledged) =
+                insert_cancellation_boundary_handle(&manager, &parent.id).await;
+            if prepared == "already-requested" {
+                assert!(matches!(
+                    manager
+                        .db()
+                        .claim_sub_agent_initial_dispatch(prepared, Utc::now())
+                        .await,
+                    phoenix_db::SubAgentInitialDispatchAuthority::Established(_)
+                ));
+                assert_eq!(
+                    manager
+                        .db()
+                        .request_sub_agent_cancellation(
+                            prepared,
+                            phoenix_db::SubAgentTerminalCause::Cancelled,
+                            Utc::now(),
+                        )
+                        .await
+                        .unwrap(),
+                    phoenix_db::SubAgentCancellationOutcome::DeliverToRuntime(
+                        phoenix_db::SubAgentTerminalCause::Cancelled,
+                    )
+                );
+            } else if prepared == "already-terminal" {
+                manager
+                    .db()
+                    .record_sub_agent_terminal(
+                        prepared,
+                        phoenix_db::SubAgentTerminalCause::SubmitResult,
+                        Utc::now(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert!(manager
+                .bash_handles()
+                .reserve_spawn_for_controller(
+                    &owner,
+                    &ResourceScopeKey::Unattached(prepared.into()),
+                )
+                .await
+                .is_ok());
+            manager
+                .handle_cancel_request(SubAgentCancelRequest {
+                    ids: vec![specs[0].agent_id.clone()],
+                    parent_conversation_id: parent.id,
+                    cause: crate::state_machine::event::CancelCause::UserRequested,
+                })
+                .await;
+            assert_controller_fenced(&manager, &owner, prepared).await;
+            if prepared == "before-dispatch" {
+                assert!(matches!(
+                    parent_events.try_recv(),
+                    Ok(Event::SubAgentResult { .. })
+                ));
+            } else {
+                assert!(parent_events.try_recv().is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_work_cancellation_boundary_preserves_owner_and_controller_admission() {
+        let manager = Arc::new(test_manager().await);
+        let owner = create_handleless_work_conv(&manager, "ordinary-parent", "/tmp", None).await;
+        let mut spec = cancellation_boundary_spec("ordinary-child");
+        spec.environment =
+            phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
+                working_dir: "/tmp".into(),
+            };
+        manager
+            .admit_sub_agent_batch(
+                "ordinary-cancel-batch",
+                std::slice::from_ref(&spec),
+                "ordinary-parent",
+                owner.work_scope_id().cloned(),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager
+                .db()
+                .claim_sub_agent_initial_dispatch(&spec.agent_id, Utc::now())
+                .await,
+            phoenix_db::SubAgentInitialDispatchAuthority::Established(_)
+        ));
+        let (mut events, _acknowledged) =
+            insert_cancellation_boundary_handle(&manager, &spec.agent_id).await;
+        manager
+            .handle_cancel_request(SubAgentCancelRequest {
+                ids: vec![spec.agent_id.clone()],
+                parent_conversation_id: "ordinary-parent".into(),
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await;
+        assert!(matches!(events.try_recv(), Ok(Event::UserCancel { .. })));
+        assert!(manager.bash_handles().reserve_spawn(&owner).await.is_ok());
+        assert!(manager
+            .bash_handles()
+            .reserve_spawn_for_controller(
+                &owner,
+                &ResourceScopeKey::Unattached(spec.agent_id.clone()),
+            )
+            .await
+            .is_ok());
+        let (_events, mut acknowledged) =
+            insert_cancellation_boundary_handle(&manager, &spec.agent_id).await;
+        let cancel = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .send_event(
+                        "ordinary-child",
+                        Event::UserCancel {
+                            reason: None,
+                            cause: crate::state_machine::event::CancelCause::UserRequested,
+                        },
+                    )
+                    .await
+            }
+        });
+        let request = tokio::time::timeout(std::time::Duration::from_secs(30), acknowledged.recv())
+            .await
+            .expect("ordinary child cancellation reaches acknowledged dispatch")
+            .unwrap();
+        assert!(manager
+            .bash_handles()
+            .reserve_spawn_for_controller(
+                &owner,
+                &ResourceScopeKey::Unattached("ordinary-child".into()),
+            )
+            .await
+            .is_ok());
+        request
+            .acknowledgement
+            .send(Ok(AcknowledgedEventOutcome::Settled))
+            .unwrap();
+        assert_eq!(cancel.await.unwrap(), Ok(()));
     }
 
     #[tokio::test]

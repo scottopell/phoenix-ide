@@ -35,12 +35,16 @@ children retain the workspace and tool rules above. The Coordinator uses the
 configured worker/tier catalog and usable routes to select suitable execution.
 Their terminal delivery and parent acceptance join one cancellation-resistant,
 bounded Bash-controller retirement, including durable reconciliation and a
-parent-cancellation backstop (ADR-224, REQ-BASH-018). Target WorkScopes retain
+parent-cancellation backstop (ADR-224, REQ-BASH-018). Established parent cancellation
+requests and real per-child timeouts fence each eligible controller before child
+event dispatch, and direct child cancellation fences before acknowledged dispatch.
+All batch children are fenced before terminal cleanup joins; cancellation delivery
+does not wait for pending launch custody. Target WorkScopes retain
 ownership and tombstones; unrelated controllers and ordinary Work-child lifecycle
 remain intact. Linux supports incarnation-bound signaling; unsupported hosts
 report incomplete cleanup. Parent and child guidance requires collecting needed
 command results before submission and keeping persistent services with parent or
-ordinary Work ownership. Focused runtime qualification and pending Linux signaling
+ordinary Work ownership. Focused runtime and hosted Linux signaling
 coverage are recorded in the Global Coordinator and Bash executive summaries.
 
 ## Technical Summary

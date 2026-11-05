@@ -842,6 +842,12 @@ impl BashHandleRegistry {
         self.handles_by_id.read().await.get(handle_id).cloned()
     }
 
+    /// Permanently closes one inline child's controller admission and starts its
+    /// detached cleanup without waiting for admitted launches or handles.
+    pub async fn begin_unattached_controller_retirement(self: &Arc<Self>, child_id: &str) {
+        self.start_unattached_controller_retirement(child_id).await;
+    }
+
     /// Permanently closes one inline child's controller admission and joins its
     /// detached cleanup. Repeated callers share the same result and deadline;
     /// dropping any caller cannot cancel cleanup. Owning tables and handles stay
@@ -853,9 +859,28 @@ impl BashHandleRegistry {
         self: &Arc<Self>,
         child_id: &str,
     ) -> Result<CascadeBashReport, String> {
+        let mut result = self.start_unattached_controller_retirement(child_id).await;
+        loop {
+            if let Some(report) = result.borrow_and_update().clone() {
+                return Ok(report);
+            }
+            if result.changed().await.is_err() {
+                let error = format!(
+                    "Bash controller cleanup task ended without an observation: {child_id}"
+                );
+                tracing::error!(%error);
+                return Err(error);
+            }
+        }
+    }
+
+    async fn start_unattached_controller_retirement(
+        self: &Arc<Self>,
+        child_id: &str,
+    ) -> watch::Receiver<Option<CascadeBashReport>> {
         let controller = ResourceScopeKey::Unattached(child_id.to_owned());
         let entry = self.get_or_create(&controller).await;
-        let mut result = {
+        {
             let mut table = entry.write().await;
             if let Some(result) = &table.controller_retirement {
                 result.clone()
@@ -871,18 +896,6 @@ impl BashHandleRegistry {
                     sender.send_replace(Some(report));
                 });
                 receiver
-            }
-        };
-        loop {
-            if let Some(report) = result.borrow_and_update().clone() {
-                return Ok(report);
-            }
-            if result.changed().await.is_err() {
-                let error = format!(
-                    "Bash controller cleanup task ended without an observation: {child_id}"
-                );
-                tracing::error!(%error);
-                return Err(error);
             }
         }
     }
