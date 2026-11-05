@@ -23,6 +23,19 @@ WorkScope, MCP, messaging, watches, Authority tools, or lifecycle actions. Durab
 Coordinator parent identity restores this capability on runtime recreation.
 ADR-223 records the boundary, superseding ADR-222.
 
+Each filesystem-free inline child's Bash controller closes before terminal
+delivery and parent acceptance, including durable-result reconciliation. One
+cancellation-resistant cleanup joins admitted launches through payload release
+or bounded unregistered settlement, then attempts bounded incarnation-bound
+cleanup of that child's handles across selected WorkScopes. A parent-cancellation
+backstop joins the same operation; terminal recreation closes the controller,
+while nonterminal recreation preserves admission. WorkScopes retain ownership,
+inventory and tombstones; sibling and parent commands are unaffected. Safe
+signaling is Linux-only; unsupported hosts report incomplete cleanup without a
+raw PID fallback. Neither full descendant reaping nor restart cleanup is promised
+(ADR-224). Parent, child and spawn-tool guidance requires needed command results
+before submission and assigns persistent services to parent or ordinary Work ownership.
+
 Coordinator LLM requests contain the stable language-specific system prompt without an automatic current-activity capsule. The Check in & drive composer action requests a fresh, broad check but selective intervention: leave healthy progress alone, do not treat idle owners as stalled, and avoid redundant nudges or re-planning to show activity. It asks the Coordinator to recover unanswered user decisions from history and verify they remain unresolved and material, advancing independent authorized work before asking the user with context and a recommendation. Repeated check-ins do not expand authority or reset decisions, pauses or gates. The requested briefing puts still-needed user input first, then material changes as problem, intervention and direction, without a mandatory template or announcements for factual watch events. ADR-149 records selective check-ins; ADR-150 refines blocked-work recovery and concrete reporting. Both system variants now distinguish blocked waiting from healthy progress, reconcile later decisions and completed work before replaying answers, and illustrate plain language with hypothetical bad/good pairs. Unsolicited reports require user action, a meaningful goal-level result or a changed blocker/risk; hypothetical examples explicitly choose silence for routine checks and sends. Requested check-ins retain an executive view. The button carries the same recovery policy without duplicating examples. The recovery/reporting base retains its pre-refinement word and character ceilings. The proposed outcome-delegation addition is bounded separately and increases both overall prompt variants; the user accepted that tradeoff as an exception to the earlier same-size request. These are prompt instructions, not guarantees of model behavior; the action adds no authority or indefinite polling. The Coordinator receives its stable instance-owned home scope ID/path as server-generated context; selected worker scope facts are still requested through `query_database`. ADR-066 records removal of the per-request snapshot and its dedicated runtime wiring.
 
 The host-bound `query_database` tool provides operator-level forensic reads of Phoenix application tables, including hidden messages and sensitive records that may not be visible in normal UI, while denying known credential-bearing columns for owner sessions, share tokens, MCP OAuth secrets and tokens, and federation credential verifiers. This is not a general security sandbox. The database still exposes legacy project-named rows and fields; normative orientation identifies ProductConversation and WorkScope, with repository context derived through WorkScope rather than a Project grouping. It executes one statement on a separate read-only connection. SQLite authorization denies mutation, connection-changing operations, internal and FTS shadow storage, filesystem and extension functions, while SQL/column/row/serialized-output/time bounds protect system stability. Results use typed cells and report truncation.
@@ -83,6 +96,17 @@ Reducer regressions cover mixed result/error submissions and stale task proposal
 from children without a default directory: each rejected round persists matching
 error results and requests another model turn without executing tools or notifying
 the parent prematurely.
+
+Local macOS qualification passed 57 registry tests, 11 native-launcher tests
+using the required existing launcher, and 11 focused runtime tests. Runtime
+coverage includes causal live delivery and common acceptance ordering,
+parent-cancellation cleanup, durable database acceptance, ordinary/unrelated
+isolation, terminal versus Interrupted/Recreate behavior, and real foreground
+Bash delegation. Two ordering regressions failed before the cleanup hooks were
+added. Linux real-background SIGKILL/tombstone and result/error-before-parent-resume
+regressions are authored but unrun locally; hosted execution remains pending.
+The earlier mixed-terminal/task-proposal fix passed 210 state-machine tests.
+These are focused results, not full current-head CI, deployment or measured token savings.
 
 The bounded API-guidance candidate (ADR-113) replaces an accidental recipe allowlist with non-exhaustive contract-grounded guidance and documents submitting exact user-provided answers or decisions made within explicit delegated decision scope through the existing structured-question response endpoint. Generic inspect/unblock instructions are not decision authority; approvals must never be fabricated or delegation extended. Gap inventories are illustrative and qualified by inspected deployment/source, permitting verified supported alternatives and bounded state reads, not invented guarantees/receipts, database/private-handler bypasses, or background monitors. It does not add tool or runtime capabilities. The recipe distinguishes current request freshness from idempotency, requires complete answers despite the backend's lack of completeness enforcement, posts once, and reconciles uncertainty against the original target without treating conflicts as success. Source/wire/UI anchors and offline Python drift checks are described in `../builtin-skills/executive.md`. Prompt/built-in/continuation Rust regressions are authored but intentionally unrun locally; no live API/question calls, instruction activation, merge or deployment are claimed.
 

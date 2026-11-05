@@ -33,6 +33,15 @@ defines each assignment's action authority. Messaging, Authority, lifecycle,
 MCP, and recursive delegation tools remain absent. Ordinary
 children retain the workspace and tool rules above. The Coordinator uses the
 configured worker/tier catalog and usable routes to select suitable execution.
+Their terminal delivery and parent acceptance join one cancellation-resistant,
+bounded Bash-controller retirement, including durable reconciliation and a
+parent-cancellation backstop (ADR-224, REQ-BASH-018). Target WorkScopes retain
+ownership and tombstones; unrelated controllers and ordinary Work-child lifecycle
+remain intact. Linux supports incarnation-bound signaling; unsupported hosts
+report incomplete cleanup. Parent and child guidance requires collecting needed
+command results before submission and keeping persistent services with parent or
+ordinary Work ownership. Focused runtime qualification and pending Linux signaling
+coverage are recorded in the Global Coordinator and Bash executive summaries.
 
 ## Technical Summary
 

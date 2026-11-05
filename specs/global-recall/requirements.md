@@ -140,6 +140,7 @@ AND SHALL preserve selected WorkScope ownership and the child's exclusive handle
 THE Coordinator SHALL be instructed to delegate context-intensive research and authorized shell work to focused inline agents, state each assignment's action authority, request concise evidence and citations, and retain synthesis, decisions, and responsibility for actions
 AND SHALL have access to the configured worker and execution-tier catalog and usable model routes for cost-appropriate selection
 AND its children SHALL be instructed to act only within the parent's assignment and existing user authority, without treating Bash access as authorization for messaging, Authority changes, or lifecycle operations
+AND both parent and children SHALL be instructed to wait for and collect needed command results before child terminal submission, not rely on background commands surviving child termination, and keep persistent services under parent or ordinary Work ownership
 
 THE ordinary-parent predecessor capability defined by
 `../conversation-retrieval/requirements.md` REQ-RET-009 SHALL remain separate
