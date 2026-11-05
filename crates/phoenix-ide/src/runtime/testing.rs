@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 #[allow(dead_code)]
 pub struct MockLlmClient {
     responses: Mutex<VecDeque<Result<LlmResponse, LlmError>>>,
+    freeze_failure: Mutex<Option<LlmError>>,
     model_id: String,
     /// Record of all requests made
     pub requests: Mutex<Vec<LlmRequest>>,
@@ -39,6 +40,7 @@ impl MockLlmClient {
         let (request_count_tx, _) = tokio::sync::watch::channel(0);
         Self {
             responses: Mutex::new(VecDeque::new()),
+            freeze_failure: Mutex::new(None),
             model_id: model_id.into(),
             requests: Mutex::new(Vec::new()),
             request_count_tx,
@@ -55,6 +57,10 @@ impl MockLlmClient {
         self.responses.lock().unwrap().push_back(Err(error));
     }
 
+    pub fn fail_freeze_once(&self, error: LlmError) {
+        *self.freeze_failure.lock().unwrap() = Some(error);
+    }
+
     /// Get recorded requests
     pub fn recorded_requests(&self) -> Vec<LlmRequest> {
         self.requests.lock().unwrap().clone()
@@ -68,6 +74,10 @@ impl MockLlmClient {
 #[async_trait]
 impl LlmClient for MockLlmClient {
     fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
+        let failure = self.freeze_failure.lock().unwrap().take();
+        if let Some(error) = failure {
+            return Err(error);
+        }
         Ok(self)
     }
 

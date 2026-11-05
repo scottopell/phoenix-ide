@@ -408,10 +408,27 @@ enum StartupSteeringDrainOutcome {
 enum TransitionAuthority {
     ExistingSettlement,
     RequiredSettlement,
+    OwnedToolFollowup,
+}
+
+impl TransitionAuthority {
+    fn requires_committed_state(self) -> bool {
+        match self {
+            Self::ExistingSettlement => false,
+            Self::RequiredSettlement | Self::OwnedToolFollowup => true,
+        }
+    }
+
+    fn accepts_registered_feature_owner(self) -> bool {
+        match self {
+            Self::OwnedToolFollowup => true,
+            Self::ExistingSettlement | Self::RequiredSettlement => false,
+        }
+    }
 }
 
 enum ToolOutcomeSettlement {
-    DurableFactEstablished(Vec<Event>),
+    DurableFactEstablished,
     DurableFactUnclassified(String),
 }
 
@@ -3457,16 +3474,28 @@ where
             owner: Some(owner),
             abandoned_reason: "ordinary_tool_outcome_owner_disappeared",
         };
-        match Box::pin(self.apply_transition_result_with_authority(
-            transition,
-            None,
-            TransitionAuthority::RequiredSettlement,
-        ))
-        .await
-        {
-            Ok(events) => {
+        let settlement =
+            async {
+                let mut events = Box::pin(self.apply_transition_result_with_authority(
+                    transition,
+                    None,
+                    TransitionAuthority::RequiredSettlement,
+                ))
+                .await?;
+                while let Some(event) = events.pop() {
+                    Box::pin(self.process_event_with_authority(
+                        event,
+                        TransitionAuthority::OwnedToolFollowup,
+                    ))
+                    .await?;
+                }
+                Ok::<(), String>(())
+            }
+            .await;
+        match settlement {
+            Ok(()) => {
                 authority.owner = None;
-                ToolOutcomeSettlement::DurableFactEstablished(events)
+                ToolOutcomeSettlement::DurableFactEstablished
             }
             Err(error) => {
                 // No command-scoped exact probe spans the checkpoint, replay,
@@ -3477,6 +3506,17 @@ where
                 ToolOutcomeSettlement::DurableFactUnclassified(error)
             }
         }
+    }
+
+    fn registered_followup_owner_is_usable(
+        &self,
+        authority: TransitionAuthority,
+        error: &str,
+    ) -> bool {
+        authority.accepts_registered_feature_owner()
+            && !self.fatal_local_authority_fence.is_closed()
+            && self.local_terminal_authority == LocalTerminalAuthority::Classified
+            && !error.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:")
     }
 
     /// Process a typed effect outcome from a background task.
@@ -3562,14 +3602,8 @@ where
                 return Err(invalid.reason);
             }
         };
-        if is_llm_outcome
-            && !result
-                .effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::ScheduleRetry { .. }))
-            && !trusted_request_continues(&result.new_state)
-        {
-            self.pending_trusted_tool_results.clear();
+        if is_llm_outcome {
+            self.settle_llm_trusted_context(&result);
         }
 
         self.classify_active_direct_turn_outcome_terminal(&result.new_state);
@@ -3579,7 +3613,7 @@ where
                 && matches!(result.new_state.step_result(), StepResult::Terminal(_)));
         let generated_events = if is_tool_outcome && !has_owned_terminal_settlement {
             match self.settle_ordinary_tool_outcome(result).await {
-                ToolOutcomeSettlement::DurableFactEstablished(events) => events,
+                ToolOutcomeSettlement::DurableFactEstablished => Vec::new(),
                 ToolOutcomeSettlement::DurableFactUnclassified(error) => return Err(error),
             }
         } else {
@@ -3592,6 +3626,20 @@ where
                 .map_err(|error| error.to_string())?;
         }
         Ok(())
+    }
+
+    fn settle_llm_trusted_context(
+        &mut self,
+        result: &crate::state_machine::transition::TransitionResult,
+    ) {
+        if !result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ScheduleRetry { .. }))
+            && !trusted_request_continues(&result.new_state)
+        {
+            self.pending_trusted_tool_results.clear();
+        }
     }
 
     async fn process_acknowledged_event(
@@ -3858,6 +3906,9 @@ where
                             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                             let _ = event_tx.send(Event::RetryBufferedSubAgentResults).await;
                         });
+                        if self.registered_followup_owner_is_usable(authority, &error) {
+                            continue;
+                        }
                         return Err(error);
                     }
                 }
@@ -3891,6 +3942,12 @@ where
             }
             if matches!(
                 terminal_event,
+                Event::LlmError { .. } | Event::ServerOverloaded { .. }
+            ) {
+                self.settle_llm_trusted_context(&result);
+            }
+            if matches!(
+                terminal_event,
                 Event::UserCancel {
                     cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
                     reason: _,
@@ -3916,6 +3973,7 @@ where
                 _ => None,
             };
             let ordinary_tool_completion = matches!(self.state, ConvState::ToolExecuting { .. })
+                && !authority.accepts_registered_feature_owner()
                 && matches!(
                     terminal_event,
                     Event::ToolComplete { .. } | Event::SpawnAgentsComplete { .. }
@@ -3925,7 +3983,7 @@ where
                     && matches!(result.new_state.step_result(), StepResult::Terminal(_)));
             let application = if ordinary_tool_completion {
                 match self.settle_ordinary_tool_outcome(result).await {
-                    ToolOutcomeSettlement::DurableFactEstablished(events) => Ok(events),
+                    ToolOutcomeSettlement::DurableFactEstablished => Ok(Vec::new()),
                     ToolOutcomeSettlement::DurableFactUnclassified(error) => Err(error),
                 }
             } else {
@@ -3942,6 +4000,9 @@ where
                             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                             let _ = event_tx.send(Event::RetryBufferedSubAgentResults).await;
                         });
+                        if self.registered_followup_owner_is_usable(authority, &error) {
+                            continue;
+                        }
                     } else if matches!(terminal_event, Event::PersistedSubAgentBootstrap) {
                         let event_tx = self.event_tx.clone();
                         tokio::spawn(async move {
@@ -4097,7 +4158,7 @@ where
                     .to_string());
             };
             for effect in downstream_dispatch {
-                if authority == TransitionAuthority::RequiredSettlement {
+                if authority.requires_committed_state() {
                     self.publish_live_state()?;
                 }
                 let is_llm_dispatch = matches!(effect, Effect::RequestLlm);
@@ -4233,7 +4294,7 @@ where
                 )
             });
             let publish = state_changed
-                && authority == TransitionAuthority::ExistingSettlement
+                && !authority.requires_committed_state()
                 && !will_drain_from_idle
                 && !will_commit_steering_drain
                 && !will_settle_creation
@@ -4388,7 +4449,7 @@ where
             let mut state_committed = false;
             let mut new_turn_input_persisted = false;
             for (effect_index, effect) in result.effects.into_iter().enumerate() {
-                if authority == TransitionAuthority::RequiredSettlement
+                if authority.requires_committed_state()
                     && matches!(effect, Effect::RequestLlm | Effect::ExecuteTool { .. })
                 {
                     self.publish_live_state()?;
@@ -4709,7 +4770,7 @@ where
                             self.install_live_state(
                                 old_state.clone(),
                                 old_state_updated_at,
-                                authority == TransitionAuthority::ExistingSettlement,
+                                !authority.requires_committed_state(),
                             )?;
                             self.manage_deadline(&failed_state);
                         }
@@ -4729,6 +4790,9 @@ where
                                     })
                                     .expect("terminal transition captured before effects"),
                             );
+                            if self.registered_followup_owner_is_usable(authority, &error) {
+                                return Ok(generated_events);
+                            }
                         }
                         return Err(error);
                     }
@@ -4850,18 +4914,14 @@ where
             {
                 continue;
             }
-            if authority == TransitionAuthority::RequiredSettlement
-                && matches!(effect, Effect::NotifyStateChange)
-            {
+            if authority.requires_committed_state() && matches!(effect, Effect::NotifyStateChange) {
                 continue;
             }
             if matches!(effect, Effect::RequestLlm) {
                 deferred_request_llm = Some(effect);
                 continue;
             }
-            if authority == TransitionAuthority::RequiredSettlement
-                && matches!(effect, Effect::PersistState)
-            {
+            if authority.requires_committed_state() && matches!(effect, Effect::PersistState) {
                 let mut admitted = self.admit_authoritative_effect()?;
                 self.persist_state_effect(false, &mut admitted).await?;
                 continue;
@@ -4893,7 +4953,7 @@ where
                     self.install_live_state(
                         old_state.clone(),
                         old_state_updated_at,
-                        authority == TransitionAuthority::ExistingSettlement,
+                        !authority.requires_committed_state(),
                     )?;
                     self.manage_deadline(&failed_state);
                     self.steering_queue = drained_entries;
@@ -4952,11 +5012,11 @@ where
         // success for a prompt already being delivered.
         drop(projection_guard);
 
-        if authority == TransitionAuthority::RequiredSettlement {
+        if authority.requires_committed_state() {
             self.execute_effect(Effect::NotifyStateChange).await?;
         }
         if let Some(effect) = deferred_request_llm {
-            if authority == TransitionAuthority::RequiredSettlement {
+            if authority.requires_committed_state() {
                 self.publish_live_state()?;
             }
             match Box::pin(self.execute_effect(effect)).await {
@@ -5901,9 +5961,8 @@ where
 
     /// Handle the hard stop after grace turn (REQ-BED-026 `SubAgentTurnLimitHardStop`).
     ///
-    /// Extract fresh grace-turn text and send `GraceTurnExhausted` event to the
-    /// state machine. The SM handles the transition and emits `NotifyParent`.
-    async fn handle_grace_turn_hard_stop(&mut self) {
+    /// Return `GraceTurnExhausted` with fresh grace-turn text when available.
+    async fn handle_grace_turn_hard_stop(&mut self) -> Event {
         let grace_started_at = self.grace_turn_started_at;
         // Extract assistant text produced during the grace turn (I/O — belongs in executor).
         let partial_result = match self
@@ -5943,20 +6002,14 @@ where
             }
         };
 
-        // Send GraceTurnExhausted event to the state machine.
-        // The state machine handles the transition to Completed/Failed
-        // and emits NotifyParent as an effect.
-        let _ = self
-            .event_tx
-            .send(Event::GraceTurnExhausted {
-                result: partial_result,
-            })
-            .await;
+        Event::GraceTurnExhausted {
+            result: partial_result,
+        }
     }
 
     /// Halt a parent conversation that has exceeded its tool-use cycle cap
     /// (task 24680). Persists a user-visible system message explaining what
-    /// happened, then sends `Event::UserCancel` so the state machine
+    /// happened, then returns `Event::UserCancel` so the state machine
     /// transitions `LlmRequesting → Idle` via the normal abort path. The
     /// next user message will reset the counter and resume normal operation.
     ///
@@ -5966,10 +6019,8 @@ where
     /// "attempt #{attempted} exceeds cap of {cap}" reads unambiguously,
     /// while a bare "limit reached ({cap})" invites confusion about whether
     /// the counter shown elsewhere (`cap + 1`) is a bug.
-    async fn halt_parent_cycle_cap(&mut self, cap: u32, attempted: u32) {
-        let Ok(mut admitted) = self.admit_authoritative_effect() else {
-            return;
-        };
+    async fn halt_parent_cycle_cap(&mut self, cap: u32, attempted: u32) -> Result<Event, String> {
+        let mut admitted = self.admit_authoritative_effect()?;
         let msg_id = uuid::Uuid::new_v4().to_string();
         let text = format!(
             "Tool-use iteration limit reached: attempted LLM call #{attempted} exceeds the cap \
@@ -6003,20 +6054,19 @@ where
                     .persisted_message(msg);
             }
             Err(e) => {
+                admitted.close("parent_cycle_cap_persistence");
                 tracing::warn!(
                     error = %e,
                     "Failed to persist parent cycle cap system message"
                 );
+                return Err(e);
             }
         }
 
-        let _ = self
-            .event_tx
-            .send(Event::UserCancel {
-                reason: Some(format!("parent_tool_cycle_cap_exceeded ({cap})")),
-                cause: crate::state_machine::event::CancelCause::UserRequested,
-            })
-            .await;
+        Ok(Event::UserCancel {
+            reason: Some(format!("parent_tool_cycle_cap_exceeded ({cap})")),
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+        })
     }
 
     /// Handle the `spawn_agents` tool specially:
@@ -8013,7 +8063,8 @@ where
 
     async fn resume_committed_steering_request(&mut self) -> Result<(), String> {
         match self.execute_effect(Effect::RequestLlm).await {
-            Ok(_) => Ok(()),
+            Ok(Some(event)) => self.process_startup_event(event).await,
+            Ok(None) => Ok(()),
             Err(error) => {
                 let failure = self.llm_dispatch_failure_event(error);
                 self.process_startup_event(failure).await
@@ -8246,8 +8297,7 @@ where
                     cap,
                     "parent conversation attempted to exceed tool-use cycle cap; halting"
                 );
-                self.halt_parent_cycle_cap(cap, attempted).await;
-                return Ok(None);
+                return self.halt_parent_cycle_cap(cap, attempted).await.map(Some);
             }
         }
 
@@ -8320,8 +8370,7 @@ where
                             "Sub-agent grace turn exhausted, extracting partial results"
                         );
 
-                        self.handle_grace_turn_hard_stop().await;
-                        return Ok(None);
+                        return Ok(Some(self.handle_grace_turn_hard_stop().await));
                     }
                 } else {
                     // First hit: grant grace turn (REQ-BED-026 SubAgentTurnLimitGraceTurn)
@@ -8463,8 +8512,12 @@ where
             Ok(client) => client,
             Err(error) => {
                 let outcome = llm_error_to_outcome(error, &request_id, &self.context.model_id);
-                let _ = llm_outcome_tx.send((dispatch_generation, outcome)).await;
-                return Ok(None);
+                self.llm_task_handle = None;
+                self.active_llm_attempt = None;
+                self.pending_provider_replay_update = None;
+                return Ok(Some(
+                    crate::state_machine::transition::llm_outcome_to_event(outcome, &self.state),
+                ));
             }
         };
         let storage = self.storage.clone();
@@ -22112,6 +22165,407 @@ mod steer_drain_detector_tests {
     }
 
     #[tokio::test]
+    async fn ordinary_tool_followup_local_dispatches_do_not_depend_on_event_queue() {
+        for path in ["freeze", "cycle", "grace", "unavailable_chain"] {
+            let mut initial = ordinary_completion_state();
+            if path == "unavailable_chain" {
+                if let ConvState::ToolExecuting {
+                    remaining_tools,
+                    assistant_message,
+                    ..
+                } = &mut initial
+                {
+                    for id in ["unavailable-2", "unavailable-3", "unavailable-4"] {
+                        remaining_tools.push(ToolCall::new(
+                            id,
+                            ToolInput::from(crate::tools::BashToolInput::run("true")),
+                        ));
+                        assistant_message.content.push(ContentBlock::tool_use(
+                            id,
+                            "bash",
+                            serde_json::json!({"op": "run", "cmd": "true"}),
+                        ));
+                    }
+                }
+            }
+            let (mut runtime, storage) =
+                build_runtime_with_state_and_queue("tool-local-dispatch", initial, vec![]);
+            runtime.event_rx.close();
+            match path {
+                "freeze" => {
+                    runtime
+                        .llm_client
+                        .fail_freeze_once(phoenix_llm::LlmError::invalid_request(
+                            "frozen route rejected",
+                        ));
+                    runtime
+                        .pending_trusted_tool_results
+                        .push(PendingTrustedToolResult {
+                            tool_result_message_id: tool_result_message_id(
+                                "ordinary-completion-assistant",
+                                "tool-1",
+                            ),
+                            output: "authenticated instructions".into(),
+                        });
+                }
+                "cycle" => {
+                    runtime.parent_tool_cycle_cap = 1;
+                    runtime.parent_tool_cycle_count = 1;
+                }
+                "grace" => {
+                    runtime.context.is_sub_agent = true;
+                    runtime.context.max_turns = 1;
+                    runtime.llm_turn_count = 2;
+                    runtime.grace_turn_granted = true;
+                }
+                "unavailable_chain" => storage.set_fail_prompt_projection_load(true),
+                _ => unreachable!(),
+            }
+            runtime
+                .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Completed(
+                    ToolResult::success("tool-1".into(), "done".into()),
+                )))
+                .await
+                .unwrap();
+            assert!(!runtime.fatal_local_authority_fence.is_closed(), "{path}");
+            assert!(runtime.llm_client.recorded_requests().is_empty(), "{path}");
+            assert!(
+                runtime.tool_executor.recorded_executions().is_empty(),
+                "{path}"
+            );
+            assert!(runtime.event_rx.try_recv().is_err(), "{path}");
+            assert!(runtime.llm_outcome_rx.try_recv().is_err(), "{path}");
+            assert!(runtime.llm_task_handle.is_none(), "{path}");
+            match path {
+                "freeze" => {
+                    assert!(matches!(runtime.state, ConvState::Error { .. }));
+                    assert!(runtime.pending_trusted_tool_results.is_empty());
+                    assert!(runtime.pending_provider_replay_update.is_none());
+                    assert!(runtime.active_llm_attempt.is_none());
+                    assert_eq!(runtime.llm_request_generation, 1);
+                }
+                "cycle" => assert!(matches!(runtime.state, ConvState::Idle)),
+                "grace" => assert!(matches!(runtime.state, ConvState::Failed { .. })),
+                "unavailable_chain" => {
+                    assert!(matches!(runtime.state, ConvState::Error { .. }));
+                    let messages = storage.get_all_messages("tool-local-dispatch");
+                    assert_eq!(messages.len(), 5);
+                    let ids: Vec<_> = messages
+                        .iter()
+                        .filter_map(|message| match &message.content {
+                            MessageContent::Tool(result) => Some(result.tool_use_id.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(
+                        ids,
+                        ["tool-1", "unavailable-2", "unavailable-3", "unavailable-4"]
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ordinary_tool_followup_local_dispatch_writes_follow_feature_authority() {
+        for path in ["freeze", "cycle", "grace"] {
+            let (mut runtime, storage) = build_runtime_with_state_and_queue(
+                "tool-local-write-failure",
+                ordinary_completion_state(),
+                vec![],
+            );
+            if path == "freeze" {
+                runtime
+                    .llm_client
+                    .fail_freeze_once(phoenix_llm::LlmError::invalid_request("freeze rejected"));
+            } else if path == "cycle" {
+                runtime.parent_tool_cycle_cap = 1;
+                runtime.parent_tool_cycle_count = 1;
+            } else {
+                runtime.context.is_sub_agent = true;
+                runtime.context.max_turns = 1;
+                runtime.llm_turn_count = 2;
+                runtime.grace_turn_granted = true;
+            }
+            let fence = Arc::clone(&runtime.fatal_local_authority_fence);
+            let (started, release) = storage.gate_state_update();
+            let operation = tokio::spawn(async move {
+                let result = runtime
+                    .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Completed(
+                        ToolResult::success("tool-1".into(), "done".into()),
+                    )))
+                    .await;
+                (runtime, result)
+            });
+            started.await.unwrap();
+            storage.set_fail_state_update(true);
+            release.send(()).unwrap();
+            let (mut runtime, result) = operation.await.unwrap();
+            if path == "grace" {
+                result.unwrap();
+                assert!(!fence.is_closed());
+                assert!(runtime.terminal_transition_retry.is_some());
+                storage.set_fail_state_update(false);
+                tokio::time::advance(TERMINAL_SETTLEMENT_RETRY_DELAY).await;
+                runtime.retry_terminal_transition().await;
+                assert!(runtime.terminal_transition_retry.is_none());
+                assert!(matches!(runtime.state, ConvState::Failed { .. }));
+            } else {
+                assert!(result.is_err());
+                assert!(fence.is_closed());
+            }
+            assert!(runtime.llm_client.recorded_requests().is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ordinary_tool_followup_transfers_fresh_direct_turn_terminal_retry() {
+        let (mut runtime, storage) = build_runtime_with_state_and_queue(
+            "tool-followup-terminal-retry",
+            ordinary_completion_state(),
+            vec![],
+        );
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(400),
+            generation: 7,
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        storage.set_fail_prompt_projection_load(true);
+        storage.set_settle_active_direct_turn_failures(1);
+        runtime.active_direct_turn = Some(Box::new(turn));
+        runtime
+            .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Completed(
+                ToolResult::success("tool-1".into(), "done".into()),
+            )))
+            .await
+            .unwrap();
+        assert!(!runtime.fatal_local_authority_fence.is_closed());
+        assert!(runtime.terminal_transition_retry.is_some());
+        assert!(runtime.active_direct_turn.is_some());
+        assert!(matches!(runtime.state, ConvState::LlmRequesting { .. }));
+        assert_eq!(storage.recorded_settle_active_direct_turn_calls().len(), 1);
+        tokio::time::advance(TERMINAL_SETTLEMENT_RETRY_DELAY).await;
+        runtime.retry_terminal_transition().await;
+        assert!(!runtime.fatal_local_authority_fence.is_closed());
+        assert!(runtime.terminal_transition_retry.is_none());
+        assert!(runtime.active_direct_turn.is_none());
+        assert!(matches!(runtime.state, ConvState::Error { .. }));
+        assert_eq!(storage.recorded_settle_active_direct_turn_calls().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ordinary_tool_followup_preserves_sub_agent_acceptance_retry_and_order() {
+        let mut initial = ordinary_completion_state();
+        if let ConvState::ToolExecuting {
+            pending_sub_agents, ..
+        } = &mut initial
+        {
+            for id in ["child-a", "child-b"] {
+                pending_sub_agents.push(PendingSubAgent {
+                    agent_id: id.into(),
+                    task: id.into(),
+                    mode: SubAgentMode::Work,
+                });
+            }
+        }
+        let (mut runtime, storage) =
+            build_runtime_with_state_and_queue("tool-followup-child-retry", initial, vec![]);
+        let (event_tx, event_rx) = mpsc::channel(32);
+        runtime.event_tx = event_tx;
+        runtime.event_rx = event_rx;
+        for id in ["child-a", "child-b"] {
+            runtime.sub_agent_result_buffer.push(Event::SubAgentResult {
+                agent_id: id.into(),
+                outcome: SubAgentOutcome::Success { result: id.into() },
+            });
+        }
+        storage.fail_sub_agent_acceptance_once();
+        storage.set_fail_prompt_projection_load(true);
+        runtime
+            .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Completed(
+                ToolResult::success("tool-1".into(), "done".into()),
+            )))
+            .await
+            .unwrap();
+        assert!(!runtime.fatal_local_authority_fence.is_closed());
+        assert_eq!(storage.sub_agent_acceptance_count(), 1);
+        assert!(
+            matches!(runtime.sub_agent_result_buffer.as_slice(), [Event::SubAgentResult { agent_id, .. }] if agent_id == "child-b")
+        );
+        tokio::time::advance(Duration::from_millis(50)).await;
+        let retry = runtime.event_rx.recv().await.unwrap();
+        assert!(matches!(retry, Event::RetryBufferedSubAgentResults));
+        runtime.process_event(retry).await.unwrap();
+        let redelivered = runtime.event_rx.recv().await.unwrap();
+        runtime.process_event(redelivered).await.unwrap();
+        assert_eq!(storage.sub_agent_acceptance_count(), 2);
+        assert!(runtime.sub_agent_result_buffer.is_empty());
+        assert!(matches!(runtime.state, ConvState::Error { .. }));
+        assert!(!runtime.fatal_local_authority_fence.is_closed());
+    }
+
+    #[tokio::test]
+    async fn ordinary_tool_followup_state_failure_selects_fatal_caller_disposition() {
+        let initial = ordinary_completion_state();
+        let (mut runtime, storage) = build_runtime_with_state_and_queue(
+            "tool-followup-state-failure",
+            initial.clone(),
+            vec![],
+        );
+        let (event_tx, event_rx) = mpsc::channel(32);
+        runtime.event_tx = event_tx;
+        runtime.event_rx = event_rx;
+        storage.set_fail_prompt_projection_load(true);
+        let (started, release) = storage.gate_state_update();
+        let fence = Arc::clone(&runtime.fatal_local_authority_fence);
+        let llm = Arc::clone(&runtime.llm_client);
+        let (watch_tx, watch_rx) = watch::channel(initial);
+        runtime = runtime.with_state_watcher(watch_tx);
+        let mut broadcasts = runtime.broadcast_tx.subscribe();
+        runtime
+            .tool_outcome_tx
+            .send((
+                runtime.tool_execution.generation(),
+                ToolExecOutcome::Completed(ToolResult::success(
+                    "tool-1".into(),
+                    "committed tool output".into(),
+                )),
+            ))
+            .await
+            .unwrap();
+        let mut task = tokio::spawn(runtime.run());
+        started.await.unwrap();
+        storage.set_fail_state_update(true);
+        release.send(()).unwrap();
+
+        let finished = tokio::time::timeout(Duration::from_secs(30), &mut task).await;
+        if finished.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
+        assert_eq!(
+            finished
+                .expect("consumed tool completion must retain follow-up settlement ownership")
+                .unwrap(),
+            RuntimeExitDisposition::FatalLocalAuthorityLoss
+        );
+        assert!(fence.is_closed());
+        assert!(llm.recorded_requests().is_empty());
+        assert!(matches!(
+            *watch_rx.borrow(),
+            ConvState::LlmRequesting { .. }
+        ));
+        assert!(matches!(
+            storage.get_current_state("tool-followup-state-failure"),
+            Some(ConvState::LlmRequesting { .. })
+        ));
+        assert_eq!(
+            storage
+                .get_all_messages("tool-followup-state-failure")
+                .len(),
+            2
+        );
+        while let Ok(event) = broadcasts.try_recv() {
+            assert!(
+                !matches!(
+                    event,
+                    SseEvent::StateChange {
+                        state: ConvState::Error { .. },
+                        ..
+                    }
+                ),
+                "{event:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_tool_followup_dispatch_failure_persists_feature_error() {
+        let initial = ordinary_completion_state();
+        let (mut runtime, storage) = build_runtime_with_state_and_queue(
+            "tool-followup-feature-error",
+            initial.clone(),
+            vec![],
+        );
+        let (event_tx, event_rx) = mpsc::channel(32);
+        runtime.event_tx = event_tx.clone();
+        runtime.event_rx = event_rx;
+        storage.set_fail_prompt_projection_load(true);
+        let fence = Arc::clone(&runtime.fatal_local_authority_fence);
+        let llm = Arc::clone(&runtime.llm_client);
+        let (watch_tx, mut watch_rx) = watch::channel(initial);
+        runtime = runtime.with_state_watcher(watch_tx);
+        runtime
+            .tool_outcome_tx
+            .send((
+                runtime.tool_execution.generation(),
+                ToolExecOutcome::Completed(ToolResult::success("tool-1".into(), "done".into())),
+            ))
+            .await
+            .unwrap();
+        let task = tokio::spawn(runtime.run());
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            watch_rx.wait_for(|state| matches!(state, ConvState::Error { .. })),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            storage.get_current_state("tool-followup-feature-error"),
+            Some(ConvState::Error { .. })
+        ));
+        assert!(!fence.is_closed());
+        assert!(llm.recorded_requests().is_empty());
+        event_tx.send(Event::Shutdown).await.unwrap();
+        assert_eq!(
+            task.await.unwrap(),
+            RuntimeExitDisposition::CoordinatedShutdown
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_tool_followup_owner_cancellation_closes_fence() {
+        let initial = ordinary_completion_state();
+        let (mut runtime, storage) =
+            build_runtime_with_state_and_queue("tool-followup-cancel", initial.clone(), vec![]);
+        let (event_tx, event_rx) = mpsc::channel(32);
+        runtime.event_tx = event_tx;
+        runtime.event_rx = event_rx;
+        storage.set_fail_prompt_projection_load(true);
+        let (checkpoint_started, checkpoint_release) = storage.gate_state_update();
+        let fence = Arc::clone(&runtime.fatal_local_authority_fence);
+        let (watch_tx, watch_rx) = watch::channel(initial);
+        runtime = runtime.with_state_watcher(watch_tx);
+        runtime
+            .tool_outcome_tx
+            .send((
+                runtime.tool_execution.generation(),
+                ToolExecOutcome::Completed(ToolResult::success("tool-1".into(), "done".into())),
+            ))
+            .await
+            .unwrap();
+        let task = tokio::spawn(runtime.run());
+        checkpoint_started.await.unwrap();
+        let (failure_started, failure_release) = storage.gate_state_update();
+        checkpoint_release.send(()).unwrap();
+        failure_started.await.unwrap();
+        assert!(!fence.is_closed());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(fence.is_closed());
+        assert!(fence
+            .owners_at_first_close()
+            .is_some_and(|owners| owners > 0));
+        assert!(failure_release.send(()).is_err());
+        assert!(matches!(
+            *watch_rx.borrow(),
+            ConvState::LlmRequesting { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn ordinary_tool_completion_failure_selects_fatal_caller_disposition() {
         for failure in [
             "checkpoint",
@@ -22488,7 +22942,7 @@ mod steer_drain_detector_tests {
         completion.effects.truncate(checkpoint_index + 1);
         assert!(matches!(
             runtime.settle_ordinary_tool_outcome(completion).await,
-            ToolOutcomeSettlement::DurableFactEstablished(_)
+            ToolOutcomeSettlement::DurableFactEstablished
         ));
         assert!(matches!(
             db.get_conversation("checkpoint-cut").await.unwrap().state,
