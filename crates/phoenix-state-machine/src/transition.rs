@@ -4683,7 +4683,7 @@ mod tests {
         }
     }
 
-    fn assert_child_rejection_without_directory(tool_calls: Vec<ToolCall>, expected: &str) {
+    fn assert_child_rejection_without_directory(tool_calls: &[ToolCall], expected: &str) {
         let ctx = ConvContext::sub_agent_with_environment(
             "research-child",
             crate::state::ConversationExecutionEnvironment::NoFilesystem,
@@ -4701,7 +4701,7 @@ mod tests {
             &ctx,
             EffectOutcome::Llm(LlmOutcome::Response {
                 content,
-                tool_calls: tool_calls.clone(),
+                tool_calls: tool_calls.to_vec(),
                 provider_replay: None,
                 end_turn: false,
                 usage: UsageData::default(),
@@ -4738,7 +4738,7 @@ mod tests {
             .expect("rejected round must retain its assistant calls and error results");
         assert!(round.assistant_message().display_data.is_none());
         assert_eq!(round.results().len(), tool_calls.len());
-        for (error, call) in round.results().iter().zip(&tool_calls) {
+        for (error, call) in round.results().iter().zip(tool_calls) {
             assert_eq!(error.tool_use_id, call.id);
             assert!(error.is_error());
             assert!(error.output().contains(expected), "{}", error.output());
@@ -4752,7 +4752,7 @@ mod tests {
             ("submit_error", serde_json::json!({"error":"premature"})),
         ] {
             assert_child_rejection_without_directory(
-                vec![
+                &[
                     ToolCall::new("terminal", ToolInput::from_name_and_value(name, input)),
                     ToolCall::new(
                         "think",
@@ -4769,7 +4769,7 @@ mod tests {
     #[test]
     fn coordinator_child_rejects_task_proposal_without_directory() {
         assert_child_rejection_without_directory(
-            vec![ToolCall::new(
+            &[ToolCall::new(
                 "proposal",
                 ToolInput::ProposeTask(crate::state::ProposeTaskInput {
                     task_file: "tasks/example.md".into(),
