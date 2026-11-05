@@ -137,15 +137,27 @@ THE SYSTEM SHALL reject any payload whose fingerprint matches neither its curren
 ### REQ-COMP-008 — Qualified Compiler-Cache Compatibility
 
 WHEN Phoenix automatically selects a compiler cache
-THE SYSTEM SHALL select an sccache executable that passes its version probe or no compiler cache
+THE SYSTEM SHALL prefer exact Kache `1.2.2` on macOS arm64 when its owned local daemon becomes ready
+AND SHALL otherwise select an sccache executable that passes its version probe or no compiler cache
 AND SHALL report the fallback reason and backend actually selected
-AND SHALL NOT automatically select Kache v0.26.0
+
+WHEN Phoenix selects Kache explicitly or automatically
+THE SYSTEM SHALL require a macOS arm64 host and an executable reporting exactly `kache 1.2.2`
+AND SHALL generate and explicitly set both `KACHE_CONFIG` and `KACHE_HOST_CONFIG` to Phoenix-owned configuration
+AND SHALL set `[cache] local_only = true` and `ignore_env = true` with explicit Phoenix-owned `local_store` and `runtime_dir`
+AND SHALL NOT configure or activate remote caching, planners, or volumes through Phoenix-managed Kache
+AND SHALL prevent ambient Kache remote settings and credentials from activating remote behavior
+AND SHALL require local daemon readiness on the effective owned socket, binding reuse to Phoenix's socket-incarnation receipt and serving-process ownership proof
+AND SHALL fail closed on an unowned or replaced socket, an unproven serving child, or an unusable local configuration
+AND SHALL NOT stop or restart an existing daemon
+
+WHEN remote Kache caching is requested
+THE SYSTEM SHALL require a separate explicit remote-cache contract and qualification before enabling it
+AND SHALL NOT infer remote eligibility from the local-only selection contract
 
 WHEN an operator explicitly selects Kache
-THE SYSTEM SHALL require a macOS arm64 host
-AND SHALL require the executable to report exactly version `0.26.0`
-AND SHALL require its local daemon to report readiness on the configured socket
-AND SHALL report that debug-symbol fidelity remains unqualified
+THE SYSTEM SHALL NOT silently bypass local-only policy through caller Kache configuration
+AND SHALL NOT claim restored-archive source-level debug fidelity for exact `1.2.2` without release-specific native evidence
 
 WHEN an operator explicitly selects Kache or sccache
 THE SYSTEM SHALL fail actionably if that backend is unusable
@@ -159,10 +171,10 @@ AND SHALL report it
 THE SYSTEM SHALL scope automatically generated compiler-cache environment variables to direct Cargo subprocesses and explicitly identified wrappers that own Cargo builds
 AND SHALL NOT propagate them into the Phoenix server or agent-executed commands
 
-THE SYSTEM SHALL guarantee this contract only for selection and local subprocess setup
-AND SHALL NOT guarantee compiler-cache performance, remote-cache compatibility, cross-version cache compatibility, or restored-archive source-level debug fidelity
+THE SYSTEM SHALL guarantee this contract only for selection, local-only configuration, daemon ownership, and local subprocess setup
+AND SHALL NOT guarantee compiler-cache performance, remote-cache compatibility, cross-version cache compatibility, or restored-archive source-level debug fidelity without release-specific qualification
 
-**Rationale:** Compiler caching is an optional development optimization. Exact qualification, explicit opt-in for unqualified fidelity, and subprocess scoping prevent an accelerator from becoming an implicit correctness or compatibility promise.
+**Rationale:** Compiler caching is an optional development optimization. Exact version selection, a Phoenix-owned local-only boundary, and subprocess scoping prevent an accelerator from becoming an implicit correctness or remote-compatibility promise.
 
 ### REQ-COMP-012: Qualified irreversible current-schema transition
 
