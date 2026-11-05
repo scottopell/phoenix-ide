@@ -19,6 +19,8 @@ Creation terminal evidence and image delivery lifetime are governed by [ADR-207]
 
 Codex reset-credit visibility and manual redemption, including resuming the stopped conversation after a redemption from its quota error, are governed by [ADR-208](208_codex-reset-credits-are-manual-and-resume-the-stopped-conversation.md), affecting REQ-CRR-001–010.
 
+Strict local-only selection of Kache v1.2.2 on macOS arm64 is governed by [ADR-225](225_kache-v1-2-2-strict-local-only-selection.md), superseding only ADR-224's selection conclusion; ADR-223 and ADR-224 retain their historical v1.0.0 evidence. Remote caching remains deferred.
+
 ## Numbering and validation
 
 ADRs use unique three-digit numeric IDs in `NNN_<slug>.md` filenames. The
@@ -215,9 +217,12 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [220](220_reminder-management-errors-use-existing-fail-stop.md) | Reminder management errors use existing fail-stop authority | Accepted | REQ-REM-006, REQ-DWF-043, REQ-BED-033 |
 | [221](221_coordinator-authority-uses-conversational-approval-and-direct-tools.md) | Coordinator Authority uses conversational approval and direct tools | Accepted | REQ-AUTH-001–006, REQ-GR-007/013/022 |
 | [222](222_unified-local-and-federated-database-query.md) | One authority-shaped database query surface selects local or federated execution | Accepted | REQ-FED-001–003, REQ-RQD-001/005/009/010 |
-| [223](223_coordinator-research-uses-explicit-file-targets.md) | Coordinator research agents use explicit file targets | Superseded by 224 | REQ-GR-007, REQ-SA-001, REQ-SA-002, REQ-SA-007 |
-| [224](224_coordinator-inline-agents-reuse-targeted-bash.md) | Coordinator inline agents reuse targeted Bash | Accepted | REQ-GR-007, REQ-SA-002, REQ-SA-007, REQ-BASH-012, REQ-BASH-013 |
-| [225](225_coordinator-inline-child-bash-controller-retirement.md) | Coordinator inline children retire their Bash controllers before parent acceptance | Accepted | REQ-GR-007, REQ-BASH-017, REQ-BASH-018, REQ-SA-003, REQ-SA-004, REQ-SA-005 |
+| [223](223_kache-v1-restores-automatic-selection.md) | Qualified Kache v1 restores automatic compiler-cache selection | Superseded by ADR-224 (selection); v1.0.0 debugger evidence remains historical | development methodology; REQ-COMP-001, REQ-COMP-008 |
+| [224](224_kache-default-waits-for-identifiable-isolation-fix.md) | Kache default waits for an identifiable isolation fix | Selection conclusion superseded by ADR-225; historical v1.0.0 evidence retained | development methodology; REQ-COMP-001, REQ-COMP-008 |
+| [225](225_kache-v1-2-2-strict-local-only-selection.md) | Select Kache v1.2.2 only behind a Phoenix-owned local-only boundary | Accepted | development methodology; REQ-COMP-001, REQ-COMP-008 |
+| [226](226_coordinator-research-uses-explicit-file-targets.md) | Coordinator research agents use explicit file targets | Superseded by 227 | REQ-GR-007, REQ-SA-001, REQ-SA-002, REQ-SA-007 |
+| [227](227_coordinator-inline-agents-reuse-targeted-bash.md) | Coordinator inline agents reuse targeted Bash | Accepted | REQ-GR-007, REQ-SA-002, REQ-SA-007, REQ-BASH-012, REQ-BASH-013 |
+| [228](228_coordinator-inline-child-bash-controller-retirement.md) | Coordinator inline children retire their Bash controllers before parent acceptance | Accepted | REQ-GR-007, REQ-BASH-017, REQ-BASH-018, REQ-SA-003, REQ-SA-004, REQ-SA-005 |
 
 ## For agents: which decisions bind your task
 
@@ -231,7 +236,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Changing Codex model discovery, availability, or account-bound routing | 062, then 052 and 034 |
 | Changing Codex reset-credit listing, redemption, or post-redemption resume | 208, then 062 and 085 |
 | Configuring named workers, tiers, or sub-agent model routes | 052, within 034's compatibility scope |
-| Selecting or qualifying development compiler-cache defaults | 079, then 078 and 034 |
+| Selecting or qualifying development compiler-cache defaults | 225, then 224/223/079/078 and 034 |
 | Changing pending-question identity compatibility or legacy tokenless settlement | 082, then 034 |
 | Specifying parallel Work-child qualification, admission, shared WorkScope collaboration, cancellation/start, or parent-result delivery | 059, then 052 and 026 |
 | Implementing federation instance identity or bounded known-credential SQL exclusions | 083, within 034's compatibility scope |
@@ -246,7 +251,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006 |
 | Specifying bash command execution / wait-window semantics | 001 |
 | Specifying Global Coordinator Bash authorization or sandbox policy | 047, then 027 and 001 |
-| Specifying filesystem-free Coordinator inline-child Bash ownership, launch admission, terminal cleanup, or parent acceptance | 225 for controller retirement, preserving 224's explicitly targeted write capability |
+| Specifying filesystem-free Coordinator inline-child Bash ownership, launch admission, terminal cleanup, or parent acceptance | 228 for controller retirement, preserving 227's explicitly targeted write capability |
 | Specifying bash handle state observation or response shaping | 002 |
 | Specifying bash process cleanup, shutdown cleanup, or kill escalation policy | 003 |
 | Specifying inline-terminal history commit, per-command rounds, or user-origin attribution | 004 |

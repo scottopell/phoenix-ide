@@ -1130,12 +1130,11 @@ pub async fn resolve_saved_peer_id(
     db: &crate::db::Database,
     selector: &str,
 ) -> Result<InstanceId, FederationClientError> {
-    let selector = selector.trim();
     if selector.is_empty() {
         return Err(FederationClientError::InvalidPeerSelector);
     }
     if let Ok(id) = InstanceId::from_str(selector) {
-        if db.federation_peer_connection(id).await?.is_some() {
+        if selector == id.to_string() && db.federation_peer_connection(id).await?.is_some() {
             return Ok(id);
         }
     }
@@ -2111,6 +2110,30 @@ mod tests {
         }
     }
 
+    async fn save_test_peer(
+        state: &AppState,
+        id: InstanceId,
+        name: &str,
+        url: &str,
+        credential_byte: &str,
+    ) {
+        let credential = phoenix_core::domain::instance_identity::PeerBearerCredential::parse(
+            format!("phx_peer_{}", credential_byte.repeat(43)),
+        )
+        .unwrap();
+        state
+            .db
+            .save_federation_peer_connection(
+                id,
+                &name.parse().unwrap(),
+                &url.parse().unwrap(),
+                &credential,
+                &PeerTlsTrust::PlatformRoots,
+            )
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn peer_tokens_are_prefixed_random_credentials() {
         let first = random_peer_token();
@@ -2185,55 +2208,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn saved_peer_selection_accepts_uuid_or_unique_name_and_refuses_ambiguity() {
+    async fn saved_peer_selection_uses_exact_uuid_or_unique_name_and_refuses_ambiguity() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
-        let token = |byte: &str| {
-            phoenix_core::domain::instance_identity::PeerBearerCredential::parse(format!(
-                "phx_peer_{}",
-                byte.repeat(43)
-            ))
-            .unwrap()
-        };
-        let first = InstanceId::new();
+        let first = InstanceId::from_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
         let second = InstanceId::new();
         let shadow = InstanceId::new();
         let first_id = first.to_string();
-        for (id, name, url) in [
-            (first, "unique", "https://first.example"),
-            (second, "duplicate", "https://second.example"),
-            (shadow, first_id.as_str(), "https://shadow.example"),
+        let uppercase_first_id = first_id.to_uppercase();
+        for (id, name, url, credential_byte) in [
+            (first, "unique", "https://first.example", "a"),
+            (second, "duplicate", "https://second.example", "b"),
+            (shadow, first_id.as_str(), "https://shadow.example", "c"),
         ] {
-            state
-                .db
-                .save_federation_peer_connection(
-                    id,
-                    &name.parse().unwrap(),
-                    &url.parse().unwrap(),
-                    &token(if id == first {
-                        "a"
-                    } else if id == second {
-                        "b"
-                    } else {
-                        "c"
-                    }),
-                    &PeerTlsTrust::PlatformRoots,
-                )
-                .await
-                .unwrap();
+            save_test_peer(&state, id, name, url, credential_byte).await;
         }
+        let uppercase_uuid_alias = InstanceId::new();
+        save_test_peer(
+            &state,
+            uppercase_uuid_alias,
+            &uppercase_first_id,
+            "https://uppercase-uuid-name.example",
+            "f",
+        )
+        .await;
         let uuid_shaped_name = InstanceId::new().to_string();
         let uuid_named_peer = InstanceId::new();
-        state
-            .db
-            .save_federation_peer_connection(
-                uuid_named_peer,
-                &uuid_shaped_name.parse().unwrap(),
-                &"https://uuid-name.example".parse().unwrap(),
-                &token("e"),
-                &PeerTlsTrust::PlatformRoots,
-            )
-            .await
-            .unwrap();
+        save_test_peer(
+            &state,
+            uuid_named_peer,
+            &uuid_shaped_name,
+            "https://uuid-name.example",
+            "e",
+        )
+        .await;
 
         assert_eq!(
             resolve_saved_peer_id(&state.db, &first.to_string())
@@ -2251,17 +2258,14 @@ mod tests {
                 .unwrap(),
             uuid_named_peer
         );
-        state
-            .db
-            .save_federation_peer_connection(
-                InstanceId::new(),
-                &"duplicate".parse().unwrap(),
-                &"https://other.example".parse().unwrap(),
-                &token("d"),
-                &PeerTlsTrust::PlatformRoots,
-            )
-            .await
-            .unwrap();
+        save_test_peer(
+            &state,
+            InstanceId::new(),
+            "duplicate",
+            "https://other.example",
+            "d",
+        )
+        .await;
         assert!(matches!(
             resolve_saved_peer_id(&state.db, "duplicate").await,
             Err(FederationClientError::PeerAmbiguous)
@@ -2270,6 +2274,24 @@ mod tests {
             resolve_saved_peer_id(&state.db, "missing").await,
             Err(FederationClientError::PeerNotFound)
         ));
+        for selector in [" unique", "unique ", " unique ", "Unique", "UNIQUE"] {
+            assert!(matches!(
+                resolve_saved_peer_id(&state.db, selector).await,
+                Err(FederationClientError::PeerNotFound)
+            ));
+        }
+        for selector in [format!(" {first} "), first.to_string().replace('-', "")] {
+            assert!(matches!(
+                resolve_saved_peer_id(&state.db, &selector).await,
+                Err(FederationClientError::PeerNotFound)
+            ));
+        }
+        assert_eq!(
+            resolve_saved_peer_id(&state.db, &uppercase_first_id)
+                .await
+                .unwrap(),
+            uppercase_uuid_alias
+        );
     }
 
     #[tokio::test]

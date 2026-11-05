@@ -85,7 +85,7 @@ same cleanup without waiting for pending launch custody. Pre-dispatch terminal
 delivery joins its observation. WorkScope tables, inventory, caps, waiter-driven tombstones,
 and other controllers remain intact. Signaling is Linux-only; unsupported hosts
 log incomplete cleanup without raw PID fallback. Complete descendant reaping and
-restart cleanup are not guaranteed (ADR-225).
+restart cleanup are not guaranteed (ADR-228).
 
 A live handle owns a 4MB byte-bounded ring buffer with monotonic per-line
 offsets; reader tasks split incoming pipe bytes on newlines and append to
@@ -156,7 +156,7 @@ entirely.
 | **REQ-BASH-015:** Display Command Simplification | 🔄 Carry-forward + extension | Was REQ-BASH-011; new display labels for peek/wait/kill, and compact conversation summaries retain identity/status/duration/output-tail rather than a generic done badge |
 | **REQ-BASH-016:** Coordinator Live-Handle Surface | ✅ Complete | Process-local discovery exposes only live Coordinator-controlled handles with immutable spawn cwd; output uses the authorized inspector, and exact stop is incarnation-bound and offered only on supported hosts |
 | **REQ-BASH-017:** Post-launch Identity and Registration Settlement | Implemented; reconciled-head hosted qualification pending | The preventive gated launcher validates birth identity and commits registration before releasing user payload; the pre-release native denial path proves no command marker is created. Caller-independent owned-child custody, 250ms natural-exit settlement, bounded capture (including empty records), and focused fault regressions cover failures after a child exists. Failed release returns a typed `launch_release_unknown` error with the retained handle and explicit no-retry/may-have-executed guidance; it is not reported as `spawn_failed`. Scope uncertainty remains conservative and sticky, blocks successful Close retirement, and never fabricates a PGID or authorizes reset/recovery. Generated TypeScript wire contracts are checked in and guarded by CI's codegen-stale check. Required CI runs the focused regressions on Linux with the native executable required; `.github/workflows/bash-launch.yml` runs them on macOS, blocking pull requests that touch macOS launch or identity code (ADR-213). Ordinary test runs explicitly skip native-executable cases when the fixture is absent; hosted qualification fails if it is absent. Exact-successor hosted CI and fault qualification remain required after integration. |
-| **REQ-BASH-018:** Filesystem-Free Coordinator Child Controller Retirement | Implemented | Admission fencing, launch-custody draining, shared bounded cleanup, live/durable acceptance ordering, and cancellation-boundary fencing preserve WorkScope ownership and unrelated controllers (ADR-225). Local focused coverage is recorded below; Linux signaling cases run in hosted CI and the PR carries exact-head results. |
+| **REQ-BASH-018:** Filesystem-Free Coordinator Child Controller Retirement | Implemented | Admission fencing, launch-custody draining, shared bounded cleanup, live/durable acceptance ordering, and cancellation-boundary fencing preserve WorkScope ownership and unrelated controllers (ADR-228). Local focused coverage is recorded below; Linux signaling cases run in hosted CI and the PR carries exact-head results. |
 
 ## Inline-child retirement verification
 
