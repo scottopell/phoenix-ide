@@ -3,7 +3,7 @@ use phoenix_tools::{Tool, ToolContext};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-async fn query_tool(instance: &TestInstance) -> Arc<dyn Tool> {
+fn query_tool(instance: &TestInstance) -> Arc<dyn Tool> {
     let db = instance.state.db.clone();
     let global_read =
         crate::api::global_read::GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
@@ -18,7 +18,7 @@ async fn query_tool(instance: &TestInstance) -> Arc<dyn Tool> {
         phoenix_terminal::ActiveTerminals::new(),
     );
 
-    crate::coordinator_tools::tools(global_read, send_chat, load, db)
+    crate::coordinator_tools::tools(global_read, send_chat, load, &db)
         .into_iter()
         .find(|tool| tool.name() == "query_database")
         .expect("Coordinator registry must expose query_database")
@@ -83,7 +83,7 @@ async fn unified_query_routes_by_uuid_and_name_with_typed_attribution_and_no_fal
     let caller_id = caller.state.db.instance_id().await.unwrap();
     let receiver_id = receiver.state.db.instance_id().await.unwrap();
     let receiver_selector = receiver_id.to_string();
-    let tool = query_tool(&caller).await;
+    let tool = query_tool(&caller);
 
     for selector in [receiver_selector.as_str(), "isolated receiver"] {
         let output = run_query(&tool, selector).await;

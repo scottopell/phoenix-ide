@@ -201,7 +201,7 @@ pub(crate) fn tools(
     service: GlobalReadService,
     send_chat: Arc<SendChatApplicationService>,
     load: Arc<crate::api::work_scope_load::WorkScopeLoadService>,
-    db: crate::db::Database,
+    db: &crate::db::Database,
 ) -> Vec<Arc<dyn Tool>> {
     let watch_db = send_chat.db().clone();
     let close_retry = send_chat.clone();
