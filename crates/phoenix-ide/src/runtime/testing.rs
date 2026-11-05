@@ -706,6 +706,7 @@ pub struct InMemoryStorage {
         Mutex<Vec<crate::runtime::traits::ContinuationDirectTurnSettlement>>,
     fail_continuation_commit: Mutex<bool>,
     fail_state_update: Mutex<bool>,
+    fail_gated_state_update_once: AtomicBool,
     state_update_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     state_update_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     fail_tool_round_persist: Mutex<bool>,
@@ -714,6 +715,7 @@ pub struct InMemoryStorage {
     tool_round_persist_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     tool_round_persist_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     fail_sub_agent_acceptance_once: Mutex<bool>,
+    fail_sub_agent_backstop: AtomicBool,
     fail_message_add: Mutex<bool>,
     message_add_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     message_add_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -814,6 +816,7 @@ impl InMemoryStorage {
             settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
+            fail_gated_state_update_once: AtomicBool::new(false),
             state_update_started: Mutex::new(None),
             state_update_release: Mutex::new(None),
             fail_tool_round_persist: Mutex::new(false),
@@ -822,6 +825,7 @@ impl InMemoryStorage {
             tool_round_persist_started: Mutex::new(None),
             tool_round_persist_release: Mutex::new(None),
             fail_sub_agent_acceptance_once: Mutex::new(false),
+            fail_sub_agent_backstop: AtomicBool::new(false),
             fail_message_add: Mutex::new(false),
             message_add_started: Mutex::new(None),
             message_add_release: Mutex::new(None),
@@ -881,6 +885,15 @@ impl InMemoryStorage {
 
     pub fn set_fail_state_update(&self, fail: bool) {
         *self.fail_state_update.lock().unwrap() = fail;
+    }
+
+    pub fn set_fail_sub_agent_backstop(&self, fail: bool) {
+        self.fail_sub_agent_backstop.store(fail, Ordering::Relaxed);
+    }
+
+    pub fn fail_gated_state_update_once(&self) {
+        self.fail_gated_state_update_once
+            .store(true, Ordering::Relaxed);
     }
 
     pub fn set_fail_tool_round_persist(&self, fail: bool) {
@@ -1359,6 +1372,19 @@ impl Default for InMemoryStorage {
 
 #[async_trait]
 impl MessageStore for InMemoryStorage {
+    async fn terminalize_sub_agent_cancellation_backstop(
+        &self,
+        _child_conversation_id: &str,
+        _cause: phoenix_db::SubAgentTerminalCause,
+        _terminal_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        if self.fail_sub_agent_backstop.load(Ordering::Relaxed) {
+            Err("injected child backstop terminal evidence failure".into())
+        } else {
+            Ok(())
+        }
+    }
+
     async fn coordinator_authority(
         &self,
     ) -> Result<phoenix_core::domain::coordinator_authority::CoordinatorAuthority, String> {
@@ -2205,6 +2231,12 @@ impl StateStore for InMemoryStorage {
         let release = self.state_update_release.lock().unwrap().take();
         if let Some(release) = release {
             let _ = release.await;
+            if self
+                .fail_gated_state_update_once
+                .swap(false, Ordering::Relaxed)
+            {
+                return Err("injected gated state update failure".to_string());
+            }
         }
         self.state_updated_ats
             .lock()

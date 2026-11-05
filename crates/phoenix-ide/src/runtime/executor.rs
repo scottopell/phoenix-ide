@@ -408,26 +408,34 @@ enum StartupSteeringDrainOutcome {
 enum TransitionAuthority {
     ExistingSettlement,
     RequiredSettlement,
-    OwnedToolFollowup,
+    OwnedCompletionFollowup,
 }
 
 impl TransitionAuthority {
     fn requires_committed_state(self) -> bool {
         match self {
             Self::ExistingSettlement => false,
-            Self::RequiredSettlement | Self::OwnedToolFollowup => true,
+            Self::RequiredSettlement | Self::OwnedCompletionFollowup => true,
         }
     }
 
     fn accepts_registered_feature_owner(self) -> bool {
         match self {
-            Self::OwnedToolFollowup => true,
+            Self::OwnedCompletionFollowup => true,
             Self::ExistingSettlement | Self::RequiredSettlement => false,
         }
     }
 }
 
-enum ToolOutcomeSettlement {
+enum RequiredCompletion {
+    Tool(Box<crate::state_machine::transition::TransitionResult>),
+    Child {
+        agent_id: String,
+        outcome: SubAgentOutcome,
+    },
+}
+
+enum CompletionSettlement {
     DurableFactEstablished,
     DurableFactUnclassified(String),
 }
@@ -2224,6 +2232,7 @@ where
     fatal_local_authority_fence: Arc<crate::runtime::FatalLocalAuthorityFence>,
     svg_publication_lifetime: Arc<super::svg_artifacts::SvgPublicationLifetime>,
     handoff_completion_authority: Option<crate::runtime::AdmittedOperation>,
+    required_settlement_authority: Option<crate::runtime::AdmittedOperation>,
     handoff_completion_timestamp: Option<DateTime<Utc>>,
     continuation_effect_disposition: ContinuationEffectDisposition,
     recovery_disposition: RuntimeRecoveryDisposition,
@@ -2444,6 +2453,7 @@ where
             fatal_local_authority_fence,
             svg_publication_lifetime: super::svg_artifacts::SvgPublicationLifetime::new(),
             handoff_completion_authority: None,
+            required_settlement_authority: None,
             handoff_completion_timestamp: None,
             continuation_effect_disposition: ContinuationEffectDisposition::Continue,
             recovery_disposition: RuntimeRecoveryDisposition::Continue,
@@ -2524,9 +2534,18 @@ where
         }
     }
 
-    fn live_state_owner(&self) -> Result<Option<crate::runtime::AdmittedOperation>, String> {
+    fn live_state_owner(&mut self) -> Result<Option<crate::runtime::AdmittedOperation>, String> {
         if self.handoff_completion_authority.is_some() {
             return Ok(None);
+        }
+        if self
+            .fatal_local_authority_fence
+            .fatal_authority_loss_is_latched()
+        {
+            return Err("runtime state publication closed after fatal local authority loss".into());
+        }
+        if let Some(authority) = &mut self.required_settlement_authority {
+            return Ok(Some(authority.reborrow()));
         }
         self.fatal_local_authority_fence
             .try_acquire()
@@ -2559,7 +2578,7 @@ where
         }
     }
 
-    fn publish_live_state(&self) -> Result<(), String> {
+    fn publish_live_state(&mut self) -> Result<(), String> {
         let _owner = self.live_state_owner()?;
         self.publish_live_state_admitted();
         Ok(())
@@ -2704,9 +2723,10 @@ where
     #[allow(clippy::too_many_lines)] // Sequential event loop owns the runtime state.
     async fn run_inner(mut self) -> RuntimeExitDisposition {
         tracing::info!(conv_id = %self.context.conversation_id, "Starting conversation runtime");
-        let Ok(owner) = self.admit_authoritative_effect() else {
-            return self.fatal_local_authority_exit();
+        let Ok(mut owner) = self.admit_authoritative_effect() else {
+            return self.closed_authority_exit().await;
         };
+        self.required_settlement_authority = Some(owner.reborrow());
         let mut startup_authority = RuntimeSettlementAuthority {
             owner: Some(owner),
             abandoned_reason: "startup_settlement_owner_disappeared",
@@ -2732,6 +2752,7 @@ where
             if self.creation_settlement_disposition == CreationSettlementDisposition::StaleAuthority
             {
                 startup_authority.owner = None;
+                self.required_settlement_authority = None;
                 return RuntimeExitDisposition::Interrupted;
             }
         }
@@ -2875,6 +2896,7 @@ where
                     let _ = ack.send(Ok(()));
                 }
                 startup_authority.owner = None;
+                self.required_settlement_authority = None;
                 return RuntimeExitDisposition::Terminal;
             }
         }
@@ -2946,7 +2968,10 @@ where
                 Ok(None) => {}
                 Err(error) => {
                     tracing::error!(%error, "Failed to resume continuation request");
-                    if self.fatal_local_authority_fence.is_closed() {
+                    if self
+                        .fatal_local_authority_fence
+                        .fatal_authority_loss_is_latched()
+                    {
                         return self.fatal_local_authority_exit();
                     }
                     if let Err(error) = self
@@ -3035,6 +3060,7 @@ where
         if let Some(ack) = self.startup_llm_recovery_ack.take() {
             let _ = ack.send(Ok(()));
         }
+        self.required_settlement_authority = None;
         startup_authority.owner = None;
         drop(startup_authority);
 
@@ -3051,7 +3077,7 @@ where
         .then(|| tokio::time::Instant::now() + Duration::from_secs(30));
         loop {
             if self.fatal_local_authority_fence.is_closed() {
-                return self.fatal_local_authority_exit();
+                return self.closed_authority_exit().await;
             }
             if let Some(disposition) = self.recovery_exit_disposition() {
                 tracing::warn!(
@@ -3461,40 +3487,53 @@ where
         generation != self.retry_generation
     }
 
-    async fn settle_ordinary_tool_outcome(
+    async fn settle_required_completion(
         &mut self,
-        transition: crate::state_machine::transition::TransitionResult,
-    ) -> ToolOutcomeSettlement {
-        let owner = match self.admit_authoritative_effect() {
+        completion: RequiredCompletion,
+    ) -> CompletionSettlement {
+        let mut owner = match self.admit_authoritative_effect() {
             Ok(owner) => owner,
-            Err(error) => return ToolOutcomeSettlement::DurableFactUnclassified(error),
+            Err(error) => return CompletionSettlement::DurableFactUnclassified(error),
         };
+        let enclosing_authority = self.required_settlement_authority.replace(owner.reborrow());
         let mut authority = RuntimeSettlementAuthority {
             owner: Some(owner),
             abandoned_reason: "ordinary_tool_outcome_owner_disappeared",
         };
-        let settlement =
-            async {
-                let mut events = Box::pin(self.apply_transition_result_with_authority(
-                    transition,
-                    None,
-                    TransitionAuthority::RequiredSettlement,
-                ))
-                .await?;
-                while let Some(event) = events.pop() {
+        let settlement = async {
+            let mut events = match completion {
+                RequiredCompletion::Tool(transition) => {
+                    Box::pin(self.apply_transition_result_with_authority(
+                        *transition,
+                        None,
+                        TransitionAuthority::RequiredSettlement,
+                    ))
+                    .await?
+                }
+                RequiredCompletion::Child { agent_id, outcome } => {
                     Box::pin(self.process_event_with_authority(
-                        event,
-                        TransitionAuthority::OwnedToolFollowup,
+                        Event::SubAgentResult { agent_id, outcome },
+                        TransitionAuthority::OwnedCompletionFollowup,
                     ))
                     .await?;
+                    Vec::new()
                 }
-                Ok::<(), String>(())
+            };
+            while let Some(event) = events.pop() {
+                Box::pin(self.process_event_with_authority(
+                    event,
+                    TransitionAuthority::OwnedCompletionFollowup,
+                ))
+                .await?;
             }
-            .await;
+            Ok::<(), String>(())
+        }
+        .await;
+        self.required_settlement_authority = enclosing_authority;
         match settlement {
             Ok(()) => {
                 authority.owner = None;
-                ToolOutcomeSettlement::DurableFactEstablished
+                CompletionSettlement::DurableFactEstablished
             }
             Err(error) => {
                 // No command-scoped exact probe spans the checkpoint, replay,
@@ -3502,7 +3541,7 @@ where
                 self.fatal_local_authority_fence
                     .close("ordinary_tool_outcome_settlement");
                 authority.owner = None;
-                ToolOutcomeSettlement::DurableFactUnclassified(error)
+                CompletionSettlement::DurableFactUnclassified(error)
             }
         }
     }
@@ -3513,7 +3552,9 @@ where
         error: &str,
     ) -> bool {
         authority.accepts_registered_feature_owner()
-            && !self.fatal_local_authority_fence.is_closed()
+            && !self
+                .fatal_local_authority_fence
+                .fatal_authority_loss_is_latched()
             && self.local_terminal_authority == LocalTerminalAuthority::Classified
             && !error.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:")
     }
@@ -3524,7 +3565,12 @@ where
     /// are logged and discarded — state unchanged.
     #[allow(clippy::large_futures)]
     async fn process_outcome(&mut self, outcome: EffectOutcome) -> Result<(), String> {
-        if self.fatal_local_authority_fence.is_closed() {
+        if self.fatal_local_authority_fence.is_closed()
+            && (self
+                .fatal_local_authority_fence
+                .fatal_authority_loss_is_latched()
+                || self.required_settlement_authority.is_none())
+        {
             return Err("runtime processing closed after fatal local authority loss".to_string());
         }
 
@@ -3611,9 +3657,12 @@ where
             || (self.context.is_sub_agent
                 && matches!(result.new_state.step_result(), StepResult::Terminal(_)));
         let generated_events = if is_tool_outcome && !has_owned_terminal_settlement {
-            match self.settle_ordinary_tool_outcome(result).await {
-                ToolOutcomeSettlement::DurableFactEstablished => Vec::new(),
-                ToolOutcomeSettlement::DurableFactUnclassified(error) => return Err(error),
+            match self
+                .settle_required_completion(RequiredCompletion::Tool(Box::new(result)))
+                .await
+            {
+                CompletionSettlement::DurableFactEstablished => Vec::new(),
+                CompletionSettlement::DurableFactUnclassified(error) => return Err(error),
             }
         } else {
             self.apply_transition_result(result).await?
@@ -3686,8 +3735,31 @@ where
 
     #[allow(clippy::too_many_lines)]
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
-        Box::pin(self.process_event_with_authority(event, TransitionAuthority::ExistingSettlement))
-            .await
+        match event {
+            Event::SubAgentResult { agent_id, outcome }
+                if matches!(&self.state,
+                    ConvState::AwaitingSubAgents { pending, .. }
+                    | ConvState::CancellingSubAgents { pending, .. }
+                    if pending.iter().any(|child| child.agent_id == agent_id)) =>
+            {
+                match self
+                    .settle_required_completion(RequiredCompletion::Child { agent_id, outcome })
+                    .await
+                {
+                    CompletionSettlement::DurableFactEstablished => Ok(()),
+                    CompletionSettlement::DurableFactUnclassified(error) => Err(error),
+                }
+            }
+            event => {
+                Box::pin(
+                    self.process_event_with_authority(
+                        event,
+                        TransitionAuthority::ExistingSettlement,
+                    ),
+                )
+                .await
+            }
+        }
     }
 
     async fn process_startup_event(&mut self, event: Event) -> Result<(), String> {
@@ -3703,6 +3775,10 @@ where
     ) -> Result<(), String> {
         if self.fatal_local_authority_fence.is_closed()
             && self.handoff_completion_authority.is_none()
+            && (self
+                .fatal_local_authority_fence
+                .fatal_authority_loss_is_latched()
+                || self.required_settlement_authority.is_none())
             && !matches!(event, Event::Shutdown)
         {
             return Err("runtime processing closed after fatal local authority loss".to_string());
@@ -3971,19 +4047,26 @@ where
                 Event::UserMessage { message_id, .. } => Some(message_id.as_str()),
                 _ => None,
             };
-            let ordinary_tool_completion = matches!(self.state, ConvState::ToolExecuting { .. })
-                && !authority.accepts_registered_feature_owner()
-                && matches!(
-                    terminal_event,
+            let ordinary_tool_completion = matches!(
+                (&self.state, &terminal_event),
+                (
+                    ConvState::ToolExecuting { .. },
                     Event::ToolComplete { .. } | Event::SpawnAgentsComplete { .. }
+                ) | (
+                    ConvState::CancellingTool { .. },
+                    Event::ToolAborted { .. } | Event::ToolComplete { .. }
                 )
+            ) && !authority.accepts_registered_feature_owner()
                 && self.pending_direct_turn_terminal.is_none()
                 && !(self.context.is_sub_agent
                     && matches!(result.new_state.step_result(), StepResult::Terminal(_)));
             let application = if ordinary_tool_completion {
-                match self.settle_ordinary_tool_outcome(result).await {
-                    ToolOutcomeSettlement::DurableFactEstablished => Ok(Vec::new()),
-                    ToolOutcomeSettlement::DurableFactUnclassified(error) => Err(error),
+                match self
+                    .settle_required_completion(RequiredCompletion::Tool(Box::new(result)))
+                    .await
+                {
+                    CompletionSettlement::DurableFactEstablished => Ok(Vec::new()),
+                    CompletionSettlement::DurableFactUnclassified(error) => Err(error),
                 }
             } else {
                 self.apply_transition_result_with_authority(result, ordinary_input_id, authority)
@@ -5802,6 +5885,14 @@ where
                 // Deadline fired but state already moved on — nothing to do.
                 return;
             };
+        let Ok(mut owner) = self.admit_authoritative_effect() else {
+            return;
+        };
+        let enclosing_authority = self.required_settlement_authority.replace(owner.reborrow());
+        let mut authority = RuntimeSettlementAuthority {
+            owner: Some(owner),
+            abandoned_reason: "cancellation_backstop_settlement",
+        };
 
         tracing::warn!(
             conv_id = %self.context.conversation_id,
@@ -5831,7 +5922,8 @@ where
                 .await
             {
                 tracing::warn!(%error, %agent_id, "failed to persist cancellation backstop terminal evidence");
-                continue;
+                self.required_settlement_authority = enclosing_authority;
+                return;
             }
             let event = Event::SubAgentResult {
                 agent_id,
@@ -5842,10 +5934,17 @@ where
                     error_kind: crate::db::ErrorKind::Cancelled,
                 },
             };
-            if let Err(e) = self.process_event(event).await {
+            if let Err(e) = self
+                .process_event_with_authority(event, TransitionAuthority::OwnedCompletionFollowup)
+                .await
+            {
                 tracing::warn!(error = %e, "Failed to process cancellation backstop SubAgentResult");
+                self.required_settlement_authority = enclosing_authority;
+                return;
             }
         }
+        self.required_settlement_authority = enclosing_authority;
+        authority.owner = None;
 
         // Persist+broadcast the user-visible system message AFTER the drain
         // loop commits the cancelled checkpoint, so its sequence is strictly
@@ -5856,7 +5955,9 @@ where
         // Only a user-requested cancel actually stops the conversation; a
         // completion timeout drains and resumes the parent's LLM turn, so the
         // "cancellation completed" notice would be wrong there.
-        if cause == crate::state_machine::event::CancelCause::UserRequested {
+        if cause == crate::state_machine::event::CancelCause::UserRequested
+            && matches!(self.state, ConvState::Idle)
+        {
             self.broadcast_cancellation_backstop_message().await;
         }
     }
@@ -6503,6 +6604,26 @@ where
         RuntimeExitDisposition::FatalLocalAuthorityLoss
     }
 
+    async fn closed_authority_exit(&mut self) -> RuntimeExitDisposition {
+        if self
+            .fatal_local_authority_fence
+            .fatal_authority_loss_is_latched()
+        {
+            self.fatal_local_authority_exit()
+        } else {
+            self.svg_publication_lifetime.coordinated_shutdown();
+            self.abort_external_effects().await;
+            if self
+                .fatal_local_authority_fence
+                .fatal_authority_loss_is_latched()
+            {
+                self.fatal_local_authority_exit()
+            } else {
+                RuntimeExitDisposition::CoordinatedShutdown
+            }
+        }
+    }
+
     fn fail_startup_authority(&mut self, reason: &'static str) -> RuntimeExitDisposition {
         self.fatal_local_authority_fence.close(reason);
         self.fatal_local_authority_exit()
@@ -6575,7 +6696,16 @@ where
         }
     }
 
-    fn admit_authoritative_effect(&self) -> Result<crate::runtime::AdmittedOperation, String> {
+    fn admit_authoritative_effect(&mut self) -> Result<crate::runtime::AdmittedOperation, String> {
+        if self
+            .fatal_local_authority_fence
+            .fatal_authority_loss_is_latched()
+        {
+            return Err("runtime persistence closed after fatal local authority loss".into());
+        }
+        if let Some(authority) = &mut self.required_settlement_authority {
+            return Ok(authority.reborrow());
+        }
         self.fatal_local_authority_fence
             .try_acquire()
             .map_err(|()| "runtime persistence closed after fatal local authority loss".to_string())
@@ -22393,11 +22523,11 @@ mod steer_drain_detector_tests {
         assert!(
             matches!(runtime.sub_agent_result_buffer.as_slice(), [Event::SubAgentResult { agent_id, .. }] if agent_id == "child-b")
         );
-        tokio::time::advance(Duration::from_millis(50)).await;
-        let retry = runtime.event_rx.recv().await.unwrap();
-        assert!(matches!(retry, Event::RetryBufferedSubAgentResults));
-        runtime.process_event(retry).await.unwrap();
-        let redelivered = runtime.event_rx.recv().await.unwrap();
+        runtime
+            .process_event(Event::RetryBufferedSubAgentResults)
+            .await
+            .unwrap();
+        let redelivered = runtime.event_rx.try_recv().unwrap();
         runtime.process_event(redelivered).await.unwrap();
         assert_eq!(storage.sub_agent_acceptance_count(), 2);
         assert!(runtime.sub_agent_result_buffer.is_empty());
@@ -22943,8 +23073,10 @@ mod steer_drain_detector_tests {
             .unwrap();
         completion.effects.truncate(checkpoint_index + 1);
         assert!(matches!(
-            runtime.settle_ordinary_tool_outcome(completion).await,
-            ToolOutcomeSettlement::DurableFactEstablished
+            runtime
+                .settle_required_completion(RequiredCompletion::Tool(Box::new(completion)))
+                .await,
+            CompletionSettlement::DurableFactEstablished
         ));
         assert!(matches!(
             db.get_conversation("checkpoint-cut").await.unwrap().state,
@@ -23007,6 +23139,520 @@ mod steer_drain_detector_tests {
             Some(ConvState::AwaitingSubAgents { .. })
         ));
         assert!(runtime.llm_client.recorded_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_completion_failure_closes_authority_without_publication() {
+        for fault in ["checkpoint", "state"] {
+            for racing_completion in [false, true] {
+                let id = "backstop-checkpoint-failure";
+                let (mut runtime, storage) =
+                    build_runtime_with_state_and_queue(id, ordinary_completion_state(), vec![]);
+                runtime
+                    .process_event(Event::UserCancel {
+                        reason: None,
+                        cause: crate::state_machine::event::CancelCause::UserRequested,
+                    })
+                    .await
+                    .unwrap();
+                let initial = runtime.state.clone();
+                let (watch_tx, watch_rx) = watch::channel(initial.clone());
+                runtime = runtime.with_state_watcher(watch_tx);
+                let mut broadcasts = runtime.broadcast_tx.subscribe();
+                match fault {
+                    "checkpoint" => storage.set_fail_tool_round_persist(true),
+                    "state" => storage.set_fail_state_update(true),
+                    _ => unreachable!(),
+                }
+                if racing_completion {
+                    runtime
+                        .process_event(Event::ToolComplete {
+                            tool_use_id: "tool-1".into(),
+                            result: ToolResult::success(
+                                "tool-1".into(),
+                                "racing completion".into(),
+                            ),
+                        })
+                        .await
+                        .unwrap_err();
+                } else {
+                    runtime.handle_cancelling_tool_timeout().await;
+                }
+                assert!(
+                    runtime.fatal_local_authority_fence.is_closed(),
+                    "{fault}/{racing_completion}"
+                );
+                assert_eq!(runtime.state, initial);
+                assert_eq!(*watch_rx.borrow(), initial);
+                assert!(runtime.llm_client.recorded_requests().is_empty());
+                assert!(storage.get_all_messages(id).is_empty());
+                while let Ok(event) = broadcasts.try_recv() {
+                    assert!(!matches!(event, SseEvent::StateChange { .. }), "{event:?}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_backstop_success_preserves_child_terminal_retry() {
+        for child in [false, true] {
+            let id = "backstop-success";
+            let (mut runtime, storage) =
+                build_runtime_with_state_and_queue(id, ordinary_completion_state(), vec![]);
+            runtime.context.is_sub_agent = child;
+            runtime
+                .process_event(Event::UserCancel {
+                    reason: None,
+                    cause: crate::state_machine::event::CancelCause::UserRequested,
+                })
+                .await
+                .unwrap();
+            if child {
+                storage.set_fail_state_update(true);
+            }
+            runtime.handle_cancelling_tool_timeout().await;
+            assert!(!runtime.fatal_local_authority_fence.is_closed());
+            if child {
+                assert!(runtime.terminal_transition_retry.is_some());
+                storage.set_fail_state_update(false);
+                runtime.retry_terminal_transition().await;
+                assert!(runtime.terminal_transition_retry.is_none());
+                assert!(matches!(runtime.state, ConvState::Failed { .. }));
+            } else {
+                assert!(matches!(runtime.state, ConvState::Idle));
+                assert_eq!(storage.get_all_messages(id).len(), 3);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_backstop_owner_cancellation_closes_authority() {
+        let (mut runtime, storage) = build_runtime_with_state_and_queue(
+            "backstop-owner-cancel",
+            ordinary_completion_state(),
+            vec![],
+        );
+        runtime
+            .process_event(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await
+            .unwrap();
+        let fence = runtime.fatal_local_authority_fence.clone();
+        let (started, _release) = storage.gate_tool_round_persist();
+        let task = tokio::spawn(async move { runtime.handle_cancelling_tool_timeout().await });
+        started.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(fence.is_closed());
+        assert_eq!(fence.owner_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn startup_process_shutdown_is_nonfatal_and_required_failure_still_wins() {
+        for failure in [false, true] {
+            let gate = Arc::new(tokio::sync::Mutex::new(()));
+            let locked = gate.clone().lock_owned().await;
+            let (runtime, storage) = build_runtime_with_state_and_queue(
+                "startup-shutdown-race",
+                ConvState::Idle,
+                vec![],
+            );
+            let fence = runtime.fatal_local_authority_fence.clone();
+            let llm = runtime.llm_client.clone();
+            let (event_tx, event_rx) = mpsc::channel(8);
+            let mut runtime = runtime.with_steering_projection_gate(gate);
+            runtime.event_rx = event_rx;
+            let mut run = runtime.run();
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(
+                    std::future::Future::poll(run.as_mut(), cx).is_pending()
+                ))
+                .await
+            );
+            assert!(fence.owner_count() > 0);
+            fence.close_for_process_shutdown();
+            storage.set_fail_steering_load(failure);
+            drop(locked);
+            event_tx.send(Event::Shutdown).await.unwrap();
+            assert_eq!(
+                run.await,
+                if failure {
+                    RuntimeExitDisposition::FatalLocalAuthorityLoss
+                } else {
+                    RuntimeExitDisposition::CoordinatedShutdown
+                },
+                "required failure: {failure}"
+            );
+            assert_eq!(fence.tx.borrow().is_some(), failure);
+            assert!(llm.recorded_requests().is_empty());
+            assert_eq!(fence.owner_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_shutdown_reuses_admitted_settlement_and_preserves_write_failures() {
+        for fail_write in [false, true] {
+            let (runtime, storage) = build_runtime_with_state_and_queue(
+                "startup-shutdown-write",
+                ConvState::LlmRequesting { attempt: 1 },
+                vec![],
+            );
+            let fence = runtime.fatal_local_authority_fence.clone();
+            let llm = runtime.llm_client.clone();
+            let (started, release) = storage.gate_state_update();
+            let task = tokio::spawn(runtime.run());
+            started.await.unwrap();
+            fence.close_for_process_shutdown();
+            if fail_write {
+                storage.fail_gated_state_update_once();
+            }
+            release.send(()).unwrap();
+            assert_eq!(
+                task.await.unwrap(),
+                if fail_write {
+                    RuntimeExitDisposition::FatalLocalAuthorityLoss
+                } else {
+                    RuntimeExitDisposition::CoordinatedShutdown
+                }
+            );
+            assert_eq!(fence.fatal_authority_loss_is_latched(), fail_write);
+            if !fail_write {
+                assert!(matches!(
+                    storage.get_current_state("startup-shutdown-write"),
+                    Some(ConvState::Error { .. })
+                ));
+            }
+            assert!(llm.recorded_requests().is_empty());
+            assert_eq!(fence.owner_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_continuation_dispatch_error_during_shutdown_keeps_feature_disposition() {
+        let initial = ConvState::AwaitingContinuation {
+            request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                operation_id: "startup-continuation-shutdown".into(),
+                rejected_tool_calls: vec![],
+                attempt: 1,
+            },
+        };
+        let (runtime, storage) =
+            build_runtime_with_state_and_queue("continuation-shutdown", initial, vec![]);
+        let fence = runtime.fatal_local_authority_fence.clone();
+        let (started, release) = storage.gate_prompt_projection_load();
+        let task = tokio::spawn(runtime.run());
+        started.await.unwrap();
+        fence.close_for_process_shutdown();
+        storage.set_fail_prompt_projection_load(true);
+        release.send(()).unwrap();
+        assert_eq!(
+            task.await.unwrap(),
+            RuntimeExitDisposition::CoordinatedShutdown
+        );
+        assert!(matches!(
+            storage.get_current_state("continuation-shutdown"),
+            Some(ConvState::RecoverableContinuationFailure { .. })
+        ));
+        assert!(!fence.fatal_authority_loss_is_latched());
+        assert_eq!(fence.owner_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn startup_closed_admission_distinguishes_shutdown_from_fatal_authority_loss() {
+        for fatal in [false, true] {
+            let (runtime, storage) = build_runtime_with_state_and_queue(
+                "startup-closed-admission",
+                ConvState::Idle,
+                vec![],
+            );
+            let fence = runtime.fatal_local_authority_fence.clone();
+            fence.close_for_process_shutdown();
+            if fatal {
+                fence.close("required_write_failed");
+            }
+            storage.set_fail_load_active_direct_turn(true);
+            assert_eq!(
+                runtime.run().await,
+                if fatal {
+                    RuntimeExitDisposition::FatalLocalAuthorityLoss
+                } else {
+                    RuntimeExitDisposition::CoordinatedShutdown
+                }
+            );
+            assert_eq!(fence.fatal_authority_loss_is_latched(), fatal);
+            assert_eq!(fence.owner_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_tool_shutdown_reuses_admitted_settlement_and_preserves_write_failures() {
+        for fail_write in [false, true] {
+            let id = "tool-shutdown-write";
+            let initial = ordinary_completion_state();
+            let (runtime, storage) = build_runtime_with_state_and_queue(id, initial, vec![]);
+            storage.set_fail_prompt_projection_load(true);
+            let fence = runtime.fatal_local_authority_fence.clone();
+            let llm = runtime.llm_client.clone();
+            let (started, release) = storage.gate_tool_round_persist();
+            runtime
+                .tool_outcome_tx
+                .send((
+                    runtime.tool_execution.generation(),
+                    ToolExecOutcome::Completed(ToolResult::success(
+                        "tool-1".into(),
+                        "finished".into(),
+                    )),
+                ))
+                .await
+                .unwrap();
+            let task = tokio::spawn(runtime.run());
+            started.await.unwrap();
+            fence.close_for_process_shutdown();
+            storage.set_fail_state_update(fail_write);
+            release.send(()).unwrap();
+            assert_eq!(
+                task.await.unwrap(),
+                if fail_write {
+                    RuntimeExitDisposition::FatalLocalAuthorityLoss
+                } else {
+                    RuntimeExitDisposition::CoordinatedShutdown
+                }
+            );
+            assert_eq!(fence.fatal_authority_loss_is_latched(), fail_write);
+            assert!(llm.recorded_requests().is_empty());
+            if !fail_write {
+                assert!(matches!(
+                    storage.get_current_state(id),
+                    Some(ConvState::Error { .. })
+                ));
+            }
+            assert_eq!(fence.owner_count(), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_deadline_failure_selects_fatal_runtime_disposition() {
+        let initial = ordinary_completion_state();
+        let context = ConvContext::new(
+            "cancel-deadline-fatal",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
+        let cancelling = transition(
+            &initial,
+            &context,
+            Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            },
+        )
+        .unwrap()
+        .new_state;
+        let (mut runtime, storage) =
+            build_runtime_with_state_and_queue("cancel-deadline-fatal", cancelling.clone(), vec![]);
+        runtime.state_updated_at = Utc::now() - chrono::Duration::seconds(10);
+        let (watch_tx, watch_rx) = watch::channel(cancelling.clone());
+        runtime = runtime.with_state_watcher(watch_tx);
+        let fence = runtime.fatal_local_authority_fence.clone();
+        storage.set_fail_tool_round_persist(true);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(30), runtime.run())
+                .await
+                .unwrap(),
+            RuntimeExitDisposition::FatalLocalAuthorityLoss
+        );
+        assert!(fence.fatal_authority_loss_is_latched());
+        assert_eq!(*watch_rx.borrow(), cancelling);
+    }
+
+    #[tokio::test]
+    async fn child_cancellation_backstop_evidence_failure_is_fatal_and_acceptance_retry_is_owned() {
+        for evidence_failure in [false, true] {
+            let id = "child-backstop-fault";
+            let (mut runtime, storage) = cancelling_runtime(
+                id,
+                &["child"],
+                crate::state_machine::event::CancelCause::UserRequested,
+            )
+            .await;
+            let (event_tx, event_rx) = mpsc::channel(8);
+            runtime.event_tx = event_tx;
+            runtime.event_rx = event_rx;
+            let initial = runtime.state.clone();
+            let (watch_tx, watch_rx) = watch::channel(initial.clone());
+            runtime = runtime.with_state_watcher(watch_tx);
+            if evidence_failure {
+                storage.set_fail_sub_agent_backstop(true);
+            } else {
+                storage.fail_sub_agent_acceptance_once();
+            }
+            let messages_before = storage.get_all_messages(id).len();
+            runtime.handle_cancelling_sub_agents_timeout().await;
+            assert_eq!(
+                runtime
+                    .fatal_local_authority_fence
+                    .fatal_authority_loss_is_latched(),
+                evidence_failure
+            );
+            assert_eq!(runtime.state, initial);
+            assert_eq!(*watch_rx.borrow(), initial);
+            assert_eq!(storage.get_all_messages(id).len(), messages_before);
+            if !evidence_failure {
+                assert_eq!(runtime.sub_agent_result_buffer.len(), 1);
+                runtime
+                    .process_event(Event::RetryBufferedSubAgentResults)
+                    .await
+                    .unwrap();
+                let result = runtime.event_rx.try_recv().unwrap();
+                runtime.process_event(result).await.unwrap();
+                assert!(matches!(runtime.state, ConvState::Idle));
+                assert_eq!(storage.sub_agent_acceptance_count(), 1);
+                assert!(!runtime.fatal_local_authority_fence.is_closed());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accepted_child_followup_failure_selects_fatal_caller_disposition() {
+        for cancelling in [false, true] {
+            let id = "child-followup-failure";
+            let (mut runtime, storage) = cancelling_runtime(
+                id,
+                &["child"],
+                crate::state_machine::event::CancelCause::Timeout,
+            )
+            .await;
+            if !cancelling {
+                runtime.state = mk_awaiting_with_pending("child");
+            }
+            let (event_tx, event_rx) = mpsc::channel(8);
+            runtime.event_tx = event_tx.clone();
+            runtime.event_rx = event_rx;
+            let fence = runtime.fatal_local_authority_fence.clone();
+            let llm = runtime.llm_client.clone();
+            let (watch_tx, watch_rx) = watch::channel(runtime.state.clone());
+            runtime = runtime.with_state_watcher(watch_tx);
+            let (started, release) = storage.gate_prompt_projection_load();
+            event_tx
+                .send(Event::SubAgentResult {
+                    agent_id: "child".into(),
+                    outcome: SubAgentOutcome::Success {
+                        result: "done".into(),
+                    },
+                })
+                .await
+                .unwrap();
+            let task = tokio::spawn(runtime.run());
+            started.await.unwrap();
+            assert_eq!(storage.sub_agent_acceptance_count(), 1);
+            storage.set_fail_prompt_projection_load(true);
+            storage.set_fail_state_update(true);
+            release.send(()).unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(30), task)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                RuntimeExitDisposition::FatalLocalAuthorityLoss
+            );
+            assert!(fence.fatal_authority_loss_is_latched());
+            assert!(matches!(
+                *watch_rx.borrow(),
+                ConvState::LlmRequesting { .. }
+            ));
+            assert!(matches!(
+                storage.get_current_state(id),
+                Some(ConvState::LlmRequesting { .. })
+            ));
+            assert!(llm.recorded_requests().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn child_completion_acceptance_retry_remains_owned_before_successful_local_error() {
+        let id = "child-followup-retry";
+        let (mut runtime, storage) =
+            build_runtime_with_state_and_queue(id, mk_awaiting_with_pending("child"), vec![]);
+        let (event_tx, event_rx) = mpsc::channel(8);
+        runtime.event_tx = event_tx;
+        runtime.event_rx = event_rx;
+        storage.fail_sub_agent_acceptance_once();
+        storage.set_fail_prompt_projection_load(true);
+        runtime
+            .process_event(Event::SubAgentResult {
+                agent_id: "child".into(),
+                outcome: SubAgentOutcome::Success {
+                    result: "done".into(),
+                },
+            })
+            .await
+            .unwrap();
+        assert!(!runtime.fatal_local_authority_fence.is_closed());
+        assert_eq!(runtime.sub_agent_result_buffer.len(), 1);
+        assert_eq!(storage.sub_agent_acceptance_count(), 0);
+        runtime
+            .process_event(Event::RetryBufferedSubAgentResults)
+            .await
+            .unwrap();
+        let event = runtime.event_rx.try_recv().unwrap();
+        runtime.process_event(event).await.unwrap();
+        assert!(matches!(runtime.state, ConvState::Error { .. }));
+        assert_eq!(storage.sub_agent_acceptance_count(), 1);
+        assert!(runtime.sub_agent_result_buffer.is_empty());
+        assert!(!runtime.fatal_local_authority_fence.is_closed());
+    }
+
+    #[tokio::test]
+    async fn closed_runtime_exit_preserves_normal_shutdown_metrics_and_fatal_memory_only_abort() {
+        for fatal in [false, true] {
+            let (mut runtime, storage) =
+                build_runtime_with_state_and_queue("closed-exit-metrics", ConvState::Idle, vec![]);
+            let capture = phoenix_llm::LlmAttemptCapture::new();
+            let telemetry = phoenix_llm::LlmRequestTelemetry {
+                capacity_plan_id: None,
+                conversation_id: runtime.context.conversation_id.clone(),
+                root_conversation_id: runtime.context.root_conversation_id.clone(),
+                request_id: "shutdown-attempt".into(),
+                retry_attempt: 1,
+                attempt_capture: capture.clone(),
+            };
+            capture.begin(
+                &telemetry,
+                "openai",
+                "gpt-test",
+                phoenix_llm::LlmTransport::Websocket,
+            );
+            runtime.active_llm_attempt = Some(capture.clone());
+            runtime.llm_task_handle = Some(tokio::spawn(std::future::pending()));
+            runtime
+                .fatal_local_authority_fence
+                .close_for_process_shutdown();
+            if fatal {
+                runtime
+                    .fatal_local_authority_fence
+                    .close("required_write_failed");
+            }
+            assert_eq!(
+                runtime.run().await,
+                if fatal {
+                    RuntimeExitDisposition::FatalLocalAuthorityLoss
+                } else {
+                    RuntimeExitDisposition::CoordinatedShutdown
+                }
+            );
+            assert_eq!(
+                capture.finalized().unwrap().outcome,
+                phoenix_llm::LlmAttemptOutcome::Cancelled
+            );
+            assert_eq!(
+                storage.recorded_llm_request_metrics().len(),
+                usize::from(!fatal)
+            );
+        }
     }
 
     #[tokio::test]
@@ -23704,7 +24350,7 @@ mod steer_drain_detector_tests {
         tokio::time::advance(Duration::from_secs(6)).await;
         tokio::task::yield_now().await;
 
-        let (rt, result) = applying.await.unwrap();
+        let (mut rt, result) = applying.await.unwrap();
         assert!(result
             .unwrap_err()
             .contains("absolute settlement deadline; fatal local authority fence closed"));
@@ -24226,7 +24872,7 @@ mod steer_drain_detector_tests {
         tokio::time::advance(Duration::from_secs(5)).await;
         tokio::task::yield_now().await;
 
-        let (rt, result) = transition.await.unwrap();
+        let (mut rt, result) = transition.await.unwrap();
         assert!(result
             .unwrap_err()
             .contains("absolute settlement deadline; fatal local authority fence closed"));
@@ -25013,7 +25659,12 @@ mod steer_drain_detector_tests {
             })
             .await;
 
-        assert!(result.is_err());
+        result.expect("the exact result remains owned by the registered acceptance retry");
+        assert!(!rt.fatal_local_authority_fence.is_closed());
+        assert_eq!(storage.sub_agent_acceptance_count(), 0);
+        assert!(matches!(rt.sub_agent_result_buffer.as_slice(),
+            [Event::SubAgentResult { agent_id, outcome: SubAgentOutcome::TimedOut }] if agent_id == "child"));
+        assert!(rt.llm_client.recorded_requests().is_empty());
         assert!(matches!(rt.state, ConvState::AwaitingSubAgents { .. }));
         assert!(storage.get_all_messages("conv-missing-fan-in").is_empty());
     }
@@ -25043,7 +25694,10 @@ mod steer_drain_detector_tests {
                 },
             };
 
-            assert!(rt.process_event(event.clone()).await.is_err());
+            rt.process_event(event.clone())
+                .await
+                .expect("the exact acceptance retry retains completion ownership");
+            assert!(!rt.fatal_local_authority_fence.is_closed());
             assert_eq!(storage.sub_agent_acceptance_count(), 0);
             assert!(matches!(
                 rt.sub_agent_result_buffer.as_slice(),

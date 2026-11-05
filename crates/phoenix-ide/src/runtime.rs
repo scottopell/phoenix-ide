@@ -582,6 +582,11 @@ impl FatalLocalAuthorityFence {
             .closed
     }
 
+    pub(crate) fn fatal_authority_loss_is_latched(&self) -> bool {
+        let _state = self.state.lock().expect("fatal authority fence poisoned");
+        self.tx.borrow().is_some()
+    }
+
     pub(crate) fn fatal_deadline(&self) -> Option<tokio::time::Instant> {
         self.state
             .lock()

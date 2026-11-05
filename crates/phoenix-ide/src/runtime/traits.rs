@@ -816,6 +816,37 @@ impl<T: SvgArtifactRepository + ?Sized> SvgArtifactRepository for Arc<T> {
 
 #[async_trait]
 impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
+    async fn record_sub_agent_terminal(
+        &self,
+        child_conversation_id: &str,
+        cause: phoenix_db::SubAgentTerminalCause,
+        terminal_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        (**self)
+            .record_sub_agent_terminal(child_conversation_id, cause, terminal_at)
+            .await
+    }
+
+    async fn terminalize_sub_agent_cancellation_backstop(
+        &self,
+        child_conversation_id: &str,
+        cause: phoenix_db::SubAgentTerminalCause,
+        terminal_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        (**self)
+            .terminalize_sub_agent_cancellation_backstop(child_conversation_id, cause, terminal_at)
+            .await
+    }
+
+    async fn sub_agent_terminal_is_accepted(
+        &self,
+        child_conversation_id: &str,
+    ) -> Result<bool, String> {
+        (**self)
+            .sub_agent_terminal_is_accepted(child_conversation_id)
+            .await
+    }
+
     async fn coordinator_authority(
         &self,
     ) -> Result<phoenix_core::domain::coordinator_authority::CoordinatorAuthority, String> {
