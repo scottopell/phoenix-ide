@@ -1,4 +1,4 @@
-# ADR-223: Coordinator inline agents reuse targeted Bash
+# ADR-224: Coordinator inline agents reuse targeted Bash
 
 - **Status:** Accepted
 - **Date:** 2026-11-04
@@ -13,7 +13,7 @@ explicit WorkScope targeting.
 
 ## Options considered
 
-1. Retain ADR-222's enforced read-only registry. This leaves substantial shell
+1. Retain ADR-223's enforced read-only registry. This leaves substantial shell
    investigation with Ember and limits the benefit of delegation.
 2. Give children an implicit Coordinator working directory and ordinary Bash.
    This introduces ambient filesystem context and a second targeting convention.
@@ -23,7 +23,7 @@ explicit WorkScope targeting.
 
 ## Decision
 
-Choose option 3, superseding ADR-222's read-only capability decision. The dedicated
+Choose option 3, superseding ADR-223's read-only capability decision. The dedicated
 child registry includes `WorkScopeCoordinatorBash`. Every run names an active
 persisted WorkScope, resolved server-side. Ember supplies its home scope for
 general work or a selected ordinary scope for project work. The scope chooses the
@@ -58,7 +58,7 @@ and recursive delegation tools remain absent.
 
 ## References
 
-- [ADR-222](222_coordinator-research-uses-explicit-file-targets.md)
+- [ADR-223](223_coordinator-research-uses-explicit-file-targets.md)
 - [Global capability contract](../global-recall/requirements.md)
 - [Sub-agent behavior](../subagents/subagents.allium)
 - [Bash contract](../bash/requirements.md)

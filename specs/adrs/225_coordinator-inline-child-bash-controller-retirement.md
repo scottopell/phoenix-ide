@@ -1,4 +1,4 @@
-# ADR-224: Coordinator inline children retire their Bash controllers before parent acceptance
+# ADR-225: Coordinator inline children retire their Bash controllers before parent acceptance
 
 - **Status:** Accepted
 - **Date:** 2026-11-04
@@ -6,7 +6,7 @@
 
 ## Context
 
-ADR-223 gives trusted filesystem-free Coordinator children the existing
+ADR-224 gives trusted filesystem-free Coordinator children the existing
 unsandboxed, explicitly WorkScope-targeted Bash tool. Each command belongs to
 its selected WorkScope, while the child's own Unattached resource identity
 controls its handle. Ordinary child-resource cleanup follows the child's
@@ -29,11 +29,11 @@ of live terminal-result transport.
    subsequent manual intervention.
 3. **Retire the child's controller independently of its owner scopes.** Adds a
    narrow process-local admission and cleanup boundary while preserving the
-   capability and ownership decision in ADR-223.
+   capability and ownership decision in ADR-224.
 
 ## Decision
 
-Choose option 3. This completes ADR-223's lifecycle without changing its trusted
+Choose option 3. This completes ADR-224's lifecycle without changing its trusted
 write-capable Bash policy or giving children an ambient cwd or WorkScope
 attachment. Apply it only to filesystem-free inline Coordinator children;
 ordinary Work children retain their existing lifecycle.
@@ -72,7 +72,7 @@ controller's handles, owner inventory/caps, or existing owner-admission rules.
 
 ## References
 
-- [ADR-223: trusted explicitly targeted Bash](223_coordinator-inline-agents-reuse-targeted-bash.md)
+- [ADR-224: trusted explicitly targeted Bash](224_coordinator-inline-agents-reuse-targeted-bash.md)
 - [Coordinator capabilities](../global-recall/requirements.md)
 - [Bash lifecycle requirements](../bash/requirements.md)
 - [Bash lifecycle contract](../bash/bash.allium)

@@ -2,12 +2,15 @@
 
 ## Overview
 
-`remote_query_database` lets the Coordinator issue one bounded, read-only SQLite
-query to an explicitly selected enrolled Phoenix instance. The destination
-reuses the local `GlobalReadService` policy; successful output carries the
-receiver's instance identity and the caller identity established by peer
-admission. This is operator-level forensic access to application data, not a
-general security sandbox or a remote write surface.
+Coordinator `query_database(sql, instance?)` issues one bounded, read-only SQLite
+query locally or to one explicitly selected enrolled Phoenix instance. Omitted,
+explicitly null, and exact `"local"` selectors use the local service; another
+string selects a saved peer by canonical UUID or unambiguous display name. The
+destination reuses the local `GlobalReadService` policy; successful remote output
+carries the receiver's instance identity and the caller identity established by
+peer admission. Ordinary non-Coordinator query registrations remain local-only.
+This is operator-level forensic access to application data, not a general
+security sandbox or a remote write surface.
 
 The implementation supplies the query path and its directional identity and
 enrollment foundation, but specification validation does not establish runtime
@@ -20,22 +23,20 @@ and existing regression coverage without line-number citations.
 
 | Requirement | Status | Implementation and coverage |
 |---|---|---|
-| REQ-RQD-001: Explicit Enrolled Destination | Implemented | `crates/phoenix-ide/src/coordinator_tools.rs`: `tools`, `RemoteQueryDatabase::input_schema`, `RemoteQueryDatabase::run`; `crates/phoenix-db/src/federation_peers.rs`: `federation_peer_connection`. Registry regressions `coordinator_question_registry_preserves_exact_authority` and `coordinator_question_registration_preserves_non_coordinator_boundaries` cover tool-set boundaries. |
+| REQ-RQD-001: Explicit Enrolled Destination | Implemented | `crates/phoenix-ide/src/coordinator_tools.rs`: `tools`, `QueryDatabase::{Local,Federated}`, `LocalQueryDatabaseInput`, `FederatedQueryDatabaseInput`, `QueryDatabase::input_schema`, `QueryDatabase::run`; `crate::api::federation::resolve_saved_peer_id`; `crates/phoenix-db/src/federation_peers.rs`: `federation_peer_connection`. Registry and schema regressions cover the single Coordinator tool, closed authority-specific schemas, and removal of the separate remote tool. |
 | REQ-RQD-002: Peer Admission and Enrollment Authority | Implemented | `crates/phoenix-ide/src/api/auth.rs`: `peer_auth_middleware`; `crates/phoenix-ide/src/api/federation.rs`: `issue_enrollment`, `revoke_enrollment`; `crates/phoenix-ide/src/api/handlers.rs`: `peer_query_database_requires_peer_auth_and_destination_identity`, `federation_enrollment_requires_owner_and_replaces_peer_credential`. Enrollment is governed by REQ-AUTH-009. |
 | REQ-RQD-003: Closed HTTPS Transport Without Redirects | Implemented | `PeerBaseUrl` and `FederationQueryDatabaseEndpoint` construct one fixed HTTPS endpoint from domain, IPv4, or IPv6 origins. `peer_base_url_requires_a_bare_https_origin`, `peer_connection_round_trips_and_replaces_by_instance`, and `migration_125_preserves_peers_and_admits_only_typed_ipv6_hosts` cover bracket-safe IPv6 parsing, typed persistence, and forward migration under ADR-093. `remote_query_client` disables redirects and applies the complete 30-second timeout; `authenticated_remote_query_does_not_follow_307_or_308` covers same-origin 307 and cross-origin 308 without weakening TLS verification. |
 | REQ-RQD-004: Per-Peer TLS Trust | Implemented | `PeerTlsTrust` is an exhaustive platform-roots/private-CA choice. Enrollment transfers the receiver's configured trust, migration 124 persists it with the peer connection, and `remote_query_client` replaces platform roots with the selected peer's private CA while retaining ordinary hostname, validity, and chain verification. ADR-093 requires CA capability checks; `peer_private_ca_requires_one_bounded_certificate` rejects leaf certificates and CA certificates whose Key Usage forbids certificate signing; `peer_private_ca_rejects_trailing_der_in_relevant_extensions` and `peer_private_ca_rejects_non_der_basic_constraints` reject trailing, constructed, and non-canonical relevant-extension encodings; `peer_import_rejects_non_der_basic_constraints_without_persisting` covers rejection at the owner import boundary before persistence; `federation_tls_trust_requires_ca_to_issue_server_chain` verifies the exported CA terminates the configured server certificate chain; `peer_connection_round_trips_and_replaces_by_instance` and `private_ca_trust_is_isolated_to_the_selected_peer` cover atomic replacement and trust isolation. |
 | REQ-RQD-005: Authoritative Caller and Destination Provenance | Implemented | `query_database_with_admission` checks the receiver's persisted identity before execution and returns enrollment-derived caller identity. `decode_remote_query_response` checks both the selected destination and the caller's persisted local identity. `peer_query_database_requires_peer_auth_and_destination_identity` and `remote_response_rejects_wrong_caller_identity` cover both sides. |
 | REQ-RQD-006: Shared Read-Only SQLite Integrity Boundary | Implemented | `crates/phoenix-ide/src/api/federation.rs`: `query_database_with_admission`; `crates/phoenix-db/src/coordinator_query.rs`: `execute_coordinator_query`, `authorize`, `read_allowed`, `function_allowed`. Tests `credential_guard_is_table_and_column_specific`, `denies_writes_attach_pragmas_and_multiple_statements`, `denies_schema_and_shadow_table_bypasses`, and `denies_fts_index_and_shadow_storage` cover the shared policy. |
-| REQ-RQD-007: Bounded Values, Work, and Admission | Implemented | The route's `DefaultBodyLimit` bounds the HTTP request before JSON extraction; `peer_query_database_bounds_body_before_json_extraction` covers rejection. `execute_coordinator_query` sets SQLite column and value-length limits before preparation and retains SQL/row/result/time budgets. The streamed caller response body is bounded before decoding. `QUERY_ADMISSION` and `spawn_with_admission_permit` retain admission through work completion. `bounds_sqlite_value_allocation_before_materialization` covers text/blob boundaries, and `denies_concat_functions_that_allocate_before_sqlite_length_enforcement` removes built-ins that amplify before SQLite applies its length limit, in addition to the existing output, work, response, exhaustion, and cancellation regressions. |
+| REQ-RQD-007: Bounded Values, Work, and Admission | Implemented | The route's `DefaultBodyLimit` bounds the HTTP request before JSON extraction; `peer_query_database_bounds_body_before_json_extraction` covers rejection. `execute_coordinator_query` sets SQLite column and value-length limits before preparation and retains SQL/row/result/time budgets. The streamed caller response body is bounded before decoding. `QUERY_ADMISSION` and `spawn_with_admission_permit` retain admission through work completion. `bounds_printf_and_zeroblob_before_materializing_results` covers text/blob boundaries, and `denies_concat_functions_that_allocate_before_sqlite_length_enforcement` removes built-ins that amplify before SQLite applies its length limit, in addition to the existing output, work, response, exhaustion, and cancellation regressions. |
 | REQ-RQD-008: Total Typed Query Wire | Implemented | `RemoteQueryDatabaseRequest`, `RemoteQueryDatabaseResponse` share serialization/deserialization; `crates/phoenix-db/src/coordinator_query.rs`: `CoordinatorQueryResult`, `CoordinatorCell`, `CoordinatorReal`. Tests `remote_query_request_uses_shared_wire_shape` and `non_finite_real_cells_have_total_json_round_trip` cover request parity and non-finite real encoding. |
-| REQ-RQD-009: Failure Honesty and No Local Fallback | Implemented | `RemoteQueryDatabase::run` returns `ToolOutput::error` on client failure, with no local-query branch. `decode_remote_query_response` preserves receiver error detail; `remote_rejection_preserves_server_error_detail` covers SQL rejection detail. |
-| REQ-RQD-010: Untrusted and Clearable Output | Implemented | `RemoteQueryDatabase::description`, `clearable`, and `run` return ordinary successful JSON text, not `TrustedInstructions`. `remote_query_results_are_clearable_and_marked_untrusted` checks clearability and forensic/untrusted wording. |
+| REQ-RQD-009: Failure Honesty and No Local Fallback | Implemented | `QueryDatabase::run` chooses the typed local or remote selector branch once. `resolve_saved_peer_id` and `query_remote_database` return remote-selection and client failures without a local-query branch. `decode_remote_query_response` preserves receiver error detail; focused regressions cover failure and rejection detail. |
+| REQ-RQD-010: Untrusted and Clearable Output | Implemented | `QueryDatabase::description`, `clearable`, and `run` return ordinary successful JSON text, not `TrustedInstructions`. Regressions check clearability and forensic/untrusted wording. |
 
 ## Wire and Resource Inventory
 
-The model supplies `{ "instance_id": "<UUID>", "sql": "<statement>" }`. The client
-resolves the stored peer connection, then posts to
-`/api/federation/peer/query-database` with a peer bearer and this JSON request:
+The Coordinator model supplies `{ "sql": "<statement>", "instance": "<saved name or UUID>" }`, with `instance` optional. Omission, explicit `null`, and exact `"local"` select the local path; another string resolves one saved peer. The local-only tool schema contains only `sql`. After remote selection, the client posts to `/api/federation/peer/query-database` with a peer bearer and this JSON request:
 
 ```json
 {

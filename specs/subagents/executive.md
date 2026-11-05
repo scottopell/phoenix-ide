@@ -35,7 +35,7 @@ children retain the workspace and tool rules above. The Coordinator uses the
 configured worker/tier catalog and usable routes to select suitable execution.
 Their terminal delivery and parent acceptance join one cancellation-resistant,
 bounded Bash-controller retirement, including durable reconciliation and a
-parent-cancellation backstop (ADR-224, REQ-BASH-018). Established parent cancellation
+parent-cancellation backstop (ADR-225, REQ-BASH-018). Established parent cancellation
 requests and real per-child timeouts fence each eligible controller before child
 event dispatch, and direct child cancellation fences before acknowledged dispatch.
 All batch children are fenced before terminal cleanup joins; cancellation delivery
@@ -91,7 +91,7 @@ only the architectural seams.
   and resolve relative cwd values from the parent conversation. Coordinator
   children reject cwd and Work requests; their typed environment persists no
   directory, and durable parent identity selects their builtin-only research
-  registry on materialization and recreation. See ADR-223, superseding ADR-222.
+  registry on materialization and recreation. See ADR-224, superseding ADR-223.
 - **Wake retirement** removes REQ-SA-009's wake binding and delivery obligations
   under ADR-098. Ordinary durable terminal evidence and parent fan-in remain;
   candidate retirement implementation and verification are ongoing.

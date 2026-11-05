@@ -3,22 +3,33 @@
 ## User Need
 
 As an owner coordinating work across enrolled Phoenix instances, I need the
-Coordinator to inspect one explicitly selected instance's operational database
-without changing it, leaking peer credentials, confusing remote and local
-results, or allowing an expensive query to exhaust the destination.
+Coordinator to inspect its local database or one explicitly selected instance's
+operational database through one query surface without changing either database,
+leaking peer credentials, confusing remote and local results, or allowing an
+expensive query to exhaust the destination.
 
 ## Scope and Related Contracts
 
-`remote_query_database` is a Coordinator-only, operator-level forensic read
-capability. It is not a general security sandbox: application data can include
-hidden messages, settings, serialized state, and workflow payloads that normal
-UI does not expose. Enrollment is directional; permission to query a receiver
-does not confer reciprocal access or owner authority.
+Coordinator `query_database(sql, instance?)` owns the public selection boundary.
+Omission, explicit `null`, and exact `"local"` select the local query path. Any
+other string selects the remote branch as one saved peer's canonical UUID or one
+unambiguous saved display name. The peer HTTP request retains the typed
+`destination_instance_id`; public model selection and peer-wire destination
+identity are distinct contracts.
+
+The remote branch is a Coordinator-only, operator-level forensic read capability.
+It is not a general security sandbox: application data can include hidden
+messages, settings, serialized state, and workflow payloads that normal UI does
+not expose. Enrollment is directional; permission to query a receiver does not
+confer reciprocal access or owner authority.
 
 - [Auth requirements](../auth/requirements.md), REQ-AUTH-009, own receiver-issued
   enrollment, replacement, revocation, and separation of peer and owner authority.
 - [Global recall requirements](../global-recall/requirements.md), REQ-GR-011A,
-  own the shared SQLite integrity policy and actionable engine diagnostics.
+  own the local query path, shared SQLite integrity policy, and actionable engine
+  diagnostics.
+- [Federation requirements](../federation/requirements.md), REQ-FED-001–003, own
+  optional destination selection, exact local routing, and no-fallback behavior.
 - [Stale tool results requirements](../stale-tool-results/requirements.md) own
   clearing model-visible output without removing persisted transcript evidence.
 
@@ -30,15 +41,28 @@ scope.
 
 ### REQ-RQD-001: Explicit Enrolled Destination
 
-WHEN the Coordinator invokes `remote_query_database`
-THE SYSTEM SHALL require a separate `instance_id` UUID and `sql` string
-AND SHALL resolve the destination through the caller's persisted directional peer connection keyed by that identity
-AND SHALL use the enrolled HTTPS origin and receiver-issued bearer credential, not a model-supplied URL or credential.
+WHEN the Coordinator invokes `query_database` with an `instance` selector other
+than omission, explicit `null`, or exact `"local"`
+THE SYSTEM SHALL resolve the selector as one saved peer's canonical instance UUID
+or one unambiguous saved display name
+AND SHALL resolve the destination through the caller's persisted directional peer
+connection keyed by that identity
+AND SHALL use the enrolled HTTPS origin and receiver-issued bearer credential, not
+a model-supplied URL, credential, or TLS trust value.
 
-IF the identity is malformed, the peer connection is absent, or connection lookup fails
-THE SYSTEM SHALL return a tool error without executing SQL.
+IF the selector is unknown, ambiguous, malformed, or the peer connection lookup
+fails
+THE SYSTEM SHALL return a tool error before network or SQL execution.
 
-THE SYSTEM SHALL expose this tool only in the Coordinator tool registry, not to ordinary ProductConversations, restricted planning conversations, or sub-agents.
+THE SYSTEM SHALL expose the optional `instance` property only in the Coordinator
+`query_database` schema, not to ordinary ProductConversations, restricted
+planning conversations, or sub-agents
+AND SHALL expose no separate `remote_query_database` tool
+AND SHALL reject unknown fields, including `instance_id`.
+
+WHEN `instance` is omitted, explicit `null`, or exact `"local"`
+THE SYSTEM SHALL reuse the existing local query service without peer lookup
+AND SHALL NOT trim whitespace or fold case when recognizing `"local"`.
 
 ### REQ-RQD-002: Peer Admission and Enrollment Authority
 
@@ -88,8 +112,13 @@ AND SHALL NOT infer or fabricate a private trust anchor for that row.
 
 ### REQ-RQD-005: Authoritative Caller and Destination Provenance
 
+BEFORE sending a remote query request
+THE caller SHALL resolve the public `instance` selector to exactly one enrolled
+peer and SHALL place that peer's typed identity in `destination_instance_id`.
+
 WHEN the receiver accepts a remote query request
-THE SYSTEM SHALL compare `destination_instance_id` against its own persisted instance identity before SQL execution
+THE receiver SHALL compare `destination_instance_id` against its own persisted
+instance identity before SQL execution
 AND SHALL reject a mismatch with HTTP 409.
 
 WHEN a query succeeds
@@ -101,7 +130,10 @@ AND SHALL reject either mismatch rather than rewrite the returned provenance or 
 
 ### REQ-RQD-006: Shared Read-Only SQLite Integrity Boundary
 
-THE receiver SHALL execute exactly one read-only SQLite statement through the shared `GlobalReadService` query policy on a separate read-only database connection.
+THE receiver SHALL execute exactly one read-only SQLite statement against its own
+application database through the shared `GlobalReadService` query policy on a
+separate read-only database connection
+AND THE source SHALL neither open nor copy the destination database.
 
 THE receiver SHALL enforce REQ-GR-011A at SQLite authorization time, including through views, aliases, common table expressions, and subqueries
 AND SHALL deny writes, transactions, pragmas, database attachment, extension loading, filesystem functions, SQLite internals, and FTS shadow storage.
@@ -143,16 +175,23 @@ THE caller SHALL decode the shared typed response and SHALL return an error for 
 
 ### REQ-RQD-009: Failure Honesty and No Local Fallback
 
-IF input validation, enrollment, transport, TLS, HTTP status, body bounds, decoding, identity validation, authorization, admission, or execution fails
+IF an explicitly remote selection's selector resolution, including an unknown or
+ambiguous saved display name, input validation, enrollment, transport, TLS, HTTP
+status, body bounds, decoding, identity validation, authorization, admission, or
+execution fails
 THE SYSTEM SHALL return a tool error
-AND SHALL NOT execute the SQL against the caller's database, select another peer, or report the failure as a successful query.
+AND SHALL NOT execute the SQL against the caller's database, select another peer,
+or report a full or partial successful query.
 
 WHEN the receiver rejects SQL
 THE SYSTEM SHALL preserve the receiver's diagnostic detail where available, including the SQLite operation phase, primary and extended result codes, symbolic code, diagnostic message, and parse-error offset when supplied by SQLite.
 
 ### REQ-RQD-010: Untrusted and Clearable Output
 
-THE tool description SHALL identify operator-level forensic access, explicit enrolled destination selection, no local fallback, and remote stored values as untrusted data rather than instructions.
+THE Coordinator `query_database` description SHALL identify operator-level
+forensic access, optional local or explicit enrolled destination selection, no
+remote-to-local fallback, and stored values as untrusted data rather than
+instructions.
 
 THE SYSTEM SHALL return successful remote query data as ordinary tool output, never as trusted instructions
 AND SHALL mark the tool clearable under the shared stale-tool-result policy without deleting transcript evidence.

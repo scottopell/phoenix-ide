@@ -6,16 +6,15 @@ A Coordinator operating one trusted Phoenix instance needs to use supported coor
 
 ## Scope and related contracts
 
-This specification covers optional `instance` selection on `send_conversation_message`, `read_conversation`, `resolve_reference`, and `read_goal`, durable remote conversation watches, and finite settlement of facts durably staged before a terminal watch gap. Goal mutations (including creation), settings, Continue, conversation creation, and rename are outside this contract.
+This specification covers optional `instance` selection on `send_conversation_message`, `read_conversation`, `resolve_reference`, `read_goal`, and `query_database`, durable remote conversation watches, and finite settlement of facts durably staged before a terminal watch gap. Goal mutations (including creation), settings, Continue, conversation creation, and rename are outside this contract.
 
 Related contracts remain authoritative for their domains:
 
 - `specs/conversation-identity/requirements.md` owns stable ProductConversation and exact transcript identity.
 - `specs/goal-continuation/requirements.md` owns Goal admission and automatic-continuation prerequisites.
-- `specs/global-recall/requirements.md` owns local Coordinator Goal commands.
+- `specs/global-recall/requirements.md` owns local Coordinator Goal commands and local query behavior.
 - `specs/compatibility/requirements.md` owns compatibility and recovery guarantees.
 - `specs/remote-query-database/requirements.md` owns remote read-only SQL behavior.
-- `specs/tool-contracts/requirements.md` owns shared tool result behavior.
 
 ## Requirements
 
@@ -23,11 +22,11 @@ Related contracts remain authoritative for their domains:
 
 **REQ-FED-001 — Optional destination selection**
 
-When `send_conversation_message`, federated `read_conversation`, `resolve_reference`, or `read_goal` receives the exact, case-sensitive `instance` string `"local"` or omits the selector, the system shall execute the local operation with the same authority checks, validation, result shape, provenance, pagination, waits, and message retry identity.
+When `send_conversation_message`, federated `read_conversation`, `resolve_reference`, `read_goal`, or Coordinator `query_database` receives the exact, case-sensitive `instance` string `"local"` or omits the selector, the system shall execute the local operation through its existing local service with the same authority checks, validation, result shape, provenance, pagination, waits, message retry identity, SQL policy, budgets, and error semantics applicable to that tool.
 
 When one of these tools receives another string selector, the system shall select the remote destination through saved-peer UUID or unambiguous display-name resolution. Recognizing the local selector shall not trim whitespace or fold case. The literal `"local"` shall be reserved for the instance executing the tool.
 
-An explicit `null` selector shall select local routing on the read tools; `send_conversation_message` shall reject an explicit `null`. Tools without an optional `instance` parameter, including remote-only SQL using a required `instance_id` UUID, shall retain their own input and authority contracts.
+An explicit `null` selector shall select local routing on the read tools, including Coordinator `query_database`; `send_conversation_message` shall reject an explicit `null`. Tools without an optional `instance` parameter shall retain their own input and authority contracts. In particular, non-Coordinator `query_database` registrations shall remain local-only and shall reject an `instance` field.
 
 **REQ-FED-002 — No destination fallback**
 

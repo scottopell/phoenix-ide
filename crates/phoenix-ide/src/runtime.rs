@@ -5199,7 +5199,7 @@ impl RuntimeManager {
             service,
             send_chat,
             self.work_scope_load.clone(),
-            self.db.clone(),
+            &self.db,
         );
         coordinator_tools.extend(
             crate::conversation_action_tools::tools(self.clone(), conversation_id)

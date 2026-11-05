@@ -21,7 +21,7 @@ or a selected project scope. Explore spawn mode does not sandbox this tool.
 The assignment and existing user authority govern permitted actions. Children have no default filesystem,
 WorkScope, MCP, messaging, watches, Authority tools, or lifecycle actions. Durable
 Coordinator parent identity restores this capability on runtime recreation.
-ADR-223 records the boundary, superseding ADR-222.
+ADR-224 records the boundary, superseding ADR-223.
 
 Each filesystem-free inline child's Bash controller closes before terminal
 delivery and parent acceptance, including durable-result reconciliation. One
@@ -35,7 +35,7 @@ while nonterminal recreation preserves admission. WorkScopes retain ownership,
 inventory and tombstones; sibling and parent commands are unaffected. Safe
 signaling is Linux-only; unsupported hosts report incomplete cleanup without a
 raw PID fallback. Neither full descendant reaping nor restart cleanup is promised
-(ADR-224). Parent, child and spawn-tool guidance requires needed command results
+(ADR-225). Parent, child and spawn-tool guidance requires needed command results
 before submission and assigns persistent services to parent or ordinary Work ownership.
 
 Coordinator LLM requests contain the stable language-specific system prompt without an automatic current-activity capsule. The Check in & drive composer action requests a fresh, broad check but selective intervention: leave healthy progress alone, do not treat idle owners as stalled, and avoid redundant nudges or re-planning to show activity. It asks the Coordinator to recover unanswered user decisions from history and verify they remain unresolved and material, advancing independent authorized work before asking the user with context and a recommendation. Repeated check-ins do not expand authority or reset decisions, pauses or gates. The requested briefing puts still-needed user input first, then material changes as problem, intervention and direction, without a mandatory template or announcements for factual watch events. ADR-149 records selective check-ins; ADR-150 refines blocked-work recovery and concrete reporting. Both system variants now distinguish blocked waiting from healthy progress, reconcile later decisions and completed work before replaying answers, and illustrate plain language with hypothetical bad/good pairs. Unsolicited reports require user action, a meaningful goal-level result or a changed blocker/risk; hypothetical examples explicitly choose silence for routine checks and sends. Requested check-ins retain an executive view. The button carries the same recovery policy without duplicating examples. The recovery/reporting base retains its pre-refinement word and character ceilings. The proposed outcome-delegation addition is bounded separately and increases both overall prompt variants; the user accepted that tradeoff as an exception to the earlier same-size request. These are prompt instructions, not guarantees of model behavior; the action adds no authority or indefinite polling. The Coordinator receives its stable instance-owned home scope ID/path as server-generated context; selected worker scope facts are still requested through `query_database`. ADR-066 records removal of the per-request snapshot and its dedicated runtime wiring.
