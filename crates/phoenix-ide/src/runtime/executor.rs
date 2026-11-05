@@ -2704,9 +2704,8 @@ where
     #[allow(clippy::too_many_lines)] // Sequential event loop owns the runtime state.
     async fn run_inner(mut self) -> RuntimeExitDisposition {
         tracing::info!(conv_id = %self.context.conversation_id, "Starting conversation runtime");
-        let owner = match self.admit_authoritative_effect() {
-            Ok(owner) => owner,
-            Err(_) => return self.fatal_local_authority_exit(),
+        let Ok(owner) = self.admit_authoritative_effect() else {
+            return self.fatal_local_authority_exit();
         };
         let mut startup_authority = RuntimeSettlementAuthority {
             owner: Some(owner),
@@ -4890,6 +4889,7 @@ where
     /// the drain event's persist effects inline, then run the deferred
     /// `RequestLlm`. Guarantees the spawned LLM task reads a DB that already
     /// contains the steered messages.
+    #[allow(clippy::too_many_lines)]
     async fn run_effects_with_inline_drain(
         &mut self,
         original_effects: Vec<Effect>,

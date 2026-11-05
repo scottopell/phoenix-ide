@@ -53,6 +53,10 @@ pub enum SpaceMeasurementFailure {
 }
 
 impl From<io::Error> for SpaceMeasurementFailure {
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "Other non-exhaustive OS error kinds intentionally share the bounded I/O category"
+    )]
     fn from(error: io::Error) -> Self {
         match error.kind() {
             io::ErrorKind::PermissionDenied => Self::PermissionDenied,
