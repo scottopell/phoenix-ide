@@ -183,6 +183,7 @@ mod tests {
     };
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn standalone_summary_classifies_lost_ack_rollback_and_unavailable_evidence() {
         for cut in [
             TerminalEvidenceTransactionCut::AfterCommit,

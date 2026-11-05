@@ -2197,10 +2197,10 @@ mod tests {
                 .await;
             match cut {
                 TerminalEvidenceTransactionCut::BeforeCommit => {
-                    assert!(result.established().unwrap().is_err())
+                    assert!(result.established().unwrap().is_err());
                 }
                 TerminalEvidenceTransactionCut::AfterCommit => {
-                    assert!(result.established().unwrap().is_ok())
+                    assert!(result.established().unwrap().is_ok());
                 }
                 TerminalEvidenceTransactionCut::AfterCommitLookupUnavailable => assert!(matches!(
                     result,
