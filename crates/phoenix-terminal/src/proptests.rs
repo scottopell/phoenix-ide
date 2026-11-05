@@ -1017,6 +1017,45 @@ async fn failed_wait_with_reused_pid_retires_exact_handle() {
     );
 }
 
+const DETACHED_SHELL_MARKER: &[u8] = b"phoenix-detached-shell-executed";
+
+fn observe_detached_shell_marker(tail: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    tail.extend_from_slice(chunk);
+    let found = tail
+        .windows(DETACHED_SHELL_MARKER.len())
+        .any(|window| window == DETACHED_SHELL_MARKER);
+    let keep_from = tail.len().saturating_sub(DETACHED_SHELL_MARKER.len() - 1);
+    tail.drain(..keep_from);
+    found
+}
+
+#[test]
+fn detached_shell_marker_matches_across_read_boundaries() {
+    for split in 0..=DETACHED_SHELL_MARKER.len() {
+        let mut tail = Vec::new();
+        let first = observe_detached_shell_marker(&mut tail, &DETACHED_SHELL_MARKER[..split]);
+        let second = observe_detached_shell_marker(&mut tail, &DETACHED_SHELL_MARKER[split..]);
+        assert!(first || second, "marker split at {split}");
+        assert!(tail.len() < DETACHED_SHELL_MARKER.len());
+    }
+}
+
+#[test]
+fn detached_shell_marker_ignores_command_echo_and_bounds_retained_output() {
+    let mut tail = Vec::new();
+    for byte in b"printf '%s%s\\n' 'phoenix-detached-' 'shell-executed'; exit\r\n" {
+        assert!(!observe_detached_shell_marker(&mut tail, &[*byte]));
+    }
+    assert!(!observe_detached_shell_marker(&mut tail, &[b'x'; 4096]));
+    assert!(tail.len() < DETACHED_SHELL_MARKER.len());
+    for (index, byte) in DETACHED_SHELL_MARKER.iter().enumerate() {
+        assert_eq!(
+            observe_detached_shell_marker(&mut tail, &[*byte]),
+            index == DETACHED_SHELL_MARKER.len() - 1,
+        );
+    }
+}
+
 #[tokio::test]
 async fn detached_direct_shell_exit_is_reaped_without_reconnect_or_close() {
     use crate::spawn::{set_nonblocking, spawn_pty, PtyExecPlan};
@@ -1045,26 +1084,93 @@ async fn detached_direct_shell_exit_is_reaped_without_reconnect_or_close() {
     let drain_fd = unsafe { OwnedFd::from_raw_fd(drain_fd) };
     set_nonblocking(drain_fd.as_raw_fd()).unwrap();
     let mut drain = crate::relay::PtyMasterIo::new(drain_fd).unwrap();
-    let command = b"exit\n";
+    // The echoed command does not contain the contiguous execution marker.
+    let command = b"printf '%s%s\\n' 'phoenix-detached-' 'shell-executed'; exit\n";
+    let started = std::time::Instant::now();
     // SAFETY: this handle still owns the master and the command buffer is valid.
     assert_eq!(
         unsafe { libc::write(fd, command.as_ptr().cast(), command.len()) },
-        5
+        isize::try_from(command.len()).unwrap()
     );
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    let output_bytes = std::cell::Cell::new(0_u64);
+    let first_output_at = std::cell::Cell::new(None);
+    let marker_at = std::cell::Cell::new(None);
+    let eof_at = std::cell::Cell::new(None);
+    let drain_error = std::cell::Cell::new(None);
+    let receipt_at = std::cell::Cell::new(None);
+    let permit_acquired_at = std::cell::Cell::new(None);
+    let mut phases = Box::pin(async {
         // macOS can defer shell exit until pending PTY output is read.
         tokio::join!(
             async {
-                tokio::io::copy(&mut drain, &mut tokio::io::sink())
-                    .await
-                    .expect("drain test PTY output");
+                use tokio::io::AsyncReadExt;
+
+                let mut buffer = [0_u8; 4096];
+                let mut tail = Vec::new();
+                loop {
+                    match drain.read(&mut buffer).await {
+                        Ok(0) => {
+                            eof_at.set(Some(started.elapsed()));
+                            break;
+                        }
+                        Ok(count) => {
+                            output_bytes.set(output_bytes.get() + count as u64);
+                            if first_output_at.get().is_none() {
+                                first_output_at.set(Some(started.elapsed()));
+                            }
+                            if marker_at.get().is_none()
+                                && observe_detached_shell_marker(&mut tail, &buffer[..count])
+                            {
+                                marker_at.set(Some(started.elapsed()));
+                            }
+                        }
+                        Err(error) => {
+                            drain_error.set(Some(error.kind()));
+                            break;
+                        }
+                    }
+                }
                 drop(drain);
             },
-            await_natural_cleanup(&handle),
+            async {
+                let result = handle.child_lifecycle.receipt().wait().await;
+                receipt_at.set(Some((started.elapsed(), result)));
+                if result.is_ok() {
+                    let _permit = handle.attach_permit.clone().acquire_owned().await.unwrap();
+                    permit_acquired_at.set(Some(started.elapsed()));
+                }
+            },
         );
-    })
-    .await
-    .expect("natural exit must clean detached shell without another connection");
+    });
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(2), phases.as_mut()).await;
+    // Snapshot before dropping the pending drainer and its duplicate master.
+    let diagnostic = format!(
+        "detached shell: elapsed={:?} timeout={} output_bytes={} first_output_at={:?} \
+         marker_at={:?} eof_at={:?} drain_error={:?} receipt_at={:?} permit_acquired_at={:?} \
+         registered={} master_open={}",
+        started.elapsed(),
+        completed.is_err(),
+        output_bytes.get(),
+        first_output_at.get(),
+        marker_at.get(),
+        eof_at.get(),
+        drain_error.get(),
+        receipt_at.get(),
+        permit_acquired_at.get(),
+        registry.get(&scope).is_some(),
+        handle.master_fd_raw().is_some(),
+    );
+    drop(phases);
+    eprintln!("{diagnostic}");
+    assert!(
+        completed.is_ok(),
+        "natural exit must clean detached shell without another connection; {diagnostic}"
+    );
+    assert!(drain_error.get().is_none(), "{diagnostic}");
+    assert!(
+        receipt_at.get().is_some_and(|(_, result)| result.is_ok()),
+        "{diagnostic}"
+    );
     assert!(registry.get(&scope).is_none());
     assert!(registry.get_for_attach(&scope).is_none());
     assert!(handle.master_fd_raw().is_none());
