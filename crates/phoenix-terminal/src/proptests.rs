@@ -1056,6 +1056,10 @@ fn detached_shell_marker_ignores_command_echo_and_bounds_retained_output() {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "keep the real-child lifetime and its phase diagnostics in one test"
+)]
 #[tokio::test]
 async fn detached_direct_shell_exit_is_reaped_without_reconnect_or_close() {
     use crate::spawn::{set_nonblocking, spawn_pty, PtyExecPlan};
