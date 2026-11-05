@@ -27493,7 +27493,7 @@ mod steer_drain_detector_tests {
 
     #[tokio::test]
     async fn coordinator_acceptance_and_cancellation_backstop_join_child_controller() {
-        use crate::runtime::traits::MessageStore;
+        use crate::runtime::traits::StateStore;
         use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
         for backstop in [false, true] {
             let (mut rt, storage) = cancelling_runtime(
@@ -27504,8 +27504,13 @@ mod steer_drain_detector_tests {
             .await;
             rt.context.is_coordinator = true;
             storage
-                .record_sub_agent_terminal(
+                .update_state_and_record_sub_agent_terminal(
                     "silent",
+                    &ConvState::Failed {
+                        error: "cancelled".into(),
+                        error_kind: crate::db::ErrorKind::Cancelled,
+                    },
+                    Utc::now(),
                     phoenix_db::SubAgentTerminalCause::Cancelled,
                     Utc::now(),
                 )
