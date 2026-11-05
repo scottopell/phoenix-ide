@@ -247,9 +247,13 @@ pub trait MessageStore: Send + Sync {
         Result<crate::state_machine::state::SubAgentOutcome, String>,
     >;
 
-    async fn persist_sub_agent_summary(
+    async fn persist_sub_agent_summary_and_accept(
         &self,
         message: &Message,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        child_id: &str,
+        accepted_at: DateTime<Utc>,
     ) -> phoenix_db::workflow::LocalAuthorityResult<Result<(), String>>;
 
     async fn sub_agent_terminal_is_accepted(
@@ -823,11 +827,23 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
             .await
     }
 
-    async fn persist_sub_agent_summary(
+    async fn persist_sub_agent_summary_and_accept(
         &self,
         message: &Message,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        child_id: &str,
+        accepted_at: DateTime<Utc>,
     ) -> phoenix_db::workflow::LocalAuthorityResult<Result<(), String>> {
-        (**self).persist_sub_agent_summary(message).await
+        (**self)
+            .persist_sub_agent_summary_and_accept(
+                message,
+                state,
+                state_updated_at,
+                child_id,
+                accepted_at,
+            )
+            .await
     }
 
     async fn sub_agent_terminal_is_accepted(
@@ -1938,9 +1954,13 @@ impl MessageStore for DatabaseStorage {
         }
     }
 
-    async fn persist_sub_agent_summary(
+    async fn persist_sub_agent_summary_and_accept(
         &self,
         message: &Message,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        child_id: &str,
+        accepted_at: DateTime<Utc>,
     ) -> phoenix_db::workflow::LocalAuthorityResult<Result<(), String>> {
         #[cfg(test)]
         let result = if self
@@ -1948,13 +1968,36 @@ impl MessageStore for DatabaseStorage {
             .swap(false, std::sync::atomic::Ordering::Relaxed)
         {
             self.db
-                .persist_sub_agent_summary_with_lost_ack_for_test(message)
+                .persist_sub_agent_summary_and_accept_with_lost_ack_for_test(
+                    message,
+                    state,
+                    state_updated_at,
+                    child_id,
+                    accepted_at,
+                )
                 .await
         } else {
-            self.db.persist_sub_agent_summary(message).await
+            self.db
+                .persist_sub_agent_summary_and_accept(
+                    message,
+                    state,
+                    state_updated_at,
+                    child_id,
+                    accepted_at,
+                )
+                .await
         };
         #[cfg(not(test))]
-        let result = self.db.persist_sub_agent_summary(message).await;
+        let result = self
+            .db
+            .persist_sub_agent_summary_and_accept(
+                message,
+                state,
+                state_updated_at,
+                child_id,
+                accepted_at,
+            )
+            .await;
         match result {
             phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
                 phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(

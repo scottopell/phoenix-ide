@@ -435,6 +435,11 @@ enum RequiredCompletion {
     },
 }
 
+enum SubAgentResultPersistence {
+    TranscriptEstablished,
+    ParentAcceptanceCommitted,
+}
+
 enum CompletionSettlement {
     DurableFactEstablished,
     DurableFactUnclassified(String),
@@ -545,7 +550,7 @@ pub(crate) enum RuntimeExitDisposition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalFactDurability {
     ProcessOnly,
-    Durable,
+    Durable { state_updated_at: DateTime<Utc> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -556,7 +561,7 @@ enum LocalTerminalAuthority {
 
 impl TerminalFactDurability {
     const fn is_durable(self) -> bool {
-        matches!(self, Self::Durable)
+        matches!(self, Self::Durable { .. })
     }
 }
 
@@ -3522,7 +3527,7 @@ where
                 } => Some(DIRECT_TURN_TERMINAL_SETTLEMENT_RETRIES),
                 TerminalSettlementAttempt::Retry {
                     remaining_after_attempt,
-                    fact_durability: TerminalFactDurability::Durable,
+                    fact_durability: TerminalFactDurability::Durable { .. },
                 } => remaining_after_attempt.map(|remaining| remaining.saturating_sub(1)),
             }
         } else {
@@ -4445,18 +4450,24 @@ where
                 self.pending_provider_replay_update =
                     Some(phoenix_core::domain::provider_replay::ProviderReplayUpdate::Clear);
             }
-            let retry_has_durable_fact = matches!(
-                self.terminal_settlement_attempt,
+            let durable_retry_timestamp = match self.terminal_settlement_attempt {
                 TerminalSettlementAttempt::Retry {
-                    fact_durability: TerminalFactDurability::Durable,
+                    fact_durability: TerminalFactDurability::Durable { state_updated_at },
                     ..
-                }
-            );
-            let next_state_updated_at = if state_changed && !retry_has_durable_fact {
-                self.handoff_completion_timestamp.unwrap_or_else(Utc::now)
-            } else {
-                self.state_updated_at
+                } => Some(state_updated_at),
+                TerminalSettlementAttempt::Initial
+                | TerminalSettlementAttempt::Retry {
+                    fact_durability: TerminalFactDurability::ProcessOnly,
+                    ..
+                } => None,
             };
+            let next_state_updated_at = durable_retry_timestamp.unwrap_or_else(|| {
+                if state_changed {
+                    self.handoff_completion_timestamp.unwrap_or_else(Utc::now)
+                } else {
+                    self.state_updated_at
+                }
+            });
             let will_drain_from_idle = matches!(result.new_state, ConvState::Idle)
                 && !self.steering_queue.is_empty()
                 && !self.context.is_sub_agent;
@@ -4714,7 +4725,28 @@ where
                     None
                 };
 
-                let effect_result = if let Some(settlement) = terminal_message_settlement {
+                let mut summary_parent_committed = false;
+                let effect_result = if let Effect::PersistSubAgentResults {
+                    results,
+                    spawn_tool_id,
+                    summary_message_id,
+                } = effect
+                {
+                    Box::pin(self.execute_sub_agent_results_transition(
+                        results,
+                        spawn_tool_id,
+                        summary_message_id,
+                        terminal_unit_admission.as_deref_mut(),
+                    ))
+                    .await
+                    .map(|receipt| {
+                        summary_parent_committed = matches!(
+                            receipt,
+                            SubAgentResultPersistence::ParentAcceptanceCommitted
+                        );
+                        None
+                    })
+                } else if let Some(settlement) = terminal_message_settlement {
                     match effect {
                         Effect::PersistMessage {
                             content,
@@ -4726,7 +4758,7 @@ where
                             let retry_has_durable_fact = matches!(
                                 self.terminal_settlement_attempt,
                                 TerminalSettlementAttempt::Retry {
-                                    fact_durability: TerminalFactDurability::Durable,
+                                    fact_durability: TerminalFactDurability::Durable { .. },
                                     ..
                                 }
                             );
@@ -4752,7 +4784,9 @@ where
                                 {
                                     TerminalEvidenceEstablishment::Established(message) => {
                                         self.direct_turn_terminal_fact =
-                                            TerminalFactDurability::Durable;
+                                            TerminalFactDurability::Durable {
+                                                state_updated_at: self.state_updated_at,
+                                            };
                                         let _ = self
                                             .broadcast_tx
                                             .admitted_publication(
@@ -4765,7 +4799,9 @@ where
                                     }
                                     TerminalEvidenceEstablishment::Retired => {
                                         self.direct_turn_terminal_fact =
-                                            TerminalFactDurability::Durable;
+                                            TerminalFactDurability::Durable {
+                                                state_updated_at: self.state_updated_at,
+                                            };
                                         Ok(None)
                                     }
                                     TerminalEvidenceEstablishment::KnownNotCommitted(error) => {
@@ -4813,7 +4849,9 @@ where
                     {
                         TerminalMutationEstablishment::Established { .. }
                         | TerminalMutationEstablishment::Retired => {
-                            self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+                            self.direct_turn_terminal_fact = TerminalFactDurability::Durable {
+                                state_updated_at: self.state_updated_at,
+                            };
                             let admitted = terminal_unit_admission
                                 .as_deref_mut()
                                 .expect("terminal state settlement is admitted");
@@ -4931,7 +4969,7 @@ where
                         if is_state_persist && new_turn_input_persisted {
                             self.ordinary_turn_context = None;
                         }
-                        state_committed |= is_state_persist;
+                        state_committed |= is_state_persist || summary_parent_committed;
                         if is_state_persist && clears_pending_trusted_after_commit {
                             self.pending_trusted_tool_results.clear();
                             pending_trusted_cleared = true;
@@ -5138,7 +5176,28 @@ where
             let is_steering_drain = matches!(effect, Effect::CommitSteeringDrain { .. });
             let is_private_state_persist = matches!(effect, Effect::PersistState)
                 && (authority.requires_committed_state() || suppress_intermediate_state_change);
-            let effect_result = if is_private_state_persist {
+            let mut summary_parent_committed = false;
+            let effect_result = if let Effect::PersistSubAgentResults {
+                results,
+                spawn_tool_id,
+                summary_message_id,
+            } = effect
+            {
+                Box::pin(self.execute_sub_agent_results_transition(
+                    results,
+                    spawn_tool_id,
+                    summary_message_id,
+                    None,
+                ))
+                .await
+                .map(|receipt| {
+                    summary_parent_committed = matches!(
+                        receipt,
+                        SubAgentResultPersistence::ParentAcceptanceCommitted
+                    );
+                    None
+                })
+            } else if is_private_state_persist {
                 let mut admitted = self.admit_authoritative_effect()?;
                 self.persist_state_effect(false, &mut admitted).await
             } else {
@@ -5171,7 +5230,7 @@ where
             if is_private_state_persist && clears_pending_trusted_after_commit {
                 self.pending_trusted_tool_results.clear();
             }
-            if is_checkpoint {
+            if is_checkpoint || summary_parent_committed {
                 checkpoint_committed_state = true;
                 if clears_pending_trusted_after_commit {
                     self.pending_trusted_tool_results.clear();
@@ -8017,10 +8076,10 @@ where
                 results,
                 spawn_tool_id,
                 summary_message_id,
-            } => {
-                self.persist_sub_agent_results(results, spawn_tool_id, summary_message_id, admitted)
-                    .await
-            }
+            } => self
+                .persist_sub_agent_results(results, spawn_tool_id, summary_message_id, admitted)
+                .await
+                .map(|_| None),
 
             AuthoritativeEffect::RequestContinuation { request } => {
                 if matches!(
@@ -9870,10 +9929,14 @@ where
             .await
         {
             TerminalMutationEstablishment::Established { .. } => {
-                self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+                self.direct_turn_terminal_fact = TerminalFactDurability::Durable {
+                    state_updated_at: self.state_updated_at,
+                };
             }
             TerminalMutationEstablishment::Retired => {
-                self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+                self.direct_turn_terminal_fact = TerminalFactDurability::Durable {
+                    state_updated_at: self.state_updated_at,
+                };
                 return Ok(None);
             }
             TerminalMutationEstablishment::KnownNotCommitted(error) => return Err(error),
@@ -10115,6 +10178,24 @@ where
         Ok(None)
     }
 
+    async fn execute_sub_agent_results_transition(
+        &mut self,
+        results: Vec<SubAgentResult>,
+        spawn_tool_id: Option<String>,
+        summary_message_id: String,
+        inherited: Option<&mut crate::runtime::AdmittedOperation>,
+    ) -> Result<SubAgentResultPersistence, String> {
+        let mut owned;
+        let admitted = if let Some(admitted) = inherited {
+            admitted
+        } else {
+            owned = self.admit_authoritative_effect()?;
+            &mut owned
+        };
+        self.persist_sub_agent_results(results, spawn_tool_id, summary_message_id, admitted)
+            .await
+    }
+
     /// Persist aggregated sub-agent results. With a `spawn_tool_id`, update the
     /// originating `spawn_agents` tool message's content and `display_data`.
     /// Without one, persist a standalone meta-user summary — never a fabricated
@@ -10125,7 +10206,7 @@ where
         spawn_tool_id: Option<String>,
         summary_message_id: String,
         admitted: &mut crate::runtime::AdmittedOperation,
-    ) -> Result<Option<Event>, String> {
+    ) -> Result<SubAgentResultPersistence, String> {
         // Build the display_data for subagent results
         let display_data = serde_json::json!({
             "type": "subagent_summary",
@@ -10158,7 +10239,8 @@ where
                     &settlement,
                     admitted,
                 )
-                .await;
+                .await
+                .map(|_| SubAgentResultPersistence::TranscriptEstablished);
         }
 
         // If we have a spawn_tool_id, update its message's content (for LLM history)
@@ -10236,7 +10318,23 @@ where
                 usage_data: None,
                 created_at: Utc::now(),
             };
-            match self.storage.persist_sub_agent_summary(&message).await {
+            let child_id = self.pending_sub_agent_acceptance.clone().ok_or_else(|| {
+                "standalone sub-agent summary has no exact parent acceptance owner".to_string()
+            })?;
+            if self.context.is_coordinator {
+                super::retire_inline_child_bash_controller(&self.bash_handles, &child_id).await;
+            }
+            match self
+                .storage
+                .persist_sub_agent_summary_and_accept(
+                    &message,
+                    &self.state,
+                    self.state_updated_at,
+                    &child_id,
+                    Utc::now(),
+                )
+                .await
+            {
                 phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
                     result?
                 }
@@ -10247,14 +10345,20 @@ where
                 }
             }
 
+            self.pending_sub_agent_acceptance = None;
+            if let Some(scope) = &mut self.required_settlement_authority {
+                scope.record_child_acceptance(&child_id);
+            }
+
             // Broadcast the new message (meta user observation, no bash enrichment needed)
             let _ = self
                 .broadcast_tx
                 .admitted_publication(admitted)
                 .persisted_message(message);
+            return Ok(SubAgentResultPersistence::ParentAcceptanceCommitted);
         }
 
-        Ok(None)
+        Ok(SubAgentResultPersistence::TranscriptEstablished)
     }
 
     async fn latest_spawn_result_message_id(&self, tool_use_id: &str) -> Result<String, String> {
@@ -10311,7 +10415,9 @@ where
                 transcript_generation,
             } => transcript_generation,
             TerminalMutationEstablishment::Retired => {
-                self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+                self.direct_turn_terminal_fact = TerminalFactDurability::Durable {
+                    state_updated_at: self.state_updated_at,
+                };
                 return Ok(None);
             }
             TerminalMutationEstablishment::KnownNotCommitted(error) => return Err(error),
@@ -10320,7 +10426,9 @@ where
                 return Err(error);
             }
         };
-        self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+        self.direct_turn_terminal_fact = TerminalFactDurability::Durable {
+            state_updated_at: self.state_updated_at,
+        };
         match evidence {
             TerminalSubAgentEvidence::Update {
                 message_id,
@@ -18931,7 +19039,9 @@ mod authoritative_user_message_effect_tests {
                 .with_effect(Effect::PersistState),
             retry_at: tokio::time::Instant::now(),
             remaining_after_attempt: Some(2),
-            fact_durability: TerminalFactDurability::Durable,
+            fact_durability: TerminalFactDurability::Durable {
+                state_updated_at: rt.state_updated_at,
+            },
         });
 
         rt.process_event(Event::UserCancel {
@@ -18979,7 +19089,9 @@ mod authoritative_user_message_effect_tests {
             crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
         ));
         rt.state = ConvState::LlmRequesting { attempt: 1 };
-        rt.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+        rt.direct_turn_terminal_fact = TerminalFactDurability::Durable {
+            state_updated_at: rt.state_updated_at,
+        };
         let result = crate::state_machine::transition::TransitionResult::new(ConvState::Idle)
             .with_effect(Effect::PersistMessage {
                 content: MessageContent::agent(vec![ContentBlock::text("final answer")]),
@@ -19062,7 +19174,9 @@ mod authoritative_user_message_effect_tests {
             DirectTurnMaterializationEligibility::StaleAuthority,
             AuthoritativeUserMessageMaterialization::StaleAuthority,
         );
-        rt.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+        rt.direct_turn_terminal_fact = TerminalFactDurability::Durable {
+            state_updated_at: rt.state_updated_at,
+        };
         rt.terminal_settlement_attempt = TerminalSettlementAttempt::Retry {
             remaining_after_attempt: None,
             fact_durability: TerminalFactDurability::ProcessOnly,
@@ -19097,7 +19211,9 @@ mod authoritative_user_message_effect_tests {
         rt.pending_direct_turn_terminal = Some(Box::new(
             crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
         ));
-        rt.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+        rt.direct_turn_terminal_fact = TerminalFactDurability::Durable {
+            state_updated_at: rt.state_updated_at,
+        };
         rt.state = ConvState::LlmRequesting { attempt: 1 };
         let result = crate::state_machine::transition::TransitionResult::new(ConvState::Idle)
             .with_effect(Effect::PersistSubAgentResults {
@@ -24098,6 +24214,61 @@ mod steer_drain_detector_tests {
     }
 
     #[tokio::test]
+    async fn standalone_summary_parent_receipt_survives_inline_steering_and_backstop_notice() {
+        for backstop in [false, true] {
+            for queued in [false, true] {
+                let id = "inline-standalone-summary";
+                let mut initial = cancelling_state(
+                    &["child"],
+                    crate::state_machine::event::CancelCause::UserRequested,
+                );
+                if let ConvState::CancellingSubAgents { spawn_tool_id, .. } = &mut initial {
+                    *spawn_tool_id = None;
+                }
+                let queue = if queued {
+                    vec![mk_entry("after-standalone", "next task")]
+                } else {
+                    vec![]
+                };
+                let (mut runtime, storage) = build_runtime_with_state_and_queue(id, initial, queue);
+                if backstop {
+                    runtime.handle_cancelling_sub_agents_timeout().await;
+                } else {
+                    runtime
+                        .process_event(Event::SubAgentResult {
+                            agent_id: "child".into(),
+                            outcome: SubAgentOutcome::Success {
+                                result: "authentic".into(),
+                            },
+                        })
+                        .await
+                        .unwrap();
+                }
+                assert_eq!(storage.sub_agent_acceptance_count(), 1);
+                assert!(!runtime.fatal_local_authority_fence.is_closed());
+                assert!(runtime.pending_sub_agent_acceptance.is_none());
+                let messages = storage.get_all_messages(id);
+                assert_eq!(
+                    messages
+                        .iter()
+                        .filter(|m| m
+                            .display_data
+                            .as_ref()
+                            .and_then(|v| v.get("type"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some("subagent_summary"))
+                        .count(),
+                    1
+                );
+                assert_eq!(messages.iter().filter(|m| matches!(&m.content, MessageContent::System(c) if c.text.starts_with("Cancellation completed."))).count(), usize::from(backstop));
+                assert!(storage.get_steering_queue(id).is_empty());
+                assert_eq!(matches!(runtime.state, ConvState::Idle), !queued);
+                runtime.abort_external_effects().await;
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn unclassified_standalone_summary_closes_authority_before_raw_child_replay() {
         let initial = ConvState::AwaitingSubAgents {
             pending: vec![PendingSubAgent {
@@ -24137,8 +24308,23 @@ mod steer_drain_detector_tests {
         db.create_conversation(id, id, "/tmp", true, None, None)
             .await
             .unwrap();
+        db.create_conversation("admitted-child", "child", "/tmp", false, Some(id), None)
+            .await
+            .unwrap();
+        db.admit_sub_agent_batch(&phoenix_db::SubAgentBatchAdmission {
+            batch_id: "domain-failure-batch".into(),
+            parent_conversation_id: id.into(),
+            parallel_work_qualified: false,
+            runs: vec![phoenix_db::SubAgentRunAdmission {
+                child_conversation_id: "admitted-child".into(),
+                execution_authority: phoenix_db::SubAgentExecutionAuthority::ReadOnly,
+            }],
+        })
+        .await
+        .unwrap();
+        sqlx::query("CREATE TRIGGER reject_child_terminal BEFORE UPDATE OF terminal_cause ON sub_agent_runs BEGIN SELECT RAISE(ABORT, 'known child terminal write failure'); END").execute(db.pool()).await.unwrap();
         let initial = cancelling_state(
-            &["missing-lifecycle"],
+            &["admitted-child"],
             crate::state_machine::event::CancelCause::UserRequested,
         );
         db.update_conversation_state(id, &initial).await.unwrap();
@@ -24168,6 +24354,12 @@ mod steer_drain_detector_tests {
             }
         ));
         assert!(db.get_messages(id).await.unwrap().is_empty());
+        let facts: (Option<i64>, Option<i64>) = sqlx::query_as("SELECT terminal_at_unix_micros, parent_accepted_at_unix_micros FROM sub_agent_runs WHERE child_conversation_id = 'admitted-child'").fetch_one(db.pool()).await.unwrap();
+        assert_eq!(
+            facts,
+            (None, None),
+            "an error cannot manufacture child terminal/acceptance evidence"
+        );
     }
 
     #[tokio::test]
@@ -24731,6 +24923,252 @@ mod steer_drain_detector_tests {
             assert_eq!(storage.get_current_state(id), Some(runtime.state.clone()));
             assert!(!runtime.fatal_local_authority_fence.is_closed());
             assert!(runtime.llm_client.recorded_requests().is_empty());
+        }
+    }
+
+    async fn materialize_native_test_turn(
+        db: &crate::db::Database,
+        id: &str,
+    ) -> crate::runtime::traits::ActiveDirectTurn {
+        use phoenix_core::domain::sm_event::{
+            PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
+            SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
+        };
+        use phoenix_db::workflow::{
+            AcceptAuthoritativeTurn, ClaimAuthoritativeTurnInput, MaterializeAuthoritativeTurnInput,
+        };
+        use phoenix_workflow::{
+            AcceptedDisposition, ClientTurnKey, ConversationAuthority, LeaseExpiry, PreparedTurn,
+            ProcessIncarnation, Timestamp, TurnOutcome,
+        };
+        let payload = PreparedDirectTurnPayload::from_parts(
+            SubmittedDirectTurnIdentity {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
+                text: "do work".into(),
+                images: vec![],
+                files: vec![],
+                message_id: "owned-user-input".into(),
+                user_agent: None,
+                skill_invocation: None,
+                expansion_policy: SubmittedDirectTurnExpansionPolicy::LiteralText,
+            },
+            PreparedDirectTurnDelivery {
+                text: "do work".into(),
+                llm_text: None,
+                images: vec![],
+                files: vec![],
+                user_agent: None,
+                skill_invocation: None,
+            },
+        );
+        let conversation = ConversationAuthority(id.into());
+        let repo = db.workflow_repository();
+        let accepted = repo
+            .accept_authoritative_turn(&AcceptAuthoritativeTurn {
+                client_key: ClientTurnKey::new("owned-user-input").unwrap(),
+                prepared: PreparedTurn::from_exact_payload(
+                    &conversation,
+                    payload.to_exact_bytes().unwrap(),
+                ),
+                disposition: AcceptedDisposition::Runtime,
+                accepted_at: Timestamp(1),
+            })
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
+            panic!("new native turn required")
+        };
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        let claim = repo
+            .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
+                turn_id,
+                workflow_id,
+                process_incarnation: ProcessIncarnation(1),
+                now: Timestamp(2),
+                lease_until: LeaseExpiry(30),
+            })
+            .await
+            .unwrap();
+        repo.materialize_authoritative_turn(&MaterializeAuthoritativeTurnInput {
+            turn_id,
+            authority: claim.authority.unwrap(),
+            prepared: payload,
+            sequence_id: 1,
+            created_at: Timestamp(3),
+            accepted_state: ConvState::LlmRequesting { attempt: 1 },
+            state_updated_at: Utc::now(),
+            now: Timestamp(3),
+        })
+        .await
+        .established()
+        .unwrap();
+        let active = repo
+            .load_active_runtime_turn(&conversation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            active.materialization,
+            phoenix_workflow::Materialization::Materialized { .. }
+        ));
+        crate::runtime::traits::ActiveDirectTurn {
+            turn_id: active.id,
+            generation: active.generation,
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn native_terminal_summary_retries_exact_suffix_after_acceptance_or_settlement_rollback()
+    {
+        use phoenix_db::{
+            SubAgentBatchAdmission, SubAgentExecutionAuthority, SubAgentRunAdmission,
+            SubAgentTerminalCause,
+        };
+        for reject_acceptance in [false, true] {
+            let db = crate::db::Database::open_in_memory().await.unwrap();
+            let id = "native-terminal-summary";
+            db.create_conversation(id, id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            let turn = materialize_native_test_turn(&db, id).await;
+            db.create_conversation("child", "child", "/tmp", false, Some(id), None)
+                .await
+                .unwrap();
+            db.admit_sub_agent_batch(&SubAgentBatchAdmission {
+                batch_id: "batch".into(),
+                parent_conversation_id: id.into(),
+                parallel_work_qualified: false,
+                runs: vec![SubAgentRunAdmission {
+                    child_conversation_id: "child".into(),
+                    execution_authority: SubAgentExecutionAuthority::ReadOnly,
+                }],
+            })
+            .await
+            .unwrap();
+            let child_at = Utc::now();
+            db.update_child_state_and_record_sub_agent_terminal(
+                "child",
+                &ConvState::Completed {
+                    result: "authentic".into(),
+                },
+                child_at,
+                SubAgentTerminalCause::SubmitResult,
+                child_at,
+            )
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
+            let mut initial = cancelling_state(
+                &["child"],
+                crate::state_machine::event::CancelCause::UserRequested,
+            );
+            if let ConvState::CancellingSubAgents { spawn_tool_id, .. } = &mut initial {
+                *spawn_tool_id = None;
+            }
+            let original_at = chrono::DateTime::from_timestamp(1, 0).unwrap();
+            db.update_conversation_state_at(id, &initial, original_at)
+                .await
+                .unwrap();
+            let (event_tx, event_rx) = mpsc::channel(16);
+            let mut runtime = ConversationRuntime::new(
+                ConvContext::new(id, PathBuf::from("/tmp"), "test-model", 200_000, 16_384),
+                initial.clone(),
+                crate::runtime::traits::DatabaseStorage::new(db.clone()),
+                Arc::new(MockLlmClient::new("test-model")),
+                Arc::new(MockToolExecutor::new()),
+                Arc::new(BrowserSessionManager::default()),
+                Arc::new(crate::tools::BashHandleRegistry::new()),
+                Arc::new(crate::tools::TmuxRegistry::new()),
+                Arc::new(ModelRegistry::new_empty()),
+                crate::terminal::ActiveTerminals::new(),
+                event_rx,
+                event_tx,
+                SseBroadcaster::new(128, 1),
+            );
+            runtime.active_direct_turn = Some(Box::new(turn));
+            runtime.direct_turn_cancellation_initiated = true;
+            runtime.state_updated_at = original_at;
+            let trigger = if reject_acceptance {
+                "CREATE TRIGGER reject_terminal_step BEFORE UPDATE OF parent_accepted_at_unix_micros ON sub_agent_runs BEGIN SELECT RAISE(ABORT, 'known acceptance rollback'); END"
+            } else {
+                "CREATE TRIGGER reject_terminal_step BEFORE UPDATE OF terminal_kind ON durable_turns WHEN NEW.terminal_kind IS NOT NULL BEGIN SELECT RAISE(ABORT, 'known terminal settlement rollback'); END"
+            };
+            sqlx::query(trigger).execute(db.pool()).await.unwrap();
+            runtime
+                .process_event(Event::SubAgentResult {
+                    agent_id: "child".into(),
+                    outcome: SubAgentOutcome::Success {
+                        result: "authentic".into(),
+                    },
+                })
+                .await
+                .unwrap();
+            assert!(runtime.terminal_transition_retry.is_some());
+            assert!(
+                runtime.sub_agent_result_buffer.is_empty(),
+                "the existing suffix retry must own an established terminal summary"
+            );
+            assert_eq!(
+                db.sub_agent_terminal_is_accepted("child").await.unwrap(),
+                !reject_acceptance
+            );
+            assert!(runtime.active_direct_turn.is_some());
+            let obligation = db
+                .workflow_repository()
+                .load_active_terminal_obligation(&phoenix_workflow::ConversationAuthority(
+                    id.into(),
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(obligation.projection.state, ConvState::Idle);
+            assert_ne!(
+                obligation.projection.state_updated_at.timestamp_micros(),
+                runtime.state_updated_at.timestamp_micros()
+            );
+            let before = db.get_messages(id).await.unwrap();
+            assert_eq!(
+                before
+                    .iter()
+                    .filter(|m| m
+                        .display_data
+                        .as_ref()
+                        .and_then(|v| v.get("type"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("subagent_summary"))
+                    .count(),
+                1
+            );
+            sqlx::query("DROP TRIGGER reject_terminal_step")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            runtime.retry_terminal_transition().await;
+            assert!(runtime.active_direct_turn.is_none());
+            assert!(runtime.terminal_transition_retry.is_none());
+            assert!(runtime.pending_sub_agent_acceptance.is_none());
+            assert!(!runtime.fatal_local_authority_fence.is_closed());
+            assert!(db.sub_agent_terminal_is_accepted("child").await.unwrap());
+            assert_eq!(
+                serde_json::to_value(db.get_messages(id).await.unwrap()).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+            let persisted = db.get_conversation(id).await.unwrap();
+            assert_eq!(persisted.state, ConvState::Idle);
+            assert_eq!(
+                persisted.state_updated_at.timestamp_micros(),
+                obligation.projection.state_updated_at.timestamp_micros()
+            );
+            assert!(db
+                .workflow_repository()
+                .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(id.into()))
+                .await
+                .unwrap()
+                .is_none());
         }
     }
 
@@ -26932,6 +27370,7 @@ mod steer_drain_detector_tests {
             task: "investigate".to_string(),
             outcome: SubAgentOutcome::TimedOut,
         }];
+        rt.pending_sub_agent_acceptance = Some("a".into());
         let mut admitted = rt.admit_authoritative_effect().unwrap();
         rt.persist_sub_agent_results(results, None, "subagent-summary".to_string(), &mut admitted)
             .await

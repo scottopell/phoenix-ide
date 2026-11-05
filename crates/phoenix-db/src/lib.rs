@@ -1891,11 +1891,11 @@ impl TerminalEvidenceTransactionCut {
     }
 
     const fn classifier_unavailable(self) -> bool {
-        #[cfg(test)]
-        if matches!(self, Self::AfterCommitLookupUnavailable) {
-            return true;
+        match self {
+            Self::None | Self::BeforeCommit | Self::AfterCommit => false,
+            #[cfg(test)]
+            Self::AfterCommitLookupUnavailable => true,
         }
-        false
     }
 }
 

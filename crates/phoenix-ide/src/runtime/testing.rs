@@ -1410,26 +1410,44 @@ impl MessageStore for InMemoryStorage {
         }
     }
 
-    async fn persist_sub_agent_summary(
+    async fn persist_sub_agent_summary_and_accept(
         &self,
         message: &Message,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        child_id: &str,
+        accepted_at: chrono::DateTime<chrono::Utc>,
     ) -> phoenix_db::workflow::LocalAuthorityResult<Result<(), String>> {
+        use phoenix_db::workflow::LocalAuthorityResult;
         if self.unclassified_sub_agent_summary.load(Ordering::Relaxed) {
-            return phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified;
+            return LocalAuthorityResult::DurableFactUnclassified;
         }
-        let result = self
-            .add_message_with_seq_at(
-                &message.message_id,
+        if *self.fail_message_add.lock().unwrap() {
+            return LocalAuthorityResult::DurableFactEstablished(Err(
+                "injected summary write failure".into(),
+            ));
+        }
+        match self
+            .update_state_and_accept_sub_agent(
                 &message.conversation_id,
-                message.sequence_id,
-                &message.content,
-                message.display_data.as_ref(),
-                message.usage_data.as_ref(),
-                message.created_at,
+                state,
+                state_updated_at,
+                child_id,
+                accepted_at,
             )
             .await
-            .map(|_| ());
-        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result)
+        {
+            Ok(()) => {
+                self.messages
+                    .lock()
+                    .unwrap()
+                    .entry(message.conversation_id.clone())
+                    .or_default()
+                    .push(message.clone());
+                LocalAuthorityResult::DurableFactEstablished(Ok(()))
+            }
+            Err(error) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+        }
     }
 
     async fn coordinator_authority(

@@ -1444,7 +1444,7 @@ impl Database {
         }
     }
 
-    async fn prepare_parent_state_and_sub_agent_acceptance<'a>(
+    pub(super) async fn prepare_parent_state_and_sub_agent_acceptance<'a>(
         &'a self,
         parent_conversation_id: &str,
         state: &ConvState,
