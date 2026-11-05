@@ -3640,6 +3640,16 @@ where
             && !error.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:")
     }
 
+    fn close_failed_required_steering_drain(&self, authority: TransitionAuthority) {
+        if !authority.requires_committed_state() {
+            return;
+        }
+        if let Some(scope) = &self.required_settlement_authority {
+            self.fatal_local_authority_fence
+                .close(scope.boundary.settlement());
+        }
+    }
+
     /// Process a typed effect outcome from a background task.
     ///
     /// Routes through `handle_outcome()` (pure SM function). Invalid outcomes
@@ -4384,6 +4394,7 @@ where
         // threads this same value into the DB write, so the persisted row and
         // the SSE value match exactly.
         let old_state_updated_at = self.state_updated_at;
+        let old_deadline = self.deadline;
         let is_direct_turn_adoption = result
             .effects
             .iter()
@@ -4582,7 +4593,18 @@ where
         let steering_drain = if terminal_direct_turn_transition {
             None
         } else {
-            Box::pin(self.prepare_steering_drain(&old_state, is_error_dismissal)).await?
+            match Box::pin(self.prepare_steering_drain(&old_state, is_error_dismissal)).await {
+                Ok(drain) => drain,
+                Err(error) => {
+                    self.install_live_state(
+                        old_state,
+                        old_state_updated_at,
+                        !authority.requires_committed_state(),
+                    )?;
+                    self.deadline = old_deadline;
+                    return Err(error);
+                }
+            }
         };
         let mut terminal_unit_admission = None;
         let terminal_state_has_notify = terminal_direct_turn_transition
@@ -4604,7 +4626,7 @@ where
                 drain_event,
                 projection_guard,
                 clears_pending_trusted_after_commit,
-                (&old_state, old_state_updated_at, authority),
+                (&old_state, old_state_updated_at, old_deadline, authority),
                 &mut generated_events,
             ))
             .await?;
@@ -4928,20 +4950,25 @@ where
                         if terminal_direct_turn_transition {
                             self.state = old_state.clone();
                             self.state_updated_at = old_state_updated_at;
-                            self.manage_deadline(&failed_state);
+                            if authority.requires_committed_state() {
+                                self.deadline = old_deadline;
+                            } else {
+                                self.manage_deadline(&failed_state);
+                            }
                         } else {
                             self.install_live_state(
                                 old_state.clone(),
                                 old_state_updated_at,
                                 !authority.requires_committed_state(),
                             )?;
-                            self.manage_deadline(&failed_state);
-                        }
-                        if is_steering_drain && authority.requires_committed_state() {
-                            if let Some(scope) = &self.required_settlement_authority {
-                                self.fatal_local_authority_fence
-                                    .close(scope.boundary.settlement());
+                            if authority.requires_committed_state() {
+                                self.deadline = old_deadline;
+                            } else {
+                                self.manage_deadline(&failed_state);
                             }
+                        }
+                        if is_steering_drain {
+                            self.close_failed_required_steering_drain(authority);
                         }
                         if (terminal_subagent_transition || terminal_direct_turn_transition)
                             && !state_committed
@@ -5066,10 +5093,15 @@ where
         drain_event: Event,
         projection_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
         clears_pending_trusted_after_commit: bool,
-        rollback_state: (&ConvState, DateTime<Utc>, TransitionAuthority),
+        rollback_state: (
+            &ConvState,
+            DateTime<Utc>,
+            Option<tokio::time::Instant>,
+            TransitionAuthority,
+        ),
         generated_events: &mut Vec<Event>,
     ) -> Result<(), String> {
-        let (old_state, old_state_updated_at, authority) = rollback_state;
+        let (old_state, old_state_updated_at, old_deadline, authority) = rollback_state;
         let mut deferred_request_llm: Option<Effect> = None;
         let drained_entries = match &drain_event {
             Event::SteerDrainedUserMessages { entries } => entries.clone(),
@@ -5091,31 +5123,21 @@ where
                 deferred_request_llm = Some(effect);
                 continue;
             }
-            if authority.requires_committed_state() && matches!(effect, Effect::PersistState) {
-                let mut admitted = self.admit_authoritative_effect()?;
-                self.persist_state_effect(false, &mut admitted).await?;
+            if suppress_intermediate_state_change && matches!(effect, Effect::NotifyStateChange) {
                 continue;
-            }
-            if suppress_intermediate_state_change {
-                match &effect {
-                    Effect::PersistState => {
-                        let mut admitted = self.admit_authoritative_effect()?;
-                        self.persist_state_effect(false, &mut admitted).await?;
-                        if clears_pending_trusted_after_commit {
-                            self.pending_trusted_tool_results.clear();
-                        }
-                        continue;
-                    }
-                    Effect::NotifyStateChange => {
-                        continue;
-                    }
-                    _ => {}
-                }
             }
             let is_authoritative_persist =
                 matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
             let is_checkpoint = matches!(effect, Effect::PersistCheckpoint { .. });
-            let effect_result = Box::pin(self.execute_effect(effect)).await;
+            let is_steering_drain = matches!(effect, Effect::CommitSteeringDrain { .. });
+            let is_private_state_persist = matches!(effect, Effect::PersistState)
+                && (authority.requires_committed_state() || suppress_intermediate_state_change);
+            let effect_result = if is_private_state_persist {
+                let mut admitted = self.admit_authoritative_effect()?;
+                self.persist_state_effect(false, &mut admitted).await
+            } else {
+                Box::pin(self.execute_effect(effect)).await
+            };
             let effect_result = match effect_result {
                 Ok(effect_result) => effect_result,
                 Err(error) => {
@@ -5125,13 +5147,23 @@ where
                         old_state_updated_at,
                         !authority.requires_committed_state(),
                     )?;
-                    self.manage_deadline(&failed_state);
+                    if authority.requires_committed_state() {
+                        self.deadline = old_deadline;
+                    } else {
+                        self.manage_deadline(&failed_state);
+                    }
                     self.steering_queue = drained_entries;
+                    if is_steering_drain {
+                        self.close_failed_required_steering_drain(authority);
+                    }
                     return Err(error);
                 }
             };
             if let Some(gen_event) = effect_result {
                 generated_events.push(gen_event);
+            }
+            if is_private_state_persist && clears_pending_trusted_after_commit {
+                self.pending_trusted_tool_results.clear();
             }
             if is_checkpoint {
                 checkpoint_committed_state = true;
@@ -5166,12 +5198,16 @@ where
             self.state_updated_at = Utc::now();
         }
         for effect in drain_result.effects {
+            let is_steering_drain = matches!(effect, Effect::CommitSteeringDrain { .. });
             match Box::pin(self.execute_effect(effect)).await {
                 Ok(Some(gen_event)) => generated_events.push(gen_event),
                 Ok(None) => {}
                 Err(error) => {
                     self.state = drain_old_state;
                     self.state_updated_at = drain_old_state_updated_at;
+                    if is_steering_drain {
+                        self.close_failed_required_steering_drain(authority);
+                    }
                     return Err(error);
                 }
             }
@@ -24007,6 +24043,162 @@ mod steer_drain_detector_tests {
             );
             assert!(counter(FailureBoundary::SettlementOwnerDisappeared).count() > before);
             assert_eq!(fence.owner_count(), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn child_pre_acceptance_preparation_failures_preserve_exact_retry_state_and_deadline() {
+        for projection_failure in [false, true] {
+            for queued in [false, true] {
+                let id = "child-pre-acceptance-preparation";
+                let initial = mk_awaiting_with_pending("child");
+                let (mut runtime, storage) =
+                    build_runtime_with_state_and_queue(id, initial.clone(), vec![]);
+                let (event_tx, event_rx) = mpsc::channel(16);
+                runtime.event_tx = event_tx;
+                runtime.event_rx = event_rx;
+                if queued {
+                    let entry = mk_entry("prep-failure-steer", "queued next turn");
+                    runtime.steering_queue = vec![entry.clone()];
+                    storage.set_steering_queue(id, vec![entry]);
+                }
+                runtime.state_updated_at = Utc::now() - chrono::Duration::minutes(15);
+                runtime.deadline = Some(tokio::time::Instant::now() + Duration::from_secs(300));
+                let updated_at = runtime.state_updated_at;
+                let deadline = runtime.deadline;
+                let (watch_tx, watch_rx) = watch::channel(initial.clone());
+                runtime = runtime.with_state_watcher(watch_tx);
+                let mut broadcasts = runtime.broadcast_tx.subscribe();
+                if projection_failure {
+                    runtime = runtime
+                        .with_steering_projection_gate(Arc::new(tokio::sync::Mutex::new(())));
+                    storage.set_fail_steering_load(true);
+                } else {
+                    storage.set_fail_load_active_direct_turn(true);
+                }
+                let mut event = Event::SubAgentResult {
+                    agent_id: "child".into(),
+                    outcome: SubAgentOutcome::Success {
+                        result: "exact raw outcome".into(),
+                    },
+                };
+                for _ in 0..3 {
+                    runtime
+                        .process_event(event)
+                        .await
+                        .expect("the exact unaccepted result remains retry-owned");
+                    assert_eq!(runtime.state, initial);
+                    assert_eq!(runtime.state_updated_at, updated_at);
+                    assert_eq!(runtime.deadline, deadline);
+                    assert_eq!(*watch_rx.borrow(), initial);
+                    assert!(!watch_rx.has_changed().unwrap());
+                    assert!(!runtime.fatal_local_authority_fence.is_closed());
+                    assert_eq!(storage.sub_agent_acceptance_count(), 0);
+                    assert!(storage.get_all_messages(id).is_empty());
+                    assert!(runtime.llm_client.recorded_requests().is_empty());
+                    assert!(broadcasts.try_recv().is_err());
+                    assert!(matches!(runtime.sub_agent_result_buffer.as_slice(),
+                        [Event::SubAgentResult { agent_id, outcome: SubAgentOutcome::Success { result } }]
+                        if agent_id == "child" && result == "exact raw outcome"));
+                    runtime
+                        .process_event(Event::RetryBufferedSubAgentResults)
+                        .await
+                        .unwrap();
+                    event = runtime
+                        .event_rx
+                        .try_recv()
+                        .expect("the same pending child must remain deliverable");
+                }
+                storage.set_fail_load_active_direct_turn(false);
+                storage.set_fail_steering_load(false);
+                storage.set_fail_prompt_projection_load(true);
+                runtime.process_event(event).await.unwrap();
+                assert_eq!(storage.sub_agent_acceptance_count(), 1);
+                assert!(runtime.sub_agent_result_buffer.is_empty());
+                assert!(matches!(runtime.state, ConvState::Error { .. }));
+                assert_eq!(storage.get_current_state(id), Some(runtime.state.clone()));
+                assert!(runtime.llm_client.recorded_requests().is_empty());
+                assert!(!runtime.fatal_local_authority_fence.is_closed());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn child_acceptance_write_retry_preserves_pending_chain_with_and_without_inline_steering()
+    {
+        for queued in [false, true] {
+            let id = "child-acceptance-write-retry";
+            let (mut runtime, storage) = cancelling_runtime(
+                id,
+                &["child"],
+                crate::state_machine::event::CancelCause::UserRequested,
+            )
+            .await;
+            let initial = runtime.state.clone();
+            let (event_tx, event_rx) = mpsc::channel(16);
+            runtime.event_tx = event_tx;
+            runtime.event_rx = event_rx;
+            if queued {
+                let entry = mk_entry("write-retry-steer", "queued next turn");
+                runtime.steering_queue = vec![entry.clone()];
+                storage.set_steering_queue(id, vec![entry]);
+            }
+            runtime.state_updated_at = Utc::now() - chrono::Duration::seconds(2);
+            runtime.deadline = Some(tokio::time::Instant::now() + Duration::from_secs(4));
+            let updated_at = runtime.state_updated_at;
+            let deadline = runtime.deadline;
+            let (watch_tx, watch_rx) = watch::channel(initial.clone());
+            runtime = runtime.with_state_watcher(watch_tx);
+            let mut broadcasts = runtime.broadcast_tx.subscribe();
+            let mut event = Event::SubAgentResult {
+                agent_id: "child".into(),
+                outcome: SubAgentOutcome::Failure {
+                    error: "exact cancelled outcome".into(),
+                    error_kind: crate::db::ErrorKind::Cancelled,
+                },
+            };
+            for _ in 0..3 {
+                storage.fail_sub_agent_acceptance_once();
+                runtime.process_event(event).await.unwrap();
+                assert_eq!(runtime.state, initial);
+                assert_eq!(runtime.state_updated_at, updated_at);
+                assert_eq!(runtime.deadline, deadline);
+                assert_eq!(*watch_rx.borrow(), initial);
+                assert!(!watch_rx.has_changed().unwrap());
+                assert_eq!(storage.sub_agent_acceptance_count(), 0);
+                assert_eq!(storage.get_all_messages(id).len(), 2);
+                assert_eq!(storage.get_steering_queue(id).len(), usize::from(queued));
+                assert!(!runtime.fatal_local_authority_fence.is_closed());
+                assert!(runtime.llm_client.recorded_requests().is_empty());
+                while let Ok(event) = broadcasts.try_recv() {
+                    assert!(!matches!(event, SseEvent::StateChange { .. }), "{event:?}");
+                }
+                assert!(
+                    matches!(runtime.sub_agent_result_buffer.as_slice(), [Event::SubAgentResult { agent_id,
+                    outcome: SubAgentOutcome::Failure { error, error_kind: crate::db::ErrorKind::Cancelled } }]
+                    if agent_id == "child" && error == "exact cancelled outcome")
+                );
+                runtime
+                    .process_event(Event::RetryBufferedSubAgentResults)
+                    .await
+                    .unwrap();
+                event = runtime
+                    .event_rx
+                    .try_recv()
+                    .expect("the same pending child remains deliverable");
+            }
+            storage.set_fail_prompt_projection_load(true);
+            runtime.process_event(event).await.unwrap();
+            assert_eq!(storage.sub_agent_acceptance_count(), 1);
+            assert!(runtime.sub_agent_result_buffer.is_empty());
+            if queued {
+                assert!(matches!(runtime.state, ConvState::Error { .. }));
+            } else {
+                assert!(matches!(runtime.state, ConvState::Idle));
+            }
+            assert_eq!(storage.get_current_state(id), Some(runtime.state.clone()));
+            assert!(!runtime.fatal_local_authority_fence.is_closed());
+            assert!(runtime.llm_client.recorded_requests().is_empty());
         }
     }
 
