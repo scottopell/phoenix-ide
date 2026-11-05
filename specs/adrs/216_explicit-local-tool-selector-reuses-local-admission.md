@@ -1,6 +1,6 @@
 # ADR-216: Explicit local tool selection reuses local admission
 
-- **Status:** Accepted
+- **Status:** Accepted; remote-SQL public tool shape partially superseded by ADR-222
 - **Date:** 2026-11-02
 - **Affects:** REQ-FED-001, REQ-FED-002, REQ-FED-019
 

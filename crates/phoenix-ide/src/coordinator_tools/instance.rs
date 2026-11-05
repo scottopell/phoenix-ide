@@ -42,6 +42,16 @@ impl InstanceSelector {
             "description": "Omit or use exact \"local\" for local routing. Otherwise use an enrolled peer UUID or unique saved name; remote errors never fall back locally. The name local is reserved for this Phoenix instance and cannot be used as a peer name."
         })
     }
+
+    pub(super) fn nullable_schema() -> Value {
+        json!({
+            "oneOf": [
+                Self::schema(),
+                { "type": "null" }
+            ],
+            "description": "Omit, use null, or use exact \"local\" for local routing. Otherwise use an enrolled peer UUID or unique saved name; remote errors never fall back locally. The name local is reserved for this Phoenix instance and cannot be used as a peer name."
+        })
+    }
 }
 
 #[cfg(test)]

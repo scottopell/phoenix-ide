@@ -210,15 +210,16 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [213](213_macos-bash-launch-qualification-is-the-only-hosted-launch-ci.md) | macOS Bash launch qualification is the only separate hosted launch CI | Accepted | REQ-BASH-017 |
 | [214](214_coordinator-speaks-as-ember.md) | The Coordinator speaks as Ember, the phoenix on the user's shoulder | Accepted | REQ-GR-021, REQ-GR-011 |
 | [215](215_tool-round-identities-are-validated-before-dispatch-and-reset.md) | Tool-round identities are validated before dispatch and reset | Accepted | REQ-BED-004, REQ-BED-007 |
-| [216](216_explicit-local-tool-selector-reuses-local-admission.md) | Explicit local tool selection reuses local admission | Accepted | REQ-FED-001, REQ-FED-002, REQ-FED-019 |
+| [216](216_explicit-local-tool-selector-reuses-local-admission.md) | Explicit local tool selection reuses local admission | Accepted; remote-SQL public tool shape partially superseded by 222 | REQ-FED-001, REQ-FED-002, REQ-FED-019 |
 | [217](217_reminders-submit-through-standard-input-admission.md) | Reminders submit through standard input admission | Accepted | REQ-REM-001–009 |
 | [218](218_reminder-occurrence-identities-are-reserved.md) | Reminder occurrence identities are reserved at fresh input admission | Accepted | REQ-REM-005/008, REQ-API-033 |
 | [219](219_reminder-reservations-cover-canonical-aliases-and-fresh-openings.md) | Reminder reservations cover canonical aliases and fresh openings | Accepted | REQ-API-033, REQ-REM-005 |
 | [220](220_reminder-management-errors-use-existing-fail-stop.md) | Reminder management errors use existing fail-stop authority | Accepted | REQ-REM-006, REQ-DWF-043, REQ-BED-033 |
 | [221](221_coordinator-authority-uses-conversational-approval-and-direct-tools.md) | Coordinator Authority uses conversational approval and direct tools | Accepted | REQ-AUTH-001–006, REQ-GR-007/013/022 |
-| [222](222_kache-v1-restores-automatic-selection.md) | Qualified Kache v1 restores automatic compiler-cache selection | Superseded by ADR-223 (selection); v1.0.0 debugger evidence remains historical | development methodology; REQ-COMP-001, REQ-COMP-008 |
-| [223](223_kache-default-waits-for-identifiable-isolation-fix.md) | Kache default waits for an identifiable isolation fix | Selection conclusion superseded by ADR-224; historical v1.0.0 evidence retained | development methodology; REQ-COMP-001, REQ-COMP-008 |
-| [224](224_kache-v1-2-2-strict-local-only-selection.md) | Select Kache v1.2.2 only behind a Phoenix-owned local-only boundary | Accepted | development methodology; REQ-COMP-001, REQ-COMP-008 |
+| [222](222_unified-local-and-federated-database-query.md) | One authority-shaped database query surface selects local or federated execution | Accepted | REQ-FED-001–003, REQ-RQD-001/005/009/010 |
+| [223](223_kache-v1-restores-automatic-selection.md) | Qualified Kache v1 restores automatic compiler-cache selection | Superseded by ADR-224 (selection); v1.0.0 debugger evidence remains historical | development methodology; REQ-COMP-001, REQ-COMP-008 |
+| [224](224_kache-default-waits-for-identifiable-isolation-fix.md) | Kache default waits for an identifiable isolation fix | Selection conclusion superseded by ADR-225; historical v1.0.0 evidence retained | development methodology; REQ-COMP-001, REQ-COMP-008 |
+| [225](225_kache-v1-2-2-strict-local-only-selection.md) | Select Kache v1.2.2 only behind a Phoenix-owned local-only boundary | Accepted | development methodology; REQ-COMP-001, REQ-COMP-008 |
 
 ## For agents: which decisions bind your task
 
@@ -236,6 +237,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Changing pending-question identity compatibility or legacy tokenless settlement | 082, then 034 |
 | Specifying parallel Work-child qualification, admission, shared WorkScope collaboration, cancellation/start, or parent-result delivery | 059, then 052 and 026 |
 | Implementing federation instance identity or bounded known-credential SQL exclusions | 083, within 034's compatibility scope |
+| Changing the public local/federated database-query surface or selector authority | 222, then 216, 083, and 034 |
 | Implementing federation peer TLS trust, enrollment transfer, or peer origins | 093, then 092, 083, and 034 |
 | Changing owner-password or federation peer-credential domains | 094, then 083 and 034 |
 | Changing Codex route admission or private continuation account identity | 085, preserving 062's advisory discovery policy |

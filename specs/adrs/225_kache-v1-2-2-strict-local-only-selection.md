@@ -1,19 +1,19 @@
-# ADR-224: Select Kache v1.2.2 only behind a Phoenix-owned local-only boundary
+# ADR-225: Select Kache v1.2.2 only behind a Phoenix-owned local-only boundary
 
 - **Status:** Accepted
 - **Date:** 2026-11-01
-- **Supersedes:** Selection conclusion of ADR-223 only; historical v1.0.0 evidence in ADR-222 and ADR-223 remains applicable to its release.
+- **Supersedes:** Selection conclusion of ADR-224 only; historical v1.0.0 evidence in ADR-223 and ADR-224 remains applicable to its release.
 - **Affects:** development methodology; REQ-COMP-001, REQ-COMP-008
 
 ## Context
 
-[ADR-222](222_kache-v1-restores-automatic-selection.md) established representative macOS arm64 restored-archive debugger fidelity for Kache v1.0.0, not for every later release. [ADR-223](223_kache-default-waits-for-identifiable-isolation-fix.md) blocked default selection of official v1.0.0: its remote-enabled trust-domain behavior could fail open and leave configured volume shards unscoped, while the corrected private candidate reported the same version as the vulnerable release. Its conclusion assumed the managed-remote configuration surface was part of selection. A bounded local-only milestone can exclude that surface instead of treating remote qualification as a prerequisite.
+[ADR-223](223_kache-v1-restores-automatic-selection.md) established representative macOS arm64 restored-archive debugger fidelity for Kache v1.0.0, not for every later release. [ADR-224](224_kache-default-waits-for-identifiable-isolation-fix.md) blocked default selection of official v1.0.0: its remote-enabled trust-domain behavior could fail open and leave configured volume shards unscoped, while the corrected private candidate reported the same version as the vulnerable release. Its conclusion assumed the managed-remote configuration surface was part of selection. A bounded local-only milestone can exclude that surface instead of treating remote qualification as a prerequisite.
 
 The published Kache v1.2.2 tag peels to commit `96052b4842239bb216f6c4812054203c21550788`. Its macOS arm64 release archive (`kache-aarch64-apple-darwin.tar.gz`) has SHA-256 `10d09e146852a8df8796cf642ca58872107a7f391b7647ec8cc253cf289af0a9`. Native qualification of that artifact used isolated test-owned paths and a hostile ambient remote configuration. Phoenix selected its owned local-only config and child; a second clean source root restored both application and dependency compilations as local hits without additional misses. Kache restored a UUID-matched dSYM, and LLDB resolved and stopped at application and dependency file/line breakpoints. The journey did not read active credentials, contact remote storage, reuse a live daemon, or inspect or mutate existing cache or upload-queue state.
 
 ## Options considered
 
-1. **Keep Kache disabled until managed-remote isolation and native debugger fidelity are qualified for a new release** — preserves ADR-223's broad gate but prevents a bounded local-only use case from advancing.
+1. **Keep Kache disabled until managed-remote isolation and native debugger fidelity are qualified for a new release** — preserves ADR-224's broad gate but prevents a bounded local-only use case from advancing.
 2. **Select v1.2.2 under Phoenix-owned strict local-only configuration** — excludes the remote trust-domain surface while retaining explicit daemon ownership and honest qualification limits.
 3. **Select v1.2.2 with ambient or remote-capable configuration** — allows remote behavior without its own isolation and qualification contract.
 
@@ -35,4 +35,4 @@ Remote caching is **deferred, not obsolete**. It requires a separate explicit co
 
 - [REQ-COMP-008](../compatibility/requirements.md)
 - [Compiler cache development guide](../../docs/development/compiler-cache.md)
-- [ADR-222](222_kache-v1-restores-automatic-selection.md) and [ADR-223](223_kache-default-waits-for-identifiable-isolation-fix.md)
+- [ADR-223](223_kache-v1-restores-automatic-selection.md) and [ADR-224](224_kache-default-waits-for-identifiable-isolation-fix.md)

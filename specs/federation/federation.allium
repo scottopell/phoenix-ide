@@ -1,7 +1,11 @@
 -- allium: 3
--- Federation behavior: REQ-FED-001 through REQ-FED-018.
--- Domain services for send_conversation_message and read_goal are governed by
--- their own specifications; this module models the federation boundary.
+-- Federation behavior for enrollment, message delivery, subscriptions, and the
+-- optional-instance tools represented by ToolKind below.
+-- Database-query routing is governed by the federation and remote-query-database
+-- requirements and is not modeled here. Domain services for
+-- send_conversation_message and read_goal are governed by their own
+-- specifications; this module models their federation destination-selection and
+-- no-fallback boundary.
 
 use "../bedrock/bedrock.allium" as bedrock
 
