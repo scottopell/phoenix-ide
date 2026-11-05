@@ -4924,10 +4924,21 @@ def _prepare_local_kache(binary: str, *, cargo_cwd: Path | None) -> None:
         os.fsync(directory_descriptor)
     finally:
         os.close(directory_descriptor)
+    log_file_path = os.environ.get("KACHE_LOG_FILE_PATH")
+    if log_file_path:
+        path = Path(log_file_path).expanduser()
+        os.environ["KACHE_LOG_FILE_PATH"] = str(
+            path if path.is_absolute() else Path.cwd().resolve() / path
+        )
     retained_operational = {
         name: value
         for name, value in os.environ.items()
-        if name in {"KACHE_LOG", "KACHE_LOG_FILE", "KACHE_PROGRESS"}
+        if name in {
+            "KACHE_LOG",
+            "KACHE_LOG_FILE",
+            "KACHE_LOG_FILE_PATH",
+            "KACHE_PROGRESS",
+        }
     }
     for name in list(os.environ):
         if name.startswith("KACHE_"):
@@ -5231,7 +5242,15 @@ def _record_kache_daemon_receipt(
         )
         descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         try:
-            os.write(descriptor, payload.encode())
+            encoded = payload.encode()
+            written = 0
+            while written < len(encoded):
+                count = os.write(descriptor, encoded[written:])
+                if count == 0:
+                    raise OSError(
+                        "short write while publishing Kache daemon ownership receipt"
+                    )
+                written += count
         finally:
             os.close(descriptor)
         os.replace(temporary, receipt)
@@ -5472,20 +5491,39 @@ def _start_kache_daemon_locked(
             return None
         return "selected socket has a running daemon whose environment or process identity cannot be verified"
 
+    child: subprocess.Popen[bytes] | None = None
+    pending_termination: int | None = None
+    termination_in_progress = False
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def handle_startup_sigterm(signum, _frame):
+        nonlocal pending_termination, termination_in_progress
+        pending_termination = signum
+        if child is not None and not termination_in_progress:
+            termination_in_progress = True
+            raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, handle_startup_sigterm)
     try:
-        child = subprocess.Popen(
-            [binary, "daemon", "run"],
-            cwd=cargo_cwd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            env=os.environ,
-            start_new_session=True,
-            close_fds=True,
-        )
-    except OSError as error:
-        return str(error)
-    try:
+        try:
+            child = subprocess.Popen(
+                [binary, "daemon", "run"],
+                cwd=cargo_cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                env=os.environ,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except OSError as error:
+            if pending_termination is not None:
+                termination_in_progress = True
+                raise SystemExit(128 + pending_termination)
+            return str(error)
+        if pending_termination is not None:
+            termination_in_progress = True
+            raise SystemExit(128 + pending_termination)
         return _finish_spawned_kache_start(
             child,
             binary=binary,
@@ -5494,8 +5532,11 @@ def _start_kache_daemon_locked(
             identity=identity,
         )
     except (KeyboardInterrupt, SystemExit) as interruption:
-        _cleanup_interrupted_kache_start(child, socket, interruption)
+        if child is not None:
+            _cleanup_interrupted_kache_start(child, socket, interruption)
         raise
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def _generated_kache_socket(binary: str, *, cargo_cwd: Path | None) -> Path:

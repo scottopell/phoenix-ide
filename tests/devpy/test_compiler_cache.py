@@ -424,6 +424,28 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertTrue(self.dev.stat.S_ISDIR(synced_modes[1]))
         self.assertEqual(0o600, Path(os.environ["KACHE_CONFIG"]).stat().st_mode & 0o777)
 
+    def test_local_config_preserves_normalized_log_file_path(self):
+        with self.dev.tempfile.TemporaryDirectory() as invoking_directory, mock.patch.object(
+            self.dev.Path, "cwd", return_value=Path(invoking_directory)
+        ):
+            os.environ.update({
+                "KACHE_LOG": "trace",
+                "KACHE_LOG_FILE": "kache=trace",
+                "KACHE_LOG_FILE_PATH": "logs/kache.log",
+                "KACHE_PROGRESS": "false",
+                "KACHE_REMOTE_URL": "https://example.invalid/cache",
+            })
+            self.dev._prepare_local_kache("/bin/kache", cargo_cwd=Path("/cargo"))
+
+        self.assertEqual("trace", os.environ["KACHE_LOG"])
+        self.assertEqual("kache=trace", os.environ["KACHE_LOG_FILE"])
+        self.assertEqual("false", os.environ["KACHE_PROGRESS"])
+        self.assertEqual(
+            str(Path(invoking_directory).resolve() / "logs" / "kache.log"),
+            os.environ["KACHE_LOG_FILE_PATH"],
+        )
+        self.assertNotIn("KACHE_REMOTE_URL", os.environ)
+
     def test_local_config_retry_completes_failed_directory_durability_barrier(self):
         real_fsync = self.dev.os.fsync
         first_modes = []
@@ -529,6 +551,62 @@ class CompilerCacheTests(unittest.TestCase):
                 {"identity", "serving_pid", "socket_device", "socket_inode", "version"},
                 set(parsed),
             )
+
+    def test_daemon_receipt_retries_partial_write(self):
+        with self.dev.tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            socket = root / "operator.sock"
+            socket.write_text("")
+            real_write = self.dev.os.write
+            writes = 0
+
+            def partial_write(descriptor, data):
+                nonlocal writes
+                writes += 1
+                if writes == 1:
+                    data = data[:7]
+                return real_write(descriptor, data)
+
+            with mock.patch.object(
+                self.dev, "_private_kache_socket_dir", return_value=root
+            ), mock.patch.object(self.dev.os, "write", side_effect=partial_write):
+                self.assertIsNone(
+                    self.dev._record_kache_daemon_receipt(socket, "a" * 64, 1234)
+                )
+                receipt = self.dev.json.loads(
+                    self.dev._kache_daemon_receipt_path(socket).read_text()
+                )
+
+        self.assertGreater(writes, 1)
+        self.assertEqual("a" * 64, receipt["identity"])
+        self.assertEqual(1234, receipt["serving_pid"])
+
+    def test_daemon_receipt_zero_write_fails_without_publication(self):
+        with self.dev.tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            socket = root / "operator.sock"
+            socket.write_text("")
+            real_write = self.dev.os.write
+            writes = 0
+
+            def zero_write(descriptor, data):
+                nonlocal writes
+                writes += 1
+                if writes == 1:
+                    return real_write(descriptor, data[:7])
+                return 0
+
+            with mock.patch.object(
+                self.dev, "_private_kache_socket_dir", return_value=root
+            ), mock.patch.object(self.dev.os, "write", side_effect=zero_write):
+                error = self.dev._record_kache_daemon_receipt(
+                    socket, "a" * 64, 1234
+                )
+                receipt = self.dev._kache_daemon_receipt_path(socket)
+
+            self.assertIn("short write", error or "")
+            self.assertFalse(receipt.exists())
+            self.assertFalse(receipt.with_suffix(f".tmp.{os.getpid()}").exists())
 
     def test_daemon_receipt_rejects_missing_socket_receipt_or_wrong_process(self):
         socket = Path(self.store_root.name) / "operator.sock"
@@ -836,6 +914,82 @@ class CompilerCacheTests(unittest.TestCase):
         child.terminate.assert_called_once_with()
         child.wait.assert_called_once_with(timeout=1.0)
         child.stderr.close.assert_called_once_with()
+
+    def test_sigterm_during_spawn_is_deferred_until_child_can_be_settled(self):
+        child = mock.Mock(pid=2468)
+        previous_sigterm = self.dev.signal.getsignal(self.dev.signal.SIGTERM)
+
+        def popen(*_args, **_kwargs):
+            handler = self.dev.signal.getsignal(self.dev.signal.SIGTERM)
+            self.assertTrue(callable(handler))
+            handler(self.dev.signal.SIGTERM, None)
+            return child
+
+        with mock.patch.object(
+            self.dev, "_kache_daemon_is_running", return_value=(False, None)
+        ), mock.patch.object(
+            self.dev.subprocess, "Popen", side_effect=popen
+        ), mock.patch.object(
+            self.dev, "_remove_kache_daemon_receipt", return_value=None
+        ) as remove, mock.patch.object(
+            self.dev, "_settle_spawned_kache_child", return_value=None
+        ) as settle:
+            with self.assertRaises(SystemExit) as raised:
+                self.dev._start_kache_daemon_locked(
+                    "/bin/kache",
+                    cargo_cwd=Path("/repo"),
+                    socket=Path("/tmp/kache.sock"),
+                    identity="identity",
+                )
+
+        self.assertEqual(128 + self.dev.signal.SIGTERM, raised.exception.code)
+        remove.assert_called_once_with(Path("/tmp/kache.sock"))
+        settle.assert_called_once_with(child)
+        self.assertIs(
+            previous_sigterm, self.dev.signal.getsignal(self.dev.signal.SIGTERM)
+        )
+
+    def test_sigterm_after_spawn_settles_child_and_restores_handler(self):
+        child = mock.Mock(pid=2468)
+        previous_sigterm = self.dev.signal.getsignal(self.dev.signal.SIGTERM)
+
+        def finish(*_args, **_kwargs):
+            handler = self.dev.signal.getsignal(self.dev.signal.SIGTERM)
+            self.assertTrue(callable(handler))
+            handler(self.dev.signal.SIGTERM, None)
+            self.fail("SIGTERM handler must interrupt startup")
+
+        def settle(_child):
+            handler = self.dev.signal.getsignal(self.dev.signal.SIGTERM)
+            self.assertTrue(callable(handler))
+            handler(self.dev.signal.SIGTERM, None)
+            return None
+
+        with mock.patch.object(
+            self.dev, "_kache_daemon_is_running", return_value=(False, None)
+        ), mock.patch.object(
+            self.dev.subprocess, "Popen", return_value=child
+        ), mock.patch.object(
+            self.dev, "_finish_spawned_kache_start", side_effect=finish
+        ), mock.patch.object(
+            self.dev, "_remove_kache_daemon_receipt", return_value=None
+        ) as remove, mock.patch.object(
+            self.dev, "_settle_spawned_kache_child", side_effect=settle
+        ) as settle_mock:
+            with self.assertRaises(SystemExit) as raised:
+                self.dev._start_kache_daemon_locked(
+                    "/bin/kache",
+                    cargo_cwd=Path("/repo"),
+                    socket=Path("/tmp/kache.sock"),
+                    identity="identity",
+                )
+
+        self.assertEqual(128 + self.dev.signal.SIGTERM, raised.exception.code)
+        remove.assert_called_once_with(Path("/tmp/kache.sock"))
+        settle_mock.assert_called_once_with(child)
+        self.assertIs(
+            previous_sigterm, self.dev.signal.getsignal(self.dev.signal.SIGTERM)
+        )
 
     def test_interrupt_surfaces_child_settlement_failure(self):
         for interruption_at in ("diagnostic", "readiness"):
