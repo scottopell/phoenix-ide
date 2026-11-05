@@ -4,6 +4,7 @@
 
 use super::traits::*;
 use crate::db::{Message, MessageContent, MessageType, UsageData};
+use crate::state_machine::state::SubAgentOutcome;
 use crate::state_machine::ConvState;
 use crate::tools::browser::BrowserSessionManager;
 use crate::tools::{ToolContext, ToolOutput};
@@ -27,6 +28,7 @@ use std::sync::{Arc, Mutex};
 #[allow(dead_code)]
 pub struct MockLlmClient {
     responses: Mutex<VecDeque<Result<LlmResponse, LlmError>>>,
+    freeze_failure: Mutex<Option<LlmError>>,
     model_id: String,
     /// Record of all requests made
     pub requests: Mutex<Vec<LlmRequest>>,
@@ -39,6 +41,7 @@ impl MockLlmClient {
         let (request_count_tx, _) = tokio::sync::watch::channel(0);
         Self {
             responses: Mutex::new(VecDeque::new()),
+            freeze_failure: Mutex::new(None),
             model_id: model_id.into(),
             requests: Mutex::new(Vec::new()),
             request_count_tx,
@@ -55,6 +58,10 @@ impl MockLlmClient {
         self.responses.lock().unwrap().push_back(Err(error));
     }
 
+    pub fn fail_freeze_once(&self, error: LlmError) {
+        *self.freeze_failure.lock().unwrap() = Some(error);
+    }
+
     /// Get recorded requests
     pub fn recorded_requests(&self) -> Vec<LlmRequest> {
         self.requests.lock().unwrap().clone()
@@ -68,6 +75,10 @@ impl MockLlmClient {
 #[async_trait]
 impl LlmClient for MockLlmClient {
     fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
+        let failure = self.freeze_failure.lock().unwrap().take();
+        if let Some(error) = failure {
+            return Err(error);
+        }
         Ok(self)
     }
 
@@ -615,6 +626,14 @@ type StoredSvgArtifacts = HashMap<
     (crate::tools::present_svg::SvgArtifactReference, Vec<u8>),
 >;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ToolRoundPersistenceFault {
+    Write,
+    Replay,
+    Commit,
+    CommitAcknowledgement,
+}
+
 /// In-memory storage for testing
 #[allow(dead_code)]
 pub struct InMemoryStorage {
@@ -678,6 +697,7 @@ pub struct InMemoryStorage {
     settle_active_direct_turn_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     settle_active_direct_turn_commit_error_once: Mutex<bool>,
     settle_active_direct_turn_failures: Mutex<usize>,
+    terminal_obligation_calls: Mutex<Vec<phoenix_db::workflow::DirectTurnTerminalObligationInput>>,
     terminal_obligation_establishment_failures: Mutex<usize>,
     terminal_obligation_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     terminal_obligation_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -688,12 +708,17 @@ pub struct InMemoryStorage {
         Mutex<Vec<crate::runtime::traits::ContinuationDirectTurnSettlement>>,
     fail_continuation_commit: Mutex<bool>,
     fail_state_update: Mutex<bool>,
+    fail_gated_state_update_once: AtomicBool,
     state_update_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     state_update_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     fail_tool_round_persist: Mutex<bool>,
+    tool_round_persistence_fault: Mutex<Option<ToolRoundPersistenceFault>>,
+    fail_steering_load: AtomicBool,
     tool_round_persist_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     tool_round_persist_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     fail_sub_agent_acceptance_once: Mutex<bool>,
+    fail_sub_agent_backstop: AtomicBool,
+    unclassified_sub_agent_summary: AtomicBool,
     fail_message_add: Mutex<bool>,
     message_add_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     message_add_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -785,6 +810,7 @@ impl InMemoryStorage {
             settle_active_direct_turn_release: Mutex::new(None),
             settle_active_direct_turn_commit_error_once: Mutex::new(false),
             settle_active_direct_turn_failures: Mutex::new(0),
+            terminal_obligation_calls: Mutex::new(Vec::new()),
             terminal_obligation_establishment_failures: Mutex::new(0),
             terminal_obligation_started: Mutex::new(None),
             terminal_obligation_release: Mutex::new(None),
@@ -794,12 +820,17 @@ impl InMemoryStorage {
             settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
+            fail_gated_state_update_once: AtomicBool::new(false),
             state_update_started: Mutex::new(None),
             state_update_release: Mutex::new(None),
             fail_tool_round_persist: Mutex::new(false),
+            tool_round_persistence_fault: Mutex::new(None),
+            fail_steering_load: AtomicBool::new(false),
             tool_round_persist_started: Mutex::new(None),
             tool_round_persist_release: Mutex::new(None),
             fail_sub_agent_acceptance_once: Mutex::new(false),
+            fail_sub_agent_backstop: AtomicBool::new(false),
+            unclassified_sub_agent_summary: AtomicBool::new(false),
             fail_message_add: Mutex::new(false),
             message_add_started: Mutex::new(None),
             message_add_release: Mutex::new(None),
@@ -861,8 +892,30 @@ impl InMemoryStorage {
         *self.fail_state_update.lock().unwrap() = fail;
     }
 
+    pub fn set_unclassified_sub_agent_summary(&self, unclassified: bool) {
+        self.unclassified_sub_agent_summary
+            .store(unclassified, Ordering::Relaxed);
+    }
+
+    pub fn set_fail_sub_agent_backstop(&self, fail: bool) {
+        self.fail_sub_agent_backstop.store(fail, Ordering::Relaxed);
+    }
+
+    pub fn fail_gated_state_update_once(&self) {
+        self.fail_gated_state_update_once
+            .store(true, Ordering::Relaxed);
+    }
+
     pub fn set_fail_tool_round_persist(&self, fail: bool) {
         *self.fail_tool_round_persist.lock().unwrap() = fail;
+    }
+
+    pub fn set_tool_round_persistence_fault(&self, fault: ToolRoundPersistenceFault) {
+        *self.tool_round_persistence_fault.lock().unwrap() = Some(fault);
+    }
+
+    pub fn set_fail_steering_load(&self, fail: bool) {
+        self.fail_steering_load.store(fail, Ordering::SeqCst);
     }
 
     pub fn fail_sub_agent_acceptance_once(&self) {
@@ -1016,6 +1069,12 @@ impl InMemoryStorage {
         *self.terminal_obligation_started.lock().unwrap() = Some(started_tx);
         *self.terminal_obligation_release.lock().unwrap() = Some(release_rx);
         (started_rx, release_tx)
+    }
+
+    pub fn recorded_terminal_obligations(
+        &self,
+    ) -> Vec<phoenix_db::workflow::DirectTurnTerminalObligationInput> {
+        self.terminal_obligation_calls.lock().unwrap().clone()
     }
 
     pub fn set_terminal_obligation_establishment_failures(&self, failures: usize) {
@@ -1283,6 +1342,44 @@ impl InMemoryStorage {
     }
 }
 
+impl InMemoryStorage {
+    async fn persist_tool_round(
+        &self,
+        conv_id: &str,
+        assistant: &Message,
+        tool_results: &[FinalizedToolResult],
+    ) -> Result<(), String> {
+        if *self.fail_tool_round_persist.lock().unwrap() {
+            return Err("injected tool round persist failure".to_string());
+        }
+        if let Some(started) = self.tool_round_persist_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.tool_round_persist_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+        let mut messages = self.messages.lock().unwrap();
+        let fault = *self.tool_round_persistence_fault.lock().unwrap();
+        let mut bucket = messages.get(conv_id).cloned().unwrap_or_default();
+        bucket.push(assistant.clone());
+        if fault == Some(ToolRoundPersistenceFault::Write) {
+            return Err("injected tool round row write failure".to_string());
+        }
+        for result in tool_results {
+            bucket.push(result.row().clone());
+        }
+        if fault == Some(ToolRoundPersistenceFault::Commit) {
+            return Err("injected tool round commit failure".to_string());
+        }
+        messages.insert(conv_id.to_string(), bucket);
+        if fault == Some(ToolRoundPersistenceFault::CommitAcknowledgement) {
+            return Err("injected lost tool round commit acknowledgement".to_string());
+        }
+        Ok(())
+    }
+}
+
 impl Default for InMemoryStorage {
     fn default() -> Self {
         Self::new()
@@ -1291,6 +1388,68 @@ impl Default for InMemoryStorage {
 
 #[async_trait]
 impl MessageStore for InMemoryStorage {
+    async fn terminalize_sub_agent_cancellation_backstop(
+        &self,
+        _child_conversation_id: &str,
+        cause: phoenix_db::SubAgentTerminalCause,
+        _terminal_at: chrono::DateTime<chrono::Utc>,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<SubAgentOutcome, String>> {
+        use phoenix_db::workflow::LocalAuthorityResult;
+        if self.fail_sub_agent_backstop.load(Ordering::Relaxed) {
+            LocalAuthorityResult::DurableFactUnclassified
+        } else {
+            let outcome = if cause == phoenix_db::SubAgentTerminalCause::TimedOut {
+                SubAgentOutcome::TimedOut
+            } else {
+                SubAgentOutcome::Failure {
+                    error: "Sub-agent did not report within the cancellation deadline".into(),
+                    error_kind: crate::db::ErrorKind::Cancelled,
+                }
+            };
+            LocalAuthorityResult::DurableFactEstablished(Ok(outcome))
+        }
+    }
+
+    async fn persist_sub_agent_summary_and_accept(
+        &self,
+        message: &Message,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        child_id: &str,
+        accepted_at: chrono::DateTime<chrono::Utc>,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<(), String>> {
+        use phoenix_db::workflow::LocalAuthorityResult;
+        if self.unclassified_sub_agent_summary.load(Ordering::Relaxed) {
+            return LocalAuthorityResult::DurableFactUnclassified;
+        }
+        if *self.fail_message_add.lock().unwrap() {
+            return LocalAuthorityResult::DurableFactEstablished(Err(
+                "injected summary write failure".into(),
+            ));
+        }
+        match self
+            .update_state_and_accept_sub_agent(
+                &message.conversation_id,
+                state,
+                state_updated_at,
+                child_id,
+                accepted_at,
+            )
+            .await
+        {
+            Ok(()) => {
+                self.messages
+                    .lock()
+                    .unwrap()
+                    .entry(message.conversation_id.clone())
+                    .or_default()
+                    .push(message.clone());
+                LocalAuthorityResult::DurableFactEstablished(Ok(()))
+            }
+            Err(error) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+        }
+    }
+
     async fn coordinator_authority(
         &self,
     ) -> Result<phoenix_core::domain::coordinator_authority::CoordinatorAuthority, String> {
@@ -1811,8 +1970,8 @@ impl MessageStore for InMemoryStorage {
 
     async fn persist_active_direct_turn_terminal_obligation(
         &self,
-        _settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
-        _response_message_id: Option<&str>,
+        settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
+        response_message_id: Option<&str>,
     ) -> crate::runtime::traits::TerminalMutationEstablishment {
         if let Some(started) = self.terminal_obligation_started.lock().unwrap().take() {
             let _ = started.send(());
@@ -1821,6 +1980,13 @@ impl MessageStore for InMemoryStorage {
         if let Some(release) = release {
             let _ = release.await;
         }
+        self.terminal_obligation_calls
+            .lock()
+            .unwrap()
+            .push(super::traits::terminal_obligation(
+                settlement,
+                response_message_id.map(str::to_owned),
+            ));
         crate::runtime::traits::TerminalMutationEstablishment::Established {
             transcript_generation: None,
         }
@@ -2018,31 +2184,6 @@ impl MessageStore for InMemoryStorage {
         Ok(())
     }
 
-    async fn persist_tool_round(
-        &self,
-        conv_id: &str,
-        assistant: &Message,
-        tool_results: &[FinalizedToolResult],
-    ) -> Result<(), String> {
-        if *self.fail_tool_round_persist.lock().unwrap() {
-            return Err("injected tool round persist failure".to_string());
-        }
-        if let Some(started) = self.tool_round_persist_started.lock().unwrap().take() {
-            let _ = started.send(());
-        }
-        let release = self.tool_round_persist_release.lock().unwrap().take();
-        if let Some(release) = release {
-            let _ = release.await;
-        }
-        let mut messages = self.messages.lock().unwrap();
-        let bucket = messages.entry(conv_id.to_string()).or_default();
-        bucket.push(assistant.clone());
-        for result in tool_results {
-            bucket.push(result.row().clone());
-        }
-        Ok(())
-    }
-
     async fn persist_tool_round_and_state(
         &self,
         conv_id: &str,
@@ -2051,9 +2192,20 @@ impl MessageStore for InMemoryStorage {
         state: &ConvState,
         state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), String> {
-        self.persist_tool_round(conv_id, assistant, tool_results)
-            .await?;
-        self.update_state(conv_id, state, state_updated_at).await
+        if *self.fail_state_update.lock().unwrap() {
+            return Err("injected state update failure".to_string());
+        }
+        let persisted = self
+            .persist_tool_round(conv_id, assistant, tool_results)
+            .await;
+        if persisted.is_err()
+            && *self.tool_round_persistence_fault.lock().unwrap()
+                != Some(ToolRoundPersistenceFault::CommitAcknowledgement)
+        {
+            return persisted;
+        }
+        self.update_state(conv_id, state, state_updated_at).await?;
+        persisted
     }
 
     async fn persist_tool_round_with_terminal_obligation(
@@ -2151,6 +2303,12 @@ impl StateStore for InMemoryStorage {
         let release = self.state_update_release.lock().unwrap().take();
         if let Some(release) = release {
             let _ = release.await;
+            if self
+                .fail_gated_state_update_once
+                .swap(false, Ordering::Relaxed)
+            {
+                return Err("injected gated state update failure".to_string());
+            }
         }
         self.state_updated_ats
             .lock()
@@ -2537,6 +2695,11 @@ impl StateStore for InMemoryStorage {
         state_updated_at: chrono::DateTime<chrono::Utc>,
         _update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> Result<(), String> {
+        if *self.tool_round_persistence_fault.lock().unwrap()
+            == Some(ToolRoundPersistenceFault::Replay)
+        {
+            return Err("injected tool round provider replay failure".to_string());
+        }
         self.persist_tool_round_and_state(
             conversation_id,
             assistant,
@@ -2622,6 +2785,9 @@ impl StateStore for InMemoryStorage {
         &self,
         conv_id: &str,
     ) -> Result<Vec<crate::state_machine::event::SteerEntry>, String> {
+        if self.fail_steering_load.load(Ordering::SeqCst) {
+            return Err("injected steering authority read failure".to_string());
+        }
         Ok(self
             .steering_queues
             .lock()

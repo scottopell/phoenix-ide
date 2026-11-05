@@ -95,29 +95,28 @@ correction; task 14004 covers related global child-materialization races.
 REQ-BED-005a is partial: forced tool cancellation publishes its notice only on
 immediate Idle. If pending children instead drain cooperatively, the final result
 does not remember or publish the owed forced-tool notice. Task 75009 tracks that
-correction and exactly-once ordering qualification. These are source-confirmed
-gaps on the clean merged base as well as this spec branch: executor source blob
-`859dbd8dd4e690621c9a79decfd976404acdca7b` is identical. No timing or runtime
-regression test is claimed for these findings, and no implementation fix is
-included. Requirements are preserved; the normative spec does not authorize
-blocking cancellation or suppressing an owed notice.
+correction and exactly-once ordering qualification. Those forced-notice and
+cancellation-responsiveness gaps remain unqualified; the scoped authority and
+backstop-receipt repairs below do not complete them. Requirements are preserved;
+the normative spec does not authorize blocking cancellation or suppressing an
+owed notice.
 
-The successful child-deadline path already snapshots pending identities,
-terminalizes each child, and feeds its typed result through `process_event` and
-the normal atomic parent-acceptance transaction. It does not directly set Idle.
-The former Allium shortcut omitted those real steps; its corrected target now
-requires the complete accepted drain before the completed notice. Error handling
-is still incomplete: terminalization errors are logged and skipped after the
-deadline is cleared, without rearming it or forwarding unknown cleanup-write
-authority to the fatal fence. The user-cancel notice can then be emitted after a
-partial drain. Task 75009 includes this classification/notice qualification; no
-production direct-to-Idle bypass is asserted and no runtime fix is delivered.
+The child-deadline path snapshots pending identities, establishes required child
+terminal evidence, and feeds each result through normal atomic parent acceptance.
+A required-boundary failure selects the existing fatal fence instead of skipping
+the failed child or reporting a partial drain as complete. The native command
+collects established acceptance receipts for those exact children; its completed
+notice therefore survives inline steering into a new turn. Timeout, retry,
+failed-settlement, and duplicate forced-notice paths do not report completion.
+This qualifies the scoped authority and notice paths, while the remaining
+payload/conflict, interruption, and cancellation-handoff obligations in tasks
+75009 and 75011 remain open; no complete backstop redesign is claimed.
 
 An already-terminal child is another backstop qualification gap. The DB helper
 locks and refuses conflicting terminal evidence rather than overwriting it, but
-does not return that existing authentic payload for delivery; the executor logs
-the conflict and skips that child. The target atomically reuses established raw
-terminal payload/cause, or establishes cancellation only when nonterminal. Existing
+does not return that existing authentic payload for delivery; the executor cannot
+deliver the existing authentic result from that conflict. The target atomically
+reuses established raw terminal payload/cause, or establishes cancellation only when nonterminal. Existing
 parent Timeout-to-TimedOut presentation policy is separate and remains intact.
 Task 75009 includes this race alongside classification/drain/notice qualification;
 no source overwrite or new runtime regression is claimed.
@@ -136,7 +135,17 @@ Existing `provider_tool_policy_tests`, `tool_generation_guard_tests`,
 `sender_drop_forwarder_tests`, and slot lifecycle tests exercise these seams.
 Specification consistency is checked separately from runtime test execution.
 
-Implements Elm Architecture with a typed-effect executor boundary. The SM has two pure entry points: `handle_user_event()` for API-initiated events and `handle_outcome()` for executor results. Effects carry oneshot channels typed to their expected outcome (`LlmOutcome`, `ToolOutcome`, `SubAgentOutcome`, `PersistOutcome`) — the compiler prevents invalid event/state combinations. Persistence uses `CheckpointData::ToolRound` which structurally requires matched `tool_use`/`tool_result` pairs. Error classification is exhaustive with no `Unknown` variant. Executor loop uses `StepResult::Terminal` to force explicit exit on terminal states. Token streaming uses fire-and-forget `StreamToken` effects routed to SSE without SM state transitions. Sub-agents have mandatory timeouts. The normative fan-in target removes each exact accepted child from pending, makes duplicate terminal acceptance idempotent, and prevents ordinary parent settlement while admitted children remain pending. On server restart, ordinary interrupted conversations resume from idle with full message history preserved. Interrupted `present_svg` invocations recover an already committed compact artifact reference by exact assistant/tool identity; invocations without a committed snapshot retain the interrupted error. A committed steering turn whose accepted user or skill message is still awaiting its first response preserves `LlmRequesting` from immutable receipt/transcript evidence; a synchronous recovery dispatch failure settles as a persisted typed error, and a failed error write retires the runtime for reconstruction. Durable continuation operations retain their operation identity and recovery state.
+Implements Elm Architecture with a typed-effect executor boundary. The SM has two pure entry points: `handle_user_event()` for API-initiated events and `handle_outcome()` for executor results. Effects carry oneshot channels typed to their expected outcome (`LlmOutcome`, `ToolOutcome`, `SubAgentOutcome`, `PersistOutcome`) — the compiler prevents invalid event/state combinations. Persistence uses `CheckpointData::ToolRound` which structurally requires matched `tool_use`/`tool_result` pairs. Error classification is exhaustive with no `Unknown` variant. Executor loop uses `StepResult::Terminal` to force explicit exit on terminal states. Token streaming uses fire-and-forget `StreamToken` effects routed to SSE without SM state transitions. Sub-agents have mandatory timeouts. The normative fan-in target removes each exact accepted child from pending, makes duplicate terminal acceptance idempotent, and prevents ordinary parent settlement while admitted children remain pending. On server restart, ordinary interrupted conversations resume from idle with full message history preserved. Interrupted `present_svg` invocations recover an already committed compact artifact reference by exact assistant/tool identity; invocations without a committed snapshot retain the interrupted error. A committed steering turn whose accepted user or skill message is still awaiting its first response preserves `LlmRequesting` from immutable receipt/transcript evidence; a synchronous recovery dispatch failure settles as a persisted typed error, and an unclassified required error settlement closes process authority under REQ-BED-033. Durable continuation operations retain their operation identity and recovery state.
+
+### Required runtime settlement authority
+
+Ordinary typed tool outcomes and generated tool-completion events own a command boundary through required steering preparation, checkpoint, replay, and state effects. The closed settlement result selects established continuation or the existing process fail-stop contract; an unavailable compound exact classifier does not authorize a retry. Watcher and SSE state publication waits for the required writes, including an inline steering drain, and the held command authority closes the fence if its owner disappears. Checkpoints commit the round and next state atomically; redundant state writes are skipped while owed child activation, acceptance, and terminal settlements remain enforced. Startup recovery holds the same affine authority discipline through required reads and settlements, while established provider/configuration failures retain their feature error paths. Focused executor and adjacent grace, trust/replay, creation, terminal, and lifecycle regressions pass locally with the exact-source native Bash launcher. Coverage includes checkpoint begin/write/commit errors, a lost commit acknowledgement, required state/replay/steering failures, command cancellation, an isolated file-backed SQLite FULL/reopen path, and a process cut immediately after checkpoint commit. Full repository and hosted qualification remain separate.
+
+The completion owner also drains synchronous local dispatch follow-ups before reporting established settlement. Freeze rejection, cycle-cap cancellation, grace hard stop, and unavailable-tool chains return typed local events rather than relying on self-queue delivery without a producer. The established tool-settlement variant carries no pending events. Follow-up state remains private until its write commits; cancellation of an owned follow-up closes the shared fence. Existing terminal ownership transfers only where the current transition freshly registers its terminal retry/reconstruction, and child acceptance transfers only after the exact current `SubAgentResult` is retained and its existing retry is registered. Stale retry flags do not classify a failed write. A required steering-commit failure closes its owning command boundary in both inline and ordinary effect loops before an already-accepted child can be incorrectly assigned its retry. Preparation-read failures before acceptance restore the original pending state, entry time, and absolute deadline so the exact child retry remains consumable without renewing its liveness window. When final cancellation owes both child acceptance and the active parent turn’s terminal settlement, the state effect completes both through their existing receipt/terminal-obligation APIs. A known terminal failure retains its exact terminal retry; an accepted raw child cannot stand in for it. Post-terminal steering work retains admitted authority through preparation, typed local follow-ups, and watcher adoption, including when invoked by that retry. Standalone child-result failures use the existing other-local-authority observation category; child owner loss retains a child-specific owner-disappearance label. Focused coverage includes the actual checkpoint-success/dispatch-failure/error-write-failure caller disposition, positive persisted errors, queue loss, cancellation, unavailable chains, end-first acceptance order, and direct-turn/grace known-failure retries.
+
+The completion boundary includes synthetic `ToolAborted` and racing `ToolComplete` events in `CancellingTool`, and pending-child results consumed by normal fan-in. Required child-backstop terminal evidence remains owned through parent acceptance. Its native result preserves an already committed authentic outcome, distinguishes a definite rejection that settles as nonretryable `SubAgentError`, and closes authority when classification is unavailable. An explicitly registered acceptance or terminal retry retains its feature contract. Backstop completion notices consume the exact native command’s established acceptance receipts, so inline steering may advance into a new turn without suppressing the old chain’s notice; retry, failed, timeout, and duplicate forced-notice paths do not publish it. The `Arc<MessageStore>` adapter delegates the terminal-evidence and acceptance queries to its underlying store. Standalone nonterminal summaries commit their exact message, parent projection, and child acceptance in one native transaction; a single exact classifier handles lost commit acknowledgement. The transition consumes an explicit parent-commit receipt, while terminal summary/obligation establishment remains a separate receipt with acceptance and direct-turn settlement still owed. Durable terminal retry ownership carries the original projection timestamp across actor rollback. Causal coverage includes real SQLite acceptance/settlement aborts, authentic terminal races, lost acknowledgement, unavailable classification, inline steering, and preserved summary identities after reopen.
+
+Startup, completion, and child-backstop commands retain a mutable reborrow of their admitted authority through nested awaited settlement. Ordinary process shutdown closes fresh admission while allowing those commands to finish; runtime exit distinguishes that closure from the existing fatal watch latch. A required persistence failure during shutdown still promotes the shared fence to fatal. Focused regressions exercise actual backstop and run-loop disposition, command cancellation, normal shutdown during startup and tool checkpoint writes, concurrent required failures, and post-acceptance dispatch/error-write failures.
 
 ### Terminal startup acknowledgement
 
@@ -183,7 +192,7 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-031A:** Start Follow-up Creates Fresh Open Conversation | Not implemented | Normative target requires a fresh ProductConversation/WorkScope, exact follow-up objective, no transcript injection, and typed `follow_up` provenance |
 | **REQ-BED-031B:** Permanent Delete Removes Only the Conversation Aggregate and Is Idempotent | Not implemented | Shipped hard delete removes a legacy row-oriented shape; complete ProductConversation aggregate deletion, normalized-child coverage, and typed surviving provenance tombstones remain migration targets |
 | **REQ-BED-032:** Conversation Terminal-Transition Cascade | ✅ Complete (legacy current reality) | Existing hard-delete cascade invokes bash/tmux/project-named/browser cleanup and broadcasts `ConversationHardDeleted`; aggregate-aware Delete remains governed by REQ-BED-031B and WorkScope/GitRepository authority remains a migration target |
-| **REQ-BED-033:** Unclassified Local Persistence Authority Fails Stop | Partially implemented | The runtime admission fence and fatal exit handle unclassified local authority loss, including continuation provenance reads. Regression coverage verifies fence closure before releasing the admitted owner and suppresses semantic persistence/publication after failure; broader SQLite-boundary coverage remains incomplete. ADR-036 defines the governing policy. |
+| **REQ-BED-033:** Unclassified Local Persistence Authority Fails Stop | Partially implemented | The runtime admission fence and fatal exit cover ordinary tool settlement, required executor startup recovery, and continuation provenance reads. Regression coverage verifies fence closure before releasing the admitted owner, no proposed state publication on failed settlement, and preservation of committed checkpoint state across reopen. Broader SQLite-boundary coverage remains incomplete. ADR-036 defines the governing policy. |
 
 ## Opening settlement repair
 

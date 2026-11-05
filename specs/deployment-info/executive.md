@@ -70,11 +70,23 @@ staying safe to open because ordinary inspection changes nothing.
 | **REQ-DEPLOY-004C:** Preserve last-good semantics across refresh failures | Implemented | On fetch failure, `fetchResources` leaves `sample` and `history` intact, marks `stale: true` when a prior sample exists, and surfaces the error as `Live data stale — …`. When no sample exists yet, the page shows the error without fabricating data. |
 | **REQ-DEPLOY-004D:** Keep deployment facts and live resource monitoring separate | Implemented | `GET /api/deployment` carries build, network, log, and locality facts without a parallel resource snapshot; `GET /api/about/resources` is the deployment-wide CPU, memory, load, and managed-process telemetry contract (WorkScope summaries use `../work-scope-load/`); and `GET /api/deployment/disk` owns explicit disk sizing. Deployment-facts and disk refreshes re-sample only their owning endpoints, while visible-page resource observations refresh independently on their demand-driven cadence. |
 | **REQ-DEPLOY-005:** Report on-disk locations and their sizes | Implemented | `GET /api/deployment/disk` returns `DeploymentDiskInfo` with typed `DiskSize` variants, aggregate managed-worktree sizing, and per-worktree rows with typed disposition. The UI keeps disk loading/error state separate from the live resource monitor. |
+| **REQ-DEPLOY-005A:** Observe available filesystem space independently | Implemented | Authenticated `GET /api/deployment/observations` samples available-to-process bytes through statvfs over static DB/data/tmp/log locations, deduplicates filesystem device identities, preserves sampled ancestors and explicit per-location errors, and performs no DB reads or recursive sizing. `OperationalObservations` provides independent manual refresh, sample age, a 1 GiB warning threshold, and last-good/stale behavior. |
 | **REQ-DEPLOY-006:** Surface logging destinations, never their contents | Implemented | `LogInfo` reports stdout, process-rotated structured-file, and bounded fatal-diagnostic destinations from one immutable process configuration, and the page renders their facts only. Development, bare, and launchd launchers retain bounded output separately for failures that happen outside the running logger. |
+| **REQ-DEPLOY-006A:** Observe persistence-boundary and diagnostic-sink failures | Implemented with exporter capability limit | Fixed process-local atomic count/time observations cover the existing fatal authority boundary, underlying structured-file/stdout Write and flush errors, fatal diagnostic failures, and OTLP export results. Nonblocking queue drops remain separate. The fence supplies its existing exact static boundary without a second authority representation. Datadog's SDK exposes no exporter injection/callback, so its failure-observation capability is explicitly unavailable; its existing pipeline is preserved. Counters reset on process replacement and do not prove health or own runtime correctness. |
 | **REQ-DEPLOY-007:** Freshness of sampled values | Implemented | `DeploymentInfo`, `DeploymentDiskInfo`, and `AboutResourcesSnapshot` all carry `sampled_at`; the UI distinguishes deployment-facts refresh, disk refresh, and continuous resource sampling rather than serving one cached omnibus snapshot. |
 | **REQ-DEPLOY-008:** Safely clean up leftover managed worktrees | Implemented | `POST /api/deployment/disk/managed-worktrees/cleanup` revalidates DB ownership, Phoenix path shape, live-conversation ownership, and mode semantics before removal; the UI offers cleanup only for typed leftover rows whose disposition allows it. |
 
 ## Behavioural Specification
+
+Observation verification: injected Write/flush and exporter failures exercise the
+process-local counters without a subscriber or persistence; a repeated-fence-close
+regression verifies one fatal observation per fence. Filesystem tests cover
+deduplication, zero/threshold values, explicit errors, existing-ancestor fallback,
+and a successful location after another location on the same filesystem fails.
+The authenticated route remains usable with the SQLite pool closed and leaves
+runtime admission unchanged. `OperationalObservations.test.tsx` and
+`AboutDeploymentPage.test.tsx` cover rendering, warning/error/stale/refresh states,
+exporter capability distinctions, and availability when facts and inventory fail.
 
 No Allium spec accompanies this feature. The page composes read-only endpoint
 fetches plus a narrowly scoped cleanup action, but it does not introduce a new

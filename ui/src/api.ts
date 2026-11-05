@@ -9,6 +9,7 @@ import type { ErrorPresentation } from './errorPresentation';
 import type { ErrorKind } from './generated/ErrorKind';
 import type { DeploymentInfo } from './generated/DeploymentInfo';
 import type { DeploymentDiskInfo } from './generated/DeploymentDiskInfo';
+import type { DeploymentObservations } from './generated/DeploymentObservations';
 import { ContinuationOpeningSchema } from './conversation/opening';
 import type { AboutResourcesSnapshot } from './generated/AboutResourcesSnapshot';
 import type { SqliteWorkloadReportResponse } from './generated/SqliteWorkloadReportResponse';
@@ -1457,6 +1458,12 @@ export const api = {
   async deploymentDiskInfo(): Promise<DeploymentDiskInfo> {
     const resp = await fetch('/api/deployment/disk');
     if (!resp.ok) throw new Error('Failed to load deployment disk info');
+    return resp.json();
+  },
+
+  async deploymentObservations(): Promise<DeploymentObservations> {
+    const resp = await fetch('/api/deployment/observations');
+    if (!resp.ok) throw new Error('Failed to load operational observations');
     return resp.json();
   },
 

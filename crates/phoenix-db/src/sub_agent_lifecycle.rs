@@ -1,5 +1,40 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+enum ExistingChildTerminal {
+    RequireExactProjection,
+    ReturnAuthenticOutcome,
+}
+
+struct ChildTerminalProjection {
+    state: ConvState,
+    cause: SubAgentTerminalCause,
+}
+
+pub(crate) fn terminal_sub_agent_outcome(
+    state: ConvState,
+    cause: Option<SubAgentTerminalCause>,
+) -> Option<phoenix_core::domain::sm_state::SubAgentOutcome> {
+    use phoenix_core::domain::sm_state::SubAgentOutcome;
+    if let ConvState::Completed { result } = state {
+        Some(
+            if cause == Some(SubAgentTerminalCause::ImplicitCompletion) {
+                SubAgentOutcome::ImplicitCompletion { result }
+            } else {
+                SubAgentOutcome::Success { result }
+            },
+        )
+    } else if let ConvState::Failed { error, error_kind } = state {
+        Some(if cause == Some(SubAgentTerminalCause::TimedOut) {
+            SubAgentOutcome::TimedOut
+        } else {
+            SubAgentOutcome::Failure { error, error_kind }
+        })
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubAgentExecutionAuthority {
     ReadOnly,
@@ -51,7 +86,7 @@ impl SubAgentTerminalCause {
         }
     }
 
-    fn from_db_str(value: &str) -> DbResult<Self> {
+    pub(super) fn from_db_str(value: &str) -> DbResult<Self> {
         match value {
             "submit_result" => Ok(Self::SubmitResult),
             "submit_error" => Ok(Self::SubmitError),
@@ -1108,7 +1143,10 @@ impl Database {
         child_conversation_id: &str,
         cause: SubAgentTerminalCause,
         terminal_at: DateTime<Utc>,
-    ) -> DbResult<()> {
+    ) -> crate::workflow::LocalAuthorityResult<
+        DbResult<phoenix_core::domain::sm_state::SubAgentOutcome>,
+    > {
+        use crate::workflow::LocalAuthorityResult;
         let error_kind = match cause {
             SubAgentTerminalCause::TimedOut => ErrorKind::TimedOut,
             SubAgentTerminalCause::Cancelled => ErrorKind::Cancelled,
@@ -1118,9 +1156,11 @@ impl Database {
             | SubAgentTerminalCause::TurnLimit
             | SubAgentTerminalCause::ContextExhausted
             | SubAgentTerminalCause::RuntimeFailure => {
-                return Err(lifecycle_conflict(format!(
-                    "cancellation backstop cannot establish terminal cause {}",
-                    cause.as_db_str()
+                return LocalAuthorityResult::DurableFactEstablished(Err(lifecycle_conflict(
+                    format!(
+                        "cancellation backstop cannot establish terminal cause {}",
+                        cause.as_db_str()
+                    ),
                 )))
             }
         };
@@ -1129,21 +1169,26 @@ impl Database {
             error_kind,
         };
         match self
-            .update_child_state_and_record_sub_agent_terminal(
+            .establish_child_terminal_projection(
                 child_conversation_id,
                 &state,
                 terminal_at,
                 cause,
                 terminal_at,
+                ExistingChildTerminal::ReturnAuthenticOutcome,
+                TerminalEvidenceTransactionCut::None,
             )
             .await
         {
-            crate::workflow::LocalAuthorityResult::DurableFactEstablished(result) => result,
-            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => {
-                Err(DbError::Serialization(
-                    "child cancellation-backstop terminal commit could not be classified"
-                        .to_string(),
-                ))
+            LocalAuthorityResult::DurableFactEstablished(result) => {
+                LocalAuthorityResult::DurableFactEstablished(result.and_then(|projection| {
+                    terminal_sub_agent_outcome(projection.state, Some(projection.cause)).ok_or_else(
+                        || lifecycle_conflict("child terminal evidence has no terminal outcome"),
+                    )
+                }))
+            }
+            LocalAuthorityResult::DurableFactUnclassified => {
+                LocalAuthorityResult::DurableFactUnclassified
             }
         }
     }
@@ -1157,6 +1202,39 @@ impl Database {
         cause: SubAgentTerminalCause,
         terminal_at: DateTime<Utc>,
     ) -> crate::workflow::LocalAuthorityResult<DbResult<()>> {
+        use crate::workflow::LocalAuthorityResult;
+        match self
+            .establish_child_terminal_projection(
+                child_conversation_id,
+                state,
+                state_updated_at,
+                cause,
+                terminal_at,
+                ExistingChildTerminal::RequireExactProjection,
+                TerminalEvidenceTransactionCut::None,
+            )
+            .await
+        {
+            LocalAuthorityResult::DurableFactEstablished(result) => {
+                LocalAuthorityResult::DurableFactEstablished(result.map(|_| ()))
+            }
+            LocalAuthorityResult::DurableFactUnclassified => {
+                LocalAuthorityResult::DurableFactUnclassified
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn establish_child_terminal_projection(
+        &self,
+        child_conversation_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        cause: SubAgentTerminalCause,
+        terminal_at: DateTime<Utc>,
+        existing_terminal: ExistingChildTerminal,
+        cut: TerminalEvidenceTransactionCut,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<ChildTerminalProjection>> {
         use crate::workflow::LocalAuthorityResult;
         let state_json = match serde_json::to_string(state) {
             Ok(state) => state,
@@ -1208,8 +1286,33 @@ impl Database {
                 Ok(state) => state,
                 Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error)),
             };
+            if matches!(
+                existing_terminal,
+                ExistingChildTerminal::ReturnAuthenticOutcome
+            ) {
+                let existing_cause = match existing_cause
+                    .as_deref()
+                    .map(SubAgentTerminalCause::from_db_str)
+                    .transpose()
+                {
+                    Ok(Some(cause)) if existing_at.is_some() => cause,
+                    Ok(_) => {
+                        return LocalAuthorityResult::DurableFactEstablished(Err(
+                            lifecycle_conflict("incomplete child terminal evidence"),
+                        ))
+                    }
+                    Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                };
+                return LocalAuthorityResult::DurableFactEstablished(Ok(ChildTerminalProjection {
+                    state: existing_state,
+                    cause: existing_cause,
+                }));
+            }
             if existing_cause.as_deref() == Some(cause.as_db_str()) && existing_state == *state {
-                return LocalAuthorityResult::DurableFactEstablished(Ok(()));
+                return LocalAuthorityResult::DurableFactEstablished(Ok(ChildTerminalProjection {
+                    state: existing_state,
+                    cause,
+                }));
             }
             return LocalAuthorityResult::DurableFactEstablished(Err(lifecycle_conflict(format!(
                 "child {child_conversation_id} already has different terminal evidence"
@@ -1243,28 +1346,40 @@ impl Database {
         {
             return LocalAuthorityResult::DurableFactEstablished(Err(error.into()));
         }
-        if let Err(error) = tx.commit().await {
-            let classified = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM sub_agent_runs r
+        if let Err(error) = cut.commit(tx).await {
+            let classified = if cut.classifier_unavailable() {
+                Err(sqlx::Error::PoolClosed)
+            } else {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM sub_agent_runs r
                  JOIN conversations c ON c.id = r.child_conversation_id
                  WHERE r.child_conversation_id = ?1
                    AND r.terminal_cause = ?2
                    AND r.terminal_at_unix_micros IS NOT NULL
                    AND c.state = ?3 AND c.state_updated_at = ?4",
-            )
-            .bind(child_conversation_id)
-            .bind(cause.as_db_str())
-            .bind(&state_json)
-            .bind(state_updated_at.to_rfc3339())
-            .fetch_one(&self.pool)
-            .await;
+                )
+                .bind(child_conversation_id)
+                .bind(cause.as_db_str())
+                .bind(&state_json)
+                .bind(state_updated_at.to_rfc3339())
+                .fetch_one(&self.pool)
+                .await
+            };
             return match classified {
-                Ok(1) => LocalAuthorityResult::DurableFactEstablished(Ok(())),
-                Ok(_) => LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+                Ok(1) => {
+                    LocalAuthorityResult::DurableFactEstablished(Ok(ChildTerminalProjection {
+                        state: state.clone(),
+                        cause,
+                    }))
+                }
+                Ok(_) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
                 Err(_) => LocalAuthorityResult::DurableFactUnclassified,
             };
         }
-        LocalAuthorityResult::DurableFactEstablished(Ok(()))
+        LocalAuthorityResult::DurableFactEstablished(Ok(ChildTerminalProjection {
+            state: state.clone(),
+            cause,
+        }))
     }
 
     pub async fn update_parent_state_and_accept_sub_agent(
@@ -1329,7 +1444,7 @@ impl Database {
         }
     }
 
-    async fn prepare_parent_state_and_sub_agent_acceptance<'a>(
+    pub(super) async fn prepare_parent_state_and_sub_agent_acceptance<'a>(
         &'a self,
         parent_conversation_id: &str,
         state: &ConvState,
@@ -2044,6 +2159,140 @@ mod tests {
                 SubAgentCancellationOutcome::CancelledBeforeDispatch
             )
         ));
+    }
+
+    #[tokio::test]
+    async fn backstop_terminal_projection_classifies_commit_acknowledgement_loss() {
+        use crate::workflow::LocalAuthorityResult;
+        for cut in [
+            TerminalEvidenceTransactionCut::BeforeCommit,
+            TerminalEvidenceTransactionCut::AfterCommit,
+            TerminalEvidenceTransactionCut::AfterCommitLookupUnavailable,
+        ] {
+            let db = Database::open_in_memory().await.unwrap();
+            parent_with_children(&db, "parent", &["child"]).await;
+            db.admit_sub_agent_batch(&batch(
+                "batch",
+                "parent",
+                false,
+                &[("child", SubAgentExecutionAuthority::ReadOnly)],
+            ))
+            .await
+            .unwrap();
+            let at = Utc::now();
+            let state = ConvState::Failed {
+                error: "backstop cancelled".into(),
+                error_kind: ErrorKind::Cancelled,
+            };
+            let result = db
+                .establish_child_terminal_projection(
+                    "child",
+                    &state,
+                    at,
+                    SubAgentTerminalCause::Cancelled,
+                    at,
+                    ExistingChildTerminal::ReturnAuthenticOutcome,
+                    cut,
+                )
+                .await;
+            match cut {
+                TerminalEvidenceTransactionCut::BeforeCommit => {
+                    assert!(result.established().unwrap().is_err());
+                }
+                TerminalEvidenceTransactionCut::AfterCommit => {
+                    assert!(result.established().unwrap().is_ok());
+                }
+                TerminalEvidenceTransactionCut::AfterCommitLookupUnavailable => assert!(matches!(
+                    result,
+                    LocalAuthorityResult::DurableFactUnclassified
+                )),
+                TerminalEvidenceTransactionCut::None => unreachable!(),
+            }
+            let terminal = db.owed_sub_agent_terminals("parent").await.unwrap();
+            assert_eq!(
+                terminal.len(),
+                usize::from(cut != TerminalEvidenceTransactionCut::BeforeCommit)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_backstop_preserves_authentic_terminal_outcomes() {
+        use phoenix_core::domain::sm_state::SubAgentOutcome;
+        for (state, cause, expected) in [
+            (
+                ConvState::Completed {
+                    result: "authentic success".into(),
+                },
+                SubAgentTerminalCause::SubmitResult,
+                SubAgentOutcome::Success {
+                    result: "authentic success".into(),
+                },
+            ),
+            (
+                ConvState::Completed {
+                    result: "authentic implicit".into(),
+                },
+                SubAgentTerminalCause::ImplicitCompletion,
+                SubAgentOutcome::ImplicitCompletion {
+                    result: "authentic implicit".into(),
+                },
+            ),
+            (
+                ConvState::Failed {
+                    error: "cooperative cancellation".into(),
+                    error_kind: ErrorKind::Cancelled,
+                },
+                SubAgentTerminalCause::Cancelled,
+                SubAgentOutcome::Failure {
+                    error: "cooperative cancellation".into(),
+                    error_kind: ErrorKind::Cancelled,
+                },
+            ),
+            (
+                ConvState::Failed {
+                    error: "actual timeout".into(),
+                    error_kind: ErrorKind::TimedOut,
+                },
+                SubAgentTerminalCause::TimedOut,
+                SubAgentOutcome::TimedOut,
+            ),
+        ] {
+            let db = Database::open_in_memory().await.unwrap();
+            parent_with_children(&db, "parent", &["child"]).await;
+            db.admit_sub_agent_batch(&batch(
+                "batch",
+                "parent",
+                false,
+                &[("child", SubAgentExecutionAuthority::ReadOnly)],
+            ))
+            .await
+            .unwrap();
+            let at = Utc::now();
+            db.update_child_state_and_record_sub_agent_terminal("child", &state, at, cause, at)
+                .await
+                .established()
+                .unwrap()
+                .unwrap();
+            let outcome = db
+                .terminalize_sub_agent_cancellation_backstop(
+                    "child",
+                    SubAgentTerminalCause::Cancelled,
+                    at + chrono::Duration::seconds(6),
+                )
+                .await
+                .established()
+                .unwrap()
+                .unwrap();
+            assert_eq!(outcome, expected);
+            assert_eq!(db.get_conversation("child").await.unwrap().state, state);
+            let stored: (String, i64, Option<i64>) = sqlx::query_as("SELECT terminal_cause, terminal_at_unix_micros, parent_accepted_at_unix_micros FROM sub_agent_runs WHERE child_conversation_id = 'child'")
+                .fetch_one(db.pool()).await.unwrap();
+            assert_eq!(
+                stored,
+                (cause.as_db_str().into(), at.timestamp_micros(), None)
+            );
+        }
     }
 
     #[tokio::test]

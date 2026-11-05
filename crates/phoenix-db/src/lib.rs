@@ -72,6 +72,7 @@ mod sqlite_native_statement;
 mod sqlite_telemetry;
 mod sqlite_workload;
 mod sub_agent_lifecycle;
+mod sub_agent_summary;
 pub mod workflow;
 pub use sub_agent_lifecycle::*;
 // The schema *types* (MessageContent, ToolResult, ConvState's persisted shape,
@@ -1868,6 +1869,34 @@ enum TerminalEvidenceTransactionCut {
     None,
     BeforeCommit,
     AfterCommit,
+    #[cfg(test)]
+    AfterCommitLookupUnavailable,
+}
+
+impl TerminalEvidenceTransactionCut {
+    async fn commit(self, tx: sqlx::Transaction<'_, sqlx::Sqlite>) -> DbResult<()> {
+        if self == Self::BeforeCommit {
+            tx.rollback().await?;
+            return Err(DbError::Serialization(
+                "injected terminal write rollback".into(),
+            ));
+        }
+        tx.commit().await?;
+        if self != Self::None {
+            return Err(DbError::Serialization(
+                "injected terminal write acknowledgement loss".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    const fn classifier_unavailable(self) -> bool {
+        match self {
+            Self::None | Self::BeforeCommit | Self::AfterCommit => false,
+            #[cfg(test)]
+            Self::AfterCommitLookupUnavailable => true,
+        }
+    }
 }
 
 fn parent_creation_values(
@@ -12537,7 +12566,7 @@ impl Database {
         pending: &[phoenix_core::domain::sm_state::PendingSubAgent],
     ) -> DbResult<std::collections::HashMap<String, phoenix_core::domain::sm_state::SubAgentOutcome>>
     {
-        use phoenix_core::domain::sm_state::{ConvState, SubAgentOutcome};
+        use phoenix_core::domain::sm_state::ConvState;
         use std::collections::HashMap;
 
         let mut outcomes = HashMap::new();
@@ -12560,23 +12589,11 @@ impl Database {
                     agent.agent_id
                 ))
             })?;
-            // Only the two terminal sub-agent states carry a real outcome; any
-            // other (still running) state leaves the agent absent so the caller
-            // uses the interrupted fallback. `if let` chain rather than a match
-            // with a wildcard arm (denied by `wildcard_enum_match_arm`).
-            if let ConvState::Completed { result } = state {
-                let outcome = if terminal_cause.as_deref() == Some("implicit_completion") {
-                    SubAgentOutcome::ImplicitCompletion { result }
-                } else {
-                    SubAgentOutcome::Success { result }
-                };
-                outcomes.insert(agent.agent_id.clone(), outcome);
-            } else if let ConvState::Failed { error, error_kind } = state {
-                let outcome = if terminal_cause.as_deref() == Some("timed_out") {
-                    SubAgentOutcome::TimedOut
-                } else {
-                    SubAgentOutcome::Failure { error, error_kind }
-                };
+            let cause = terminal_cause
+                .as_deref()
+                .map(SubAgentTerminalCause::from_db_str)
+                .transpose()?;
+            if let Some(outcome) = sub_agent_lifecycle::terminal_sub_agent_outcome(state, cause) {
                 outcomes.insert(agent.agent_id.clone(), outcome);
             }
         }

@@ -24,6 +24,7 @@ import type { ManagedProcessRow } from '../generated/ManagedProcessRow';
 import type { ManagedResourceCategory } from '../generated/ManagedResourceCategory';
 import { formatGitShaForDisplay } from '../utils';
 import { ReleaseUpdatePanel } from './ReleaseUpdatePanel';
+import { OperationalObservations } from './OperationalObservations';
 import './AboutDeploymentPage.css';
 
 const RESOURCE_POLL_MS = 1_000;
@@ -1221,6 +1222,8 @@ export function AboutDeploymentPage() {
               )}
 
               <ResourceMonitor state={resources} refresh={() => { fetchResources(true); }} />
+
+              <OperationalObservations />
 
               <SqliteDiagnostics
                 state={sqlite}

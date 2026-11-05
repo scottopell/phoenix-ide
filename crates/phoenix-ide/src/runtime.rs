@@ -473,7 +473,6 @@ pub(crate) fn is_invalid_runtime_cwd_error(error: &str) -> bool {
 /// Manager for all conversation runtimes
 struct FatalLocalAuthorityFenceState {
     closed: bool,
-    boundary: Option<&'static str>,
     fatal_deadline: Option<tokio::time::Instant>,
     owners: usize,
 }
@@ -485,6 +484,8 @@ pub(crate) struct FatalLocalAuthorityFence {
     tx: watch::Sender<Option<&'static str>>,
     #[cfg(test)]
     owners_at_first_close: AtomicUsize,
+    #[cfg(test)]
+    diagnostic_recordings: AtomicUsize,
 }
 
 pub(crate) struct AdmittedOperation {
@@ -497,7 +498,6 @@ impl FatalLocalAuthorityFence {
         Arc::new(Self {
             state: Mutex::new(FatalLocalAuthorityFenceState {
                 closed: false,
-                boundary: None,
                 fatal_deadline: None,
                 owners: 0,
             }),
@@ -506,6 +506,8 @@ impl FatalLocalAuthorityFence {
             tx,
             #[cfg(test)]
             owners_at_first_close: AtomicUsize::new(usize::MAX),
+            #[cfg(test)]
+            diagnostic_recordings: AtomicUsize::new(0),
         })
     }
 
@@ -531,7 +533,6 @@ impl FatalLocalAuthorityFence {
     fn close_inner(&self, boundary: &'static str, signal_fatal_authority_loss: bool) {
         let mut state = self.state.lock().expect("fatal authority fence poisoned");
         state.closed = true;
-        let boundary = *state.boundary.get_or_insert(boundary);
         state
             .fatal_deadline
             .get_or_insert_with(|| tokio::time::Instant::now() + crate::tls::SHUTDOWN_GRACE);
@@ -542,11 +543,22 @@ impl FatalLocalAuthorityFence {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
-        if signal_fatal_authority_loss {
-            self.tx.send_replace(Some(boundary));
-        }
+        let first_fatal_notification = signal_fatal_authority_loss
+            && self.tx.send_if_modified(|first_fatal_boundary| {
+                if first_fatal_boundary.is_some() {
+                    false
+                } else {
+                    *first_fatal_boundary = Some(boundary);
+                    true
+                }
+            });
         self.external_effect_cancellation.cancel();
         drop(state);
+        if first_fatal_notification {
+            crate::operational_observations::record_authority_failure(boundary);
+            #[cfg(test)]
+            self.diagnostic_recordings.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     async fn wait_for_owners(&self) {
@@ -572,6 +584,11 @@ impl FatalLocalAuthorityFence {
             .lock()
             .expect("fatal authority fence poisoned")
             .closed
+    }
+
+    pub(crate) fn fatal_authority_loss_is_latched(&self) -> bool {
+        let _state = self.state.lock().expect("fatal authority fence poisoned");
+        self.tx.borrow().is_some()
     }
 
     pub(crate) fn fatal_deadline(&self) -> Option<tokio::time::Instant> {
@@ -2674,6 +2691,10 @@ impl RuntimeManager {
 
     pub(crate) fn signal_fatal_local_authority(&self, boundary: &'static str) {
         self.fatal_local_authority_fence.close(boundary);
+    }
+
+    pub(crate) fn observed_local_authority_failure_boundary(&self) -> Option<&'static str> {
+        *self.fatal_local_authority_fence.tx.borrow()
     }
 
     pub(crate) fn require_startup_local_authority(
@@ -12621,6 +12642,54 @@ mod scope_liveness_tests {
         assert_eq!(fence.owner_count(), 0);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn fatal_observation_records_once_even_with_repeated_close_and_shutdown_promotion() {
+        use crate::operational_observations::{counter, FailureBoundary};
+
+        let fence = FatalLocalAuthorityFence::new();
+        fence.close("ordinary_tool_outcome_settlement");
+        fence.close("startup_settlement_owner_disappeared");
+        assert_eq!(fence.diagnostic_recordings.load(Ordering::Relaxed), 1);
+        assert_eq!(*fence.tx.borrow(), Some("ordinary_tool_outcome_settlement"));
+
+        for (boundary, category) in [
+            (
+                "startup_steering_authority",
+                FailureBoundary::StartupRequiredAuthority,
+            ),
+            (
+                "ordinary_tool_outcome_settlement",
+                FailureBoundary::OrdinaryToolSettlement,
+            ),
+            (
+                "startup_settlement_owner_disappeared",
+                FailureBoundary::SettlementOwnerDisappeared,
+            ),
+        ] {
+            let before = counter(category).count();
+            let fence = FatalLocalAuthorityFence::new();
+            let owner = fence.try_acquire().unwrap();
+            fence.close_for_process_shutdown();
+            let deadline = fence.fatal_deadline();
+            assert_eq!(*fence.tx.borrow(), None);
+            assert_eq!(fence.diagnostic_recordings.load(Ordering::Relaxed), 0);
+            assert_eq!(fence.owners_at_first_close(), Some(1));
+            assert!(fence.try_acquire().is_err());
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            fence.close(boundary);
+            assert_eq!(*fence.tx.borrow(), Some(boundary));
+            assert!(counter(category).count() > before);
+            fence.close("a_later_unclassified_boundary");
+            fence.close_for_process_shutdown();
+            assert_eq!(*fence.tx.borrow(), Some(boundary));
+            assert_eq!(fence.diagnostic_recordings.load(Ordering::Relaxed), 1);
+            assert_eq!(fence.fatal_deadline(), deadline);
+            assert_eq!(fence.owners_at_first_close(), Some(1));
+            drop(owner);
+            assert_eq!(fence.owner_count(), 0);
+        }
+    }
+
     #[tokio::test]
     async fn fatal_fence_shares_one_deadline_across_owner_and_runtime_map_drains() {
         let manager = Arc::new(test_manager().await);
@@ -14663,9 +14732,37 @@ mod scope_liveness_tests {
         transfer_barrier.wait().await;
         barrier.wait().await;
 
-        ordinary.await.unwrap().unwrap();
-        inherited.await.unwrap().unwrap();
-        assert!(mgr.try_get_handle(conversation_id).await.is_some());
+        let ordinary_handle = ordinary.await.unwrap().unwrap();
+        let inherited_handle = inherited.await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(
+            &ordinary_handle.identity,
+            &inherited_handle.identity
+        ));
+        assert!(ordinary_handle
+            .broadcast_tx
+            .same_channel(&inherited_handle.broadcast_tx));
+        assert!(ordinary_handle
+            .event_tx
+            .same_channel(&inherited_handle.event_tx));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            ordinary_handle.event_tx.closed(),
+        )
+        .await
+        .expect("the materialized runtime retires after fatal admission closure");
+        assert!(inherited_handle.event_tx.is_closed());
+        assert_eq!(
+            ordinary_handle.state_rx.borrow().presentation_mode(),
+            "idle"
+        );
+        assert_eq!(
+            inherited_handle.state_rx.borrow().presentation_mode(),
+            "idle"
+        );
+        assert_eq!(
+            mgr.observed_local_authority_failure_boundary(),
+            Some("test_late_inherited_materialization")
+        );
         assert!(!mgr
             .runtime_creations
             .lock()

@@ -346,3 +346,16 @@
     overflow-x: auto;
   }
 }
+
+.deploy-space-observation {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin-block: 1rem;
+}
+
+.deploy-space-locations {
+  margin-block: 0.5rem;
+  padding-inline-start: 1.5rem;
+  overflow-wrap: anywhere;
+}

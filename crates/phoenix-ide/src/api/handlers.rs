@@ -560,6 +560,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/version", get(get_version_json))
         // About this deployment diagnostics
         .route("/api/deployment", get(super::deployment::deployment_info))
+        .route(
+            "/api/deployment/observations",
+            get(super::deployment_observations::deployment_observations),
+        )
         .route("/api/deployment/retrieval", get(retrieval_status))
         .route(
             "/api/about/resources",
@@ -20380,6 +20384,65 @@ mod lifecycle_handler_tests {
             } else {
                 assert_eq!(payload["hits"].as_array().unwrap().len(), 1);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn deployment_observations_requires_auth_and_works_without_database_authority() {
+        let mut state = make_test_state().await;
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                "observation-password".to_string(),
+            )
+            .unwrap(),
+        );
+        state.db.pool().close().await;
+        let runtime = Arc::clone(&state.runtime);
+        let temporary_root = state.runtime_env.tmp_root().to_string_lossy().into_owned();
+        let router = create_router(state);
+        let unauthorized = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/deployment/observations")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        for _ in 0..2 {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/deployment/observations")
+                        .header(
+                            axum::http::header::AUTHORIZATION,
+                            "Bearer observation-password",
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let payload: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(payload["failures"].as_array().unwrap().len(), 10);
+            assert!(payload["filesystems"].is_array());
+            assert!(payload["filesystems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|filesystem| filesystem["locations"].as_array().unwrap())
+                .any(|location| location["label"] == "Temporary directory"
+                    && location["path"].as_str() == Some(temporary_root.as_str())));
+            assert!(payload["measurement_errors"].is_array());
+            assert!(payload["local_authority_failure_boundary"].is_null());
+            assert!(!runtime.fatal_local_authority_is_latched());
         }
     }
 
