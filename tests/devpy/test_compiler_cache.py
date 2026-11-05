@@ -778,6 +778,36 @@ class CompilerCacheTests(unittest.TestCase):
         child.terminate.assert_called_once_with()
         child.wait.assert_called_once_with(timeout=1.0)
 
+    def test_child_exit_after_receipt_fails_closed_and_removes_receipt(self):
+        child = mock.Mock(pid=2468)
+        child.poll.return_value = 7
+        with mock.patch.object(
+            self.dev,
+            "_kache_daemon_is_running",
+            side_effect=[(False, None), (True, None)],
+        ), mock.patch.object(
+            self.dev.subprocess, "Popen", return_value=child
+        ), mock.patch.object(
+            self.dev, "_wait_for_kache_daemon", return_value=None
+        ), mock.patch.object(
+            self.dev, "_kache_daemon_serving_pid", return_value=2468
+        ), mock.patch.object(
+            self.dev, "_record_kache_daemon_receipt", return_value=None
+        ) as record, mock.patch.object(
+            self.dev, "_remove_kache_daemon_receipt", return_value=None
+        ) as remove:
+            error = self.dev._start_kache_daemon_locked(
+                "/bin/kache",
+                cargo_cwd=Path("/repo"),
+                socket=Path("/tmp/kache.sock"),
+                identity="identity",
+            )
+
+        self.assertIn("cannot confirm spawned Kache child ownership", error or "")
+        record.assert_called_once()
+        remove.assert_called_once_with(Path("/tmp/kache.sock"))
+        child.terminate.assert_not_called()
+
     def test_malformed_utf8_proof_files_are_unverifiable(self):
         with self.dev.tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -863,7 +893,9 @@ class CompilerCacheTests(unittest.TestCase):
 
         def launch(*_args, **_kwargs):
             events.append("started")
-            return mock.Mock(pid=1234)
+            child = mock.Mock(pid=1234)
+            child.poll.return_value = None
+            return child
 
         with mock.patch.dict(
             os.environ, {"KACHE_SOCKET_PATH": str(socket)}, clear=True
@@ -950,6 +982,7 @@ class CompilerCacheTests(unittest.TestCase):
 
     def test_kache_daemon_holds_socket_lock_across_check_start_and_readiness(self):
         child = mock.Mock(pid=1234)
+        child.poll.return_value = None
         events = []
 
         @contextlib.contextmanager
@@ -960,7 +993,7 @@ class CompilerCacheTests(unittest.TestCase):
 
         def status(*_args, **_kwargs):
             events.append("check")
-            return False, None
+            return events.count("check") > 1, None
 
         def start(*_args, **_kwargs):
             events.append("start")
@@ -986,7 +1019,9 @@ class CompilerCacheTests(unittest.TestCase):
             self.dev, "_record_kache_daemon_receipt", return_value=None
         ):
             self.assertIsNone(self.dev._ensure_kache_daemon("/bin/kache"))
-        self.assertEqual(["lock", "check", "start", "ready", "unlock"], events)
+        self.assertEqual(
+            ["lock", "check", "start", "ready", "check", "unlock"], events
+        )
 
     @unittest.skipUnless("fork" in multiprocessing.get_all_start_methods(), "requires fork")
     def test_kache_daemon_rejects_running_process_with_unverifiable_environment(self):
@@ -1115,9 +1150,11 @@ class CompilerCacheTests(unittest.TestCase):
         with self.subTest("socket path and permissions"), mock.patch.dict(
             os.environ, {"KACHE_CACHE_DIR": "/very/long/worktree/cache"}, clear=True
         ), mock.patch.object(
-            self.dev, "_kache_daemon_is_running", return_value=(False, None)
+            self.dev,
+            "_kache_daemon_is_running",
+            side_effect=[(False, None), (True, None)],
         ), mock.patch.object(
-            self.dev.subprocess, "Popen", return_value=mock.Mock(pid=1234)
+            self.dev.subprocess, "Popen"
         ) as run, mock.patch.object(
             self.dev, "_wait_for_kache_daemon", return_value=None
         ), mock.patch.object(
@@ -1125,6 +1162,9 @@ class CompilerCacheTests(unittest.TestCase):
         ), mock.patch.object(
             self.dev, "_record_kache_daemon_receipt", return_value=None
         ):
+            child = mock.Mock(pid=1234)
+            child.poll.return_value = None
+            run.return_value = child
             with self.dev.tempfile.TemporaryDirectory() as temporary, mock.patch.object(
                 self.dev.tempfile, "gettempdir", return_value=temporary
             ), mock.patch.object(

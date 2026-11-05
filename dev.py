@@ -5188,6 +5188,14 @@ def _record_kache_daemon_receipt(
         return f"cannot record Kache daemon ownership: {error}"
 
 
+def _remove_kache_daemon_receipt(socket: Path) -> str | None:
+    try:
+        _kache_daemon_receipt_path(socket).unlink(missing_ok=True)
+        return None
+    except OSError as error:
+        return f"cannot remove Kache daemon ownership receipt: {error}"
+
+
 def _kache_daemon_receipt_matches(
     socket: Path, identity: str, serving_pid: int
 ) -> bool:
@@ -5345,6 +5353,29 @@ def _start_kache_daemon_locked(
         if settlement_error:
             return f"{receipt_error}; {settlement_error}"
         return f"{receipt_error}; spawned Kache child pid {child.pid} is no longer running"
+
+    confirmed_running, confirmation_error = _kache_daemon_is_running(
+        binary, cargo_cwd=cargo_cwd, expected_socket=socket
+    )
+    confirmed_pid = _kache_daemon_serving_pid(socket)
+    if (
+        child.poll() is not None
+        or not confirmed_running
+        or confirmation_error is not None
+        or confirmed_pid != child.pid
+    ):
+        cleanup_error = _remove_kache_daemon_receipt(socket)
+        settlement_error = _settle_spawned_kache_child(child)
+        errors = [
+            error
+            for error in (cleanup_error, settlement_error)
+            if error is not None
+        ]
+        detail = f"; {'; '.join(errors)}" if errors else ""
+        return (
+            "cannot confirm spawned Kache child ownership after recording receipt; "
+            f"refusing daemon reuse{detail}"
+        )
     return None
 
 
