@@ -2705,11 +2705,12 @@ where
                     .execute_effect(Effect::CompleteCreation { job_id, claim })
                     .await
                 {
+                    let exit = self.fail_startup_authority("startup_creation_settlement");
                     tracing::error!(
                         %error,
                         "Failed to settle creation completion before resuming LLM dispatch"
                     );
-                    return self.fail_startup_authority("startup_creation_settlement");
+                    return exit;
                 }
             }
             if self.creation_settlement_disposition == CreationSettlementDisposition::StaleAuthority
@@ -2726,8 +2727,9 @@ where
         {
             Ok(pending) => pending,
             Err(error) => {
+                let exit = self.fail_startup_authority("startup_continuation_opening_authority");
                 tracing::error!(%error, "pending continuation opening is unclassified");
-                return self.fail_startup_authority("startup_continuation_opening_authority");
+                return exit;
             }
         };
         let startup_drain = if continuation_opening_pending {
@@ -2736,12 +2738,13 @@ where
             match self.commit_startup_steering_queue().await {
                 Ok(outcome) => outcome,
                 Err(error) => {
+                    let exit = self.fail_startup_authority("startup_steering_authority");
                     tracing::error!(
                         conversation_id = %self.context.conversation_id,
                         %error,
                         "Startup steering authority could not be established"
                     );
-                    return self.fail_startup_authority("startup_steering_authority");
+                    return exit;
                 }
             }
         };
@@ -2757,8 +2760,9 @@ where
                     .process_startup_event(Event::OverloadRetryDeadlineExpired)
                     .await
                 {
+                    let exit = self.fail_startup_authority("startup_overload_expiry");
                     tracing::error!(%error, "Failed to expire recovered overload retry");
-                    return self.fail_startup_authority("startup_overload_expiry");
+                    return exit;
                 }
             } else {
                 match overload_startup_action(&retry, now) {
@@ -2770,8 +2774,9 @@ where
                             })
                             .await
                         {
+                            let exit = self.fail_startup_authority("startup_overload_dispatch");
                             tracing::error!(%error, "Failed to dispatch due recovered overload retry");
-                            return self.fail_startup_authority("startup_overload_dispatch");
+                            return exit;
                         }
                     }
                     OverloadStartupAction::Schedule { delay, attempt } => {
@@ -2785,8 +2790,9 @@ where
                             })
                             .await
                         {
+                            let exit = self.fail_startup_authority("startup_overload_schedule");
                             tracing::error!(%error, "Failed to schedule recovered overload retry");
-                            return self.fail_startup_authority("startup_overload_schedule");
+                            return exit;
                         }
                     }
                     OverloadStartupAction::Expire => unreachable!("handled before startup action match"),
@@ -2811,8 +2817,9 @@ where
                         match self.execute_effect(effect).await {
                             Ok(Some(event)) => {
                                 if let Err(error) = self.process_startup_event(event).await {
+                                    let exit = self.fail_startup_authority("startup_overload_settlement");
                                     tracing::error!(%error, "Failed to settle resumed overload retry");
-                                    return self.fail_startup_authority("startup_overload_settlement");
+                                    return exit;
                                 }
                             }
                             Ok(None) => {}
@@ -2828,8 +2835,9 @@ where
                                     }
                                 };
                                 if let Err(settle_error) = self.process_startup_event(failure).await {
+                                    let exit = self.fail_startup_authority("startup_overload_failure_settlement");
                                     tracing::error!(%settle_error, "Failed to settle resumed overload dispatch failure");
-                                    return self.fail_startup_authority("startup_overload_failure_settlement");
+                                    return exit;
                                 }
                             }
                         }
@@ -2889,11 +2897,12 @@ where
                     let _ = ack.send(recovery.clone());
                 }
                 if let Err(settlement_error) = recovery {
+                    let exit = self.fail_startup_authority("startup_llm_settlement_authority");
                     tracing::error!(
                         %settlement_error,
                         "Failed to durably settle interrupted LLM request"
                     );
-                    return self.fail_startup_authority("startup_llm_settlement_authority");
+                    return exit;
                 }
             }
         }
@@ -2913,8 +2922,9 @@ where
             {
                 Ok(Some(failure)) => {
                     if let Err(error) = self.process_startup_event(failure).await {
+                        let exit = self.fail_startup_authority("startup_continuation_settlement");
                         tracing::error!(%error, "Failed to settle resumed continuation request");
-                        return self.fail_startup_authority("startup_continuation_settlement");
+                        return exit;
                     }
                 }
                 Ok(None) => {}
@@ -2931,9 +2941,10 @@ where
                         })
                         .await
                     {
+                        let exit =
+                            self.fail_startup_authority("startup_continuation_failure_settlement");
                         tracing::error!(%error, "Failed to settle continuation startup rejection");
-                        return self
-                            .fail_startup_authority("startup_continuation_failure_settlement");
+                        return exit;
                     }
                 }
             }
@@ -2954,8 +2965,9 @@ where
                     .process_startup_event(Event::OverloadRetryDeadlineExpired)
                     .await
                 {
+                    let exit = self.fail_startup_authority("startup_overload_credential_expiry");
                     tracing::error!(%error, "Failed to expire recovered overload credential wait");
-                    return self.fail_startup_authority("startup_overload_credential_expiry");
+                    return exit;
                 }
             } else if credential_status.is_some_and(|status| {
                 !matches!(
@@ -2967,8 +2979,9 @@ where
                     .handle_credential_settlement(TransitionAuthority::RequiredSettlement)
                     .await
                 {
+                    let exit = self.fail_startup_authority("startup_credential_settlement");
                     tracing::error!(%error, "Failed to settle startup credential recovery");
-                    return self.fail_startup_authority("startup_credential_settlement");
+                    return exit;
                 }
             } else if credential_status.is_none() {
                 if let Err(error) = self
@@ -2977,8 +2990,9 @@ where
                     })
                     .await
                 {
+                    let exit = self.fail_startup_authority("startup_credential_failure_settlement");
                     tracing::error!(%error, "Error handling post-restart credential recovery");
-                    return self.fail_startup_authority("startup_credential_failure_settlement");
+                    return exit;
                 }
             }
         }

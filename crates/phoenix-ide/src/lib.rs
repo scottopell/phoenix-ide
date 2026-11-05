@@ -96,6 +96,7 @@ use tower_http::{
 };
 mod hot_restart;
 mod logging;
+mod operational_observations;
 
 /// Install the bounded fatal-diagnostic hook before structured logging starts.
 pub fn install_fatal_diagnostic_hook() {

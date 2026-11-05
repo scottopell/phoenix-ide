@@ -31,7 +31,10 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter, Layer};
 
+pub(crate) mod observations;
 mod rotation;
+use crate::operational_observations::{counter, FailureBoundary};
+use observations::{ObservedExporter, ObservedWriter};
 
 const FATAL_LOG_ENV: &str = "PHOENIX_FATAL_LOG_FILE";
 const MAX_FATAL_LOG_BYTES: usize = 64 * 1024;
@@ -60,11 +63,13 @@ pub(crate) fn record_fatal_diagnostic(message: &(impl std::fmt::Display + ?Sized
     };
     if let Some(structured) = config.file.as_deref() {
         if let Err(error) = validate_fatal_log_path(structured, path) {
+            counter(FailureBoundary::FatalDiagnosticWrite).record();
             eprintln!("failed to resolve fatal diagnostic path: {error}");
             return;
         }
     }
     if let Err(error) = write_fatal_diagnostic(path, &message.to_string()) {
+        counter(FailureBoundary::FatalDiagnosticWrite).record();
         eprintln!("failed to write {}: {error}", path.display());
     }
 }
@@ -363,7 +368,9 @@ impl PreparedLogConfig {
 /// what lets the deployment report derive its file path from [`LogConfig`]
 /// without ever advertising a sink the subscriber isn't writing (REQ-DEPLOY-006).
 pub fn init(config: &PreparedLogConfig) -> std::io::Result<TracingHandles> {
-    let tracer_provider = match trace_exporter_from_env(|name| std::env::var_os(name))? {
+    let exporter = trace_exporter_from_env(|name| std::env::var_os(name))?;
+    observations::configure_trace(exporter);
+    let tracer_provider = match exporter {
         TraceExporter::None => None,
         #[cfg(feature = "datadog-tracing")]
         TraceExporter::Datadog => Some(init_datadog_provider()),
@@ -387,6 +394,11 @@ pub fn init(config: &PreparedLogConfig) -> std::io::Result<TracingHandles> {
             .json()
             .with_current_span(true)
             .with_span_list(false)
+            .with_writer(|| ObservedWriter {
+                inner: std::io::stdout(),
+                write_errors: counter(FailureBoundary::StdoutWrite),
+                flush_errors: counter(FailureBoundary::StdoutFlush),
+            })
             .with_filter(make_env_filter())
     });
 
@@ -398,7 +410,12 @@ pub fn init(config: &PreparedLogConfig) -> std::io::Result<TracingHandles> {
                     format!("failed to open PHOENIX_LOG_FILE {}: {e}", path.display()),
                 )
             })?;
-            let (writer, guard) = tracing_appender::non_blocking(file);
+            let (writer, guard) = tracing_appender::non_blocking(ObservedWriter {
+                inner: file,
+                write_errors: counter(FailureBoundary::StructuredLogWrite),
+                flush_errors: counter(FailureBoundary::StructuredLogFlush),
+            });
+            observations::install_queue_counter(writer.error_counter());
             let layer = fmt::layer()
                 .json()
                 .with_current_span(true)
@@ -674,7 +691,7 @@ fn init_otlp_provider() -> std::io::Result<SdkTracerProvider> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
     Ok(SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
+        .with_batch_exporter(ObservedExporter(exporter))
         .with_resource(otlp_resource())
         .with_span_limits(phoenix_span_limits())
         .build())

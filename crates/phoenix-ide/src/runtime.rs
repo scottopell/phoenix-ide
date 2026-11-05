@@ -485,6 +485,8 @@ pub(crate) struct FatalLocalAuthorityFence {
     tx: watch::Sender<Option<&'static str>>,
     #[cfg(test)]
     owners_at_first_close: AtomicUsize,
+    #[cfg(test)]
+    diagnostic_recordings: AtomicUsize,
 }
 
 pub(crate) struct AdmittedOperation {
@@ -506,6 +508,8 @@ impl FatalLocalAuthorityFence {
             tx,
             #[cfg(test)]
             owners_at_first_close: AtomicUsize::new(usize::MAX),
+            #[cfg(test)]
+            diagnostic_recordings: AtomicUsize::new(0),
         })
     }
 
@@ -542,11 +546,15 @@ impl FatalLocalAuthorityFence {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
-        if signal_fatal_authority_loss {
-            self.tx.send_replace(Some(boundary));
-        }
+        let first_fatal_notification =
+            signal_fatal_authority_loss && self.tx.send_replace(Some(boundary)).is_none();
         self.external_effect_cancellation.cancel();
         drop(state);
+        if first_fatal_notification {
+            crate::operational_observations::record_authority_failure(boundary);
+            #[cfg(test)]
+            self.diagnostic_recordings.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     async fn wait_for_owners(&self) {
@@ -2674,6 +2682,10 @@ impl RuntimeManager {
 
     pub(crate) fn signal_fatal_local_authority(&self, boundary: &'static str) {
         self.fatal_local_authority_fence.close(boundary);
+    }
+
+    pub(crate) fn observed_local_authority_failure_boundary(&self) -> Option<&'static str> {
+        *self.fatal_local_authority_fence.tx.borrow()
     }
 
     pub(crate) fn require_startup_local_authority(
@@ -12619,6 +12631,22 @@ mod scope_liveness_tests {
             Ok(SseEvent::Message { message, .. }) if message.sequence_id == admitted_seq
         ));
         assert_eq!(fence.owner_count(), 0);
+    }
+
+    #[test]
+    fn fatal_observation_records_once_even_with_repeated_close_and_shutdown_promotion() {
+        let fence = FatalLocalAuthorityFence::new();
+        fence.close("ordinary_tool_outcome_settlement");
+        fence.close("startup_settlement_owner_disappeared");
+        assert_eq!(fence.diagnostic_recordings.load(Ordering::Relaxed), 1);
+        assert_eq!(*fence.tx.borrow(), Some("ordinary_tool_outcome_settlement"));
+
+        let fence = FatalLocalAuthorityFence::new();
+        fence.close_for_process_shutdown();
+        assert_eq!(fence.diagnostic_recordings.load(Ordering::Relaxed), 0);
+        fence.close("startup_steering_authority");
+        fence.close("startup_settlement_owner_disappeared");
+        assert_eq!(fence.diagnostic_recordings.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
