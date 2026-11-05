@@ -418,10 +418,10 @@ class CompilerCacheTests(unittest.TestCase):
             ):
                 self.dev._kache_daemon_receipt_path(socket).write_text("[]")
                 self.assertFalse(
-                    self.dev._kache_daemon_receipt_matches(socket, "a" * 64)
+                    self.dev._kache_daemon_receipt_matches(socket, "a" * 64, 1234)
                 )
 
-    def test_daemon_receipt_contains_only_digest_and_socket_incarnation(self):
+    def test_daemon_receipt_contains_only_digest_pid_and_socket_incarnation(self):
         with self.dev.tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             socket = root / "operator.sock"
@@ -431,7 +431,7 @@ class CompilerCacheTests(unittest.TestCase):
             ):
                 self.assertIsNone(
                     self.dev._record_kache_daemon_receipt(
-                        socket, "a" * 64
+                        socket, "a" * 64, 1234
                     )
                 )
                 receipt_path = self.dev._kache_daemon_receipt_path(socket)
@@ -441,19 +441,20 @@ class CompilerCacheTests(unittest.TestCase):
             self.assertEqual(0o600, receipt_path.stat().st_mode & 0o777)
             parsed = self.dev.json.loads(receipt)
             self.assertEqual(
-                {"identity", "socket_device", "socket_inode", "version"},
+                {"identity", "serving_pid", "socket_device", "socket_inode", "version"},
                 set(parsed),
             )
 
-    def test_daemon_receipt_rejects_missing_socket_missing_receipt_or_wrong_identity(self):
+    def test_daemon_receipt_rejects_missing_socket_receipt_or_wrong_process(self):
         socket = Path(self.store_root.name) / "operator.sock"
-        self.assertFalse(self.dev._kache_daemon_receipt_matches(socket, "a" * 64))
+        self.assertFalse(self.dev._kache_daemon_receipt_matches(socket, "a" * 64, 1234))
         socket.write_text("mock socket")
-        self.assertFalse(self.dev._kache_daemon_receipt_matches(socket, "a" * 64))
-        self.assertIsNone(self.dev._record_kache_daemon_receipt(socket, "a" * 64))
-        self.assertFalse(self.dev._kache_daemon_receipt_matches(socket, "b" * 64))
+        self.assertFalse(self.dev._kache_daemon_receipt_matches(socket, "a" * 64, 1234))
+        self.assertIsNone(self.dev._record_kache_daemon_receipt(socket, "a" * 64, 1234))
+        self.assertFalse(self.dev._kache_daemon_receipt_matches(socket, "b" * 64, 1234))
+        self.assertFalse(self.dev._kache_daemon_receipt_matches(socket, "a" * 64, 5678))
         socket.unlink()
-        self.assertFalse(self.dev._kache_daemon_receipt_matches(socket, "a" * 64))
+        self.assertFalse(self.dev._kache_daemon_receipt_matches(socket, "a" * 64, 1234))
 
     def test_daemon_receipt_rejects_socket_incarnation_change(self):
         with self.dev.tempfile.TemporaryDirectory() as temporary:
@@ -464,16 +465,16 @@ class CompilerCacheTests(unittest.TestCase):
                 self.dev, "_private_kache_socket_dir", return_value=root
             ):
                 self.assertIsNone(
-                    self.dev._record_kache_daemon_receipt(socket, "a" * 64)
+                    self.dev._record_kache_daemon_receipt(socket, "a" * 64, 1234)
                 )
                 self.assertTrue(
-                    self.dev._kache_daemon_receipt_matches(socket, "a" * 64)
+                    self.dev._kache_daemon_receipt_matches(socket, "a" * 64, 1234)
                 )
                 replacement = root / "replacement.sock"
                 replacement.write_text("second")
                 replacement.replace(socket)
                 self.assertFalse(
-                    self.dev._kache_daemon_receipt_matches(socket, "a" * 64)
+                    self.dev._kache_daemon_receipt_matches(socket, "a" * 64, 1234)
                 )
 
     def test_effective_socket_omission_or_status_failure_never_starts_daemon(self):
@@ -788,7 +789,7 @@ class CompilerCacheTests(unittest.TestCase):
             ):
                 self.dev._kache_daemon_receipt_path(socket).write_bytes(b"\xff")
                 self.assertFalse(
-                    self.dev._kache_daemon_receipt_matches(socket, "identity")
+                    self.dev._kache_daemon_receipt_matches(socket, "identity", 1234)
                 )
                 self.assertIsNone(self.dev._kache_daemon_serving_pid(socket))
 
@@ -804,7 +805,7 @@ class CompilerCacheTests(unittest.TestCase):
             ):
                 self.dev._kache_daemon_receipt_path(socket).write_bytes(invalid)
                 self.assertFalse(
-                    self.dev._kache_daemon_receipt_matches(socket, "identity")
+                    self.dev._kache_daemon_receipt_matches(socket, "identity", 1234)
                 )
                 self.assertIsNone(self.dev._kache_daemon_serving_pid(socket))
 
@@ -888,8 +889,8 @@ class CompilerCacheTests(unittest.TestCase):
             self.assertIsNone(self.dev._ensure_kache_daemon("/bin/kache"))
 
         self.assertEqual(1, run.call_count)
-        record.assert_called_once()
-        matches.assert_called_once()
+        record.assert_called_once_with(mock.ANY, mock.ANY, 1234)
+        matches.assert_called_once_with(mock.ANY, mock.ANY, 1234)
 
     def test_operator_socket_rejects_replaced_daemon(self):
         with mock.patch.dict(

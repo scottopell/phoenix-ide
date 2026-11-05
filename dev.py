@@ -5155,7 +5155,9 @@ def _kache_daemon_receipt_path(socket: Path) -> Path:
     return _kache_local_paths()[3] / f"{digest}.receipt"
 
 
-def _record_kache_daemon_receipt(socket: Path, identity: str) -> str | None:
+def _record_kache_daemon_receipt(
+    socket: Path, identity: str, serving_pid: int
+) -> str | None:
     try:
         socket_info = socket.stat()
         receipt = _kache_daemon_receipt_path(socket)
@@ -5164,6 +5166,7 @@ def _record_kache_daemon_receipt(socket: Path, identity: str) -> str | None:
             {
                 "version": 1,
                 "identity": identity,
+                "serving_pid": serving_pid,
                 "socket_device": socket_info.st_dev,
                 "socket_inode": socket_info.st_ino,
             },
@@ -5185,7 +5188,9 @@ def _record_kache_daemon_receipt(socket: Path, identity: str) -> str | None:
         return f"cannot record Kache daemon ownership: {error}"
 
 
-def _kache_daemon_receipt_matches(socket: Path, identity: str) -> bool:
+def _kache_daemon_receipt_matches(
+    socket: Path, identity: str, serving_pid: int
+) -> bool:
     try:
         receipt = json.loads(_kache_daemon_receipt_path(socket).read_text())
         socket_info = socket.stat()
@@ -5196,6 +5201,7 @@ def _kache_daemon_receipt_matches(socket: Path, identity: str) -> bool:
     return (
         receipt.get("version") == 1
         and receipt.get("identity") == identity
+        and receipt.get("serving_pid") == serving_pid
         and receipt.get("socket_device") == socket_info.st_dev
         and receipt.get("socket_inode") == socket_info.st_ino
     )
@@ -5257,7 +5263,10 @@ def _start_kache_daemon_locked(
         )
         return f"cannot verify existing daemon environment: {safe_status}"
     if running:
-        if _kache_daemon_receipt_matches(socket, identity):
+        serving_pid = _kache_daemon_serving_pid(socket)
+        if serving_pid is not None and _kache_daemon_receipt_matches(
+            socket, identity, serving_pid
+        ):
             return None
         return "selected socket has a running daemon whose environment or process identity cannot be verified"
 
@@ -5330,7 +5339,7 @@ def _start_kache_daemon_locked(
             "a different process won the daemon bind race; refusing to claim ownership; "
             f"spawned Kache child pid {child.pid} is no longer running"
         )
-    receipt_error = _record_kache_daemon_receipt(socket, identity)
+    receipt_error = _record_kache_daemon_receipt(socket, identity, serving_pid)
     if receipt_error:
         settlement_error = _settle_spawned_kache_child(child)
         if settlement_error:
