@@ -14,10 +14,14 @@ Standing Coordinator Authority is specified separately in `specs/coordinator-aut
 
 Ember exposes `spawn_agents` with configured workers, tiers, and model routes.
 Inline research children receive bounded SQL, history search, transcript reads,
-reference resolution, explicit WorkScope-targeted file reads, thinking, and terminal submission. They have no default filesystem,
+reference resolution, explicit WorkScope-targeted file reads and unsandboxed
+write-capable Coordinator Bash, thinking, and terminal submission. Bash runs
+require an explicit active scope: the Coordinator home for general shell work,
+or a selected project scope. Explore spawn mode does not sandbox this tool.
+The assignment and existing user authority govern permitted actions. Children have no default filesystem,
 WorkScope, MCP, messaging, watches, Authority tools, or lifecycle actions. Durable
 Coordinator parent identity restores this capability on runtime recreation.
-ADR-222 records the boundary.
+ADR-223 records the boundary, superseding ADR-222.
 
 Coordinator LLM requests contain the stable language-specific system prompt without an automatic current-activity capsule. The Check in & drive composer action requests a fresh, broad check but selective intervention: leave healthy progress alone, do not treat idle owners as stalled, and avoid redundant nudges or re-planning to show activity. It asks the Coordinator to recover unanswered user decisions from history and verify they remain unresolved and material, advancing independent authorized work before asking the user with context and a recommendation. Repeated check-ins do not expand authority or reset decisions, pauses or gates. The requested briefing puts still-needed user input first, then material changes as problem, intervention and direction, without a mandatory template or announcements for factual watch events. ADR-149 records selective check-ins; ADR-150 refines blocked-work recovery and concrete reporting. Both system variants now distinguish blocked waiting from healthy progress, reconcile later decisions and completed work before replaying answers, and illustrate plain language with hypothetical bad/good pairs. Unsolicited reports require user action, a meaningful goal-level result or a changed blocker/risk; hypothetical examples explicitly choose silence for routine checks and sends. Requested check-ins retain an executive view. The button carries the same recovery policy without duplicating examples. The recovery/reporting base retains its pre-refinement word and character ceilings. The proposed outcome-delegation addition is bounded separately and increases both overall prompt variants; the user accepted that tradeoff as an exception to the earlier same-size request. These are prompt instructions, not guarantees of model behavior; the action adds no authority or indefinite polling. The Coordinator receives its stable instance-owned home scope ID/path as server-generated context; selected worker scope facts are still requested through `query_database`. ADR-066 records removal of the per-request snapshot and its dedicated runtime wiring.
 
@@ -68,11 +72,13 @@ The failed `8f10d54d` packet was correctly stopped by the host; the earlier stat
 
 ## Verification Summary
 
-The inline-research regression exercises delegation, real bounded SQLite tool
-dispatch, terminal submission, and normal parent fan-in using a deterministic
-model. It asserts the exact eight-tool child surface and persisted absence of cwd
-and WorkScope. Companion regressions cover parallel research, rejected Work/cwd
-requests before admission, and model selection in the research-only schema.
+The inline-research regression exercises delegation, real bounded SQLite and Bash
+tool dispatch, terminal submission, and normal parent fan-in using a deterministic
+model. It asserts the exact nine-tool child surface, a real file write beneath the
+explicit Coordinator home target, and persisted absence of ambient cwd and
+WorkScope attachment. Companion regressions cover missing/invalid Bash targets,
+child handle inspection, explicit file paging, parallel research, rejected
+Work/cwd requests before admission, and model selection in the Coordinator schema.
 
 The bounded API-guidance candidate (ADR-113) replaces an accidental recipe allowlist with non-exhaustive contract-grounded guidance and documents submitting exact user-provided answers or decisions made within explicit delegated decision scope through the existing structured-question response endpoint. Generic inspect/unblock instructions are not decision authority; approvals must never be fabricated or delegation extended. Gap inventories are illustrative and qualified by inspected deployment/source, permitting verified supported alternatives and bounded state reads, not invented guarantees/receipts, database/private-handler bypasses, or background monitors. It does not add tool or runtime capabilities. The recipe distinguishes current request freshness from idempotency, requires complete answers despite the backend's lack of completeness enforcement, posts once, and reconciles uncertainty against the original target without treating conflicts as success. Source/wire/UI anchors and offline Python drift checks are described in `../builtin-skills/executive.md`. Prompt/built-in/continuation Rust regressions are authored but intentionally unrun locally; no live API/question calls, instruction activation, merge or deployment are claimed.
 
@@ -97,7 +103,7 @@ The Coordinator runs on user turns and explicit watch notifications. Watches fol
 ## Out of Scope
 
 - Database writes, attached databases, extensions, filesystem functions, or SQLite internal and FTS shadow storage.
-- Phoenix-wide tools for restricted planning conversations or ordinary sub-agents; Coordinator research children receive only bounded global reads.
+- Phoenix-wide tools for restricted planning conversations or ordinary sub-agents; Coordinator children receive bounded global readers and explicitly targeted Bash.
 - Images, files, skills, user-agent metadata, or lifecycle commands in cross-conversation messages.
 - Batch-action transactions or atomic fan-out.
 - Dedicated conversation-creation, task-lifecycle, approval, repository, filesystem, or workspace mutation tools for the Coordinator; user-authorized supported HTTP APIs remain available only through explicitly targeted Bash. The inspected source's recipe gaps include aggregate-targeted lifecycle operations, uniform operation receipts, general conversation retry, and caller-idempotent cancel; this illustrative inventory is not a deployment-wide denylist. Verify the selected deployment/source contract before relying on a gap or a supported alternative.

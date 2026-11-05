@@ -71,6 +71,7 @@ external entity ChildProcess {
 
 -- The owner key for bash handles. Work carries a durable WorkScope id;
 -- Coordinator is the singleton scope shared by Coordinator continuations;
+-- Unattached carries the inline child's own controller identity;
 -- GlobalTerminal is reserved for host terminal resources. The namespaces are
 -- disjoint, so ordinary conversations cannot address Coordinator handles.
 value ResourceScope {
@@ -79,7 +80,7 @@ value ResourceScope {
 }
 
 -- Validated execution target selected before Bash process creation. Coordinator
--- targets are resolved from a persisted WorkScope with a live owner; callers
+-- and its inline-child targets are resolved from a persisted WorkScope with a live owner; callers
 -- cannot supply a working directory directly.
 value BashSpawnTarget {
     owner_scope: ResourceScope
@@ -148,6 +149,7 @@ value ExitInformation {
 enum ResourceScopeKind {
     work
     | coordinator
+    | unattached
     | global_terminal
 }
 
@@ -518,7 +520,7 @@ rule HandleSpawned {
     @guidance
         -- Run sequence (in src/tools/bash/operations.rs):
         --   1. Validate inputs and spawn_target. Ordinary runs derive the
-        --      target from the conversation; Coordinator runs resolve a
+        --      target from the conversation; Coordinator and its inline-child runs resolve a
         --      persisted WorkScope with a live owner by work_scope_id and
         --      canonicalize its worktree_path (preferred) or cwd server-side.
         --      There is no ambient/default cwd.
@@ -578,6 +580,8 @@ rule BashIsolationMatchesWorkScopeAuthority {
     @guidance
         -- Restricted WorkScope authority selects the Explore OS sandbox.
         -- Work authority selects unsandboxed Bash.
+        -- Explicit Coordinator and inline-child targets use Work Bash authority
+        -- after active WorkScope resolution, without an ambient cwd or sandbox.
         -- Conversation mode otherwise remains provenance, not authority.
 }
 

@@ -23,10 +23,14 @@ Direct's unscoped write semantics. Results are submitted via dedicated
 tools (`submit_result` / `submit_error`). Maximum 10 sub-agents per
 spawn call.
 
-The Global Coordinator exposes inline read-only research using the same fan-in.
+The Global Coordinator exposes trusted inline research and authorized shell work using the same fan-in.
 These children have no default filesystem environment or WorkScope attachment and
-receive bounded global readers, explicit WorkScope-targeted file reads, thinking,
-and terminal submission. Ordinary
+receive bounded global readers, explicit WorkScope-targeted file reads and
+unsandboxed write-capable Coordinator Bash, thinking, and terminal submission.
+Their Explore spawn mode does not enforce a Bash sandbox. Ember supplies its home
+scope for general shell work or a selected project scope for project work and
+defines each assignment's action authority. Messaging, Authority, lifecycle,
+MCP, and recursive delegation tools remain absent. Ordinary
 children retain the workspace and tool rules above. The Coordinator uses the
 configured worker/tier catalog and usable routes to select suitable execution.
 
@@ -56,7 +60,7 @@ only the architectural seams.
   sub-agent's `ConvMode` from the parent's mode and selects the
   per-mode tool registry (`for_subagent_explore` /
   `for_subagent_work`); on runtime re-creation the registry is
-  recovered from persisted WorkScope authority with an Explore-child restriction. Git-backed Work children persist a non-owning `AttachedWorkChild` marker; Work Bash is unsandboxed, while Explore Bash retains its read-only sandbox.
+  recovered from persisted WorkScope authority with an Explore-child restriction. Git-backed Work children persist a non-owning `AttachedWorkChild` marker; Work Bash is unsandboxed, while ordinary Explore Bash retains its read-only sandbox.
 - **Timeout** is a 20-minute wall-clock safety-net set when the parent
   enters `awaiting_sub_agents`; `max_turns` (per-mode default 20/50) is
   the primary budget.
@@ -74,7 +78,7 @@ only the architectural seams.
   and resolve relative cwd values from the parent conversation. Coordinator
   children reject cwd and Work requests; their typed environment persists no
   directory, and durable parent identity selects their builtin-only research
-  registry on materialization and recreation. See ADR-222.
+  registry on materialization and recreation. See ADR-223, superseding ADR-222.
 - **Wake retirement** removes REQ-SA-009's wake binding and delivery obligations
   under ADR-098. Ordinary durable terminal evidence and parent fan-in remain;
   candidate retirement implementation and verification are ongoing.

@@ -507,7 +507,6 @@ impl Database {
             if child.environment.working_dir().is_none() != coordinator_parent
                 || (coordinator_parent
                     && (child.run.execution_authority != SubAgentExecutionAuthority::ReadOnly
-                        || batch.parent_scope.is_some()
                         || !matches!(
                             child.conv_mode,
                             ConvMode::Explore {
@@ -516,7 +515,7 @@ impl Database {
                             }
                         )))
             {
-                return Err(lifecycle_conflict("Coordinator children require read-only research without a filesystem or WorkScope; ordinary children require a filesystem"));
+                return Err(lifecycle_conflict("Coordinator children require Explore mode without an ambient filesystem or WorkScope; ordinary children require a filesystem"));
             }
         }
         let now = Utc::now();
@@ -586,7 +585,14 @@ impl Database {
             .bind(cm.task_id)
             .bind(cm.task_title)
             .bind(cm.next_taskmd_id_hint)
-            .bind(batch.parent_scope.as_ref().map(WorkScopeId::as_str))
+            .bind(match &child.environment {
+                phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem => {
+                    None
+                }
+                phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
+                    ..
+                } => batch.parent_scope.as_ref().map(WorkScopeId::as_str),
+            })
             .bind(
                 child
                     .environment
@@ -1632,35 +1638,43 @@ mod tests {
 
     #[tokio::test]
     async fn coordinator_research_admission_persists_no_filesystem_or_scope() {
-        let db = Database::open_in_memory().await.unwrap();
-        let parent = db
-            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+        for with_home in [false, true] {
+            let db = Database::open_in_memory().await.unwrap();
+            if with_home {
+                db.initialize_coordinator_work_scope("/owned/coordinator")
+                    .await
+                    .unwrap();
+            }
+            let parent = db
+                .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+                .await
+                .unwrap();
+            assert_eq!(parent.attached_work_scope_id.is_some(), with_home);
+            let mut batch = atomic_batch("research", parent.attached_work_scope_id);
+            batch.parent_conversation_id = parent.id;
+            batch.children[0].run.execution_authority = SubAgentExecutionAuthority::ReadOnly;
+            batch.children[0].environment =
+                phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem;
+            db.admit_sub_agent_batch_atomically(&batch)
+                .await
+                .established()
+                .unwrap()
+                .unwrap();
+            let child = db.get_conversation("child").await.unwrap();
+            assert!(child.cwd.is_empty());
+            assert!(child.attached_work_scope_id.is_none());
+            let cwd: Option<String> = sqlx::query_scalar(
+                "SELECT sub_agent_cwd_override FROM conversations WHERE id = 'child'",
+            )
+            .fetch_one(db.pool())
             .await
             .unwrap();
-        let mut batch = atomic_batch("research", None);
-        batch.parent_conversation_id = parent.id;
-        batch.children[0].run.execution_authority = SubAgentExecutionAuthority::ReadOnly;
-        batch.children[0].environment =
-            phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem;
-        db.admit_sub_agent_batch_atomically(&batch)
-            .await
-            .established()
-            .unwrap()
-            .unwrap();
-        let child = db.get_conversation("child").await.unwrap();
-        assert!(child.cwd.is_empty());
-        assert!(child.attached_work_scope_id.is_none());
-        let cwd: Option<String> = sqlx::query_scalar(
-            "SELECT sub_agent_cwd_override FROM conversations WHERE id = 'child'",
-        )
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(cwd, None);
+            assert_eq!(cwd, None);
+        }
     }
 
     #[tokio::test]
-    async fn research_admission_rejects_ordinary_parent_or_coordinator_write_capabilities() {
+    async fn research_admission_rejects_ordinary_parent_or_coordinator_workspace_overrides() {
         use phoenix_core::domain::sm_state::ConversationExecutionEnvironment;
         for invalid in ["ordinary", "filesystem", "work", "direct"] {
             let db = Database::open_in_memory().await.unwrap();

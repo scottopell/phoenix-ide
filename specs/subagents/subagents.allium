@@ -189,8 +189,8 @@ enum ParentTerminalDisposition { owed | fan_in_accepted }
 
 -- Tool registries selectable for a sub-agent. The registry shape itself
 -- lives in code (crates/phoenix-ide/src/tools.rs); the spec only names
--- the two variants and which mode picks which.
-enum SubAgentToolRegistry { subagent_read_only | subagent_write_capable }
+-- the variants and which mode or durable parent picks each.
+enum SubAgentToolRegistry { subagent_read_only | subagent_write_capable | coordinator_research }
 
 ------------------------------------------------------------
 -- Config
@@ -518,7 +518,7 @@ rule CoordinatorRejectsFilesystemOrWorkResearch {
     requires: coordinator_parent(parent)
     requires: any_task_mode_is_work(tasks) or any_task_supplies_cwd(tasks)
     ensures: SpawnAgentsRejected(invocation,
-        reason: "Coordinator research requires read-only authority and no filesystem")
+        reason: "Coordinator children require Explore mode and no ambient filesystem")
     ensures: AdmittedChildCountForInvocation(parent, tasks) = 0
 }
 
@@ -552,6 +552,8 @@ rule CoordinatorResearchSpecsResolved {
         -- Execution selection uses the same configured workers, tiers, usable
         -- routes, persona restoration, max-turn defaults, and timeout as ordinary
         -- children. No cwd is resolved, inherited, fabricated, or persisted.
+        -- Admission still validates the parent's persisted scope snapshot when
+        -- the Coordinator owns its home; NoFilesystem children do not inherit it.
         -- Durable Coordinator parent identity selects the research capability;
         -- model and worker selection cannot grant it to ordinary children.
 }
@@ -678,7 +680,7 @@ rule DuplicateParentDeliveryIsIdempotent {
 -- 5. PER-MODE TOOL REGISTRIES (REQ-PROJ-008)
 -- ===========================================================
 
--- Fresh spawn: the registry is determined by the sub-agent's mode.
+-- Ordinary fresh spawn: the registry is determined by the sub-agent's mode.
 -- Explore => `subagent_read_only` (read-only information tools + browser +
 -- sandboxed bash when the platform capability is available +
 -- submit_result/submit_error). Work => `subagent_write_capable`
@@ -702,6 +704,7 @@ rule SubAgentRegistryOnFreshSpawn {
         else:
             sub_agent.tool_registry = subagent_read_only
     ensures: sub_agent.mcp_enabled = not coordinator_parent(parent)
+    ensures: coordinator_parent(parent) implies sub_agent.bash_sandboxed = false
     ensures: sub_agent.execution_authority = write_capable implies sub_agent.bash_sandboxed = false
 }
 
@@ -720,6 +723,7 @@ rule SubAgentRegistryOnResume {
         else:
             sub_agent.tool_registry = subagent_write_capable
     ensures: sub_agent.mcp_enabled = not coordinator_parent(sub_agent.parent)
+    ensures: coordinator_parent(sub_agent.parent) implies sub_agent.bash_sandboxed = false
     ensures: sub_agent.execution_authority = write_capable implies sub_agent.bash_sandboxed = false
     -- A named agent's persona is likewise restored on this path: it is
     -- persisted with the sub-agent conversation at spawn and re-read into the
@@ -781,12 +785,15 @@ invariant WorkSubAgentCwdInsideWorktree {
         is_within(sa.working_dir, sa.parent.worktree_path)
 }
 
-invariant CoordinatorResearchHasOnlyReadCapabilities {
+-- read_only denotes the absence of ambient WorkScope write authority here;
+-- the dedicated registry grants write-capable Bash through explicit targets.
+invariant CoordinatorResearchUsesExplicitTargets {
     for sa in SubAgents where coordinator_parent(sa.parent):
         sa.execution_authority = read_only
         and sa.spec.environment_kind = no_filesystem
         and sa.attached_work_scope_id = absent
         and sa.tool_registry = coordinator_research
+        and sa.bash_sandboxed = false
         and sa.mcp_enabled = false
 }
 
@@ -914,6 +921,9 @@ surface NativeSpawnAdoptionBoundary {
 --   True when any task supplies a non-null cwd, including a blank string.
 -- coordinator_research registry:
 --   query_database, search_conversations, read_conversation, resolve_reference,
---   read_file with an explicit active WorkScope target, think, submit_result,
---   submit_error. No ambient filesystem, Bash, browser, MCP,
+--   read_file and unsandboxed write-capable bash with explicit active WorkScope
+--   targets, think, submit_result, submit_error. The Coordinator home is a valid
+--   target for general shell work; project work selects its ordinary scope.
+--   Explore spawn mode does not sandbox this Bash path. No ambient directory,
+--   browser, MCP,
 --   messaging, subscriptions, skills, task approval, lifecycle, or spawn tools.

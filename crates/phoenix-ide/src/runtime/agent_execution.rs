@@ -363,7 +363,7 @@ execution = [{model = "luna", connection = "codex", reasoning_effort = "low"}]
         assert!(props.get("cwd").is_none());
         assert_eq!(props["mode"]["enum"], serde_json::json!(["explore"]));
         assert!(props["execution"].to_string().contains("gpt-6-luna"));
-        assert!(definition.description.contains("inline read-only agents"));
+        assert!(definition.description.contains("trusted inline agents"));
     }
 
     #[test]

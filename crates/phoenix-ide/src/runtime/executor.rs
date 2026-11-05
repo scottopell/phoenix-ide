@@ -5955,7 +5955,7 @@ where
                         tool_use_id: tool_use_id.clone(),
                         result: ToolResult::error(
                             tool_use_id,
-                            "Coordinator research agents have no filesystem; omit cwd".into(),
+                            "Coordinator inline agents have no default directory; omit cwd and target an active WorkScope in file reads and Bash runs".into(),
                         ),
                     }));
                 }
@@ -8272,7 +8272,8 @@ where
             "Resolved output budget cannot be represented by provider APIs".to_string()
         })?;
         let is_sub_agent = self.context.is_sub_agent;
-        let is_coordinator = self.context.is_coordinator;
+        let uses_work_scope_targets = self.context.is_coordinator
+            || (is_sub_agent && self.context.execution_environment.working_dir().is_none());
         let request_tool_surface = tool_surface;
 
         // Token streaming channel (REQ-BED-025).
@@ -8670,7 +8671,7 @@ where
                         .tool_uses()
                         .into_iter()
                         .map(|(id, name, input)| {
-                            let typed_input = if is_coordinator {
+                            let typed_input = if uses_work_scope_targets {
                                 ToolInput::from_name_and_value_with_work_scope_target(
                                     name,
                                     input.clone(),

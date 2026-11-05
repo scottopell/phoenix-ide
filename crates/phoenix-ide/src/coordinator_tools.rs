@@ -197,6 +197,7 @@ pub(crate) fn research_tools(
         }),
         Arc::new(QueryDatabase(service.clone())),
         Arc::new(WorkScopeResearchReadFile(service.clone())),
+        Arc::new(WorkScopeCoordinatorBash(service.clone())),
         Arc::new(ResolveReference {
             service,
             remote_db: db,
@@ -1468,6 +1469,69 @@ mod tests {
         assert!(!output.output().contains("gamma"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn coordinator_research_bash_uses_explicit_scope_without_ambient_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let scope = db
+            .initialize_coordinator_work_scope(home.to_str().unwrap())
+            .await
+            .unwrap();
+        let tools = research_tools(
+            GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever())),
+            db,
+        );
+        let bash = tools.iter().find(|tool| tool.name() == "bash").unwrap();
+        let ctx = ToolContext::new_without_filesystem(
+            CancellationToken::new(),
+            "research-child".into(),
+            Arc::new(crate::tools::BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(NoLlm),
+            phoenix_terminal::ActiveTerminals::new(),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            crate::work_scope::ResourceScopeKey::Unattached("research-child".into()),
+            crate::work_scope::ResourceAuthority::Restricted,
+        );
+        let registry = ctx.bash_handle_registry().clone();
+        for input in [
+            json!({"op":"run","cmd":"touch unauthorized"}),
+            json!({"op":"run","cmd":"touch unauthorized","work_scope_id":"unknown"}),
+        ] {
+            assert!(!bash.run(input, ctx.clone()).await.is_success());
+            assert!(!home.join("unauthorized").exists());
+            assert!(registry.snapshot_live_pgids().await.is_empty());
+        }
+        let output = bash
+            .run(
+                json!({"op":"run","cmd":"pwd; printf delegated > evidence.txt","work_scope_id":scope.work_scope_id.as_str(),"wait_seconds":10}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(output.is_success(), "{}", output.output());
+        assert!(output.output().contains(home.to_str().unwrap()));
+        assert_eq!(
+            std::fs::read_to_string(home.join("evidence.txt")).unwrap(),
+            "delegated"
+        );
+        let ToolOutput::Success {
+            display_data: Some(display),
+            ..
+        } = output
+        else {
+            panic!("Bash must return display data");
+        };
+        assert_eq!(
+            display["coordinator_environment"]["work_scope_id"],
+            scope.work_scope_id.as_str()
+        );
+        let handle = display["handle"].as_str().expect("Bash handle");
+        let peek = bash.run(json!({"op":"peek","handle":handle}), ctx).await;
+        assert!(peek.is_success(), "{}", peek.output());
+    }
+
     #[tokio::test]
     async fn explicit_remote_resolution_error_does_not_fall_back_locally() {
         let db = crate::db::Database::open_in_memory().await.unwrap();
@@ -2289,6 +2353,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "think",
+                "spawn_agents",
                 "search_conversations",
                 "read_conversation",
                 "query_database",

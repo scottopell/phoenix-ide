@@ -842,15 +842,16 @@ ring buffer output as the command saw it
 AND the tool description SHALL include a clear explanation of sandbox
 constraints
 
-WHEN the singleton Global Coordinator exposes `bash`
+WHEN the singleton Global Coordinator or its inline child exposes `bash`
 THE SYSTEM SHALL reuse the existing write-capable Bash execution path without applying the Explore `nono` sandbox
 AND SHALL require each `op="run"` call to provide an active persisted `WorkScope` ID
 AND SHALL resolve and canonicalize that `WorkScope`'s execution directory server-side
 AND SHALL reject the call without spawning a process when the `WorkScope` ID is missing, blank, stale, invalid, or resolves to no live owner
 AND SHALL NOT assign the Coordinator a default cwd
+AND SHALL NOT assign its inline children a default cwd or infer a Bash sandbox from their Explore spawn mode
 AND SHALL store the process solely under the selected `WorkScope`
-AND SHALL retain Coordinator continuation control as handle authorization metadata
-AND SHALL keep background-command handles available to Coordinator continuations for manual `peek`, `wait`, and `kill`
+AND SHALL retain caller control as handle authorization metadata, using Coordinator continuation control for Coordinator calls and the child's own resource identity for inline child calls
+AND SHALL keep background-command handles available to the authorized caller for manual `peek`, `wait`, and `kill`
 AND SHALL keep Coordinator-controlled terminal events from triggering branch-observation reconciliation
 AND SHALL include the process in the owning WorkScope's inventory, lifecycle broadcasts, inspection, health attribution, and teardown
 AND SHALL preserve the same command, wait, label, output, process-count, handle-control, cancellation, teardown, and audit bounds as other Bash execution
@@ -882,7 +883,7 @@ WHEN `nono::Sandbox::support_info()` reports that no enforceable sandbox backend
 with network-block and unrelated-process isolation support is available
 THE SYSTEM SHALL detect this at startup
 AND SHALL NOT expose `bash` in top-level Explore mode
-AND SHALL continue to expose the singleton Global Coordinator's unsandboxed, explicitly WorkScope-targeted Bash path
+AND SHALL continue to expose the singleton Global Coordinator's and its inline children's unsandboxed, explicitly WorkScope-targeted Bash path
 AND SHALL continue to expose the remaining read-only/planning tools for those modes
 
 WHEN degraded mode is active

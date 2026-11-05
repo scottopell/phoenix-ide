@@ -1,6 +1,6 @@
 # ADR-222: Coordinator research agents use explicit file targets
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-223](223_coordinator-inline-agents-reuse-targeted-bash.md)
 - **Date:** 2026-11-04
 - **Affects:** REQ-GR-007, REQ-SA-001, REQ-SA-002, REQ-SA-007
 

@@ -65,9 +65,11 @@ table; controller authorization metadata determines which conversation or
 Coordinator continuation may operate it. The registry has no SQLite shadow store
 or cross-restart persistence.
 
-Coordinator selects an active WorkScope ID, Phoenix resolves its canonical
+The Coordinator or its inline child selects an active WorkScope ID, Phoenix resolves its canonical
 execution directory, and the existing write-capable Bash path launches the process
-without the Explore `nono` sandbox. Coordinator control remains authorization
+without the Explore `nono` sandbox. Inline children use the same adapter with no
+ambient cwd, even in Explore spawn mode; their own resource identity controls
+their handles. Coordinator control remains authorization
 metadata while inventory, inspection, health attribution, lifecycle broadcasts,
 and teardown belong to the WorkScope.
 
@@ -132,7 +134,7 @@ entirely.
 | **REQ-BASH-010b:** Reconciliation Emits One Settled Observation Per Terminal Edge | ✅ Complete | `crates/phoenix-ide/src/runtime.rs` passes `terminal_generation` into `derive_active_work_scope_pr_selection`, so stale overlapping edges cannot overwrite a newer settled inference |
 | **REQ-BASH-010c:** Bash Reconciliation Is a Source, Not the Whole Observation Model | ✅ Complete | `crates/phoenix-ide/src/runtime.rs` observes authoritative local Git state only at supported reconciliation boundaries; the spec's scope boundary matches the implemented source model |
 | **REQ-BASH-011:** Command Safety Checks | 🔄 Relocated | Enforcement moved to the permission seam (specs/permissions/); `brush-parser` AST walk (`bash_check`) unchanged, now invoked by the seam |
-| **REQ-BASH-012:** Explore `nono` Sandbox | ✅ Complete | `SandboxedBashTool` uses a Phoenix child-process launcher; the singleton Global Coordinator instead uses unsandboxed Bash with an explicit active WorkScope target |
+| **REQ-BASH-012:** Explore `nono` Sandbox | ✅ Complete | `SandboxedBashTool` uses a Phoenix child-process launcher; the singleton Global Coordinator and its inline children instead use unsandboxed Bash with an explicit active WorkScope target |
 | **REQ-BASH-013:** Fail-Closed Explore Bash | ✅ Complete | Startup uses `nono::Sandbox::support_info()`; unsupported hosts omit Bash from top-level Explore registries without suppressing the Coordinator's separately authorized path |
 | **REQ-BASH-014:** Stateless Tool with Per-WorkScope Handle Registry | ✅ Complete | Tool stays stateless; `ctx.bash_handles()` resolves the caller's structural resource scope |
 | **REQ-BASH-WS-001:** Handle Registry Keyed by WorkScope | ✅ Complete | All handles are stored under durable WorkScope identity; globally unique IDs and controller metadata preserve Coordinator continuation control |

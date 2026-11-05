@@ -10994,9 +10994,9 @@ mod scope_liveness_tests {
 
     struct FailingLlm;
 
-    #[derive(Default)]
     struct CoordinatorResearchLlm {
         requests: Mutex<Vec<phoenix_llm::LlmRequest>>,
+        work_scope_id: String,
     }
 
     #[async_trait::async_trait]
@@ -11020,7 +11020,7 @@ mod scope_liveness_tests {
                 (false, 0) => ContentBlock::tool_use(
                     "delegate",
                     "spawn_agents",
-                    serde_json::json!({"tasks":[{"task":"Query SELECT 42 AS evidence and report research-evidence-42"}]}),
+                    serde_json::json!({"tasks":[{"task":format!("Query SELECT 42 AS evidence, run pwd and write delegated to evidence.txt using WorkScope {}, and report research-evidence-42", self.work_scope_id)}]}),
                 ),
                 (true, 0) => ContentBlock::tool_use(
                     "research-query",
@@ -11032,19 +11032,32 @@ mod scope_liveness_tests {
                         ContentBlock::ToolResult { tool_use_id, content, is_error: false, .. }
                         if tool_use_id == "research-query" && content.contains("42") && content.contains("evidence"))));
                     ContentBlock::tool_use(
+                        "research-bash",
+                        "bash",
+                        serde_json::json!({"op":"run","cmd":"pwd; printf delegated > evidence.txt","work_scope_id":self.work_scope_id,"wait_seconds":10}),
+                    )
+                }
+                (true, 2) => {
+                    assert!(request.messages.iter().flat_map(|message| &message.content).any(|block| matches!(block,
+                        ContentBlock::ToolResult { tool_use_id, content, is_error: false, .. }
+                        if tool_use_id == "research-bash" && content.contains("exited") && content.contains("evidence.txt"))), "child request: {request:#?}");
+                    ContentBlock::tool_use(
                         "research-result",
                         "submit_result",
                         serde_json::json!({"result":"research-evidence-42"}),
                     )
                 }
                 (false, 1) => {
-                    assert!(request
-                        .messages
-                        .iter()
-                        .flat_map(|message| &message.content)
-                        .any(|block| matches!(block,
+                    assert!(
+                        request
+                            .messages
+                            .iter()
+                            .flat_map(|message| &message.content)
+                            .any(|block| matches!(block,
                         ContentBlock::ToolResult { tool_use_id, content, is_error: false, .. }
-                        if tool_use_id == "delegate" && content.contains("research-evidence-42"))));
+                        if tool_use_id == "delegate" && content.contains("research-evidence-42"))),
+                        "parent request: {request:#?}"
+                    );
                     ContentBlock::text("Research received")
                 }
                 _ => panic!("unexpected research round trip"),
@@ -11063,10 +11076,21 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    async fn coordinator_inline_research_queries_and_returns_through_normal_fan_in() {
-        let llm = Arc::new(CoordinatorResearchLlm::default());
+    #[allow(clippy::too_many_lines)] // One fixture proves delegation, tool execution, and fan-in.
+    async fn coordinator_inline_research_queries_runs_bash_and_returns_through_normal_fan_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = db
+            .initialize_coordinator_work_scope(home.to_str().unwrap())
+            .await
+            .unwrap();
+        let llm = Arc::new(CoordinatorResearchLlm {
+            requests: Mutex::new(Vec::new()),
+            work_scope_id: scope.work_scope_id.to_string(),
+        });
         let manager = Arc::new(RuntimeManager::new(
-            Database::open_in_memory().await.unwrap(),
+            db,
             Arc::new(ModelRegistry::for_test_with_sonnet(llm.clone())),
             PlatformCapability::None {
                 details: "no sandbox needed for research".into(),
@@ -11110,7 +11134,11 @@ mod scope_liveness_tests {
         .expect("research and parent fan-in complete");
         assert_eq!(*states.borrow(), ConvState::Idle);
         let requests = llm.requests.lock().unwrap().clone();
-        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            std::fs::read_to_string(home.join("evidence.txt")).unwrap(),
+            "delegated"
+        );
+        assert_eq!(requests.len(), 5);
         let child_requests: Vec<_> = requests
             .iter()
             .filter(|request| {
@@ -11119,7 +11147,7 @@ mod scope_liveness_tests {
                     .starts_with("You are an inline research agent")
             })
             .collect();
-        assert_eq!(child_requests.len(), 2);
+        assert_eq!(child_requests.len(), 3);
         for request in &child_requests {
             let tools: std::collections::BTreeSet<_> = request
                 .tool_availability
@@ -11136,6 +11164,7 @@ mod scope_liveness_tests {
                     "read_conversation",
                     "resolve_reference",
                     "read_file",
+                    "bash",
                     "submit_result",
                     "submit_error"
                 ])
