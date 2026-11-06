@@ -813,7 +813,7 @@ authority closes the handoff gap: text edits cannot silently erase the scope and
 revision checks that make the feedback trustworthy. The precise lifecycle is
 specified in `ios_prose_feedback.allium`.
 
-### REQ-IOS-019: Identify Ember in the Conversation List
+### REQ-IOS-022: Identify Ember in the Conversation List
 
 WHEN the user views the native conversation list
 THE SYSTEM SHALL provide a named Ember entry for the Global coordinator, distinct from ordinary conversation rows and lifecycle actions

@@ -482,7 +482,7 @@ export function Sidebar({
 
   const isOnNewPage = location.pathname === '/' || location.pathname === '/new';
   const isOnTerminalPage = location.pathname === '/terminal';
-  const isOnGlobalPage = location.pathname === '/global';
+  const isOnGlobalPage = location.pathname === '/global' || location.pathname.startsWith('/global/');
   const collapsedProductConversations = collapsedDotProductConversations(openProductConversations, activeProductRouteIdentity);
   const collapsedConversations = productConversationsError && productConversations.length === 0
     ? collapsedDotConversations(conversations, activeSlug)

@@ -703,6 +703,19 @@ export function ConversationList({
   const [collapsedChains, setCollapsedChains] = useState<Set<string>>(new Set());
   const menuRef = useRef<HTMLDivElement>(null);
   const listRootRef = useRef<HTMLElement>(null);
+
+  useLayoutEffect(() => {
+    const root = listRootRef.current;
+    const header = root?.querySelector<HTMLElement>('.conversation-list-pinned-header');
+    if (!root || !header) return;
+    const updateScrollOffset = () => {
+      root.style.scrollPaddingTop = `${header.getBoundingClientRect().height}px`;
+    };
+    updateScrollOffset();
+    const observer = new ResizeObserver(updateScrollOffset);
+    observer.observe(header);
+    return () => observer.disconnect();
+  }, []);
   const lastRevealedActiveSlugRef = useRef<string | null>(null);
 
   const effectiveListDensity = listDensity ?? (sidebarMode ? 'sidebar' : 'full');

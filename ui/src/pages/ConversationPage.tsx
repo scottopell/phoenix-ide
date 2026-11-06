@@ -2217,7 +2217,7 @@ function ConversationPageContent({
   ) : null;
 
   const stateBarConversation = routePrefix === '/global' && conversation
-    ? { ...conversation, slug: 'Ember', cwd: '', worktree_path: null }
+    ? { ...conversation, cwd: '', worktree_path: null }
     : conversation;
 
   return (
@@ -2628,6 +2628,7 @@ function ConversationPageContent({
       ) : null}
       <RenderProfiler id="StateBar">
       <ConnectedStateBar
+        {...(routePrefix === '/global' ? { displayName: 'Ember' } : {})}
         slug={slug!}
         conversation={stateBarConversation as Conversation}
         convState={convStateForChildren}

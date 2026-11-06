@@ -128,4 +128,4 @@ remain blocked until independently scheduled.
 - The `recoverable_inconsistency` trigger is time-based rather than
   causally proven (deviation recorded in REQ-IOS-002).
 
-A pinned entry above the conversation list identifies Ember with “Global coordinator” as the secondary role description, retaining `openCoordinator()` navigation, in-flight protection, and cached-offline gating. The destination navigation title also identifies Ember from Coordinator identity rather than stored title text (REQ-IOS-019, ADR-229). Native simulator tests pass; visual qualification of the native list at large Dynamic Type sizes remains unverified.
+A pinned entry above the conversation list identifies Ember with “Global coordinator” as the secondary role description, retaining `openCoordinator()` navigation, in-flight protection, and cached-offline gating. The destination navigation title also identifies Ember from Coordinator identity rather than stored title text (REQ-IOS-022, ADR-229). Native simulator tests pass; visual qualification of the native list at large Dynamic Type sizes remains unverified.

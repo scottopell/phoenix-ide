@@ -269,7 +269,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
   return (
     <main className="coordinator-page" ref={journey.attach}>
       {error && <div className="coordinator-error coordinator-page-status">{error}</div>}
-      {loading ? <div className="coordinator-muted coordinator-page-status">Loading…</div> : null}
+      {loading ? <div className="coordinator-muted coordinator-page-status">Loading Ember…</div> : null}
 
 
 

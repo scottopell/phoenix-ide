@@ -42,8 +42,8 @@ struct ConversationListView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Open Ember, Global coordinator")
-                .accessibilityHint(model.connectivity.isOnline || model.coordinatorAvailableOffline ? "Open the Global coordinator" : "Connect to open Ember")
+                .accessibilityLabel(openingCoordinator ? "Opening Ember, Global coordinator" : "Open Ember, Global coordinator")
+                .accessibilityHint(openingCoordinator ? "Opening the Global coordinator" : (model.connectivity.isOnline || model.coordinatorAvailableOffline ? "Open the Global coordinator" : "Connect to open Ember"))
                 .disabled(openingCoordinator || (!model.connectivity.isOnline && !model.coordinatorAvailableOffline))
                 .accessibilityIdentifier("conversationList.ember")
                 list
@@ -215,7 +215,7 @@ struct ConversationListView: View {
                             .listRowSeparator(.hidden)
                     }
                 }
-                ForEach(model.listStore.conversations, id: \.aggregateIdentity) { conversation in
+                ForEach(model.listStore.conversations.filter { !$0.isCoordinator && $0.transcriptRowIdentity != model.coordinatorConversationId }, id: \.aggregateIdentity) { conversation in
                     let transcriptRowId = conversation.transcriptRowIdentity
                     let navigationId = conversation.archived == true
                         ? conversation.aggregateIdentity

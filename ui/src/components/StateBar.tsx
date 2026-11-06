@@ -83,6 +83,7 @@ export interface StateBarConversationExtension {
 }
 
 interface StateBarProps {
+  displayName?: string;
   conversation: Conversation | null;
   convState: ConversationState;
   connectionState: ConnectionState;
@@ -498,6 +499,7 @@ function formatElapsed(seconds: number): string {
 const HEARTBEAT_WATCHDOG_SECONDS = 35;
 
 export function StateBar({
+  displayName,
   conversation,
   convState,
   connectionState,
@@ -1405,7 +1407,7 @@ export function StateBar({
                 onClick={(e) => e.stopPropagation()}
               >
                 <span className="back-arrow">&larr;</span>
-                <span className="slug-text">{conversation.slug}</span>
+                <span className="slug-text">{displayName ?? conversation.slug}</span>
               </Link>
             ) : (
               <span className="statebar-slug">&mdash;</span>
@@ -1614,7 +1616,7 @@ export function StateBar({
                   title="Back to conversations"
                 >
                   <span className="back-arrow">&larr;</span>
-                  <span className="slug-text">{conversation.slug}</span>
+                  <span className="slug-text">{displayName ?? conversation.slug}</span>
                 </Link>
                 {modeLabel && (
                   <span
@@ -1625,8 +1627,8 @@ export function StateBar({
                     {modeSuffix}
                   </span>
                 )}
-                <span className="statebar-desktop-heading" title={identity?.title ?? conversation.slug}>
-                  {identity?.title ?? conversation.slug}
+                <span className="statebar-desktop-heading" title={displayName ?? identity?.title ?? conversation.slug}>
+                  {displayName ?? identity?.title ?? conversation.slug}
                 </span>
                 {projectName && (
                   <span className="statebar-project" title={identity?.path.full ?? conversation.cwd}>

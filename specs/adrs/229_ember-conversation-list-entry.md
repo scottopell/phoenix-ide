@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-11-05
-- **Affects:** `specs/global-recall/requirements.md` REQ-GR-023; `specs/ios_client/requirements.md` REQ-IOS-019
+- **Affects:** `specs/global-recall/requirements.md` REQ-GR-023; `specs/ios_client/requirements.md` REQ-IOS-022
 
 ## Context
 
