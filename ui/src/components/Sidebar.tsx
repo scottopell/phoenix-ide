@@ -3,6 +3,7 @@ import { useNavigate, useLocation } from 'react-router-dom';
 import { ApiResponseError, ConflictError, api, getConvDisplayState } from '../api';
 import type { Conversation, ProductConversationListRow } from '../api';
 import { ConversationList } from './ConversationList';
+import { EmberEntry } from './EmberEntry';
 import { productConversationPresentationIndicator, renamedProductConversationLocation } from './ConversationList.presentation';
 import { ConfirmDialog } from './ConfirmDialog';
 import { RenameDialog } from './RenameDialog';
@@ -515,14 +516,7 @@ export function Sidebar({
         >
           <TerminalGlyph />
         </button>
-        <button
-          className={`sidebar-icon-btn ${isOnGlobalPage ? 'active' : ''}`}
-          onClick={() => navigate('/global')}
-          title="Coordinator"
-          aria-label="Coordinator"
-        >
-          ◎
-        </button>
+        <EmberEntry compact active={isOnGlobalPage} onClick={() => navigate('/global')} />
         <SettingsDropdown
           theme={theme}
           onToggleTheme={toggleTheme}
@@ -609,14 +603,7 @@ export function Sidebar({
         >
           <TerminalGlyph />
         </button>
-        <button
-          className={`sidebar-icon-btn ${isOnGlobalPage ? 'active' : ''}`}
-          onClick={() => navigate('/global')}
-          title="Coordinator"
-          aria-label="Coordinator"
-        >
-          ◎
-        </button>
+
         <SettingsDropdown
           theme={theme}
           onToggleTheme={toggleTheme}
@@ -624,6 +611,7 @@ export function Sidebar({
           onPreflightInvalidated={refetchCodexPreflight}
         />
       </div>
+      <EmberEntry active={isOnGlobalPage} onClick={() => navigate('/global')} />
       <div className="sidebar-lifecycle-tabs" aria-label="Conversation lifecycle">
         <button
           type="button"

@@ -23,6 +23,7 @@ import {
   productConversationPresentationIndicator,
 } from './ConversationList.presentation';
 import './ConversationList.css';
+import { EmberEntry } from './EmberEntry';
 
 
 interface ConversationListProps {
@@ -887,6 +888,7 @@ export function ConversationList({
               <img src="/phoenix.svg" alt="" className="conversation-list-brand-logo" />
               <span>Phoenix</span>
             </button>
+            <EmberEntry active={window.location.pathname === '/global'} onClick={() => navigate('/global')} />
             <div className="conversation-list-subnav">
               <button
                 className={`archive-toggle-text ${!showArchived ? 'active' : ''}`}
@@ -906,15 +908,6 @@ export function ConversationList({
             </div>
           </div>
           <div className="conversation-list-command-cluster">
-            <button
-              type="button"
-              className="conversation-list-icon-btn conversation-list-coordinator-btn"
-              onClick={() => navigate('/global')}
-              title="Coordinator"
-              aria-label="Open Coordinator"
-            >
-              <span aria-hidden="true">◎</span>
-            </button>
             <button
               type="button"
               className="conversation-list-icon-btn"

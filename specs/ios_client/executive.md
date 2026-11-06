@@ -127,3 +127,5 @@ remain blocked until independently scheduled.
   block core ProductConversation migration.
 - The `recoverable_inconsistency` trigger is time-based rather than
   causally proven (deviation recorded in REQ-IOS-002).
+
+The conversation-list toolbar identifies the Global coordinator as Ember with an accessible role description, retaining `openCoordinator()` navigation, in-flight protection, and cached-offline gating (REQ-IOS-019, ADR-229).

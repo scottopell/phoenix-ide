@@ -21,7 +21,7 @@ describe('ConversationReturnBreadcrumb', () => {
       </MemoryRouter>,
     );
 
-    const link = screen.getByRole('link', { name: '← from: Coordinator' });
+    const link = screen.getByRole('link', { name: '← from: Ember' });
     expect(link.closest('.conversation-seed-breadcrumb')).not.toBeNull();
     fireEvent.click(link);
     expect(screen.getByText('/global/coordinator-id')).toBeInTheDocument();
@@ -34,6 +34,6 @@ describe('ConversationReturnBreadcrumb', () => {
       </MemoryRouter>,
     );
 
-    expect(screen.queryByText(/from: Coordinator/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/from: Ember/)).not.toBeInTheDocument();
   });
 });

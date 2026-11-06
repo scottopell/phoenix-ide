@@ -118,7 +118,7 @@ describe('App Markdown alias navigation', () => {
     expect(JSON.parse(screen.getByTestId('route-state').textContent!)).toEqual({
       conversationReturnOrigin: { kind: 'coordinator', href: origin },
     });
-    if (domain === 'ordinary') expect(await screen.findByRole('link', { name: '← from: Coordinator' })).toHaveAttribute('href', origin);
+    if (domain === 'ordinary') expect(await screen.findByRole('link', { name: '← from: Ember' })).toHaveAttribute('href', origin);
     view.unmount();
     vi.restoreAllMocks();
     restoreFixture();
@@ -168,7 +168,7 @@ describe('App Markdown alias navigation', () => {
       await waitFor(() => expect(screen.getByTestId('route').textContent).toBe(`/c/product-alpha${suffix}`));
       expect(lookup).toHaveBeenCalledWith(alias.split('/').at(-1), { message_limit: 1, open_id: expect.any(String), onTelemetry: expect.any(Function) });
       expect(await screen.findByTestId('product-conversation-page', {}, { timeout: 5_000 })).toBeInTheDocument();
-      const breadcrumb = await screen.findByRole('link', { name: '← from: Coordinator' });
+      const breadcrumb = await screen.findByRole('link', { name: '← from: Ember' });
       expect(breadcrumb).toHaveAttribute('href', origin);
       expect(screen.getByTestId('route-state').textContent).toBe(JSON.stringify({
         conversationReturnOrigin: { kind: 'coordinator', href: origin },

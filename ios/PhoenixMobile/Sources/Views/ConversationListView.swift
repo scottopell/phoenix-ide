@@ -14,6 +14,38 @@ struct ConversationListView: View {
         NavigationStack(path: $navPath) {
             VStack(spacing: 0) {
                 OfflineBanner()
+                Button {
+                    guard !openingCoordinator else { return }
+                    openingCoordinator = true
+                    Task {
+                        defer { openingCoordinator = false }
+                        if let id = await model.openCoordinator() {
+                            navPath.append(id)
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: "sparkle")
+                            .foregroundStyle(.tint)
+                            .frame(width: 32, height: 32)
+                            .background(.tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Ember").font(.subheadline.weight(.semibold))
+                            Text("Global coordinator").font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if openingCoordinator { ProgressView().controlSize(.small) }
+                        else { Image(systemName: "arrow.right").foregroundStyle(.secondary) }
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 9)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Open Ember, Global coordinator")
+                .accessibilityHint(model.connectivity.isOnline || model.coordinatorAvailableOffline ? "Open the Global coordinator" : "Connect to open Ember")
+                .disabled(openingCoordinator || (!model.connectivity.isOnline && !model.coordinatorAvailableOffline))
+                .accessibilityIdentifier("conversationList.ember")
                 list
             }
             .navigationTitle("Conversations")
@@ -40,32 +72,6 @@ struct ConversationListView: View {
                     } label: {
                         Image(systemName: "gearshape")
                     }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    // The fleet Coordinator: one conversation that answers
-                    // questions about all the others. Ordinary conversation
-                    // underneath, so it inherits offline caching and the
-                    // outbox for free. Enabled offline once its snapshot exists.
-                    Button {
-                        guard !openingCoordinator else { return }
-                        openingCoordinator = true
-                        Task {
-                            defer { openingCoordinator = false }
-                            if let id = await model.openCoordinator() {
-                                navPath.append(id)
-                            }
-                        }
-                    } label: {
-                        if openingCoordinator {
-                            ProgressView().controlSize(.small)
-                        } else {
-                            Image(systemName: "globe")
-                        }
-                    }
-                    .disabled(
-                        openingCoordinator
-                            || (!model.connectivity.isOnline
-                                && !model.coordinatorAvailableOffline))
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {

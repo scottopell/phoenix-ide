@@ -718,7 +718,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     unsubscribe();
   });
 
-  it('labels the global nav entry as Coordinator', async () => {
+  it('labels the global nav entry as Ember', async () => {
     const conversations = [makeConv('active-id', 'active-project-one')];
 
     const { getAllByLabelText, queryByLabelText } = render(
@@ -735,7 +735,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => {
-      expect(getAllByLabelText('Coordinator').length).toBeGreaterThan(0);
+      expect(getAllByLabelText('Open Ember, Global coordinator').length).toBeGreaterThan(0);
     });
     expect(queryByLabelText('Global Recall')).toBeNull();
   });

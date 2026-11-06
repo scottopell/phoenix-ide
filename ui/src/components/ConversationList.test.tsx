@@ -42,7 +42,7 @@ import { ConversationList, ConversationRow, ChainBlock } from './ConversationLis
 import { productConversationPresentationIndicator } from './ConversationList.presentation';
 
 describe('ConversationList — global navigation', () => {
-  it('exposes a labeled Coordinator entry from the mobile list header', () => {
+  it('exposes a labeled Ember entry from the mobile list header', () => {
     function Location() { return <span data-testid="location">{useLocation().pathname}</span>; }
     const { getByRole, getByTestId } = render(
       <MemoryRouter initialEntries={['/']}>
@@ -51,7 +51,7 @@ describe('ConversationList — global navigation', () => {
       </MemoryRouter>,
     );
 
-    fireEvent.click(getByRole('button', { name: 'Open Coordinator' }));
+    fireEvent.click(getByRole('button', { name: 'Open Ember, Global coordinator' }));
     expect(getByTestId('location')).toHaveTextContent('/global');
   });
 });

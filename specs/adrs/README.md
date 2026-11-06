@@ -222,6 +222,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [225](225_kache-v1-2-2-strict-local-only-selection.md) | Select Kache v1.2.2 only behind a Phoenix-owned local-only boundary | Accepted | development methodology; REQ-COMP-001, REQ-COMP-008 |
 | [226](226_coordinator-research-uses-explicit-file-targets.md) | Coordinator research agents use explicit file targets | Superseded by 227 | REQ-GR-007, REQ-SA-001, REQ-SA-002, REQ-SA-007 |
 | [227](227_coordinator-inline-agents-reuse-targeted-bash.md) | Coordinator inline agents reuse targeted Bash | Accepted | REQ-GR-007, REQ-SA-002, REQ-SA-007, REQ-BASH-012, REQ-BASH-013 |
+| [229](229_ember-conversation-list-entry.md) | Name and pin Ember in conversation navigation | Accepted | REQ-GR-023, REQ-IOS-019 |
 | [228](228_coordinator-inline-child-bash-controller-retirement.md) | Coordinator inline children retire their Bash controllers before parent acceptance | Accepted | REQ-GR-007, REQ-BASH-017, REQ-BASH-018, REQ-SA-003, REQ-SA-004, REQ-SA-005 |
 
 ## For agents: which decisions bind your task

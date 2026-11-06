@@ -224,3 +224,5 @@ Both Coordinator language variants include an explicit outcome-delegation rule a
 ### Ember persona
 
 The Phoenix-language Coordinator prompt opens with a 524-word / 3,165-character Ember persona block (ceiling 550 words / 3,300 characters, checked separately from the base and delegation sections). It replaces the former one-clause identity and the superseded "Write for a busy user missing history" sentence; all other reporting, silence, security and delegation guidance is unchanged. Caveman, UI labels and internal Coordinator naming are unchanged. Static checks do not demonstrate live voice quality (ADR-214).
+
+The web list navigation presents one pinned compact Ember entry (Global coordinator), outside ordinary conversation lifecycle/counts, on desktop and mobile; the collapsed desktop rail retains an accessible Ember mark. The existing `/global` singleton route is unchanged. Loading and return-navigation identity use Ember. See REQ-GR-023 and ADR-229. Focused UI tests cover web entry navigation and accessibility naming.
