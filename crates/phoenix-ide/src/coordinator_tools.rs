@@ -406,6 +406,37 @@ struct WatchInput {
 #[serde(deny_unknown_fields)]
 struct ListWatchInput {}
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteListWatchInput {
+    after: Option<uuid::Uuid>,
+}
+
+fn remote_watch_page(
+    mut rows: Vec<phoenix_db::federation_subscriptions::RemoteSubscription>,
+) -> ToolOutput {
+    let mut has_more = rows.len() > 50;
+    rows.truncate(50);
+    loop {
+        let next_cursor = has_more
+            .then(|| rows.last().map(|row| row.subscription_id))
+            .flatten();
+        let value =
+            json!({"subscriptions": rows, "has_more": has_more, "next_cursor": next_cursor});
+        let output = match serde_json::to_string(&value) {
+            Ok(output) => output,
+            Err(error) => return ToolOutput::error(error.to_string()),
+        };
+        if output.len() <= 96 * 1024 {
+            return ToolOutput::success(output);
+        }
+        if rows.pop().is_none() {
+            return ToolOutput::error("remote subscription exceeds the list output budget".into());
+        }
+        has_more = true;
+    }
+}
+
 fn watch_output(value: impl Serialize) -> ToolOutput {
     match serde_json::to_string(&value) {
         Ok(value) => ToolOutput::success(value),
@@ -535,13 +566,13 @@ impl instance::RoutedTool for ListWatchedConversations {
         instance::PeerResolution::WatchUuidIdentity
     }
     fn description(&self) -> String {
-        "List local active watches, or durable remote subscriptions for one explicit saved instance with lifecycle and admitted cursor (not a live remote snapshot). No remote fallback.".into()
+        "List local active watches, or page through durable remote subscriptions for one explicit saved instance with lifecycle and admitted cursor (not a live remote snapshot). For remote pages, pass next_cursor as after until has_more is false. No remote fallback.".into()
     }
     fn clearable(&self) -> bool {
         true
     }
     fn schema_without_instance(&self) -> Value {
-        json!({"type":"object","properties":{},"additionalProperties":false})
+        json!({"type":"object","properties":{"after":{"type":"string","format":"uuid","description":"Continue a remote listing after the previous page's next_cursor; not valid for local watches."}},"additionalProperties":false})
     }
     fn resolution_db(&self) -> &crate::db::Database {
         &self.peer_db
@@ -552,22 +583,30 @@ impl instance::RoutedTool for ListWatchedConversations {
         route: instance::Route<crate::api::federation::ResolvedPeer>,
         _ctx: ToolContext,
     ) -> ToolOutput {
-        if let Err(error) = serde_json::from_value::<ListWatchInput>(input) {
-            return ToolOutput::error(error.to_string());
-        }
         match route {
-            instance::Route::Local => match self.db.list_coordinator_watches().await {
-                Ok(watches) => watch_output(watches),
-                Err(error) => ToolOutput::error(error.to_string()),
-            },
-            instance::Route::Remote(peer) => match self
-                .db
-                .remote_subscriptions(Some(peer.instance_id()), 1024)
-                .await
-            {
-                Ok(rows) => watch_output(rows),
-                Err(error) => ToolOutput::error(error.to_string()),
-            },
+            instance::Route::Local => {
+                if let Err(error) = serde_json::from_value::<ListWatchInput>(input) {
+                    return ToolOutput::error(error.to_string());
+                }
+                match self.db.list_coordinator_watches().await {
+                    Ok(watches) => watch_output(watches),
+                    Err(error) => ToolOutput::error(error.to_string()),
+                }
+            }
+            instance::Route::Remote(peer) => {
+                let parsed: RemoteListWatchInput = match serde_json::from_value(input) {
+                    Ok(parsed) => parsed,
+                    Err(error) => return ToolOutput::error(error.to_string()),
+                };
+                match self
+                    .db
+                    .remote_subscriptions_page(peer.instance_id(), parsed.after, 50)
+                    .await
+                {
+                    Ok(rows) => remote_watch_page(rows),
+                    Err(error) => ToolOutput::error(error.to_string()),
+                }
+            }
         }
     }
 }
@@ -831,6 +870,13 @@ struct LocalQueryDatabaseInput {
     sql: String,
 }
 
+fn required_query_sql(input: &Value) -> Result<(), String> {
+    match input.get("sql").and_then(Value::as_str) {
+        Some(sql) if !sql.trim().is_empty() => Ok(()),
+        _ => Err("sql is required".into()),
+    }
+}
+
 struct ResolveReference {
     service: GlobalReadService,
     remote_db: crate::db::Database,
@@ -1011,13 +1057,13 @@ impl Tool for QueryDatabase {
         true
     }
     async fn run(&self, input: Value, _ctx: ToolContext) -> ToolOutput {
+        if let Err(error) = required_query_sql(&input) {
+            return ToolOutput::error(error);
+        }
         let parsed = match serde_json::from_value::<LocalQueryDatabaseInput>(input) {
             Ok(value) => value,
             Err(error) => return ToolOutput::error(format!("invalid input: {error}")),
         };
-        if parsed.sql.trim().is_empty() {
-            return ToolOutput::error("sql is required".to_string());
-        }
         run_local_query(
             match self {
                 Self::Local(service) => service,
@@ -1032,6 +1078,9 @@ impl Tool for QueryDatabase {
 impl instance::RoutedTool for FederatedQueryDatabase {
     fn name(&self) -> &'static str {
         "query_database"
+    }
+    fn validate_before_peer_lookup(&self, input: &Value) -> Result<(), String> {
+        required_query_sql(input)
     }
     fn nullable_instance(&self) -> bool {
         true
@@ -1054,13 +1103,13 @@ impl instance::RoutedTool for FederatedQueryDatabase {
         route: instance::Route<crate::api::federation::ResolvedPeer>,
         _ctx: ToolContext,
     ) -> ToolOutput {
+        if let Err(error) = required_query_sql(&input) {
+            return ToolOutput::error(error);
+        }
         let parsed = match serde_json::from_value::<LocalQueryDatabaseInput>(input) {
             Ok(value) => value,
             Err(error) => return ToolOutput::error(format!("invalid input: {error}")),
         };
-        if parsed.sql.trim().is_empty() {
-            return ToolOutput::error("sql is required".to_string());
-        }
         match route {
             instance::Route::Local => run_local_query(&self.service, &parsed.sql).await,
             instance::Route::Remote(peer) => match crate::api::federation::query_remote_database(
@@ -1849,22 +1898,223 @@ mod tests {
             unexpected_instance.output()
         );
 
-        let empty_sql = federated
-            .run(json!({"sql": "   "}), context("coordinator"))
-            .await;
-        assert!(!empty_sql.is_success());
-        assert_eq!(empty_sql.output(), "sql is required");
-
-        for input in [json!({}), json!({"sql": null}), json!({"sql": 7})] {
-            let output = federated.run(input, context("coordinator")).await;
+        for input in [
+            json!({}),
+            json!({"sql": null}),
+            json!({"sql": 7}),
+            json!({"sql": "   "}),
+        ] {
+            for selector in [
+                None,
+                Some(json!(null)),
+                Some(json!("local")),
+                Some(json!("missing-peer")),
+            ] {
+                let mut selected = input.clone();
+                if let Some(selector) = selector {
+                    selected["instance"] = selector;
+                }
+                let output = federated.run(selected, context("coordinator")).await;
+                assert!(!output.is_success());
+                assert_eq!(output.output(), "sql is required");
+            }
+            let output = local.run(input, context("ordinary")).await;
             assert!(!output.is_success());
+            assert_eq!(output.output(), "sql is required");
         }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn registered_watch_list_pages_all_remote_subscriptions_without_crossing_peers() {
+        use phoenix_core::domain::{
+            federation_subscription::SubscriptionReference, instance_identity::InstanceId,
+            product_conversation::ProductConversationId,
+        };
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let peer = InstanceId::new();
+        let other = InstanceId::new();
+        let bearer = phoenix_core::domain::instance_identity::PeerBearerCredential::parse(format!(
+            "phx_peer_{}",
+            "d".repeat(43)
+        ))
+        .unwrap();
+        for (id, name) in [(peer, "selected-peer"), (other, "other-peer")] {
+            db.save_federation_peer_connection(
+                id,
+                &name.parse().unwrap(),
+                &"https://localhost:1".parse().unwrap(),
+                &bearer,
+                &phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
+            )
+            .await
+            .unwrap();
+        }
+        for ordinal in 1..=1025_u128 {
+            db.save_remote_subscription(
+                &SubscriptionReference {
+                    instance_id: peer,
+                    product_conversation_id: ProductConversationId::parse(format!(
+                        "watched-{ordinal}"
+                    ))
+                    .unwrap(),
+                },
+                uuid::Uuid::from_u128(ordinal),
+            )
+            .await
+            .unwrap();
+        }
+        db.save_remote_subscription(
+            &SubscriptionReference {
+                instance_id: other,
+                product_conversation_id: ProductConversationId::parse("other-watch").unwrap(),
+            },
+            uuid::Uuid::from_u128(2048),
+        )
+        .await
+        .unwrap();
+        let retriever = Arc::new(db.fts_retriever());
+        let runtime = Arc::new(crate::runtime::RuntimeManager::new(
+            db.clone(),
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            phoenix_core::platform::PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        ));
+        let service = GlobalReadService::new(db.clone(), retriever);
+        let send_chat = Arc::new(SendChatApplicationService::new(db.clone(), runtime));
+        let registered = tools(
+            service,
+            send_chat,
+            crate::api::work_scope_load::WorkScopeLoadService::new(
+                &Arc::new(crate::tools::BashHandleRegistry::new()),
+                crate::api::resource_monitor::ResourceMonitor::new(),
+                phoenix_terminal::ActiveTerminals::new(),
+            ),
+            &db,
+        );
+        let tool = registered
+            .iter()
+            .find(|tool| tool.name() == "list_watched_conversations")
+            .unwrap();
+        assert!(tool.input_schema()["properties"].get("after").is_some());
+        let local = tool
+            .run(json!({"instance":"local"}), context("coordinator"))
+            .await;
+        assert!(local.is_success());
+        assert_eq!(
+            serde_json::from_str::<Value>(local.output()).unwrap(),
+            json!([])
+        );
+        let invalid_local = tool
+            .run(
+                json!({"instance":"local","after":uuid::Uuid::new_v4()}),
+                context("coordinator"),
+            )
+            .await;
+        assert!(!invalid_local.is_success());
+        let mut after = None;
+        let mut ids = Vec::new();
+        loop {
+            let output = tool
+                .run(
+                    json!({"instance":peer.to_string(),"after":after}),
+                    context("coordinator"),
+                )
+                .await;
+            assert!(output.is_success(), "{}", output.output());
+            assert!(output.output().len() <= 100 * 1024);
+            let page: Value = serde_json::from_str(output.output()).unwrap();
+            let rows = page["subscriptions"].as_array().unwrap();
+            assert!(!rows.is_empty());
+            ids.extend(rows.iter().map(|row| {
+                row["subscription_id"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<uuid::Uuid>()
+                    .unwrap()
+            }));
+            if page["has_more"] == false {
+                assert!(page["next_cursor"].is_null());
+                break;
+            }
+            after = Some(
+                page["next_cursor"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<uuid::Uuid>()
+                    .unwrap(),
+            );
+            assert_eq!(ids.last(), after.as_ref());
+        }
+        assert_eq!(
+            ids,
+            (1..=1025_u128)
+                .map(uuid::Uuid::from_u128)
+                .collect::<Vec<_>>()
+        );
+        let isolated = tool
+            .run(
+                json!({"instance":other.to_string()}),
+                context("coordinator"),
+            )
+            .await;
+        assert!(isolated.is_success());
+        let page: Value = serde_json::from_str(isolated.output()).unwrap();
+        assert_eq!(page["subscriptions"].as_array().unwrap().len(), 1);
+        assert_eq!(page["has_more"], false);
+        assert!(page["next_cursor"].is_null());
+        for ordinal in [2049_u128, 2050] {
+            db.save_remote_subscription(
+                &SubscriptionReference {
+                    instance_id: other,
+                    product_conversation_id: ProductConversationId::parse(format!(
+                        "large-{ordinal}-{}",
+                        "x".repeat(55_000)
+                    ))
+                    .unwrap(),
+                },
+                uuid::Uuid::from_u128(ordinal),
+            )
+            .await
+            .unwrap();
+        }
+        let first = tool
+            .run(
+                json!({"instance":other.to_string(),"after":uuid::Uuid::from_u128(2048)}),
+                context("coordinator"),
+            )
+            .await;
+        assert!(first.is_success(), "{}", first.output());
+        assert!(first.output().len() <= 100 * 1024);
+        let first_page: Value = serde_json::from_str(first.output()).unwrap();
+        assert_eq!(first_page["subscriptions"].as_array().unwrap().len(), 1);
+        assert_eq!(first_page["has_more"], true);
+        assert_eq!(
+            first_page["next_cursor"],
+            json!(uuid::Uuid::from_u128(2049))
+        );
+        let last = tool
+            .run(
+                json!({"instance":other.to_string(),"after":first_page["next_cursor"]}),
+                context("coordinator"),
+            )
+            .await;
+        assert!(last.is_success(), "{}", last.output());
+        assert!(last.output().len() <= 100 * 1024);
+        let last_page: Value = serde_json::from_str(last.output()).unwrap();
+        assert_eq!(last_page["subscriptions"].as_array().unwrap().len(), 1);
+        assert_eq!(last_page["has_more"], false);
+        assert!(last_page["next_cursor"].is_null());
     }
 
     #[tokio::test]
     async fn explicit_local_reads_preserve_local_resolution_and_message_context() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("explicit-local-reads.db");
+
         let db = crate::db::Database::open(db_path.to_str().unwrap())
             .await
             .unwrap();

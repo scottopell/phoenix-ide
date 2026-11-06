@@ -562,6 +562,31 @@ impl Database {
     ) -> DbResult<Vec<RemoteSubscription>> {
         sqlx::query("SELECT *, EXISTS(SELECT 1 FROM federation_pending_unsubscribes u WHERE u.destination_instance_id = federation_remote_subscriptions.destination_instance_id AND u.subscription_id = federation_remote_subscriptions.subscription_id) AS pending_unsubscribe FROM federation_remote_subscriptions WHERE (?1 IS NULL OR destination_instance_id = ?1) ORDER BY destination_instance_id,subscription_id LIMIT ?2").bind(destination.map(|id| id.to_string())).bind(limit.clamp(1,1024)).fetch_all(&self.pool).await?.iter().map(decode_remote).collect()
     }
+
+    /// Read one keyset page of saved source subscriptions for a destination.
+    ///
+    /// The result includes one lookahead row when available so callers can detect
+    /// whether another page exists. The requested page size is capped at 50.
+    ///
+    /// # Errors
+    /// Returns an error if the query fails or persisted bindings cannot be decoded.
+    pub async fn remote_subscriptions_page(
+        &self,
+        destination: InstanceId,
+        after: Option<Uuid>,
+        limit: i64,
+    ) -> DbResult<Vec<RemoteSubscription>> {
+        let fetch_limit = limit.clamp(1, 50) + 1;
+        sqlx::query("SELECT *, EXISTS(SELECT 1 FROM federation_pending_unsubscribes u WHERE u.destination_instance_id = federation_remote_subscriptions.destination_instance_id AND u.subscription_id = federation_remote_subscriptions.subscription_id) AS pending_unsubscribe FROM federation_remote_subscriptions WHERE destination_instance_id = ?1 AND (?2 IS NULL OR subscription_id > ?2) ORDER BY subscription_id LIMIT ?3")
+            .bind(destination.to_string())
+            .bind(after.map(|id| id.to_string()))
+            .bind(fetch_limit)
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(decode_remote)
+            .collect()
+    }
     /// Stop unrequested delivery without discarding in-flight authorization identities.
     ///
     /// # Errors
@@ -670,5 +695,84 @@ impl Database {
     pub async fn touch_remote_subscription(&self, remote: &RemoteSubscription) -> DbResult<()> {
         sqlx::query("UPDATE federation_remote_subscriptions SET last_sync_at_us = ?3 WHERE destination_instance_id = ?1 AND subscription_id = ?2").bind(remote.reference.instance_id.to_string()).bind(remote.subscription_id.to_string()).bind(chrono::Utc::now().timestamp_micros()).execute(&self.pool).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod destination_pagination_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn destination_pages_are_ordered_isolated_and_bounded() {
+        let db = Database::open_in_memory().await.unwrap();
+        let destination = InstanceId::new();
+        let other_destination = InstanceId::new();
+
+        for ordinal in 1..=1025_u128 {
+            let reference = SubscriptionReference {
+                instance_id: destination,
+                product_conversation_id: ProductConversationId::parse(format!(
+                    "uncapped-{ordinal}"
+                ))
+                .unwrap(),
+            };
+            db.save_remote_subscription(&reference, Uuid::from_u128(ordinal))
+                .await
+                .unwrap();
+        }
+        db.save_remote_subscription(
+            &SubscriptionReference {
+                instance_id: other_destination,
+                product_conversation_id: ProductConversationId::parse("other-destination").unwrap(),
+            },
+            Uuid::from_u128(2048),
+        )
+        .await
+        .unwrap();
+
+        let mut listed = Vec::new();
+        let mut after = None;
+        loop {
+            let page = db
+                .remote_subscriptions_page(destination, after, 50)
+                .await
+                .unwrap();
+            let has_more = page.len() > 50;
+            let visible = page.into_iter().take(50).collect::<Vec<_>>();
+            if let Some(last) = visible.last() {
+                after = Some(last.subscription_id);
+            }
+            listed.extend(visible);
+            if !has_more {
+                break;
+            }
+        }
+        assert_eq!(listed.len(), 1025);
+        assert!(listed
+            .iter()
+            .all(|subscription| subscription.reference.instance_id == destination));
+        assert!(listed
+            .windows(2)
+            .all(|pair| pair[0].subscription_id < pair[1].subscription_id));
+        assert_eq!(
+            listed
+                .iter()
+                .map(|row| row.subscription_id)
+                .collect::<Vec<_>>(),
+            (1..=1025_u128).map(Uuid::from_u128).collect::<Vec<_>>()
+        );
+
+        let bounded = db
+            .remote_subscriptions(Some(destination), 2048)
+            .await
+            .unwrap();
+        assert_eq!(bounded.len(), 1024);
+
+        let isolated = db
+            .remote_subscriptions_page(other_destination, None, 50)
+            .await
+            .unwrap();
+        assert_eq!(isolated.len(), 1);
+        assert_eq!(isolated[0].subscription_id, Uuid::from_u128(2048));
     }
 }

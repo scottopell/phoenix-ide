@@ -224,7 +224,9 @@ async fn registered_watch_unwatch_and_list_route_saved_peer_without_local_watch_
         run_coordinator_tool(&list, json!({"instance": "isolated receiver"})).await;
     assert!(listed_by_name.is_success(), "{}", listed_by_name.output());
     let listed_by_name: Value = serde_json::from_str(listed_by_name.output()).unwrap();
-    assert_eq!(listed_by_name.as_array().unwrap().len(), 1);
+    assert_eq!(listed_by_name["subscriptions"].as_array().unwrap().len(), 1);
+    assert_eq!(listed_by_name["has_more"], false);
+    assert!(listed_by_name["next_cursor"].is_null());
     assert!(listed_by_name.to_string().contains(&remote_id));
     assert!(!listed_by_name.to_string().contains(&local_id));
 
@@ -265,8 +267,19 @@ async fn registered_watch_unwatch_and_list_route_saved_peer_without_local_watch_
         listed_after_unwatch.output()
     );
     let listed_after_unwatch: Value = serde_json::from_str(listed_after_unwatch.output()).unwrap();
-    assert_eq!(listed_after_unwatch.as_array().unwrap().len(), 1);
-    assert_eq!(listed_after_unwatch[0]["pending_unsubscribe"], true);
+    assert_eq!(
+        listed_after_unwatch["subscriptions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        listed_after_unwatch["subscriptions"][0]["pending_unsubscribe"],
+        true
+    );
+    assert_eq!(listed_after_unwatch["has_more"], false);
+    assert!(listed_after_unwatch["next_cursor"].is_null());
 
     let local_watches = a.state.db.list_coordinator_watches().await.unwrap();
     assert_eq!(local_watches.len(), 1);
