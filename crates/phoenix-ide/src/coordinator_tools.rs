@@ -1344,7 +1344,7 @@ impl instance::RoutedTool for FederatedSendConversationMessage {
         "Send one conversation-authored message by typed target locally or to one explicitly selected saved peer. @conv:<product_conversation_id> routes to the current writable transcript at authoritative admission; @transcript:<conversation_id> targets that exact runtime member. Remote messages are limited to 32768 UTF-8 bytes. No local fallback. Never target this conversation, a sub-agent, or the Coordinator chain. Delivered or queued outcomes report acceptance only.".into()
     }
     fn clearable(&self) -> bool {
-        true
+        false
     }
     fn schema_without_instance(&self) -> Value {
         self.local.input_schema()
@@ -2773,6 +2773,19 @@ mod tests {
             schemas["read_conversation"]["properties"]["conversation_id"]["oneOf"][1]["pattern"],
             "^@transcript:[^\\s#]+(?:#message-[^\\s#]+)?$"
         );
+    }
+
+    #[tokio::test]
+    async fn coordinator_send_receipt_is_not_clearable() {
+        let (_, coordinator) = application_tools().await;
+        let registry = crate::tools::ToolRegistry::coordinator(coordinator, None);
+        let send = registry
+            .find_tool("send_conversation_message")
+            .expect("send tool");
+        assert!(!send.clearable());
+        assert!(!registry
+            .clearable_tool_names()
+            .contains("send_conversation_message"));
     }
 
     #[tokio::test]
