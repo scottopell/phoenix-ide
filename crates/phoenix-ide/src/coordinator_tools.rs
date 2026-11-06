@@ -418,6 +418,9 @@ impl instance::RoutedTool for WatchConversation {
     fn name(&self) -> &'static str {
         "watch_conversation"
     }
+    fn clearable(&self) -> bool {
+        false
+    }
     fn description(&self) -> String {
         "Subscribe this Global Coordinator to future terminal facts for an open ordinary stable ProductConversation. Returns its current transcript and state atomically with enrollment. No historical events are replayed.".into()
     }
@@ -467,6 +470,9 @@ impl instance::RoutedTool for WatchConversation {
 impl instance::RoutedTool for UnwatchConversation {
     fn name(&self) -> &'static str {
         "unwatch_conversation"
+    }
+    fn clearable(&self) -> bool {
+        false
     }
     fn description(&self) -> String {
         "End this Global Coordinator's subscription to a stable ProductConversation. Suppress pending but not already accepted notifications.".into()
@@ -921,6 +927,13 @@ impl instance::RoutedTool for FederatedReadConversation {
     fn name(&self) -> &'static str {
         "read_conversation"
     }
+    fn validate_before_peer_lookup(&self, input: &Value) -> Result<(), String> {
+        let parsed: FederatedReadConversationInput = serde_json::from_value(input.clone())
+            .map_err(|error| format!("invalid input: {error}"))?;
+        crate::api::federation::validate_remote_read_target(&parsed.conversation_id, parsed.cursor)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
     fn nullable_instance(&self) -> bool {
         true
     }
@@ -1074,6 +1087,13 @@ async fn run_local_query(service: &GlobalReadService, sql: &str) -> ToolOutput {
 impl instance::RoutedTool for ResolveReference {
     fn name(&self) -> &'static str {
         "resolve_reference"
+    }
+    fn validate_before_peer_lookup(&self, input: &Value) -> Result<(), String> {
+        let parsed: ResolveReferenceInput =
+            serde_json::from_value(input.clone()).map_err(|error| error.to_string())?;
+        crate::api::federation::validate_remote_resolve_reference(&parsed.reference)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
     fn nullable_instance(&self) -> bool {
         true
@@ -3397,13 +3417,16 @@ mod tests {
             ),
         ));
 
-        let tool = SendConversationMessage {
-            service: GlobalReadService::new(state.db.clone(), state.message_retriever.clone()),
-            send_chat: Arc::new(SendChatApplicationService::new(
-                state.db.clone(),
-                state.runtime,
-            )),
-        };
+        let tool = instance::RouteTool::new(FederatedSendConversationMessage {
+            local: SendConversationMessage {
+                service: GlobalReadService::new(state.db.clone(), state.message_retriever.clone()),
+                send_chat: Arc::new(SendChatApplicationService::new(
+                    state.db.clone(),
+                    state.runtime,
+                )),
+            },
+            db: state.db.clone(),
+        });
         let output = tool
             .run(
                 json!({
@@ -3450,10 +3473,13 @@ mod tests {
             Arc::new(crate::tools::mcp::McpClientManager::new()),
             None,
         ));
-        let tool = SendConversationMessage {
-            service: GlobalReadService::new(db.clone(), retriever),
-            send_chat: Arc::new(SendChatApplicationService::new(db.clone(), runtime)),
-        };
+        let tool = instance::RouteTool::new(FederatedSendConversationMessage {
+            local: SendConversationMessage {
+                service: GlobalReadService::new(db.clone(), retriever),
+                send_chat: Arc::new(SendChatApplicationService::new(db.clone(), runtime)),
+            },
+            db: db.clone(),
+        });
         let message_id = uuid::Uuid::new_v4().to_string();
 
         for target in [

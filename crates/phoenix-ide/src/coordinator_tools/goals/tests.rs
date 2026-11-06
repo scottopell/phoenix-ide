@@ -1447,6 +1447,32 @@ async fn watch_tools_treat_omitted_and_exact_local_as_equal_and_reject_invalid_s
 }
 
 #[tokio::test]
+async fn malformed_remote_reads_reject_before_saved_peer_lookup() {
+    let f = Fixture::new().await;
+    for (name, input, expected) in [
+        (
+            "read_conversation",
+            json!({"instance":"missing-peer", "conversation_id":"@conv:target", "cursor":1_000_001}),
+            "cursor exceeds maximum",
+        ),
+        (
+            "resolve_reference",
+            json!({"instance":"missing-peer", "reference":"not-a-reference"}),
+            "reference",
+        ),
+    ] {
+        let output = f.invoke(name, input).await;
+        assert!(!output.is_success());
+        assert!(
+            output.output().contains(expected),
+            "{name}: {}",
+            output.output()
+        );
+        assert!(!output.output().contains("peer connection not found"));
+    }
+}
+
+#[tokio::test]
 async fn production_coordinator_query_database_routes_to_local_when_omitted_or_exact_local() {
     let f = Fixture::new().await;
     let registry = f

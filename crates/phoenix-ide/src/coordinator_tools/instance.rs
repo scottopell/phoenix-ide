@@ -106,6 +106,9 @@ pub(crate) trait RoutedTool: Send + Sync {
     async fn authorize(&self, _ctx: &ToolContext) -> Result<(), String> {
         Ok(())
     }
+    fn validate_before_peer_lookup(&self, _input: &Value) -> Result<(), String> {
+        Ok(())
+    }
     async fn run_routed(
         &self,
         input: Value,
@@ -172,6 +175,9 @@ impl<T: RoutedTool + 'static> Tool for RouteTool<T> {
         let route = match selector {
             InstanceSelector::Local => Route::Local,
             InstanceSelector::Remote(selector) => {
+                if let Err(error) = self.0.validate_before_peer_lookup(&input) {
+                    return ToolOutput::error(error);
+                }
                 match crate::api::federation::resolve_tool_peer(self.0.db(), &selector).await {
                     Ok(peer) => Route::Remote(peer),
                     Err(error) => return ToolOutput::error(error.to_string()),

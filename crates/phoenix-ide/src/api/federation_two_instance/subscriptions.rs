@@ -3,6 +3,7 @@ use crate::api::federation::subscriptions::*;
 use phoenix_core::domain::{
     federation_subscription::*, product_conversation::ProductConversationId,
 };
+use phoenix_tools::Tool;
 use uuid::Uuid;
 
 async fn source(instance: &TestInstance) -> phoenix_db::Conversation {
@@ -125,6 +126,161 @@ fn create_request(
     }
 }
 
+fn coordinator_tool(
+    instance: &TestInstance,
+    name: &str,
+) -> std::sync::Arc<dyn phoenix_tools::Tool> {
+    let db = instance.state.db.clone();
+    let global_read = crate::api::global_read::GlobalReadService::new(
+        db.clone(),
+        std::sync::Arc::new(db.fts_retriever()),
+    );
+    let send_chat = std::sync::Arc::new(crate::send_chat_service::SendChatApplicationService::new(
+        db.clone(),
+        instance.state.runtime.clone(),
+    ));
+    let handles = std::sync::Arc::new(crate::tools::BashHandleRegistry::new());
+    let load = crate::api::work_scope_load::WorkScopeLoadService::new(
+        &handles,
+        crate::api::resource_monitor::ResourceMonitor::new(),
+        phoenix_terminal::ActiveTerminals::new(),
+    );
+    crate::coordinator_tools::tools(global_read, send_chat, load, &db)
+        .into_iter()
+        .find(|tool| tool.name() == name)
+        .unwrap_or_else(|| panic!("Coordinator registry must expose {name}"))
+}
+
+fn tool_context() -> phoenix_tools::ToolContext {
+    struct NoLlm;
+
+    impl phoenix_core::llm_service::LlmSelector for NoLlm {
+        fn get(
+            &self,
+            _model_id: &str,
+        ) -> Option<std::sync::Arc<dyn phoenix_core::llm_service::CompletionService>> {
+            None
+        }
+
+        fn default_service(
+            &self,
+        ) -> Option<std::sync::Arc<dyn phoenix_core::llm_service::CompletionService>> {
+            None
+        }
+    }
+
+    phoenix_tools::ToolContext::new_without_filesystem(
+        tokio_util::sync::CancellationToken::new(),
+        "test-transcript".into(),
+        std::sync::Arc::new(crate::tools::BrowserSessionManager::default()),
+        std::sync::Arc::new(crate::tools::BashHandleRegistry::new()),
+        std::sync::Arc::new(NoLlm),
+        phoenix_terminal::ActiveTerminals::new(),
+        std::sync::Arc::new(crate::tools::TmuxRegistry::new()),
+        crate::work_scope::ResourceScopeKey::Coordinator,
+        crate::work_scope::ResourceAuthority::Work,
+    )
+}
+
+async fn run_coordinator_tool(
+    tool: &std::sync::Arc<dyn phoenix_tools::Tool>,
+    input: serde_json::Value,
+) -> phoenix_tools::ToolOutput {
+    tool.run(input, tool_context()).await
+}
+
+#[tokio::test]
+async fn registered_watch_unwatch_and_list_route_saved_peer_without_local_watch_crossover() {
+    use serde_json::{json, Value};
+
+    let a = TestInstance::start().await;
+    let b = TestInstance::start().await;
+    let peer = a.connect_to(&b).await;
+    let local = source(&a).await;
+    let remote = source(&b).await;
+    assert_ne!(
+        local.product_conversation_id,
+        remote.product_conversation_id
+    );
+
+    a.state
+        .db
+        .watch_product_conversation(&local.product_conversation_id)
+        .await
+        .unwrap();
+
+    let watch = coordinator_tool(&a, "watch_conversation");
+    let unwatch = coordinator_tool(&a, "unwatch_conversation");
+    let list = coordinator_tool(&a, "list_watched_conversations");
+    let remote_id = remote.product_conversation_id.to_string();
+    let local_id = local.product_conversation_id.to_string();
+    let watch_result = run_coordinator_tool(
+        &watch,
+        json!({"instance": peer.peer_instance_id.to_string(), "product_conversation_id": remote_id}),
+    )
+    .await;
+    assert!(watch_result.is_success(), "{}", watch_result.output());
+
+    let listed_by_name =
+        run_coordinator_tool(&list, json!({"instance": "isolated receiver"})).await;
+    assert!(listed_by_name.is_success(), "{}", listed_by_name.output());
+    let listed_by_name: Value = serde_json::from_str(listed_by_name.output()).unwrap();
+    assert_eq!(listed_by_name.as_array().unwrap().len(), 1);
+    assert!(listed_by_name.to_string().contains(&remote_id));
+    assert!(!listed_by_name.to_string().contains(&local_id));
+
+    let listed_local = run_coordinator_tool(&list, json!({"instance": "local"})).await;
+    assert!(listed_local.is_success(), "{}", listed_local.output());
+    let listed_local: Value = serde_json::from_str(listed_local.output()).unwrap();
+    assert!(listed_local.to_string().contains(&local_id));
+    assert!(!listed_local.to_string().contains(&remote_id));
+
+    b.stop().await;
+    let unwatch_result = run_coordinator_tool(
+        &unwatch,
+        json!({"instance": peer.peer_instance_id.to_string(), "product_conversation_id": remote_id}),
+    )
+    .await;
+    assert!(unwatch_result.is_success(), "{}", unwatch_result.output());
+    let remaining = a
+        .state
+        .db
+        .remote_subscriptions(Some(peer.peer_instance_id), 1024)
+        .await
+        .unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert!(remaining[0].pending_unsubscribe);
+    assert_eq!(
+        remaining[0].reference.product_conversation_id.as_str(),
+        remote_id
+    );
+
+    let listed_after_unwatch = run_coordinator_tool(
+        &list,
+        json!({"instance": peer.peer_instance_id.to_string()}),
+    )
+    .await;
+    assert!(
+        listed_after_unwatch.is_success(),
+        "{}",
+        listed_after_unwatch.output()
+    );
+    let listed_after_unwatch: Value = serde_json::from_str(listed_after_unwatch.output()).unwrap();
+    assert_eq!(listed_after_unwatch.as_array().unwrap().len(), 1);
+    assert_eq!(listed_after_unwatch[0]["pending_unsubscribe"], true);
+
+    let local_watches = a.state.db.list_coordinator_watches().await.unwrap();
+    assert_eq!(local_watches.len(), 1);
+    assert_eq!(
+        local_watches[0].product_conversation_id,
+        local.product_conversation_id
+    );
+
+    a.stop().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn https_subscription_future_only_nonempty_idle_and_busy_admission_ack_and_replacement() {

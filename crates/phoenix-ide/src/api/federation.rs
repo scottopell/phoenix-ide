@@ -1606,12 +1606,18 @@ async fn send_bounded_peer_request<T: serde::de::DeserializeOwned>(
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+pub(crate) fn validate_remote_resolve_reference(
+    reference: &str,
+) -> Result<RemoteConversationTarget, FederationClientError> {
+    RemoteConversationTarget::parse(reference)
+}
+
 pub async fn resolve_remote_reference(
     db: &crate::db::Database,
     peer: &ResolvedPeer,
     reference: &str,
 ) -> Result<RemoteResolveReferenceResponse, FederationClientError> {
-    let requested = RemoteConversationTarget::parse(reference)?;
+    let requested = validate_remote_resolve_reference(reference)?;
     let peer_id = peer.instance_id;
     let caller = db.instance_id().await?;
     let mut response: RemoteResolveReferenceResponse = send_bounded_peer_request(
@@ -1672,17 +1678,25 @@ fn validate_remote_read_cursor(cursor: usize) -> Result<(), FederationClientErro
     Ok(())
 }
 
+pub(crate) fn validate_remote_read_target(
+    reference: &str,
+    cursor: usize,
+) -> Result<RemoteConversationTarget, FederationClientError> {
+    validate_remote_read_cursor(cursor)?;
+    let requested = RemoteConversationTarget::parse(reference)?;
+    require_bounded_read_target(&requested)?;
+    validate_remote_cursor_target(&requested, cursor)
+        .map_err(|error| FederationClientError::RemoteRejected(error.to_string()))?;
+    Ok(requested)
+}
+
 pub async fn read_remote_conversation(
     db: &crate::db::Database,
     peer: &ResolvedPeer,
     reference: &str,
     cursor: usize,
 ) -> Result<RemoteReadConversationResponse, FederationClientError> {
-    validate_remote_read_cursor(cursor)?;
-    let requested = RemoteConversationTarget::parse(reference)?;
-    require_bounded_read_target(&requested)?;
-    validate_remote_cursor_target(&requested, cursor)
-        .map_err(|error| FederationClientError::RemoteRejected(error.to_string()))?;
+    let requested = validate_remote_read_target(reference, cursor)?;
     let peer_id = peer.instance_id;
     let caller = db.instance_id().await?;
     let request = RemoteReadConversationRequest {
