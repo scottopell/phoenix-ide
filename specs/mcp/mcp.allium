@@ -22,6 +22,8 @@ config {
     -- stdio bridge. Held as a config constant so the decision is a checkable
     -- invariant rather than prose (REQ-MCP-019).
     legacy_sse_native: Boolean = false
+    http_recovery_initial_delay: Duration = 5.seconds
+    http_recovery_max_delay: Duration = 60.seconds
 }
 
 ------------------------------------------------------------
@@ -42,6 +44,10 @@ enum AuthScheme { none | static | oauth }
 
 -- Sub-lifecycle within auth_scheme = oauth.
 enum OAuthPhase { discovering | registering | awaiting_user | authorized | refreshing }
+
+enum HttpRecoveryState { attempting | waiting | completed | blocked | superseded }
+enum HttpRecoveryPhase { cleanup | credentials | credential_persistence | handshake }
+enum HttpFailureKind { temporary | authentication | scope | permanent | quiescence }
 
 ------------------------------------------------------------
 -- Entities
@@ -73,6 +79,40 @@ entity McpServer {
 
     -- Failure cause retained for the status API (REQ-MCP-018).
     last_error: String           when state = failed
+}
+
+-- Process-local ownership of an HTTP connection lifecycle, not a tool-call
+-- retry or a durable workflow. Historical episodes are not a retention contract.
+entity HttpRecovery {
+    server: McpServer
+    owner_key: String
+    status: HttpRecoveryState
+    phase: HttpRecoveryPhase
+    attempt_number: Integer
+    next_retry_at: Timestamp?
+    last_failure: String?
+
+    transitions status {
+        attempting -> waiting
+        attempting -> completed
+        attempting -> blocked
+        attempting -> superseded
+        waiting -> attempting
+        waiting -> superseded
+        terminal: completed, blocked, superseded
+    }
+
+    invariant WaitingHasDeadline {
+        (status = waiting) = (next_retry_at != null)
+    }
+}
+
+external entity HttpLifecycleFailure {
+    kind: HttpFailureKind
+    phase: HttpRecoveryPhase
+    description: String
+    retry_not_before: Timestamp?
+    authorization_challenge: String?
 }
 
 -- Persisted client identity for an authorization server. Keyed by the
@@ -135,6 +175,10 @@ surface McpControl {
         srv.tools when srv.state = ready
         srv.pending_auth_url when srv.state = unauthorized
         srv.last_error when srv.state = failed
+        for recovery in HttpRecoveries where server = srv and status in {attempting, waiting}:
+            recovery.phase
+            recovery.last_failure
+            recovery.next_retry_at
 
     provides:
         DisableServer(srv)
@@ -260,6 +304,7 @@ rule ConnectFailed {
     when: ServerConnectFailed(srv, error)
 
     requires: srv.state in { connecting, reconnecting }
+    requires: not automatic_http_retry_eligible(srv, error)
 
     ensures: srv.state = failed
     ensures: srv.last_error = error
@@ -339,6 +384,111 @@ rule HttpSessionExpired {
     @guidance
         -- 404 on a session-bearing request -> treat session as expired,
         -- re-run initialize (REQ-MCP-005).
+}
+
+-- REQ-MCP-007/012/013: lifecycle retries have an owner even without callers.
+-- Initial HTTP establishment and reconnect ownership both admit this event.
+rule HttpRecoveryStarts {
+    when: HttpLifecycleStarted(srv, owner_key, phase)
+    requires: srv.transport = http
+    requires: http_connection_target(srv)
+    requires: current_http_owner(srv, owner_key)
+    requires: not exists r in HttpRecoveries where r.server = srv and r.status in {attempting, waiting}
+
+    ensures: HttpRecovery.created(server: srv, owner_key: owner_key,
+        status: attempting, phase: phase, attempt_number: 1,
+        next_retry_at: null, last_failure: null)
+}
+
+rule HttpRecoveryWaitsAfterTemporaryFailure {
+    when: HttpLifecycleFailed(recovery, failure)
+    requires: recovery.status = attempting
+    requires: current_http_owner(recovery.server, recovery.owner_key)
+    requires: failure.kind = temporary
+
+    ensures: recovery.status = waiting
+    ensures: recovery.phase = failure.phase
+    ensures: recovery.last_failure = failure.description
+    ensures: recovery.next_retry_at = http_retry_deadline(recovery, failure)
+    ensures: recovery.server.state = reconnecting
+}
+
+rule HttpRecoveryRetriesWhenDue {
+    when: recovery: HttpRecovery.next_retry_at <= now
+    requires: recovery.status = waiting
+    requires: current_http_owner(recovery.server, recovery.owner_key)
+    requires: http_connection_target(recovery.server)
+
+    ensures: recovery.status = attempting
+    ensures: recovery.next_retry_at = null
+    ensures: recovery.attempt_number = recovery.attempt_number + 1
+    ensures: ResumeHttpLifecycle(recovery)
+
+    @guidance
+        -- Resume the unfinished lifecycle step with retained session/credential
+        -- ownership. No tools/call is replayed by this event. Every network step
+        -- remains bounded and cancellable; recovery does not extend a caller's
+        -- deadline. Reload, callers and status readers join this owner.
+}
+
+rule HttpRecoveryHandsAuthenticationToOAuth {
+    when: HttpLifecycleFailed(recovery, failure)
+    requires: recovery.status = attempting
+    requires: current_http_owner(recovery.server, recovery.owner_key)
+    requires: failure.kind in {authentication, scope}
+
+    ensures: recovery.status = blocked
+    ensures: recovery.phase = failure.phase
+    ensures: recovery.last_failure = failure.description
+    ensures: OwnedHttpAuthorizationNeeded(recovery.server, failure)
+
+    @guidance
+        -- The OAuth rules retain the same non-callable transport and challenge.
+        -- DELETE 401 or expired credentials can admit OAuth after transport
+        -- cleanup failure without a concurrent failing tool call. Static auth
+        -- remains failed. A fresh grant rejected for the same challenge enters
+        -- owned authorization rather than repeating refresh indefinitely.
+        -- Once OAuth can resume connection work, HttpLifecycleStarted admits its
+        -- current owner. No denied/expired browser flow is retried automatically.
+}
+
+rule HttpRecoveryStopsOnActionableFailure {
+    when: HttpLifecycleFailed(recovery, failure)
+    requires: recovery.status = attempting
+    requires: current_http_owner(recovery.server, recovery.owner_key)
+    requires: failure.kind in {permanent, quiescence}
+
+    ensures: recovery.status = blocked
+    ensures: recovery.phase = failure.phase
+    ensures: recovery.last_failure = failure.description
+    ensures: recovery.server.state = failed
+    ensures: recovery.server.last_error = failure.description
+}
+
+rule HttpRecoveryCompletes {
+    when: HttpLifecycleReady(recovery)
+    requires: recovery.status = attempting
+    requires: current_http_owner(recovery.server, recovery.owner_key)
+    requires: recovery.server.state = ready
+
+    ensures: recovery.status = completed
+    ensures: recovery.next_retry_at = null
+    ensures: recovery.last_failure = null
+}
+
+rule HttpRecoverySuperseded {
+    when: HttpLifecycleOwnerReplaced(recovery)
+    requires: recovery.status in {attempting, waiting}
+
+    ensures: recovery.status = superseded
+    ensures: recovery.next_retry_at = null
+
+    @guidance
+        -- Transfer retained cleanup through configuration/removal ownership;
+        -- ending this retry episode does not abandon its transport. Old timers
+        -- and completions cannot mutate credentials, publish auth or tools.
+        -- Existing transient-refresh removal behavior remains under REQ-MCP-012;
+        -- this episode adds no automatic cleanup retries for removal or shutdown.
 }
 
 -- A stdio server's process exited; respawn and reconnect (REQ-MCP-003).
@@ -617,7 +767,8 @@ rule TokenRefreshNeeded {
         -- grant with the replaced refresh token. Token invalidation discards
         -- this unpersisted response under the same per-server mutation fence.
         -- Reauthorization setup errors settle as failed with explicit retry
-        -- ownership; only token-refresh transport failures retry automatically.
+        -- ownership. Configured HTTP lifecycle failures use the typed temporary
+        -- retry policy; browser denial, quiescence and permanent failures do not.
         -- Token persistence, invalidation, and re-prompt publication share the
         -- per-server config-reconciliation mutation fence. Check the recovery epoch after
         -- acquiring that fence, so a superseded retry cannot mutate credentials
@@ -1235,10 +1386,34 @@ invariant SingleRecoveryLeaderPerEpoch {
     -- epoch for authorization before replaying; config changes reject the
     -- original invocation and cannot inherit its scopes or discovery metadata.
     -- Failed owned cleanup distinguishes authorization rejection from transient
-    -- teardown failure after fresh credentials were installed. Explicit retry
+    -- teardown failure after fresh credentials were installed. Automatic retry
     -- reuses a valid persisted bearer for the latter, refreshing on expiry;
     -- authorization retries preserve the challenge and scope union for sign-in.
 }
+
+invariant OneAutomaticHttpRecoveryOwner {
+    for srv in McpServers:
+        (HttpRecoveries where server = srv and status in {attempting, waiting}).count <= 1
+}
+
+-- Automatic-recovery helpers (REQ-MCP-007/012/013):
+-- http_connection_target(srv): Bool
+--   True while establishing/restoring configured HTTP service, including old
+--   cleanup for queued configuration; false for removal and process shutdown.
+-- current_http_owner(srv, key): Bool
+--   The key names the live connection incarnation/configuration and recovery
+--   epoch. Removed/replaced ownership cannot satisfy this predicate.
+-- automatic_http_retry_eligible(srv, error): Bool
+--   True only for a current configured HTTP lifecycle's typed temporary failure.
+--   Network loss/timeouts, 408, 429 and 500/502/503/504 qualify. Certificate,
+--   configuration/protocol, local quiescence and authorization failures do not.
+--   These outcomes take HttpLifecycleFailed rather than terminal ConnectFailed.
+-- http_retry_deadline(recovery, failure): Timestamp
+--   now plus exponential delay from config.http_recovery_initial_delay capped
+--   by config.http_recovery_max_delay, with positive bounded jitter inside the
+--   cap; never earlier than failure.retry_not_before when supplied. Attempts
+--   remain eligible at the cap without a retry-count cutoff. Success resets it.
+--   Structured status preserves phase/challenge/deadline; prose is not policy.
 
 invariant SupersededCompletionCannotPublish {
     -- Reconfigure and remove advance the epoch before asynchronous work settles,

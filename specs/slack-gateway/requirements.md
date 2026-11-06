@@ -208,6 +208,36 @@ THE SYSTEM SHALL expose whether discovery is enabled, baselining, healthy, await
 
 THE SYSTEM SHALL NOT promise a fixed discovery latency or complete event capture from search. Partial scans and throttling SHALL NOT advance completion evidence or handled identities for unseen triggers. Empty-page evidence and pagination completion SHALL match recognized connector envelopes exactly, allowing surrounding whitespace and the connector's terminal escaped newline; an error explanation containing a completion phrase SHALL remain retryable. Disabling discovery SHALL stop new acceptance without cancelling ordinary Phoenix work already accepted.
 
+WHEN the configured MCP connection is unavailable, THE SYSTEM SHALL use its
+connection lifecycle under REQ-MCP-007/012/013 rather than own a separate reconnect
+loop. Gateway status SHALL distinguish connecting or recovering, active sign-in
+required, permanent connection failure, a disabled MCP server, and a ready server
+whose required tools are missing or incompatible. Missing tools on an unavailable
+connection SHALL NOT alone imply that the owner must authorize again.
+
+Owner-facing status SHALL present current connection health separately from the
+last completed discovery scan. A retained successful scan SHALL NOT label a failed
+or recovering connection healthy. Connection failure and recovery SHALL NOT update
+that scan's completion time or imply observation of unseen reactions. The native
+Slack settings surface SHALL expose the cause and available next action without
+requiring a functioning Slack connection or a new notification mechanism.
+
+WHEN the connection becomes ready, enabled discovery SHALL resume on its next
+ordinary service opportunity, using retained baseline, page and request identities.
+Recovery SHALL NOT reinitialize the baseline, reset accepted work, replay uncertain
+writes, retry single-attempt private notices or acknowledgments, or bypass the
+shared discovery allowance and provider retry deadline. Discovery SHALL revalidate
+the authenticated owner and workspace on the replacement connection before using
+its source evidence or publishing a return. A changed identity SHALL stop those
+operations and expose the mismatch; recovered connectivity SHALL NOT stand in for
+account verification.
+
+WHEN discovery resumes and its last completed scan predates the current eligible
+four-calendar-date window, THE SYSTEM SHALL warn that triggers outside that window
+may have been missed. It SHALL NOT extend the search window or claim complete
+catch-up. Baseline completion and trigger eligibility remain governed by
+REQ-SG-003/004.
+
 Ready responses SHALL be reconciled independently of waiting for the next discovery interval. Each serialized service opportunity SHALL start at most one thread-delivery attempt, preserving remaining returns for later delivery opportunities so a slow reply backlog cannot monopolize private notification, acknowledgment and discovery work. Their Slack operations SHALL share the gateway's finite call allowance and persisted retry deadline with discovery. Previously recorded source identities, including baseline identities, SHALL be skipped before fetching additional source context. Pagination SHALL preserve progress for both trigger searches without allowing one search to starve the other.
 
 The gateway's owner-facing read-access inspection SHALL share that allowance, serialization and persisted retry deadline, without accepting triggers or advancing discovery. Direct agent or manual MCP tool calls are outside this gateway allowance.

@@ -172,6 +172,47 @@ THE SYSTEM SHALL retry the connection rather than treating the server as
 permanently failed, distinct from the stdio respawn path which restarts a
 process.
 
+WHEN a configured HTTP connection cannot finish establishment or recovery because
+of a transient network, session-cleanup, handshake, token-refresh or recovered-token
+persistence failure, THE SYSTEM SHALL retain one recovery owner and retry without
+requiring a tool invocation, status-page visit, manual reload or Phoenix restart.
+This includes initial connection and old-resource cleanup required to apply a
+queued configuration. A recovery owner SHALL NOT make a replacement callable
+before retained transport activity and session cleanup are resolved.
+
+Automatic retries SHALL cover connection loss, network timeouts, HTTP 408,
+HTTP 429, and HTTP 500/502/503/504 during those lifecycle operations. Invalid
+configuration, unsupported protocol, certificate verification failure, ordinary
+authorization rejection and failure to quiesce local transport activity SHALL NOT
+be classified as transient network failures. Tool-level errors SHALL NOT by
+themselves start a connection retry loop.
+
+THE SYSTEM SHALL schedule failed-attempt retries with increasing delays starting
+at five seconds and capped at sixty seconds, with bounded jitter. A valid
+server-directed retry deadline SHALL be a lower bound even when it exceeds that
+cap. Each lifecycle network operation SHALL retain its transport timeout and
+cancellation boundary. An unchanged reload or another caller SHALL join the same
+recovery rather than bypass its deadline or create another retry worker. Successful
+connection SHALL end recovery and reset its backoff.
+
+Recovery attempts SHALL preserve structured failure category, lifecycle phase,
+authorization challenge and server-directed retry deadline until the next action
+has been selected. Human-readable error text SHALL NOT determine retry policy.
+Every asynchronous completion SHALL verify its recovery ownership before changing
+credentials, publishing authorization or exposing tools. Configuration changes,
+removal and shutdown SHALL supersede or transfer ownership through their existing
+lifecycle contracts; obsolete retries SHALL NOT reconnect removed configuration.
+
+This automatic cleanup/handshake retry guarantee applies to establishing or
+restoring configured HTTP connections. It SHALL NOT add automatic removal retries,
+stdio restart loops, process restarts or durable retry schedules. Transient
+credential-refresh retries during removal remain governed by REQ-MCP-012. A Phoenix
+restart SHALL reconstruct connections from configuration and stored credentials;
+it SHALL NOT restore volatile HTTP sessions or retry timers.
+
+Connection recovery SHALL NOT extend an originating tool call's deadline, convert
+an uncertain result into success, or add operation replay beyond REQ-MCP-003.
+
 **Rationale:** HTTP has no process to respawn; recovery is reconnection. The
 recovery trigger and mechanism differ from stdio and must not be conflated.
 
@@ -368,9 +409,13 @@ or replacement publication from masking that failure; session deletion SHALL
 remain available to an explicit cleanup retry.
 An OAuth failure from the same observed connection epoch SHALL be able to
 take over transport recovery whose session cleanup failed, obtaining a bearer
-before retrying that cleanup. Reauthorization setup failure SHALL settle as
-failed and require explicit retry; only transient token-refresh failures retry
-automatically while retaining the existing grant.
+before retrying that cleanup. An expired resource-matched credential or a session
+DELETE 401 SHALL admit that OAuth recovery without requiring a second failing
+tool call, even when transport recovery originally retained the session. Static
+credentials SHALL NOT enter OAuth recovery. Reauthorization setup failure SHALL
+settle as failed and require explicit retry; automatic lifecycle retries are
+limited by REQ-MCP-007 and SHALL retain the existing grant until its replacement
+or definitive rejection is established.
 Removal requested between transient refresh attempts SHALL retain the grant
 and recovery epoch until authenticated cleanup finishes, then delete the token
 and forget the server without reconnecting. Re-adding the same configuration
@@ -416,6 +461,15 @@ including previously required scopes when the returned grant narrows, for
 replacement connection recovery while the configuration remains unchanged.
 Transient refresh or token persistence failures after successful handshake
 teardown SHALL retain recovery ownership and retry without manual reload.
+After successful refresh, a transient session DELETE or replacement-handshake
+failure SHALL retain the recovered credential and resume the unfinished lifecycle
+step. It SHALL NOT exchange a rotating refresh token again merely because a
+later network step failed. A subsequent credential expiry or new authorization
+rejection MAY require OAuth recovery. Rejection of a freshly recovered grant for
+the same authorization challenge SHALL require owned authorization rather than
+an unbounded refresh loop. DELETE 404 SHALL finish cleanup as an already-absent
+session. DELETE 403 without an insufficient-scope challenge SHALL remain a visible
+authorization failure rather than be retried as a network outage.
 
 **Rationale:** The whole value of native OAuth is silent reconnect. Tokens
 survive restarts; the stored token must be loaded and attached to the very
@@ -441,6 +495,14 @@ THE SYSTEM SHALL expose, per server, whether it is connected, awaiting
 authorization (with the authorization URL), removing while cleanup is pending,
 or failed (with the error), via
 `GET /api/mcp/status`.
+
+While automatic recovery is active, status SHALL identify connection recovery,
+its current lifecycle phase, most recent failure and next scheduled retry time
+when waiting. A pending authorization URL SHALL appear only for an active owned
+authorization flow. A transient connection failure SHALL NOT be presented as a
+request to sign in. Successful recovery SHALL clear its failure and retry status.
+These diagnostics SHALL NOT expose credentials, session identifiers or raw
+authorization headers, and SHALL NOT require persisted retry history.
 
 **Rationale:** A server blocked on authorization must be distinguishable from
 one that failed to connect and from one that is healthy. The authorization URL

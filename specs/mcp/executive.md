@@ -22,13 +22,13 @@ natively, without the `mcp-remote` subprocess bridge.
 | REQ-MCP-004 | Streamable HTTP Transport | Complete | `HttpTransport` (`mcp/http.rs`): POST with the dual `Accept` pair, unary-JSON and SSE-stream response handling (`SseFramer`), `MCP-Protocol-Version` echoed after `initialize`, 202-with-empty-body accepted for notifications. |
 | REQ-MCP-005 | HTTP Session Lifecycle | Complete | `Mcp-Session-Id` captured at `initialize` and echoed on every request; DELETE on shutdown (`HttpTransport::shutdown`); 404 → `TransportError::SessionExpired` → re-initialize before one retry. |
 | REQ-MCP-006 | Server-Initiated Stream and Resumability | Complete | `ServerStream` (`mcp/http.rs`): a detached GET (`Accept: text/event-stream`, bearer + session + protocol-version) opened once `initialize` negotiates, feeding server-initiated messages to the shared `NotificationSink`; reconnect resumes via `Last-Event-ID` with capped backoff; aborted on `shutdown`/`Drop`. |
-| REQ-MCP-007 | HTTP Connection Recovery | Complete | `McpServer::should_reestablish`: HTTP recovers from `Disconnected`/`Timeout`/`SessionExpired` by rebuilding the client + handshake, distinct from the stdio respawn (which recovers only from `Disconnected`). |
+| REQ-MCP-007 | HTTP Connection Recovery | Partial | Immediate transport recovery exists. Draft automatic lifecycle retry contract requires implementation and qualification; see the draft section below. |
 | REQ-MCP-008 | Static Token / Header Authentication | Complete | `HttpAuth::Static` (bearer or designated auth headers) attached to every request; generic `headers` ride every request without classifying the server. The 401-versus-OAuth routing distinction becomes observable when the OAuth flow exists (M3). |
 | REQ-MCP-009 | OAuth 2.1 Authorization Discovery | Complete | `mcp/oauth.rs`: 401 challenge parsing → PRM (`resource_metadata` or the path-aware/root well-knowns, RFC 9728) → AS metadata via both RFC 8414 and OIDC discovery forms. A resource-advertised authorization server's self-declared issuer is accepted even when it differs from the fetch URL (`IssuerTrust::ResourceAdvertised`); a directly-named issuer is held to exact equality. |
 | REQ-MCP-010 | Client Identity Acquisition | Complete | Cached registrations keyed by authorization server are reused; a pre-configured public client (Claude Code's top-level `oauth.clientId`, no secret — PKCE only) seeds the registration once discovery resolves the issuer; RFC 7591 DCR is the fallback. Phoenix hosts no Client ID Metadata Document, so that step resolves to nothing (logged at `debug`) and falls through to DCR. |
 | REQ-MCP-011 | Authorization Code Flow with PKCE | Complete | Native flow in `mcp.rs` (`begin_oauth_flow` / `complete_oauth_authorization`): S256 PKCE (refused when not advertised), unguessable `state` bound to the pending flow, `iss` validation, RFC 8707 `resource` on both requests, and callback at `GET /api/mcp/oauth/callback`. `OAuthConfig` preserves Claude Code-compatible `oauth.scopes`; configured and challenge-required scopes are unioned, Protected Resource Metadata is the fallback when neither is present, and prior grants are always retained during re-authorization. |
-| REQ-MCP-012 | Token Storage, Refresh, Invalidation, and Step-Up | Complete | `mcp_oauth_registrations` + `mcp_oauth_tokens` (phoenix-db migration 22, plaintext); bearer on every request via the shared cell; silent restore (resource-matched, unexpired-or-refreshable); refresh with rotation persisted; refresh rejection discards and re-prompts; 403 `insufficient_scope` steps up with the scope union while the triggering call waits on the supervisor recovery epoch. |
-| REQ-MCP-013 | Authorization Status Surfaced to the UI | Complete | `GET /api/mcp/status` carries each server's `state` (`ready`/`unauthorized`/`failed`/`removing`), `transport`, `auth`, and the native flow's structured `pending_oauth_url` (the stdio `mcp-remote` path still feeds the same map from its stderr drain). |
+| REQ-MCP-012 | Token Storage, Refresh, Invalidation, and Step-Up | Partial | Stored grants, rotation and owned authorization exist. Draft requires cleanup-triggered OAuth without a second failed call and automatic resumption after transient later lifecycle failures. |
+| REQ-MCP-013 | Authorization Status Surfaced to the UI | Partial | State, errors and owned sign-in URL exist. Draft phase, last failure and next-retry diagnostics require implementation. |
 | REQ-MCP-014 | Tool Exposure and Live Resolution | Complete | `tool_definitions` / `create_mcp_tool_by_name`; live resolution via `ToolRegistryExecutor`. Schema-bound calls retain the selected supervisor and recheck its serving catalog before dispatch and recovery retry. Queued-call and respawn regressions verify rejection without replacement I/O. |
 | REQ-MCP-015 | Config Reload Reconciliation | Complete | `reload_from_actor_configs` sends reconfigure/remove commands to per-server supervisors; epoch checks discard stale connect/recovery completions. The `PartialEq` comparison spans the `Stdio | Http` config variants and `timeoutSeconds`. |
 | REQ-MCP-016 | Per-Server Enable/Disable | Complete | `disable_server` / `enable_server`; persisted in `mcp_disabled_servers` (`crates/phoenix-db/src/lib.rs`). |
@@ -36,6 +36,35 @@ natively, without the `mcp-remote` subprocess bridge.
 | REQ-MCP-018 | Connection Failure Visibility | Complete | Each supervisor snapshot retains `Failed` with `last_error` until a current-epoch publish succeeds or the server is removed. A server still awaiting auth is represented by a recovering snapshot with `pending_oauth_url`, not failed. `McpStatusPanel` renders the operator-facing states distinctly. |
 | REQ-MCP-019 | Legacy HTTP+SSE Not Natively Supported | Complete | By decision; `legacy_sse_native = false`. Such servers use the `mcp-remote` stdio bridge. |
 | REQ-MCP-020 | OAuth Redirect Origin Resolution | Complete | The redirect base is the canonical external origin: `PHOENIX_EXTERNAL_URL` override, else derived from the TLS host config (`ConfigSource::external_host`, first non-loopback host in order) + scheme + bind port (`resolve_external_origin`). Derived from trusted config, not request headers. A cached DCR client registered with a different `redirect_uri` is re-registered (`acquire_client_registration`; registrations carry the redirect_uri, phoenix-db migration 23). An all-interfaces bind that still resolves to loopback warns at startup and on every `unauthorized` status entry (`auth_redirect_warning`). A pre-configured client pinning a loopback `callbackPort` (its app allowlist Phoenix can't edit) uses an `http://localhost:<port>/callback` redirect and a loopback listener (`bind_loopback_listeners`/`run_loopback_redirect`, `OAuthRuntime::loopback_listeners`) — bound synchronously before the URL is surfaced (bind failure fails the flow), on both IP families, accepting until the flow resolves or 25 minutes expire — that 302-bounces the callback to the real route. An accepted callback with exactly one matching nonce retains thirty seconds for redirect completion without accepting new connections (`oauth_callback_near_deadline_retains_only_a_bounded_nonce_matched_grace`). |
+
+## Automatic HTTP recovery draft
+
+The requirements and Allium contain a specification-only draft for unattended
+configured HTTP recovery. [ADR-229](../adrs/229_http-connection-recovery-retries-under-existing-ownership.md)
+is proposed, not an implementation or deployment claim. Runtime code, generated
+types and database schema are unchanged by this draft.
+
+The acceptance matrix for implementation is:
+
+| Scenario | Required observation |
+|---|---|
+| Transport loss, cleanup failure, credential expiry, then network recovery | One owner silently refreshes, cleans up and restores tools without reload, callers or restart. |
+| Transient initial handshake failure | Connection eventually becomes ready without a tool caller or status-page visit. |
+| Cleanup 401 with an apparently unexpired stored grant | Cleanup enters owned OAuth recovery; a second tool failure is unnecessary. |
+| Refresh succeeds, then cleanup or replacement handshake fails transiently | Retry the unfinished step; no repeated rotating-grant exchange solely for that later failure. |
+| Rotated grant cannot be persisted immediately | Retain the result and retry persistence; exchange the old refresh token only once. |
+| Repeated transient errors or server-directed throttling | One paced worker; honor the retry deadline and reset backoff only after readiness. |
+| Concurrent callers, reload and diagnostic reads | Join recovery; do not bypass its timer or extend individual call deadlines. |
+| Reconfigure, remove or shutdown races with a timer/completion | Transfer or supersede ownership; stale work cannot publish tools, auth or credentials. |
+| Denied/expired authorization, plain 403, static-auth rejection, invalid configuration or local quiescence failure | Expose actionable failure; no network retry or browser-flow loop. |
+| Uncertain dispatched one-shot tool call | Connection recovers, but the original operation is not replayed or declared successful. |
+| Slack becomes ready again | Reverify account, resume saved discovery and deduplicate requests without resetting baseline or signal attempts. |
+| Outage predates Slack's current eligible calendar window | Warn about possibly missed older triggers; do not claim complete catch-up. |
+
+Deterministic transport/clock tests precede any live fault-injection acceptance.
+A live check needs its own agreed plan and verifies recovery without a process
+restart. Neither these spec checks nor successful process startup establish
+production acceptance or authorize a database-lineage conversion.
 
 ## Milestones
 

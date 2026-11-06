@@ -31,6 +31,12 @@ prepare separate private briefings. Thread reuse and exact reply coverage remain
 
 ## Simplification
 
+The HTTP-recovery specification draft extends REQ-SG-017 with shared MCP health,
+truthful stale-scan reporting and bounded resume. Those changes are unimplemented
+and unqualified. The [MCP draft acceptance matrix](../mcp/executive.md#automatic-http-recovery-draft)
+owns connection recovery; Slack adds no reconnect worker, signal retries, schema
+conversion or wider discovery window.
+
 ADR-155 replaces independent signal recovery with single-attempt behavior.
 Private commands record submission, rejection or uncertainty without receipt
 inspection or automatic retry. Eyes is claimed once before calling Slack; failure

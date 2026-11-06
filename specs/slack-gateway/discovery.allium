@@ -490,6 +490,24 @@ surface DiscoveryBoundary {
         GatewayProcessRestarted(controller, new_process_key)
         ReconcileAcceptedWork(gateway)
 
+    @guarantee McpRecoveryBoundary
+        -- REQ-SG-017: shared MCP owns connection recovery, credential recovery
+        -- and connection retry deadlines. This boundary owns no reconnect loop.
+        -- Recovering/connecting, an active sign-in flow, permanent failure,
+        -- disabled tools and missing/incompatible tools on a ready connection
+        -- are different conditions. They cannot be inferred from an empty tool
+        -- catalog alone. A successful old scan cannot mask unavailable service.
+        -- Recovery does not advance last_completed_scan_at. Ready service resumes
+        -- enabled discovery at its ordinary next opportunity with retained
+        -- baseline, cursors, observations and handled identities. Reverify owner
+        -- and workspace on that connection before trusting sources or writes.
+        -- Account mismatch stops those operations and is exposed to the owner.
+        -- Resume shares existing allowance and provider backoff. It neither
+        -- replays uncertain writes nor revives single-attempt notices or eyes.
+        -- When the last completed scan predates the current eligible calendar
+        -- window, native status warns of potentially missed older triggers.
+        -- No expanded search window or complete outage catch-up is promised.
+
     @guarantee SchedulingPolicy
         -- Owner-facing read-access inspection shares serial service, allowance
         -- and persisted provider backoff. Its reads cannot accept triggers,
