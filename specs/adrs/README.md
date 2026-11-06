@@ -225,7 +225,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [227](227_coordinator-inline-agents-reuse-targeted-bash.md) | Coordinator inline agents reuse targeted Bash | Accepted | REQ-GR-007, REQ-SA-002, REQ-SA-007, REQ-BASH-012, REQ-BASH-013 |
 | [229](229_ember-conversation-list-entry.md) | Name and pin Ember in conversation navigation | Accepted | REQ-GR-023, REQ-IOS-022 |
 | [228](228_coordinator-inline-child-bash-controller-retirement.md) | Coordinator inline children retire their Bash controllers before parent acceptance | Accepted | REQ-GR-007, REQ-BASH-017, REQ-BASH-018, REQ-SA-003, REQ-SA-004, REQ-SA-005 |
-| [229](229_http-connection-recovery-retries-under-existing-ownership.md) | HTTP connection recovery retries under existing ownership | Proposed | REQ-MCP-003/007/012/013/018; REQ-SG-017 |
+| [229](229_http-connection-recovery-retries-under-existing-ownership.md) | HTTP connection recovery retries under existing ownership | Proposed | REQ-MCP-003/005/007/012/013/018; REQ-SG-017 |
 
 ## For agents: which decisions bind your task
 

@@ -139,8 +139,13 @@ THE SYSTEM SHALL include that session id on the `Mcp-Session-Id` header of every
 subsequent request to that server
 AND issue an HTTP `DELETE` to end the session on shutdown.
 
-WHEN a request to a session-bearing server returns HTTP 404
-THE SYSTEM SHALL treat the session as expired and re-initialize before retrying.
+WHEN a non-DELETE request to a session-bearing server returns HTTP 404
+THE SYSTEM SHALL treat the session as expired and re-initialize before any retry
+permitted by the caller's execution policy under REQ-MCP-003. Session expiry SHALL
+NOT authorize replay of a dispatched single-attempt operation.
+
+WHEN session DELETE returns HTTP 404, THE SYSTEM SHALL treat that session as
+already absent and finish cleanup without re-initializing it.
 
 **Rationale:** Session id binds a sequence of requests to server-side state. A
 404 is the protocol's signal that the session is gone; silently failing the
@@ -182,18 +187,29 @@ before retained transport activity and session cleanup are resolved.
 
 Automatic retries SHALL cover connection loss, network timeouts, HTTP 408,
 HTTP 429, and HTTP 500/502/503/504 during those lifecycle operations. Invalid
-configuration, unsupported protocol, certificate verification failure, ordinary
+configuration, unsupported protocol, certificate verification failure,
 authorization rejection and failure to quiesce local transport activity SHALL NOT
 be classified as transient network failures. Tool-level errors SHALL NOT by
-themselves start a connection retry loop.
+themselves start a connection retry loop. Authentication and scope challenges
+SHALL instead follow REQ-MCP-012 where applicable.
 
-THE SYSTEM SHALL schedule failed-attempt retries with increasing delays starting
-at five seconds and capped at sixty seconds, with bounded jitter. A valid
-server-directed retry deadline SHALL be a lower bound even when it exceeds that
-cap. Each lifecycle network operation SHALL retain its transport timeout and
-cancellation boundary. An unchanged reload or another caller SHALL join the same
+THE SYSTEM SHALL schedule failed-attempt retries with exponential delays starting
+at five seconds and capped at sixty seconds, with nonnegative jitter of at most
+twenty percent inside that cap. A valid server-directed retry deadline SHALL be
+a lower bound even when it exceeds that
+cap. A deadline in the past SHALL NOT delay recovery; a missing or malformed
+deadline SHALL use ordinary backoff. HTTP delay-seconds and HTTP-date forms
+SHALL both be recognized. Each lifecycle network operation SHALL retain its
+transport timeout and cancellation boundary. An unchanged reload or another caller SHALL join the same
 recovery rather than bypass its deadline or create another retry worker. Successful
 connection SHALL end recovery and reset its backoff.
+
+A retry SHALL resume the first unfinished lifecycle step. If replacement
+initialization created a session before the handshake failed, that session SHALL
+also be cleaned up before another replacement is initialized. While awaiting an
+owned browser authorization, THE SYSTEM SHALL wait for that flow rather than
+schedule connection attempts. Denial, expiry or failed authorization setup SHALL
+retain an actionable failure until explicit retry.
 
 Recovery attempts SHALL preserve structured failure category, lifecycle phase,
 authorization challenge and server-directed retry deadline until the next action

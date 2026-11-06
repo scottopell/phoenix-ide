@@ -20,7 +20,7 @@ natively, without the `mcp-remote` subprocess bridge.
 | REQ-MCP-002 | Transport-Agnostic JSON-RPC Protocol | Complete | Protocol (initialize / paginated `tools/list` / `tools/call` / notification handling via `ServerMessageSink`) lives on `McpServer` over the `McpTransport` trait; a bounded per-server supervisor mailbox owns lifecycle state and epochs. Stdio calls execute sequentially in the supervisor; HTTP calls run concurrently and return epoch-tagged completions. |
 | REQ-MCP-003 | Stdio Transport | Complete | `StdioTransport::spawn` / `McpServer::initialize` / `list_tools`; crash detection (`is_alive`, `TransportError::Disconnected` classification) + `respawn` in `mcp.rs`. Single-attempt calls retain late cancellation outcomes for connection recovery without tool replay; a paused-clock regression distinguishes invalidating and cancellation-safe transports. |
 | REQ-MCP-004 | Streamable HTTP Transport | Complete | `HttpTransport` (`mcp/http.rs`): POST with the dual `Accept` pair, unary-JSON and SSE-stream response handling (`SseFramer`), `MCP-Protocol-Version` echoed after `initialize`, 202-with-empty-body accepted for notifications. |
-| REQ-MCP-005 | HTTP Session Lifecycle | Complete | `Mcp-Session-Id` captured at `initialize` and echoed on every request; DELETE on shutdown (`HttpTransport::shutdown`); 404 → `TransportError::SessionExpired` → re-initialize before one retry. |
+| REQ-MCP-005 | HTTP Session Lifecycle | Complete | `Mcp-Session-Id` captured at initialize and echoed on later requests; DELETE on shutdown. Non-DELETE session 404 reinitializes; DELETE 404 completes already-absent cleanup. |
 | REQ-MCP-006 | Server-Initiated Stream and Resumability | Complete | `ServerStream` (`mcp/http.rs`): a detached GET (`Accept: text/event-stream`, bearer + session + protocol-version) opened once `initialize` negotiates, feeding server-initiated messages to the shared `NotificationSink`; reconnect resumes via `Last-Event-ID` with capped backoff; aborted on `shutdown`/`Drop`. |
 | REQ-MCP-007 | HTTP Connection Recovery | Partial | Immediate transport recovery exists. Draft automatic lifecycle retry contract requires implementation and qualification; see the draft section below. |
 | REQ-MCP-008 | Static Token / Header Authentication | Complete | `HttpAuth::Static` (bearer or designated auth headers) attached to every request; generic `headers` ride every request without classifying the server. The 401-versus-OAuth routing distinction becomes observable when the OAuth flow exists (M3). |
@@ -51,12 +51,14 @@ The acceptance matrix for implementation is:
 | Transport loss, cleanup failure, credential expiry, then network recovery | One owner silently refreshes, cleans up and restores tools without reload, callers or restart. |
 | Transient initial handshake failure | Connection eventually becomes ready without a tool caller or status-page visit. |
 | Cleanup 401 with an apparently unexpired stored grant | Cleanup enters owned OAuth recovery; a second tool failure is unnecessary. |
+| Session DELETE 404 versus an ordinary session request 404 | DELETE finishes cleanup; ordinary session expiry reinitializes subject to the caller's replay policy. |
 | Refresh succeeds, then cleanup or replacement handshake fails transiently | Retry the unfinished step; no repeated rotating-grant exchange solely for that later failure. |
 | Rotated grant cannot be persisted immediately | Retain the result and retry persistence; exchange the old refresh token only once. |
 | Repeated transient errors or server-directed throttling | One paced worker; honor the retry deadline and reset backoff only after readiness. |
 | Concurrent callers, reload and diagnostic reads | Join recovery; do not bypass its timer or extend individual call deadlines. |
 | Reconfigure, remove or shutdown races with a timer/completion | Transfer or supersede ownership; stale work cannot publish tools, auth or credentials. |
 | Denied/expired authorization, plain 403, static-auth rejection, invalid configuration or local quiescence failure | Expose actionable failure; no network retry or browser-flow loop. |
+| Fresh recovered grant rejected for the same challenge before readiness | Request owned authorization once; do not repeatedly exchange refresh grants. |
 | Uncertain dispatched one-shot tool call | Connection recovers, but the original operation is not replayed or declared successful. |
 | Slack becomes ready again | Reverify account, resume saved discovery and deduplicate requests without resetting baseline or signal attempts. |
 | Outage predates Slack's current eligible calendar window | Warn about possibly missed older triggers; do not claim complete catch-up. |
@@ -65,6 +67,14 @@ Deterministic transport/clock tests precede any live fault-injection acceptance.
 A live check needs its own agreed plan and verifies recovery without a process
 restart. Neither these spec checks nor successful process startup establish
 production acceptance or authorize a database-lineage conversion.
+
+Two specification-only review passes cover self-consistency and complexity cliffs.
+The [review record](../../docs/reviews/2026-11-06-http-recovery-spec-review.md)
+lists the findings, corrections and retained tradeoffs. Runtime implementation,
+fault-injection regressions and live acceptance remain outstanding.
+Allium analysis, spEARS shape and requirement-anchor checks pass. The tooling unit
+suite's one LibreSSL certificate-fixture error passes on exact recheck with
+OpenSSL 3; the review record retains the full accounting.
 
 ## Milestones
 

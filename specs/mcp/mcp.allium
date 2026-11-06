@@ -45,7 +45,7 @@ enum AuthScheme { none | static | oauth }
 -- Sub-lifecycle within auth_scheme = oauth.
 enum OAuthPhase { discovering | registering | awaiting_user | authorized | refreshing }
 
-enum HttpRecoveryState { attempting | waiting | completed | blocked | superseded }
+enum HttpRecoveryState { active | waiting | completed | blocked | superseded }
 enum HttpRecoveryPhase { cleanup | credentials | credential_persistence | handshake }
 enum HttpFailureKind { temporary | authentication | scope | permanent | quiescence }
 
@@ -90,14 +90,14 @@ entity HttpRecovery {
     phase: HttpRecoveryPhase
     attempt_number: Integer
     next_retry_at: Timestamp?
-    last_failure: String?
+    last_failure: HttpLifecycleFailure?
 
     transitions status {
-        attempting -> waiting
-        attempting -> completed
-        attempting -> blocked
-        attempting -> superseded
-        waiting -> attempting
+        active -> waiting
+        active -> completed
+        active -> blocked
+        active -> superseded
+        waiting -> active
         waiting -> superseded
         terminal: completed, blocked, superseded
     }
@@ -175,9 +175,10 @@ surface McpControl {
         srv.tools when srv.state = ready
         srv.pending_auth_url when srv.state = unauthorized
         srv.last_error when srv.state = failed
-        for recovery in HttpRecoveries where server = srv and status in {attempting, waiting}:
+        for recovery in HttpRecoveries where server = srv and status in {active, waiting}:
             recovery.phase
-            recovery.last_failure
+            recovery.last_failure?.description
+            recovery.last_failure?.phase
             recovery.next_retry_at
 
     provides:
@@ -371,7 +372,7 @@ rule HttpTransportErrorReconnects {
     ensures: srv.state = reconnecting
 }
 
--- HTTP 404 means the server-side session is gone. Drop it and re-initialize.
+-- Non-DELETE HTTP 404 means the server-side session is gone. Re-initialize.
 rule HttpSessionExpired {
     when: HttpSessionNotFound(srv)
 
@@ -382,8 +383,9 @@ rule HttpSessionExpired {
     ensures: srv.session_id = null
 
     @guidance
-        -- 404 on a session-bearing request -> treat session as expired,
-        -- re-run initialize (REQ-MCP-005).
+        -- 404 on a session-bearing non-DELETE request expires the session and
+        -- re-runs initialize (REQ-MCP-005). DELETE 404 instead finishes cleanup;
+        -- it does not emit HttpSessionNotFound or create another session.
 }
 
 -- REQ-MCP-007/012/013: lifecycle retries have an owner even without callers.
@@ -393,22 +395,22 @@ rule HttpRecoveryStarts {
     requires: srv.transport = http
     requires: http_connection_target(srv)
     requires: current_http_owner(srv, owner_key)
-    requires: not exists r in HttpRecoveries where r.server = srv and r.status in {attempting, waiting}
+    requires: not exists r in HttpRecoveries where r.server = srv and r.status in {active, waiting}
 
     ensures: HttpRecovery.created(server: srv, owner_key: owner_key,
-        status: attempting, phase: phase, attempt_number: 1,
+        status: active, phase: phase, attempt_number: 1,
         next_retry_at: null, last_failure: null)
 }
 
 rule HttpRecoveryWaitsAfterTemporaryFailure {
     when: HttpLifecycleFailed(recovery, failure)
-    requires: recovery.status = attempting
+    requires: recovery.status = active
     requires: current_http_owner(recovery.server, recovery.owner_key)
     requires: failure.kind = temporary
 
     ensures: recovery.status = waiting
     ensures: recovery.phase = failure.phase
-    ensures: recovery.last_failure = failure.description
+    ensures: recovery.last_failure = failure
     ensures: recovery.next_retry_at = http_retry_deadline(recovery, failure)
     ensures: recovery.server.state = reconnecting
 }
@@ -419,7 +421,7 @@ rule HttpRecoveryRetriesWhenDue {
     requires: current_http_owner(recovery.server, recovery.owner_key)
     requires: http_connection_target(recovery.server)
 
-    ensures: recovery.status = attempting
+    ensures: recovery.status = active
     ensures: recovery.next_retry_at = null
     ensures: recovery.attempt_number = recovery.attempt_number + 1
     ensures: ResumeHttpLifecycle(recovery)
@@ -433,14 +435,18 @@ rule HttpRecoveryRetriesWhenDue {
 
 rule HttpRecoveryHandsAuthenticationToOAuth {
     when: HttpLifecycleFailed(recovery, failure)
-    requires: recovery.status = attempting
+    requires: recovery.status = active
     requires: current_http_owner(recovery.server, recovery.owner_key)
     requires: failure.kind in {authentication, scope}
+    requires: recovery.server.auth_scheme != static
 
-    ensures: recovery.status = blocked
-    ensures: recovery.phase = failure.phase
-    ensures: recovery.last_failure = failure.description
-    ensures: OwnedHttpAuthorizationNeeded(recovery.server, failure)
+    ensures: recovery.phase = credentials
+    ensures: recovery.last_failure = failure
+    ensures:
+        if failure.kind = authentication or recovery.server.auth_scheme = none:
+            HttpRequestUnauthorized(recovery.server)
+        else:
+            HttpInsufficientScope(recovery.server)
 
     @guidance
         -- The OAuth rules retain the same non-callable transport and challenge.
@@ -448,28 +454,54 @@ rule HttpRecoveryHandsAuthenticationToOAuth {
         -- cleanup failure without a concurrent failing tool call. Static auth
         -- remains failed. A fresh grant rejected for the same challenge enters
         -- owned authorization rather than repeating refresh indefinitely.
-        -- Once OAuth can resume connection work, HttpLifecycleStarted admits its
-        -- current owner. No denied/expired browser flow is retried automatically.
+        -- Preserve failure.authorization_challenge in the owned OAuth plan before
+        -- emitting the protocol event. Active means lifecycle ownership, not a
+        -- continuously in-flight network call. Awaiting browser authorization
+        -- schedules no connection attempts. A recovery-epoch transfer supersedes
+        -- this episode before admitting HttpLifecycleStarted for the new owner.
+        -- Authorization denial/expiry/setup failure emits a permanent
+        -- HttpLifecycleFailed outcome, blocking the episode for explicit retry.
+}
+
+rule HttpRecoveryStopsOnStaticAuthorization {
+    when: HttpLifecycleFailed(recovery, failure)
+    requires: recovery.status = active
+    requires: current_http_owner(recovery.server, recovery.owner_key)
+    requires: recovery.server.auth_scheme = static
+    requires: failure.kind in {authentication, scope}
+
+    ensures: recovery.status = blocked
+    ensures: recovery.phase = failure.phase
+    ensures: recovery.last_failure = failure
+    ensures: recovery.server.state = failed
+    ensures: recovery.server.last_error = failure.description
+}
+
+rule HttpRecoveryChangesPhase {
+    when: HttpLifecyclePhaseChanged(recovery, phase)
+    requires: recovery.status = active
+    requires: current_http_owner(recovery.server, recovery.owner_key)
+
+    ensures: recovery.phase = phase
 }
 
 rule HttpRecoveryStopsOnActionableFailure {
     when: HttpLifecycleFailed(recovery, failure)
-    requires: recovery.status = attempting
+    requires: recovery.status = active
     requires: current_http_owner(recovery.server, recovery.owner_key)
     requires: failure.kind in {permanent, quiescence}
 
     ensures: recovery.status = blocked
     ensures: recovery.phase = failure.phase
-    ensures: recovery.last_failure = failure.description
+    ensures: recovery.last_failure = failure
     ensures: recovery.server.state = failed
     ensures: recovery.server.last_error = failure.description
 }
 
 rule HttpRecoveryCompletes {
-    when: HttpLifecycleReady(recovery)
-    requires: recovery.status = attempting
-    requires: current_http_owner(recovery.server, recovery.owner_key)
-    requires: recovery.server.state = ready
+    when: srv: McpServer.state transitions_to ready
+    for recovery in HttpRecoveries where server = srv and status = active:
+    requires: current_http_owner(srv, recovery.owner_key)
 
     ensures: recovery.status = completed
     ensures: recovery.next_retry_at = null
@@ -478,7 +510,7 @@ rule HttpRecoveryCompletes {
 
 rule HttpRecoverySuperseded {
     when: HttpLifecycleOwnerReplaced(recovery)
-    requires: recovery.status in {attempting, waiting}
+    requires: recovery.status in {active, waiting}
 
     ensures: recovery.status = superseded
     ensures: recovery.next_retry_at = null
@@ -701,6 +733,7 @@ rule TokenRefreshNeeded {
 
     requires: srv.auth_scheme = oauth
     requires: srv.oauth_phase = authorized
+    requires: not fresh_grant_rejected(srv)
 
     ensures: srv.oauth_phase = refreshing
 
@@ -776,6 +809,22 @@ rule TokenRefreshNeeded {
         -- Bind a re-authorization flow to its cleanup owner and publish the
         -- awaiting-authorization state before releasing the mutation fence,
         -- so an immediate callback cannot resolve it as an unowned flow.
+}
+
+rule FreshOAuthGrantRejected {
+    when: HttpRequestUnauthorized(srv)
+    requires: srv.auth_scheme = oauth
+    requires: srv.oauth_phase = authorized
+    requires: fresh_grant_rejected(srv)
+
+    ensures: srv.state = unauthorized
+    ensures: srv.oauth_phase = awaiting_user
+    ensures: srv.pending_auth_url = authorization_url(srv)
+
+    @guidance
+        -- Retain the cleanup owner and complete challenge/scope plan. Failure
+        -- to prepare this owned flow follows OAuthFlowFailed; no automatic
+        -- browser retries or second grant exchange for this same challenge.
 }
 
 -- Refresh succeeded: update the stored token (including a rotated refresh
@@ -1393,7 +1442,7 @@ invariant SingleRecoveryLeaderPerEpoch {
 
 invariant OneAutomaticHttpRecoveryOwner {
     for srv in McpServers:
-        (HttpRecoveries where server = srv and status in {attempting, waiting}).count <= 1
+        (HttpRecoveries where server = srv and status in {active, waiting}).count <= 1
 }
 
 -- Automatic-recovery helpers (REQ-MCP-007/012/013):
@@ -1402,18 +1451,32 @@ invariant OneAutomaticHttpRecoveryOwner {
 --   cleanup for queued configuration; false for removal and process shutdown.
 -- current_http_owner(srv, key): Bool
 --   The key names the live connection incarnation/configuration and recovery
---   epoch. Removed/replaced ownership cannot satisfy this predicate.
+--   epoch. A queued configuration retains old-resource cleanup ownership until
+--   transfer/adoption. Removed/replaced ownership cannot satisfy this predicate.
 -- automatic_http_retry_eligible(srv, error): Bool
 --   True only for a current configured HTTP lifecycle's typed temporary failure.
---   Network loss/timeouts, 408, 429 and 500/502/503/504 qualify. Certificate,
+--   Network loss/timeouts, 408, 429, 500/502/503/504 and recoverable credential
+--   persistence failures qualify. Certificate,
 --   configuration/protocol, local quiescence and authorization failures do not.
 --   These outcomes take HttpLifecycleFailed rather than terminal ConnectFailed.
 -- http_retry_deadline(recovery, failure): Timestamp
 --   now plus exponential delay from config.http_recovery_initial_delay capped
---   by config.http_recovery_max_delay, with positive bounded jitter inside the
---   cap; never earlier than failure.retry_not_before when supplied. Attempts
---   remain eligible at the cap without a retry-count cutoff. Success resets it.
+--   by config.http_recovery_max_delay, with nonnegative jitter of at most twenty
+--   percent inside the cap; never earlier than failure.retry_not_before when
+--   supplied. Attempts remain eligible at the cap without a retry-count cutoff.
+--   Success resets it.
 --   Structured status preserves phase/challenge/deadline; prose is not policy.
+--   Invalid/missing Retry-After uses ordinary backoff; valid HTTP-date and
+--   delay-seconds forms are recognized, and past deadlines add no delay.
+--   ResumeHttpLifecycle advances the first unfinished step. A replacement that
+--   obtained a session before failing must itself be cleaned up before another
+--   initialize. HttpLifecycleFailure.description is sanitized display text;
+--   its private challenge never appears in the control surface or logs.
+-- fresh_grant_rejected(srv): Bool
+--   The current owned lifecycle has already recovered credentials and that
+--   fresh, unexpired grant is rejected for the same authorization challenge
+--   before service reaches ready. A later expiry or different challenge does
+--   not satisfy this predicate. Partition fresh rejection from TokenRefreshNeeded.
 
 invariant SupersededCompletionCannotPublish {
     -- Reconfigure and remove advance the epoch before asynchronous work settles,

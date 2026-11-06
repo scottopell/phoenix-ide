@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-11-06
-- **Affects:** REQ-MCP-003/007/012/013/018; REQ-SG-017
+- **Affects:** REQ-MCP-003/005/007/012/013/018; REQ-SG-017
 
 ## Context
 
@@ -44,6 +44,7 @@ server-directed deadlines as a lower bound. Retry eligibility has no attempt-cou
 cutoff, but every network operation retains a timeout and ownership cancellation.
 Permanent failures, local quiescence failures, denied authorization and failed
 authorization setup remain explicit-action boundaries.
+Timing values are internal policy, not a new set of operator configuration knobs.
 
 The scope is configured HTTP connection establishment/recovery, including old
 cleanup needed for queued configuration. Automatic removal cleanup and stdio
