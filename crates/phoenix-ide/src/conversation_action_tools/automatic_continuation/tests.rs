@@ -10,6 +10,33 @@ fn settings_parsers_are_closed_and_boolean_is_required_for_set_only() {
     let coordinator = json!({"kind":"coordinator"});
     assert!(serde_json::from_value::<ReadRequest>(json!({"target":ordinary})).is_ok());
     assert!(serde_json::from_value::<ReadRequest>(json!({"target":coordinator})).is_ok());
+    for instance in [
+        "local",
+        "remote-name",
+        "00000000-0000-0000-0000-000000000001",
+    ] {
+        assert!(serde_json::from_value::<ReadRequest>(
+            json!({"target":coordinator, "instance":instance})
+        )
+        .is_ok());
+        assert!(serde_json::from_value::<SetRequest>(json!({"target":coordinator, "instance":instance, "auto_continue_on_context_exhaustion":false})).is_ok());
+    }
+    assert!(
+        serde_json::from_value::<ReadRequest>(json!({"target":coordinator, "instance":42}))
+            .is_err()
+    );
+    assert!(serde_json::from_value::<SetRequest>(
+        json!({"target":coordinator, "instance":true, "auto_continue_on_context_exhaustion":true})
+    )
+    .is_err());
+    assert!(
+        serde_json::from_value::<ReadRequest>(json!({"target":coordinator, "instance":null}))
+            .is_err()
+    );
+    assert!(serde_json::from_value::<SetRequest>(
+        json!({"target":coordinator, "instance":null, "auto_continue_on_context_exhaustion":true})
+    )
+    .is_err());
     for enabled in [false, true] {
         assert!(serde_json::from_value::<SetRequest>(json!({
             "target":{"kind":"coordinator"},
@@ -49,6 +76,14 @@ async fn settings_schema_and_real_preference_round_trip() {
     assert_eq!(read.name(), "read_automatic_continuation");
     assert_eq!(set.name(), "set_automatic_continuation");
     assert_eq!(read.input_schema()["additionalProperties"], false);
+    assert_eq!(
+        read.input_schema()["properties"]["instance"]["type"],
+        "string"
+    );
+    assert_eq!(
+        set.input_schema()["properties"]["instance"]["type"],
+        "string"
+    );
     assert_eq!(read.input_schema()["required"], json!(["target"]));
     assert_eq!(
         set.input_schema()["required"],
@@ -123,6 +158,166 @@ async fn settings_schema_and_real_preference_round_trip() {
 }
 
 #[tokio::test]
+async fn remote_selector_errors_never_write_local_preference() {
+    let (runtime, db, source) = native_runtime().await;
+    let tool = AutomaticContinuationTool::set(runtime);
+    let ordinary = db
+        .create_conversation(
+            "remote-selector",
+            "remote-selector",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let target =
+        json!({"kind":"ordinary", "product_conversation_id":ordinary.product_conversation_id});
+    for instance in ["unknown-peer", "LOCAL"] {
+        assert!(tool.run_inner(json!({"instance":instance, "target":target, "auto_continue_on_context_exhaustion":true}), native_context(&source)).await.is_err());
+        assert_eq!(
+            db.auto_continue_on_context_exhaustion(&ordinary.product_conversation_id)
+                .await
+                .unwrap(),
+            AutoContinueOnContextExhaustion::Disabled
+        );
+    }
+    let result = tool.run_inner(json!({"instance":"local", "target":target, "auto_continue_on_context_exhaustion":true}), native_context(&source)).await.unwrap();
+    assert_eq!(result["auto_continue_on_context_exhaustion"], true);
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "TLS peer fixture and admission ordering are exercised together"
+)]
+async fn cancelled_remote_preference_request_keeps_source_admission_and_authority_until_peer_settles(
+) {
+    use phoenix_core::domain::instance_identity::{
+        InstanceId, PeerBearerCredential, PeerCaCertificatePem, PeerTlsTrust,
+    };
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+
+    let (runtime, db, source) = native_runtime().await;
+    let source_product = db
+        .get_conversation(&source)
+        .await
+        .unwrap()
+        .product_conversation_id;
+    let destination = InstanceId::new();
+    let caller = db.instance_id().await.unwrap();
+    let bearer = PeerBearerCredential::parse(format!("phx_peer_{}", "c".repeat(43))).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut tls = crate::tls::load_config(&crate::tls::ConfigSource::Auto {
+        dir: temp.path().to_path_buf(),
+        hosts: vec!["localhost".to_string()],
+    })
+    .unwrap();
+    tls.server.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let trust = PeerTlsTrust::PrivateCa {
+        certificate_pem: PeerCaCertificatePem::parse(
+            std::fs::read_to_string(tls.ca_cert_path.unwrap()).unwrap(),
+        )
+        .unwrap(),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    db.save_federation_peer_connection(
+        destination,
+        &"saved-peer".parse().unwrap(),
+        &format!(
+            "https://localhost:{}",
+            listener.local_addr().unwrap().port()
+        )
+        .parse()
+        .unwrap(),
+        &bearer,
+        &trust,
+    )
+    .await
+    .unwrap();
+
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let stream = tokio_rustls::TlsAcceptor::from(Arc::new(tls.server))
+            .accept(stream)
+            .await
+            .unwrap();
+        let mut stream = tokio::io::BufReader::new(stream);
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            assert_ne!(stream.read_until(b'\n', &mut headers).await.unwrap(), 0);
+        }
+        let headers = String::from_utf8(headers).unwrap();
+        assert!(
+            headers.starts_with("POST /api/federation/peer/read-automatic-continuation HTTP/1.1")
+        );
+        assert!(headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer phx_peer_"));
+        let length: usize = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .and_then(|value| value.trim().parse().ok())
+            })
+            .unwrap();
+        let mut body = vec![0; length];
+        stream.read_exact(&mut body).await.unwrap();
+        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(request["destination_instance_id"], destination.to_string());
+        assert_eq!(request["caller_instance_id"], caller.to_string());
+        assert_eq!(request["target"]["kind"], "coordinator");
+        received_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        stream
+            .get_mut()
+            .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    });
+
+    let tool = AutomaticContinuationTool::read(runtime.clone());
+    let requester = tokio::spawn(async move {
+        tool.run_inner(
+            json!({"instance":"saved-peer", "target":{"kind":"coordinator"}}),
+            native_context(&source),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), received_rx)
+        .await
+        .expect("peer must receive the bounded request")
+        .unwrap();
+    requester.abort();
+    assert!(requester.await.unwrap_err().is_cancelled());
+
+    let closing_authority = runtime.acquire_local_authority_pass().unwrap();
+    closing_authority.close("remote_preference_cancellation_test");
+    assert_eq!(runtime.fatal_authority_owners_at_first_close(), Some(3));
+    drop(closing_authority);
+
+    let admission = runtime.lock_product_message_admission(source_product.as_str());
+    tokio::pin!(admission);
+    assert!(matches!(
+        futures::poll!(admission.as_mut()),
+        std::task::Poll::Pending
+    ));
+
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), server)
+        .await
+        .expect("peer must finish responding")
+        .unwrap();
+    let _guard = tokio::time::timeout(std::time::Duration::from_secs(10), admission)
+        .await
+        .expect("source admission must resume after peer settlement");
+}
+
+#[tokio::test]
 async fn settings_require_trusted_source_and_refuse_ordinary_sources_without_writing() {
     let (runtime, db, source) = native_runtime().await;
     let set = AutomaticContinuationTool::set(runtime.clone());
@@ -174,6 +369,26 @@ async fn settings_require_trusted_source_and_refuse_ordinary_sources_without_wri
         AutoContinueOnContextExhaustion::Disabled,
     );
     assert!(!runtime.local_authority_is_closed());
+}
+
+#[tokio::test]
+async fn preclosed_remote_source_authority_refuses_before_peer_resolution() {
+    let (runtime, _, coordinator) = native_runtime().await;
+    let closing_authority = runtime.acquire_local_authority_pass().unwrap();
+    closing_authority.close("preclosed_remote_source_test");
+    drop(closing_authority);
+
+    let error = remote_from_coordinator(
+        runtime,
+        coordinator,
+        "unconfigured-peer".into(),
+        TargetInput::Coordinator {},
+        native::Operation::Read,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error, "Local mutation authority is closed");
 }
 
 #[tokio::test]

@@ -10,7 +10,7 @@ independent backend owner and durable status remains authoritative.
 
 macOS now uses protocol 2 and candidate-owned migration once, with failed
 ownership/evidence retained for manual recovery after disruption. The launchd
-executive and ADR-229 account for the withdrawn prepared, paired, current-schema,
+executive and ADR-230 account for the withdrawn prepared, paired, current-schema,
 refresh, repair, rollback, finalization and replay contracts and their tests.
 Installed-state restart remains unchanged. Active macOS deploy/restart markers
 always block a new operation until owner release or explicit operator resolution.
@@ -30,7 +30,7 @@ startup digest matching, direct-child identity, stop semantics and reboot guidan
 | REQ-PD-001–009,011–017 | Backend selection/source preparation, independent ownership, exact verification and durable status; backend-specific tests and disposable harnesses |
 | REQ-PD-010 | Ordinary Linux runtime-artifact rollback; no database compatibility claim |
 | REQ-PD-021,023–027,029 | Existing exact protected Linux contracts preserved; systemd focused suite 32 tests passes |
-| REQ-PD-018–020,022,028,030 | Withdrawn macOS routes; ADR-229 |
+| REQ-PD-018–020,022,028,030 | Withdrawn macOS routes; ADR-230 |
 | REQ-PD-031 | Protocol-2 launchd helper, 21 helper and 60 installer tests; explicit manual recovery and 32 UI tests |
 
 Reported focused Linux results are systemd 32 and bare 21 tests passing. macOS

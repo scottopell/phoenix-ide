@@ -3795,6 +3795,92 @@ def _doctor_version(
     return ok, detail
 
 
+def _doctor_compiler_cache_result(
+    kache_binary: str | None, kache_version: str | None, kache_error: str | None,
+    sccache_binary: str | None, sccache_version: str | None, sccache_error: str | None,
+) -> DoctorResult:
+    scope = "direct Cargo subprocesses"
+    if "RUSTC_WRAPPER" in os.environ:
+        wrapper = os.environ["RUSTC_WRAPPER"]
+        if not wrapper:
+            return DoctorResult(
+                "compiler-cache", True,
+                "requested=RUSTC_WRAPPER (empty); selected=none; "
+                "scope=caller-owned inherited environment",
+            )
+        binary = shutil.which(wrapper)
+        if binary is None:
+            return DoctorResult(
+                "compiler-cache", False,
+                f"requested=RUSTC_WRAPPER; selected=explicit wrapper {wrapper!r}; "
+                "not executable; set RUSTC_WRAPPER to an executable path or remove it",
+            )
+        absolute = _absolute_executable(binary)
+        if absolute == _absolute_executable(kache_binary):
+            probe = kache_version or f"probe warning: {kache_error}"
+        elif absolute == _absolute_executable(sccache_binary):
+            probe = sccache_version or f"probe warning: {sccache_error}"
+        else:
+            probe = "not probed (custom wrapper)"
+        return DoctorResult(
+            "compiler-cache", True,
+            f"requested=RUSTC_WRAPPER; selected=explicit wrapper {wrapper!r}; "
+            f"executable={absolute}; version={probe}; "
+            "scope=caller-owned inherited environment",
+        )
+
+    requested = os.environ.get("PHOENIX_COMPILER_CACHE", "auto")
+    if requested not in _COMPILER_CACHE_BACKENDS:
+        return DoctorResult(
+            "compiler-cache", False,
+            f"invalid PHOENIX_COMPILER_CACHE={requested!r}; choose one of: "
+            f"{', '.join(_COMPILER_CACHE_BACKENDS)}",
+        )
+    prefix = f"requested=PHOENIX_COMPILER_CACHE={requested}; "
+    if requested == "none":
+        return DoctorResult("compiler-cache", True, prefix + f"selected=none; scope={scope}")
+
+    kache_reason = kache_error or (
+        f"PHOENIX_KACHE_BIN is not executable: {os.environ['PHOENIX_KACHE_BIN']}; "
+        "point it at a released Kache binary or unset it"
+        if os.environ.get("PHOENIX_KACHE_BIN") else
+        "not installed or not on PATH; install Kache 1.2.2 or select sccache/none"
+    )
+    if kache_error:
+        kache_reason += (
+            f" ({_absolute_executable(kache_binary)}); "
+            "check host, KACHE_DISABLED and Kache 1.2.2, or select sccache/none"
+        )
+    sccache_reason = sccache_error or "not installed or not on PATH; install sccache or select none"
+    if sccache_error:
+        sccache_reason += (
+            f" ({_absolute_executable(sccache_binary)}); check sccache installation or select none"
+        )
+    if requested in ("auto", "kache") and kache_version is not None:
+        return DoctorResult(
+            "compiler-cache", True,
+            prefix + f"selected=kache; executable={_absolute_executable(kache_binary)}; "
+            f"version={kache_version}; runtime readiness=checked when Cargo starts; "
+            f"scope=local-only; {scope}",
+        )
+    if requested == "kache":
+        return DoctorResult("compiler-cache", False, prefix + f"selected=unavailable; kache: {kache_reason}")
+    if requested in ("auto", "sccache") and sccache_version is not None:
+        fallback = f"auto fallback: kache: {kache_reason}; " if requested == "auto" else ""
+        return DoctorResult(
+            "compiler-cache", True,
+            prefix + fallback + f"selected=sccache; executable={_absolute_executable(sccache_binary)}; "
+            f"version={sccache_version}; scope={scope}",
+        )
+    if requested == "sccache":
+        return DoctorResult("compiler-cache", False, prefix + f"selected=unavailable; sccache: {sccache_reason}")
+    return DoctorResult(
+        "compiler-cache", True,
+        prefix + f"selected=none; auto fallback: kache: {kache_reason}; "
+        f"sccache: {sccache_reason}; scope={scope}",
+    )
+
+
 def collect_doctor_results() -> list[DoctorResult]:
     node_environment = {**node_env(), "COREPACK_ENABLE_NETWORK": "0"}
     results: list[DoctorResult] = []
@@ -3890,30 +3976,39 @@ def collect_doctor_results() -> list[DoctorResult]:
     ))
 
     kache_binary = _kache_binary()
+    kache_version = None
+    kache_error = None
     if kache_binary:
         kache_error = _kache_host_error()
         if kache_error is None and _environment_flag("KACHE_DISABLED"):
             kache_error = "KACHE_DISABLED is set"
-        version, error = (
+        kache_version, kache_error = (
             (None, kache_error) if kache_error else _kache_version(kache_binary)
         )
         results.append(DoctorResult(
             "kache",
-            version is not None,
-            f"{version} ({kache_binary})" if version else str(error),
+            kache_version is not None,
+            f"{kache_version} ({kache_binary})" if kache_version else str(kache_error),
             required=False,
         ))
     else:
         results.append(DoctorResult("kache", False, "not found", required=False))
 
     sccache_binary = shutil.which("sccache")
+    sccache_version = None
+    sccache_error = None
     if sccache_binary:
-        version, error = _usable_sccache(sccache_binary)
+        sccache_version, sccache_error = _usable_sccache(sccache_binary)
         results.append(DoctorResult(
-            "sccache", version is not None, version or str(error), required=False,
+            "sccache", sccache_version is not None, sccache_version or str(sccache_error), required=False,
         ))
     else:
         results.append(DoctorResult("sccache", False, "not found", required=False))
+
+    results.append(_doctor_compiler_cache_result(
+        kache_binary, kache_version, kache_error,
+        sccache_binary, sccache_version, sccache_error,
+    ))
 
     for name, command, environment in (
         ("cargo-nextest", ["cargo", "nextest", "--version"], rust_environment),
@@ -4967,7 +5062,11 @@ def _restore_kache_environment(original: dict[str, str]) -> None:
 
 
 
-def _command_version(binary: str) -> tuple[str | None, str | None]:
+def _command_version(
+    binary: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> tuple[str | None, str | None]:
     try:
         result = subprocess.run(
             [binary, "--version"],
@@ -4976,6 +5075,7 @@ def _command_version(binary: str) -> tuple[str | None, str | None]:
             errors="replace",
             timeout=10,
             check=False,
+            env=env,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         return None, str(error)
@@ -4985,7 +5085,16 @@ def _command_version(binary: str) -> tuple[str | None, str | None]:
 
 
 def _kache_version(binary: str) -> tuple[str | None, str | None]:
-    detail, error = _command_version(binary)
+    try:
+        with tempfile.TemporaryDirectory(prefix="phoenix-kache-version-") as temporary_home:
+            probe_env = {
+                key: value for key, value in os.environ.items()
+                if not key.startswith("KACHE_")
+            }
+            probe_env.update({"HOME": temporary_home, "TMPDIR": temporary_home})
+            detail, error = _command_version(binary, env=probe_env)
+    except OSError as probe_error:
+        return None, f"cannot isolate kache version probe: {probe_error}"
     if error:
         return None, error
     assert detail is not None
@@ -6364,7 +6473,8 @@ def cmd_check(
             out += ["-p", c]
         return out
 
-    def run_step(name, cmd, cwd=ROOT, env_extra=None, *, timeout=CHECK_TIMEOUT):
+    def run_step(name, cmd, cwd=ROOT, env_extra=None, *, timeout=CHECK_TIMEOUT,
+                 output_observer=None, output_validator=None):
         # Stream stdout+stderr line-by-line into a bounded buffer so that on
         # timeout we keep the last N lines of output instead of throwing it
         # away. Process is launched in its own session so SIGKILL can target
@@ -6448,15 +6558,18 @@ def cmd_check(
             raise
 
         reader_cpu_ms = 0.0
+        reader_error = ""
 
         stop_reader = threading.Event()
 
         def observe_qualification(text):
             clean = _CONTROL_SEQ_RE.sub("", text).replace("\x1b", "").rstrip("\n")
             lock_timer.observe_line(clean, time.monotonic())
+            if output_observer is not None:
+                output_observer(clean)
 
         def reader():
-            nonlocal truncated, reader_cpu_ms
+            nonlocal truncated, reader_cpu_ms, reader_error
             started_reader_ns = time.thread_time_ns()
             try:
                 assert proc.stdout is not None
@@ -6474,8 +6587,11 @@ def cmd_check(
                         # tool-agnostic backstop so the reprinted buffer stays clean.
                         clean = _CONTROL_SEQ_RE.sub("", line).rstrip("\n")
                         lock_timer.observe_line(clean, now)
+                        if output_observer is not None:
+                            output_observer(clean)
                         buf.append(clean)
             except Exception as error:
+                reader_error = str(error)
                 if output_log is not None:
                     output_log.error = f"output reader failed: {error}; payload INCOMPLETE"
                 raise
@@ -6561,6 +6677,14 @@ def cmd_check(
                 output += f"QUALIFICATION FAILED: {capture_error}\n"
                 if rc == 0:
                     rc = 1
+        if rc == 0 and output_validator is not None:
+            validation_error = (
+                "output capture incomplete" if rt.is_alive() or reader_error
+                else output_validator()
+            )
+            if validation_error:
+                output += f"\nOUTPUT VALIDATION FAILED: {validation_error}\n"
+                rc = 1
         with results_lock:
             results.append((name, rc, elapsed, output))
         reporter.step_done(lane, name, rc, elapsed)
@@ -6612,7 +6736,7 @@ def cmd_check(
         return rc
 
     def lane_rust():
-        """Rust lane: codegen export → staleness diff → test compile → test run.
+        """Rust lane: native launcher → codegen → staleness → compile → test run.
 
         This lane does not generate a Linux-musl cross-target artifact tree.
 
@@ -6646,20 +6770,81 @@ def cmd_check(
         if rust_split is not None:
             lane_rust_split()
             return
+        launcher_env = build_native_bash_launcher()
+        if launcher_env is None:
+            return
         rc = run_step("codegen", codegen_cmd,
-                      env_extra={"TS_RS_EXPORT_DIR": str(codegen_export_base)})
+                      env_extra={**launcher_env, "TS_RS_EXPORT_DIR": str(codegen_export_base)})
         if rc == 0:
             codegen_stale_step()
-        run_step("cargo test compile", compile_cmd)
-        run_step("cargo test", test_cmd, timeout=CARGO_TEST_TIMEOUT)
+        run_step("cargo test compile", compile_cmd, env_extra=launcher_env)
+        run_step("cargo test", test_cmd, env_extra=launcher_env, timeout=CARGO_TEST_TIMEOUT)
+
+    def build_native_bash_launcher():
+        executables = []
+
+        def observe_artifact(line):
+            try:
+                artifact = json.loads(line)
+            except json.JSONDecodeError:
+                return
+            if not isinstance(artifact, dict):
+                return
+            target = artifact.get("target")
+            if (artifact.get("reason") == "compiler-artifact"
+                    and artifact.get("manifest_path") == str(ROOT / "crates" / "phoenix-ide" / "Cargo.toml")
+                    and isinstance(target, dict)
+                    and target.get("name") == "phoenix_ide"
+                    and target.get("kind") == ["bin"]):
+                executables.append(artifact.get("executable"))
+
+        def validate_artifact():
+            if len(executables) != 1:
+                return f"expected one phoenix_ide binary compiler-artifact; got {len(executables)}"
+            executable = executables[0]
+            if not isinstance(executable, str) or not executable:
+                return "phoenix_ide compiler-artifact has no executable"
+            path = Path(executable)
+            if not (path.is_absolute() and path.is_file() and os.access(path, os.X_OK)):
+                return f"phoenix_ide compiler-artifact must name an existing absolute executable file: {executable!r}"
+            return None
+
+        if run_step("native bash launcher", [
+            "cargo", "build", "-p", "phoenix_ide", "--bin", "phoenix_ide",
+            "--message-format=json-render-diagnostics",
+        ], output_observer=observe_artifact, output_validator=validate_artifact) != 0:
+            return None
+        return {
+            "PHOENIX_BASH_LAUNCH_TEST_EXE": executables[0],
+            "PHOENIX_BASH_LAUNCH_TEST_REQUIRED": "1",
+        }
 
     def lane_rust_split():
         phase = rust_split.phase
         if phase is RustPhase.BUILD:
+            if build_native_bash_launcher() is None:
+                return
             # Archiving compresses every test binary after the compile.
             run_step("cargo test compile", split_cmds["cargo test compile"],
                      timeout=CHECK_TIMEOUT + 300)
             return
+        if phase is RustPhase.TEST:
+            step = "native bash launcher validation"
+            reporter.step_start("rust", step)
+            started = time.monotonic()
+            launcher = os.environ.get("PHOENIX_BASH_LAUNCH_TEST_EXE", "")
+            path = Path(launcher)
+            valid = bool(launcher) and path.is_absolute() and path.is_file() and os.access(path, os.X_OK)
+            detail = ("" if valid else
+                      "PHOENIX_BASH_LAUNCH_TEST_EXE must name an existing absolute executable file "
+                      f"for split TEST (got {launcher!r}); download and chmod +x the native launcher fixture.")
+            elapsed = time.monotonic() - started
+            rc = 0 if valid else 1
+            with results_lock:
+                results.append((step, rc, elapsed, detail))
+            reporter.step_done("rust", step, rc, elapsed)
+            if not valid:
+                return
         if run_step("extract test archive", split_cmds["extract test archive"]) != 0:
             return
         if phase is RustPhase.CODEGEN:
@@ -6668,7 +6853,9 @@ def cmd_check(
             if rc == 0:
                 codegen_stale_step()
         else:
-            run_step("cargo test", split_cmds["cargo test"], timeout=CARGO_TEST_TIMEOUT)
+            run_step("cargo test", split_cmds["cargo test"],
+                     env_extra={"PHOENIX_BASH_LAUNCH_TEST_REQUIRED": "1"},
+                     timeout=CARGO_TEST_TIMEOUT)
 
     def lane_clippy():
         """Clippy in a bounded, non-incremental target directory.
@@ -7453,9 +7640,8 @@ def cmd_check(
     # Python therefore cannot leave every later lane parked on a lock or multiply
     # the join timeout. daemon=True lets the interpreter exit after recording the
     # one stuck lane; subprocess steps have their own CHECK_TIMEOUT kill budget.
-    # The rust lane runs compile and codegen (CHECK_TIMEOUT each) before the
-    # cargo-test step, so a raised cargo-test budget must raise the join too.
-    LANE_JOIN_TIMEOUT = max(CHECK_TIMEOUT * 6, CHECK_TIMEOUT * 2 + CARGO_TEST_TIMEOUT) + 30
+    # Launcher build, codegen, and test compilation each have CHECK_TIMEOUT.
+    LANE_JOIN_TIMEOUT = max(CHECK_TIMEOUT * 6, CHECK_TIMEOUT * 3 + CARGO_TEST_TIMEOUT) + 30
     with _check_interrupt_handlers(interrupted):
         stuck = _run_check_threads_sequentially(
             threads, LANE_JOIN_TIMEOUT, interrupted=interrupted
@@ -8260,7 +8446,7 @@ def _build_pipeline_model(with_timings: bool = False):
 # Per-lane step lists mirror the lane_* / check_* functions in cmd_check; shown
 # in node tooltips. Kept beside _LANE_DEFS conceptually — update both together.
 _GRAPH_LANE_STEPS = {
-    "rust": ["codegen export", "codegen-stale diff", "cargo test (compile)",
+    "rust": ["native bash launcher", "codegen export", "codegen-stale diff", "cargo test (compile)",
              "cargo test (run)"],
     "clippy": ["cargo clippy --all-targets -D warnings"],
     "tsc": ["tsc -b --noEmit"],

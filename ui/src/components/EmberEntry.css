@@ -1,0 +1,92 @@
+#conversation-list:has(> .conversation-list-pinned-header) {
+  flex-shrink: 0;
+}
+
+.ember-entry {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+  width: calc(100% - 24px);
+  min-height: 48px;
+  margin: 8px 12px;
+  padding: 6px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 7%, var(--bg-primary));
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+}
+
+.ember-entry:hover,
+.ember-entry.active {
+  border-color: var(--accent-blue, #3b82f6);
+  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 13%, var(--bg-primary));
+}
+
+.ember-entry:focus-visible {
+  outline: 2px solid var(--accent-blue, #3b82f6);
+  outline-offset: 2px;
+}
+
+.ember-entry-mark {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  border-radius: 8px;
+  color: var(--accent-blue, #3b82f6);
+  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 14%, transparent);
+  font-size: 17px;
+}
+
+.ember-entry-copy {
+  display: grid;
+  min-width: 0;
+  line-height: 1.2;
+}
+
+.ember-entry-copy strong {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.ember-entry-copy small {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.ember-entry-arrow {
+  margin-left: auto;
+  color: var(--text-muted);
+}
+
+.ember-entry.compact {
+  justify-content: center;
+  width: 40px;
+  min-height: 40px;
+  margin: 8px auto;
+  padding: 4px;
+  gap: 0;
+}
+
+.conversation-list-pinned-header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: var(--bg-primary);
+  padding-top: 1px;
+}
+
+.conversation-list-pinned-header > .ember-entry {
+  width: 100%;
+  margin: 0 0 8px;
+}
+
+@media (width <= 700px) {
+  .conversation-list-pinned-header > .ember-entry {
+    min-height: 44px;
+  }
+}

@@ -51,4 +51,4 @@ The plist's `Listeners` socket uses `SockFamily=IPv4v6`, `SockProtocol=TCP`, `So
 
 Phoenix rotates structured logs daily and retains 14 compressed generations. The fixed fatal log holds the latest Rust fatal diagnostic up to 64 KiB. OS-owned newsyslog rotation bounds loader stderr to 64 KiB with two generations. Deployment fixes these destinations rather than allowing structured output into discarded launchd stdout.
 
-The normative contracts are `specs/launchd-deployment/requirements.md` and `launchd-deployment.allium`; ADR-229 records the availability and manual-recovery tradeoff. Historical ADRs and transaction artifacts describe retired routes and do not provide active operator commands.
+The normative contracts are `specs/launchd-deployment/requirements.md` and `launchd-deployment.allium`; ADR-230 records the availability and manual-recovery tradeoff. Historical ADRs and transaction artifacts describe retired routes and do not provide active operator commands.

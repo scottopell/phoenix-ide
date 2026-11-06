@@ -596,13 +596,13 @@ THE native capability SHALL NOT enable automatic continuation, retry or rearm fa
 ### REQ-GR-020: Read and Set Automatic-Continuation Preferences Without Scheduling Work
 
 WHEN the current Coordinator inspects or changes automatic continuation
-THE SYSTEM SHALL expose native `read_automatic_continuation` and `set_automatic_continuation` tools that share the persisted preference with supported public settings surfaces without implicitly continuing or admitting work.
+THE SYSTEM SHALL expose native `read_automatic_continuation` and `set_automatic_continuation` tools that share the persisted preference with supported public settings surfaces without implicitly continuing or admitting work. Each tool MAY select an instance under [Federation REQ-FED-001–003 and REQ-FED-020](../federation/requirements.md): omission or exact `"local"` uses the local operation; a non-null saved-peer UUID or unambiguous display name selects that peer without local or alternate-peer fallback. Explicit `null`, unknown or ambiguous peers, and self-selection are errors.
 
-1. Both tools require trusted source tool-call context and transactionally revalidate that the source transcript is the current Coordinator. Ordinary conversations, sub-agents and predecessor Coordinator transcripts receive no such capability; retaining an earlier tool handle does not preserve source authority after rotation.
+1. Both tools require trusted source tool-call context and revalidate that the source transcript is the current Coordinator. Local operations revalidate inside their preference transaction; remote operations revalidate at dispatch and hold the source aggregate admission gate through the request. Ordinary conversations, sub-agents and predecessor Coordinator transcripts receive no such capability; retaining an earlier tool handle does not preserve source authority after rotation.
 2. Each request has a closed `target` tagged by `kind`: `ordinary` requires one nonblank `product_conversation_id`; `coordinator` carries no caller-supplied identity and resolves the singleton Coordinator aggregate. An ordinary target must name an exact published ordinary ProductConversation. Transcript aliases, subordinate or unpublished conversations and a Coordinator disguised as an ordinary target are rejected.
-3. Read accepts only `target`. Set additionally requires the strict Boolean `auto_continue_on_context_exhaustion`; omitted, string and numeric values are rejected. Unknown fields, source-identity overrides and recovery controls are rejected. The persisted default is false.
-4. Successful results contain only the resolved `aggregate` and Boolean `auto_continue_on_context_exhaustion`, not a claim about scheduler state, admission or dispatch. The aggregate identifies its `ordinary` or `coordinator` kind and resolved ProductConversation ID. Read is side-effect-free. Set changes only the preference and establishes its returned value within the committing transaction; a later status-projection failure cannot misrepresent that write as an acknowledged rollback.
-5. Preference changes are prospective under [Bedrock REQ-BED-020](../bedrock/requirements.md). Enabling after exhaustion does not wake or retroactively admit continuation. Disabling does not revoke already-admitted continuation. Neither operation creates or removes a dispatch intent, retries/rearms failed work, alters a Goal or bypasses stop, pause, closed-work or approval gates.
+3. Read accepts only `target` and optional non-null `instance`. Set additionally requires the strict Boolean `auto_continue_on_context_exhaustion`; omitted, `null`, string and numeric values are rejected. Read and set have distinct closed shapes; unknown fields, source-identity overrides and recovery controls are rejected. The persisted default is false.
+4. Successful results contain only the resolved `aggregate` and Boolean `auto_continue_on_context_exhaustion`, not a claim about scheduler state, admission or dispatch. The aggregate identifies its `ordinary` or `coordinator` kind and resolved ProductConversation ID. Read is side-effect-free. Set changes only the preference and establishes its returned value within the committing transaction; a later status-projection failure cannot misrepresent that write as an acknowledged rollback. A remote response is accepted only after checking its caller and destination identities, aggregate kind, exact ordinary aggregate identity or a syntactically valid stable ProductConversation identity returned by that authenticated exact destination for its Coordinator singleton, and, for set, Boolean value against the request.
+5. Preference changes are prospective under [Bedrock REQ-BED-021](../bedrock/requirements.md). Enabling after exhaustion does not wake or retroactively admit continuation. Disabling does not revoke already-admitted continuation. Neither operation creates or removes a dispatch intent, retries/rearms failed work, alters a Goal or bypasses stop, pause, closed-work or approval gates.
 6. Requester cancellation does not cancel an owned write before its durability outcome is classified. An acknowledged rollback is an ordinary refusal. An unclassified commit or rollback closes local runtime authority before its write owner is released; neither ordinary success nor ordinary error is published after that closure. A read failure is not classified as an uncertain write. These rules add no cross-process recovery, idempotency receipt or eventual-completion guarantee.
 
 ---
@@ -632,3 +632,15 @@ THE Coordinator instructions SHALL require interpreting user feedback into expli
 THE instructions SHALL direct authorized in-scope action without redundant permission requests while preserving later user restrictions and structural execution boundaries.
 
 THE tools SHALL NOT introduce server-verified human approval, pending proposals, review UI, conversation-state transitions, timers, remote Authority mutation or automatic execution.
+
+
+### REQ-GR-023: Identify the Coordinator as Ember in Navigation
+
+WHEN a user navigates to the singleton Global Coordinator from desktop or mobile web
+THE SYSTEM SHALL provide one compact, persistently reachable entry named Ember, with Global coordinator as its secondary role description
+AND SHALL visually distinguish it from ordinary Open/History conversations without including it in their counts or lifecycle controls
+AND SHALL expose the accessible name “Open Ember”
+AND SHALL expose selected state on both `/global` and canonical `/global/<id>` routes in persistent desktop sidebar navigation
+AND SHALL replace the mobile conversation-list view with the Ember destination when the user opens Ember, rather than retain a duplicate self-navigation entry
+AND SHALL use Ember as the primary visible identity in the destination's loading/accessibility labels and Coordinator-origin return breadcrumb
+AND SHALL retain the existing singleton route, identity, transcript, and authorization behavior.

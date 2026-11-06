@@ -7,7 +7,7 @@ not promise downgrade compatibility or universal data retention. Database
 replacement and older-binary startup require offline operator work and a matching
 backup; no general automatic database rollback or live replacement exists.
 
-ADR-229 withdraws macOS exact prepared/current-schema/ordinary interval
+ADR-230 withdraws macOS exact prepared/current-schema/ordinary interval
 qualifications REQ-COMP-012/013/015/017/018/019. Routine launchd deployment lets
 the candidate own migrations, runs it once, and retains failed claim/evidence for
 manual recovery after disruption. No deployment-side database scan, registry
@@ -29,13 +29,13 @@ with the predecessor. The in-app UI states this limitation explicitly.
 | REQ-COMP-001–004,021 | Explicit guarantees, forward migration and offline recovery; launchd helper/installer/manual-recovery tests and operator guidance |
 | REQ-COMP-005 | Integer Unix microseconds apply to new or structurally changed internal timestamp columns; unchanged historical columns remain outside convergence scope |
 | REQ-COMP-006–007 | Legacy Direct authority repairs remain forward-only; accepted source-locator fingerprints/encodings remain authoritative |
-| REQ-COMP-008 | Exact Kache 1.2.2 macOS arm64 strict local-only selection remains unchanged; remote caching is outside its contract |
+| REQ-COMP-008 | Exact Kache 1.2.2 macOS arm64 strict local-only selection remains unchanged; remote caching is outside its contract. The development doctor reports the effective request, read-only backend selection, executable, version, scope and fallback reasons without starting a daemon or leaving probe-created cache state. Runtime readiness is checked when Cargo starts; unusable explicit selections fail actionably and `RUSTC_WRAPPER` remains authoritative. |
 | REQ-COMP-012/013/015/017/018/019 | Withdrawn macOS qualifications; IDs reserved |
 | REQ-COMP-014/016 | Existing exact protected Linux systemd qualification remains active |
 | REQ-COMP-020 | Goals lineage validation remains candidate-owned; see below |
 
 The retired macOS regression classes and replacement failure/identity coverage
-are accounted for explicitly in the launchd executive and ADR-229. No production
+are accounted for explicitly in the launchd executive and ADR-230. No production
 operation occurred; production remains `9c5d471d`.
 
 ## Public literal chat

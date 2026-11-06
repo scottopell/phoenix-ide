@@ -10,6 +10,35 @@ runSurfaceCapture({
     { name: 'desktop', width: 1180, height: 900 },
   ],
   captureStory: async ({ page, id, outDir, viewport }) => {
+    if (id === 'active-overview-dark' && viewport.name === 'mobile') {
+      await page.setViewportSize({ width: 320, height: 568 });
+      await page.waitForFunction(() => {
+        const owner = document.querySelector('[data-app-scroll-owner]');
+        const header = document.querySelector('.conversation-list-pinned-header');
+        return owner && header && Number.parseFloat(getComputedStyle(owner).scrollPaddingTop) >= header.getBoundingClientRect().height;
+      });
+      const metrics = await page.evaluate(() => {
+        const owner = document.querySelector('[data-app-scroll-owner]');
+        const header = document.querySelector('.conversation-list-pinned-header');
+        const row = document.querySelector('.conv-item');
+        if (!owner || !header || !row) throw new Error('Pinned list fixture structure missing');
+        owner.scrollTop = owner.scrollHeight;
+        row.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+        return {
+          headerBottom: header.getBoundingClientRect().bottom,
+          rowTop: row.getBoundingClientRect().top,
+          rowBottom: row.getBoundingClientRect().bottom,
+          viewportHeight: innerHeight,
+          documentWidth: document.documentElement.scrollWidth,
+        };
+      });
+      if (metrics.rowTop < metrics.headerBottom - 1 || metrics.rowBottom > metrics.viewportHeight || metrics.documentWidth > 320) {
+        throw new Error(`Pinned header conceals upward-revealed row: ${JSON.stringify(metrics)}`);
+      }
+      console.log(`Pinned header upward-reveal bounds: ${JSON.stringify(metrics)}`);
+      await page.screenshot({ path: `${outDir}/ember-upward-reveal-320.png`, fullPage: true });
+      return true;
+    }
     if (!id.startsWith('product-conversations-')) return false;
     const isHistory = id.includes('-history-');
     const productConversationId = isHistory ? 'mobile-product-history' : 'mobile-product-open';

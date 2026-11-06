@@ -41,18 +41,89 @@ vi.mock('../utils', async () => {
 import { ConversationList, ConversationRow, ChainBlock } from './ConversationList';
 import { productConversationPresentationIndicator } from './ConversationList.presentation';
 
+describe('ConversationList — pinned header scroll offset', () => {
+  it('updates the nearest app scroll owner across densities and restores its prior inline style', () => {
+    const observers: Array<{ observed: Element[]; disconnected: boolean; trigger: () => void }> = [];
+    const OriginalResizeObserver = globalThis.ResizeObserver;
+    class ObserverMock {
+      observed: Element[] = [];
+      disconnected = false;
+      constructor(private callback: ResizeObserverCallback) { observers.push(this); }
+      observe(target: Element) { this.observed.push(target); }
+      unobserve() {}
+      disconnect() { this.disconnected = true; }
+      trigger() { this.callback([], this as unknown as ResizeObserver); }
+    }
+    vi.stubGlobal('ResizeObserver', ObserverMock);
+    try {
+      const { container, rerender, unmount } = render(
+        <MemoryRouter><div data-app-scroll-owner style={{ scrollPaddingTop: '7px' }}>
+          <ConversationList {...defaultProps} conversations={[]} listDensity="mobile" />
+        </div></MemoryRouter>,
+      );
+      const owner = container.querySelector<HTMLElement>('[data-app-scroll-owner]')!;
+      const root = container.querySelector<HTMLElement>('#conversation-list')!;
+      const header = root.querySelector<HTMLElement>('.conversation-list-pinned-header')!;
+      vi.spyOn(header, 'getBoundingClientRect').mockReturnValue({ height: 48 } as DOMRect);
+      act(() => observers.at(-1)!.trigger());
+      expect(owner.style.scrollPaddingTop).toBe('48px');
+      expect(root.style.scrollPaddingTop).toBe('');
+
+      rerender(<MemoryRouter><div data-app-scroll-owner style={{ scrollPaddingTop: '7px' }}>
+        <ConversationList {...defaultProps} conversations={[]} listDensity="full" />
+      </div></MemoryRouter>);
+      expect(observers[0]!.disconnected).toBe(true);
+      expect(owner.style.scrollPaddingTop).toBe('48px');
+      rerender(<MemoryRouter><div data-app-scroll-owner style={{ scrollPaddingTop: '7px' }}>
+        <ConversationList {...defaultProps} conversations={[]} sidebarMode listDensity="sidebar" />
+      </div></MemoryRouter>);
+      expect(observers.at(-1)!.observed).toContain(header);
+      unmount();
+      expect(owner.style.scrollPaddingTop).toBe('7px');
+      expect(observers.at(-1)!.disconnected).toBe(true);
+    } finally {
+      vi.stubGlobal('ResizeObserver', OriginalResizeObserver);
+    }
+  });
+});
+
 describe('ConversationList — global navigation', () => {
-  it('exposes a labeled Coordinator entry from the mobile list header', () => {
+  it('pins Ember below the complete mobile list toolbar and navigates with router state', () => {
     function Location() { return <span data-testid="location">{useLocation().pathname}</span>; }
-    const { getByRole, getByTestId } = render(
+    const { getByRole, getByTestId, container } = render(
       <MemoryRouter initialEntries={['/']}>
         <ConversationList {...defaultProps} conversations={[]} listDensity="mobile" />
         <Location />
       </MemoryRouter>,
     );
 
-    fireEvent.click(getByRole('button', { name: 'Open Coordinator' }));
+    const pinnedHeader = container.querySelector('.conversation-list-pinned-header')!;
+    const toolbar = pinnedHeader.querySelector('.conversation-list-header')!;
+    const ember = getByRole('button', { name: 'Open Ember' });
+    expect(ember).toHaveAccessibleDescription('Global coordinator');
+    expect(pinnedHeader.firstElementChild).toBe(toolbar);
+    expect(toolbar.contains(ember)).toBe(false);
+    expect(toolbar.nextElementSibling).toBe(ember);
+    expect(pinnedHeader).toContainElement(ember);
+
+    fireEvent.click(ember);
     expect(getByTestId('location')).toHaveTextContent('/global');
+    expect(ember).not.toHaveAttribute('aria-current');
+  });
+
+  it('leaves list navigation when opening Ember through the mobile route boundary', () => {
+    const { getByRole, queryByRole } = render(
+      <MemoryRouter initialEntries={['/']}>
+        <Routes>
+          <Route path="/" element={<ConversationList {...defaultProps} conversations={[]} listDensity="mobile" />} />
+          <Route path="/global" element={<h1>Ember destination</h1>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(getByRole('button', { name: 'Open Ember' }));
+    expect(getByRole('heading', { name: 'Ember destination' })).toBeInTheDocument();
+    expect(queryByRole('button', { name: 'Open Ember' })).not.toBeInTheDocument();
   });
 });
 

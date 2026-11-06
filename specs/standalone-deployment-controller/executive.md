@@ -1,6 +1,6 @@
 # Standalone Deployment Controller — Executive Status
 
-The standalone Rust controller is retired under ADR-229. REQ-SDC-001–023 remain
+The standalone Rust controller is retired under ADR-230. REQ-SDC-001–023 remain
 withdrawn tombstones and its behavioral Allium file is removed. The crate had no
 production caller; removing it changes no production orchestration.
 

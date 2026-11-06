@@ -187,13 +187,14 @@ async fn explicit_local_goal_read_preserves_snapshot_wait_and_authority() {
         input["instance"] = Value::Null;
         assert_eq!(omitted, value(&f.invoke("read_goal", input.clone()).await));
         input["instance"] = json!("local");
-        let unauthorized = GoalTool {
-            service: GoalCommandService::new(f.runtime.clone()),
-            runtime: f.runtime.clone(),
-            operation: Operation::Read,
-        }
-        .run(input, super::super::tests::context(&f.target_transcript))
-        .await;
+        let unauthorized = f
+            .executor
+            .execute(
+                CheckedToolCall::cleared_for_test("read_goal", input),
+                super::super::tests::context(&f.target_transcript),
+            )
+            .await
+            .expect("registered read_goal tool");
         assert!(!unauthorized.is_success());
         assert!(unauthorized.output().contains("Coordinator"));
     }
@@ -1292,5 +1293,226 @@ fn runtime_input(transcript: &str, key: &str) -> phoenix_db::workflow::AcceptAut
         ),
         disposition: AcceptedDisposition::Runtime,
         accepted_at: Timestamp(1),
+    }
+}
+
+#[tokio::test]
+async fn production_coordinator_registry_has_exact_instance_selector_contract() {
+    let f = Fixture::new().await;
+    let registry = f
+        .runtime
+        .coordinator_tool_registry(&f.caller, None)
+        .await
+        .unwrap();
+    let definitions = registry.definitions();
+    let selector_tools = [
+        "read_conversation",
+        "query_database",
+        "resolve_reference",
+        "send_conversation_message",
+        "watch_conversation",
+        "unwatch_conversation",
+        "list_watched_conversations",
+        "read_goal",
+    ];
+
+    assert!(!definitions
+        .iter()
+        .any(|definition| definition.name == "remote_query_database"));
+    for name in selector_tools {
+        let definition = definitions
+            .iter()
+            .find(|definition| definition.name == name)
+            .unwrap_or_else(|| panic!("missing production coordinator tool {name}"));
+        let expected = if matches!(
+            name,
+            "send_conversation_message"
+                | "watch_conversation"
+                | "unwatch_conversation"
+                | "list_watched_conversations"
+        ) {
+            crate::coordinator_tools::instance::InstanceSelector::schema()
+        } else {
+            crate::coordinator_tools::instance::InstanceSelector::nullable_schema()
+        };
+        assert_eq!(
+            definition.input_schema["properties"]["instance"], expected,
+            "{name} must expose its standard instance selector"
+        );
+    }
+    for name in ["read_automatic_continuation", "set_automatic_continuation"] {
+        let definition = definitions
+            .iter()
+            .find(|definition| definition.name == name)
+            .unwrap_or_else(|| panic!("missing production coordinator tool {name}"));
+        assert_eq!(
+            definition.input_schema["properties"]["instance"],
+            json!({"type": "string", "minLength": 1}),
+            "{name} retains its existing separate instance contract"
+        );
+    }
+    for definition in definitions.iter().filter(|definition| {
+        !selector_tools.contains(&definition.name.as_str())
+            && !matches!(
+                definition.name.as_str(),
+                "read_automatic_continuation" | "set_automatic_continuation"
+            )
+    }) {
+        assert!(
+            definition.input_schema["properties"]
+                .get("instance")
+                .is_none(),
+            "{} must not expose an instance selector",
+            definition.name
+        );
+    }
+}
+
+#[tokio::test]
+async fn watch_tools_treat_omitted_and_exact_local_as_equal_and_reject_invalid_selectors_without_effects(
+) {
+    let f = Fixture::new().await;
+    let target = f.owner.as_str();
+
+    let omitted_watch = value(
+        &f.invoke(
+            "watch_conversation",
+            json!({"product_conversation_id":target}),
+        )
+        .await,
+    );
+    let explicit_local_watch = value(
+        &f.invoke(
+            "watch_conversation",
+            json!({"product_conversation_id":target,"instance":"local"}),
+        )
+        .await,
+    );
+    assert_eq!(omitted_watch, explicit_local_watch);
+
+    let omitted_unwatch = value(
+        &f.invoke(
+            "unwatch_conversation",
+            json!({"product_conversation_id":target}),
+        )
+        .await,
+    );
+    assert_eq!(omitted_unwatch["ended"], true);
+    let _ = f
+        .invoke(
+            "watch_conversation",
+            json!({"product_conversation_id":target}),
+        )
+        .await;
+    let explicit_local_unwatch = value(
+        &f.invoke(
+            "unwatch_conversation",
+            json!({"product_conversation_id":target,"instance":"local"}),
+        )
+        .await,
+    );
+    assert_eq!(omitted_unwatch, explicit_local_unwatch);
+
+    let omitted_list = value(&f.invoke("list_watched_conversations", json!({})).await);
+    let explicit_local_list = value(
+        &f.invoke("list_watched_conversations", json!({"instance":"local"}))
+            .await,
+    );
+    assert_eq!(omitted_list, explicit_local_list);
+
+    let _ = f
+        .invoke(
+            "watch_conversation",
+            json!({"product_conversation_id":target}),
+        )
+        .await;
+    let before = f.db.list_coordinator_watches().await.unwrap();
+    for (name, input) in [
+        (
+            "watch_conversation",
+            json!({"product_conversation_id":target}),
+        ),
+        (
+            "unwatch_conversation",
+            json!({"product_conversation_id":target}),
+        ),
+        ("list_watched_conversations", json!({})),
+    ] {
+        for selector in [
+            json!("missing-peer"),
+            json!("Local"),
+            json!(" local "),
+            json!(false),
+        ] {
+            let mut input = input.clone();
+            input["instance"] = selector;
+            let output = f.invoke(name, input).await;
+            assert!(
+                !output.is_success(),
+                "{name} unexpectedly accepted selector"
+            );
+            assert_eq!(
+                serde_json::to_value(&before).unwrap(),
+                serde_json::to_value(f.db.list_coordinator_watches().await.unwrap()).unwrap(),
+                "{name} with invalid selector must not change local watches"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn malformed_remote_reads_reject_before_saved_peer_lookup() {
+    let f = Fixture::new().await;
+    for (name, input, expected) in [
+        (
+            "read_conversation",
+            json!({"instance":"missing-peer", "conversation_id":"@conv:target", "cursor":1_000_001}),
+            "cursor exceeds maximum",
+        ),
+        (
+            "resolve_reference",
+            json!({"instance":"missing-peer", "reference":"not-a-reference"}),
+            "reference",
+        ),
+    ] {
+        let output = f.invoke(name, input).await;
+        assert!(!output.is_success());
+        assert!(
+            output.output().contains(expected),
+            "{name}: {}",
+            output.output()
+        );
+        assert!(!output.output().contains("peer connection not found"));
+    }
+}
+
+#[tokio::test]
+async fn production_coordinator_query_database_routes_to_local_when_omitted_or_exact_local() {
+    let f = Fixture::new().await;
+    let registry = f
+        .runtime
+        .coordinator_tool_registry(&f.caller, None)
+        .await
+        .unwrap();
+    let query = registry.find_tool("query_database").unwrap();
+    let local = query
+        .run(
+            json!({"sql":"SELECT 'local-selector-parity' AS source"}),
+            f.ctx(),
+        )
+        .await;
+    assert!(local.is_success(), "{}", local.output());
+    assert!(local.output().contains("local-selector-parity"));
+    let mut local_result: Value = serde_json::from_str(local.output()).unwrap();
+    local_result["elapsed_ms"] = json!(0);
+    for input in [
+        json!({"sql":"SELECT 'local-selector-parity' AS source","instance":"local"}),
+        json!({"sql":"SELECT 'local-selector-parity' AS source","instance":null}),
+    ] {
+        let output = query.run(input, f.ctx()).await;
+        assert!(output.is_success(), "{}", output.output());
+        let mut result: Value = serde_json::from_str(output.output()).unwrap();
+        result["elapsed_ms"] = json!(0);
+        assert_eq!(local_result, result);
     }
 }

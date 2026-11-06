@@ -22,7 +22,7 @@ transactions remain untouched; the new helper refuses old manifests.
 
 Installed-runtime restart remains a separate independent helper that preserves
 binary, plist, environment, listener and deployed SHA and verifies the same exact
-identity on a new PID. ADR-229 records the accepted availability/manual-recovery
+identity on a new PID. ADR-230 records the accepted availability/manual-recovery
 cost and supersedes the retired macOS recovery routes.
 
 ## Requirement coverage
@@ -34,7 +34,7 @@ cost and supersedes the retired macOS recovery routes.
 | REQ-LDD-014–016 | Installed-state restart helper; 38 focused tests and real initiator-death journey |
 | REQ-LDD-030–031 | Failed status/retained marker/evidence, explicit stop uncertainty, old-manifest refusal, UI/API manual-recovery block |
 | REQ-LDD-032 | Claim-release, reporting and cleanup failures preserve committed status and the healthy runtime; warning output is best effort |
-| REQ-LDD-008,017–028 | Withdrawn by ADR-229; no active guarantee |
+| REQ-LDD-008,017–028 | Withdrawn by ADR-230; no active guarantee |
 
 ## Verification and deliberate test retirement
 

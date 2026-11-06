@@ -108,6 +108,74 @@ impl Database {
         (observed, release)
     }
 
+    /// Read a peer's preference under its current send enrollment.
+    ///
+    /// # Errors
+    /// Returns an error for inactive authority, unavailable target or storage failure.
+    pub async fn read_federated_automatic_continuation_settings(
+        &self,
+        authority: &crate::FederationSendAuthority,
+        target: AutomaticContinuationTarget<'_>,
+    ) -> DbResult<AutomaticContinuationSettings> {
+        let mut tx = self.pool.begin().await?;
+        crate::federation_enrollment::require_federation_send_authority_tx(&mut tx, authority)
+            .await?;
+        let aggregate = Self::resolve_settings_target(&mut tx, target).await?;
+        let preference = read_preference_on(&mut tx, aggregate.product_conversation_id()).await?;
+        tx.commit().await?;
+        Ok(AutomaticContinuationSettings {
+            aggregate,
+            preference,
+        })
+    }
+
+    /// Set a peer's preference under its current send enrollment.
+    ///
+    /// # Errors
+    /// Returns an established error after acknowledged rollback; uncertain commit or rollback
+    /// acknowledgement remains unclassified.
+    pub async fn set_federated_automatic_continuation_settings(
+        &self,
+        authority: &crate::FederationSendAuthority,
+        target: AutomaticContinuationTarget<'_>,
+        preference: AutoContinueOnContextExhaustion,
+    ) -> LocalAuthorityResult<DbResult<AutomaticContinuationSettings>> {
+        use LocalAuthorityResult::{
+            DurableFactEstablished as Established, DurableFactUnclassified as Unclassified,
+        };
+        let mut connection = match self.pool.acquire().await {
+            Ok(connection) => connection,
+            Err(error) => return Established(Err(error.into())),
+        };
+        let mut tx = match connection.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return Established(Err(error.into())),
+        };
+        let result = async {
+            crate::federation_enrollment::require_federation_send_authority_tx(&mut tx, authority)
+                .await?;
+            let aggregate = Self::resolve_settings_target(&mut tx, target).await?;
+            write_preference_on(&mut tx, aggregate.product_conversation_id(), preference).await?;
+            let preference =
+                read_preference_on(&mut tx, aggregate.product_conversation_id()).await?;
+            Ok(AutomaticContinuationSettings {
+                aggregate,
+                preference,
+            })
+        }
+        .await;
+        match result {
+            Ok(settings) => match tx.commit().await {
+                Ok(()) => Established(Ok(settings)),
+                Err(_) => Unclassified,
+            },
+            Err(error) => match tx.rollback().await {
+                Ok(()) => Established(Err(error)),
+                Err(_) => Unclassified,
+            },
+        }
+    }
+
     /// Reads the current preference for a verified transcript and target.
     ///
     /// # Errors

@@ -13,7 +13,7 @@ export function ConversationReturnBreadcrumb() {
         event.preventDefault();
         navigate(candidate.href);
       }}>
-        {'\u2190'} from: Coordinator
+        {'\u2190'} from: Ember
       </a>
     </div>
   );

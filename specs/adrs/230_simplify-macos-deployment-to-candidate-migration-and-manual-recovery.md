@@ -1,4 +1,4 @@
-# ADR-229: Simplify macOS deployment to candidate migration and manual recovery
+# ADR-230: Simplify macOS deployment to candidate migration and manual recovery
 
 - **Status:** Accepted
 - **Date:** 2026-11-06

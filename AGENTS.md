@@ -304,7 +304,7 @@ Compatibility, downgrade, rollback, live-resource replacement, recovery, cross-v
 
 #### Deployment favors a small operational contract
 
-Routine macOS deployment lets the exact candidate own migrations. After disruption failure it attempts stop, reports what ran and failed, and retains its claim and artifacts for an operator. Availability loss and manual recovery are accepted costs. Do not reintroduce exhaustive database scans, schema-specific upgrade routes, snapshot/rehearsal/replay frameworks, automatic predecessor startup, or a standalone controller without demonstrated product need; agent-authored requirements alone do not establish that need. Downgrade requires a matching database restore offline. Linux keeps its separately specified contracts. See `specs/adrs/229_simplify-macos-deployment-to-candidate-migration-and-manual-recovery.md`.
+Routine macOS deployment lets the exact candidate own migrations. After disruption failure it attempts stop, reports what ran and failed, and retains its claim and artifacts for an operator. Availability loss and manual recovery are accepted costs. Do not reintroduce exhaustive database scans, schema-specific upgrade routes, snapshot/rehearsal/replay frameworks, automatic predecessor startup, or a standalone controller without demonstrated product need; agent-authored requirements alone do not establish that need. Downgrade requires a matching database restore offline. Linux keeps its separately specified contracts. See `specs/adrs/230_simplify-macos-deployment-to-candidate-migration-and-manual-recovery.md`.
 
 #### PR feedback is an actionable snapshot, not a GitHub mirror
 

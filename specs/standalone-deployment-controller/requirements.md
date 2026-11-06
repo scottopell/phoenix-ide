@@ -2,7 +2,7 @@
 
 ## Scope
 
-No standalone deployment controller is part of the production deployment contract. The identifiers below are reserved withdrawn requirements; none grants an implementation or recovery obligation. See ADR-229.
+No standalone deployment controller is part of the production deployment contract. The identifiers below are reserved withdrawn requirements; none grants an implementation or recovery obligation. See ADR-230.
 
 ## Withdrawn requirements
 

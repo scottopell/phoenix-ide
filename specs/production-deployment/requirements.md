@@ -91,15 +91,15 @@ Published releases shall provide checksummed `x86_64-unknown-linux-musl` and `aa
 
 ### REQ-PD-018 — Withdrawn macOS deployment route
 
-Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-229.
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
 ### REQ-PD-019 — Withdrawn macOS deployment route
 
-Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-229.
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
 ### REQ-PD-020 — Withdrawn macOS deployment route
 
-Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-229.
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
 ### REQ-PD-021 — Explicit protected Linux mode selection
 
@@ -107,7 +107,7 @@ The exact Linux prepared source shall require `--systemd-current-schema-upgrade`
 
 ### REQ-PD-022 — Withdrawn macOS deployment route
 
-Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-229.
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
 ### REQ-PD-023 — Exact protected systemd published-release admission
 
@@ -178,7 +178,7 @@ Ambiguous evidence, a prepared transaction, a post-marker transaction, or an act
 
 ### REQ-PD-028 — Withdrawn macOS deployment route
 
-Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-229.
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
 ### REQ-PD-029: Exact prepared Linux systemd candidate
 
@@ -194,7 +194,7 @@ This exact prepared source SHALL reuse the protected systemd lifecycle in REQ-PD
 
 ### REQ-PD-030 — Withdrawn macOS deployment route
 
-Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-229.
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
 ### REQ-PD-031 — macOS manual-recovery contract
 

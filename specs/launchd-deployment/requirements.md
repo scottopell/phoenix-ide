@@ -36,7 +36,7 @@ A deployment shall succeed only when the target has a new PID, the credential-fr
 
 ### REQ-LDD-008 — Withdrawn deployment recovery contract
 
-Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-229.
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
 ### REQ-LDD-009 — Truthful durable result
 
@@ -72,51 +72,51 @@ A restart shall require the installed runtime to report a complete 40-character 
 
 ### REQ-LDD-017 — Withdrawn deployment recovery contract
 
-Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-229.
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
 ### REQ-LDD-018 — Withdrawn deployment recovery contract
 
-Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-229.
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
 ### REQ-LDD-019 — Withdrawn deployment recovery contract
 
-Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-229.
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
 ### REQ-LDD-020 — Withdrawn deployment recovery contract
 
-Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-229.
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
 ### REQ-LDD-021 — Withdrawn deployment recovery contract
 
-Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-229.
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
 ### REQ-LDD-022 — Withdrawn deployment recovery contract
 
-Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-229.
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
 ### REQ-LDD-023 — Withdrawn deployment recovery contract
 
-Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-229.
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
 ### REQ-LDD-024 — Withdrawn deployment recovery contract
 
-Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-229.
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
 ### REQ-LDD-025 — Withdrawn deployment recovery contract
 
-Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-229.
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
 ### REQ-LDD-026 — Withdrawn deployment recovery contract
 
-Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-229.
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
 ### REQ-LDD-027 — Withdrawn deployment recovery contract
 
-Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-229.
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
 ### REQ-LDD-028 — Withdrawn deployment recovery contract
 
-Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-229.
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
 ### REQ-LDD-029 — Candidate-owned migration
 

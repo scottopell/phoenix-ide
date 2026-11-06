@@ -206,3 +206,20 @@ Representative local samples on the same Mac (single before/after runs with some
 | Candidate/Linux gate classes | 15 cases / 14.696 s | 11 cases / 10.678 s |
 
 All 53 lineage/checkpoint tests and all 271 tests in the two affected Python modules pass. Focused fixture-cleanup/topology coverage also passes. These changes avoid a cross-process database-template cache; genuine migration, reopen, and topology coverage remains in its owning tests. Local logs are retained under `target/fixture-work-20261102/` in the Codex checkout. The broader CI handoff remains in progress.
+
+## Bundled SQLite dev/test optimization (2026-11-02)
+
+The SQLx package override optimizes the Rust facade; the bundled SQLite C engine was compiled without optimization. Setting `profile.dev.package.libsqlite3-sys.opt-level = 2` optimizes that dependency for dev and inherited test builds. Release profiles retain their existing settings. Test cases, SQLite features, schema, and runtime validation are unchanged.
+
+Three paired local samples at source `b32b50e13240407ecdb491c562061c901f528e04`:
+
+| Scope | Median test-body time before / after | Median CPU before / after |
+| --- | ---: | ---: |
+| Fresh DB/settings test | 1.03 / 0.51 s | 1.02 / 0.50 s |
+| Eight-prefix upgrade/reopen test | 13.62 / 6.78 s | 13.77 / 7.01 s |
+
+Runtime durations exclude process startup, as reported by Rust's test harness; CPU measurements include the full test process.
+
+Three alternating fresh replays of the real bundled-library build script measured the C-stage tradeoff: median wall time 2.74 s at `-O0`, 14.10 s at `-O2`; user CPU 1.31 / 12.95 s. Replay objects byte-match Cargo's actual artifacts, and compiler commands differ only in optimization level. The archive grows by 3.84 MiB, primarily DWARF, while code size decreases 6.9%. Observed peak compiler RSS grows from about 294 to 918 MB. These are C-stage measurements with warm OS caches, excluding Rust rebuilding and linking; the affected-test samples are not a full-check speedup estimate.
+
+Raw runtime samples remain under `target/post-1018-sqlite-profile-probe/`; cold-build parity, commands, and samples are under `target/sqlite-optimization-20261102/cold-c/` in the Codex checkout.

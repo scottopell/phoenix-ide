@@ -2,7 +2,7 @@
 
 ## Summary
 
-Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance conversation read/resolve support, and optional-instance `send_conversation_message`, `read_goal`, and Coordinator `query_database` routing through destination-owned admission. All five optional-instance tools share a typed selector: omission and exact `"local"` use local services; read tools also treat explicit `null` as local, while other strings retain remote selection. Ordinary non-Coordinator query registrations remain local-only. Durable remote watches remain in progress. Existing subscription groundwork does not by itself establish watch behavior.
+Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance conversation read/resolve support, and optional-instance `send_conversation_message`, `read_goal`, Coordinator `query_database`, and Coordinator `read_automatic_continuation`/`set_automatic_continuation` routing through destination-owned admission. Omission and exact `"local"` use local services; the preference tools reject explicit `null` even on read, while other read tools treat it as local. Other strings select an exact saved peer without fallback. Ordinary non-Coordinator query registrations remain local-only. Durable remote watches provide destination-owned enrollment, continuation following, accepted-delivery deduplication, restart and bounded-gap recovery, ordered unsubscribe, and revocation-aware closure.
 
 ## Requirement status
 
@@ -11,10 +11,11 @@ Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance c
 | REQ-FED-001–003 | Implemented | Shared local/remote selection covers send, read, resolve, Goal read, and Coordinator database query. Tool-level regressions cover authority-specific schemas, local parity, delivery/steering replay and provenance, target and Coordinator restrictions, local paging/message context, Goal waits/history, UUID/name remote routing, and retained remote failure behavior without local fallback. |
 | REQ-FED-004–006 | Implemented | Authenticated remote attribution, peer-scoped durable retry identity, destination admission, direct/steering replay, revocation/replacement rechecks, cancellation survival, and database/runtime reconstruction are covered by focused tests. |
 | REQ-FED-007 | Implemented | Optional-instance Goal reads preserve stable resolution, version waiting, timeout, result semantics, and malformed-response rejection. |
-| REQ-FED-008 | Partial | Remote message and Goal-read results identify the stable ProductConversation and exact admitted transcript; remote watch results remain. |
-| REQ-FED-009–016 | Partial | Durable subscription schema and local Coordinator notification admission are groundwork only; remote watch creation, delivery, replay, bounds, close/gap recovery, unsubscribe, and revocation behavior remain. |
+| REQ-FED-008 | Implemented | Remote message, Goal-read, and watch results preserve stable ProductConversation identity and exact admitted transcript provenance. |
+| REQ-FED-009–016 | Implemented | Two-instance and persistence regressions cover destination-owned future-only enrollment, idle and busy admission, Continue-chain following, accepted-delivery deduplication, restart recovery, bounded-gap evidence and replay, ordered online/offline unsubscribe, late-create fencing, source closure, and revocation/replacement races. |
 | REQ-FED-017–018 | Defined | Complexity boundaries and non-goals are normative in `requirements.md`. |
 | REQ-FED-019 | Implemented | Enrollment and peer-connection writes require a validated `PeerDisplayName`; constructor/JSON and HTTP tests pass for blank names and case/whitespace variants of local, including rejection without replacing credentials or connections. |
+| REQ-FED-020 | Implemented; deployment pending | Separate closed remote read/set requests, source Coordinator dispatch gate, authenticated destination transaction, strict preference-only set and response verification passed focused regressions, exact-range review, full repository qualification, and merge-head CI. Production deployment and live cross-host acceptance are not established. No generic settings, trust/enrollment, or combined enable-and-create operation is included. |
 
 ## Existing foundations
 
@@ -25,14 +26,14 @@ Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance c
 - Local payload-bound message replay through `message_id`.
 - Optional-instance remote message routing with authenticated source attribution, stable and exact destination receipts, durable peer-scoped replay, and no local fallback.
 - Local and optional-instance Goal reads with stable resolution, version waiting, timeout, typed wait outcomes, exact transcript provenance, and malformed-response rejection.
-- Local durable Coordinator watch notification admission and deduplication.
-- Federation event, source-subscription, and consumer-state tables.
+- Durable Coordinator watches with destination-owned admission, source continuation following, accepted-delivery deduplication, restart and bounded-gap recovery, ordered unsubscribe, and revocation-aware closure.
+- Federation event, source-subscription, consumer-state, gap-evidence, and tombstone persistence.
 
 ## Verification still required
 
-- Full repository validation and an actual accepted mutation through a second Phoenix process or machine; focused local persistence, API, runtime, Coordinator-tool, codegen, and UI checks do not satisfy that acceptance.
-- Watch replay, local durable admission before acknowledgement, restart recovery, bounded backlog failure, gap resynchronization, ordered unsubscribe, and revocation-admission race tests.
+- Production rollout and live cross-host acceptance of the automatic-continuation controls remain unverified. Repository qualification and merge-head CI do not establish deployed behavior.
+- Operational interoperability still requires compatible deployment on participating hosts; this does not reopen the implemented watch lifecycle.
 
-## Exclusions
+## Delivery inventory
 
-This slice does not implement Goal mutations (including creation), settings, Continue, conversation creation or rename, reverse enrollment, deployment, or live peer changes.
+Goal mutations (including creation), generic settings beyond the typed automatic-continuation preference, Continue, conversation creation, rename, reverse enrollment, live peer changes, and combined enable-and-create are not implemented in this status snapshot. This inventory reports delivered behavior; it does not narrow separately authorized scope.

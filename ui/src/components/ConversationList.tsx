@@ -23,6 +23,7 @@ import {
   productConversationPresentationIndicator,
 } from './ConversationList.presentation';
 import './ConversationList.css';
+import { EmberEntry } from './EmberEntry';
 
 
 interface ConversationListProps {
@@ -701,11 +702,28 @@ export function ConversationList({
   const [collapsedChains, setCollapsedChains] = useState<Set<string>>(new Set());
   const menuRef = useRef<HTMLDivElement>(null);
   const listRootRef = useRef<HTMLElement>(null);
-  const lastRevealedActiveSlugRef = useRef<string | null>(null);
-
   const effectiveListDensity = listDensity ?? (sidebarMode ? 'sidebar' : 'full');
   const isSidebarLayout = effectiveListDensity === 'sidebar';
   const isMobileList = effectiveListDensity === 'mobile';
+
+  useLayoutEffect(() => {
+    const root = listRootRef.current;
+    const header = root?.querySelector<HTMLElement>('.conversation-list-pinned-header');
+    const scrollOwner = root?.closest<HTMLElement>('[data-app-scroll-owner]');
+    if (!root || !header || !scrollOwner) return;
+    const previousScrollPaddingTop = scrollOwner.style.scrollPaddingTop;
+    const updateScrollOffset = () => {
+      scrollOwner.style.scrollPaddingTop = `${header.getBoundingClientRect().height}px`;
+    };
+    updateScrollOffset();
+    const observer = new ResizeObserver(updateScrollOffset);
+    observer.observe(header);
+    return () => {
+      observer.disconnect();
+      scrollOwner.style.scrollPaddingTop = previousScrollPaddingTop;
+    };
+  }, [effectiveListDensity, sidebarMode]);
+  const lastRevealedActiveSlugRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!expandedId) return;
@@ -875,6 +893,7 @@ export function ConversationList({
   return (
     <section ref={listRootRef} id="conversation-list" className={`view active ${isSidebarLayout ? 'sidebar-mode' : ''} ${isMobileList ? 'mobile-list-density' : ''}`}>
       {!isSidebarLayout && (
+        <div className="conversation-list-pinned-header">
         <div className="view-header conversation-list-header">
           <div className="conversation-list-title-group">
             <button
@@ -887,34 +906,8 @@ export function ConversationList({
               <img src="/phoenix.svg" alt="" className="conversation-list-brand-logo" />
               <span>Phoenix</span>
             </button>
-            <div className="conversation-list-subnav">
-              <button
-                className={`archive-toggle-text ${!showArchived ? 'active' : ''}`}
-                onClick={() => { if (showArchived) onToggleArchived(); }}
-                disabled={!showArchived}
-              >
-                {usingProductRows ? 'Open' : 'Active'}
-              </button>
-              <span aria-hidden="true">·</span>
-              <button
-                className={`archive-toggle-text ${showArchived ? 'active' : ''}`}
-                onClick={() => { if (!showArchived) onToggleArchived(); }}
-              >
-                History {usingProductRows ? archivedProductConversations.length : archivedConversations.length}
-              </button>
-              {authChip && <span className="conversation-list-auth-chip">{authChip}</span>}
-            </div>
           </div>
           <div className="conversation-list-command-cluster">
-            <button
-              type="button"
-              className="conversation-list-icon-btn conversation-list-coordinator-btn"
-              onClick={() => navigate('/global')}
-              title="Coordinator"
-              aria-label="Open Coordinator"
-            >
-              <span aria-hidden="true">◎</span>
-            </button>
             <button
               type="button"
               className="conversation-list-icon-btn"
@@ -933,6 +926,25 @@ export function ConversationList({
             >
               + New
             </button>
+          </div>
+        </div>
+          <EmberEntry onClick={() => navigate('/global')} />
+          <div className="conversation-list-subnav">
+            <button
+              className={`archive-toggle-text ${!showArchived ? 'active' : ''}`}
+              onClick={() => { if (showArchived) onToggleArchived(); }}
+              disabled={!showArchived}
+            >
+              {usingProductRows ? 'Open' : 'Active'}
+            </button>
+            <span aria-hidden="true">·</span>
+            <button
+              className={`archive-toggle-text ${showArchived ? 'active' : ''}`}
+              onClick={() => { if (!showArchived) onToggleArchived(); }}
+            >
+              History {usingProductRows ? archivedProductConversations.length : archivedConversations.length}
+            </button>
+            {authChip && <span className="conversation-list-auth-chip">{authChip}</span>}
           </div>
         </div>
       )}

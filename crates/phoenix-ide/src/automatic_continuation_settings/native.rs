@@ -6,7 +6,7 @@ use phoenix_db::{
     AutomaticContinuationSettings, AutomaticContinuationTarget,
     ResolvedAutomaticContinuationAggregate,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::Target;
 use crate::api::AutomaticContinuationAggregateView;
@@ -17,7 +17,8 @@ pub(crate) enum Operation {
     Set(AutoContinueOnContextExhaustion),
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PreferenceView {
     pub aggregate: AutomaticContinuationAggregateView,
     pub auto_continue_on_context_exhaustion: bool,
@@ -53,12 +54,16 @@ pub(crate) enum Completion {
     LocalAuthorityClosed,
 }
 
-struct PreferenceWritePass {
+pub(crate) struct PreferenceWritePass {
     owner: Option<AdmittedOperation>,
 }
 
 impl PreferenceWritePass {
-    fn classify<T>(mut self, result: LocalAuthorityResult<T>) -> Result<T, String> {
+    pub(crate) fn new(owner: AdmittedOperation) -> Self {
+        Self { owner: Some(owner) }
+    }
+
+    pub(crate) fn classify<T>(mut self, result: LocalAuthorityResult<T>) -> Result<T, String> {
         match result {
             LocalAuthorityResult::DurableFactEstablished(value) => {
                 self.owner.take();
@@ -181,7 +186,7 @@ async fn apply_owned(
             let owner = runtime.acquire_local_authority_pass().map_err(|()| {
                 "runtime admission closed after fatal local authority loss".to_string()
             })?;
-            let pass = PreferenceWritePass { owner: Some(owner) };
+            let pass = PreferenceWritePass::new(owner);
             pass.classify(
                 db.set_native_automatic_continuation_settings(
                     &source_transcript_id,
