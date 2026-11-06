@@ -112,6 +112,16 @@ it.each([
   expect(screen.getByText(/Older triggers may have been missed/)).toBeTruthy();
 });
 
+it.each([true, false])('offers the owned sign-in link only for an enabled unauthorized connection: %s', async enabled => {
+  const url = 'https://auth.example/authorize?state=owned-flow';
+  const config = { enabled: true, mcp_server: 'slack' };
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ config, connection: { state: 'unauthorized', enabled, tools: [], pending_oauth_url: url }, requests: [], returns: [] }) }));
+  render(<SlackGatewaySettings standalone />);
+  await screen.findByText(/Slack connection:/);
+  const link = screen.queryByRole('link', { name: 'Sign in to Slack' });
+  expect(link?.getAttribute('href') ?? null).toBe(enabled ? url : null);
+});
+
 
 it('shows schema incompatibility even when every required tool name is present', async () => {
   const names = ['slack_read_user_profile', 'slack_search_public_and_private', 'slack_read_thread', 'slack_get_reactions', 'slack_add_reaction', 'slack_send_message'];

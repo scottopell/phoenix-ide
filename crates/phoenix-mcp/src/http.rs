@@ -298,6 +298,9 @@ impl HttpTransport {
         if error.is_builder() {
             return TransportError::Protocol(format!("invalid HTTP request for '{method}'"));
         }
+        if error.is_redirect() {
+            return TransportError::Protocol(format!("HTTP redirect rejected for '{method}'"));
+        }
         if error.is_timeout() {
             TransportError::Timeout(format!("request timed out for '{method}'"))
         } else if error.is_decode() {
@@ -2273,6 +2276,30 @@ mod tests {
         let message = HttpTransport::classify_request_error(error, "initialize").to_string();
         assert!(!message.contains("diagnostic-secret"), "{message}");
         assert!(!message.contains("access_token"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn redirect_loops_are_permanent_connection_failures() {
+        let server = TestServer::start(vec![]).await;
+        server.route("/mcp", status_response(302, &[("location", &server.url)]));
+        let manager = McpClientManager::new();
+        manager
+            .reload_from_configs(vec![(
+                "remote".into(),
+                http_config(&server.url, HttpAuth::None),
+            )])
+            .await;
+        manager.await_background_tasks().await;
+        let status = &manager.status().await[0];
+        assert_eq!(status.state, crate::McpConnState::Failed);
+        assert!(status
+            .last_error
+            .as_ref()
+            .unwrap()
+            .contains("redirect rejected"));
+        assert!(status.next_retry_at.is_none());
+        assert!(status.pending_oauth_url.is_none());
+        manager.shutdown().await;
     }
 
     #[tokio::test]
@@ -4534,6 +4561,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_json_refresh_rejections_discard_the_grant_and_offer_owned_sign_in() {
+        for status in [400, 401, 403] {
+            for body in ["", "<html>grant rejected</html>"] {
+                let server = TestServer::start(handshake_responses("sess-1")).await;
+                let manager = ready_refreshable_manager(&server).await;
+                let mut response = status_response(status, &[("content-type", "text/html")]);
+                response.body = body.into();
+                server.route("/token", response);
+                server.push_responses(vec![unauthorized(&server)]);
+                let error = manager
+                    .call_tool("remote", "report", serde_json::json!({}))
+                    .await
+                    .unwrap_err();
+                assert!(error.contains("re-authorize at"), "{status}: {error}");
+                assert!(manager
+                    .oauth
+                    .store()
+                    .token("remote")
+                    .await
+                    .unwrap()
+                    .is_none());
+                assert!(pending_auth_url(&manager).await.is_some());
+                assert!(manager
+                    .oauth
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .get("remote")
+                    .unwrap()
+                    .owner
+                    .is_some());
+                assert_eq!(server.recorded_for_path("/token").len(), 1);
+                manager.shutdown().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_successful_refresh_keeps_the_grant_and_fails_without_sign_in() {
+        for body in [
+            "<html>not a token</html>",
+            "{}",
+            r#"{"access_token":"at-2","token_type":"DPoP"}"#,
+        ] {
+            let server = TestServer::start(handshake_responses("sess-1")).await;
+            let manager = ready_refreshable_manager(&server).await;
+            let mut response = status_response(200, &[("content-type", "application/json")]);
+            response.body = body.into();
+            server.route("/token", response);
+            server.push_responses(vec![unauthorized(&server)]);
+            manager
+                .call_tool("remote", "report", serde_json::json!({}))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                manager
+                    .oauth
+                    .store()
+                    .token("remote")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .access_token,
+                "at-1"
+            );
+            assert_eq!(manager.status().await[0].state, crate::McpConnState::Failed);
+            assert!(pending_auth_url(&manager).await.is_none());
+            assert_eq!(server.recorded_for_path("/token").len(), 1);
+            manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn delayed_replacement_refreshes_only_after_expiry_or_a_new_challenge() {
+        for case in ["expired", "changed_scope", "same_challenge"] {
+            let server = TestServer::start(handshake_responses("sess-1")).await;
+            let manager = ready_refreshable_manager(&server).await;
+            let handle = manager.servers.read().await.get("remote").unwrap().clone();
+            let crate::supervisor::RecoveryClaim::Leader(permit) =
+                handle.claim_oauth_recovery(0).await
+            else {
+                panic!("OAuth recovery owner");
+            };
+            server.route_seq(
+                "/token",
+                vec![
+                    token_response("at-2", Some("rt-2"), None),
+                    token_response("at-3", Some("rt-3"), None),
+                ],
+            );
+            let challenge = format!("Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource/mcp\", scope=\"mcp.read\"", server.base());
+            server.push_responses(vec![delete_ack()]);
+            let outcome = manager
+                .refresh_authorized_server("remote", &handle, &permit, Some(&challenge))
+                .await;
+            server.push_responses(vec![status_response(503, &[])]);
+            manager
+                .finish_oauth_refresh("remote", &handle, &permit, outcome)
+                .await
+                .unwrap_err();
+            assert!(handle.snapshot().next_retry_at.is_some());
+            if case == "expired" {
+                let mut token = manager
+                    .oauth
+                    .store()
+                    .token("remote")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                token.expires_at = 1;
+                manager.oauth.store().upsert_token(&token).await.unwrap();
+            }
+            let next_challenge = if case == "changed_scope" {
+                challenge.replace("mcp.read", "mcp.write")
+            } else {
+                challenge.clone()
+            };
+            server.push_responses(vec![status_response(
+                401,
+                &[("www-authenticate", &next_challenge)],
+            )]);
+            if case != "same_challenge" {
+                server.push_responses(handshake_responses("sess-2"));
+            }
+            tokio::time::timeout(Duration::from_secs(15), manager.await_background_tasks())
+                .await
+                .unwrap();
+            if case == "same_challenge" {
+                assert_eq!(
+                    manager.status().await[0].state,
+                    crate::McpConnState::Unauthorized
+                );
+                assert!(pending_auth_url(&manager).await.is_some());
+                assert_eq!(server.recorded_for_path("/token").len(), 1);
+            } else {
+                assert_eq!(
+                    manager.status().await[0].state,
+                    crate::McpConnState::Ready,
+                    "{case}"
+                );
+                assert!(pending_auth_url(&manager).await.is_none());
+                let grants = server.recorded_for_path("/token");
+                assert_eq!(grants.len(), 2, "{case}");
+                assert!(grants[1].1.contains("refresh_token=rt-2"));
+            }
+            *server.routes.delete_bearer.lock().unwrap() = None;
+            server.push_responses(vec![delete_ack()]);
+            manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
     async fn refresh_rejection_discards_token_and_reprompts() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
         let manager = Arc::new(McpClientManager::new());
@@ -5419,6 +5598,9 @@ mod tests {
                         vec![
                             status_response(503, &[]),
                             token_response("at-2", Some("rt-2"), Some("mcp.read")),
+                            // The later, different scope challenge may refresh
+                            // once with rt-2 before falling back to sign-in.
+                            status_response(400, &[]),
                         ]
                     } else {
                         vec![token_response("at-2", Some("rt-2"), Some("mcp.read"))]
@@ -5468,7 +5650,7 @@ mod tests {
                 );
                 assert_eq!(
                     server.recorded_for_path("/token").len(),
-                    if transient { 2 } else { 1 }
+                    if transient { 3 } else { 1 }
                 );
                 assert!(server.recorded_for_path("/original-metadata").len() >= 2);
                 let deletes: Vec<_> = server

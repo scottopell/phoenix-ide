@@ -248,3 +248,20 @@ The complete MCP suite now passes 188 tests, with MCP all-target Clippy and
 Allium/anchor checks passing. Client-registration/callback setup and failed owned
 re-authorization retain their existing explicit-action boundary; this follow-up
 does not introduce automatic identity-provisioning retries.
+
+The third GitHub review found redirect errors being treated as network outages,
+non-JSON token rejections preserving a dead grant, delayed replacement retries
+carrying an unconditional sign-in decision, and the standalone Slack settings
+page omitting the owned sign-in action. Redirect failures now require correction.
+Definitive token endpoint rejection discards the grant even without a JSON body;
+malformed successful responses remain permanent protocol errors and retain it.
+Delayed retries compare expiry and scope/resource challenge evidence before
+refreshing, while an unexpired grant rejected for the same challenge still asks
+for sign-in. Callback reconnects retain the original challenge for that comparison.
+Settings expose the existing pending authorization URL for enabled connections.
+
+The scope-preservation regression now permits one refresh with the rotated token
+when delayed recovery encounters a different scope challenge, then checks that
+rejection still preserves the complete scope union for sign-in. No regression
+was removed. All 192 MCP tests and 28 focused UI tests pass, along with MCP
+all-target Clippy, TypeScript, focused ESLint, formatting and Allium/anchor checks.

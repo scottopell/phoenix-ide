@@ -454,6 +454,25 @@ enum OAuthHandshakeAction {
     Authorize,
 }
 
+// A fresh grant must not be refreshed repeatedly for the same rejection. A
+// later expiry or a changed scope/resource challenge is a new refresh attempt.
+fn oauth_challenge_changed(previous: Option<&str>, current: Option<&str>) -> bool {
+    let previous = oauth::parse_bearer_challenge(previous.unwrap_or_default());
+    let current = oauth::parse_bearer_challenge(current.unwrap_or_default());
+    current
+        .get("resource_metadata")
+        .is_some_and(|value| previous.get("resource_metadata") != Some(value))
+        || current.get("scope").is_some_and(|value| {
+            let scopes = |value: &str| {
+                value
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+            scopes(value) != scopes(previous.get("scope").map_or("", String::as_str))
+        })
+}
+
 fn merge_oauth_challenges<'a>(challenges: impl IntoIterator<Item = &'a str>) -> Option<String> {
     let mut parameters = std::collections::BTreeMap::new();
     let mut scopes = Vec::new();
@@ -2414,6 +2433,10 @@ impl McpClientManager {
             handle,
             epoch,
             OAuthHandshakeAction::Authorize,
+            Some(OAuthRetryPlan {
+                scopes: flow.scopes,
+                www_authenticate: resolved.www_authenticate,
+            }),
         ));
 
         Ok(name)
@@ -2905,13 +2928,21 @@ impl McpClientManager {
         handle: SupervisorHandle,
         epoch: u64,
         action: OAuthHandshakeAction,
+        plan: Option<OAuthRetryPlan>,
     ) -> tokio::task::JoinHandle<()> {
         let connect_name = name;
         let connect_config = config.clone();
         let manager = self.clone();
         tokio::spawn(async move {
             let _ = manager
-                .connect_actor_owned(&connect_name, &connect_config, &handle, epoch, action, None)
+                .connect_actor_owned(
+                    &connect_name,
+                    &connect_config,
+                    &handle,
+                    epoch,
+                    action,
+                    plan.as_ref(),
+                )
                 .await;
         })
     }
@@ -3214,6 +3245,7 @@ impl McpClientManager {
             handle,
             epoch,
             OAuthHandshakeAction::Refresh,
+            None,
         ))
     }
 
@@ -3884,6 +3916,7 @@ impl McpClientManager {
                     handle.clone(),
                     permit.epoch,
                     OAuthHandshakeAction::Refresh,
+                    None,
                 );
                 if let Some(cancel) = cancel {
                     tokio::select! {
@@ -4627,6 +4660,10 @@ impl McpClientManager {
         else {
             return Err(failure.into_connect_failure(None, action, prior_plan));
         };
+        let challenge_changed = oauth_challenge_changed(
+            prior_plan.and_then(|plan| plan.www_authenticate.as_deref()),
+            www_authenticate.as_deref(),
+        );
         www_authenticate = merge_oauth_challenges(
             [
                 prior_plan.and_then(|plan| plan.www_authenticate.as_deref()),
@@ -4650,7 +4687,11 @@ impl McpClientManager {
         }
         if let Some(token) = stored {
             extend_unique(&mut prior_scopes, token.scopes.iter().map(String::as_str));
-            if matches!(action, OAuthHandshakeAction::Refresh) && token.refresh_token.is_some() {
+            if (matches!(action, OAuthHandshakeAction::Refresh)
+                || token.is_expired()
+                || challenge_changed)
+                && token.refresh_token.is_some()
+            {
                 match oauth_refresh(&oauth_rt, name, url, www_authenticate.as_deref(), &token).await
                 {
                     Ok(access_token) => {

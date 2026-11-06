@@ -436,9 +436,12 @@ replacement connects. Late completions SHALL NOT restore a removed grant or
 publish tools for superseded configuration. Invocation schema and original
 configuration binding SHALL remain intact through ordinary replay-eligible recovery.
 
-A fresh grant rejected during replacement handshake SHALL request owned browser
+A fresh, unexpired grant rejected for the same authorization challenge during
+replacement handshake SHALL request owned browser
 authorization with its discovery challenge and complete required scope union
-rather than repeatedly refresh. A denied, expired or unstartable browser flow
+rather than repeatedly refresh. A retry delayed by a temporary replacement-handshake
+failure SHALL reevaluate expiry and scope/resource challenges before choosing
+refresh or browser authorization. A denied, expired or unstartable browser flow
 SHALL clear its pending URL, retain its cause and permit explicit retry. Failure
 to stop local transport activity SHALL remain visible and prevent replacement;
 best-effort remote cleanup SHALL NOT mask that local failure.

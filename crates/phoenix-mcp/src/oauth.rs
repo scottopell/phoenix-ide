@@ -968,21 +968,23 @@ async fn token_grant(
             minimum,
         });
     }
-    let doc: Value = response.json().await.map_err(OAuthRequestError::request)?;
+    let doc = response.json::<Value>().await;
     if !status.is_success() {
         return Err(OAuthRequestError::Rejected(format!(
             "token endpoint rejected the grant (HTTP {status}): {}",
-            doc.get("error_description")
-                .or_else(|| doc.get("error"))
+            doc.as_ref()
+                .ok()
+                .and_then(|doc| doc.get("error_description").or_else(|| doc.get("error")))
                 .and_then(Value::as_str)
                 .unwrap_or("unknown error")
         )));
     }
+    let doc = doc.map_err(OAuthRequestError::request)?;
     let access_token = doc
         .get("access_token")
         .and_then(Value::as_str)
         .ok_or_else(|| {
-            OAuthRequestError::Rejected("token response missing access_token".to_string())
+            OAuthRequestError::Permanent("token response missing access_token".to_string())
         })?;
     // The token rides as `Authorization: Bearer …`; a non-Bearer grant (e.g.
     // DPoP) would be silently misused and surface as opaque 401/refresh
@@ -990,7 +992,7 @@ async fn token_grant(
     // noncompliant (RFC 6749 §5.1) but always means Bearer in practice.
     match doc.get("token_type").and_then(Value::as_str) {
         Some(token_type) if !token_type.eq_ignore_ascii_case("bearer") => {
-            return Err(OAuthRequestError::Rejected(format!(
+            return Err(OAuthRequestError::Permanent(format!(
                 "unsupported token_type '{token_type}'; only Bearer tokens can be attached"
             )));
         }
