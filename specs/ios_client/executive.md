@@ -65,7 +65,7 @@ The hosted iOS job remains responsible for executing these unit regressions.
 | REQ-IOS-014 versioned persistence | `DiskStore.saveVersioned/loadVersioned` (tested), per-store schema version constants |
 | REQ-IOS-015 image attachments | `AttachmentViews.swift`, `ImageProcessing` (tested), composer PhotosPicker, outbox `images` |
 | REQ-IOS-016 question answering | `QuestionCard.swift`, `QuestionAnswers` encoder (tested), respond/dismiss actions |
-| REQ-IOS-017 coordinator access | `AppModel.openCoordinator`, list globe entry + row badge |
+| REQ-IOS-017 coordinator access | `ConversationListView` pinned Ember button → `AppModel.openCoordinator`; `ConversationView.navigationTitle` uses session identity before the first snapshot |
 | REQ-IOS-018 advisory nudges | `AttentionMonitor` (diff tested), `BackgroundRefresh`, `NotificationRouter` |
 | REQ-IOS-019 grounding/files | Not started; blocked by ProductConversation migration (`tasks/04009-p2-blocked--ios-vnext-grounding-files.md`) |
 | REQ-IOS-020 prose reader | Not started; planned under `tasks/04010-p2-blocked--ios-vnext-prose-reader-comments.md` |

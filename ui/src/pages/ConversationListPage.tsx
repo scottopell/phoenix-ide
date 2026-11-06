@@ -460,6 +460,9 @@ export function ConversationListPage() {
   if (initError) {
     return (
       <div id="app" className="list-page">
+        <div className="conversation-list-pinned-header">
+          <EmberEntry onClick={() => navigate('/global')} />
+        </div>
         <main className="init-error" data-app-scroll-owner>
           <h2><AlertTriangle />Storage Error</h2>
           <p>Failed to initialize local storage: {initError}</p>

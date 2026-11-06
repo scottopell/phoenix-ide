@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProductConversationListRow } from '../api';
 import { ApiResponseError, api } from '../api';
@@ -9,6 +9,7 @@ const pageMocks = vi.hoisted(() => ({
   refresh: vi.fn().mockResolvedValue(undefined),
   isOnline: true,
   isReady: true,
+  initError: null as string | null,
 }));
 
 vi.mock('../api', async () => {
@@ -44,7 +45,7 @@ vi.mock('../hooks/useAppMachine', () => ({
   useAppMachine: () => ({
     isOnline: pageMocks.isOnline,
     isReady: pageMocks.isReady,
-    initError: null,
+    initError: pageMocks.initError,
     pendingOpsCount: 0,
     queueOperation: vi.fn(),
   }),
@@ -91,6 +92,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     pageMocks.refresh.mockResolvedValue(undefined);
     pageMocks.isOnline = true;
     pageMocks.isReady = true;
+    pageMocks.initError = null;
     vi.mocked(api.codexLoginPreflight).mockResolvedValue({} as never);
     vi.mocked(api.listProductConversations).mockResolvedValue({
       product_conversations: [productConversation()],
@@ -120,6 +122,24 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     expect(pinnedHeader).toBeInTheDocument();
     expect(pinnedHeader?.querySelector('.conversation-list-header')).toBeInTheDocument();
     expect(screen.getByTitle('Loading conversations')).toBeInTheDocument();
+  });
+
+  it('keeps Ember navigation available when local storage initialization fails', async () => {
+    pageMocks.isReady = false;
+    pageMocks.initError = 'IndexedDB unavailable';
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <Routes>
+          <Route path="/" element={<ConversationListPage />} />
+          <Route path="/global" element={<h1>Ember destination</h1>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('heading', { name: 'Storage Error' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Refresh Page' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Open Ember' }));
+    expect(await screen.findByRole('heading', { name: 'Ember destination' })).toBeInTheDocument();
   });
 
   it('renames through the production mobile list touch target', async () => {

@@ -66,9 +66,18 @@ final class ModelCompatibilityTests: XCTestCase {
             Conversation.self,
             from: Data(#"{"id":"ordinary","slug":"ordinary"}"#.utf8))
 
-        XCTAssertEqual(ConversationView.navigationTitle(for: coordinator, coordinatorConversationId: nil), "Ember")
-        XCTAssertEqual(ConversationView.navigationTitle(for: remembered, coordinatorConversationId: "remembered"), "Ember")
-        XCTAssertEqual(ConversationView.navigationTitle(for: ordinary, coordinatorConversationId: nil), ordinary.displayTitle)
+        XCTAssertEqual(ConversationView.navigationTitle(for: coordinator, sessionId: "fleet", coordinatorConversationId: nil), "Ember")
+        XCTAssertEqual(ConversationView.navigationTitle(for: remembered, sessionId: "remembered", coordinatorConversationId: "remembered"), "Ember")
+        XCTAssertEqual(ConversationView.navigationTitle(for: ordinary, sessionId: "ordinary", coordinatorConversationId: nil), ordinary.displayTitle)
+    }
+
+    func testDestinationTitleBeforeFirstSnapshotUsesSessionIdentity() {
+        XCTAssertEqual(ConversationView.navigationTitle(
+            for: nil, sessionId: "fleet", coordinatorConversationId: "fleet"), "Ember")
+        XCTAssertEqual(ConversationView.navigationTitle(
+            for: nil, sessionId: "ordinary", coordinatorConversationId: "fleet"), "Conversation")
+        XCTAssertEqual(ConversationView.navigationTitle(
+            for: nil, sessionId: "ordinary", coordinatorConversationId: nil), "Conversation")
     }
 
     func testConversationAggregateIdentityFallsBackToTranscriptId() throws {
