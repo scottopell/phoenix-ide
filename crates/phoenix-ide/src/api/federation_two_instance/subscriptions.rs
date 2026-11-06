@@ -3,7 +3,6 @@ use crate::api::federation::subscriptions::*;
 use phoenix_core::domain::{
     federation_subscription::*, product_conversation::ProductConversationId,
 };
-use phoenix_tools::Tool;
 use uuid::Uuid;
 
 async fn source(instance: &TestInstance) -> phoenix_db::Conversation {
