@@ -4,9 +4,9 @@
 
 Phoenix exposes a typed in-app published-release update surface on the About deployment page. It discovers GitHub's latest stable release, resolves the tag to a full source commit, selects the host asset and published checksum, and presents that immutable identity and release notes before any approval is possible.
 
-Approval is same-host only and binds the exact preview tag plus full commit. Backend eligibility derives from the same typed runtime-ownership snapshot shown by the deployment API; development, unmanaged, ambiguous, and unsupported processes cannot approve disruptive updates. The server downloads that commit's deployment controller into an owner-only transaction artifact and waits until the controller's transaction ID appears in backend-owned durable status. Launchd, systemd, and bare Linux continue to own disruption, exact runtime verification, commit, and rollback through the production-deployment stack; the running Phoenix process never replaces or restarts itself.
+Approval is same-host only and binds the exact preview tag plus full commit. Backend eligibility derives from the same typed runtime-ownership snapshot shown by the deployment API; development, unmanaged, ambiguous, and unsupported processes cannot approve disruptive updates. The server downloads that commit's deployment controller into an owner-only transaction artifact and waits until the controller's transaction ID appears in backend-owned durable status. Backend owners handle disruption, exact runtime verification and commit; Linux retains its specified rollback while macOS failure requires manual recovery; the running Phoenix process never replaces or restarts itself.
 
-After reconnect, the UI hydrates the authoritative native status file. In-progress, committed, precondition-failed, backend-reported rollback, rollback failure, concurrent rejection, unreadable, and stale outcomes remain distinct. The backend's rollback status covers runtime artifacts only. The UI reports that runtime changes were rolled back and verified while explicitly stating that the database was not restored. Phoenix does not provide a general automatic database rollback subsystem. `./dev.py` remains available for bootstrap, local HEAD deployment, offline repair, migration, and emergency recovery.
+After reconnect, the UI hydrates the authoritative native status file. A macOS `failed` outcome is terminal, stops polling, explains possible candidate database writes and the offline paired-restore boundary, and blocks another in-app approval pending operator recovery. In-progress, committed, precondition-failed, backend-reported rollback, rollback failure, concurrent rejection, unreadable, and stale outcomes remain distinct. The backend's rollback status covers runtime artifacts only. The UI reports that runtime changes were rolled back and verified while explicitly stating that the database was not restored. Phoenix does not provide a general automatic database rollback subsystem. `./dev.py` remains available for bootstrap, local HEAD deployment, offline repair, migration, and emergency recovery.
 
 ## Requirement coverage
 
@@ -20,7 +20,7 @@ After reconnect, the UI hydrates the authoritative native status file. In-progre
 | REQ-RU-005 | `release_updates::approve` launches the controller independently and returns only after durable backend handoff. |
 | REQ-RU-006 | `read_status` normalizes backend-owned status and the UI polls/restores it after reconnect. |
 | REQ-RU-007 | Committed status displays backend-verified expected identity and approved source commit. |
-| REQ-RU-008 | `TransactionStatus` distinguishes runtime-artifact rollback from rollback failure; the success text explicitly states that runtime changes were rolled back and verified while the database was not restored. |
+| REQ-RU-008 | `failed` is terminal and blocks approval with manual-recovery/database warning. Linux runtime-artifact rollback still distinguishes rollback failure and explicitly states that the database was not restored. |
 | REQ-RU-009 | Native status supplies transaction ID, approved source, expected runtime identity, timestamps, and failure evidence without a parallel SQLite copy. |
 | REQ-RU-010 | Normal `./dev.py prod deploy` behavior remains available; controller mode is additive and explicit. |
 
@@ -29,5 +29,5 @@ After reconnect, the UI hydrates the authoritative native status file. In-progre
 - `allium check specs/release-updates/release-updates.allium`
 - controller-mode tests across launchd, systemd, and bare Linux in `tests/devpy/`
 - Rust release identity and approval-binding tests in `api::release_updates::tests`
-- `ReleaseUpdatePanel.test.tsx` covers immutable preview, explicit approval, remote denial, unreadable status, verified rollback, and rollback failure
+- `ReleaseUpdatePanel.test.tsx` covers immutable preview, explicit approval, remote denial, unreadable status, manual-recovery failure/approval block, verified Linux rollback, and rollback failure (32 tests pass)
 - `./dev.py check` validates local repository lanes and generated TypeScript freshness; normal Linux CI checks x86_64-musl compatibility, and release CI builds both Linux musl targets

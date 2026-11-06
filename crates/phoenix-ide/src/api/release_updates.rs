@@ -37,6 +37,7 @@ const USER_AGENT: &str = "phoenix-ide-release-updates";
 const PREVIEW_CACHE_TTL: Duration = Duration::from_secs(300);
 const TERMINAL_STATUS_STATES: &[&str] = &[
     "committed",
+    "failed",
     "precondition_failed",
     "activation_failed_rolled_back",
     "activation_failed_rollback_failed",
@@ -510,7 +511,10 @@ fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransa
     let published = value.get("source_kind").and_then(serde_json::Value::as_str)
         == Some("published_release")
         || marker.is_file();
-    if !published {
+    let local_launchd_failure = matches!(backend, ReleaseUpdateBackend::Launchd)
+        && value.get("source_kind").and_then(serde_json::Value::as_str) == Some("local_head")
+        && string("state").as_deref() == Some("failed");
+    if !published && !local_launchd_failure {
         return ReleaseTransactionStatus::None;
     }
     let Some(state) = string("state") else {
@@ -685,6 +689,13 @@ fn valid_approval(request: &ApproveReleaseUpdateRequest, preview: &ReleasePrevie
     )
 }
 
+fn durable_status_establishes_handoff(state: &str) -> bool {
+    matches!(
+        state,
+        "activating" | "stopping" | "migration_started" | "starting" | "verifying" | "publishing"
+    ) || TERMINAL_STATUS_STATES.contains(&state)
+}
+
 fn updater_dir(state: &AppState) -> Result<PathBuf, String> {
     let root = state
         .runtime_env
@@ -745,6 +756,16 @@ pub async fn approve(
         ReleaseUpdateAuthority::Allowed
     ) {
         return (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": "release update approval is not authorized on this request" }))).into_response();
+    }
+    if matches!(
+        read_status(&state, selected_backend),
+        ReleaseTransactionStatus::Present { state, .. } if state == "failed"
+    ) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "the failed deployment requires manual recovery before another update" })),
+        )
+            .into_response();
     }
     let preview = match discover_release().await {
         Ok(preview) if valid_approval(&request, &preview) => preview,
@@ -900,10 +921,7 @@ pub async fn approve(
             ..
         } = &durable
         {
-            if durable_id == &transaction_id
-                && (durable_state == "activating"
-                    || TERMINAL_STATUS_STATES.contains(&durable_state.as_str()))
-            {
+            if durable_id == &transaction_id && durable_status_establishes_handoff(durable_state) {
                 tokio::task::spawn_blocking(move || {
                     if let Err(error) = child.wait() {
                         tracing::warn!(%error, "failed to reap release controller");
@@ -960,8 +978,28 @@ pub async fn approve(
 mod tests {
     use super::*;
 
+    #[test]
+    fn launched_backend_states_establish_handoff_before_controller_exit() {
+        for state in [
+            "stopping",
+            "migration_started",
+            "starting",
+            "verifying",
+            "publishing",
+            "activating",
+        ] {
+            assert!(durable_status_establishes_handoff(state), "{state}");
+        }
+        for state in TERMINAL_STATUS_STATES {
+            assert!(durable_status_establishes_handoff(state), "{state}");
+        }
+        for state in ["preparing", "prepared", "unknown"] {
+            assert!(!durable_status_establishes_handoff(state), "{state}");
+        }
+    }
+
     #[tokio::test]
-    async fn rollback_failures_hydrate_as_terminal_with_both_diagnostics() {
+    async fn failures_hydrate_as_terminal_with_diagnostics() {
         let home = tempfile::tempdir().unwrap();
         let mut app = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         app.runtime_env =
@@ -969,6 +1007,7 @@ mod tests {
         let path = status_path(&app, ReleaseUpdateBackend::BareLinux).unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         for durable_state in [
+            "failed",
             "ordinary_activation_failed_rollback_failed",
             "activation_failed_rollback_failed",
         ] {
@@ -1011,6 +1050,55 @@ mod tests {
                 !stale,
                 "terminal failure must not be marked in-progress stale"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_launchd_failure_remains_visible_without_exposing_other_local_statuses() {
+        let home = tempfile::tempdir().unwrap();
+        let mut app = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        app.runtime_env =
+            Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::with_root(home.path()));
+        let path = status_path(&app, ReleaseUpdateBackend::Launchd).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for durable_state in ["failed", "committed", "preparing"] {
+            fs::write(
+                &path,
+                serde_json::json!({
+                    "transaction_id": "local-deploy",
+                    "source_kind": "local_head",
+                    "state": durable_state,
+                    "source_commit": "a".repeat(40),
+                    "updated_at": "2020-01-01T00:00:00Z",
+                    "failure": "verifying: unhealthy candidate; stopping failed: denied",
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let status = read_status(&app, ReleaseUpdateBackend::Launchd);
+            if durable_state == "failed" {
+                let ReleaseTransactionStatus::Present {
+                    state,
+                    failure,
+                    stale,
+                    ..
+                } = status
+                else {
+                    panic!("local launchd failure must remain visible for manual recovery");
+                };
+                assert_eq!(state, "failed");
+                assert_eq!(
+                    failure.as_deref(),
+                    Some("verifying: unhealthy candidate; stopping failed: denied")
+                );
+                assert!(!stale);
+            } else {
+                assert!(matches!(status, ReleaseTransactionStatus::None));
+            }
+            assert!(matches!(
+                read_status(&app, ReleaseUpdateBackend::BareLinux),
+                ReleaseTransactionStatus::None
+            ));
         }
     }
 

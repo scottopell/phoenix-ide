@@ -8,6 +8,7 @@ import './ReleaseUpdatePanel.css';
 const POLL_MS = 2_000;
 const TERMINAL_STATES = new Set([
   'committed',
+  'failed',
   'precondition_failed',
   'activation_failed_rolled_back',
   'activation_failed_rollback_failed',
@@ -36,6 +37,7 @@ function stateText(state: string): string {
     handed_off: 'Activation handed off',
     activating: 'Activating and verifying',
     committed: 'Update committed',
+    failed: 'Activation failed — manual recovery required',
     precondition_failed: 'Preparation failed before disruption',
     activation_failed_rolled_back: 'Activation failed; runtime changes rolled back and verified (database not restored)',
     activation_failed_rollback_failed: 'Activation and rollback failed — offline recovery required',
@@ -73,6 +75,9 @@ function TransactionStatus({ transaction }: { transaction: ReleaseTransactionSta
       {transaction.updated_at && <div>Updated: {new Date(transaction.updated_at).toLocaleString()}</div>}
       {transaction.failure && <div>Failure: {transaction.failure}</div>}
       {transaction.rollback_failure && <div>Rollback failure: {transaction.rollback_failure}</div>}
+      {transaction.state === 'failed' && (
+        <div className="release-update__recovery">The candidate may have changed the database. Inspect the deployment log and service state before manual recovery. Starting an older binary requires its matching offline database restore.</div>
+      )}
       {transaction.stale && <div className="release-update__recovery">Status is stale. Inspect the backend deployment log and use <code>./dev.py prod status</code> for offline recovery.</div>}
       {transaction.state === 'activation_failed_rollback_failed' && (
         <div className="release-update__recovery">The deployment claim remains retained. Do not clear it until the installed runtime and backend owner are inspected offline.</div>
@@ -268,6 +273,7 @@ export function ReleaseUpdatePanel({
   const approvalStatusSafe = !handoffPending && transactionError === null && (transaction?.kind === 'none'
     || (transaction?.kind === 'present'
       && TERMINAL_STATES.has(transaction.state)
+      && transaction.state !== 'failed'
       && transaction.state !== 'activation_failed_rollback_failed'
       && (transaction.state !== 'ordinary_activation_failed_rollback_failed'
         || snapshot?.installation_ownership.kind === 'launchd_managed')));
@@ -345,7 +351,7 @@ export function ReleaseUpdatePanel({
               {discoveryFreshness === 'current' && snapshot.authority.kind === 'allowed' && snapshot.preview.newer_than_current && approvalStatusSafe && !committedReleaseIsPreview && (
                 confirming ? (
                   <div className="release-update__confirm">
-                    <span>Install {snapshot.preview.tag}? Phoenix will reconnect after backend-owned verification or rollback.</span>
+                    <span>Install {snapshot.preview.tag}? Phoenix may disconnect during installation and verification. Failure may require manual recovery.</span>
                     <button type="button" className="settings-inline-btn release-update__approve" onClick={() => { void approve(); }} disabled={approving}>
                       {approving ? 'Preparing handoff…' : 'Approve and install'}
                     </button>
@@ -363,7 +369,7 @@ export function ReleaseUpdatePanel({
           )}
         </>
       )}
-      {active && <div className="release-update__hint">An approved update is in progress. Transaction status refreshes every 2 seconds; Phoenix may disconnect while the native backend activates, verifies, or rolls back.</div>}
+      {active && <div className="release-update__hint">An approved update is in progress. Transaction status refreshes every 2 seconds; Phoenix may disconnect during installation and verification. Failure may require manual recovery.</div>}
       {transaction && <TransactionStatus transaction={transaction} />}
     </section>
   );

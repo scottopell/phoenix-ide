@@ -47,6 +47,8 @@ describe('ReleaseUpdatePanel', () => {
       fireEvent.click(screen.getByRole('button', { name: 'Review and install v1.1.0' }));
     });
     expect(screen.getByRole('button', { name: 'Approve and install' })).toBeInTheDocument();
+    expect(screen.getByText(/Phoenix may disconnect during installation and verification\. Failure may require manual recovery\./)).toBeInTheDocument();
+    expect(screen.queryByText(/will reconnect|verification or rollback/)).not.toBeInTheDocument();
   });
 
   it('does not repeat the running deployment identity', async () => {
@@ -93,6 +95,8 @@ describe('ReleaseUpdatePanel', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
 
     expect(await screen.findByText(/activating and verifying/i)).toBeInTheDocument();
+    expect(screen.getByText(/Phoenix may disconnect during installation and verification\. Failure may require manual recovery\./)).toBeInTheDocument();
+    expect(screen.queryByText(/activates, verifies, or rolls back/)).not.toBeInTheDocument();
     expect(screen.getByText('tx-reconnect')).toBeInTheDocument();
     expect(fetchMock).toHaveBeenLastCalledWith('/api/release-updates/transaction');
   });
@@ -538,6 +542,24 @@ describe('ReleaseUpdatePanel', () => {
     render(<ReleaseUpdatePanel />);
 
     expect(await screen.findByRole('button', { name: /install v1.1.0/i })).toBeInTheDocument();
+  });
+
+  it('shows manual recovery after failed activation and blocks another approval', async () => {
+    vi.mocked(fetch).mockImplementation(() => json({
+      ...snapshot,
+      transaction: {
+        kind: 'present' as const, transaction_id: 'tx-failed', state: 'failed',
+        source_commit: snapshot.preview.commit, release_tag: snapshot.preview.tag,
+        expected_version: snapshot.preview.version, expected_git_sha: snapshot.preview.commit,
+        created_at: null, updated_at: null, failure: 'migration_started: exit 7',
+        rollback_failure: null, stale: false,
+      },
+    }));
+    render(<ReleaseUpdatePanel />);
+    expect(await screen.findByText(/activation failed — manual recovery required/i)).toBeInTheDocument();
+    expect(screen.getByText(/candidate may have changed the database/i)).toBeInTheDocument();
+    expect(screen.getByText(/migration_started: exit 7/i)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /install v1.1.0/i })).not.toBeInTheDocument();
   });
 
   it.each([

@@ -1,158 +1,74 @@
 # Native macOS launchd Deployment — Executive Status
 
-## Protected exact schema-128-to-129 activation
-
-REQ-LDD-026 defines the approved narrow native launchd route from the complete migration-128 source ledger to the exact route-pinned migration-129 target. It requires the native SQLite backup API, retained backup and one restore-capacity slot, sequential rehearsal in that slot before live invocation, target-plist quarantine, process/database exclusivity, exact full candidate identity, and immutable route evidence. Before durable `migration_started`, only a verified unchanged predecessor may restart; after the marker, activation is fail-stopped and candidate-only, and `finalize-current` is the sole manual continuation. Successful backup and unresolved failure evidence remain retained and claim-bound. Ordinary, alternate-source/backend, version-only, and manual bypasses are rejected.
-
-The normative route is authored in this documentation slice. Implementation, hosted qualification, runtime acceptance, and production activation are not claimed; no test was run. Existing migration-128 route pins and the other launchd modes remain unchanged.
-
-## Protected exact schema-129-to-129 private refresh
-
-REQ-LDD-027 defines a private exact refresh whose complete source and target ledgers are the migration-129 registry. Each transaction dynamically authenticates and binds its full candidate SHA and preparation-receipt digest, complete registry/ledger proofs, separate clean controller/helper identities, and canonical database path. The route requires a native SQLite backup API snapshot and one sequential isolated rehearsal, performs no live migration or reconciliation, and retains the backup and proofs. A durable phase/`migration_started` marker precedes candidate startup: before it only a verified unchanged predecessor may restart; after it the transaction is fail-stopped and candidate-only, with `finalize-current` as the sole continuation. Equal ledgers do not override phase or proof authority. Unresolved evidence remains claim-bound, and ordinary, alternate-source/backend, version-only, and manual bypasses are rejected.
-
-The normative private-refresh boundary is authored in this documentation slice. Implementation, hosted qualification, runtime acceptance, and production activation are not claimed; no test was run. Existing migration-128 and schema-128-to-129 route pins remain unchanged.
-
-## Sealed current-schema repair controller
-
-[ADR-126](../adrs/126_seal-exact-current-schema-forward-replacement.md) / REQ-LDD-025 adds `repair-current` and retained-only `resume-current-repair` for the single exact original/repair pair in [REQ-COMP-015](../compatibility/requirements.md#req-comp-015--exact-current-schema-candidate-only-forward-replacement). The repair application pin is the merged, hosted-qualified PR #946 source; the separately qualified controller was merged by PR #947. The full SHA/version pair lives only in that table and `CURRENT_REPAIR_*` helper constants. The complete registry128 digest is unchanged.
-
-The deterministic sealed child fences original finalization without changing the parent's status or claim identity. Before sealing, a stopped runtime fence invalidates the installed original checksum and removes the persistent target plist, so historical helpers and login/reboot persistence cannot start it; private parent evidence remains intact. Its immutable `parent-status.json` copy/hash binds the exact original committed/pending status. Active work cross-checks live global status; terminal historical audit uses the snapshot after global overwrite, and claim acquisition still treats terminal status as unresolved until exact parent-claim release. Classification validates stored shapes/paths/hashes without DB/backup scans; activation/resume retains full parent backup/proof and offline target validation. Malformed child status still triggers hash-bound, original-owner teardown and truthful stop diagnostics without fabricating a checkpoint. Pending committed retries and cleanup after reservation removal remain same-child-only.
-
-[ADR-128](../adrs/128_repair-failure-stopped-truth-includes-persistence.md) makes persistent auto-start absence part of stopped failure truth. Settlement first requires the fixed Phoenix label and canonical owning-user LaunchAgents target, then boundedly quarantines and fsyncs target entries without reading or deleting them before and after stop. Its final exact process-absence probe is authoritative and is followed by a final bounded persistence pass that fences target recreation during that probe; inability to establish process or durable target-path absence, including continued recreation through the bound or process reappearance, selects `stop_unconfirmed`. Resume separately bounds quarantine count and aggregate bytes while reserving both-publication/all-three-settlement headroom that failure retries may consume, and authenticates every retained quarantine after sealed-child validation through size-bounded non-following nonblocking stable descriptor reads, pathname-binding checks, closing per-file metadata revalidation, repeated complete enumeration, and a stable directory change token, and refuses unknown evidence. Publication is no-replace and atomically retires its temporary into authenticated retained quarantine instead of pathname-deleting it. The expanded regressions require successor hosted execution; local validation remains limited to Python compilation and diff whitespace checks.
-
-[ADR-125](../adrs/125_qualify-exact-prepared-source114-candidate.md) / REQ-LDD-019 adds one prepared-artifact qualification for exact candidate `23badb8be4bc8d05a7e1c49c5367ceb14ebccd92` and candidate git-object registry SHA-256 `a4eb047e59b21997ea068f1bd5e97c9c943f74a4c5670cdd8ff8ac10ffd5eee6`: exact prefix114 or target128 only, with typed `PreparedSource114Upgrade` evidence, a different clean retained controller/helper, immutable candidate-object registry materialization and snapshot-proof tamper checks. RC4 semantic registry and all protected capacity/snapshot/exclusivity/invocation/recovery/finalization boundaries are unchanged. This is explicit source-kind/candidate expansion, not generic prepared114. Generic prepared123/target128, published-release114 and ordinary paths remain distinct. Tests are authored, not executed; only `py_compile` and `git diff --check` are permitted locally. Hosted CI and exact-head review are pending; no runtime or production acceptance is claimed.
-
-The retained helper exposes a typed read-only `validate_pre_disruption_handoff` result and mutating activation consumes that same result before preparing candidate or rollback installation. The contract validates manifest/mode/helper identity, staged bytes, exact prepared-source114 timeout and plist bindings, and registry without creating transaction directories, opening SQLite, or invoking status, claim, launchd, migration, publication, or cleanup effects. Activation performs the distinct database admission immediately afterward and still before install preparation. Focused regressions cover read-only behavior, exact binding rejection, and activation reuse; hosted qualification is required.
-
 ## Current reality
 
-Native macOS production deployment prepares local `HEAD`, a checksummed published release, or the explicitly selected protected prepared-artifact paired source, requires the candidate's complete 40-character embedded SHA to equal the selected source commit, stages rollback inputs and a redacted manifest, and transfers activation to a distinct one-shot LaunchAgent. The helper serializes activation, performs atomic replacement, requires exact `/api/version` identity, and attempts verified runtime-artifact rollback on failure. A captured already-installed predecessor may retain a legacy 12-character identity only for that rollback verification. Durable status is reported by `./dev.py prod status`.
+The protocol-2 helper implements one ordinary local/published deployment path.
+It validates exact identity, hash, complete plist/environment and atomic staging
+before disruption; quarantines the canonical plist; confirms predecessor stop;
+installs the candidate; durably records `migration_started`; and runs exact
+candidate `--migrate-only` once with a 600-second bound and inherited log output.
+It boots the private plist, verifies stable new PID plus exact version/full SHA,
+publishes that same inode, writes deployed SHA and committed status, and releases
+its claim. Durable committed is terminal for runtime behavior; claim-release,
+reporting and cleanup errors preserve the healthy runtime and committed status.
+An incomplete release retains temporary binary copies and any surviving marker
+for operator inspection. Warning output is best effort.
 
-Installed-runtime restart is a separate launchd-owned transaction. It sends SIGHUP without unloading the socket-activated target, verifies a new PID with the same exact identity, preserves the binary, plist, environment, listener, and deployed SHA, and reports its own durable status without replacing deployment status.
+After disruption failure before durable committed it attempts stop and retains
+`failed`, a single phase/error/stop-failure diagnostic, the claim and transaction evidence. There is
+no rollback, resume, repair, finalization or replay. All active deploy/restart
+markers fence a new operation regardless of terminal status. Historical on-disk
+transactions remain untouched; the new helper refuses old manifests.
 
-Ordinary rollback restores runtime artifacts and service state, not the SQLite database. It therefore does not guarantee that a restored older binary can use data migrated by the failed candidate and does not provide general downgrade compatibility.
-
-Live production deployment remains an explicitly gated operator action; automated validation uses disposable resources.
-
-The prepared-artifact paired path is deliberately narrower than ordinary release deployment: the prepared standalone binary remains byte-identical and is only strict-codesign checked (not ad-hoc resigned), while the clean controller `HEAD` supplies the helper. Its private transaction directory retains the SQLite backup/proof and active claim for manual recovery; snapshot, open-file, path, ledger, or health proof failures fail closed rather than silently starting an unproven runtime.
-
-The protected schema-128-to-129 route is a separate exact route and is not an extension of the current-schema prepared migration-128 admission. Its implementation and runtime qualification are pending; it must not be inferred from the existing helper's schema-128 rejection or from unchanged registry semantics.
-
-The current-schema prepared mode shares those supply-chain checks but has a different compatibility boundary. It admits either the exact migration-123 baseline or a source ledger exactly equal to the migration-128 candidate registry under [ADR-105](../adrs/105_qualify-migration-128-for-bounded-current-schema-activation.md) and [ADR-114](../adrs/114_admit-exact-target-ledger-for-prepared-current-schema-activation.md), including named migrations 126/127/128 and immutable complete registry/SHA-256 evidence re-verified before migration, activation, and forward recovery. The 128-to-128 admission and regression changes are authored; hosted CI qualification is pending, with no runtime or deployment acceptance claimed. The contract reserves backup plus restore capacity with a 20 GiB post-reservation floor, snapshots under exclusive ownership, and runs the installed candidate offline before runtime traffic even when the source ledger already equals the target. Before offline migration invocation, exact unchanged transaction-bound source contents permit predecessor rollback; invocation itself ends that authority because a failed process cannot prove that no migration/reconciliation write committed. A complete target ledger can be resumed only by `finalize-current`, which verifies proof before starting the exact retained candidate and never reruns offline migration or snapshot restore; normal compatible startup retains ownership of its idempotent initialization and reconciliation.
-
-[ADR-115](../adrs/115_protect-exact-114-to-128-published-release-activation.md) adds exactly one protected published-release source: the complete candidate-registry prefix through 114 to exact target 128. Release tag, expected full release commit, version/embedded SHA, host-target asset and checksum must agree. Candidate binary and complete registry remain release-sourced; an explicitly pinned full controller commit, not the release commit, supplies the retained hash-bound helper. The same capacity, exclusive snapshot, durable `migration_started`, mandatory offline invocation, target verification and candidate-only post-invocation recovery/finalization apply, preserving captured installed configuration. Prepared 123/exact-target and ordinary 123-to-128 qualification remain unchanged. Documentation is authored; controller/regression qualification and runtime/deployment acceptance remain pending. Ordinary unqualified pending migration intervals reject before disruption; this protected admission is not an ordinary fallback or generic baseline/range guarantee.
-
-Ordinary in-place deployment remains backup-free. For the same exact 123-to-128 interval, the authored policy retains immutable complete registry/digest and candidate/helper evidence and persists a forward-only fence before attempting candidate startup. Hosted CI qualification is pending. Pre-start failures keep ordinary predecessor rollback; startup or health failure stops and retains the candidate without launching the predecessor. `resume-forward` is the only automated continuation and starts only the exact retained candidate after operator authorization.
-
-## Paired prepared-artifact surface
-
-- `./dev.py prod deploy --prepared-artifact DIR --expected-full-commit SHA --paired-database-upgrade` is macOS launchd-only and rejects release aliases, first install, or a mismatched installed database path.
-- The receipt must identify the exact host-target standalone basename, submission UUID, full SHA, Developer ID/hardened/timestamp codesign evidence, and qualified notarization/ticket/Gatekeeper/helper evidence. Standalone `spctl` is not imposed because notarization may be stapled only to the containing app.
-- Recovery is fail-closed: do not delete the paired transaction or claim, manually inspect the retained proof and run offline SQLite integrity checks before restoring/starting the predecessor.
-
-## Paired interruption and ownership table
-
-| Boundary | OS / filesystem state | Supported outcome and ownership |
-| --- | --- | --- |
-| Preparing, before handoff (manifest absent or persisted) | Predecessor unchanged; matching status/PID precede claim | Dead preparation PID plus confirmed helper absence permit terminal status then owned-claim release; missing evidence/live or reused PID refuses |
-| Helper admitted, before stop | Predecessor runs; private snapshot and DB-adjacent restore capacity physically allocated | Capacity failure reports precondition failure without disruption |
-| Stopped, before snapshot proof | Target service absent; predecessor plist quarantined; binary unchanged | Exclusive legacy DB plus captured binary/config hashes allow private predecessor resume; no DB restoration claimed; release unproven temporary allocations after verified terminal resume. Unknown ownership or modern DB stays stopped/fenced |
-| Snapshot verified, candidate installed/started | Matching snapshot/proof retained; candidate bootstraps private plist; no auto-loaded target plist | Install/start/health interruption retains claim and audit proof; login cannot discover an unverified candidate plist |
-| Failed candidate, paired restore | Service-target teardown; exclusive offline snapshot restore before predecessor binary/start | Private predecessor bootstrap; publish matching plist only after predecessor identity/deployed SHA; failed proof attempts teardown and retains claim/quarantine |
-| Verified predecessor, terminal persistence interrupted | Running predecessor and durable recovery checkpoint; claim remains, even if the terminal rename is readable | Subsequent deploy/restart cannot infer claim release. `prod recover-paired` verifies running predecessor/private configuration and republishes status only, without stop/start or snapshot replay |
-| Exact candidate durably committed | Candidate identity and deployed SHA verified; commit durable before plist publication | Persist pending publication/cleanup warning and retain claim through both attempts. Release only restore reservation, retaining backup/proof; publish prepared candidate plist last preserving the private bootstrap inode for strict restart verification. Cleanup/publication error is a displayed committed warning, never rollback; missing publication does not prove reboot persistence |
-| Terminal failed paired status | Recovery claim unresolved | `prod status` always presents `prod recover-paired` guidance, never generic marker removal |
-
-Focused regression coverage includes real launchctl command shapes, both exact
-missing-service spellings, wrong-target and I/O refusals, private bootstrap,
-BaseException interruption at install/start/health, capacity-growth unchanged
-resume, unsafe no-snapshot refusal, preparation ownership, SQLite interpreter
-probes, and reservation-only cleanup. These controller refinements are local/CI
-qualification; the devmbp deployment receipt below used an earlier controller
-and is not live verification of these refinements.
-
-## Main implementation gap
-
-The accepted paired contract (REQ-LDD-017 / REQ-LDD-018) and behavioral model are normative,
-but their controller implementation is not yet shipped on `main`. PR #836 owns
-prepared receipt admission, private paired SQLite recovery, claim/status behavior,
-and regression qualification. The documentation prerequisite PR #842 changes no
-runtime. Until #836 lands, main does not implement these paired guarantees;
-ordinary deployment/restart behavior is separate. Local/source evidence below
-must not be read as main coverage or live verification of every refinement.
-
-The committed finalization-only resumer is commissioned by Global as delegated
-engineering scope, not a new quoted user release/deployment authorization.
-It is qualified locally/CI only; no healthy production finalization was executed.
+Installed-runtime restart remains a separate independent helper that preserves
+binary, plist, environment, listener and deployed SHA and verifies the same exact
+identity on a new PID. ADR-230 records the accepted availability/manual-recovery
+cost and supersedes the retired macOS recovery routes.
 
 ## Requirement coverage
 
-
-| Requirement | Implementation / verification |
+| Requirements | Current implementation / verification |
 | --- | --- |
-| REQ-LDD-019 | ADR-125 exact prepared23bad prefix114/target128 qualification, typed evidence and candidate git-object registry regressions authored; static-only validation, hosted CI/review pending. ADR-115 protected exact-114-to-128 release admission and independent controller pin documented; qualification pending. Authored; hosted CI pending for exact 123-to-128 or 128-to-128 `--current-schema-upgrade` admission, named 126/127/128 registry entries, immutable complete registry/digest and controller/helper binding, and exact-ledger fail-closed regressions |
-| REQ-LDD-020 | Authored; hosted CI pending for transaction-bound source integrity/FK/ledger/logical-hash snapshot proof and backup/restore plus 20 GiB capacity-floor regressions |
-| REQ-LDD-021 | Authored; hosted CI pending for mandatory bounded offline candidate invocation to exact target 128, including equal-ledger sources, pre-invocation-only rollback, and partial/ambiguous-write no-rollback fault regressions |
-| REQ-LDD-022 | Authored; hosted CI pending for mode-matched current recovery/finalization with immutable registry/digest and proof-before-start checks, no offline-migration replay, and exact compatible candidate resume |
-| REQ-LDD-023 | ADR-115 pre-disruption refusal of ordinary unqualified pending intervals documented; qualification pending. Authored; hosted CI pending for exact 123-to-128 ordinary immutable registry/digest and candidate/helper binding, pre-start rollback, post-start forward-only failure, and exact-candidate resume regressions |
-| REQ-LDD-018 | Finalization-only retry / no-runtime-no-DB fault and replay regressions; not shipped on main until #836 |
-| REQ-LDD-001 | `_helper_plist`, `launchd_prod_deploy`; disposable integration harness |
-| REQ-LDD-002 | `launchd_prod_deploy`, `_binary_identity`; preparation tests |
-| REQ-LDD-003 | `_claim_launchd_deploy`, helper `flock`; concurrent-deploy tests |
-| REQ-LDD-004 | helper `Manifest`; secret-safe metadata test. ADR-115 independent release/controller commit and retained helper hash contract documented; qualification pending |
-| REQ-LDD-005 | `atomic_install`; atomic install test |
-| REQ-LDD-006 | `Launchctl.stop`, `Launchctl.start`; transition tests |
-| REQ-LDD-007 | `wait_for_identity`; candidate preparation and runtime verification require full-SHA equality rather than prefix matching |
-| REQ-LDD-008 | `restore`, `activate`; rollback verification accepts only the captured predecessor's 12- or 40-character lowercase identity and reports runtime-artifact rather than database rollback |
-| REQ-LDD-009 | `write_status`, post-verification `deployed.sha`; success test |
-| REQ-LDD-010 | `launchd_prod_status`; stale-status test |
-| REQ-LDD-011 | `_prepare_release_candidate`, `prod_build`; local and release candidates embed the exact selected 40-character source commit |
-| REQ-LDD-012 | `main` prod parser; positional rejection test |
-| REQ-LDD-013 | `tests/integration/launchd_deploy_harness.py`; macOS-gated harness |
-| REQ-LDD-014 | `launchd_prod_restart`, `launchd_restart_helper.restart`; unit tests and disposable launchd restart journey |
-| REQ-LDD-015 | `_claim_launchd_restart`, `/api/version` socket-activation report, restart helper LaunchAgent handoff; runtime-activation, mutual-exclusion, and secret-redaction tests |
-| REQ-LDD-016 | `launchd_restart_helper.wait_for_identity`, restart status; restart requires an installed full-SHA identity and does not reuse the predecessor-only 12-character rollback allowance |
-| REQ-LDD-017 | `_prepare_prepared_artifact`, paired structural manifest, SQLite backup API, legacy ledger/table preflight, and fail-closed proof validation; focused helper tests cover ordinary activation regression |
-| REQ-LDD-026 | Exact launchd schema-128-to-129 contract: native consistent backup, reserved restore-slot sequential rehearsal, startup quarantine/exclusivity, exact candidate identity, pre-marker predecessor restart, post-marker fail-stopped manual finalization, retained success/unresolved evidence, and explicit bypass rejection. Authored; implementation, hosted qualification, runtime acceptance, and production activation remain pending. |
-| REQ-LDD-027 | Exact private launchd schema-129-to-129 refresh is authored with dynamic per-transaction full candidate SHA and authenticated receipt digest, exact registry/ledger129, separate controller/helper, native backup and sequential rehearsal, no live migration, marker-before-start, phase/proof authority despite equal ledgers, pre-marker unchanged-predecessor recovery, post-marker candidate-only finalization, retained success/unresolved evidence, and explicit route rejection. Implementation, hosted qualification, runtime acceptance, and production activation remain pending. |
-| REQ-LDD-025 | Merged repair source plus ADR-126 sealed child, stopped runtime fence, immutable parent-status snapshot, lightweight classification/full admission split, truthful malformed-stop and fault regressions authored; controller static-only validation, no executed controller qualification. |
+| REQ-LDD-001–007,009–012,029 | `launchd_prod_deploy`, helper `validate_pre_disruption_handoff`/`activate`; ordinary source/identity/configuration/concurrency and real candidate migration tests |
+| REQ-LDD-013 | Disposable native launchd harness rejects production resources |
+| REQ-LDD-014–016 | Installed-state restart helper; 38 focused tests and real initiator-death journey |
+| REQ-LDD-030–031 | Failed status/retained marker/evidence, explicit stop uncertainty, old-manifest refusal, UI/API manual-recovery block |
+| REQ-LDD-032 | Claim-release, reporting and cleanup failures preserve committed status and the healthy runtime; warning output is best effort |
+| REQ-LDD-008,017–028 | Withdrawn by ADR-230; no active guarantee |
 
-Ordinary pre-handoff admission uses the manifest-bound staged helper path and SHA-256, including a standalone controller directory without `scripts/`. Registry/policy evidence is staged only for an existing candidate database, including an existing database on first install. A switch to a nonexistent candidate database retains ordinary artifact rollback through the predecessor's captured configuration and old database; it does not restore database contents. Focused regressions cover both local and release path switches, candidate failure, and predecessor restoration.
+## Verification and deliberate test retirement
 
-## Operator surfaces
+Reported focused results: helper 25; installer 60 (53 ordinary retained plus
+seven new manual-recovery/isolation tests); restart 38; harness safety five; and
+ReleaseUpdatePanel 32 pass. Real disposable launchd healthy commit, partial-write
+migration failure, health failure and restart after initiator SIGKILL pass. Helper
+tests exercise actual SQLite candidate subprocess writes without parent database
+reads, durable marker ordering, partial-write retention/no predecessor, health/PID
+failure, stop failure, protocol refusal, same-inode publication, cleanup failure,
+post-commit output failure, claim-release failure and unlink-then-fsync failure.
 
-- `./dev.py prod deploy` — checked local `HEAD` build.
-- `./dev.py prod deploy --release vX.Y.Z` — exact published release.
-- `./dev.py prod deploy --release latest` — latest stable release resolved once.
-- `./dev.py prod deploy --prepared-artifact DIR --expected-full-commit SHA --current-schema-upgrade` — exact migration-123 or migration-128 prepared source to the exact migration-128 candidate registry under ADR-105 and ADR-114 (128-to-128 admission authored; hosted CI qualification pending).
-- `./dev.py prod deploy --release TAG --expected-full-commit CANDIDATE_SHA --controller-source-commit CONTROLLER_SHA --current-schema-upgrade` — ADR-115 exact-114-to-128 protected release transition on macOS launchd. Requires an exact non-alias tag and distinct full lowercase candidate/controller SHAs; excludes prepared and paired modes. No hidden controller flags are required: backend and host asset/checksum use normal release selection, candidate/registry remain release-sourced, and retained helper path/hash come from the controller commit. Hidden controller-mode invocations retain exact tag/backend/asset bindings. Local regression coverage includes public parsing/dispatch and retained provenance; hosted/runtime qualification remains separate.
-- Protected exact launchd schema-128-to-129 current-schema selection — exact route-pinned source/target ledgers and candidate/helper identities only; native backup, sequential rehearsal, quarantine, exclusivity, marker, and manual-finalization boundaries are mandatory.
-- Protected exact launchd schema-129-to-129 private refresh — dynamic per-transaction candidate/receipt identity, exact registry/ledger129, separate controller/helper, native backup, sequential rehearsal, no live migration, marker, phase/proof authority, retained evidence, and candidate-only finalization are mandatory.
-- `./dev.py prod recover-current TXN` / `finalize-current TXN` — mode-matched unchanged-source recovery or committed-candidate finalization.
-- `./dev.py prod resume-forward TXN` — explicitly resume only the retained ordinary forward candidate after predecessor rollback becomes unsafe.
-- `./dev.py prod repair-current TXN --prepared-artifact DIR --expected-full-commit REPAIR_SHA` — exact sealed forward replacement under REQ-COMP-015; the merged repair-source pin does not qualify or authorize this controller by itself.
-- `./dev.py prod resume-current-repair TXN` — same sealed child only; never original finalization or snapshot replay. See [operator instructions](../../LAUNCHD.md#sealed-exact-current-schema-forward-repair).
-- `./dev.py prod status` — launchd PID/runtime identity and durable transaction result.
-- `./dev.py prod restart` — restart the installed process in place without rebuilding or changing installed configuration.
+The 6,406-line `test_current_schema_prepared_upgrade.py` and old manifest,
+Activation, schema114/123/128/129, repair, refresh and rollback classes are retired
+with their withdrawn contracts. `test_launchd_deploy.py` shrinks from 7,357 to
+1,257 lines. Their identity/source/configuration/concurrency and essential failure
+coverage is carried by the helper, ordinary installer and disposable harness;
+obsolete recovery promises are intentionally not reproduced. The unused Rust
+controller and its prepared validation harness are retired separately, not adopted.
+The Rust `current_schema_controller_accepts_compiled_123_and_128_shapes` and its
+single-use embedded Python hook are retired with deployment-side schema admission;
+migration128 data/constraint and migration-lineage tests remain. The maintained
+macOS app workflow runs ordinary helper, installer, harness-safety and restart
+tests instead of the removed prepared-upgrade module.
 
-## Exact-source devmbp upgrade receipt
+Full TypeScript checking is blocked by older primary dependencies missing patched
+micromark/mdast modules; no wire type shape changed. No production deployment was
+performed; production remains `9c5d471d`. Focused and disposable results do not
+claim hosted/full-repository or production acceptance.
 
-On 2026-10-04, transaction `20261004T185609Z-8f1cdf96` committed the protected
-prepared candidate `f5f98d7b2e51b112157e12c2b23d62c1a3c58d71` on devmbp, using
-controller `a31cddc3c0165606bb98bbb0f62fe8dfea2999a1`. Authenticated `/api/version`
-reported the exact full candidate SHA and `socket_activated=true`. Installed
-environment equality was verified against the predecessor snapshot; migration
-69 advanced to 112 while retaining 1009 physical conversation rows and all prior
-visible conversation IDs/working directories. A verified private matched
-predecessor database/binary/plist proof is retained server-local; no backup data
-is published. Activation succeeded, so production rollback was not exercised.
-Disposable failure/restore fixtures and 143 deployment/restart tests passed on
-both hosts. Owner turn resumption remains separately verified; idle projection
-does not prove provider rejection was resolved.
+## Operator recovery
 
-
-## Exact ordinary source129-to-target131 qualification
-
-REQ-LDD-028 and [ADR-148](../adrs/148_qualify-exact-ordinary-launchd-source129-to-target131.md) add one ordinary native launchd interval. The complete registry is bound to SHA-256 `850c25de411d57f14d07cd3fb09e3ee15e9e89f4fd07b24d48de00a533f1e1ac`; source129 must match its complete prefix. The retained staged helper owns admission. Existing candidate-start fencing, candidate/evidence/claim retention, pre-start unchanged-predecessor rollback, and explicit exact-candidate recovery apply. Recovery additionally admits only exact source129, partial130 or target131 ledgers. No standalone ordinary backup or protected snapshot/rehearsal evidence is claimed. Historical protected pins and exact123-to-128 remain independent.
-
-Nine focused `OrdinarySource129To131Tests` pass locally: exact admission/no-pending, standalone staged-controller admission, wrong registry/name/source pre-stop refusal, pre-start rollback, post-start forward-only failure, exact candidate and partial130 resume, missing/tampered evidence and stale ownership. These tests use disposable SQLite files, real installer/helper policy and filesystem staging, and launchd doubles. The fixed historical schema129 registry fixture matches the untouched protected digest and requires no historical git objects in CI. The historical exact-route suite passes 45 tests and the complete launchd controller suite passes 269 tests. The coordinated full devpy run completed 1,198 tests (one existing skip); its seed build and temporary-database integration passed, while 71 errors shared one remaining systemd historical-registry fixture that removed only migration129 from ambient future bytes. That fixture now derives its synthetic target128 from the same immutable historical129 bytes without changing production pins; the entire systemd helper module passes 185 tests, including the preserved exact129 negative gate. Aggregate full-check acceptance remains pending. Real migration SQL, native launchd service activation, hosted CI, independent review and production deployment are separate gates; no live production operation was performed.
+Inspect logs, retained evidence and actual service/helper state; preserve the
+failed transaction. Confirm exact helper absence and resolve target runtime state
+before explicitly clearing the matching marker and deploying a chosen forward
+candidate. An older binary requires its matching offline database restore with
+all users stopped. See `LAUNCHD.md`; historical helper commands are not recovery APIs.

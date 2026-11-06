@@ -2,7 +2,7 @@
 
 ## Scope
 
-In-app discovery, preview, approval, installation tracking, and operator messaging for stable published Phoenix releases. This specification defines the user-facing contract above `specs/production-deployment/`: it decides which published release is offered, how the preview remains immutable, how explicit approval binds to an exact release identity on the same host, how the UI reconnects to durable backend progress, and how success or rollback is reported truthfully. It does not redefine backend activation, exact runtime verification, or rollback mechanics, which remain owned by `specs/production-deployment/requirements.md`.
+In-app discovery, preview, approval, installation tracking, and operator messaging for stable published Phoenix releases. This specification defines the user-facing contract above `specs/production-deployment/`: it decides which published release is offered, how the preview remains immutable, how explicit approval binds to an exact release identity on the same host, how the UI reconnects to durable backend progress, and how success, backend rollback or manual-recovery failure is reported truthfully. It does not redefine backend activation, exact runtime verification, or rollback mechanics, which remain owned by `specs/production-deployment/requirements.md`.
 
 ## Requirements
 
@@ -67,7 +67,7 @@ The in-app update surface shall present installation as successful only when the
 
 ### REQ-RU-008 — Truthful rollback and failure language
 
-If the backend records rollback, rollback failure, rejection, or another non-success terminal outcome, the in-app update surface shall say so explicitly and shall not imply that the attempted release became active.
+If the backend records rollback, rollback failure, rejection, or another non-success terminal outcome, the in-app update surface shall say so explicitly and shall not imply that the attempted release became active. A macOS `failed` deployment shall state that manual recovery is required, the candidate may have changed the database, and an older binary requires its matching offline database restore. The system shall block another in-app approval while that failed deployment requires operator recovery.
 
 ### REQ-RU-009 — Terminal and replay-safe audit trail
 

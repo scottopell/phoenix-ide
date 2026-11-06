@@ -2,7 +2,7 @@
 
 ## Scope
 
-Safe replacement and operation of native Phoenix production runtimes on macOS launchd, Linux systemd, and Linux hosts without systemd. The deployment source is exact checked local `HEAD`, an immutable published release, an explicitly qualified launchd prepared artifact, or the exact protected Linux prepared artifact under REQ-PD-029. The protected systemd exceptions are limited to REQ-PD-023–027 and REQ-PD-029. This specification owns shared cross-platform guarantees and the release assets required to satisfy them. `specs/launchd-deployment/requirements.md` cumulatively refines launchd-specific mechanics; it does not redefine the shared guarantees.
+Production operation on native macOS launchd, Linux systemd, and Linux without systemd. macOS uses ordinary local or published candidates with manual recovery under `specs/launchd-deployment/requirements.md`. Linux retains its ordinary runtime-artifact rollback and exact protected systemd contracts.
 
 ## Requirements
 
@@ -14,7 +14,7 @@ When an operator invokes a production command, the system shall select launchd o
 
 The local deployment command shall run required checks, build exact local `HEAD`, require the candidate to embed that complete 40-character lowercase commit SHA, and stage the resulting binary. The release deployment command shall resolve `latest` at most once or use the requested tag, bind the tag to one immutable commit, select the host target asset, verify the published checksum, and require the candidate's complete 40-character lowercase embedded SHA to equal the selected commit exactly; it shall not run repository checks, install dependencies, mutate the worktree, or compile.
 
-A prepared-artifact source SHALL be admitted only under an exact backend-specific qualification. macOS launchd SHALL admit only its protected prepared contracts. Linux x86_64 systemd SHALL admit only the exact artifact, candidate and database interval in REQ-PD-029. Every prepared route SHALL use exact protected bytes and an independently verified clean controller without rebuilding on the deployment host.
+A prepared-artifact source SHALL be admitted only on Linux x86_64 systemd under REQ-PD-029, using exact protected bytes and an independently verified clean controller without rebuilding on the deployment host. macOS SHALL admit only ordinary local or published candidates.
 
 WHEN `latest` is requested,
 THE release deployment command SHALL require the resolved tag and GitHub release metadata to identify a stable supported release.
@@ -24,9 +24,7 @@ THE release deployment command SHALL require the tag, GitHub prerelease metadata
 
 ### REQ-PD-003 — Complete preparation before disruption
 
-For the prepared-artifact paired source under REQ-PD-018, the captured installed launchd plist environment and PATH SHALL be the sole configuration authority; `.phoenix-ide.env` SHALL NOT replace credentials, models, paths or network configuration. For protected systemd activation under REQ-PD-023 or REQ-PD-029, the captured installed environment, service and socket SHALL be preserved instead; `.phoenix-ide.env` SHALL NOT replace them. Protected published-release current-schema activation under REQ-PD-021 SHALL preserve the captured installed launchd configuration and database path. The ordinary environment-snapshot rules below apply only to unprotected local/published sources.
-
-Before disrupting a running runtime, the system shall stage and validate the candidate, backend configuration, source-specific environment snapshot, rollback inputs, runtime identities and endpoints, destination-space reservations, artifact hashes, backend activation program, immutable handoff, and initial durable transaction status.
+Before disrupting a running runtime, the system shall validate and stage its candidate, backend configuration, source-specific environment snapshot, runtime identity, endpoint, artifact hashes, independent activation program, immutable handoff and initial durable status. Linux shall also prepare its specified rollback inputs and destination-space reservations. Protected systemd activation under REQ-PD-023 or REQ-PD-029 shall preserve captured installed environment, service and socket configuration.
 
 ### REQ-PD-004 — Backend-owned activation
 
@@ -34,7 +32,7 @@ Before stopping Phoenix, the system shall transfer activation to an owner indepe
 
 ### REQ-PD-005 — Immutable, secret-safe handoff
 
-The activation owner shall consume only immutable host-resident transaction inputs identified by hashes. Manifests, statuses, logs, process arguments, and diagnostics shall omit environment values and other secrets.
+The activation owner shall consume immutable host-resident inputs identified by hashes. Manifests, status and process arguments shall omit environment values and other secrets. Candidate migration diagnostics shall flow to the transaction log without a separate diagnostic transformation layer.
 
 ### REQ-PD-006 — Single fenced activation writer
 
@@ -46,23 +44,15 @@ The systemd handoff shall copy inputs into a root-owned transaction location bef
 
 ### REQ-PD-008 — Atomic installation
 
-When installing a candidate or restoring rollback state, the activation owner shall fsync staged data and atomically replace each target without first unlinking the live path. Candidate and rollback copies shall be reserved on each destination filesystem before disruption.
+When installing a candidate or restoring authorized Linux rollback state, the activation owner shall fsync staged data and atomically replace the target without first unlinking the live path. Linux candidate and rollback copies shall be reserved on their destination filesystems before disruption. macOS plist publication follows REQ-LDD-005.
 
 ### REQ-PD-009 — Exact runtime verification
 
 A deployment shall commit only after observing a new backend-owned runtime process and verifying that its credential-free version endpoint reports the exact expected package version and complete 40-character lowercase embedded git SHA. The candidate SHA shall equal the transaction's selected full source commit exactly; prefix equality shall not establish candidate identity. Bare Linux shall additionally bind verification to the supervisor's direct child PID and `/proc` start time.
 
-### REQ-PD-010 — Verified rollback
+### REQ-PD-010 — Linux runtime-artifact rollback
 
-Protected current-schema launchd transactions SHALL obey the pre-invocation-only predecessor recovery boundary in REQ-LDD-021–022. Qualified ordinary launchd migration activation SHALL obey REQ-LDD-023's candidate-start boundary; the runtime-artifact rollback rules below SHALL NOT override either boundary.
-
-For prepared-artifact paired transactions, predecessor startup/rollback is conditional on the verified recovery authorization under REQ-LDD-017. If database, ownership, snapshot or captured runtime/configuration proof fails, the system SHALL instead attempt teardown, retain a stopped service and unresolved claim, and report recovery failure; it SHALL NOT bootstrap an unproven predecessor. Protected systemd activation follows the stricter pre-marker unchanged-predecessor and post-marker candidate-only boundary in REQ-PD-025. The artifact-rollback attempt below applies to other sources subject to their explicitly qualified compatibility boundaries.
-
-If activation fails after disruption, the activation owner shall stop the candidate, atomically restore the previous binary, backend configuration, environment snapshot, and service state, verify the captured previous runtime identity at its previous endpoint, restore the previous deployed SHA, and durably distinguish successful runtime-artifact rollback from rollback failure.
-
-Only in this rollback role, the captured identity of an already-installed previous runtime may contain either a legacy 12-character lowercase git SHA or a full 40-character lowercase git SHA. This allowance shall not admit a 12-character identity for a candidate, controller, release asset, newly installed runtime, or general downgrade path, and shall not establish cross-version deployment compatibility.
-
-Ordinary deployment rollback shall restore runtime artifacts only and shall not guarantee that the predecessor can use a database changed by the candidate. The explicit prepared-artifact ProductConversation upgrade shall restore its verified predecessor database, binary, and configuration before restarting the predecessor; its boundary is defined by REQ-PD-018 and `specs/launchd-deployment/requirements.md`.
+For ordinary Linux activation failure after disruption, the owner shall stop the candidate, atomically restore the previous binary, backend configuration, environment and service state, verify the captured predecessor identity at its previous endpoint, restore its deployed SHA, and distinguish successful runtime-artifact rollback from rollback failure. A captured installed predecessor may report a legacy 12-character lowercase SHA only in this rollback role; candidates require a complete 40-character identity. Runtime-artifact rollback shall not restore a database or establish compatibility with candidate-mutated data. Protected systemd activation follows the stricter pre-marker unchanged-predecessor and post-marker candidate-only boundary in REQ-PD-025. macOS shall instead follow REQ-LDD-030 and shall never automatically start the predecessor after disruption.
 
 ### REQ-PD-011 — Truthful durable status and recovery
 
@@ -70,9 +60,7 @@ After exact verification, the system shall write `deployed.sha` from the selecte
 
 ### REQ-PD-012 — Configuration source of truth
 
-For the prepared-artifact paired source under REQ-PD-018, the captured installed launchd plist environment and PATH SHALL be the sole configuration authority; `.phoenix-ide.env` SHALL NOT replace credentials, models, paths or network configuration. For protected systemd activation under REQ-PD-023 or REQ-PD-029, the captured installed environment, service and socket SHALL be preserved instead; `.phoenix-ide.env` SHALL NOT replace them. Protected published-release current-schema activation under REQ-PD-021 SHALL preserve the captured installed launchd configuration and database path. The ordinary environment-snapshot rules below apply only to unprotected local/published sources.
-
-Ordinary local/published deployment outside the protected modes above shall load `.phoenix-ide.env` once and use that exact snapshot for preflight, installation, and candidate endpoint selection. Runtime status shall inspect installed configuration, rollback shall use the previous installed snapshot, and modern operation shall ignore rather than migrate or consult a legacy launchd override store, systemd drop-in, or inferred detached-daemon environment.
+Ordinary operator deployment shall load `.phoenix-ide.env` once and use that snapshot for preflight, installation and endpoint selection. An in-app source-pinned release controller shall preserve the installed launchd environment and PATH instead of applying ambient checkout configuration. Status shall inspect installed configuration. Linux rollback shall use the captured previous installed snapshot. Protected systemd activation shall preserve captured installed environment, service, socket and canonical database path. Modern operation shall ignore legacy launchd override stores, systemd drop-ins and inferred detached-daemon environments.
 
 ### REQ-PD-013 — Consistent operator surface
 
@@ -101,44 +89,25 @@ Integration harnesses shall use randomized virtual machines or containers, units
 
 Published releases shall provide checksummed `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` binaries in addition to supported macOS assets, and release candidate selection shall reject an asset whose target, checksum, version, or embedded commit does not match the selected release.
 
-### REQ-PD-018 — Prepared-artifact paired launchd boundary
+### REQ-PD-018 — Withdrawn macOS deployment route
 
-WHEN the explicit prepared-artifact ProductConversation upgrade is selected
-THE SYSTEM SHALL bind the protected candidate provenance to a clean controller helper and private transaction proof
-AND SHALL fail closed when database ownership, legacy ledger/table shape, snapshot integrity, configuration identity, or rollback proof cannot be established
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
-THE SYSTEM SHALL NOT generalize this feature-scoped pair into automatic database rollback for other deployment sources or backends.
+### REQ-PD-019 — Withdrawn macOS deployment route
 
-### REQ-PD-019 — Feature-scoped prepared paired upgrade
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
-THE shared production deployment contract SHALL treat the macOS launchd prepared-artifact/ProductConversation database upgrade as an explicit feature-scoped guarantee, not as a general snapshot or downgrade facility. The separate systemd exception in REQ-PD-023–027 does not inherit the launchd paired rollback guarantee. Other deployment paths retain their separately specified database behavior.
+### REQ-PD-020 — Withdrawn macOS deployment route
 
-### REQ-PD-020 — Narrow committed paired finalization
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
-The shared command surface SHALL expose `prod finalize-paired TXN` only for the launchd paired contract under `specs/launchd-deployment/requirements.md` REQ-LDD-018. This operation SHALL be publication/reservation-only and SHALL NOT reuse runtime activation or database rollback. Unknown ownership, helper absence, committed identity or captured configuration SHALL retain the fence and refuse.
+### REQ-PD-021 — Explicit protected Linux mode selection
 
-### REQ-PD-021: Explicit protected database mode selection
+The exact Linux prepared source shall require `--systemd-current-schema-upgrade` and the receipt, provenance and lifecycle contract in REQ-PD-029. macOS shall reject protected/prepared deployment modes and use only the ordinary candidate-owned migration path.
 
-**Condition:** When an operator deploys a prepared artifact through native macOS launchd,
-**System:** the interface SHALL require exactly one of paired legacy upgrade or current-schema upgrade, SHALL reject local sources and release sources except for the protected launchd current-schema admission below, SHALL require the expected full candidate commit, and SHALL expose mode-matched finalization and recovery commands without weakening launchd prepared-artifact signature, notarization, receipt, architecture, source-commit, or embedded-identity verification. The exact Linux prepared source SHALL instead require `--systemd-current-schema-upgrade` and the distinct receipt, provenance and lifecycle contract in REQ-PD-029; it SHALL NOT inherit paired launchd supply-chain or recovery semantics.
+### REQ-PD-022 — Withdrawn macOS deployment route
 
-**Rationale:** Artifact provenance and database compatibility are separate dimensions; selecting a newer database family must not bypass the prepared artifact's existing supply-chain contract.
-
-**Condition:** When an operator explicitly selects a published release for protected current-schema launchd activation,
-**System:** the interface SHALL require the exact immutable release identity and a separately explicit full controller commit for the retained activation helper; SHALL retain the helper's hash and obtain the candidate binary and complete migration registry from the release commit, not the controller commit; SHALL admit only the source ledger exactly equal to that registry's complete prefix through 114 and the exact qualified target 128 under REQ-LDD-019; and SHALL reuse the protected snapshot, capacity, exclusivity, durable `migration_started`, and candidate-only post-invocation recovery/finalization lifecycle. It SHALL reject aliases, other source baselines, target registries, and backends before disruption. Prepared exact-123/exact-target and ordinary exact-123-to-128 admissions SHALL remain unchanged; this exception SHALL NOT establish generic release, range, or rollback compatibility.
-
-For prepared current-schema launchd candidate `23badb8be4bc8d05a7e1c49c5367ceb14ebccd92` only, the unchanged public command `./dev.py prod deploy --prepared-artifact DIR --expected-full-commit 23badb8be4bc8d05a7e1c49c5367ceb14ebccd92 --current-schema-upgrade` SHALL automatically emit the typed `prepared_source_baseline: 114` and `candidate_registry_expected_sha256: a4eb047e59b21997ea068f1bd5e97c9c943f74a4c5670cdd8ff8ac10ffd5eee6` evidence defined by REQ-LDD-019. Receipt/signature/version/embedded-SHA checks SHALL remain intact; the complete registry SHALL be obtained by `git show` from the exact locally present candidate commit and hash-verified, independently of the different clean controller checkout supplying the retained hash-bound helper. This admits only exact prefix114 or exact target128 to that exact registry128 and preserves the protected lifecycle, proof tamper rejection and candidate-only boundary. Another receipt commit SHALL NOT receive this qualification. Generic prepared123/target128, published-release114 and ordinary paths SHALL remain unchanged; this is explicit candidate/source-kind expansion with RC4 registry semantics unchanged, not generic prepared114 support.
-
-**Protected exact launchd schema-128-to-129 route:** When an operator selects the explicit protected native launchd current-schema route, the interface SHALL admit only the complete migration-128 source ledger to the exact route-pinned migration-129 target registry. It SHALL preserve the existing launchd candidate, receipt, controller/helper, configuration, canonical database path, and exact full-identity checks, and SHALL expose only the mode-matched `recover-current` and `finalize-current` operations. It SHALL reject ordinary, paired, unqualified prepared, alias, local, runtime-only, systemd, and bare-Linux routes for this transition.
-
-The shared deployment contract SHALL reserve capacity for a retained backup and one restore-capacity slot, quarantine the auto-loaded target plist before stopping the predecessor, and then require a native SQLite backup-API snapshot with integrity, foreign-key, fsync, logical-content, and complete-ledger proof before any live candidate database write. The exact candidate SHALL be rehearsed sequentially in that restore slot before live invocation, with no concurrent or unreserved copy. Launchd SHALL prove process and database exclusivity and start only the exact retained candidate after the quarantine and identity checks succeed. A durable `migration_started` marker SHALL precede live migration or reconciliation: before it, only a verified unchanged predecessor may be restarted; after it, the deployment SHALL remain fail-stopped and candidate-only, with manual finalization as the only continuation. Successful activation SHALL retain the verified backup and unresolved evidence SHALL retain the claim and fence. No flag, manual marker/claim deletion, alternate registry, version-only check, or path substitution may bypass these boundaries. These launchd rules do not qualify schema-128-to-129 for another backend or alter existing migration-128 route pins.
-
-### REQ-PD-022: Ordinary forward-only recovery surface
-
-When ordinary launchd deployment has pending migrations outside an explicitly qualified ordinary interval, the interface SHALL reject deployment before runtime disruption, not fall back to unqualified runtime-artifact rollback. Protected exact-114-to-128 release admission SHALL NOT qualify that interval for ordinary deployment.
-
-**Condition:** When ordinary launchd activation crosses the qualified candidate-start boundary and does not verify candidate health,
-**System:** the production interface SHALL report that predecessor rollback is forbidden, retain the deployment claim and exact candidate evidence, and expose only explicit `prod resume-forward TXN` recovery for that transaction. It SHALL NOT require or imply a standalone backup for the normal in-place route.
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
 ### REQ-PD-023 — Exact protected systemd published-release admission
 
@@ -175,7 +144,7 @@ Before stopping either unit, it SHALL install and fsync transaction-bound persis
 
 THE SYSTEM SHALL run the exact candidate's `--migrate-only` operation against an isolated copy of that backup, not against the pristine backup or live database, and durably verify successful exit, exact complete target ledger, SQLite integrity and foreign-key checks, and unchanged pristine backup before permitting the live irreversible marker. Rehearsal proof SHALL bind the candidate, registry, backup and transaction evidence and SHALL be re-verified before live invocation or post-marker recovery.
 
-Backup or rehearsal capacity failure, failed rehearsal, or failed verification SHALL remain pre-marker failures and MAY recover only the verified unchanged predecessor under REQ-PD-025. This systemd contract SHALL NOT impose the launchd capacity policy or its 20 GiB free-space floor. The exact pristine backup and its proof SHALL remain after success; the rehearsal copy SHALL NOT replace them.
+Backup or rehearsal capacity failure, failed rehearsal, or failed verification SHALL remain pre-marker failures and MAY recover only the verified unchanged predecessor under REQ-PD-025. This systemd contract SHALL NOT impose a 20 GiB free-space floor. The exact pristine backup and its proof SHALL remain after success; the rehearsal copy SHALL NOT replace them.
 
 ### REQ-PD-025 — Durable irreversible marker and exact-candidate-only recovery
 
@@ -207,11 +176,9 @@ THE SYSTEM SHALL serialize systemd staging, activation and recovery with the glo
 
 Ambiguous evidence, a prepared transaction, a post-marker transaction, or an active competing operation SHALL remain fenced rather than be treated as abandoned staging. Missing or unreadable status SHALL NOT authorize clearing an extant claim.
 
-### REQ-PD-028 — Explicit exact current-schema launchd forward replacement
+### REQ-PD-028 — Withdrawn macOS deployment route
 
-WHEN an operator selects `prod repair-current TX --prepared-artifact DIR --expected-full-commit REPAIR_SHA`, THE SYSTEM SHALL restrict the operation to the original/repair qualification in `specs/compatibility/requirements.md` REQ-COMP-015 and the sealed child protocol in `specs/launchd-deployment/requirements.md` REQ-LDD-025. It SHALL preserve prepared-artifact supply-chain and full-identity checks, exact captured parent configuration and database, the original claim and immutable private parent audit evidence, independently clean controller/helper provenance, and immutable candidate git-object registry evidence. After full admission and before child sealing, it SHALL physically fence the installed original runtime with the exact stopped binary/plist boundary in REQ-LDD-025 so historical helpers and login/reboot persistence cannot start it. It SHALL NOT reuse ordinary deploy, alter the original transaction evidence, acquire a child claim, infer a schema range, or permit an original/predecessor start or snapshot replay.
-
-WHEN `prod resume-current-repair TX` is selected, THE SYSTEM SHALL use only the same retained sealed child, not ambient candidate/configuration/helper/registry inputs. Durable reconciliation and target/start/failure/finalization checkpoints SHALL make interruption fail closed and exact-child resumption idempotent. Status and operation refusal SHALL distinguish pending or malformed repair evidence from terminal child success while leaving parent committed/pending status unchanged by the repair. The child SHALL seal a private byte-exact `parent-status.json` snapshot and hash, require live global status equality until terminal commit, and use that snapshot for terminal historical audit after another deployment overwrites global status. Lightweight classification SHALL check exact stored shapes/paths and parent evidence hashes without database/backup scans; full backup/proof and exclusive offline live-database validation SHALL remain operation admission requirements before runtime mutation. Repair identity and health, durable publication and owned cleanup, then terminal child status SHALL precede release/fsync of only the exact parent claim; any ambiguity SHALL retain ownership and evidence, attempt repair teardown and report confirmed absence or stop uncertainty. Malformed child status SHALL NOT prevent teardown through hash-bound parent routing with exact original ownership, nor permit a fabricated checkpoint/terminal state; malformed bytes SHALL remain diagnostic evidence. This command SHALL NOT authorize production execution merely by existing, nor expand prepared114/123/target, published114, ordinary, or systemd admission.
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
 ### REQ-PD-029: Exact prepared Linux systemd candidate
 
@@ -225,13 +192,10 @@ The privileged helper SHALL re-parse the same closed receipt, reject prepared so
 
 This exact prepared source SHALL reuse the protected systemd lifecycle in REQ-PD-024 and recovery in REQ-PD-025 without weakening them: persistent verified service/socket inhibits, both-unit stop, exclusive offline ownership, pristine backup, isolated exact-candidate rehearsal, durable live `migration_started` boundary, exact-target verification, candidate-only post-marker recovery, and retained backup/evidence SHALL all remain required. It SHALL admit only the complete ordered source ledger equal to the exact candidate-registry prefix through migration 65 and the exact target128. No other prepared candidate, architecture, source baseline, target, backend, same-schema replacement, downgrade or generic rollback guarantee follows from this qualification.
 
-### REQ-PD-030: Exact private launchd schema-129-to-129 refresh
+### REQ-PD-030 — Withdrawn macOS deployment route
 
-WHEN an authorized operator selects the private native launchd refresh mode,
-THE SYSTEM SHALL admit only a production database whose complete ordered source ledger equals the exact migration-129 registry and whose complete ordered target ledger equals that same exact registry. The mode SHALL bind the complete registry bytes and digest, both ledger proofs, a dynamically selected full 40-character candidate SHA, exact package version, independently authenticated preparation-receipt digest, separate controller commit and helper hash, canonical database path, and transaction identity as immutable per-transaction evidence. The candidate SHA and authenticated receipt digest SHALL be re-verified before backup, rehearsal, startup, recovery, and finalization; version-only, maximum-ledger, equal-ledger, SHA-prefix, and semantic-registry checks SHALL not establish admission.
+Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. See ADR-230.
 
-The controller and helper SHALL remain separate identities, with the helper materialized from a clean retained controller checkout. Before any candidate startup or live database write, the route SHALL reserve capacity for a retained native SQLite backup and one restore-capacity slot, quarantine the auto-loaded launchd target, quiesce the predecessor, prove database/WAL/SHM exclusivity, create and fsync a SQLite backup-API snapshot, and verify integrity, foreign keys, exact ledger129, logical contents, and transaction-bound proof. The exact candidate SHALL be rehearsed only once, sequentially, against an isolated copy in the restore slot; backup and rehearsal SHALL not be concurrent or unreserved. The route SHALL perform no live migration or live reconciliation against the production database, and equal source and target ledgers SHALL not waive the backup or rehearsal.
+### REQ-PD-031 — macOS manual-recovery contract
 
-The route SHALL durably record `migration_started` immediately before starting the exact retained candidate. Before that marker, mode-matched `recover-current` MAY restore and verify the captured unchanged predecessor runtime/configuration and restart only that predecessor after re-proving exclusive ownership, exact ledger129, and unchanged logical contents; it SHALL not replay the backup to manufacture unchanged-source proof. At or after the marker, including startup failure, interruption, partial or ambiguous writes, and uncertain publication, recovery SHALL be fail-stopped and candidate-only: it SHALL not restore the backup or start the predecessor, and SHALL retain the exact candidate, claim, quarantine, backup, and unresolved evidence. Only mode-matched `finalize-current` MAY continue, and it MAY start only the exact retained candidate after verifying the durable phase/marker, registry and ledger129 proof, authenticated receipt digest, candidate/helper identity, integrity, foreign keys, captured configuration, ownership, and claim. Phase and proof authority SHALL govern despite identical source and target ledgers; ledger equality alone SHALL never authorize recovery or finalization.
-
-Successful activation SHALL retain the verified backup, rehearsal proof, receipt digest, registry/ledger proof, quarantine history, and identity evidence as transaction audit evidence. Any unresolved failure or uncertainty SHALL retain the backup, all evidence, ownership claim, and stopped fence. The mode SHALL reject ordinary launchd deployment, unqualified prepared or published sources, aliases, local or runtime-only sources, systemd or bare-Linux backends, another source or target ledger, candidate/helper/receipt/registry/configuration substitution, and any flag or manual action that bypasses native backup, sequential rehearsal, exact per-transaction identity, durable marker, phase/proof authority, candidate-only finalization, or evidence retention. It SHALL not qualify another backend or deployment mode, authorize downgrade or generic rollback, or alter existing migration-128 or schema-128-to-129 routes.
+Native macOS deployment shall follow REQ-LDD-029–032: invoke candidate-owned migration once, retain failed ownership and diagnostics after disruption, require operator recovery, and provide no automatic database rollback or transaction resumption. This contract shall not alter Linux deployment, recovery or rollback.

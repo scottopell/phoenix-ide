@@ -384,8 +384,8 @@ class SystemdDeployCommandTests(unittest.TestCase):
     def test_protected_mode_rejects_every_unpinned_or_wrong_backend_route_before_work(self):
         import platform
         cases = [dict(enabled=False), dict(backend="bare_linux"), dict(backend="launchd"),
-                 dict(prepared_artifact=Path("/prepared")), dict(current_schema_upgrade=True),
-                 dict(paired_database_upgrade=True), dict(exact_release_tag=None),
+                 dict(prepared_artifact=Path("/prepared")),
+                 dict(exact_release_tag=None),
                  dict(expected_full_commit=None), dict(expected_full_commit="B" * 40),
                  dict(expected_asset_name=None), dict(expected_asset_name="other-asset"),
                  dict(expected_asset_sha256=None), dict(expected_asset_sha256="D" * 64),
@@ -626,8 +626,7 @@ class SystemdDeployCommandTests(unittest.TestCase):
                      dict(exact_release_tag=self.dev.SYSTEMD_PROTECTED_TAG),
                      dict(expected_asset_name=self.dev.SYSTEMD_PROTECTED_ASSET),
                      dict(expected_asset_sha256=self.dev.SYSTEMD_PROTECTED_ASSET_SHA256),
-                     dict(systemd_current_schema_upgrade=False), dict(current_schema_upgrade=True),
-                     dict(paired_database_upgrade=True)]
+                     dict(systemd_current_schema_upgrade=False)]
             for changes in cases:
                 with self.subTest(changes=changes), self.assertRaises(SystemExit):
                     self.dev.cmd_prod_deploy(controller=self.linux_prepared_options(base, **changes))

@@ -134,6 +134,9 @@ entity UpdateController {
 --   durable backend status records a rejected or non-started attempt.
 -- failure_recorded(installation) -> Boolean
 --   durable backend status records a failed attempt that did not commit.
+-- unresolved_manual_recovery(controller) -> Boolean
+--   Backend failed deployment requires operator recovery; another approval is
+--   blocked until the backend reports resolved ownership.
 -- audit_trail_complete(installation) -> Boolean
 --   durable release-update records preserve preview.id, approved_identity,
 --   installation.id, and terminal backend outcome.
@@ -232,6 +235,7 @@ rule SameHostApprovalBindsExactIdentity {
     requires: preview.state = discovered
     requires: same_host_session(controller)
     requires: supported_runtime_owner(controller)
+    requires: not unresolved_manual_recovery(controller)
     requires: approval_matches_preview(preview, installation)
     ensures: preview.state = approved
     ensures: installation.preview = preview
@@ -246,6 +250,7 @@ rule StaleOrRemoteApprovalRejected {
     requires: preview.state in { discovered, approved }
     requires: not same_host_session(controller)
         or not supported_runtime_owner(controller)
+        or unresolved_manual_recovery(controller)
         or not approval_matches_preview(preview, installation)
     ensures: installation.state = rejected
     ensures: controller.visible_terminal_message = rejected
@@ -354,6 +359,11 @@ rule HydratedFailureShowsFailure {
     ensures: controller.installation.state = failed
     ensures: controller.visible_terminal_message = failure
     ensures: controller.hydrated_from_backend = true
+
+    @guidance
+        -- For native macOS failed deployment, explain possible database writes,
+        -- manual operator recovery, and matching offline restore before an older
+        -- binary. Keep subsequent in-app approval blocked pending recovery.
 }
 
 invariant PreviewApprovalBindsExactIdentity {

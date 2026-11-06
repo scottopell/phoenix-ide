@@ -157,10 +157,7 @@ Mid-QA on a sub-agent's commit you spot drift in a file that was out of their sc
 
 `dev.py` requires uv-managed CPython 3.13. uv installs it automatically when
 needed. Its inline script configuration also governs `uv run dev.py` and copied
-deployment controllers. The deployment helper captures that interpreter's
-absolute path; the Rust controller-contract test requests managed Python 3.13
-through uv as well. This keeps SQLite validation on the upstream SQLite bundled
-with the managed runtime when reading databases produced by Rust.
+deployment scripts. The launchd helper captures that interpreter's absolute path.
 
 ```bash
 ./dev.py up          # Build and start Phoenix + Vite (auto-seeds DB if empty)
@@ -304,6 +301,10 @@ These are constraints on the technical artifact, not process guidelines. They ov
 #### Compatibility guarantees must be explicit
 
 Compatibility, downgrade, rollback, live-resource replacement, recovery, cross-version behavior, and internal SQLite timestamp guarantees are governed by `specs/compatibility/requirements.md` and more specific normative requirements. Do not add or expand one as defensive hardening without updating the normative contract and recording a policy or architecture change in an ADR; ADR-034 records the project-wide policy; ADR-033 records the Foundation-specific application.
+
+#### Deployment favors a small operational contract
+
+Routine macOS deployment lets the exact candidate own migrations. After disruption failure it attempts stop, reports what ran and failed, and retains its claim and artifacts for an operator. Availability loss and manual recovery are accepted costs. Do not reintroduce exhaustive database scans, schema-specific upgrade routes, snapshot/rehearsal/replay frameworks, automatic predecessor startup, or a standalone controller without demonstrated product need; agent-authored requirements alone do not establish that need. Downgrade requires a matching database restore offline. Linux keeps its separately specified contracts. See `specs/adrs/230_simplify-macos-deployment-to-candidate-migration-and-manual-recovery.md`.
 
 #### PR feedback is an actionable snapshot, not a GitHub mirror
 
