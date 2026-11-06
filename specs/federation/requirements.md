@@ -6,7 +6,7 @@ A Coordinator operating one trusted Phoenix instance needs to use supported coor
 
 ## Scope and related contracts
 
-This specification covers optional `instance` selection on `send_conversation_message`, `read_conversation`, `resolve_reference`, `read_goal`, `query_database`, `read_automatic_continuation`, and `set_automatic_continuation`; the typed remote automatic-continuation preference operations; durable remote conversation watches; and finite settlement of facts durably staged before a terminal watch gap. Goal mutations (including creation), settings other than this typed automatic-continuation preference, Continue, conversation creation, and rename are outside this contract.
+This specification covers optional `instance` selection on `send_conversation_message`, `read_conversation`, `resolve_reference`, `read_goal`, `query_database`, `read_automatic_continuation`, `set_automatic_continuation`, `watch_conversation`, `unwatch_conversation`, and `list_watched_conversations`; the typed remote automatic-continuation preference operations; durable remote conversation watches; and finite settlement of facts durably staged before a terminal watch gap. Goal mutations (including creation), settings other than this typed automatic-continuation preference, Continue, conversation creation, and rename are outside this contract.
 
 Related contracts remain authoritative for their domains:
 
@@ -61,6 +61,10 @@ When a remote operation or watch result reports a transcript-scoped conversation
 ### Durable watches
 
 **REQ-FED-009 — Durable remote watch**
+
+When `watch_conversation`, `unwatch_conversation`, or `list_watched_conversations` omits `instance` or receives the exact, case-sensitive string `"local"`, the system shall use the existing local watch, unwatch, or list operation respectively, preserving that operation's authority checks, validation, result shape, and error semantics. An explicit `null` `instance` shall be rejected by all three tools rather than treated as omission or as `"local"`.
+
+When one of these tools receives another string selector, the system shall resolve exactly the saved peer UUID or unambiguous saved display name supplied, without trimming whitespace or folding case. `watch_conversation` shall create a durable remote subscription for the selected peer's ProductConversation; `unwatch_conversation` shall end the selected peer's durable remote subscription, not a local watch; and `list_watched_conversations` shall list locally stored durable remote subscriptions for that selected peer, not local watches or an assumed live snapshot from the peer. Local watches and remote subscriptions shall remain distinct even when their ProductConversation identifiers match. Failure of peer resolution, authentication, transport, or remote operation shall be reported without falling back to another peer or creating, ending, or listing a local watch in place of the requested remote operation.
 
 When a trusted peer watches a ProductConversation, the system shall preserve the watch, its ordered event cursor, and unacknowledged delivery state across restarts of either instance.
 

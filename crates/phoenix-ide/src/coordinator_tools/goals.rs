@@ -14,11 +14,8 @@ use crate::api::GoalCommandService;
 use crate::runtime::RuntimeManager;
 use crate::tools::{Tool, ToolContext, ToolOutput};
 
-use super::instance::InstanceSelector;
-
 #[derive(Clone, Copy)]
 enum Operation {
-    Read,
     Prepare,
     Apply,
 }
@@ -29,18 +26,29 @@ struct GoalTool {
     operation: Operation,
 }
 
+struct ReadGoalTool {
+    service: GoalCommandService,
+    runtime: Arc<RuntimeManager>,
+}
+
 pub(super) fn tools(runtime: &Arc<RuntimeManager>) -> Vec<Arc<dyn Tool>> {
     let service = GoalCommandService::new(Arc::clone(runtime));
-    [Operation::Read, Operation::Prepare, Operation::Apply]
-        .into_iter()
-        .map(|operation| {
-            Arc::new(GoalTool {
-                service: service.clone(),
-                operation,
-                runtime: Arc::clone(runtime),
-            }) as Arc<dyn Tool>
-        })
-        .collect()
+    let mut tools = vec![super::instance::RouteTool::new(ReadGoalTool {
+        service: service.clone(),
+        runtime: Arc::clone(runtime),
+    })];
+    tools.extend(
+        [Operation::Prepare, Operation::Apply]
+            .into_iter()
+            .map(|operation| {
+                Arc::new(GoalTool {
+                    service: service.clone(),
+                    operation,
+                    runtime: Arc::clone(runtime),
+                }) as Arc<dyn Tool>
+            }),
+    );
+    tools
 }
 
 #[derive(Deserialize)]
@@ -49,8 +57,6 @@ struct ReadInput {
     target: String,
     #[serde(default)]
     after_version: Option<i64>,
-    #[serde(default, deserialize_with = "InstanceSelector::deserialize_nullable")]
-    instance: InstanceSelector,
     #[serde(default)]
     wait: Option<GoalWaitInput>,
 }
@@ -103,23 +109,18 @@ fn text_schema() -> Value {
 impl Tool for GoalTool {
     fn name(&self) -> &str {
         match self.operation {
-            Operation::Read => "read_goal",
             Operation::Prepare => "prepare_goal",
             Operation::Apply => "apply_goal",
         }
     }
     fn description(&self) -> String {
         match self.operation {
-            Operation::Read => "Read an ordinary conversation's saved Goal and up to 100 ordered history entries. Coordinator only. Uses stable @conv targets and follows the current transcript. after_version is only a history cursor. Omit instance or set it to exact \"local\" for this instance; otherwise a saved-peer ID or unique display name reads exactly that peer and never falls back locally. Optional wait blocks for minimum_version for 1-25 seconds and returns an authoritative satisfied or timed_out snapshot. Goal disposition is not active-execution state; this never dispatches work.",
             Operation::Prepare => "Prepare an immutable Goal action against the observed saved Goal. Coordinator only. create refuses an existing Goal; replace is an explicit new Goal identity retaining old history; state updates disposition. Applying create/replace requires the target's persisted autoContinue preference to be explicitly enabled; preparation does not enable it. Returns a server-created action_reference and frozen expected version/Goal identity. Review this observation, then pass only action_reference to apply_goal. Never invent UUIDs or versions. A conflict requires deliberate reconsideration, NOT reread-and-overwrite/reprepare. No automatic scheduling, Start/Stop, Suspended disposition, or Suspended reactivation.",
             Operation::Apply => "Apply or reconcile a previously prepared Goal action by its server-issued action_reference. Coordinator only. Never accepts target, version, authority, or replacement content. Exact retries replay the immutable accepted or refused receipt, including across restart/Coordinator continuation. New create/replace requires the target's persisted autoContinue preference to be explicitly enabled; refusal does not enable it or dispatch work. On conflict or busy refusal do NOT blindly prepare another action; read Goal/history and reconsider explicitly. Does not dispatch or schedule work, Start/Stop, or reactivate Suspended Goals.",
         }.to_owned()
     }
     fn input_schema(&self) -> Value {
         match self.operation {
-            Operation::Read => {
-                json!({"type":"object","properties":{"target":target_schema(),"after_version":{"type":"integer","minimum":0,"description":"History cursor only; entries at or before this Goal version are omitted."},"instance":InstanceSelector::schema(),"wait":{"type":"object","properties":{"minimum_version":{"type":"integer","minimum":0},"timeout_seconds":{"type":"integer","minimum":1,"maximum":25}},"required":["minimum_version","timeout_seconds"],"additionalProperties":false}},"required":["target"],"additionalProperties":false})
-            }
             Operation::Apply => {
                 json!({"type":"object","properties":{"action_reference":{"type":"string","format":"uuid","description":"Copy the opaque reference returned by prepare_goal; do not generate one."}},"required":["action_reference"],"additionalProperties":false})
             }
@@ -134,6 +135,120 @@ impl Tool for GoalTool {
         match self.execute(input, &ctx).await {
             Ok(output) => output,
             Err(error) => ToolOutput::error(error),
+        }
+    }
+}
+
+#[async_trait]
+impl super::instance::RoutedTool for ReadGoalTool {
+    fn name(&self) -> &'static str {
+        "read_goal"
+    }
+    fn nullable_instance(&self) -> bool {
+        true
+    }
+    fn description(&self) -> String {
+        "Read an ordinary conversation's saved Goal and up to 100 ordered history entries. Coordinator only. Uses stable @conv targets and follows the current transcript. after_version is only a history cursor. Omit instance or set it to exact \"local\" for this instance; otherwise a saved-peer ID or unique display name reads exactly that peer and never falls back locally. Optional wait blocks for minimum_version for 1-25 seconds and returns an authoritative satisfied or timed_out snapshot. Goal disposition is not active-execution state; this never dispatches work.".into()
+    }
+    fn clearable(&self) -> bool {
+        true
+    }
+    fn schema_without_instance(&self) -> Value {
+        json!({"type":"object","properties":{"target":target_schema(),"after_version":{"type":"integer","minimum":0,"description":"History cursor only; entries at or before this Goal version are omitted."},"wait":{"type":"object","properties":{"minimum_version":{"type":"integer","minimum":0},"timeout_seconds":{"type":"integer","minimum":1,"maximum":25}},"required":["minimum_version","timeout_seconds"],"additionalProperties":false}},"required":["target"],"additionalProperties":false})
+    }
+    fn db(&self) -> &crate::db::Database {
+        self.runtime.db()
+    }
+    async fn authorize(&self, ctx: &ToolContext) -> Result<(), String> {
+        self.service
+            .authorize_coordinator(&ctx.conversation_id)
+            .await
+            .map_err(|error| self.refusal(error))
+    }
+    async fn run_routed(
+        &self,
+        input: Value,
+        route: super::instance::Route<crate::api::federation::ResolvedPeer>,
+        ctx: ToolContext,
+    ) -> ToolOutput {
+        match self.read(input, &ctx, route).await {
+            Ok(value) => ToolOutput::success(value.to_string()),
+            Err(error) => ToolOutput::error(error),
+        }
+    }
+}
+
+impl ReadGoalTool {
+    fn bad_input(&self, error: &serde_json::Error) -> String {
+        format!("Invalid read_goal input: {error}. Read the tool schema; authority and versions are server-derived.")
+    }
+
+    fn refusal(&self, error: crate::api::handlers::AppError) -> String {
+        use crate::api::handlers::AppError;
+        let message = match error {
+            AppError::Conflict(response) => response.error,
+            other @ (AppError::BadRequest(_)
+            | AppError::TypedBadRequest { .. }
+            | AppError::NotFound(_)
+            | AppError::Forbidden(_)
+            | AppError::Internal(_)
+            | AppError::TranscriptSnapshotChanged
+            | AppError::TypedInternal { .. }
+            | AppError::UnprocessableEntity(_)) => super::app_error_message(other),
+        };
+        format!("read_goal refused: {message}. Verify current Coordinator authority and an ordinary open @conv target.")
+    }
+
+    async fn read(
+        &self,
+        input: Value,
+        ctx: &ToolContext,
+        route: super::instance::Route<crate::api::federation::ResolvedPeer>,
+    ) -> Result<Value, String> {
+        let args: ReadInput =
+            serde_json::from_value(input).map_err(|error| self.bad_input(&error))?;
+        self.service
+            .authorize_coordinator(&ctx.conversation_id)
+            .await
+            .map_err(|error| self.refusal(error))?;
+        let owner = target(&args.target)?;
+        let after = GoalVersion::parse(args.after_version.unwrap_or(0))
+            .map_err(|error| error.to_string())?;
+        match (route, args.wait) {
+            (super::instance::Route::Local, None) => {
+                let (current, history) = self
+                    .service
+                    .read_coordinator(&ctx.conversation_id, &owner, after)
+                    .await
+                    .map_err(|error| self.refusal(error))?;
+                Ok(
+                    json!({"target":args.target,"current":current,"history":history,"history_page_size":100,"execution_state_included":false}),
+                )
+            }
+            (super::instance::Route::Local, Some(wait)) => {
+                let wait = wait.into_request()?;
+                let result = self
+                    .service
+                    .wait_coordinator(&ctx.conversation_id, &owner, after, wait)
+                    .await
+                    .map_err(|error| self.refusal(error))?;
+                Ok(
+                    json!({"target":args.target,"exact_transcript_id":result.destination_transcript_id(),"current":result.current(),"history":result.history(),"history_page_size":100,"execution_state_included":false,"wait_status":result.status()}),
+                )
+            }
+            (super::instance::Route::Remote(peer), wait) => {
+                let wait = wait.map(GoalWaitInput::into_request).transpose()?;
+                let response = crate::api::federation::read_remote_goal(
+                    self.runtime.db(),
+                    &peer,
+                    &owner,
+                    after,
+                    wait,
+                )
+                .await
+                .map_err(|error| format!("read_goal remote read failed: {error}"))?;
+                serde_json::to_value(response).map_err(|error| error.to_string())
+            }
         }
     }
 }
@@ -159,51 +274,11 @@ impl GoalTool {
             | AppError::TypedInternal { .. }
             | AppError::UnprocessableEntity(_)) => super::app_error_message(other),
         };
-        format!("{} refused: {}. Verify current Coordinator authority and an ordinary open @conv target. Read Goal/history before explicitly reconsidering; do not blind-retry with a fresh preparation.", self.name(), message)
-    }
-
-    async fn read(&self, input: Value, ctx: &ToolContext) -> Result<Value, String> {
-        let args: ReadInput =
-            serde_json::from_value(input).map_err(|error| self.bad_input(&error))?;
-        let owner = target(&args.target)?;
-        let after = GoalVersion::parse(args.after_version.unwrap_or(0))
-            .map_err(|error| error.to_string())?;
-        match (args.instance, args.wait) {
-            (InstanceSelector::Local, None) => {
-                let (current, history) = self
-                    .service
-                    .read_coordinator(&ctx.conversation_id, &owner, after)
-                    .await
-                    .map_err(|error| self.refusal(error))?;
-                Ok(
-                    json!({"target":args.target,"current":current,"history":history,"history_page_size":100,"execution_state_included":false}),
-                )
-            }
-            (InstanceSelector::Local, Some(wait)) => {
-                let wait = wait.into_request()?;
-                let result = self
-                    .service
-                    .wait_coordinator(&ctx.conversation_id, &owner, after, wait)
-                    .await
-                    .map_err(|error| self.refusal(error))?;
-                Ok(
-                    json!({"target":args.target,"exact_transcript_id":result.destination_transcript_id(),"current":result.current(),"history":result.history(),"history_page_size":100,"execution_state_included":false,"wait_status":result.status()}),
-                )
-            }
-            (InstanceSelector::Remote(instance), wait) => {
-                let wait = wait.map(GoalWaitInput::into_request).transpose()?;
-                let response = crate::api::federation::read_remote_goal(
-                    self.runtime.db(),
-                    instance.as_str(),
-                    &owner,
-                    after,
-                    wait,
-                )
-                .await
-                .map_err(|error| format!("read_goal remote read failed: {error}"))?;
-                serde_json::to_value(response).map_err(|error| error.to_string())
-            }
-        }
+        format!(
+            "{} refused: {}. Verify current Coordinator authority and an ordinary open @conv target. Read Goal/history before explicitly reconsidering; do not blind-retry with a fresh preparation.",
+            self.name(),
+            message
+        )
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, String> {
@@ -212,7 +287,6 @@ impl GoalTool {
             .await
             .map_err(|error| self.refusal(error))?;
         let output = match self.operation {
-            Operation::Read => self.read(input, ctx).await?,
             Operation::Prepare => {
                 let args: PrepareInput =
                     serde_json::from_value(input).map_err(|error| self.bad_input(&error))?;

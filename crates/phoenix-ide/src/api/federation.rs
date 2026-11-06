@@ -644,9 +644,54 @@ fn bounded_send_diagnostic(message: &str) -> String {
     message.chars().take(512).collect()
 }
 
+pub(crate) struct ResolvedPeer {
+    instance_id: InstanceId,
+    connection: phoenix_db::FederationPeerConnection,
+}
+
+impl ResolvedPeer {
+    pub(crate) fn instance_id(&self) -> InstanceId {
+        self.instance_id
+    }
+
+    pub(crate) fn connection(&self) -> &phoenix_db::FederationPeerConnection {
+        &self.connection
+    }
+}
+
+async fn resolve_saved_peer(
+    db: &crate::db::Database,
+    selector: &str,
+) -> Result<ResolvedPeer, FederationClientError> {
+    let instance_id = resolve_saved_peer_id(db, selector).await?;
+    let connection = db
+        .federation_peer_connection(instance_id)
+        .await?
+        .ok_or(FederationClientError::PeerNotFound)?;
+    Ok(ResolvedPeer {
+        instance_id,
+        connection,
+    })
+}
+
+pub(crate) async fn resolve_tool_peer(
+    db: &crate::db::Database,
+    selector: &crate::coordinator_tools::instance::RemoteInstanceSelector,
+) -> Result<ResolvedPeer, FederationClientError> {
+    resolve_saved_peer(db, selector.as_str()).await
+}
+
+#[cfg(test)]
+pub(crate) async fn resolve_saved_peer_for_test(
+    db: &crate::db::Database,
+    selector: &str,
+) -> Result<ResolvedPeer, FederationClientError> {
+    resolve_saved_peer(db, selector).await
+}
+
 pub async fn send_remote_conversation_message(
     local_db: &crate::db::Database,
-    peer: &phoenix_db::FederationPeerConnection,
+    peer: &ResolvedPeer,
     request: &RemoteSendMessageRequest,
 ) -> Result<RemoteSendMessageResponse, FederationClientError> {
     if !request.locators_are_bounded() {
@@ -654,17 +699,17 @@ pub async fn send_remote_conversation_message(
             "send locators exceed the request budget".into(),
         ));
     }
-    if request.destination_instance_id != peer.peer_instance_id {
+    if request.destination_instance_id != peer.instance_id {
         return Err(FederationClientError::DestinationMismatch);
     }
     let caller = local_db.instance_id().await?;
     let endpoint = format!(
         "{}api/federation/peer/send-conversation-message",
-        peer.base_url
+        peer.connection.base_url
     );
-    let response = remote_query_client(&peer.tls_trust)?
+    let response = remote_query_client(&peer.connection.tls_trust)?
         .post(endpoint)
-        .bearer_auth(peer.bearer_credential.expose())
+        .bearer_auth(peer.connection.bearer_credential.expose())
         .json(request)
         .send()
         .await?;
@@ -686,7 +731,11 @@ pub async fn send_remote_conversation_message(
             let RemoteSendNavigation::AppLocal { path } = navigation else {
                 return Err(FederationClientError::SendProvenanceMismatch);
             };
-            let url = format!("{}{}", peer.base_url, path.trim_start_matches('/'));
+            let url = format!(
+                "{}{}",
+                peer.connection.base_url,
+                path.trim_start_matches('/')
+            );
             *navigation = RemoteSendNavigation::Peer { url };
         }
     }
@@ -764,12 +813,12 @@ fn decode_remote_send_response(
             } if product_conversation_id
                 != &acceptance.stable_destination.product_conversation_id =>
             {
-                return Err(FederationClientError::SendProvenanceMismatch)
+                return Err(FederationClientError::SendProvenanceMismatch);
             }
             RemoteSendTarget::Transcript { transcript_id }
                 if transcript_id != &acceptance.accepting_transcript =>
             {
-                return Err(FederationClientError::SendProvenanceMismatch)
+                return Err(FederationClientError::SendProvenanceMismatch);
             }
             RemoteSendTarget::ProductConversation { .. } | RemoteSendTarget::Transcript { .. } => {}
         }
@@ -830,11 +879,11 @@ pub enum FederationClientError {
 
 pub async fn query_remote_database(
     db: &crate::db::Database,
-    peer_instance_id: InstanceId,
+    peer: &ResolvedPeer,
     sql: &str,
 ) -> Result<RemoteQueryDatabaseResponse, FederationClientError> {
-    let peer = db.federation_peer_connection(peer_instance_id).await?;
-    let peer = peer.ok_or(FederationClientError::PeerNotFound)?;
+    let peer_instance_id = peer.instance_id;
+    let peer = &peer.connection;
     let caller_instance_id = db.instance_id().await?;
     let endpoint = peer.base_url.query_database_endpoint();
     let client = remote_query_client(&peer.tls_trust)?;
@@ -1493,7 +1542,7 @@ pub async fn set_automatic_continuation(
     peer_write_join_response(&state.runtime, tokio::spawn(operation).await).await
 }
 
-pub async fn resolve_saved_peer_id(
+async fn resolve_saved_peer_id(
     db: &crate::db::Database,
     selector: &str,
 ) -> Result<InstanceId, FederationClientError> {
@@ -1559,20 +1608,19 @@ async fn send_bounded_peer_request<T: serde::de::DeserializeOwned>(
 
 pub async fn resolve_remote_reference(
     db: &crate::db::Database,
-    selector: &str,
+    peer: &ResolvedPeer,
     reference: &str,
 ) -> Result<RemoteResolveReferenceResponse, FederationClientError> {
     let requested = RemoteConversationTarget::parse(reference)?;
-    let peer_id = resolve_saved_peer_id(db, selector).await?;
-    let peer = db
-        .federation_peer_connection(peer_id)
-        .await?
-        .ok_or(FederationClientError::PeerNotFound)?;
+    let peer_id = peer.instance_id;
     let caller = db.instance_id().await?;
     let mut response: RemoteResolveReferenceResponse = send_bounded_peer_request(
-        format!("{}api/federation/peer/resolve-reference", peer.base_url),
-        peer.bearer_credential.expose(),
-        &peer.tls_trust,
+        format!(
+            "{}api/federation/peer/resolve-reference",
+            peer.connection.base_url
+        ),
+        peer.connection.bearer_credential.expose(),
+        &peer.connection.tls_trust,
         &RemoteResolveReferenceRequest {
             destination_instance_id: peer_id,
             target: requested.clone(),
@@ -1614,27 +1662,28 @@ fn require_bounded_read_target(
     Ok(())
 }
 
-pub async fn read_remote_conversation(
-    db: &crate::db::Database,
-    selector: &str,
-    reference: &str,
-    cursor: usize,
-) -> Result<RemoteReadConversationResponse, FederationClientError> {
+fn validate_remote_read_cursor(cursor: usize) -> Result<(), FederationClientError> {
     if cursor > super::global_read::MAX_CONVERSATION_READ_CURSOR {
         return Err(FederationClientError::RemoteRejected(format!(
             "cursor exceeds maximum {}",
             super::global_read::MAX_CONVERSATION_READ_CURSOR
         )));
     }
+    Ok(())
+}
+
+pub async fn read_remote_conversation(
+    db: &crate::db::Database,
+    peer: &ResolvedPeer,
+    reference: &str,
+    cursor: usize,
+) -> Result<RemoteReadConversationResponse, FederationClientError> {
+    validate_remote_read_cursor(cursor)?;
     let requested = RemoteConversationTarget::parse(reference)?;
     require_bounded_read_target(&requested)?;
     validate_remote_cursor_target(&requested, cursor)
         .map_err(|error| FederationClientError::RemoteRejected(error.to_string()))?;
-    let peer_id = resolve_saved_peer_id(db, selector).await?;
-    let peer = db
-        .federation_peer_connection(peer_id)
-        .await?
-        .ok_or(FederationClientError::PeerNotFound)?;
+    let peer_id = peer.instance_id;
     let caller = db.instance_id().await?;
     let request = RemoteReadConversationRequest {
         destination_instance_id: peer_id,
@@ -1642,9 +1691,12 @@ pub async fn read_remote_conversation(
         cursor,
     };
     let response: RemoteReadConversationResponse = send_bounded_peer_request(
-        format!("{}api/federation/peer/read-conversation", peer.base_url),
-        peer.bearer_credential.expose(),
-        &peer.tls_trust,
+        format!(
+            "{}api/federation/peer/read-conversation",
+            peer.connection.base_url
+        ),
+        peer.connection.bearer_credential.expose(),
+        &peer.connection.tls_trust,
         &request,
     )
     .await?;
@@ -1824,16 +1876,12 @@ fn validate_remote_goal_wait_status(
 
 pub async fn read_remote_goal(
     db: &crate::db::Database,
-    selector: &str,
+    peer: &ResolvedPeer,
     target: &ProductConversationId,
     after_version: GoalVersion,
     wait: Option<CoordinatorGoalWaitRequest>,
 ) -> Result<RemoteReadGoalResponse, FederationClientError> {
-    let peer_id = resolve_saved_peer_id(db, selector).await?;
-    let peer = db
-        .federation_peer_connection(peer_id)
-        .await?
-        .ok_or(FederationClientError::PeerNotFound)?;
+    let peer_id = peer.instance_id;
     let caller = db.instance_id().await?;
     let wait = wait
         .map(RemoteGoalWaitRequest::from_coordinator_request)
@@ -1846,9 +1894,9 @@ pub async fn read_remote_goal(
         wait,
     };
     let response: RemoteReadGoalResponse = send_bounded_peer_request(
-        format!("{}api/federation/peer/read-goal", peer.base_url),
-        peer.bearer_credential.expose(),
-        &peer.tls_trust,
+        format!("{}api/federation/peer/read-goal", peer.connection.base_url),
+        peer.connection.bearer_credential.expose(),
+        &peer.connection.tls_trust,
         &request,
     )
     .await?;
@@ -2667,56 +2715,31 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn remote_read_rejects_oversized_cursor_before_peer_lookup() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
-
-        let error = read_remote_conversation(
-            &state.db,
-            "missing-peer",
-            "@conv:missing-product",
+    #[test]
+    fn remote_read_rejects_oversized_cursor_before_peer_lookup() {
+        let error = validate_remote_read_cursor(
             super::super::global_read::MAX_CONVERSATION_READ_CURSOR + 1,
         )
-        .await
         .unwrap_err();
-
-        assert!(
-            matches!(error, FederationClientError::RemoteRejected(message) if message.contains("cursor exceeds maximum"))
-        );
+        assert!(matches!(
+            error,
+            FederationClientError::RemoteRejected(message)
+                if message.contains("cursor exceeds maximum")
+        ));
     }
 
-    #[tokio::test]
-    async fn remote_read_cursor_target_guard_runs_before_peer_lookup() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    #[test]
+    fn remote_read_cursor_target_guard_rejects_product_continuations() {
+        let target = RemoteConversationTarget::parse("@conv:missing-product").unwrap();
+        assert_eq!(
+            validate_remote_cursor_target(&target, 1),
+            Err(REMOTE_STABLE_CONTINUATION_ERROR)
+        );
+        assert_eq!(validate_remote_cursor_target(&target, 0), Ok(()));
 
-        let continuation_error =
-            read_remote_conversation(&state.db, "missing-peer", "@conv:missing-product", 1)
-                .await
-                .unwrap_err();
-        assert!(matches!(
-            continuation_error,
-            FederationClientError::RemoteRejected(message)
-                if message == REMOTE_STABLE_CONTINUATION_ERROR
-        ));
-
-        let first_page_error =
-            read_remote_conversation(&state.db, "missing-peer", "@conv:missing-product", 0)
-                .await
-                .unwrap_err();
-        assert!(matches!(
-            first_page_error,
-            FederationClientError::PeerNotFound
-        ));
-
-        let exact_error = read_remote_conversation(
-            &state.db,
-            "missing-peer",
-            "@transcript:missing-transcript",
-            1,
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(exact_error, FederationClientError::PeerNotFound));
+        let exact_target =
+            RemoteConversationTarget::parse("@transcript:missing-transcript").unwrap();
+        assert_eq!(validate_remote_cursor_target(&exact_target, 1), Ok(()));
     }
 
     #[test]
@@ -3914,9 +3937,16 @@ mod tests {
             stream.write_all(&body).await.unwrap();
         });
 
-        resolve_remote_reference(&state.db, "remote", "@conv:product")
+        let peer = resolve_saved_peer_for_test(&state.db, "remote")
             .await
             .unwrap();
+        resolve_remote_reference(&state.db, &peer, "@conv:product")
+            .await
+            .unwrap();
+        assert!(matches!(
+            resolve_saved_peer_for_test(&state.db, "missing").await,
+            Err(FederationClientError::PeerNotFound)
+        ));
         server.await.unwrap();
     }
 
@@ -4051,7 +4081,10 @@ mod tests {
                 .await
                 .unwrap();
 
-            let result = query_remote_database(&state.db, peer, "SELECT 1").await;
+            let resolved_peer = resolve_saved_peer_for_test(&state.db, "peer")
+                .await
+                .unwrap();
+            let result = query_remote_database(&state.db, &resolved_peer, "SELECT 1").await;
             assert!(matches!(
                 result,
                 Err(FederationClientError::RemoteRejected(detail))

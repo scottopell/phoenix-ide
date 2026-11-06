@@ -185,7 +185,9 @@ async fn https_subscription_future_only_nonempty_idle_and_busy_admission_ack_and
     // The explicit saved peer must win even with a real same-ID local conversation and watch.
     let remote = create_saved_peer_subscription(
         &a.state.db,
-        destination.to_string(),
+        &crate::api::federation::resolve_saved_peer_for_test(&a.state.db, &destination.to_string())
+            .await
+            .unwrap(),
         source.product_conversation_id.clone(),
         Some(id),
     )
@@ -439,20 +441,35 @@ async fn tls_trust_failure_and_explicit_missing_instance_never_fall_back_to_loca
         .unwrap();
     assert!(create_saved_peer_subscription(
         &a.state.db,
-        peer.peer_instance_id.to_string(),
+        &crate::api::federation::resolve_saved_peer_for_test(
+            &a.state.db,
+            &peer.peer_instance_id.to_string()
+        )
+        .await
+        .unwrap(),
         source.product_conversation_id.clone(),
         None
     )
     .await
     .is_err());
-    assert!(create_saved_peer_subscription(
-        &a.state.db,
-        InstanceId::new().to_string(),
-        source.product_conversation_id,
-        None
-    )
-    .await
-    .is_err());
+    let missing_selector = InstanceId::new().to_string();
+    assert!(matches!(
+        crate::api::federation::resolve_saved_peer_for_test(&a.state.db, &missing_selector).await,
+        Err(crate::api::federation::FederationClientError::PeerNotFound)
+    ));
+    let remote_count_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM federation_remote_subscriptions")
+            .fetch_one(a.state.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(remote_count_before, 1); // Only the preceding trust-failure attempt persisted.
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM federation_remote_subscriptions",)
+            .fetch_one(a.state.db.pool())
+            .await
+            .unwrap(),
+        remote_count_before
+    );
     assert!(a
         .state
         .db
@@ -526,7 +543,12 @@ async fn repeated_refresh_keeps_authorization_retryable_and_future_watch_active(
     let source = source(&b).await;
     let remote = create_saved_peer_subscription(
         &a.state.db,
-        peer.peer_instance_id.to_string(),
+        &crate::api::federation::resolve_saved_peer_for_test(
+            &a.state.db,
+            &peer.peer_instance_id.to_string(),
+        )
+        .await
+        .unwrap(),
         source.product_conversation_id.clone(),
         None,
     )
@@ -634,7 +656,12 @@ async fn failed_gap_repeated_refresh_exhausts_before_gap_exposure() {
     let source = source(&b).await;
     let remote = create_saved_peer_subscription(
         &a.state.db,
-        peer.peer_instance_id.to_string(),
+        &crate::api::federation::resolve_saved_peer_for_test(
+            &a.state.db,
+            &peer.peer_instance_id.to_string(),
+        )
+        .await
+        .unwrap(),
         source.product_conversation_id.clone(),
         None,
     )
@@ -768,7 +795,12 @@ async fn actual_close_before_authorization_suppresses_a_staged_nonempty_replay()
     let source = source(&b).await;
     let remote = create_saved_peer_subscription(
         &a.state.db,
-        peer.peer_instance_id.to_string(),
+        &crate::api::federation::resolve_saved_peer_for_test(
+            &a.state.db,
+            &peer.peer_instance_id.to_string(),
+        )
+        .await
+        .unwrap(),
         source.product_conversation_id.clone(),
         None,
     )
@@ -820,7 +852,12 @@ async fn actual_close_after_source_authorization_suppresses_unadmitted_fact() {
     let source = source(&b).await;
     let remote = create_saved_peer_subscription(
         &a.state.db,
-        peer.peer_instance_id.to_string(),
+        &crate::api::federation::resolve_saved_peer_for_test(
+            &a.state.db,
+            &peer.peer_instance_id.to_string(),
+        )
+        .await
+        .unwrap(),
         source.product_conversation_id.clone(),
         None,
     )
@@ -941,7 +978,12 @@ async fn unsubscribe_before_create_reaches_source_confirms_exact_retry_and_fence
     assert_eq!(never_created, 0);
     let receipt = unsubscribe_saved_peer(
         &a.state.db,
-        peer.peer_instance_id.to_string(),
+        &crate::api::federation::resolve_saved_peer_for_test(
+            &a.state.db,
+            &peer.peer_instance_id.to_string(),
+        )
+        .await
+        .unwrap(),
         source.product_conversation_id.clone(),
     )
     .await
@@ -984,7 +1026,12 @@ async fn unsubscribe_before_create_reaches_source_confirms_exact_retry_and_fence
     drop(reopened);
     let replacement = create_saved_peer_subscription(
         &a.state.db,
-        peer.peer_instance_id.to_string(),
+        &crate::api::federation::resolve_saved_peer_for_test(
+            &a.state.db,
+            &peer.peer_instance_id.to_string(),
+        )
+        .await
+        .unwrap(),
         source.product_conversation_id.clone(),
         None,
     )
@@ -1005,7 +1052,12 @@ async fn offline_unsubscribe_is_locally_stopped_and_retries_the_exact_remote_ide
     let source = source(&b).await;
     let remote = create_saved_peer_subscription(
         &a.state.db,
-        peer.peer_instance_id.to_string(),
+        &crate::api::federation::resolve_saved_peer_for_test(
+            &a.state.db,
+            &peer.peer_instance_id.to_string(),
+        )
+        .await
+        .unwrap(),
         source.product_conversation_id.clone(),
         None,
     )
@@ -1035,7 +1087,12 @@ async fn offline_unsubscribe_is_locally_stopped_and_retries_the_exact_remote_ide
         .unwrap();
     let receipt = unsubscribe_saved_peer(
         &a.state.db,
-        peer.peer_instance_id.to_string(),
+        &crate::api::federation::resolve_saved_peer_for_test(
+            &a.state.db,
+            &peer.peer_instance_id.to_string(),
+        )
+        .await
+        .unwrap(),
         source.product_conversation_id.clone(),
     )
     .await
@@ -1055,7 +1112,12 @@ async fn offline_unsubscribe_is_locally_stopped_and_retries_the_exact_remote_ide
         .is_empty());
     assert!(create_saved_peer_subscription(
         &a.state.db,
-        peer.peer_instance_id.to_string(),
+        &crate::api::federation::resolve_saved_peer_for_test(
+            &a.state.db,
+            &peer.peer_instance_id.to_string()
+        )
+        .await
+        .unwrap(),
         source.product_conversation_id.clone(),
         None
     )
@@ -1359,7 +1421,12 @@ async fn source_and_coordinator_continuation_preserve_exact_fact_and_follow_curr
     let source = source(&b).await;
     let remote = create_saved_peer_subscription(
         &a.state.db,
-        peer.peer_instance_id.to_string(),
+        &crate::api::federation::resolve_saved_peer_for_test(
+            &a.state.db,
+            &peer.peer_instance_id.to_string(),
+        )
+        .await
+        .unwrap(),
         source.product_conversation_id.clone(),
         None,
     )
@@ -1480,7 +1547,12 @@ async fn subscription_peer_bearer_cannot_use_owner_routes_and_owner_password_can
     let source = source(&b).await;
     let remote = create_saved_peer_subscription(
         &a.state.db,
-        peer.peer_instance_id.to_string(),
+        &crate::api::federation::resolve_saved_peer_for_test(
+            &a.state.db,
+            &peer.peer_instance_id.to_string(),
+        )
+        .await
+        .unwrap(),
         source.product_conversation_id.clone(),
         None,
     )
@@ -1554,7 +1626,12 @@ async fn source_revocation_without_pending_notifications_ends_create_or_replay_l
         if enrolled {
             let remote = create_saved_peer_subscription(
                 &a.state.db,
-                peer.peer_instance_id.to_string(),
+                &crate::api::federation::resolve_saved_peer_for_test(
+                    &a.state.db,
+                    &peer.peer_instance_id.to_string(),
+                )
+                .await
+                .unwrap(),
                 source.product_conversation_id.clone(),
                 Some(id),
             )
@@ -1676,7 +1753,12 @@ async fn revocation_during_saved_peer_create_ends_the_persisted_retry_identity()
         async move {
             create_saved_peer_subscription(
                 &db,
-                peer.peer_instance_id.to_string(),
+                &crate::api::federation::resolve_saved_peer_for_test(
+                    &db,
+                    &peer.peer_instance_id.to_string(),
+                )
+                .await
+                .unwrap(),
                 product,
                 Some(id),
             )
@@ -1732,7 +1814,12 @@ async fn revoked_bearer_cannot_recover_an_already_authorized_delivery_receipt_ov
     let source = source(&b).await;
     let remote = create_saved_peer_subscription(
         &a.state.db,
-        peer.peer_instance_id.to_string(),
+        &crate::api::federation::resolve_saved_peer_for_test(
+            &a.state.db,
+            &peer.peer_instance_id.to_string(),
+        )
+        .await
+        .unwrap(),
         source.product_conversation_id.clone(),
         None,
     )
@@ -1823,7 +1910,12 @@ async fn source_unsubscribe_or_revoke_before_authorization_suppresses_staged_adm
         let source = source(&b).await;
         let remote = create_saved_peer_subscription(
             &a.state.db,
-            peer.peer_instance_id.to_string(),
+            &crate::api::federation::resolve_saved_peer_for_test(
+                &a.state.db,
+                &peer.peer_instance_id.to_string(),
+            )
+            .await
+            .unwrap(),
             source.product_conversation_id.clone(),
             None,
         )
@@ -1898,7 +1990,12 @@ async fn disconnected_age_gap_retains_terminal_evidence_and_has_remote_presentat
     let source = source(&b).await;
     let remote = create_saved_peer_subscription(
         &a.state.db,
-        peer.peer_instance_id.to_string(),
+        &crate::api::federation::resolve_saved_peer_for_test(
+            &a.state.db,
+            &peer.peer_instance_id.to_string(),
+        )
+        .await
+        .unwrap(),
         source.product_conversation_id.clone(),
         None,
     )
