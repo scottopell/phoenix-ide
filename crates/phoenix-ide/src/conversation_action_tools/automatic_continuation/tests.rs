@@ -192,7 +192,8 @@ async fn remote_selector_errors_never_write_local_preference() {
     clippy::too_many_lines,
     reason = "TLS peer fixture and admission ordering are exercised together"
 )]
-async fn cancelled_remote_preference_request_keeps_source_admission_until_peer_settles() {
+async fn cancelled_remote_preference_request_keeps_source_admission_and_authority_until_peer_settles(
+) {
     use phoenix_core::domain::instance_identity::{
         InstanceId, PeerBearerCredential, PeerCaCertificatePem, PeerTlsTrust,
     };
@@ -294,6 +295,11 @@ async fn cancelled_remote_preference_request_keeps_source_admission_until_peer_s
     requester.abort();
     assert!(requester.await.unwrap_err().is_cancelled());
 
+    let closing_authority = runtime.acquire_local_authority_pass().unwrap();
+    closing_authority.close("remote_preference_cancellation_test");
+    assert_eq!(runtime.fatal_authority_owners_at_first_close(), Some(3));
+    drop(closing_authority);
+
     let admission = runtime.lock_product_message_admission(source_product.as_str());
     tokio::pin!(admission);
     assert!(matches!(
@@ -363,6 +369,26 @@ async fn settings_require_trusted_source_and_refuse_ordinary_sources_without_wri
         AutoContinueOnContextExhaustion::Disabled,
     );
     assert!(!runtime.local_authority_is_closed());
+}
+
+#[tokio::test]
+async fn preclosed_remote_source_authority_refuses_before_peer_resolution() {
+    let (runtime, _, coordinator) = native_runtime().await;
+    let closing_authority = runtime.acquire_local_authority_pass().unwrap();
+    closing_authority.close("preclosed_remote_source_test");
+    drop(closing_authority);
+
+    let error = remote_from_coordinator(
+        runtime,
+        coordinator,
+        "unconfigured-peer".into(),
+        TargetInput::Coordinator {},
+        native::Operation::Read,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error, "Local mutation authority is closed");
 }
 
 #[tokio::test]
