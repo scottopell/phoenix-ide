@@ -81,7 +81,10 @@ pub(crate) async fn config(db: &crate::db::Database) -> Result<Option<Config>, S
         .map(|v| serde_json::from_str(&v).map_err(|e| e.to_string()))
         .transpose()
 }
-pub(crate) async fn status(db: &crate::db::Database) -> Result<serde_json::Value, String> {
+pub(crate) async fn status(
+    db: &crate::db::Database,
+    manager: &phoenix_tools::mcp::McpClientManager,
+) -> Result<serde_json::Value, String> {
     let conf = config(db).await?;
     let Some(c) = conf else {
         return Ok(
@@ -90,8 +93,27 @@ pub(crate) async fn status(db: &crate::db::Database) -> Result<serde_json::Value
     };
     let account=sqlx::query("SELECT status,last_scan_at_unix_micros,last_error,baseline_complete,calls_last_pass,pages_last_pass,retry_at_us FROM slack_gateway_accounts WHERE workspace=?1 AND owner=?2").bind(&c.workspace).bind(&c.owner).fetch_optional(db.pool()).await.map_err(|e|e.to_string())?;
     let scan=account.map(|r|serde_json::json!({"status":r.get::<String,_>("status"),"last_scan_at_unix_micros":r.get::<Option<i64>,_>("last_scan_at_unix_micros"),"last_error":r.get::<Option<String>,_>("last_error"),"baseline_complete":r.get::<bool,_>("baseline_complete"),"calls_last_pass":r.get::<i64,_>("calls_last_pass"),"pages_last_pass":r.get::<i64,_>("pages_last_pass"),"retry_at_us":r.get::<Option<i64>,_>("retry_at_us")}));
+    let connection = manager
+        .status()
+        .await
+        .into_iter()
+        .find(|server| server.name == c.mcp_server);
+    let stale_scan_warning = c
+        .timezone
+        .parse::<chrono_tz::Tz>()
+        .ok()
+        .is_some_and(|timezone| {
+            scan.as_ref()
+                .and_then(|scan| scan["last_scan_at_unix_micros"].as_i64())
+                .and_then(chrono::DateTime::from_timestamp_micros)
+                .is_some_and(|scan| {
+                    scan.with_timezone(&timezone).date_naive()
+                        < chrono::Utc::now().with_timezone(&timezone).date_naive()
+                            - chrono::Days::new(3)
+                })
+        });
     Ok(
-        serde_json::json!({"config":c,"scan":scan,"requests":db.slack_requests(&c.workspace,&c.owner).await.map_err(|e|e.to_string())?,"returns":db.slack_returns(&c.workspace,&c.owner).await.map_err(|e|e.to_string())?}),
+        serde_json::json!({"config":c,"scan":scan,"connection":connection,"stale_scan_warning":stale_scan_warning,"requests":db.slack_requests(&c.workspace,&c.owner).await.map_err(|e|e.to_string())?,"returns":db.slack_returns(&c.workspace,&c.owner).await.map_err(|e|e.to_string())?}),
     )
 }
 #[derive(Clone, Copy)]
@@ -216,7 +238,7 @@ pub(crate) fn start(state: crate::api::AppState) {
                         &c.workspace,
                         &c.owner,
                         false,
-                        slack.failure_status(&error),
+                        slack.failure_status(&error).await,
                         Some(&error),
                     )
                     .await;

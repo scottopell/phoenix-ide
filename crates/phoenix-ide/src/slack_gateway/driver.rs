@@ -57,7 +57,7 @@ pub(super) async fn tick(
                         &c.workspace,
                         &c.owner,
                         false,
-                        slack.failure_status(&error),
+                        slack.failure_status(&error).await,
                         Some(&error),
                     )
                     .await
@@ -74,7 +74,7 @@ pub(super) async fn tick(
                     if backing_off || !slack.can_call() {
                         "backing_off"
                     } else {
-                        "awaiting_authentication"
+                        slack.failure_status(error).await
                     },
                     Some(error),
                 )

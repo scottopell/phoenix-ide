@@ -1094,7 +1094,7 @@ export interface ForkProposalSummary {
   refinement_conversation_id?: string;
 }
 
-export type McpConnState = 'ready' | 'unauthorized' | 'failed' | 'removing';
+export type McpConnState = 'connecting' | 'recovering' | 'ready' | 'unauthorized' | 'failed';
 export type McpTransportKind = 'stdio' | 'http';
 export type McpAuthKind = 'none' | 'static' | 'oauth';
 
@@ -1111,6 +1111,7 @@ export interface McpServerStatus {
   pending_oauth_url?: string;
   /** Failure cause when state = failed; cleared on a successful reconnect. */
   last_error?: string;
+  next_retry_at?: number | null;
   /** On an unauthorized entry, a diagnostic when the OAuth redirect base is
    *  unreachable from another machine, so the authorize link will fail. */
   auth_redirect_warning?: string;
@@ -1125,7 +1126,6 @@ export interface McpReloadFailure {
 export interface McpReloadResult {
   added: string[];
   removed: string[];
-  pending_removals: string[];
   restarted: string[];
   unchanged: string[];
   failed: McpReloadFailure[];

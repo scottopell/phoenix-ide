@@ -20,7 +20,6 @@ const reloadMcp = vi.mocked(api.reloadMcp);
 const emptyReload: McpReloadResult = {
   added: [],
   removed: [],
-  pending_removals: [],
   restarted: [],
   unchanged: [],
   failed: [],
@@ -39,33 +38,30 @@ const healthy: McpServerStatus = {
 };
 
 describe('McpStatusPanel', () => {
-  it('keeps polling a deferred removal until its later authorization and cleanup finish', async () => {
+  it('shows background recovery and keeps expanded diagnostics current after readiness', async () => {
     vi.useFakeTimers();
-    for (const [anotherReady, deferred] of [[true, true], [false, true], [true, false]]) {
-    const survivors = anotherReady ? [healthy] : [];
-    const showToast = vi.fn();
-    getMcpStatus.mockResolvedValue([...survivors, { ...healthy, name: 'remote' }]);
-    const { unmount } = render(<McpStatusPanel showToast={showToast} showError={vi.fn()} />);
+    getMcpStatus.mockResolvedValue([{ ...healthy, state: 'recovering', tool_count: 0, tools: [], last_error: 'HTTP 503', next_retry_at: 2000000000 }]);
+    render(<McpStatusPanel showToast={vi.fn()} showError={vi.fn()} />);
     await act(async () => {});
     fireEvent.click(screen.getByRole('button', { name: /^MCP / }));
-    reloadMcp.mockResolvedValue(deferred
-      ? { ...emptyReload, pending_removals: ['remote'], unchanged: survivors.map(s => s.name) }
-      : { ...emptyReload, failed: [{ server: 'remote', action: 'remove', error: 'transient refresh' }] });
-    getMcpStatus.mockResolvedValue([...survivors, { ...healthy, name: 'remote', state: 'removing' }]);
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Reload MCP servers' })); });
-    if (deferred) expect(showToast).toHaveBeenCalledWith(expect.stringContaining('removal pending'), 3000);
-    const afterReload = getMcpStatus.mock.calls.length;
-    getMcpStatus.mockResolvedValue([...survivors, { ...healthy, name: 'remote', state: 'unauthorized', auth: 'oauth', pending_oauth_url: 'https://example.com/authorize' }]);
+    await act(async () => {});
+    fireEvent.click(screen.getByRole('button', { name: /healthy/ }));
+    expect(screen.getByText(/HTTP 503/)).toBeTruthy();
+    expect(screen.getByText(/Next retry/)).toBeTruthy();
+    const beforeRecovery = getMcpStatus.mock.calls.length;
+    getMcpStatus.mockResolvedValue([healthy]);
     await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
-    expect(getMcpStatus.mock.calls.length).toBe(afterReload + 1);
+    expect(getMcpStatus.mock.calls.length).toBeGreaterThan(beforeRecovery);
+    expect(screen.queryByText(/HTTP 503/)).toBeNull();
+    getMcpStatus.mockResolvedValue([{ ...healthy, state: 'unauthorized', pending_oauth_url: 'https://example.com/authorize' }]);
+    await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
     expect(screen.getByRole('link', { name: /Sign in/ })).toHaveAttribute('href', 'https://example.com/authorize');
-    getMcpStatus.mockResolvedValue(survivors);
+    getMcpStatus.mockResolvedValue([healthy]);
     await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
-    const afterCleanup = getMcpStatus.mock.calls.length;
-    await act(async () => { await vi.advanceTimersByTimeAsync(6000); });
-    expect(getMcpStatus.mock.calls.length).toBe(afterCleanup);
-    unmount();
-    }
+    fireEvent.click(screen.getByRole('button', { name: /^MCP / }));
+    const settled = getMcpStatus.mock.calls.length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(9000); });
+    expect(getMcpStatus.mock.calls.length).toBeLessThanOrEqual(settled + 1);
   });
 
   it('reloads config from the writable empty state', async () => {

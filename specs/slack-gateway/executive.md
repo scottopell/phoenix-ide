@@ -31,6 +31,13 @@ prepare separate private briefings. Thread reuse and exact reply coverage remain
 
 ## Simplification
 
+REQ-SG-017 projects shared MCP connection health separately from stored scan
+status, checks required tools and warns when the last completed scan predates
+the four-calendar-date window. These changes are implemented; local verification
+is recorded in the [MCP implementation matrix](../mcp/executive.md#automatic-http-recovery-implementation).
+Live fault-injection acceptance and production deployment remain open. Slack adds
+no reconnect worker, signal retries, schema conversion or wider discovery window.
+
 ADR-155 replaces independent signal recovery with single-attempt behavior.
 Private commands record submission, rejection or uncertainty without receipt
 inspection or automatic retry. Eyes is claimed once before calling Slack; failure

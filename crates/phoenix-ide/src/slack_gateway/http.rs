@@ -3,7 +3,7 @@ use super::Config;
 use crate::api::{handlers::AppError, AppState};
 use axum::{extract::State, Json};
 pub(crate) async fn get(State(s): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
-    super::status(&s.db)
+    super::status(&s.db, &s.mcp_manager)
         .await
         .map(Json)
         .map_err(AppError::Internal)
@@ -24,7 +24,7 @@ pub(crate) async fn put(
             AppError::Internal(e.to_string())
         }
     })?;
-    super::status(&s.db)
+    super::status(&s.db, &s.mcp_manager)
         .await
         .map(Json)
         .map_err(AppError::Internal)
@@ -52,8 +52,20 @@ pub(crate) async fn source(
 }
 
 pub(crate) async fn capabilities(State(s): State<AppState>) -> Json<serde_json::Value> {
-    let tools=s.mcp_manager.tool_definitions().await.into_iter().filter(|(_,t)|t.name.contains("slack")).map(|(server,t)|serde_json::json!({"server":server,"name":t.name,"input_schema":t.input_schema})).collect::<Vec<_>>();
-    Json(serde_json::json!({"tools":tools}))
+    let catalogs = s.mcp_manager.cached_tool_catalogs().await;
+    let freshness = catalogs
+        .iter()
+        .map(|(server, tools)| serde_json::json!({"server":server,"current":tools.is_some()}))
+        .collect::<Vec<_>>();
+    let tools = catalogs
+        .into_iter()
+        .flat_map(|(server, tools)| {
+            tools.unwrap_or_default().into_iter()
+                .filter(|t| t.name.contains("slack"))
+                .map(move |t| serde_json::json!({"server":server,"name":t.name,"input_schema":t.input_schema}))
+        })
+        .collect::<Vec<_>>();
+    Json(serde_json::json!({"tools":tools,"catalogs":freshness}))
 }
 
 pub(crate) async fn inspect(

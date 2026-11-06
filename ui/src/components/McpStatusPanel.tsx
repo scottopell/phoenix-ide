@@ -4,6 +4,7 @@ import type { McpServerStatus } from '../api';
 import { GroundingSection, GroundingState } from './GroundingPanel';
 import { summarizeMcpStatus } from './groundingSummaries';
 import './McpStatusPanel.css';
+const connectionPending = (server: McpServerStatus) => server.state === 'connecting' || server.state === 'recovering';
 interface McpStatusPanelProps {
   /** Success / info path. Renders with the success / info styling
    *  (whatever the parent wires into this prop). */
@@ -58,7 +59,7 @@ export function McpStatusPanel({ showToast, showError, readOnly = false }: McpSt
   useEffect(() => {
     let cancelled = false;
     const shouldStopPolling = (s: McpServerStatus[]) =>
-      (s.length > 0 || awaitingRef.current !== null) && s.every(srv => !srv.pending_oauth_url) && reloadSettled(s);
+      !expanded && (s.length > 0 || awaitingRef.current !== null) && s.every(srv => !srv.pending_oauth_url && !connectionPending(srv)) && reloadSettled(s);
 
     fetchStatus().then(count => {
       if (cancelled) return;
@@ -72,22 +73,23 @@ export function McpStatusPanel({ showToast, showError, readOnly = false }: McpSt
     return () => {
       cancelled = true;
       if (pollRef.current) clearInterval(pollRef.current);
+      pollRef.current = null;
     };
-  }, [fetchStatus]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [fetchStatus, expanded]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Stop polling once all OAuth flows have resolved and any reload retry has
   // settled.
   useEffect(() => {
     if (
-      (servers.length > 0 || awaitingRef.current !== null) &&
-      servers.every(s => !s.pending_oauth_url) &&
+      !expanded && (servers.length > 0 || awaitingRef.current !== null) &&
+      servers.every(s => !s.pending_oauth_url && !connectionPending(s)) &&
       reloadSettled(servers) &&
       pollRef.current
     ) {
       clearInterval(pollRef.current);
       pollRef.current = null;
     }
-  }, [servers, reloadSettled]);
+  }, [servers, reloadSettled, expanded]);
 
   const handleReload = useCallback(async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -117,13 +119,11 @@ export function McpStatusPanel({ showToast, showError, readOnly = false }: McpSt
         ...[...result.added, ...result.restarted]
           .map(name => [name, 'ready'] as const),
         ...result.failed.map(f => [f.server, f.action === 'remove' ? 'removed' : 'ready'] as const),
-        ...result.pending_removals.map(name => [name, 'removed'] as const),
       ]);
       await fetchStatus();
       const parts: string[] = [];
       if (result.added.length > 0) parts.push(`+${result.added.length} added`);
       if (result.removed.length > 0) parts.push(`-${result.removed.length} removed`);
-      if (result.pending_removals.length > 0) parts.push(`${result.pending_removals.length} removal pending`);
       if (result.restarted.length > 0) parts.push(`↻${result.restarted.length} restarted`);
       if (result.failed.length > 0) parts.push(`!${result.failed.length} failed`);
       if (result.unchanged.length > 0) parts.push(`${result.unchanged.length} unchanged`);
@@ -300,8 +300,8 @@ export function McpStatusPanel({ showToast, showError, readOnly = false }: McpSt
                     <span className="mcp-server-state">
                       {server.state === 'failed'
                         ? <span className="mcp-state-failed">failed</span>
-                        : server.state === 'removing'
-                          ? 'removal pending'
+                        : server.state === 'connecting' || server.state === 'recovering'
+                          ? server.state
                         : server.state === 'unauthorized'
                           ? <span className="mcp-auth-needed">auth needed</span>
                           : `${server.tool_count} tool${server.tool_count !== 1 ? 's' : ''}`}
@@ -309,8 +309,10 @@ export function McpStatusPanel({ showToast, showError, readOnly = false }: McpSt
                   </span>
                 </button>
                 {expandedServers.has(server.name) && (
-                  server.state === 'failed' ? (
-                    <div className="mcp-server-error">{server.last_error ?? 'connection failed'}</div>
+                  server.state === 'failed' || server.state === 'connecting' || server.state === 'recovering' ? (
+                    <div className="mcp-server-error">{server.last_error ?? (server.state === 'failed' ? 'connection failed' : 'Connecting automatically…')}
+                      {server.next_retry_at != null && <div>Next retry: {new Date(server.next_retry_at * 1000).toLocaleTimeString()}</div>}
+                    </div>
                   ) : (
                     <div className="mcp-tool-list">
                       {server.tools.map(tool => (

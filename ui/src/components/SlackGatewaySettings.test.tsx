@@ -96,3 +96,53 @@ it('keeps best-effort status separate from native work without implying notifica
   expect(screen.getByText('Submission receipt')).toBeTruthy();
   expect(screen.queryByText('Failed')).toBeNull();
 });
+
+
+it.each([
+  [null, 'Connection unavailable'],
+  [{ state: 'recovering', enabled: true, tools: [], last_error: 'HTTP 503', next_retry_at: 2000000000 }, 'recovering'],
+  [{ state: 'unauthorized', enabled: true, tools: [] }, 'Sign-in required'],
+  [{ state: 'ready', enabled: true, tools: [] }, 'Required tools unavailable'],
+])('does not report old healthy scans as a healthy current connection', async (connection, label) => {
+  const config = { enabled: true, mcp_server: 'slack', owner: 'UOWNER', workspace: 'example.slack.com', timezone: 'UTC', phoenix_url: 'https://phoenix.example', notification_command: [] };
+  vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => ({ ok: true, json: async () => url.endsWith('/capabilities')
+    ? { catalogs: [{ server: 'slack', current: true }], tools: [] }
+    : { config, connection, stale_scan_warning: true, scan: { baseline_complete: true, status: 'healthy' }, requests: [], returns: [] } })));
+  render(<SlackGatewaySettings standalone />);
+  await screen.findByText(new RegExp('Slack connection: ' + label));
+  expect(screen.queryByText('healthy')).toBeNull();
+  expect(screen.getByText(/Older triggers may have been missed/)).toBeTruthy();
+});
+
+it.each([true, false])('offers the owned sign-in link only for an enabled unauthorized connection: %s', async enabled => {
+  const url = 'https://auth.example/authorize?state=owned-flow';
+  const config = { enabled: true, mcp_server: 'slack' };
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ config, connection: { state: 'unauthorized', enabled, tools: [], pending_oauth_url: url }, requests: [], returns: [] }) }));
+  render(<SlackGatewaySettings standalone />);
+  await screen.findByText(/Slack connection:/);
+  const link = screen.queryByRole('link', { name: 'Sign in to Slack' });
+  expect(link?.getAttribute('href') ?? null).toBe(enabled ? url : null);
+});
+
+
+it('shows schema incompatibility even when every required tool name is present', async () => {
+  const names = ['slack_read_user_profile', 'slack_search_public_and_private', 'slack_read_thread', 'slack_get_reactions', 'slack_add_reaction', 'slack_send_message'];
+  const config = { enabled: true, mcp_server: 'slack', owner: 'UOWNER', workspace: 'example.slack.com', timezone: 'UTC', phoenix_url: 'https://phoenix.example', notification_command: [] };
+  vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => ({ ok: true, json: async () => url.endsWith('/capabilities')
+    ? { catalogs: [{ server: 'slack', current: true }], tools: names.map(name => ({ server: 'slack', name, input_schema: name === 'slack_send_message' ? { type: 'object', properties: { message: { type: 'number' } } } : { type: 'object' } })) }
+    : { config, connection: { name: 'slack', state: 'ready', enabled: true, tools: names }, scan: { baseline_complete: true, status: 'healthy' }, requests: [], returns: [] } })));
+  render(<SlackGatewaySettings standalone />);
+  await screen.findByText(/Slack connection: Incompatible tool schema: slack_send_message/);
+  expect(screen.queryByText('healthy')).toBeNull();
+});
+
+it.each([[], ['slack_read_user_profile'], ['slack_read_user_profile', 'slack_search_public_and_private', 'slack_read_thread', 'slack_get_reactions', 'slack_add_reaction', 'slack_send_message']].map(names => ({ names })))('keeps a stale catalog unverified regardless of its previous names: $names', async ({ names }) => {
+  const config = { enabled: true, mcp_server: 'slack' };
+  vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => ({ ok: true, json: async () => url.endsWith('/capabilities')
+    ? { catalogs: [{ server: 'slack', current: false }], tools: [] }
+    : { config, connection: { name: 'slack', state: 'ready', enabled: true, tools: names }, scan: { baseline_complete: true, status: 'healthy' }, requests: [], returns: [] } })));
+  render(<SlackGatewaySettings standalone />);
+  await screen.findByText(/Slack connection: Cannot verify required tool schemas/);
+  expect(screen.queryByText(/Required tools unavailable/)).toBeNull();
+  expect(screen.queryByText('healthy')).toBeNull();
+});
