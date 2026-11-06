@@ -39,7 +39,7 @@ natively, without the `mcp-remote` subprocess bridge.
 
 ## Automatic HTTP recovery implementation
 
-ADR-229 is accepted following the owner's simplification decision. Local transport
+ADR-230 is accepted following the owner's simplification decision. Local transport
 activity must stop before replacement; remote DELETE is one bounded best-effort
 attempt and never starts credential recovery. Connection timers are process-local.
 Durability for credentials, local credential-removal intent and accepted Slack
