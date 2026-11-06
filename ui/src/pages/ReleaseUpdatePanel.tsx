@@ -351,7 +351,7 @@ export function ReleaseUpdatePanel({
               {discoveryFreshness === 'current' && snapshot.authority.kind === 'allowed' && snapshot.preview.newer_than_current && approvalStatusSafe && !committedReleaseIsPreview && (
                 confirming ? (
                   <div className="release-update__confirm">
-                    <span>Install {snapshot.preview.tag}? Phoenix will reconnect after backend-owned verification or rollback.</span>
+                    <span>Install {snapshot.preview.tag}? Phoenix may disconnect during installation and verification. Failure may require manual recovery.</span>
                     <button type="button" className="settings-inline-btn release-update__approve" onClick={() => { void approve(); }} disabled={approving}>
                       {approving ? 'Preparing handoff…' : 'Approve and install'}
                     </button>
@@ -369,7 +369,7 @@ export function ReleaseUpdatePanel({
           )}
         </>
       )}
-      {active && <div className="release-update__hint">An approved update is in progress. Transaction status refreshes every 2 seconds; Phoenix may disconnect while the native backend activates, verifies, or rolls back.</div>}
+      {active && <div className="release-update__hint">An approved update is in progress. Transaction status refreshes every 2 seconds; Phoenix may disconnect during installation and verification. Failure may require manual recovery.</div>}
       {transaction && <TransactionStatus transaction={transaction} />}
     </section>
   );

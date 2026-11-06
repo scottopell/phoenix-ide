@@ -511,7 +511,10 @@ fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransa
     let published = value.get("source_kind").and_then(serde_json::Value::as_str)
         == Some("published_release")
         || marker.is_file();
-    if !published {
+    let local_launchd_failure = matches!(backend, ReleaseUpdateBackend::Launchd)
+        && value.get("source_kind").and_then(serde_json::Value::as_str) == Some("local_head")
+        && string("state").as_deref() == Some("failed");
+    if !published && !local_launchd_failure {
         return ReleaseTransactionStatus::None;
     }
     let Some(state) = string("state") else {
@@ -1047,6 +1050,55 @@ mod tests {
                 !stale,
                 "terminal failure must not be marked in-progress stale"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_launchd_failure_remains_visible_without_exposing_other_local_statuses() {
+        let home = tempfile::tempdir().unwrap();
+        let mut app = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        app.runtime_env =
+            Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::with_root(home.path()));
+        let path = status_path(&app, ReleaseUpdateBackend::Launchd).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for durable_state in ["failed", "committed", "preparing"] {
+            fs::write(
+                &path,
+                serde_json::json!({
+                    "transaction_id": "local-deploy",
+                    "source_kind": "local_head",
+                    "state": durable_state,
+                    "source_commit": "a".repeat(40),
+                    "updated_at": "2020-01-01T00:00:00Z",
+                    "failure": "verifying: unhealthy candidate; stopping failed: denied",
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let status = read_status(&app, ReleaseUpdateBackend::Launchd);
+            if durable_state == "failed" {
+                let ReleaseTransactionStatus::Present {
+                    state,
+                    failure,
+                    stale,
+                    ..
+                } = status
+                else {
+                    panic!("local launchd failure must remain visible for manual recovery");
+                };
+                assert_eq!(state, "failed");
+                assert_eq!(
+                    failure.as_deref(),
+                    Some("verifying: unhealthy candidate; stopping failed: denied")
+                );
+                assert!(!stale);
+            } else {
+                assert!(matches!(status, ReleaseTransactionStatus::None));
+            }
+            assert!(matches!(
+                read_status(&app, ReleaseUpdateBackend::BareLinux),
+                ReleaseTransactionStatus::None
+            ));
         }
     }
 

@@ -47,6 +47,8 @@ describe('ReleaseUpdatePanel', () => {
       fireEvent.click(screen.getByRole('button', { name: 'Review and install v1.1.0' }));
     });
     expect(screen.getByRole('button', { name: 'Approve and install' })).toBeInTheDocument();
+    expect(screen.getByText(/Phoenix may disconnect during installation and verification\. Failure may require manual recovery\./)).toBeInTheDocument();
+    expect(screen.queryByText(/will reconnect|verification or rollback/)).not.toBeInTheDocument();
   });
 
   it('does not repeat the running deployment identity', async () => {
@@ -93,6 +95,8 @@ describe('ReleaseUpdatePanel', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
 
     expect(await screen.findByText(/activating and verifying/i)).toBeInTheDocument();
+    expect(screen.getByText(/Phoenix may disconnect during installation and verification\. Failure may require manual recovery\./)).toBeInTheDocument();
+    expect(screen.queryByText(/activates, verifies, or rolls back/)).not.toBeInTheDocument();
     expect(screen.getByText('tx-reconnect')).toBeInTheDocument();
     expect(fetchMock).toHaveBeenLastCalledWith('/api/release-updates/transaction');
   });
