@@ -2943,13 +2943,16 @@ mod tests {
             )
             .await;
 
-        let tool = SendConversationMessage {
-            service: GlobalReadService::new(state.db.clone(), state.message_retriever.clone()),
-            send_chat: Arc::new(crate::send_chat_service::SendChatApplicationService::new(
-                state.db.clone(),
-                state.runtime.clone(),
-            )),
-        };
+        let tool = instance::RouteTool::new(FederatedSendConversationMessage {
+            local: SendConversationMessage {
+                service: GlobalReadService::new(state.db.clone(), state.message_retriever.clone()),
+                send_chat: Arc::new(crate::send_chat_service::SendChatApplicationService::new(
+                    state.db.clone(),
+                    state.runtime.clone(),
+                )),
+            },
+            db: state.db.clone(),
+        });
         for target_ref in [
             format!("@transcript:{}", target.id),
             format!("@conv:{}", target.product_conversation_id),
@@ -3024,10 +3027,13 @@ mod tests {
             .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
             .await
             .unwrap();
-        let tool = SendConversationMessage {
-            service: GlobalReadService::new(db.clone(), state.message_retriever.clone()),
-            send_chat: Arc::new(SendChatApplicationService::new(db.clone(), state.runtime)),
-        };
+        let tool = instance::RouteTool::new(FederatedSendConversationMessage {
+            local: SendConversationMessage {
+                service: GlobalReadService::new(db.clone(), state.message_retriever.clone()),
+                send_chat: Arc::new(SendChatApplicationService::new(db.clone(), state.runtime)),
+            },
+            db: db.clone(),
+        });
         let mut input = json!({
             "target":"@transcript:target", "message":"local delivery",
             "message_id":uuid::Uuid::new_v4().to_string(), "instance":"local",
@@ -3092,13 +3098,16 @@ mod tests {
             .create_conversation("local-target", "target", "/tmp", true, None, None)
             .await
             .unwrap();
-        let tool = SendConversationMessage {
-            service: GlobalReadService::new(state.db.clone(), state.message_retriever.clone()),
-            send_chat: Arc::new(SendChatApplicationService::new(
-                state.db.clone(),
-                state.runtime,
-            )),
-        };
+        let tool = instance::RouteTool::new(FederatedSendConversationMessage {
+            local: SendConversationMessage {
+                service: GlobalReadService::new(state.db.clone(), state.message_retriever.clone()),
+                send_chat: Arc::new(SendChatApplicationService::new(
+                    state.db.clone(),
+                    state.runtime,
+                )),
+            },
+            db: state.db.clone(),
+        });
         let own_instance = state.db.instance_id().await.unwrap().to_string();
         for instance in ["missing-peer".to_string(), own_instance] {
             let output = tool
@@ -3185,13 +3194,16 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let tool = SendConversationMessage {
-            service: GlobalReadService::new(state.db.clone(), state.message_retriever.clone()),
-            send_chat: Arc::new(SendChatApplicationService::new(
-                state.db.clone(),
-                state.runtime,
-            )),
-        };
+        let tool = instance::RouteTool::new(FederatedSendConversationMessage {
+            local: SendConversationMessage {
+                service: GlobalReadService::new(state.db.clone(), state.message_retriever.clone()),
+                send_chat: Arc::new(SendChatApplicationService::new(
+                    state.db.clone(),
+                    state.runtime,
+                )),
+            },
+            db: state.db.clone(),
+        });
 
         let output = tool
             .run(
