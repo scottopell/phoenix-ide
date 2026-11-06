@@ -1,5 +1,9 @@
 # HTTP MCP recovery specification review — 2026-11-06
 
+The two review passes below describe the initial draft. The later owner-approved
+simplification supersedes the retained strict-cleanup disposition; see the final
+section. These were author-performed review passes, not independent agent reviews.
+
 Scope: requirements, Allium, proposed ADR-229 and acceptance scenarios only.
 These are two author-performed adversarial passes, not independent-agent or
 implementation reviews. Initial draft: commit `56342e81e`. The corrections below
@@ -138,3 +142,75 @@ system. Strict remote cleanup remains the consequential retained tradeoff.
   no fixture or implementation change was made for this environment difference.
 - Whitespace validation passes. Only specification and review documents changed;
   the recovery acceptance scenarios above have not been implemented or executed.
+
+
+## Owner-approved simplification and implementation
+
+The owner accepted best-effort remote deletion and rejected durable connection
+retry jobs, gateway reconnect/alert controllers and complete outage catch-up.
+Only strict cleanup was an existing guarantee being removed; the latter three
+were alternatives already excluded from the draft. ADR-229 records the decision.
+Accepted Slack requests, conversations, bindings and reply obligations remain
+durable. Local credential-removal intent still survives restart under ADR-086.
+
+Implementation deletes cleanup-only refresh/sign-in/removal workflows and queued
+configuration ownership. Scope/challenge plans now live on the existing supervisor,
+independently of the retired transport. One process-local retry counter and deadline
+cover configured connection and refresh recovery. Native status exposes state,
+error and next retry; Slack projects it without another recovery controller.
+
+### Deliberate regression retirement
+
+The removed strict-cleanup cases covered: authenticated DELETE as a prerequisite;
+cleanup challenges driving new sign-in or scope consent; deferred removal through
+OAuth; configuration queued behind obsolete remote sessions; and repeated DELETE
+attempts after refreshed grants. Those expectations conflict with the new contract.
+The standalone repeated-DELETE test is subsumed by the single-attempt status matrix.
+The obsolete UI pending-removal OAuth poll test is replaced by a background-recovery
+polling test. Existing schema/epoch fencing, cancellation, OAuth nonce/issuer/scope
+checks, grant rotation and one-shot accounting remain required regressions.
+
+Replacement coverage includes the DELETE status matrix, removal without refreshing
+expired credentials, live OAuth recovery despite failed DELETE, cancellation of a
+scheduled retry on reconfiguration/removal, connection and token endpoint throttling,
+local credential-removal intent surviving manager reconstruction, and an uncertain
+one-shot operation whose connection recovers without replay. Startup refresh and
+persistence regressions now allow the specified exponential delay rather than
+assuming a constant five-second loop. Denied authorization retries preserve scope
+plans after the old transport is gone.
+
+
+### Implementation alignment and hardening pass
+
+- **Code bug:** Authorization retry plans were stored on retained transports.
+  Best-effort retirement exposed loss of the requested scope/challenge after a
+  denied flow. The existing supervisor now retains the plan independently.
+- **Code bug:** OAuth metadata failures were flattened into text. Typed discovery
+  and grant failures now retain temporary/permanent classification and Retry-After.
+  Invalid metadata stops automatic recovery without discarding a usable grant.
+- **Code bug:** Failed credential invalidation could leave an old connection owner
+  eligible to publish. Configuration changes now fence it before invalidation,
+  retain the old configuration on failure and expose the error for explicit retry.
+- **Code bug:** A reload-response timeout could stop a still-valid HTTP lifecycle.
+  The response deadline now leaves the owned background operation running; each
+  network operation retains its own bounded timeout.
+- **Spec bug:** Two obsolete removal guards still referred to deferred refresh.
+  They were removed; remote cleanup cannot defer removal into authorization.
+- **Intentional abstraction:** Allium represents recovery phases behaviorally.
+  Code retains the unfinished step through typed continuations and the retained
+  refresh response; no stored phase history or operator phase UI is introduced.
+
+### Local qualification
+
+- Slack database regressions: 27 passed, including accepted-source deduplication
+  across restart, exact shared-reply coverage, and single-attempt signal recovery.
+- UI regressions: 16 passed. TypeScript and focused ESLint checks passed.
+- Allium analysis and canonical requirement anchors passed. Direct spEARS artifact
+  shape validation passed; deployment-tooling tests were not repeated for runtime
+  changes. Formatting and whitespace checks passed.
+- Full MCP engine suite: 180 passed. Application Slack regressions: 54 passed.
+  Together with the database and UI regressions, 277 selected tests passed.
+  Clippy passed for all targets of the MCP and application crates with warnings
+  denied. Only pre-existing ts-rs macro attribute notices were emitted.
+- No production deployment, prototype database conversion, live Slack fault
+  injection, workflow modification or external message send was performed.

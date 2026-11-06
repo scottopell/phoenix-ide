@@ -361,20 +361,36 @@ pub fn oauth_http_client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("failed to build OAuth HTTP client: {e}"))
 }
 
-async fn fetch_json(client: &reqwest::Client, url: &str) -> Result<Value, String> {
+async fn fetch_json(client: &reqwest::Client, url: &str) -> Result<Value, OAuthRequestError> {
     let response = client
         .get(url)
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .await
-        .map_err(|e| format!("GET {url}: {e}"))?;
+        .map_err(|e| OAuthRequestError::request(&e))?;
     if !response.status().is_success() {
-        return Err(format!("GET {url}: HTTP {}", response.status()));
+        let status = response.status();
+        let detail = format!("metadata HTTP {status}");
+        return Err(
+            if matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504) {
+                OAuthRequestError::Retryable {
+                    detail,
+                    minimum: response
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(crate::http::parse_retry_after)
+                        .unwrap_or_default(),
+                }
+            } else {
+                OAuthRequestError::Permanent(detail)
+            },
+        );
     }
     response
         .json()
         .await
-        .map_err(|e| format!("GET {url}: invalid JSON: {e}"))
+        .map_err(|e| OAuthRequestError::Permanent(format!("metadata invalid JSON: {e}")))
 }
 
 fn origin_from_url(url: &str) -> Option<String> {
@@ -451,7 +467,7 @@ pub async fn fetch_protected_resource_metadata(
     client: &reqwest::Client,
     mcp_url: &str,
     challenge: &HashMap<String, String>,
-) -> Result<ProtectedResourceMetadata, String> {
+) -> Result<ProtectedResourceMetadata, OAuthRequestError> {
     let mut candidates = Vec::new();
     if let Some(from_challenge) = challenge.get("resource_metadata") {
         candidates.push(from_challenge.clone());
@@ -464,7 +480,9 @@ pub async fn fetch_protected_resource_metadata(
             Ok(doc) => {
                 let authorization_servers = string_list(doc.get("authorization_servers"));
                 if authorization_servers.is_empty() {
-                    errors.push(format!("{candidate}: no authorization_servers"));
+                    errors.push(OAuthRequestError::Permanent(format!(
+                        "{candidate}: no authorization_servers"
+                    )));
                     continue;
                 }
                 return Ok(ProtectedResourceMetadata {
@@ -472,6 +490,7 @@ pub async fn fetch_protected_resource_metadata(
                     scopes_supported: string_list(doc.get("scopes_supported")),
                 });
             }
+            Err(e @ OAuthRequestError::Retryable { .. }) => return Err(e),
             Err(e) => errors.push(e),
         }
     }
@@ -488,7 +507,9 @@ pub async fn fetch_protected_resource_metadata(
             match fetch_json(client, &candidate).await {
                 Ok(doc) => {
                     let Some(issuer) = auth_server_issuer_from_metadata(&doc) else {
-                        errors.push(format!("{candidate}: not authorization server metadata"));
+                        errors.push(OAuthRequestError::Permanent(format!(
+                            "{candidate}: not authorization server metadata"
+                        )));
                         continue;
                     };
                     tracing::warn!(
@@ -502,14 +523,15 @@ pub async fn fetch_protected_resource_metadata(
                         scopes_supported: Vec::new(),
                     });
                 }
+                Err(e @ OAuthRequestError::Retryable { .. }) => return Err(e),
                 Err(e) => errors.push(e),
             }
         }
     }
 
-    Err(format!(
-        "protected resource metadata not found (RFC 9728): {}",
-        errors.join("; ")
+    Err(OAuthRequestError::metadata_failure(
+        "protected resource metadata not found (RFC 9728)",
+        &errors,
     ))
 }
 
@@ -598,16 +620,19 @@ pub async fn fetch_auth_server_metadata(
     client: &reqwest::Client,
     issuer: &str,
     trust: IssuerTrust,
-) -> Result<AuthServerMetadata, String> {
+) -> Result<AuthServerMetadata, OAuthRequestError> {
     let candidates = as_metadata_candidates(issuer);
     if candidates.is_empty() {
-        return Err(format!("invalid authorization server URL '{issuer}'"));
+        return Err(OAuthRequestError::Permanent(format!(
+            "invalid authorization server URL '{issuer}'"
+        )));
     }
 
     let mut errors = Vec::new();
     for candidate in &candidates {
         let doc = match fetch_json(client, candidate).await {
             Ok(doc) => doc,
+            Err(e @ OAuthRequestError::Retryable { .. }) => return Err(e),
             Err(e) => {
                 errors.push(e);
                 continue;
@@ -626,7 +651,9 @@ pub async fn fetch_auth_server_metadata(
                 );
             }
             IssuerCheck::Rejected(reason) => {
-                errors.push(format!("{candidate}: {reason}"));
+                errors.push(OAuthRequestError::Permanent(format!(
+                    "{candidate}: {reason}"
+                )));
                 continue;
             }
         }
@@ -635,19 +662,19 @@ pub async fn fetch_auth_server_metadata(
             doc.get("authorization_endpoint").and_then(Value::as_str),
             doc.get("token_endpoint").and_then(Value::as_str),
         ) else {
-            errors.push(format!(
+            errors.push(OAuthRequestError::Permanent(format!(
                 "{candidate}: missing authorization_endpoint or token_endpoint"
-            ));
+            )));
             continue;
         };
 
         let pkce_methods = string_list(doc.get("code_challenge_methods_supported"));
         if !pkce_methods.iter().any(|m| m == "S256") {
-            return Err(format!(
+            return Err(OAuthRequestError::Permanent(format!(
                 "authorization server '{issuer}' does not advertise S256 in \
                  code_challenge_methods_supported; refusing to authorize without PKCE \
                  (OAuth 2.1)"
-            ));
+            )));
         }
 
         return Ok(AuthServerMetadata {
@@ -668,9 +695,9 @@ pub async fn fetch_auth_server_metadata(
                 .unwrap_or(false),
         });
     }
-    Err(format!(
-        "authorization server metadata not found for '{issuer}' (RFC 8414 / OIDC): {}",
-        errors.join("; ")
+    Err(OAuthRequestError::metadata_failure(
+        &format!("authorization server metadata not found for '{issuer}' (RFC 8414 / OIDC)"),
+        &errors,
     ))
 }
 
@@ -824,22 +851,75 @@ pub struct TokenResponse {
     pub scopes: Option<Vec<String>>,
 }
 
-/// Failure from a token-endpoint grant. The variant matters to the refresh
+/// Failure from OAuth discovery or a token-endpoint grant. The variant matters to the refresh
 /// path: a definitive rejection discards the stored token (REQ-MCP-012),
 /// while a transport failure is not evidence the token is stale.
 #[derive(Debug)]
-pub enum TokenGrantError {
+pub enum OAuthRequestError {
     /// The authorization server answered and rejected the grant.
     Rejected(String),
     /// The request never completed (connect/timeout) or the response was
     /// unreadable.
     Transport(String),
+    /// Invalid configuration/protocol/TLS; explicit action is required.
+    Permanent(String),
+    /// Temporary HTTP failure; preserve the server-directed delay.
+    Retryable {
+        detail: String,
+        minimum: std::time::Duration,
+    },
 }
 
-impl std::fmt::Display for TokenGrantError {
+impl std::fmt::Display for OAuthRequestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Rejected(detail) | Self::Transport(detail) => write!(f, "{detail}"),
+            Self::Rejected(detail)
+            | Self::Transport(detail)
+            | Self::Permanent(detail)
+            | Self::Retryable { detail, .. } => {
+                write!(f, "{detail}")
+            }
+        }
+    }
+}
+
+impl OAuthRequestError {
+    fn request(error: &reqwest::Error) -> Self {
+        match crate::http::HttpTransport::classify_request_error(error, "OAuth request") {
+            crate::TransportError::Protocol(detail) => Self::Permanent(detail),
+            other
+            @ (crate::TransportError::Disconnected(_) | crate::TransportError::Timeout(_)) => {
+                Self::Transport(other.to_string())
+            }
+            other @ (crate::TransportError::Unauthorized { .. }
+            | crate::TransportError::InsufficientScope { .. }
+            | crate::TransportError::SessionExpired
+            | crate::TransportError::RetryableHttp { .. }
+            | crate::TransportError::Quiescence(_)
+            | crate::TransportError::Rpc { .. }) => Self::Permanent(other.to_string()),
+        }
+    }
+
+    pub(crate) fn metadata_failure(message: &str, errors: &[Self]) -> Self {
+        let minimum = errors
+            .iter()
+            .filter_map(|error| match error {
+                Self::Retryable { minimum, .. } => Some(*minimum),
+                Self::Transport(_) => Some(std::time::Duration::ZERO),
+                Self::Rejected(_) | Self::Permanent(_) => None,
+            })
+            .max();
+        let detail = format!(
+            "{message}: {}",
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        match minimum {
+            Some(minimum) => Self::Retryable { detail, minimum },
+            None => Self::Permanent(detail),
         }
     }
 }
@@ -849,7 +929,7 @@ async fn token_grant(
     token_endpoint: &str,
     registration: &OAuthRegistrationRecord,
     params: Vec<(&str, &str)>,
-) -> Result<TokenResponse, TokenGrantError> {
+) -> Result<TokenResponse, OAuthRequestError> {
     let mut form: Vec<(&str, &str)> = params;
     let mut request = client.post(token_endpoint);
     match &registration.client_secret {
@@ -875,13 +955,26 @@ async fn token_grant(
         .form(&form)
         .send()
         .await
-        .map_err(|e| TokenGrantError::Transport(format!("token request failed: {e}")))?;
+        .map_err(|e| OAuthRequestError::request(&e))?;
     let status = response.status();
-    let doc: Value = response.json().await.map_err(|e| {
-        TokenGrantError::Transport(format!("token response unreadable (HTTP {status}): {e}"))
-    })?;
+    if matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504) {
+        let minimum = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(crate::http::parse_retry_after)
+            .unwrap_or_default();
+        return Err(OAuthRequestError::Retryable {
+            detail: format!("token endpoint temporarily unavailable (HTTP {status})"),
+            minimum,
+        });
+    }
+    let doc: Value = response
+        .json()
+        .await
+        .map_err(|e| OAuthRequestError::request(&e))?;
     if !status.is_success() {
-        return Err(TokenGrantError::Rejected(format!(
+        return Err(OAuthRequestError::Rejected(format!(
             "token endpoint rejected the grant (HTTP {status}): {}",
             doc.get("error_description")
                 .or_else(|| doc.get("error"))
@@ -893,7 +986,7 @@ async fn token_grant(
         .get("access_token")
         .and_then(Value::as_str)
         .ok_or_else(|| {
-            TokenGrantError::Rejected("token response missing access_token".to_string())
+            OAuthRequestError::Rejected("token response missing access_token".to_string())
         })?;
     // The token rides as `Authorization: Bearer …`; a non-Bearer grant (e.g.
     // DPoP) would be silently misused and surface as opaque 401/refresh
@@ -901,7 +994,7 @@ async fn token_grant(
     // noncompliant (RFC 6749 §5.1) but always means Bearer in practice.
     match doc.get("token_type").and_then(Value::as_str) {
         Some(token_type) if !token_type.eq_ignore_ascii_case("bearer") => {
-            return Err(TokenGrantError::Rejected(format!(
+            return Err(OAuthRequestError::Rejected(format!(
                 "unsupported token_type '{token_type}'; only Bearer tokens can be attached"
             )));
         }
@@ -930,7 +1023,7 @@ async fn token_grant(
 /// indicator) for tokens (REQ-MCP-011).
 ///
 /// # Errors
-/// Returns a [`TokenGrantError`] when the grant fails.
+/// Returns a [`OAuthRequestError`] when the grant fails.
 pub async fn exchange_code(
     client: &reqwest::Client,
     token_endpoint: &str,
@@ -939,7 +1032,7 @@ pub async fn exchange_code(
     code: &str,
     pkce_verifier: &str,
     resource: &str,
-) -> Result<TokenResponse, TokenGrantError> {
+) -> Result<TokenResponse, OAuthRequestError> {
     token_grant(
         client,
         token_endpoint,
@@ -959,14 +1052,14 @@ pub async fn exchange_code(
 /// RFC 8707 resource indicator keeping the replacement audience-bound.
 ///
 /// # Errors
-/// Returns a [`TokenGrantError`] when the grant fails.
+/// Returns a [`OAuthRequestError`] when the grant fails.
 pub async fn refresh_grant(
     client: &reqwest::Client,
     token_endpoint: &str,
     registration: &OAuthRegistrationRecord,
     refresh_token: &str,
     resource: &str,
-) -> Result<TokenResponse, TokenGrantError> {
+) -> Result<TokenResponse, OAuthRequestError> {
     token_grant(
         client,
         token_endpoint,

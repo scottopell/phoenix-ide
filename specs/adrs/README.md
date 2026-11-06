@@ -225,7 +225,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [227](227_coordinator-inline-agents-reuse-targeted-bash.md) | Coordinator inline agents reuse targeted Bash | Accepted | REQ-GR-007, REQ-SA-002, REQ-SA-007, REQ-BASH-012, REQ-BASH-013 |
 | [229](229_ember-conversation-list-entry.md) | Name and pin Ember in conversation navigation | Accepted | REQ-GR-023, REQ-IOS-022 |
 | [228](228_coordinator-inline-child-bash-controller-retirement.md) | Coordinator inline children retire their Bash controllers before parent acceptance | Accepted | REQ-GR-007, REQ-BASH-017, REQ-BASH-018, REQ-SA-003, REQ-SA-004, REQ-SA-005 |
-| [229](229_http-connection-recovery-retries-under-existing-ownership.md) | HTTP connection recovery retries under existing ownership | Proposed | REQ-MCP-003/005/007/012/013/018; REQ-SG-017 |
+| [229](229_http-connection-recovery-retries-under-existing-ownership.md) | HTTP connection recovery retries under existing ownership | Accepted | REQ-MCP-003/005/007/012/013/018; REQ-SG-017 |
 
 ## For agents: which decisions bind your task
 
@@ -248,7 +248,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Changing owner-password or federation peer-credential domains | 094, then 083 and 034 |
 | Changing Codex route admission or private continuation account identity | 085, preserving 062's advisory discovery policy |
 | Changing MCP credential removal or restart recovery | 086, within 034's compatibility scope |
-| Changing automatic HTTP connection recovery or Slack connection-health reporting | 229 (proposed), within 034 and 086's recovery scope |
+| Changing automatic HTTP connection recovery or Slack connection-health reporting | 229, within 034 and 086's recovery scope |
 | Specifying Close failure, startup observation, History cleanup attention, mandatory Global failure delivery, or explicit safe retry | 088 supersedes the Close recovery/finalization consequences of 026/040/041/042/080; retain their identity and ownership safeguards |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |

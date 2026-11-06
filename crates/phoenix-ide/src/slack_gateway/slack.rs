@@ -1,7 +1,7 @@
 //! The only component that knows the connected Slack tool names and text format.
 use super::Config;
 use phoenix_db::{SlackRequestKind, SlackSource};
-use phoenix_tools::mcp::{McpClientManager, McpConnectionBinding, McpOneShotError};
+use phoenix_tools::mcp::{McpClientManager, McpConnState, McpConnectionBinding, McpOneShotError};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -122,11 +122,26 @@ impl Slack {
         self.window_calls.load(Ordering::Relaxed) < CALL_LIMIT
             && self.retry_after.load(std::sync::atomic::Ordering::Relaxed) == 0
     }
-    pub fn failure_status(&self, error: &str) -> &'static str {
+    pub async fn failure_status(&self, error: &str) -> &'static str {
         if self.retry_after.load(Ordering::Relaxed) > 0 || error == BUDGET_EXHAUSTED {
             "backing_off"
         } else {
-            "failed"
+            match self
+                .manager
+                .status()
+                .await
+                .into_iter()
+                .find(|server| server.name == self.server)
+            {
+                Some(server) if !server.enabled => "connection_disabled",
+                Some(server) => match server.state {
+                    McpConnState::Connecting => "connecting",
+                    McpConnState::Recovering => "recovering",
+                    McpConnState::Unauthorized => "awaiting_authentication",
+                    McpConnState::Ready | McpConnState::Failed => "failed",
+                },
+                None => "failed",
+            }
         }
     }
     pub fn can_discover(&self) -> bool {
@@ -883,12 +898,12 @@ mod tests {
             .call("slack_read_thread", json!({}))
             .await
             .unwrap_err();
-        assert_eq!(slack.failure_status(&failure), "failed");
+        assert_eq!(slack.failure_status(&failure).await, "failed");
         let refused = slack
             .call("slack_read_thread", json!({}))
             .await
             .unwrap_err();
-        assert_eq!(slack.failure_status(&refused), "backing_off");
+        assert_eq!(slack.failure_status(&refused).await, "backing_off");
         assert_eq!(slack.calls.load(Ordering::Relaxed), 1);
     }
     #[tokio::test]

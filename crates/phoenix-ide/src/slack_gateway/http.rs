@@ -3,7 +3,7 @@ use super::Config;
 use crate::api::{handlers::AppError, AppState};
 use axum::{extract::State, Json};
 pub(crate) async fn get(State(s): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
-    super::status(&s.db)
+    super::status(&s.db, &s.mcp_manager)
         .await
         .map(Json)
         .map_err(AppError::Internal)
@@ -24,7 +24,7 @@ pub(crate) async fn put(
             AppError::Internal(e.to_string())
         }
     })?;
-    super::status(&s.db)
+    super::status(&s.db, &s.mcp_manager)
         .await
         .map(Json)
         .map_err(AppError::Internal)

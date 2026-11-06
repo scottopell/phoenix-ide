@@ -96,3 +96,18 @@ it('keeps best-effort status separate from native work without implying notifica
   expect(screen.getByText('Submission receipt')).toBeTruthy();
   expect(screen.queryByText('Failed')).toBeNull();
 });
+
+
+it.each([
+  [null, 'Connection unavailable'],
+  [{ state: 'recovering', enabled: true, tools: [], last_error: 'HTTP 503', next_retry_at: 2000000000 }, 'recovering'],
+  [{ state: 'unauthorized', enabled: true, tools: [] }, 'Sign-in required'],
+  [{ state: 'ready', enabled: true, tools: [] }, 'Required tools unavailable'],
+])('does not report old healthy scans as a healthy current connection', async (connection, label) => {
+  const config = { enabled: true, mcp_server: 'slack', owner: 'UOWNER', workspace: 'example.slack.com', timezone: 'UTC', phoenix_url: 'https://phoenix.example', notification_command: [] };
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ config, connection, stale_scan_warning: true, scan: { baseline_complete: true, status: 'healthy' }, requests: [], returns: [] }) }));
+  render(<SlackGatewaySettings standalone />);
+  await screen.findByText(new RegExp('Slack connection: ' + label));
+  expect(screen.queryByText('healthy')).toBeNull();
+  expect(screen.getByText(/Older triggers may have been missed/)).toBeTruthy();
+});

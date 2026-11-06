@@ -1,6 +1,6 @@
 # ADR-229: HTTP connection recovery retries under existing ownership
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-11-06
 - **Affects:** REQ-MCP-003/005/007/012/013/018; REQ-SG-017
 
@@ -12,50 +12,56 @@ the credential expires before an explicit reload, deletion itself can require
 OAuth recovery. Retaining cleanup ownership prevents overlapping replacement
 sessions, but ownership without another scheduled attempt cannot restore service.
 
-The MCP contract permits automatic transient refresh retries, while ordinary
-cleanup failures can stop for explicit retry. Background Slack discovery depends
-on the same connection and cannot repair that distinction by polling for tools.
+Background Slack discovery depends on the same connection and cannot repair
+it by polling for tools. Requiring successful remote DELETE before replacement
+also couples availability to cleanup-only OAuth flows, retained transports and
+queued configuration. The owner approved removing that guarantee while retaining
+durability for accepted work and local credential-removal intent.
 
 ## Options considered
 
-1. Keep explicit reload/restart as recovery. Smallest implementation, but an
-   unattended integration can remain unavailable after the network recovers.
-2. Have the Slack gateway reload MCP or restart Phoenix after failed scans.
-   Locally convenient, but duplicates lifecycle ownership, affects other MCP
-   users and can bypass cleanup, credential and uncertain-operation boundaries.
-3. Extend configured HTTP lifecycle recovery under the existing per-server
-   owner. Retry typed transient failures, route cleanup authorization into OAuth,
-   and expose current recovery through native status. This requires correct
-   fencing and pacing, but keeps one owner of sessions and credentials.
-4. Add durable recovery jobs and remote-session reconstruction. This would add
-   storage, migration, timer recovery and remote cleanup guarantees beyond the
-   actual need to recover an available configured service in one running process.
+1. Keep manual reload/restart as recovery. Smallest change, but unattended work
+   can remain unavailable after the network recovers.
+2. Add Slack-owned reconnect and alert loops. This duplicates shared lifecycle
+   ownership and affects credential and uncertain-operation boundaries.
+3. Retry configured HTTP lifecycle operations in the existing supervisor, with
+   best-effort remote retirement. Keep timers process-local and expose current
+   status. This restores service without making remote cleanup an auth workflow.
+4. Add durable recovery jobs, remote-session reconstruction and complete outage
+   capture. Storage, timer recovery and cross-version semantics exceed the need.
 
 ## Decision
 
-Propose option 3. Use the existing MCP supervisor, recovery epoch, credential
-mutation fence and retained transport. A process-local retry episode continues
-through transient connection, cleanup, handshake, refresh and recovered-token
-persistence failures. A cleanup 401 can admit OAuth recovery even when transport
-failure started the episode. Never infer policy from formatted error strings.
+Use option 3. Stop local transport activity before replacement. Attempt remote
+DELETE once, for at most five seconds, using available credentials. Treat 404 as
+already absent and 405 as unsupported; log other failures, retire the local session
+and continue. Do not refresh a grant, request browser authorization or retry solely
+to delete an obsolete session. A remote session may remain until server expiration.
+Local quiescence failure remains a hard replacement boundary.
 
-Five-second initial backoff grows to sixty seconds, with bounded jitter and
-server-directed deadlines as a lower bound. Retry eligibility has no attempt-count
-cutoff, but every network operation retains a timeout and ownership cancellation.
-Permanent failures, local quiescence failures, denied authorization and failed
-authorization setup remain explicit-action boundaries.
-Timing values are internal policy, not a new set of operator configuration knobs.
+The existing per-server supervisor, epoch and credential mutation fence own
+configured HTTP recovery. Typed transient transport/handshake, token-refresh and
+recovered-token persistence failures use process-local backoff from five to sixty
+seconds, with nonnegative jitter inside the cap and valid Retry-After as a lower
+bound. Unchanged reloads join recovery. Successful readiness resets backoff.
+Permanent failures and denied/unstartable authorization require explicit action.
+A rejected freshly recovered grant requests authorization rather than looping
+through refresh. Retain scope/challenge plans on the server owner independently
+of retired transports. Preserve a rotated refresh response across local persistence
+retry, without exchanging its predecessor again.
 
-The scope is configured HTTP connection establishment/recovery, including old
-cleanup needed for queued configuration. Automatic removal cleanup and stdio
-respawn loops are not added. Existing transient-refresh removal behavior remains.
-Retry schedules and HTTP session identities remain volatile. Existing configured
-startup and credential removal recovery retain their own contracts.
+Removal cancels obsolete authorization. Existing durable local credential-removal
+intent remains governed by ADR-086. Credentials, accepted Slack requests, thread
+bindings, conversations and reply obligations retain their existing persistence.
+Connection recovery never authorizes replay of an uncertain dispatched operation.
+A process restart reconstructs configured connections from stored credentials;
+it does not restore remote sessions or retry timers.
 
-Native MCP status exposes the active phase, most recent failure and next retry.
-Slack derives its connection health from that status and keeps the last completed
-scan distinct. The gateway adds no reconnect controller, health history table,
-alert outbox or changes to single-attempt notifications and acknowledgments.
+Native status exposes current connection state, last failure and next retry.
+Slack derives connection health from it and reports the last completed scan and
+an old-window warning. It adds no reconnect controller, phase UI, health-history
+store or alert outbox. The four-calendar-date discovery window and single-attempt
+notifications/acknowledgments remain unchanged.
 
 ## Consequences
 
@@ -63,12 +69,11 @@ alert outbox or changes to single-attempt notifications and acknowledgments.
   network loss and token expiry without a caller, reload or process restart.
 - **Positive:** Connection recovery never authorizes tool replay or bypasses
   gateway request identity, authenticated-account verification or call budgets.
-- **Negative:** Transient versus permanent failure classification must survive
-  session cleanup. Recovery timers and completions need fencing against queued
-  configuration, removal and shutdown. A falsely transient permanent outage can
-  continue producing bounded background traffic until configuration is corrected.
-- **Negative:** Native status needs new recovery diagnostics, and tests that
-  expect transient cleanup to remain terminal need deliberate revision.
+- **Negative:** Failed remote deletion can leave a remote session until the
+  server expires it. No guarantee is made about that expiration time.
+- **Negative:** Typed retry classification, ownership fencing and pacing need
+  targeted regression coverage. A falsely transient failure can keep producing
+  bounded traffic until the configuration is corrected.
 - **Neutral:** No new database tables, retry history, cross-process session
   reconstruction, process watchdog or prototype conversion is required. Deployment
   and cross-version qualification remain separate from this recovery decision.
@@ -80,5 +85,5 @@ alert outbox or changes to single-attempt notifications and acknowledgments.
 - [Slack discovery](../slack-gateway/discovery.allium)
 - [Compatibility policy](034_compatibility-guarantees-are-explicit-and-data-aware.md)
 - [Credential removal scope](086_mcp-credential-removal-has-durable-intent.md)
-- `McpClientManager::recover_actor`, `McpClientManager::retry_oauth_cleanup_owned`,
+- `McpClientManager::recover_actor`, `McpClientManager::spawn_connect_retry`,
   `Supervisor::stop_server`, `HttpTransport::shutdown`

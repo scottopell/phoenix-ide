@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useId } from 'react';
+import type { McpServerStatus } from '../api';
 import '../pages/SlackGatewayPage.css';
 
 interface Config {
@@ -7,6 +8,8 @@ interface Config {
 }
 interface GatewayStatus {
   config: Config | null;
+  connection?: McpServerStatus | null;
+  stale_scan_warning?: boolean;
   scan?: { status: string; last_scan_at_unix_micros: number | null; last_error: string | null; baseline_complete: boolean; calls_last_pass: number; pages_last_pass: number; retry_at_us: number | null } | null;
   requests: { request_id: string; product_id: string | null; conversation_available: boolean; admitted: boolean; accepted_at_us: number; eyes_confirmed: boolean; eyes_failure: string | null; failure: string | null; source: { source_url: string; kind: string; trigger_kind: 'prefix' | 'reaction'; observed_at_unix_micros: number; message_ts: string } }[];
   returns: { return_id: string; state: string; destination: string; request_ids: string[]; failure: string | null; notification_receipt: string | null }[];
@@ -50,7 +53,10 @@ export function SlackGatewaySettings({ standalone = false }: { standalone?: bool
     finally { setBusy(false); }
   }
   const fields = [ ['mcp_server', 'Slack MCP server', 'Connection name, such as slack'], ['owner', 'Your Slack user ID', 'The owner whose gestures Phoenix watches'], ['workspace', 'Slack workspace host', 'Permalink host only, without https://'], ['timezone', 'Timezone', 'Used for the four-calendar-date discovery window'], ['phoenix_url', 'Phoenix URL', 'Used in links back to this Phoenix instance'] ] as const;
-  const discoveryState = !status?.config ? 'Not configured' : !status.config.enabled ? 'Paused' : !status.scan?.baseline_complete ? 'Initializing' : (status.scan.status ?? 'Initializing').replaceAll('_', ' ');
+  const connection = status?.connection;
+  const missingTools = connection?.state === 'ready' && ['slack_read_user_profile', 'slack_search_public_and_private', 'slack_read_thread', 'slack_get_reactions', 'slack_add_reaction', 'slack_send_message'].some(name => connection.tools.filter(tool => tool === name || tool.endsWith('_' + name)).length !== 1);
+  const connectionProblem = status?.config && status.connection === null ? 'Connection unavailable' : connection && !connection.enabled ? 'Connection disabled' : connection?.state === 'unauthorized' ? 'Sign-in required' : connection && connection.state !== 'ready' ? connection.state.replaceAll('_', ' ') : missingTools ? 'Required tools unavailable' : null;
+  const discoveryState = !status?.config ? 'Not configured' : !status.config.enabled ? 'Paused' : connectionProblem ?? (!status.scan?.baseline_complete ? 'Initializing' : (status.scan.status ?? 'Initializing').replaceAll('_', ' '));
   const command = config.notification_command ?? [];
   const setCommandPart = (index: number, value: string) => {
     const next = [...command]; next[index] = value;
@@ -90,6 +96,8 @@ export function SlackGatewaySettings({ standalone = false }: { standalone?: bool
       {error && <p className="sg-feedback sg-feedback--error" role="alert">{error}</p>}
       {status && <section className="sg-card" aria-labelledby="sg-activity-title">
         <div className="sg-card-heading"><div><h2 id="sg-activity-title">Activity</h2><p>Accepted work and delivery evidence, even while discovery is paused.</p></div></div>
+        {connectionProblem && <p className="sg-feedback" role="status">Slack connection: {connectionProblem}. {connection?.last_error}{connection?.next_retry_at != null && <> Next retry: {new Date(connection.next_retry_at * 1000).toLocaleTimeString()}.</>}</p>}
+        {status.stale_scan_warning && <p className="sg-feedback" role="status">The last completed scan predates the current four-calendar-date window. Older triggers may have been missed.</p>}
         {status.scan?.last_error && <p className="sg-feedback sg-feedback--error" role="alert">{status.scan.last_error}</p>}
         <dl className="sg-stats"><div><dt>Last complete scan</dt><dd>{status.scan?.last_scan_at_unix_micros ? new Date(status.scan.last_scan_at_unix_micros / 1000).toLocaleString() : 'No complete scan yet'}</dd></div><div><dt>Calls in last pass</dt><dd>{status.scan?.calls_last_pass ?? 0}<small> MCP tool calls</small></dd></div><div><dt>Pages in last pass</dt><dd>{status.scan?.pages_last_pass ?? 0}<small> search pages</small></dd></div></dl>
         {status.scan?.retry_at_us && <p className="sg-hint">Retry after {new Date(status.scan.retry_at_us / 1000).toLocaleString()}.</p>}

@@ -137,7 +137,21 @@ WHEN an HTTP server returns an `Mcp-Session-Id` header on the `initialize`
 response
 THE SYSTEM SHALL include that session id on the `Mcp-Session-Id` header of every
 subsequent request to that server
-AND issue an HTTP `DELETE` to end the session on shutdown.
+AND stop local transport activity before replacement or shutdown.
+
+WHEN retiring a known remote HTTP session, THE SYSTEM SHALL attempt DELETE at
+most once with a timeout no greater than five seconds, using already available
+credentials. Success and 404 mean the session is absent; 405 means remote
+termination is unsupported. Other responses, network failure and timeout SHALL
+be logged as unconfirmed remote cleanup, without blocking reconnection,
+reconfiguration, local credential removal or process shutdown. An expired or
+unavailable credential MAY skip that attempt. THE SYSTEM SHALL NOT refresh a
+grant, request authorization or retain a retry job solely for remote deletion.
+
+THE SYSTEM SHALL retire the local session identity after that attempt or skip.
+Remote state MAY remain until server-managed cleanup; its lifetime and successful
+remote cancellation SHALL NOT be guaranteed. Already dispatched operations retain
+their ordinary confirmed/failed/uncertain outcome and replay policy.
 
 WHEN a non-DELETE request to a session-bearing server returns HTTP 404
 THE SYSTEM SHALL treat the session as expired and re-initialize before any retry
@@ -178,12 +192,11 @@ permanently failed, distinct from the stdio respawn path which restarts a
 process.
 
 WHEN a configured HTTP connection cannot finish establishment or recovery because
-of a transient network, session-cleanup, handshake, token-refresh or recovered-token
+of a transient network, handshake, token-refresh or recovered-token
 persistence failure, THE SYSTEM SHALL retain one recovery owner and retry without
 requiring a tool invocation, status-page visit, manual reload or Phoenix restart.
-This includes initial connection and old-resource cleanup required to apply a
-queued configuration. A recovery owner SHALL NOT make a replacement callable
-before retained transport activity and session cleanup are resolved.
+This includes initial connection. A recovery owner SHALL NOT make a replacement callable
+before old local transport activity is stopped. Remote DELETE is best effort.
 
 Automatic retries SHALL cover connection loss, network timeouts, HTTP 408,
 HTTP 429, and HTTP 500/502/503/504 during those lifecycle operations. Invalid
@@ -206,7 +219,7 @@ connection SHALL end recovery and reset its backoff.
 
 A retry SHALL resume the first unfinished lifecycle step. If replacement
 initialization created a session before the handshake failed, that session SHALL
-also be cleaned up before another replacement is initialized. While awaiting an
+also receive best-effort retirement before another replacement is initialized. While awaiting an
 owned browser authorization, THE SYSTEM SHALL wait for that flow rather than
 schedule connection attempts. Denial, expiry or failed authorization setup SHALL
 retain an actionable failure until explicit retry.
@@ -219,10 +232,9 @@ credentials, publishing authorization or exposing tools. Configuration changes,
 removal and shutdown SHALL supersede or transfer ownership through their existing
 lifecycle contracts; obsolete retries SHALL NOT reconnect removed configuration.
 
-This automatic cleanup/handshake retry guarantee applies to establishing or
+This automatic connection/handshake retry guarantee applies to establishing or
 restoring configured HTTP connections. It SHALL NOT add automatic removal retries,
-stdio restart loops, process restarts or durable retry schedules. Transient
-credential-refresh retries during removal remain governed by REQ-MCP-012. A Phoenix
+stdio restart loops, process restarts or durable retry schedules. Local credential-removal durability remains governed by REQ-MCP-012. A Phoenix
 restart SHALL reconstruct connections from configuration and stored credentials;
 it SHALL NOT restore volatile HTTP sessions or retry timers.
 
@@ -402,90 +414,39 @@ AND, when a tool call returns HTTP 403 `insufficient_scope` with a
 previously granted scopes and the newly challenged scope, then retry, rather
 than surfacing a permanent tool failure.
 
-OAuth recovery SHALL retain the old session as non-callable cleanup ownership
-without requiring authenticated session deletion before token refresh or
-re-authorization. THE SYSTEM SHALL use the recovered bearer to finish that
-cleanup before making a replacement connection callable. An unresolved cleanup
-failure SHALL retain retry ownership and block replacement.
-Configuration supersession SHALL fence token persistence, token invalidation,
-and authorization-flow publication, including background refresh retries.
-A recovered bearer SHALL reach the retained session before configuration
-supersession can discard its stored token or retry cleanup with old credentials.
-Authorization retained solely to finish removal SHALL complete cleanup and
-forget the removed server and token without republishing its tools.
-A denied authorization SHALL clear its pending URL and settle as
-failed while retaining the session cleanup owner and requested scopes. An
-explicit unchanged-configuration reload SHALL request authorization again
-with those scopes and the discovery challenge before attempting authenticated
-session deletion, including when denied removal cleanup failed and the server
-is re-added.
-Stream-quiescence failure SHALL settle as failed with teardown ownership
-retained, including during handshake shutdown. It SHALL prevent OAuth refresh
-or replacement publication from masking that failure; session deletion SHALL
-remain available to an explicit cleanup retry.
-An OAuth failure from the same observed connection epoch SHALL be able to
-take over transport recovery whose session cleanup failed, obtaining a bearer
-before retrying that cleanup. An expired resource-matched credential or a session
-DELETE 401 SHALL admit that OAuth recovery without requiring a second failing
-tool call, even when transport recovery originally retained the session. Static
-credentials SHALL NOT enter OAuth recovery. Reauthorization setup failure SHALL
-settle as failed and require explicit retry; automatic lifecycle retries are
-limited by REQ-MCP-007 and SHALL retain the existing grant until its replacement
-or definitive rejection is established.
-Removal requested between transient refresh attempts SHALL retain the grant
-and recovery epoch until authenticated cleanup finishes, then delete the token
-and forget the server without reconnecting. Re-adding the same configuration
-SHALL restore reconnect intent. A rejected grant during deferred removal SHALL
-transfer cleanup-only intent to the new authorization flow.
-Removal intent SHALL be persisted before admitting credential cleanup. A token
-deletion failure SHALL retain a visible, non-callable cleanup owner and SHALL
-not report completed removal. Startup and reload SHALL retry persisted credential
-removals whose server name remains absent from configuration; re-adding the name
-SHALL cancel that intent without deleting the grant. Token deletion and durable
-removal completion SHALL commit atomically. This restart recovery covers stored
-credentials and removal intent; it does not recover volatile HTTP session identifiers.
-A changed configuration requested during owned OAuth cleanup SHALL queue the
-new configuration while retaining the old resource's grant and cleanup plan.
-THE SYSTEM SHALL finish authenticated cleanup before invalidating that grant
-and applying the queued configuration. A tool invocation SHALL remain bound to
-its original configuration; applying a different configuration SHALL supersede
-the invocation rather than replay its tool and arguments against the new server.
-Pending authorization SHALL be replaced
-with a fresh nonce while preserving the cleanup discovery challenge and scopes.
-A replacement connection that requires authorization SHALL expose its owned
-pending authorization as unauthorized, including after successful token refresh.
-A handshake's authorization failure SHALL retain its challenge and OAuth cleanup
-ownership when session teardown also fails. A restored token SHALL still take
-the silent refresh path before reauthorization; a handshake rejected after that
-refresh SHALL request owned reauthorization without repeating the grant, using
-that handshake's discovery challenge. A session DELETE authorization rejection
-SHALL admit OAuth cleanup recovery even when the handshake's primary failure
-is not an authorization error. Challenges from both failures SHALL contribute
-required scopes, with the latest supplied discovery metadata retained when later challenges
-omit it. Removing a ready OAuth server SHALL reserve exclusive OAuth cleanup ownership
-before discarding its grant. Expired tokens SHALL refresh before session cleanup;
-a cleanup authorization rejection SHALL retain its challenge and support refresh
-or owned reauthorization. A DELETE `403 insufficient_scope` challenge SHALL
-retain its discovery metadata and required scopes and request owned
-reauthorization instead of refreshing the same insufficient grant.
-Failed removal retries SHALL retain that ownership.
-Recovered removal grants SHALL remain persisted until cleanup succeeds. A failed
-removal callback cleanup SHALL retain its complete authorization retry plan so
-expired recovered credentials cannot prevent explicit reauthorization.
-Successful refresh continuations SHALL preserve the complete authorization plan,
-including previously required scopes when the returned grant narrows, for
-replacement connection recovery while the configuration remains unchanged.
-Transient refresh or token persistence failures after successful handshake
-teardown SHALL retain recovery ownership and retry without manual reload.
-After successful refresh, a transient session DELETE or replacement-handshake
-failure SHALL retain the recovered credential and resume the unfinished lifecycle
-step. It SHALL NOT exchange a rotating refresh token again merely because a
-later network step failed. A subsequent credential expiry or new authorization
-rejection MAY require OAuth recovery. Rejection of a freshly recovered grant for
-the same authorization challenge SHALL require owned authorization rather than
-an unbounded refresh loop. DELETE 404 SHALL finish cleanup as an already-absent
-session. DELETE 403 without an insufficient-scope challenge SHALL remain a visible
-authorization failure rather than be retried as a network outage.
+OAuth recovery SHALL stop the old transport's local activity before replacing
+it. Remote session deletion SHALL follow REQ-MCP-005's best-effort contract;
+DELETE failure SHALL NOT retain a cleanup workflow, block replacement, refresh a
+grant or request additional authorization solely for deletion.
+
+Configuration supersession SHALL fence token persistence, token invalidation and
+authorization-flow publication, including background refresh retries. A changed
+resource or client identity SHALL invalidate incompatible credentials before the
+replacement connects. Late completions SHALL NOT restore a removed grant or
+publish tools for superseded configuration. Invocation schema and original
+configuration binding SHALL remain intact through ordinary replay-eligible recovery.
+
+A fresh grant rejected during replacement handshake SHALL request owned browser
+authorization with its discovery challenge and complete required scope union
+rather than repeatedly refresh. A denied, expired or unstartable browser flow
+SHALL clear its pending URL, retain its cause and permit explicit retry. Failure
+to stop local transport activity SHALL remain visible and prevent replacement;
+best-effort remote cleanup SHALL NOT mask that local failure.
+
+Removal intent SHALL be persisted before deleting locally stored credentials.
+Credential deletion and intent completion SHALL commit atomically. Failed local
+deletion SHALL remain visible and retryable through startup/reload for names still
+absent from configuration; re-adding a name SHALL cancel removal intent before
+reconnecting. Removal SHALL cancel obsolete connection/authorization work and SHALL
+NOT refresh or request a grant solely to terminate a remote session. Existing
+registrations shared by other resources SHALL remain intact. This durability
+covers local credential-removal intent, not remote sessions or reconnect timers.
+
+After successful refresh, transient credential persistence or replacement-handshake
+failure SHALL resume the unfinished step without repeating a rotating-grant
+exchange solely because a later step failed. A subsequent expiry or a new
+credential rejection MAY require normal OAuth recovery. Permanent configuration,
+certificate and protocol failures SHALL require explicit correction.
 
 **Rationale:** The whole value of native OAuth is silent reconnect. Tokens
 survive restarts; the stored token must be loaded and attached to the very
@@ -508,12 +469,12 @@ through repeated re-authorization.
 ### REQ-MCP-013: Authorization Status Surfaced to the UI
 
 THE SYSTEM SHALL expose, per server, whether it is connected, awaiting
-authorization (with the authorization URL), removing while cleanup is pending,
+authorization (with the authorization URL),
 or failed (with the error), via
 `GET /api/mcp/status`.
 
 While automatic recovery is active, status SHALL identify connection recovery,
-its current lifecycle phase, most recent failure and next scheduled retry time
+its most recent failure and next scheduled retry time
 when waiting. A pending authorization URL SHALL appear only for an active owned
 authorization flow. A transient connection failure SHALL NOT be presented as a
 request to sign in. Successful recovery SHALL clear its failure and retry status.
@@ -551,12 +512,11 @@ WHEN MCP config is reloaded
 THE SYSTEM SHALL reconcile the running set against the new config: connect added
 servers, disconnect removed servers, restart servers whose config changed, and
 leave unchanged servers untouched
-AND report the per-server outcome (added / removed / pending removal / restarted /
-unchanged / failed). Deferred cleanup SHALL report pending removal until the
-server is forgotten; the UI SHALL keep awaiting its cleanup or authorization
-outcome within the reload polling window, including while another server is ready.
-Applying a queued configuration SHALL consume its queued target so later
-recovery on that configuration remains eligible for replay.
+AND report the per-server outcome (added / removed / restarted / unchanged / failed).
+Local credential-removal failures SHALL remain visible and retryable without
+starting remote cleanup authorization. Changed configurations SHALL supersede
+obsolete retries; unchanged configurations in automatic recovery SHALL retain
+their existing owner and retry deadline.
 
 **Rationale:** Reload must not tear down healthy connections. Reconciliation
 applies the minimum change and reports what happened so the operator sees the
