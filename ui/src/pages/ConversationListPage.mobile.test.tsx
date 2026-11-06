@@ -115,7 +115,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     vi.mocked(api.listProductConversations).mockReturnValue(new Promise(() => {}));
     render(<MemoryRouter initialEntries={['/']}><ConversationListPage /></MemoryRouter>);
 
-    const ember = await screen.findByRole('button', { name: 'Open Ember, Global coordinator' });
+    const ember = await screen.findByRole('button', { name: 'Open Ember' });
     const pinnedHeader = ember.closest('.conversation-list-pinned-header');
     expect(pinnedHeader).toBeInTheDocument();
     expect(pinnedHeader?.querySelector('.conversation-list-header')).toBeInTheDocument();

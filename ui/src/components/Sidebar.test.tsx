@@ -735,7 +735,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => {
-      expect(getAllByLabelText('Open Ember, Global coordinator').length).toBeGreaterThan(0);
+      expect(getAllByLabelText('Open Ember').length).toBeGreaterThan(0);
     });
     expect(queryByLabelText('Global Recall')).toBeNull();
     expect(document.querySelector('.ember-entry.active')).toBeInTheDocument();

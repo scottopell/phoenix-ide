@@ -99,7 +99,8 @@ describe('ConversationList — global navigation', () => {
 
     const pinnedHeader = container.querySelector('.conversation-list-pinned-header')!;
     const toolbar = pinnedHeader.querySelector('.conversation-list-header')!;
-    const ember = getByRole('button', { name: 'Open Ember, Global coordinator' });
+    const ember = getByRole('button', { name: 'Open Ember' });
+    expect(ember).toHaveAccessibleDescription('Global coordinator');
     expect(pinnedHeader.firstElementChild).toBe(toolbar);
     expect(toolbar.contains(ember)).toBe(false);
     expect(toolbar.nextElementSibling).toBe(ember);
@@ -120,9 +121,9 @@ describe('ConversationList — global navigation', () => {
       </MemoryRouter>,
     );
 
-    fireEvent.click(getByRole('button', { name: 'Open Ember, Global coordinator' }));
+    fireEvent.click(getByRole('button', { name: 'Open Ember' }));
     expect(getByRole('heading', { name: 'Ember destination' })).toBeInTheDocument();
-    expect(queryByRole('button', { name: 'Open Ember, Global coordinator' })).not.toBeInTheDocument();
+    expect(queryByRole('button', { name: 'Open Ember' })).not.toBeInTheDocument();
   });
 });
 

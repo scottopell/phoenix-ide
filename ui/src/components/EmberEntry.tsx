@@ -15,7 +15,8 @@ export function EmberEntry({
       className={`ember-entry${active ? ' active' : ''}${compact ? ' compact' : ''}`}
       onClick={onClick}
       title={compact ? 'Open Ember — Global coordinator' : undefined}
-      aria-label="Open Ember, Global coordinator"
+      aria-label="Open Ember"
+      aria-description="Global coordinator"
       aria-current={active ? 'page' : undefined}
     >
       <span className="ember-entry-mark" aria-hidden="true">✦</span>
