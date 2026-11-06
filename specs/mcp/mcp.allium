@@ -1232,6 +1232,8 @@ invariant OneAutomaticHttpRecoveryOwner {
 --   The key names the live connection incarnation/configuration and recovery
 --   epoch. Local retirement precedes replacement; removed or superseded
 --   ownership cannot satisfy this predicate.
+--   Retirement drains local POST/notification exchange futures and rejects new
+--   ones; it does not confirm remote cancellation or expand replay permission.
 -- automatic_http_retry_eligible(srv, error): Bool
 --   True only for a current configured HTTP lifecycle's typed temporary failure.
 --   Network loss/timeouts, 408, 429, 500/502/503/504 and recoverable credential

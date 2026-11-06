@@ -56,6 +56,8 @@ pub struct HttpTransport {
     /// version. Aborted on shutdown and on drop so a torn-down transport never
     /// leaves a stream task reconnecting against a dead connection.
     stream_task: std::sync::Mutex<Option<JoinHandle<()>>>,
+    retired: tokio_util::sync::CancellationToken,
+    active_requests: tokio::sync::RwLock<()>,
     next_id: AtomicU64,
 }
 
@@ -127,6 +129,8 @@ impl HttpTransport {
             },
             sink,
             stream_task: std::sync::Mutex::new(None),
+            retired: tokio_util::sync::CancellationToken::new(),
+            active_requests: tokio::sync::RwLock::new(()),
             next_id: AtomicU64::new(1),
         })
     }
@@ -378,12 +382,23 @@ fn insert_header(map: &mut HeaderMap, server: &str, key: &str, value: &str) -> R
     Ok(())
 }
 
-#[async_trait]
-impl McpTransport for HttpTransport {
+impl HttpTransport {
+    async fn while_active<T: Send>(
+        &self,
+        operation: impl std::future::Future<Output = Result<T, TransportError>> + Send,
+    ) -> Result<T, TransportError> {
+        let _active = self.active_requests.read().await;
+        tokio::select! {
+            biased;
+            () = self.retired.cancelled() => Err(TransportError::Disconnected("HTTP transport retired".into())),
+            result = operation => result,
+        }
+    }
+
     /// POST one JSON-RPC request. Requests are concurrent by design: HTTP
     /// correlates each POST with its own response, so no per-server
     /// round-trip lock exists here (unlike stdio).
-    async fn request(
+    async fn request_active(
         &self,
         method: &str,
         params: Value,
@@ -477,7 +492,7 @@ impl McpTransport for HttpTransport {
         Ok(result)
     }
 
-    async fn notify(&self, notification: &Value) -> Result<(), TransportError> {
+    async fn notify_active(&self, notification: &Value) -> Result<(), TransportError> {
         let (builder, sent_session_id) = self.post(crate::NOTIFY_TIMEOUT);
         let response = builder
             .json(notification)
@@ -490,6 +505,24 @@ impl McpTransport for HttpTransport {
         // body, if present, is ignored.
         Self::classify_status(response, sent_session_id.as_deref()).map(|_| ())
     }
+}
+
+#[async_trait]
+impl McpTransport for HttpTransport {
+    async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        sink: &dyn ServerMessageSink,
+    ) -> Result<Value, TransportError> {
+        self.while_active(self.request_active(method, params, timeout, sink))
+            .await
+    }
+
+    async fn notify(&self, notification: &Value) -> Result<(), TransportError> {
+        self.while_active(self.notify_active(notification)).await
+    }
 
     fn requested_protocol_version(&self) -> &'static str {
         // The revision that introduced the Streamable HTTP transport;
@@ -499,12 +532,14 @@ impl McpTransport for HttpTransport {
     }
 
     fn is_alive(&self) -> bool {
-        // No process to probe; failures are classified per request and
-        // recovery is reconnection (REQ-MCP-007).
-        true
+        !self.retired.is_cancelled()
     }
 
     async fn quiesce(&self) -> Result<(), TransportError> {
+        self.retired.cancel();
+        // Cancellation drops each local exchange future before this exclusive
+        // guard can be acquired. Retired transports admit no new exchanges.
+        let _quiescent = self.active_requests.write().await;
         let stream_task = self.stream_task.lock().unwrap().take();
         if let Some(task) = stream_task {
             task.abort();
@@ -1078,6 +1113,12 @@ mod tests {
                 Arc<tokio::sync::Semaphore>,
             )>,
         >,
+        tool_call_gate: Mutex<
+            Option<(
+                tokio::sync::mpsc::UnboundedSender<()>,
+                Arc<tokio::sync::Semaphore>,
+            )>,
+        >,
     }
 
     type RouteMap = Arc<ResponseRoutes>;
@@ -1360,6 +1401,7 @@ mod tests {
 
             let initializing = recorded.rpc_method() == "initialize";
             let listing_tools = recorded.rpc_method() == "tools/list";
+            let calling_tool = recorded.rpc_method() == "tools/call";
             let response = select_response(
                 &method,
                 &path,
@@ -1377,6 +1419,8 @@ mod tests {
                 routes.initialize_gate.lock().unwrap().take()
             } else if listing_tools {
                 routes.tools_list_gate.lock().unwrap().take()
+            } else if calling_tool {
+                routes.tool_call_gate.lock().unwrap().take()
             } else {
                 None
             };
@@ -2737,18 +2781,177 @@ mod tests {
         let server = TestServer::start(handshake_responses("original")).await;
         let manager = ready_refreshable_manager(&server).await;
         let before = server.requests.lock().unwrap().len();
-        let tools = manager.cached_tool_definitions().await;
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].0, "remote");
-        assert_eq!(tools[0].1.name, "report");
+        let catalogs = manager.cached_tool_catalogs().await;
+        assert_eq!(catalogs.len(), 1);
+        assert_eq!(catalogs[0].0, "remote");
+        assert_eq!(catalogs[0].1.as_ref().unwrap()[0].name, "report");
         let handle = manager.servers.read().await.get("remote").unwrap().clone();
         if let crate::supervisor::SupervisorState::Ready(serving) = handle.snapshot().state {
             serving.tools_changed.store(true, Ordering::Release);
         } else {
             panic!("fixture must be ready");
         }
-        assert!(manager.cached_tool_definitions().await.is_empty());
+        let stale = manager.cached_tool_catalogs().await;
+        assert_eq!(stale.len(), 1);
+        assert!(stale[0].1.is_none());
         assert_eq!(server.requests.lock().unwrap().len(), before);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn http_quiescence_cancels_and_drains_local_exchanges_and_refuses_new_ones() {
+        let server = TestServer::start(handshake_responses("old")).await;
+        let (started, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        *server.routes.initialize_gate.lock().unwrap() = Some((started, release.clone()));
+        let transport = Arc::new(
+            HttpTransport::connect(
+                "remote",
+                &server.url,
+                &HashMap::new(),
+                &HttpAuth::None,
+                Arc::new(std::sync::RwLock::new(None)),
+                Arc::new(NullSink),
+            )
+            .unwrap(),
+        );
+        let request = tokio::spawn({
+            let transport = transport.clone();
+            async move {
+                transport
+                    .request(
+                        "initialize",
+                        serde_json::json!({}),
+                        Duration::from_secs(30),
+                        &NullSink,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), observed.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), transport.quiesce())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            transport.active_requests.try_write().is_ok(),
+            "every exchange future released its guard before quiescence returned"
+        );
+        assert!(matches!(
+            request.await.unwrap(),
+            Err(TransportError::Disconnected(_))
+        ));
+        let before = server.requests.lock().unwrap().len();
+        assert!(transport
+            .request(
+                "tools/list",
+                serde_json::json!({}),
+                Duration::from_secs(5),
+                &NullSink
+            )
+            .await
+            .is_err());
+        assert!(transport
+            .notify(&serde_json::json!({"method":"notifications/initialized"}))
+            .await
+            .is_err());
+        assert_eq!(server.requests.lock().unwrap().len(), before);
+        release.add_permits(1);
+        transport.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_recovery_cancels_old_call_before_a_replacement_becomes_callable() {
+        let server = TestServer::start(handshake_responses("old")).await;
+        let manager = ready_refreshable_manager(&server).await;
+        *server.routes.delete_bearer.lock().unwrap() = None;
+        let (started, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        *server.routes.tool_call_gate.lock().unwrap() = Some((started, release.clone()));
+        server.push_responses(vec![
+            echo_id_response(
+                &serde_json::json!({"content":[{"type":"text","text":"late old answer"}]}),
+            ),
+            status_response(404, &[]),
+            delete_ack(),
+        ]);
+        server.push_responses(handshake_responses("new"));
+        let old_call = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .call_tool_once(
+                        "remote",
+                        "report",
+                        serde_json::json!({}),
+                        serde_json::json!({"type":"object"}),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), observed.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            manager
+                .call_tool_once(
+                    "remote",
+                    "report",
+                    serde_json::json!({}),
+                    serde_json::json!({"type":"object"})
+                )
+                .await,
+            Err(crate::McpOneShotError::Uncertain(_))
+        ));
+        tokio::time::timeout(Duration::from_secs(5), manager.await_background_tasks())
+            .await
+            .unwrap();
+        // The original server has not replied. Its local caller must already
+        // be cancelled, with no stale success and no replay of either request.
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), old_call)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(crate::McpOneShotError::Uncertain(_))
+        ));
+        assert_eq!(manager.status().await[0].state, crate::McpConnState::Ready);
+        server.push_responses(vec![echo_id_response(
+            &serde_json::json!({"content":[{"type":"text","text":"new answer"}]}),
+        )]);
+        assert!(manager
+            .call_tool_once(
+                "remote",
+                "report",
+                serde_json::json!({}),
+                serde_json::json!({"type":"object"})
+            )
+            .await
+            .unwrap()
+            .contains("new answer"));
+        {
+            let requests = server.requests.lock().unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|r| r.rpc_method() == "tools/call")
+                    .count(),
+                3
+            );
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|r| r.rpc_method() == "initialize")
+                    .count(),
+                2
+            );
+        }
+        release.add_permits(1);
+        server.push_responses(vec![delete_ack()]);
         manager.shutdown().await;
     }
 

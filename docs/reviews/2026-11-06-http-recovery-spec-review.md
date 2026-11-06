@@ -281,3 +281,19 @@ Regressions exercise autonomous idle recovery, manager/transport release,
 malformed private metadata through the status API, and all three date formats.
 All 194 MCP tests pass, with all-target MCP Clippy, formatting and Allium/anchor
 checks passing. These changes leave the previously verified UI code unchanged.
+
+The next review identified a local-quiescence gap for concurrent HTTP POSTs and
+an ambiguity between stale and genuinely missing tool catalogs. HTTP retirement
+now cancels local exchange futures, waits for their guards to drain, rejects new
+requests/notifications, and stops the GET stream before remote cleanup or a
+replacement handshake. This does not confirm remote cancellation. Caller intent
+is preserved: replay-eligible reads may join recovery; single-attempt operations
+remain uncertain and are never replayed. Existing concurrent-read recovery and
+epoch-fencing regressions still pass without weakening their assertions.
+
+Cached catalog snapshots now explicitly distinguish current definitions from
+unverified state. The capabilities response derives tools and freshness from that
+same read without remote I/O. Settings keep stale catalogs unverified even when
+their previous names were incomplete; a current empty catalog can establish
+missing tools. The obsolete definitions-only cached API was replaced rather
+than retained alongside its replacement. All 196 MCP and 31 focused UI tests pass.

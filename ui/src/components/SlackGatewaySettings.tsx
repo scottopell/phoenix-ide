@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useId } from 'react';
 import type { McpServerStatus } from '../api';
-import { slackGatewayArgumentProbes, slackGatewayToolProblem, type SlackToolSchema } from './slackGatewayToolCompatibility';
+import { slackGatewayToolProblem, type SlackToolSchema } from './slackGatewayToolCompatibility';
 import '../pages/SlackGatewayPage.css';
 
 interface Config {
@@ -34,12 +34,10 @@ export function SlackGatewaySettings({ standalone = false }: { standalone?: bool
       try {
         const r = await fetch('/api/slack-gateway/capabilities');
         if (!r.ok) throw Error('Catalog unavailable');
-        const catalog: { tools?: SlackToolSchema[] } = await r.json();
+        const catalog: { tools?: SlackToolSchema[]; catalogs?: { server: string; current: boolean }[] } = await r.json();
         const tools = catalog.tools ?? [];
         const server = s.config.mcp_server;
-        const knownNames = s.connection.tools;
-        const hasKnownTools = Object.keys(slackGatewayArgumentProbes).every(name => knownNames.filter(tool => tool === name || tool.endsWith('_' + name)).length === 1);
-        problem = !tools.some(tool => tool.server === server) && hasKnownTools
+        problem = !catalog.catalogs?.some(c => c.server === server && c.current)
           ? 'Cannot verify required tool schemas: catalog unavailable or outdated.'
           : slackGatewayToolProblem(tools, server);
       } catch { problem = 'Cannot verify required tool schemas: catalog unavailable.'; }

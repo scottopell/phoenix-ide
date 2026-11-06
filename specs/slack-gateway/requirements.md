@@ -217,6 +217,9 @@ validate the adapter's argument forms against the advertised catalog. Unsupporte
 schemas or a known-stale catalog SHALL be reported as unverified rather than
 healthy; static conformance SHALL NOT imply live account or provider access.
 Diagnostic catalog reads SHALL NOT issue MCP calls or start recovery.
+They SHALL expose catalog freshness explicitly; stale or absent definitions SHALL
+remain unverified regardless of the previous tool-name list. A current empty
+catalog MAY demonstrate missing tools.
 Missing tools on an unavailable
 connection SHALL NOT alone imply that the owner must authorize again.
 

@@ -180,10 +180,8 @@ pub trait ServerMessageSink: Send + Sync {
 
     /// The transport observed its session reset out-of-band -- a session-bearing
     /// GET-stream 404 (REQ-MCP-005, REQ-MCP-006). The stream cannot rebuild the
-    /// transport itself; marking the tool list stale routes the next
-    /// `tool_definitions` read through the lazy-refresh path, whose
-    /// `SessionExpired` re-establishes the connection (new session + fresh GET
-    /// stream). Default no-op for sinks with no such state.
+    /// transport itself; the sink flags stale tools and wakes the serving
+    /// connection's recovery owner. Default no-op for sinks with no such state.
     fn on_session_reset(&self) {}
 }
 
@@ -225,7 +223,7 @@ pub trait McpTransport: Send + Sync {
         false
     }
 
-    /// Stop unsolicited background work while retaining remote session ownership.
+    /// Stop local exchanges and background work while retaining remote session ownership.
     async fn quiesce(&self) -> Result<(), TransportError> {
         Ok(())
     }
@@ -3449,23 +3447,26 @@ impl McpClientManager {
         statuses
     }
 
-    pub async fn cached_tool_definitions(&self) -> Vec<(String, McpToolDef)> {
+    /// Read cached catalogs without I/O. None means unverified, including a
+    /// ready connection whose catalog has been invalidated by a notification.
+    pub async fn cached_tool_catalogs(&self) -> Vec<(String, Option<Vec<McpToolDef>>)> {
         let handles = self.servers.read().await;
         handles
             .iter()
-            .flat_map(|(name, handle)| match handle.snapshot().state {
-                SupervisorState::Ready(server) if !server.tools_changed.load(Ordering::Acquire) => {
-                    server
-                        .tools()
-                        .into_iter()
-                        .map(|tool| (name.clone(), tool))
-                        .collect()
-                }
-                SupervisorState::Ready(_)
-                | SupervisorState::Connecting
-                | SupervisorState::Recovering
-                | SupervisorState::Failed
-                | SupervisorState::Removed => Vec::new(),
+            .map(|(name, handle)| {
+                (
+                    name.clone(),
+                    match handle.snapshot().state {
+                        SupervisorState::Ready(server) => {
+                            let tools = server.tools();
+                            (!server.tools_changed.load(Ordering::Acquire)).then_some(tools)
+                        }
+                        SupervisorState::Connecting
+                        | SupervisorState::Recovering
+                        | SupervisorState::Failed
+                        | SupervisorState::Removed => None,
+                    },
+                )
             })
             .collect()
     }

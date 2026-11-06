@@ -199,7 +199,10 @@ of a transient network, handshake, token-refresh or recovered-token
 persistence failure, THE SYSTEM SHALL retain one recovery owner and retry without
 requiring a tool invocation, status-page visit, manual reload or Phoenix restart.
 This includes initial connection. A recovery owner SHALL NOT make a replacement callable
-before old local transport activity is stopped. Remote DELETE is best effort.
+before old local transport activity is stopped, including in-flight POST exchanges
+and notifications. A retired transport SHALL admit no new exchanges. Stopping a
+local exchange SHALL NOT assert remote cancellation or authorize replay outside
+the caller's existing policy. Remote DELETE is best effort.
 
 Automatic retries SHALL cover connection loss, network timeouts, HTTP 408,
 HTTP 429, and HTTP 500/502/503/504 during those lifecycle operations. Invalid
