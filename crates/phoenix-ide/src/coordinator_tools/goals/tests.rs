@@ -1503,12 +1503,16 @@ async fn production_coordinator_query_database_routes_to_local_when_omitted_or_e
         .await;
     assert!(local.is_success(), "{}", local.output());
     assert!(local.output().contains("local-selector-parity"));
+    let mut local_result: Value = serde_json::from_str(local.output()).unwrap();
+    local_result["elapsed_ms"] = json!(0);
     for input in [
         json!({"sql":"SELECT 'local-selector-parity' AS source","instance":"local"}),
         json!({"sql":"SELECT 'local-selector-parity' AS source","instance":null}),
     ] {
         let output = query.run(input, f.ctx()).await;
         assert!(output.is_success(), "{}", output.output());
-        assert_eq!(local.output(), output.output());
+        let mut result: Value = serde_json::from_str(output.output()).unwrap();
+        result["elapsed_ms"] = json!(0);
+        assert_eq!(local_result, result);
     }
 }

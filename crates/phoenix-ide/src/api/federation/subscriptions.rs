@@ -932,10 +932,7 @@ pub async fn owner_create(
         }
     };
     let peer = match state.db.resolve_federation_peer(&selector).await {
-        Ok(connection) => super::ResolvedPeer {
-            instance_id: connection.peer_instance_id,
-            connection,
-        },
+        Ok(connection) => super::ResolvedPeer { connection },
         Err(error) => {
             tracing::debug!(%error, "owner subscription peer resolution failed");
             return rejected(StatusCode::CONFLICT);

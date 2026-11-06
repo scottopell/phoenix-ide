@@ -645,13 +645,12 @@ fn bounded_send_diagnostic(message: &str) -> String {
 }
 
 pub(crate) struct ResolvedPeer {
-    instance_id: InstanceId,
     connection: phoenix_db::FederationPeerConnection,
 }
 
 impl ResolvedPeer {
     pub(crate) fn instance_id(&self) -> InstanceId {
-        self.instance_id
+        self.connection.peer_instance_id
     }
 
     pub(crate) fn connection(&self) -> &phoenix_db::FederationPeerConnection {
@@ -668,10 +667,7 @@ async fn resolve_saved_peer(
         .federation_peer_connection(instance_id)
         .await?
         .ok_or(FederationClientError::PeerNotFound)?;
-    Ok(ResolvedPeer {
-        instance_id,
-        connection,
-    })
+    Ok(ResolvedPeer { connection })
 }
 
 pub(crate) async fn resolve_tool_peer(
@@ -689,10 +685,7 @@ pub(crate) async fn resolve_tool_peer(
                     .federation_peer_connection(id)
                     .await?
                     .ok_or(FederationClientError::PeerNotFound)?;
-                return Ok(ResolvedPeer {
-                    instance_id: id,
-                    connection,
-                });
+                return Ok(ResolvedPeer { connection });
             }
         }
     }
@@ -717,7 +710,7 @@ pub async fn send_remote_conversation_message(
             "send locators exceed the request budget".into(),
         ));
     }
-    if request.destination_instance_id != peer.instance_id {
+    if request.destination_instance_id != peer.instance_id() {
         return Err(FederationClientError::DestinationMismatch);
     }
     let caller = local_db.instance_id().await?;
@@ -900,7 +893,7 @@ pub async fn query_remote_database(
     peer: &ResolvedPeer,
     sql: &str,
 ) -> Result<RemoteQueryDatabaseResponse, FederationClientError> {
-    let peer_instance_id = peer.instance_id;
+    let peer_instance_id = peer.instance_id();
     let peer = &peer.connection;
     let caller_instance_id = db.instance_id().await?;
     let endpoint = peer.base_url.query_database_endpoint();
@@ -1636,7 +1629,7 @@ pub async fn resolve_remote_reference(
     reference: &str,
 ) -> Result<RemoteResolveReferenceResponse, FederationClientError> {
     let requested = validate_remote_resolve_reference(reference)?;
-    let peer_id = peer.instance_id;
+    let peer_id = peer.instance_id();
     let caller = db.instance_id().await?;
     let mut response: RemoteResolveReferenceResponse = send_bounded_peer_request(
         format!(
@@ -1715,7 +1708,7 @@ pub async fn read_remote_conversation(
     cursor: usize,
 ) -> Result<RemoteReadConversationResponse, FederationClientError> {
     let requested = validate_remote_read_target(reference, cursor)?;
-    let peer_id = peer.instance_id;
+    let peer_id = peer.instance_id();
     let caller = db.instance_id().await?;
     let request = RemoteReadConversationRequest {
         destination_instance_id: peer_id,
@@ -1913,7 +1906,7 @@ pub async fn read_remote_goal(
     after_version: GoalVersion,
     wait: Option<CoordinatorGoalWaitRequest>,
 ) -> Result<RemoteReadGoalResponse, FederationClientError> {
-    let peer_id = peer.instance_id;
+    let peer_id = peer.instance_id();
     let caller = db.instance_id().await?;
     let wait = wait
         .map(RemoteGoalWaitRequest::from_coordinator_request)
