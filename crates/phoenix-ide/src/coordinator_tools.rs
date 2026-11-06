@@ -1935,12 +1935,14 @@ mod tests {
         let db = crate::db::Database::open_in_memory().await.unwrap();
         let peer = InstanceId::new();
         let other = InstanceId::new();
-        let bearer = phoenix_core::domain::instance_identity::PeerBearerCredential::parse(format!(
-            "phx_peer_{}",
-            "d".repeat(43)
-        ))
-        .unwrap();
-        for (id, name, port) in [(peer, "selected-peer", 7001), (other, "other-peer", 7002)] {
+        for (id, name, port, credential_char) in [
+            (peer, "selected-peer", 7001, "d"),
+            (other, "other-peer", 7002, "e"),
+        ] {
+            let bearer = phoenix_core::domain::instance_identity::PeerBearerCredential::parse(
+                format!("phx_peer_{}", credential_char.repeat(43)),
+            )
+            .unwrap();
             db.save_federation_peer_connection(
                 id,
                 &name.parse().unwrap(),
