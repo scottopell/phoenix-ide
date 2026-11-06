@@ -367,7 +367,7 @@ async fn fetch_json(client: &reqwest::Client, url: &str) -> Result<Value, OAuthR
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .await
-        .map_err(|e| OAuthRequestError::request(&e))?;
+        .map_err(OAuthRequestError::request)?;
     if !response.status().is_success() {
         let status = response.status();
         let detail = format!("metadata HTTP {status}");
@@ -884,7 +884,7 @@ impl std::fmt::Display for OAuthRequestError {
 }
 
 impl OAuthRequestError {
-    fn request(error: &reqwest::Error) -> Self {
+    fn request(error: reqwest::Error) -> Self {
         match crate::http::HttpTransport::classify_request_error(error, "OAuth request") {
             crate::TransportError::Protocol(detail) => Self::Permanent(detail),
             other
@@ -955,7 +955,7 @@ async fn token_grant(
         .form(&form)
         .send()
         .await
-        .map_err(|e| OAuthRequestError::request(&e))?;
+        .map_err(OAuthRequestError::request)?;
     let status = response.status();
     if matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504) {
         let minimum = response
@@ -969,10 +969,7 @@ async fn token_grant(
             minimum,
         });
     }
-    let doc: Value = response
-        .json()
-        .await
-        .map_err(|e| OAuthRequestError::request(&e))?;
+    let doc: Value = response.json().await.map_err(OAuthRequestError::request)?;
     if !status.is_success() {
         return Err(OAuthRequestError::Rejected(format!(
             "token endpoint rejected the grant (HTTP {status}): {}",

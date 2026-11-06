@@ -284,8 +284,9 @@ impl HttpTransport {
         None
     }
 
-    pub(crate) fn classify_request_error(error: &reqwest::Error, method: &str) -> TransportError {
-        let mut source = std::error::Error::source(error);
+    pub(crate) fn classify_request_error(error: reqwest::Error, method: &str) -> TransportError {
+        let error = error.without_url();
+        let mut source = std::error::Error::source(&error);
         while let Some(cause) = source {
             if cause.is::<rustls::Error>() {
                 return TransportError::Protocol(format!(
@@ -402,7 +403,7 @@ impl McpTransport for HttpTransport {
             .json(&body)
             .send()
             .await
-            .map_err(|e| Self::classify_request_error(&e, method))?;
+            .map_err(|e| Self::classify_request_error(e, method))?;
 
         // The session id is issued on the initialize response (REQ-MCP-005).
         if method == "initialize" {
@@ -431,7 +432,7 @@ impl McpTransport for HttpTransport {
             let mut stream = response.bytes_stream();
             let mut outcome = None;
             'read: while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| Self::classify_request_error(&e, method))?;
+                let chunk = chunk.map_err(|e| Self::classify_request_error(e, method))?;
                 for data in framer.push(&chunk) {
                     if let Some(found) = self.dispatch_sse_data(&data, id, method, sink) {
                         outcome = Some(found);
@@ -454,7 +455,7 @@ impl McpTransport for HttpTransport {
             let message: Value = response
                 .json()
                 .await
-                .map_err(|e| Self::classify_request_error(&e, method))?;
+                .map_err(|e| Self::classify_request_error(e, method))?;
             self.dispatch_message(message, id, sink)
                 .unwrap_or_else(|| {
                     Err(TransportError::Protocol(format!(
@@ -482,7 +483,7 @@ impl McpTransport for HttpTransport {
             .json(notification)
             .send()
             .await
-            .map_err(|e| Self::classify_request_error(&e, "notification"))?;
+            .map_err(|e| Self::classify_request_error(e, "notification"))?;
 
         // A conforming server acknowledges an accepted notification with
         // 202 Accepted and no body (REQ-MCP-004); any 2xx is success and the
@@ -2251,6 +2252,27 @@ mod tests {
             Some("2025-03-26"),
             "the negotiated version rides the session DELETE too"
         );
+    }
+
+    #[tokio::test]
+    async fn request_failure_diagnostics_do_not_expose_endpoint_credentials() {
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get("http://127.0.0.1:0/mcp?access_token=diagnostic-secret")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error
+            .url()
+            .unwrap()
+            .query()
+            .unwrap()
+            .contains("diagnostic-secret"));
+        let message = HttpTransport::classify_request_error(error, "initialize").to_string();
+        assert!(!message.contains("diagnostic-secret"), "{message}");
+        assert!(!message.contains("access_token"), "{message}");
     }
 
     #[tokio::test]
