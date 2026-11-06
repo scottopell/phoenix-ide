@@ -1,6 +1,6 @@
 import { memo, useState, useEffect, useRef, useMemo, useCallback, useLayoutEffect } from 'react';
 import type { ReactNode } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { getConvDisplayState } from '../api';
 import type { Conversation, CachedPrSummary, ProductConversationListRow } from '../api';
 import { prReviewState } from './prReviewState';
@@ -697,7 +697,6 @@ export function ConversationList({
   footer,
 }: ConversationListProps) {
   const navigate = useNavigate();
-  const location = useLocation();
   const { hasActiveScope } = useFocusScope();
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [collapsedChains, setCollapsedChains] = useState<Set<string>>(new Set());
@@ -929,7 +928,7 @@ export function ConversationList({
             </button>
           </div>
         </div>
-          <EmberEntry active={location.pathname === '/global'} onClick={() => navigate('/global')} />
+          <EmberEntry onClick={() => navigate('/global')} />
           <div className="conversation-list-subnav">
             <button
               className={`archive-toggle-text ${!showArchived ? 'active' : ''}`}

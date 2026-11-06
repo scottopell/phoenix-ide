@@ -107,17 +107,22 @@ describe('ConversationList — global navigation', () => {
 
     fireEvent.click(ember);
     expect(getByTestId('location')).toHaveTextContent('/global');
-    expect(ember).toHaveAttribute('aria-current', 'page');
+    expect(ember).not.toHaveAttribute('aria-current');
   });
 
-  it('marks Ember active when the router is already at the Global destination', () => {
-    const { getByRole } = render(
-      <MemoryRouter initialEntries={['/global']}>
-        <ConversationList {...defaultProps} conversations={[]} listDensity="mobile" />
+  it('leaves list navigation when opening Ember through the mobile route boundary', () => {
+    const { getByRole, queryByRole } = render(
+      <MemoryRouter initialEntries={['/']}>
+        <Routes>
+          <Route path="/" element={<ConversationList {...defaultProps} conversations={[]} listDensity="mobile" />} />
+          <Route path="/global" element={<h1>Ember destination</h1>} />
+        </Routes>
       </MemoryRouter>,
     );
 
-    expect(getByRole('button', { name: 'Open Ember, Global coordinator' })).toHaveAttribute('aria-current', 'page');
+    fireEvent.click(getByRole('button', { name: 'Open Ember, Global coordinator' }));
+    expect(getByRole('heading', { name: 'Ember destination' })).toBeInTheDocument();
+    expect(queryByRole('button', { name: 'Open Ember, Global coordinator' })).not.toBeInTheDocument();
   });
 });
 
