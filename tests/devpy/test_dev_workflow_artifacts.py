@@ -208,6 +208,118 @@ class DevWorkflowArtifactTests(unittest.TestCase):
         self.assertFalse(sccache.ok)
         self.assertEqual("unrecognized version output: exit code 0", sccache.detail)
 
+    def test_doctor_cache_reports_kache_scope_without_starting_daemon(self):
+        with (
+            mock.patch.dict(os.environ, {"PHOENIX_COMPILER_CACHE": "auto"}, clear=True),
+            mock.patch.object(self.dev, "_doctor_version", return_value=(True, "ok")),
+            mock.patch.object(self.dev, "_find_chromium_binary", return_value=None),
+            mock.patch.object(self.dev, "_kache_binary", return_value="/usr/bin/kache"),
+            mock.patch.object(self.dev, "_kache_host_error", return_value=None),
+            mock.patch.object(self.dev, "_kache_version", return_value=("1.2.2", None)),
+            mock.patch.object(self.dev.shutil, "which", return_value=None),
+            mock.patch.object(self.dev, "_ensure_kache_daemon") as daemon,
+            mock.patch.object(self.dev, "_prepare_local_kache") as prepare,
+        ):
+            result = next(row for row in self.dev.collect_doctor_results() if row.name == "compiler-cache")
+
+        self.assertTrue(result.ok)
+        self.assertIn("requested=PHOENIX_COMPILER_CACHE=auto; selected=kache", result.detail)
+        self.assertIn("executable=/usr/bin/kache; version=1.2.2", result.detail)
+        self.assertIn("scope=local-only; direct Cargo subprocesses", result.detail)
+        daemon.assert_not_called()
+        prepare.assert_not_called()
+
+    def test_doctor_cache_auto_fallback_and_optional_absence(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            fallback = self.dev._doctor_compiler_cache_result(
+                "/usr/bin/kache", None, "unsupported kache 1.0.0",
+                "/usr/bin/sccache", "sccache 0.10.0", None,
+            )
+            missing = self.dev._doctor_compiler_cache_result(None, None, None, None, None, None)
+        self.assertTrue(fallback.ok)
+        self.assertIn("auto fallback: kache: unsupported kache 1.0.0", fallback.detail)
+        self.assertIn("selected=sccache; executable=/usr/bin/sccache", fallback.detail)
+        self.assertIn("version=sccache 0.10.0; scope=direct Cargo subprocesses", fallback.detail)
+        self.assertTrue(missing.ok)
+        self.assertIn("selected=none; auto fallback: kache:", missing.detail)
+        self.assertIn("sccache: not installed or not on PATH", missing.detail)
+
+    def test_doctor_cache_explicit_invalid_requests_fail(self):
+        for request, expected in (
+            ("kache", "PHOENIX_KACHE_BIN is not executable: /missing/kache"),
+            ("sccache", "unrecognized version output"),
+            ("typo", "choose one of: auto, kache, sccache, none"),
+        ):
+            with self.subTest(request=request), mock.patch.dict(
+                os.environ, {"PHOENIX_COMPILER_CACHE": request, "PHOENIX_KACHE_BIN": "/missing/kache"}, clear=True,
+            ):
+                result = self.dev._doctor_compiler_cache_result(
+                    None, None, None, "/usr/bin/sccache", None,
+                    "unrecognized version output: garbage",
+                )
+                self.assertFalse(result.ok)
+                self.assertTrue(result.required)
+                self.assertIn(expected, result.detail)
+
+    def test_doctor_cache_requested_missing_backend_is_required_but_tool_rows_stay_optional(self):
+        with (
+            mock.patch.dict(os.environ, {"PHOENIX_COMPILER_CACHE": "kache"}, clear=True),
+            mock.patch.object(self.dev, "_doctor_version", return_value=(True, "ok")),
+            mock.patch.object(self.dev, "_find_chromium_binary", return_value=None),
+            mock.patch.object(self.dev, "_kache_binary", return_value=None),
+            mock.patch.object(self.dev.shutil, "which", return_value=None),
+        ):
+            results = self.dev.collect_doctor_results()
+        cache = next(row for row in results if row.name == "compiler-cache")
+        self.assertFalse(cache.ok)
+        self.assertTrue(cache.required)
+        self.assertIn("install Kache 1.2.2", cache.detail)
+        self.assertFalse(next(row for row in results if row.name == "kache").required)
+        self.assertFalse(next(row for row in results if row.name == "sccache").required)
+
+    def test_doctor_cache_explicit_wrapper_precedes_backend_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            wrapper = Path(directory) / "custom wrapper"
+            wrapper.write_text("#!/bin/sh\nexit 0\n")
+            wrapper.chmod(0o755)
+            with mock.patch.dict(os.environ, {
+                "RUSTC_WRAPPER": str(wrapper), "PHOENIX_COMPILER_CACHE": "kache",
+            }, clear=True), mock.patch.object(self.dev, "_command_version") as probe:
+                result = self.dev._doctor_compiler_cache_result(None, None, None, None, None, None)
+            self.assertTrue(result.ok)
+            self.assertIn(f"selected=explicit wrapper {str(wrapper)!r}", result.detail)
+            self.assertIn(f"executable={wrapper.resolve()}; version=not probed (custom wrapper)", result.detail)
+            probe.assert_not_called()
+            with mock.patch.dict(os.environ, {"RUSTC_WRAPPER": "/missing/wrapper"}, clear=True):
+                invalid = self.dev._doctor_compiler_cache_result(None, None, None, None, None, None)
+            self.assertFalse(invalid.ok)
+            self.assertIn("set RUSTC_WRAPPER to an executable path", invalid.detail)
+            with mock.patch.dict(os.environ, {"RUSTC_WRAPPER": ""}, clear=True):
+                disabled = self.dev._doctor_compiler_cache_result(None, None, None, None, None, None)
+            self.assertTrue(disabled.ok)
+            self.assertIn("selected=none", disabled.detail)
+
+    def test_doctor_cache_explicit_known_wrapper_reports_unusable_version(self):
+        with mock.patch.dict(os.environ, {"RUSTC_WRAPPER": "/usr/bin/sccache"}, clear=True):
+            with mock.patch.object(self.dev.shutil, "which", return_value="/usr/bin/sccache"):
+                result = self.dev._doctor_compiler_cache_result(
+                    None, None, None, "/usr/bin/sccache", None,
+                    "unrecognized version output: garbage",
+                )
+        self.assertFalse(result.ok)
+        self.assertIn("unusable: unrecognized version output: garbage", result.detail)
+        self.assertIn("unset RUSTC_WRAPPER", result.detail)
+
+    def test_doctor_cache_explicit_unusable_backend_fails_command(self):
+        with mock.patch.dict(os.environ, {"PHOENIX_COMPILER_CACHE": "kache"}, clear=True):
+            failure = self.dev._doctor_compiler_cache_result(None, None, None, None, None, None)
+        with mock.patch.object(self.dev, "collect_doctor_results", return_value=[failure]):
+            with mock.patch("builtins.print") as output:
+                self.assertFalse(self.dev.cmd_doctor())
+        rendered = "\n".join(" ".join(map(str, call.args)) for call in output.call_args_list)
+        self.assertIn("✗ compiler-cache", rendered)
+        self.assertIn("Missing required prerequisites: compiler-cache", rendered)
+
     def test_doctor_fails_only_for_missing_required_prerequisites(self):
         results = [
             self.dev.DoctorResult("cargo", False, "not found"),

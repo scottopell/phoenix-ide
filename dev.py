@@ -3795,6 +3795,93 @@ def _doctor_version(
     return ok, detail
 
 
+def _doctor_compiler_cache_result(
+    kache_binary: str | None, kache_version: str | None, kache_error: str | None,
+    sccache_binary: str | None, sccache_version: str | None, sccache_error: str | None,
+) -> DoctorResult:
+    scope = "direct Cargo subprocesses"
+    if "RUSTC_WRAPPER" in os.environ:
+        wrapper = os.environ["RUSTC_WRAPPER"]
+        if not wrapper:
+            return DoctorResult(
+                "compiler-cache", True,
+                f"requested=RUSTC_WRAPPER (empty); selected=none; scope={scope}",
+            )
+        binary = shutil.which(wrapper)
+        if binary is None:
+            return DoctorResult(
+                "compiler-cache", False,
+                f"requested=RUSTC_WRAPPER; selected=explicit wrapper {wrapper!r}; "
+                "not executable; set RUSTC_WRAPPER to an executable path or remove it",
+            )
+        absolute = _absolute_executable(binary)
+        if absolute == _absolute_executable(kache_binary):
+            version, error = kache_version, kache_error
+        elif absolute == _absolute_executable(sccache_binary):
+            version, error = sccache_version, sccache_error
+        else:
+            version, error = None, None
+        status = (
+            f"unusable: {error}; check installation or unset RUSTC_WRAPPER"
+            if error else f"version={version or 'not probed (custom wrapper)'}"
+        )
+        return DoctorResult(
+            "compiler-cache", error is None,
+            f"requested=RUSTC_WRAPPER; selected=explicit wrapper {wrapper!r}; "
+            f"executable={absolute}; {status}; scope={scope}",
+        )
+
+    requested = os.environ.get("PHOENIX_COMPILER_CACHE", "auto")
+    if requested not in _COMPILER_CACHE_BACKENDS:
+        return DoctorResult(
+            "compiler-cache", False,
+            f"invalid PHOENIX_COMPILER_CACHE={requested!r}; choose one of: "
+            f"{', '.join(_COMPILER_CACHE_BACKENDS)}",
+        )
+    prefix = f"requested=PHOENIX_COMPILER_CACHE={requested}; "
+    if requested == "none":
+        return DoctorResult("compiler-cache", True, prefix + f"selected=none; scope={scope}")
+
+    kache_reason = kache_error or (
+        f"PHOENIX_KACHE_BIN is not executable: {os.environ['PHOENIX_KACHE_BIN']}; "
+        "point it at a released Kache binary or unset it"
+        if os.environ.get("PHOENIX_KACHE_BIN") else
+        "not installed or not on PATH; install Kache 1.2.2 or select sccache/none"
+    )
+    if kache_error:
+        kache_reason += (
+            f" ({_absolute_executable(kache_binary)}); "
+            "check host, KACHE_DISABLED and Kache 1.2.2, or select sccache/none"
+        )
+    sccache_reason = sccache_error or "not installed or not on PATH; install sccache or select none"
+    if sccache_error:
+        sccache_reason += (
+            f" ({_absolute_executable(sccache_binary)}); check sccache installation or select none"
+        )
+    if requested in ("auto", "kache") and kache_version is not None:
+        return DoctorResult(
+            "compiler-cache", True,
+            prefix + f"selected=kache; executable={_absolute_executable(kache_binary)}; "
+            f"version={kache_version}; scope=local-only; {scope}",
+        )
+    if requested == "kache":
+        return DoctorResult("compiler-cache", False, prefix + f"selected=unavailable; kache: {kache_reason}")
+    if requested in ("auto", "sccache") and sccache_version is not None:
+        fallback = f"auto fallback: kache: {kache_reason}; " if requested == "auto" else ""
+        return DoctorResult(
+            "compiler-cache", True,
+            prefix + fallback + f"selected=sccache; executable={_absolute_executable(sccache_binary)}; "
+            f"version={sccache_version}; scope={scope}",
+        )
+    if requested == "sccache":
+        return DoctorResult("compiler-cache", False, prefix + f"selected=unavailable; sccache: {sccache_reason}")
+    return DoctorResult(
+        "compiler-cache", True,
+        prefix + f"selected=none; auto fallback: kache: {kache_reason}; "
+        f"sccache: {sccache_reason}; scope={scope}",
+    )
+
+
 def collect_doctor_results() -> list[DoctorResult]:
     node_environment = {**node_env(), "COREPACK_ENABLE_NETWORK": "0"}
     results: list[DoctorResult] = []
@@ -3890,30 +3977,39 @@ def collect_doctor_results() -> list[DoctorResult]:
     ))
 
     kache_binary = _kache_binary()
+    kache_version = None
+    kache_error = None
     if kache_binary:
         kache_error = _kache_host_error()
         if kache_error is None and _environment_flag("KACHE_DISABLED"):
             kache_error = "KACHE_DISABLED is set"
-        version, error = (
+        kache_version, kache_error = (
             (None, kache_error) if kache_error else _kache_version(kache_binary)
         )
         results.append(DoctorResult(
             "kache",
-            version is not None,
-            f"{version} ({kache_binary})" if version else str(error),
+            kache_version is not None,
+            f"{kache_version} ({kache_binary})" if kache_version else str(kache_error),
             required=False,
         ))
     else:
         results.append(DoctorResult("kache", False, "not found", required=False))
 
     sccache_binary = shutil.which("sccache")
+    sccache_version = None
+    sccache_error = None
     if sccache_binary:
-        version, error = _usable_sccache(sccache_binary)
+        sccache_version, sccache_error = _usable_sccache(sccache_binary)
         results.append(DoctorResult(
-            "sccache", version is not None, version or str(error), required=False,
+            "sccache", sccache_version is not None, sccache_version or str(sccache_error), required=False,
         ))
     else:
         results.append(DoctorResult("sccache", False, "not found", required=False))
+
+    results.append(_doctor_compiler_cache_result(
+        kache_binary, kache_version, kache_error,
+        sccache_binary, sccache_version, sccache_error,
+    ))
 
     for name, command, environment in (
         ("cargo-nextest", ["cargo", "nextest", "--version"], rust_environment),
