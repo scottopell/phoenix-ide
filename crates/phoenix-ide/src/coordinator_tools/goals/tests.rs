@@ -1438,8 +1438,8 @@ async fn watch_tools_treat_omitted_and_exact_local_as_equal_and_reject_invalid_s
                 "{name} unexpectedly accepted selector"
             );
             assert_eq!(
-                before,
-                f.db.list_coordinator_watches().await.unwrap(),
+                serde_json::to_value(&before).unwrap(),
+                serde_json::to_value(f.db.list_coordinator_watches().await.unwrap()).unwrap(),
                 "{name} with invalid selector must not change local watches"
             );
         }

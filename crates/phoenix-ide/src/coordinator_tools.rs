@@ -7,6 +7,7 @@ mod authority;
 mod goals;
 pub(crate) mod instance;
 
+#[cfg(test)]
 use instance::InstanceSelector;
 
 pub(crate) fn goal_tools(runtime: &Arc<crate::runtime::RuntimeManager>) -> Vec<Arc<dyn Tool>> {
@@ -420,9 +421,6 @@ impl instance::RoutedTool for WatchConversation {
     fn description(&self) -> String {
         "Subscribe this Global Coordinator to future terminal facts for an open ordinary stable ProductConversation. Returns its current transcript and state atomically with enrollment. No historical events are replayed.".into()
     }
-    fn clearable(&self) -> bool {
-        true
-    }
     fn schema_without_instance(&self) -> Value {
         json!({"type":"object","properties":{"product_conversation_id":{"type":"string","minLength":1,"maxLength":1024}},"required":["product_conversation_id"],"additionalProperties":false})
     }
@@ -472,9 +470,6 @@ impl instance::RoutedTool for UnwatchConversation {
     }
     fn description(&self) -> String {
         "End this Global Coordinator's subscription to a stable ProductConversation. Suppress pending but not already accepted notifications.".into()
-    }
-    fn clearable(&self) -> bool {
-        true
     }
     fn schema_without_instance(&self) -> Value {
         json!({"type":"object","properties":{"product_conversation_id":{"type":"string","minLength":1,"maxLength":1024}},"required":["product_conversation_id"],"additionalProperties":false})

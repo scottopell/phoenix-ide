@@ -29,12 +29,6 @@ impl<'de> Deserialize<'de> for InstanceSelector {
 }
 
 impl InstanceSelector {
-    pub(crate) fn deserialize_nullable<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Self, D::Error> {
-        Ok(Option::<Self>::deserialize(deserializer)?.unwrap_or_default())
-    }
-
     pub(crate) fn schema() -> Value {
         json!({
             "type": "string",

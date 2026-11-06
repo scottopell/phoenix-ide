@@ -22,7 +22,6 @@ enum Operation {
 
 struct GoalTool {
     service: GoalCommandService,
-    runtime: Arc<RuntimeManager>,
     operation: Operation,
 }
 
@@ -44,7 +43,6 @@ pub(super) fn tools(runtime: &Arc<RuntimeManager>) -> Vec<Arc<dyn Tool>> {
                 Arc::new(GoalTool {
                     service: service.clone(),
                     operation,
-                    runtime: Arc::clone(runtime),
                 }) as Arc<dyn Tool>
             }),
     );
