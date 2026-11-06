@@ -10,10 +10,48 @@ struct ConversationListView: View {
     @State private var navPath: [String] = []
     @State private var openingCoordinator = false
 
+    static func ordinaryRows(from conversations: [Conversation], coordinatorConversationId: String?) -> [Conversation] {
+        conversations.filter {
+            !$0.isCoordinator && $0.transcriptRowIdentity != coordinatorConversationId
+        }
+    }
+
     var body: some View {
         NavigationStack(path: $navPath) {
             VStack(spacing: 0) {
                 OfflineBanner()
+                Button {
+                    guard !openingCoordinator else { return }
+                    openingCoordinator = true
+                    Task {
+                        defer { openingCoordinator = false }
+                        if let id = await model.openCoordinator() {
+                            navPath.append(id)
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: "sparkle")
+                            .foregroundStyle(.tint)
+                            .frame(width: 32, height: 32)
+                            .background(.tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Ember").font(.subheadline.weight(.semibold))
+                            Text("Global coordinator").font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if openingCoordinator { ProgressView().controlSize(.small) }
+                        else { Image(systemName: "arrow.right").foregroundStyle(.secondary) }
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 9)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(openingCoordinator ? "Opening Ember, Global coordinator" : "Open Ember, Global coordinator")
+                .accessibilityHint(openingCoordinator ? "Opening the Global coordinator" : (model.connectivity.isOnline || model.coordinatorAvailableOffline ? "Open the Global coordinator" : "Connect to open Ember"))
+                .disabled(openingCoordinator || (!model.connectivity.isOnline && !model.coordinatorAvailableOffline))
+                .accessibilityIdentifier("conversationList.ember")
                 list
             }
             .navigationTitle("Conversations")
@@ -40,32 +78,6 @@ struct ConversationListView: View {
                     } label: {
                         Image(systemName: "gearshape")
                     }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    // The fleet Coordinator: one conversation that answers
-                    // questions about all the others. Ordinary conversation
-                    // underneath, so it inherits offline caching and the
-                    // outbox for free. Enabled offline once its snapshot exists.
-                    Button {
-                        guard !openingCoordinator else { return }
-                        openingCoordinator = true
-                        Task {
-                            defer { openingCoordinator = false }
-                            if let id = await model.openCoordinator() {
-                                navPath.append(id)
-                            }
-                        }
-                    } label: {
-                        if openingCoordinator {
-                            ProgressView().controlSize(.small)
-                        } else {
-                            Image(systemName: "globe")
-                        }
-                    }
-                    .disabled(
-                        openingCoordinator
-                            || (!model.connectivity.isOnline
-                                && !model.coordinatorAvailableOffline))
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -177,7 +189,7 @@ struct ConversationListView: View {
 
     @ViewBuilder
     private var list: some View {
-        if model.listStore.conversations.isEmpty {
+        if Self.ordinaryRows(from: model.listStore.conversations, coordinatorConversationId: model.coordinatorConversationId).isEmpty {
             if let error = model.listStore.lastError {
                 ContentUnavailableView {
                     Label("Couldn't load conversations", systemImage: "exclamationmark.icloud")
@@ -209,7 +221,7 @@ struct ConversationListView: View {
                             .listRowSeparator(.hidden)
                     }
                 }
-                ForEach(model.listStore.conversations, id: \.aggregateIdentity) { conversation in
+                ForEach(Self.ordinaryRows(from: model.listStore.conversations, coordinatorConversationId: model.coordinatorConversationId), id: \.aggregateIdentity) { conversation in
                     let transcriptRowId = conversation.transcriptRowIdentity
                     let navigationId = conversation.archived == true
                         ? conversation.aggregateIdentity
@@ -274,6 +286,8 @@ struct ConversationRow: View {
     let conversation: Conversation
     var isCoordinator = false
 
+    var displayTitle: String { isCoordinator ? "Ember" : conversation.displayTitle }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
@@ -286,7 +300,7 @@ struct ConversationRow: View {
                         .font(.caption)
                         .foregroundStyle(.tint)
                 }
-                Text(isCoordinator ? "Coordinator" : conversation.displayTitle)
+                Text(displayTitle)
                     .font(.body)
                     .lineLimit(1)
                 Spacer()

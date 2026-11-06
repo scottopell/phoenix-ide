@@ -812,3 +812,10 @@ context before relying on the ordinary message-delivery contract. Typed draft
 authority closes the handoff gap: text edits cannot silently erase the scope and
 revision checks that make the feedback trustworthy. The precise lifecycle is
 specified in `ios_prose_feedback.allium`.
+
+### REQ-IOS-022: Identify Ember in the Conversation List
+
+WHEN the user views the native conversation list
+THE SYSTEM SHALL provide a named Ember entry for the Global coordinator, distinct from ordinary conversation rows and lifecycle actions
+AND SHALL preserve the existing `openCoordinator()` duplicate-open guard and cached-offline availability behavior
+AND SHALL expose truthful accessible naming and disabled-state feedback.

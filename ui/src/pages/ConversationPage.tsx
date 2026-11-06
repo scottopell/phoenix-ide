@@ -2628,6 +2628,7 @@ function ConversationPageContent({
       ) : null}
       <RenderProfiler id="StateBar">
       <ConnectedStateBar
+        {...(routePrefix === '/global' ? { displayName: 'Ember' } : {})}
         slug={slug!}
         conversation={stateBarConversation as Conversation}
         convState={convStateForChildren}

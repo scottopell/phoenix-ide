@@ -1438,6 +1438,14 @@ describe('ConversationPage archived read-only rendering', () => {
     });
   });
 
+  it('uses the Ember journey name in the coordinator state bar', async () => {
+    const conversation = makeConversation({ slug: 'implementation-slug' });
+    renderPage(conversation, conversation.slug, '', '/global');
+
+    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
+    expect(document.querySelector('.statebar-mobile-slug .slug-text')).toHaveTextContent('Ember');
+  });
+
   it('does not expose a conversation terminal on coordinator routes', async () => {
     viewportFlags.isDesktop = false;
     viewportFlags.isWideDesktop = false;

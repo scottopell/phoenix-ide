@@ -632,3 +632,15 @@ THE Coordinator instructions SHALL require interpreting user feedback into expli
 THE instructions SHALL direct authorized in-scope action without redundant permission requests while preserving later user restrictions and structural execution boundaries.
 
 THE tools SHALL NOT introduce server-verified human approval, pending proposals, review UI, conversation-state transitions, timers, remote Authority mutation or automatic execution.
+
+
+### REQ-GR-023: Identify the Coordinator as Ember in Navigation
+
+WHEN a user navigates to the singleton Global Coordinator from desktop or mobile web
+THE SYSTEM SHALL provide one compact, persistently reachable entry named Ember, with Global coordinator as its secondary role description
+AND SHALL visually distinguish it from ordinary Open/History conversations without including it in their counts or lifecycle controls
+AND SHALL expose the accessible name “Open Ember”
+AND SHALL expose selected state on both `/global` and canonical `/global/<id>` routes in persistent desktop sidebar navigation
+AND SHALL replace the mobile conversation-list view with the Ember destination when the user opens Ember, rather than retain a duplicate self-navigation entry
+AND SHALL use Ember as the primary visible identity in the destination's loading/accessibility labels and Coordinator-origin return breadcrumb
+AND SHALL retain the existing singleton route, identity, transcript, and authorization behavior.

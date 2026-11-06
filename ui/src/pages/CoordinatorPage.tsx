@@ -269,13 +269,13 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
   return (
     <main className="coordinator-page" ref={journey.attach}>
       {error && <div className="coordinator-error coordinator-page-status">{error}</div>}
-      {loading ? <div className="coordinator-muted coordinator-page-status">Loading…</div> : null}
+      {loading ? <div className="coordinator-muted coordinator-page-status">Loading Ember…</div> : null}
 
 
 
-      <section className="coordinator-conversation" aria-label="Coordinator conversation" hidden={!!error || resolvedSourceSelectionKey !== sourceSelectionKey}>
+      <section className="coordinator-conversation" aria-label="Ember conversation" hidden={!!error || resolvedSourceSelectionKey !== sourceSelectionKey}>
         {resolvedCoordinatorId !== null ? fixtureData?.conversation ?? (
-          <Suspense fallback={<div className="coordinator-muted">Loading Coordinator conversation…</div>}>
+          <Suspense fallback={<div className="coordinator-muted">Loading Ember conversation…</div>}>
             <ProductConversationPage journey={journey} productId={resolvedCoordinatorId ?? undefined} globalShell={{ composerQuickAction: COORDINATOR_QUICK_ACTION, stateBarExtension }} />
           </Suspense>
         ) : null}

@@ -718,11 +718,11 @@ describe('Sidebar — ProductConversation navigation', () => {
     unsubscribe();
   });
 
-  it('labels the global nav entry as Coordinator', async () => {
+  it('labels the global nav entry as Ember', async () => {
     const conversations = [makeConv('active-id', 'active-project-one')];
 
     const { getAllByLabelText, queryByLabelText } = render(
-      <MemoryRouter initialEntries={['/c/active-project-one']}>
+      <MemoryRouter initialEntries={['/global/coordinator-id']}>
         <Sidebar
           collapsed={false}
           onToggle={vi.fn()}
@@ -735,9 +735,10 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => {
-      expect(getAllByLabelText('Coordinator').length).toBeGreaterThan(0);
+      expect(getAllByLabelText('Open Ember').length).toBeGreaterThan(0);
     });
     expect(queryByLabelText('Global Recall')).toBeNull();
+    expect(document.querySelector('.ember-entry.active')).toBeInTheDocument();
   });
 
 

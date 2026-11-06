@@ -259,7 +259,7 @@ describe('CoordinatorPage', () => {
     }));
 
     const { unmount } = renderPage();
-    expect(screen.getByText('Loading…')).toHaveClass('coordinator-page-status');
+    expect(screen.getByText('Loading Ember…')).toHaveClass('coordinator-page-status');
     resolveCoordinator({ conversation: coordinatorConversation() });
     await screen.findByText('Shared conversation runtime /global');
     unmount();
