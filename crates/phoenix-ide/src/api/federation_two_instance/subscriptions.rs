@@ -1687,6 +1687,55 @@ async fn source_and_coordinator_continuation_preserve_exact_fact_and_follow_curr
 }
 
 #[tokio::test]
+async fn owner_create_does_not_route_unsaved_uuid_to_colliding_peer_name() {
+    use phoenix_core::domain::instance_identity::OwnerPassword;
+
+    let a = TestInstance::start_with_router(false, |mut state| {
+        state.password = Some(OwnerPassword::parse("owner-only-password".into()).unwrap());
+        create_router(state)
+    })
+    .await;
+    let b = TestInstance::start().await;
+    let saved = a.connect_to(&b).await;
+    let unsaved_id = InstanceId::new();
+    a.state
+        .db
+        .save_federation_peer_connection(
+            saved.peer_instance_id,
+            &unsaved_id.to_string().parse().unwrap(),
+            &b.origin,
+            &saved.bearer_credential,
+            &b.trust,
+        )
+        .await
+        .unwrap();
+    let product = source(&b).await.product_conversation_id;
+    let response = a
+        .client
+        .post(a.endpoint("/api/federation/subscriptions/create"))
+        .bearer_auth("owner-only-password")
+        .json(&serde_json::json!({
+            "instance": unsaved_id.to_string(),
+            "product_conversation_id": product,
+            "subscription_id": Uuid::new_v4(),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    assert!(a
+        .state
+        .db
+        .remote_subscriptions(None, 1024)
+        .await
+        .unwrap()
+        .is_empty());
+
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test]
 async fn subscription_peer_bearer_cannot_use_owner_routes_and_owner_password_cannot_authorize_delivery(
 ) {
     use phoenix_core::domain::instance_identity::OwnerPassword;

@@ -925,15 +925,17 @@ pub async fn owner_create(
     Json(request): Json<OwnerSubscriptionRequest>,
 ) -> Response {
     let selector = match InstanceSelector::parse(&request.instance) {
-        Ok(InstanceSelector::Id(id)) => id.to_string(),
-        Ok(InstanceSelector::Alias(name)) => name,
+        Ok(selector) => selector,
         Err(error) => {
             tracing::debug!(%error, "owner subscription peer resolution failed");
             return rejected(StatusCode::CONFLICT);
         }
     };
-    let peer = match super::resolve_saved_peer(&state.db, &selector).await {
-        Ok(peer) => peer,
+    let peer = match state.db.resolve_federation_peer(&selector).await {
+        Ok(connection) => super::ResolvedPeer {
+            instance_id: connection.peer_instance_id,
+            connection,
+        },
         Err(error) => {
             tracing::debug!(%error, "owner subscription peer resolution failed");
             return rejected(StatusCode::CONFLICT);
