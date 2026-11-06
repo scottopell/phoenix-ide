@@ -3816,19 +3816,15 @@ def _doctor_compiler_cache_result(
             )
         absolute = _absolute_executable(binary)
         if absolute == _absolute_executable(kache_binary):
-            version, error = kache_version, kache_error
+            probe = kache_version or f"probe warning: {kache_error}"
         elif absolute == _absolute_executable(sccache_binary):
-            version, error = sccache_version, sccache_error
+            probe = sccache_version or f"probe warning: {sccache_error}"
         else:
-            version, error = None, None
-        status = (
-            f"unusable: {error}; check installation or unset RUSTC_WRAPPER"
-            if error else f"version={version or 'not probed (custom wrapper)'}"
-        )
+            probe = "not probed (custom wrapper)"
         return DoctorResult(
-            "compiler-cache", error is None,
+            "compiler-cache", True,
             f"requested=RUSTC_WRAPPER; selected=explicit wrapper {wrapper!r}; "
-            f"executable={absolute}; {status}; scope={scope}",
+            f"executable={absolute}; version={probe}; scope={scope}",
         )
 
     requested = os.environ.get("PHOENIX_COMPILER_CACHE", "auto")
@@ -3862,7 +3858,8 @@ def _doctor_compiler_cache_result(
         return DoctorResult(
             "compiler-cache", True,
             prefix + f"selected=kache; executable={_absolute_executable(kache_binary)}; "
-            f"version={kache_version}; scope=local-only; {scope}",
+            f"version={kache_version}; runtime readiness=checked when Cargo starts; "
+            f"scope=local-only; {scope}",
         )
     if requested == "kache":
         return DoctorResult("compiler-cache", False, prefix + f"selected=unavailable; kache: {kache_reason}")

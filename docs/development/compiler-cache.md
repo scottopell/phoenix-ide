@@ -6,7 +6,7 @@ Phoenix uses one compiler-cache selection path for Rust checks, ordinary develop
 
 Phoenix selects only released Kache `1.2.2` on macOS arm64, using a strictly local-only Phoenix-generated configuration. Install the official arm64 release or point `PHOENIX_KACHE_BIN` at its executable; other reported versions, including `1.0.0`, do not qualify. The v1.2.2 release tag peels to commit `96052b4842239bb216f6c4812054203c21550788`; the macOS arm64 `kache-aarch64-apple-darwin.tar.gz` release archive has SHA-256 `10d09e146852a8df8796cf642ca58872107a7f391b7647ec8cc253cf289af0a9`. These pins identify the selected release; they do not establish native restored-archive qualification.
 
-`sccache` remains supported when its executable is on `PATH`. Run `./dev.py doctor` to see the detected cache tools and versions; both are optional development prerequisites.
+`sccache` remains supported when its executable is on `PATH`. Run `./dev.py doctor` to see each optional cache tool, executable, and version plus the effective compiler-cache request, read-only selected candidate, scope, and automatic fallback reasons. Doctor does not install tools, create cache state, or start a daemon; Kache runtime readiness is checked only when a Cargo command starts. A missing optional cache is advisory under `auto`, while an unusable backend explicitly requested through `PHOENIX_COMPILER_CACHE` fails doctor actionably. An explicit `RUSTC_WRAPPER` remains authoritative and is reported without executing an unknown custom wrapper.
 
 ## Selection
 

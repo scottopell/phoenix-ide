@@ -225,6 +225,7 @@ class DevWorkflowArtifactTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertIn("requested=PHOENIX_COMPILER_CACHE=auto; selected=kache", result.detail)
         self.assertIn("executable=/usr/bin/kache; version=1.2.2", result.detail)
+        self.assertIn("runtime readiness=checked when Cargo starts", result.detail)
         self.assertIn("scope=local-only; direct Cargo subprocesses", result.detail)
         daemon.assert_not_called()
         prepare.assert_not_called()
@@ -299,16 +300,16 @@ class DevWorkflowArtifactTests(unittest.TestCase):
             self.assertTrue(disabled.ok)
             self.assertIn("selected=none", disabled.detail)
 
-    def test_doctor_cache_explicit_known_wrapper_reports_unusable_version(self):
+    def test_doctor_cache_explicit_known_wrapper_preserves_override_despite_probe_warning(self):
         with mock.patch.dict(os.environ, {"RUSTC_WRAPPER": "/usr/bin/sccache"}, clear=True):
             with mock.patch.object(self.dev.shutil, "which", return_value="/usr/bin/sccache"):
                 result = self.dev._doctor_compiler_cache_result(
                     None, None, None, "/usr/bin/sccache", None,
                     "unrecognized version output: garbage",
                 )
-        self.assertFalse(result.ok)
-        self.assertIn("unusable: unrecognized version output: garbage", result.detail)
-        self.assertIn("unset RUSTC_WRAPPER", result.detail)
+        self.assertTrue(result.ok)
+        self.assertIn("selected=explicit wrapper '/usr/bin/sccache'", result.detail)
+        self.assertIn("probe warning: unrecognized version output: garbage", result.detail)
 
     def test_doctor_cache_explicit_unusable_backend_fails_command(self):
         with mock.patch.dict(os.environ, {"PHOENIX_COMPILER_CACHE": "kache"}, clear=True):

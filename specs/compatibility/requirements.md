@@ -141,6 +141,12 @@ THE SYSTEM SHALL prefer exact Kache `1.2.2` on macOS arm64 when its owned local 
 AND SHALL otherwise select an sccache executable that passes its version probe or no compiler cache
 AND SHALL report the fallback reason and backend actually selected
 
+WHEN an operator runs the development doctor
+THE SYSTEM SHALL inspect compiler-cache availability without installing tools, starting daemons, or creating cache state
+AND SHALL report the effective explicit or automatic request, the backend selected by read-only host and version probes, its executable and scope, and any automatic fallback reasons
+AND SHALL state that Kache runtime readiness is evaluated only when a Cargo command starts
+AND SHALL report an unusable backend explicitly selected through `PHOENIX_COMPILER_CACHE` as an actionable configuration failure while preserving an explicit `RUSTC_WRAPPER`
+
 WHEN Phoenix selects Kache explicitly or automatically
 THE SYSTEM SHALL require a macOS arm64 host and an executable reporting exactly `kache 1.2.2`
 AND SHALL generate and explicitly set both `KACHE_CONFIG` and `KACHE_HOST_CONFIG` to Phoenix-owned configuration
