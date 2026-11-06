@@ -316,13 +316,10 @@ pub(crate) fn parse_retry_after(value: &str) -> Option<Duration> {
     if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
         return value.parse().ok().map(Duration::from_secs);
     }
-    chrono::DateTime::parse_from_rfc2822(value)
-        .ok()
-        .map(|date| {
-            (date.with_timezone(&chrono::Utc) - chrono::Utc::now())
-                .to_std()
-                .unwrap_or_default()
-        })
+    httpdate::parse_http_date(value).ok().map(|date| {
+        date.duration_since(std::time::SystemTime::now())
+            .unwrap_or_default()
+    })
 }
 
 impl Drop for HttpTransport {
@@ -744,8 +741,8 @@ impl ServerStream {
     fn classify_stream_status(&self, status: reqwest::StatusCode) -> Option<StreamOutcome> {
         match status.as_u16() {
             // A session-bearing 404 means the session is gone: signal the
-            // protocol layer so the next definitions read re-establishes (new
-            // session + fresh GET stream) rather than leaving the server
+            // protocol layer so its owner re-establishes (new session + fresh
+            // GET stream) rather than leaving the server
             // `ready` on a dead session (REQ-MCP-005); a re-GET on the dead
             // session would only 404 again.
             404 if self.session_id.is_some() => {
@@ -1895,8 +1892,7 @@ mod tests {
     async fn server_initiated_stream_404_flags_session_reset() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
         // The session-bearing GET stream observes the session expired (404). It
-        // must flag the server so the next definitions read re-establishes
-        // (REQ-MCP-005), not leave it ready on a dead session.
+        // flags the raw server and notifies its owning manager (REQ-MCP-005).
         server.set_get_responses(vec![status_response(404, &[])]);
         let mcp = connect_http(&server, HttpAuth::None)
             .await
@@ -1918,6 +1914,76 @@ mod tests {
         let gets = server.get_recorded();
         assert_eq!(gets.len(), 1, "a dead session must not be re-GETted");
         assert_eq!(gets[0].header("mcp-session-id"), Some("sess-1"));
+    }
+
+    #[tokio::test]
+    async fn idle_stream_expiry_recovers_without_a_consumer_and_does_not_retain_the_manager() {
+        let mut responses = handshake_responses("sess-1");
+        responses.push(delete_ack());
+        responses.extend(handshake_responses("sess-2"));
+        let server = TestServer::start(responses).await;
+        server.set_get_responses(vec![status_response(404, &[]), status_response(405, &[])]);
+        let manager = McpClientManager::new();
+        manager
+            .reload_from_configs(vec![(
+                "remote".into(),
+                http_config(&server.url, HttpAuth::None),
+            )])
+            .await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let handle = manager.servers.read().await.get("remote").cloned().unwrap();
+                if handle.snapshot().epoch > 0 && handle.snapshot().is_ready() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect(
+            "idle GET expiry recovers without definitions, tool calls, reload, or status API reads",
+        );
+        manager.await_background_tasks().await;
+        assert_eq!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.rpc_method() == "initialize")
+                .count(),
+            2
+        );
+        let gets = server.get_recorded();
+        assert_eq!(
+            gets.iter()
+                .filter(|r| r.header("mcp-session-id") == Some("sess-1"))
+                .count(),
+            1
+        );
+        let weak_servers = Arc::downgrade(&manager.servers);
+        let weak_transport = {
+            let snapshot = manager
+                .servers
+                .read()
+                .await
+                .get("remote")
+                .unwrap()
+                .snapshot();
+            let crate::supervisor::SupervisorState::Ready(connection) = snapshot.state else {
+                panic!("ready");
+            };
+            Arc::downgrade(&connection.transport)
+        };
+        server.push_responses(vec![delete_ack()]);
+        drop(manager);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while weak_servers.upgrade().is_some() || weak_transport.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("idle observer holds neither the manager map nor the supervisor mailbox alive");
     }
 
     #[tokio::test]
@@ -2299,6 +2365,51 @@ mod tests {
             .contains("redirect rejected"));
         assert!(status.next_retry_at.is_none());
         assert!(status.pending_oauth_url.is_none());
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn malformed_challenge_metadata_does_not_expose_its_url_in_status() {
+        let server = TestServer::start(vec![]).await;
+        let private_path = "/private-metadata?access_token=metadata-secret";
+        let challenge = format!(
+            "Bearer resource_metadata=\"{}{private_path}\"",
+            server.base()
+        );
+        server.push_responses(vec![status_response(
+            401,
+            &[("www-authenticate", &challenge)],
+        )]);
+        server.route("/private-metadata", json_doc(&serde_json::json!({})));
+        for path in [
+            "/.well-known/oauth-protected-resource/mcp",
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-authorization-server",
+            "/.well-known/openid-configuration",
+        ] {
+            server.route(path, status_response(404, &[]));
+        }
+        let manager = McpClientManager::new();
+        manager.set_oauth_redirect_base(REDIRECT_BASE.into());
+        manager
+            .reload_from_configs(vec![(
+                "remote".into(),
+                http_config(&server.url, HttpAuth::None),
+            )])
+            .await;
+        manager.await_background_tasks().await;
+        let status = &manager.status().await[0];
+        assert_eq!(status.state, crate::McpConnState::Failed);
+        let error = status.last_error.as_ref().unwrap();
+        assert!(error.contains("no authorization_servers"), "{error}");
+        for private in [
+            "metadata-secret",
+            "access_token",
+            "private-metadata",
+            server.base().as_str(),
+        ] {
+            assert!(!error.contains(private), "{error}");
+        }
         manager.shutdown().await;
     }
 
@@ -3023,11 +3134,21 @@ mod tests {
         assert_eq!(parse_retry_after("7"), Some(Duration::from_secs(7)));
         assert_eq!(parse_retry_after("-1"), None);
         assert_eq!(parse_retry_after("later"), None);
-        let date = (chrono::Utc::now() + chrono::Duration::seconds(120))
-            .format("%a, %d %b %Y %H:%M:%S GMT")
-            .to_string();
-        let delay = parse_retry_after(&date).unwrap();
-        assert!((118..=120).contains(&delay.as_secs()));
+        let future = chrono::Utc::now() + chrono::Duration::seconds(120);
+        for format in [
+            "%a, %d %b %Y %H:%M:%S GMT",
+            "%A, %d-%b-%y %H:%M:%S GMT",
+            "%a %b %e %H:%M:%S %Y",
+        ] {
+            let date = future.format(format).to_string();
+            let delay =
+                parse_retry_after(&date).unwrap_or_else(|| panic!("valid HTTP date: {date}"));
+            assert!((118..=120).contains(&delay.as_secs()), "{date}: {delay:?}");
+        }
+        assert_eq!(
+            parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(Duration::ZERO)
+        );
     }
 
     #[tokio::test]
@@ -3078,6 +3199,7 @@ mod tests {
                 config: http_config(&server.url, HttpAuth::None),
                 tools: <_>::default(),
                 tools_changed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                session_reset: Arc::new(tokio::sync::Notify::new()),
                 pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
                 oauth_bearer: bearer,
             };
@@ -6004,6 +6126,7 @@ mod tests {
             config: http_config(&server.url, HttpAuth::None),
             tools: <_>::default(),
             tools_changed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            session_reset: Arc::new(tokio::sync::Notify::new()),
             pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
             oauth_bearer: bearer,
         };

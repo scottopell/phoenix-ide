@@ -27,6 +27,7 @@ futures = "0.3"
 # carries the OAuth token-endpoint grants (application/x-www-form-urlencoded).
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "stream", "rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["std"] }
+httpdate = "1.0.3"
 
 # Serialization (JSON-RPC messages, server configs, OAuth records).
 serde = { version = "1", features = ["derive"] }

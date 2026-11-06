@@ -363,6 +363,8 @@ rule HttpSessionExpired {
         -- 404 on a session-bearing non-DELETE request expires the session and
         -- re-runs initialize (REQ-MCP-005). DELETE 404 instead finishes cleanup;
         -- it does not emit HttpSessionNotFound or create another session.
+        -- A session-bearing GET stream emits the same event while idle, waking
+        -- the existing epoch-fenced recovery owner without a consumer read.
 }
 
 -- REQ-MCP-007/012/013: lifecycle retries have an owner even without callers.

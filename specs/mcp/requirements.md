@@ -157,6 +157,9 @@ WHEN a non-DELETE request to a session-bearing server returns HTTP 404
 THE SYSTEM SHALL treat the session as expired and re-initialize before any retry
 permitted by the caller's execution policy under REQ-MCP-003. Session expiry SHALL
 NOT authorize replay of a dispatched single-attempt operation.
+An idle server-initiated GET stream reporting this expiry SHALL wake the existing
+connection recovery owner without requiring a tool call, definitions read, reload
+or status request. A retired connection's signal SHALL NOT recover its replacement.
 
 WHEN session DELETE returns HTTP 404, THE SYSTEM SHALL treat that session as
 already absent and finish cleanup without re-initializing it.

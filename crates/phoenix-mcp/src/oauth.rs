@@ -482,9 +482,9 @@ pub async fn fetch_protected_resource_metadata(
             Ok(doc) => {
                 let authorization_servers = string_list(doc.get("authorization_servers"));
                 if authorization_servers.is_empty() {
-                    errors.push(OAuthRequestError::Permanent(format!(
-                        "{candidate}: no authorization_servers"
-                    )));
+                    errors.push(OAuthRequestError::Permanent(
+                        "protected resource metadata: no authorization_servers".to_string(),
+                    ));
                     continue;
                 }
                 return Ok(ProtectedResourceMetadata {
@@ -507,16 +507,13 @@ pub async fn fetch_protected_resource_metadata(
         for candidate in as_metadata_candidates(&origin) {
             match fetch_json(client, &candidate).await {
                 Ok(doc) => {
-                    let Some(issuer) = auth_server_issuer_from_metadata(&doc) else {
-                        errors.push(OAuthRequestError::Permanent(format!(
-                            "{candidate}: not authorization server metadata"
-                        )));
+                    let Some(_) = auth_server_issuer_from_metadata(&doc) else {
+                        errors.push(OAuthRequestError::Permanent(
+                            "same-origin metadata: not authorization server metadata".to_string(),
+                        ));
                         continue;
                     };
                     tracing::warn!(
-                        mcp_url = %mcp_url,
-                        metadata_url = %candidate,
-                        issuer = %issuer,
                         "protected resource metadata missing; falling back to same-origin authorization server metadata"
                     );
                     return Ok(ProtectedResourceMetadata {
@@ -599,9 +596,9 @@ fn check_advertised_issuer(advertised: &str, fetch_url: &str, trust: IssuerTrust
         return IssuerCheck::Ok;
     }
     match trust {
-        IssuerTrust::Strict => IssuerCheck::Rejected(format!(
-            "issuer '{advertised}' does not match '{fetch_url}'"
-        )),
+        IssuerTrust::Strict => IssuerCheck::Rejected(
+            "advertised issuer does not match the expected authorization server".to_string(),
+        ),
         IssuerTrust::ResourceAdvertised => IssuerCheck::Accepted,
     }
 }
@@ -623,9 +620,9 @@ pub async fn fetch_auth_server_metadata(
 ) -> Result<AuthServerMetadata, OAuthRequestError> {
     let candidates = as_metadata_candidates(issuer);
     if candidates.is_empty() {
-        return Err(OAuthRequestError::Permanent(format!(
-            "invalid authorization server URL '{issuer}'"
-        )));
+        return Err(OAuthRequestError::Permanent(
+            "invalid authorization server URL".to_string(),
+        ));
     }
 
     let mut errors = Vec::new();
@@ -643,16 +640,12 @@ pub async fn fetch_auth_server_metadata(
             IssuerCheck::Ok => {}
             IssuerCheck::Accepted => {
                 tracing::debug!(
-                    fetched_from = %candidate,
-                    advertised_issuer = %advertised_issuer,
                     "authorization server metadata declares an issuer differing from its \
                      resource-advertised location; accepting the declared issuer"
                 );
             }
             IssuerCheck::Rejected(reason) => {
-                errors.push(OAuthRequestError::Permanent(format!(
-                    "{candidate}: {reason}"
-                )));
+                errors.push(OAuthRequestError::Permanent(reason));
                 continue;
             }
         }
@@ -661,19 +654,21 @@ pub async fn fetch_auth_server_metadata(
             doc.get("authorization_endpoint").and_then(Value::as_str),
             doc.get("token_endpoint").and_then(Value::as_str),
         ) else {
-            errors.push(OAuthRequestError::Permanent(format!(
-                "{candidate}: missing authorization_endpoint or token_endpoint"
-            )));
+            errors.push(OAuthRequestError::Permanent(
+                "authorization server metadata: missing authorization_endpoint or token_endpoint"
+                    .to_string(),
+            ));
             continue;
         };
 
         let pkce_methods = string_list(doc.get("code_challenge_methods_supported"));
         if !pkce_methods.iter().any(|m| m == "S256") {
-            return Err(OAuthRequestError::Permanent(format!(
-                "authorization server '{issuer}' does not advertise S256 in \
+            return Err(OAuthRequestError::Permanent(
+                "authorization server does not advertise S256 in \
                  code_challenge_methods_supported; refusing to authorize without PKCE \
                  (OAuth 2.1)"
-            )));
+                    .to_string(),
+            ));
         }
 
         return Ok(AuthServerMetadata {
@@ -695,7 +690,7 @@ pub async fn fetch_auth_server_metadata(
         });
     }
     Err(OAuthRequestError::metadata_failure(
-        &format!("authorization server metadata not found for '{issuer}' (RFC 8414 / OIDC)"),
+        "authorization server metadata not found (RFC 8414 / OIDC)",
         &errors,
     ))
 }

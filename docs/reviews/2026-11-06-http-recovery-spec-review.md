@@ -269,3 +269,15 @@ all-target Clippy, TypeScript, focused ESLint, formatting and Allium/anchor chec
 CI found that an independently merged decision had taken ADR-229. After rebasing
 onto current main, this unpublished decision is ADR-230; existing accepted
 decisions are unchanged. The combined spec-shape validator passes locally.
+
+The next GitHub review found idle GET-stream expiry deferred recovery until a
+consumer read, malformed metadata errors exposing challenge URLs, and incomplete
+HTTP-date parsing for Retry-After. Idle expiry now wakes the existing supervisor
+recovery claim. The observer is scoped to the serving epoch/connection, exits on
+retirement and holds neither the manager map nor supervisor mailbox alive.
+Metadata diagnostics omit endpoint/challenge URLs, and Retry-After uses the
+already locked HTTP-date parser for modern, RFC 850 and asctime date forms.
+Regressions exercise autonomous idle recovery, manager/transport release,
+malformed private metadata through the status API, and all three date formats.
+All 194 MCP tests pass, with all-target MCP Clippy, formatting and Allium/anchor
+checks passing. These changes leave the previously verified UI code unchanged.

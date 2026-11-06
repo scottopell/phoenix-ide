@@ -696,6 +696,7 @@ impl std::fmt::Display for HandshakeFailure {
 struct NotificationSink {
     server: String,
     tools_changed: Arc<AtomicBool>,
+    session_reset: Arc<tokio::sync::Notify>,
 }
 
 impl ServerMessageSink for NotificationSink {
@@ -720,22 +721,26 @@ impl ServerMessageSink for NotificationSink {
     }
 
     fn on_session_reset(&self) {
-        // The session is gone; force the next definitions read to re-verify,
-        // which re-establishes the connection on the expired-session tools/list.
         tracing::info!(
             server = %self.server,
-            "GET stream observed a session reset -- will re-establish on next definitions() call"
+            "GET stream observed a session reset -- waking connection recovery"
         );
         self.tools_changed.store(true, Ordering::Release);
+        self.session_reset.notify_one();
     }
 }
 
 /// Build the protocol-layer sink for a server, shared between the per-request
 /// path and the transport's server-initiated GET stream.
-fn notification_sink(name: &str, tools_changed: &Arc<AtomicBool>) -> Arc<dyn ServerMessageSink> {
+fn notification_sink(
+    name: &str,
+    tools_changed: &Arc<AtomicBool>,
+    session_reset: &Arc<tokio::sync::Notify>,
+) -> Arc<dyn ServerMessageSink> {
     Arc::new(NotificationSink {
         server: name.to_string(),
         tools_changed: Arc::clone(tools_changed),
+        session_reset: Arc::clone(session_reset),
     })
 }
 
@@ -762,6 +767,7 @@ pub struct McpServer {
     /// the HTTP transport's server-initiated GET stream sets it from a
     /// detached task (REQ-MCP-006), not only the per-request sink.
     tools_changed: Arc<AtomicBool>,
+    session_reset: Arc<tokio::sync::Notify>,
     /// Shared map of server name → OAuth URL; written by the stdio stderr
     /// drain, read by `McpClientManager::status()`. Retained so a respawned
     /// transport keeps feeding the same map.
@@ -785,12 +791,13 @@ impl McpServer {
         oauth_bearer: SharedBearer,
     ) -> Result<Self, String> {
         let tools_changed = Arc::new(AtomicBool::new(false));
+        let session_reset = Arc::new(tokio::sync::Notify::new());
         let transport = connect_transport(
             name,
             &config,
             Arc::clone(&pending_oauth_urls),
             &oauth_bearer,
-            notification_sink(name, &tools_changed),
+            notification_sink(name, &tools_changed, &session_reset),
         )
         .await?;
         Ok(Self {
@@ -799,6 +806,7 @@ impl McpServer {
             tools: Arc::new(std::sync::RwLock::new(Vec::new())),
             config,
             tools_changed,
+            session_reset,
             pending_oauth_urls,
             oauth_bearer,
         })
@@ -815,6 +823,7 @@ impl McpServer {
         let sink = NotificationSink {
             server: self.name.clone(),
             tools_changed: Arc::clone(&self.tools_changed),
+            session_reset: Arc::clone(&self.session_reset),
         };
         self.transport.request(method, params, timeout, &sink).await
     }
@@ -972,6 +981,7 @@ impl McpServer {
             transport: Arc::clone(&self.transport),
             config: self.config.clone(),
             tools_changed: Arc::clone(&self.tools_changed),
+            session_reset: Arc::clone(&self.session_reset),
             oauth_bearer: Arc::clone(&self.oauth_bearer),
             tools: Arc::clone(&self.tools),
         }
@@ -1022,7 +1032,7 @@ impl McpServer {
                 &self.config,
                 Arc::clone(&self.pending_oauth_urls),
                 &self.oauth_bearer,
-                notification_sink(&self.name, &self.tools_changed),
+                notification_sink(&self.name, &self.tools_changed, &self.session_reset),
             )
             .await
             .map_err(HandshakeFailure::Other)?,
@@ -1083,6 +1093,7 @@ pub(crate) struct CallContext {
     transport: Arc<dyn McpTransport>,
     config: McpServerConfig,
     tools_changed: Arc<AtomicBool>,
+    session_reset: Arc<tokio::sync::Notify>,
     oauth_bearer: SharedBearer,
 }
 
@@ -1104,6 +1115,7 @@ impl CallContext {
         let sink = NotificationSink {
             server: self.name.clone(),
             tools_changed: Arc::clone(&self.tools_changed),
+            session_reset: Arc::clone(&self.session_reset),
         };
         self.transport.request(method, params, timeout, &sink).await
     }
@@ -2982,8 +2994,17 @@ impl McpClientManager {
             }
             match result {
                 Ok(server) => {
+                    let session_reset = Arc::clone(&server.session_reset);
                     if handle.publish(epoch, server).await {
                         pending.write().await.remove(name);
+                        if matches!(config, McpServerConfig::Http { .. }) {
+                            self.observe_session_reset(
+                                name.to_owned(),
+                                handle,
+                                epoch,
+                                session_reset,
+                            );
+                        }
                         Ok(())
                     } else {
                         Err("MCP connection was superseded".to_owned())
@@ -3058,6 +3079,67 @@ impl McpClientManager {
                 }
             }
         })
+    }
+
+    fn observe_session_reset(
+        &self,
+        name: String,
+        handle: &SupervisorHandle,
+        epoch: u64,
+        reset: Arc<tokio::sync::Notify>,
+    ) {
+        let mut snapshots = handle.subscribe();
+        // Idle observation must not keep the manager or supervisor mailbox alive.
+        let Self {
+            servers,
+            disabled_servers,
+            reload_serial,
+            pending_oauth_urls,
+            removal_errors,
+            #[cfg(test)]
+            background_tasks,
+            oauth,
+        } = self.clone();
+        let servers = Arc::downgrade(&servers);
+        tokio::spawn(async move {
+            loop {
+                let snapshot = snapshots.borrow().clone();
+                if snapshot.epoch != epoch || !snapshot.is_ready() {
+                    return;
+                }
+                tokio::select! {
+                    () = reset.notified() => break,
+                    result = snapshots.changed() => { if result.is_err() { return; } }
+                }
+            }
+            let Some(servers) = servers.upgrade() else {
+                return;
+            };
+            let Some(handle) = servers.read().await.get(&name).cloned() else {
+                return;
+            };
+            let current = handle.snapshot();
+            if current.epoch != epoch
+                || !matches!(&current.state,
+                SupervisorState::Ready(server) if Arc::ptr_eq(&server.session_reset, &reset))
+            {
+                return;
+            }
+            let manager = Self {
+                servers,
+                disabled_servers,
+                reload_serial,
+                pending_oauth_urls,
+                removal_errors,
+                #[cfg(test)]
+                background_tasks,
+                oauth,
+            };
+            let recovery = manager.clone();
+            manager.spawn_background(async move {
+                let _ = recovery.recover_actor(&name, &handle, epoch, None).await;
+            });
+        });
     }
 
     fn spawn_connect_retry(
@@ -5677,6 +5759,7 @@ mod tests {
                     tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
                 },
                 tools_changed: Arc::new(AtomicBool::new(false)),
+                session_reset: Arc::new(tokio::sync::Notify::new()),
                 pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
                 oauth_bearer: Arc::default(),
             },
@@ -5770,6 +5853,7 @@ mod tests {
             tools: Arc::new(std::sync::RwLock::new(Vec::new())),
             config,
             tools_changed: Arc::new(AtomicBool::new(false)),
+            session_reset: Arc::new(tokio::sync::Notify::new()),
             pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
             oauth_bearer: Arc::default(),
         };

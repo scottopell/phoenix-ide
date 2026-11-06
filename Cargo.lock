@@ -3064,6 +3064,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "futures",
+ "httpdate",
  "phoenix-core",
  "reqwest 0.13.4",
  "rustls",
