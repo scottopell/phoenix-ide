@@ -48,46 +48,6 @@ impl InstanceSelector {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use proptest::prelude::*;
-
-    proptest! {
-        #[test]
-        fn only_exact_local_selects_local(selector in prop_oneof![Just("local".to_string()), any::<String>()]) {
-            let parsed: InstanceSelector = serde_json::from_value(json!(selector)).unwrap();
-            match parsed {
-                InstanceSelector::Local => prop_assert_eq!(selector, "local"),
-                InstanceSelector::Remote(remote) => {
-                    prop_assert_ne!(selector.as_str(), "local");
-                    prop_assert_eq!(remote.as_str(), selector.as_str());
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn local_spelling_variants_and_uuids_remain_remote_selectors() {
-        for selector in [
-            "Local",
-            "LOCAL",
-            " local",
-            "local ",
-            "",
-            " ",
-            "missing-peer",
-            "00000000-0000-4000-8000-000000000001",
-        ] {
-            let parsed: InstanceSelector = serde_json::from_value(json!(selector)).unwrap();
-            let InstanceSelector::Remote(remote) = parsed else {
-                panic!("unexpected local alias: {selector:?}");
-            };
-            assert_eq!(remote.as_str(), selector);
-        }
-    }
-}
-
 pub(crate) enum Route<T> {
     Local,
     Remote(T),
@@ -107,7 +67,7 @@ pub(crate) trait RoutedTool: Send + Sync {
         false
     }
     fn schema_without_instance(&self) -> Value;
-    fn db(&self) -> &crate::db::Database;
+    fn resolution_db(&self) -> &crate::db::Database;
     fn peer_resolution(&self) -> PeerResolution {
         PeerResolution::SavedUuidOrName
     }
@@ -128,7 +88,7 @@ pub(crate) trait RoutedTool: Send + Sync {
 pub(crate) struct RouteTool<T>(T);
 
 impl<T: RoutedTool + 'static> RouteTool<T> {
-    pub(crate) fn new(inner: T) -> Arc<dyn Tool> {
+    pub(crate) fn boxed(inner: T) -> Arc<dyn Tool> {
         Arc::new(Self(inner))
     }
 }
@@ -187,7 +147,7 @@ impl<T: RoutedTool + 'static> Tool for RouteTool<T> {
                     return ToolOutput::error(error);
                 }
                 match crate::api::federation::resolve_tool_peer(
-                    self.0.db(),
+                    self.0.resolution_db(),
                     &selector,
                     self.0.peer_resolution(),
                 )
@@ -204,3 +164,43 @@ impl<T: RoutedTool + 'static> Tool for RouteTool<T> {
 
 use crate::tools::{Tool, ToolContext, ToolOutput};
 use std::sync::Arc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn only_exact_local_selects_local(selector in prop_oneof![Just("local".to_string()), any::<String>()]) {
+            let parsed: InstanceSelector = serde_json::from_value(json!(selector)).unwrap();
+            match parsed {
+                InstanceSelector::Local => prop_assert_eq!(selector, "local"),
+                InstanceSelector::Remote(remote) => {
+                    prop_assert_ne!(selector.as_str(), "local");
+                    prop_assert_eq!(remote.as_str(), selector.as_str());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_spelling_variants_and_uuids_remain_remote_selectors() {
+        for selector in [
+            "Local",
+            "LOCAL",
+            " local",
+            "local ",
+            "",
+            " ",
+            "missing-peer",
+            "00000000-0000-4000-8000-000000000001",
+        ] {
+            let parsed: InstanceSelector = serde_json::from_value(json!(selector)).unwrap();
+            let InstanceSelector::Remote(remote) = parsed else {
+                panic!("unexpected local alias: {selector:?}");
+            };
+            assert_eq!(remote.as_str(), selector);
+        }
+    }
+}

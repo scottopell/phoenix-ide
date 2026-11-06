@@ -4057,13 +4057,10 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_remote_query_does_not_follow_307_or_308() {
+        use phoenix_core::domain::instance_identity::PeerBearerCredential;
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         let peer = InstanceId::new();
-        let token = phoenix_core::domain::instance_identity::PeerBearerCredential::parse(format!(
-            "phx_peer_{}",
-            "a".repeat(43)
-        ))
-        .unwrap();
+        let token = PeerBearerCredential::parse(format!("phx_peer_{}", "a".repeat(43))).unwrap();
 
         for (status, cross_origin) in [
             ("307 Temporary Redirect", false),

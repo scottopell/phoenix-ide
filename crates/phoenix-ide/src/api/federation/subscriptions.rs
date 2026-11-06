@@ -499,7 +499,7 @@ pub(crate) async fn create_saved_peer_subscription(
         subscription_id: id,
         operation: SubscriptionOperation::Create,
     };
-    let response = request_active_peer_subscription(db, &peer, &request)
+    let response = request_active_peer_subscription(db, peer, &request)
         .await
         .map_err(|error| error.to_string())?;
     let SubscriptionResult::Created { snapshot } = response.result else {
@@ -534,7 +534,7 @@ pub(crate) async fn unsubscribe_saved_peer(
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "active or pending remote subscription not found".to_string())?;
-    unsubscribe_remote(db, &peer, &remote).await
+    unsubscribe_remote(db, peer, &remote).await
 }
 
 pub(crate) async fn unsubscribe_remote(

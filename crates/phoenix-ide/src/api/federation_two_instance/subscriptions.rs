@@ -1202,15 +1202,13 @@ async fn offline_unsubscribe_is_locally_stopped_and_retries_the_exact_remote_ide
     let a = TestInstance::start().await;
     let b = TestInstance::start().await;
     let peer = a.connect_to(&b).await;
+    let peer_id = peer.peer_instance_id.to_string();
     let source = source(&b).await;
     let remote = create_saved_peer_subscription(
         &a.state.db,
-        &crate::api::federation::resolve_saved_peer_for_test(
-            &a.state.db,
-            &peer.peer_instance_id.to_string(),
-        )
-        .await
-        .unwrap(),
+        &crate::api::federation::resolve_saved_peer_for_test(&a.state.db, &peer_id)
+            .await
+            .unwrap(),
         source.product_conversation_id.clone(),
         None,
     )
@@ -1240,12 +1238,9 @@ async fn offline_unsubscribe_is_locally_stopped_and_retries_the_exact_remote_ide
         .unwrap();
     let receipt = unsubscribe_saved_peer(
         &a.state.db,
-        &crate::api::federation::resolve_saved_peer_for_test(
-            &a.state.db,
-            &peer.peer_instance_id.to_string(),
-        )
-        .await
-        .unwrap(),
+        &crate::api::federation::resolve_saved_peer_for_test(&a.state.db, &peer_id)
+            .await
+            .unwrap(),
         source.product_conversation_id.clone(),
     )
     .await
@@ -1265,12 +1260,9 @@ async fn offline_unsubscribe_is_locally_stopped_and_retries_the_exact_remote_ide
         .is_empty());
     assert!(create_saved_peer_subscription(
         &a.state.db,
-        &crate::api::federation::resolve_saved_peer_for_test(
-            &a.state.db,
-            &peer.peer_instance_id.to_string()
-        )
-        .await
-        .unwrap(),
+        &crate::api::federation::resolve_saved_peer_for_test(&a.state.db, &peer_id)
+            .await
+            .unwrap(),
         source.product_conversation_id.clone(),
         None
     )
@@ -1814,6 +1806,7 @@ async fn source_revocation_without_pending_notifications_ends_create_or_replay_l
         let a = TestInstance::start().await;
         let b = TestInstance::start().await;
         let peer = a.connect_to(&b).await;
+        let peer_id = peer.peer_instance_id.to_string();
         let source = source(&b).await;
         let reference = SubscriptionReference {
             instance_id: peer.peer_instance_id,
@@ -1828,12 +1821,9 @@ async fn source_revocation_without_pending_notifications_ends_create_or_replay_l
         if enrolled {
             let remote = create_saved_peer_subscription(
                 &a.state.db,
-                &crate::api::federation::resolve_saved_peer_for_test(
-                    &a.state.db,
-                    &peer.peer_instance_id.to_string(),
-                )
-                .await
-                .unwrap(),
+                &crate::api::federation::resolve_saved_peer_for_test(&a.state.db, &peer_id)
+                    .await
+                    .unwrap(),
                 source.product_conversation_id.clone(),
                 Some(id),
             )

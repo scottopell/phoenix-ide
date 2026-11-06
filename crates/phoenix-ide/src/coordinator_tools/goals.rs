@@ -32,7 +32,7 @@ struct ReadGoalTool {
 
 pub(super) fn tools(runtime: &Arc<RuntimeManager>) -> Vec<Arc<dyn Tool>> {
     let service = GoalCommandService::new(Arc::clone(runtime));
-    let mut tools = vec![super::instance::RouteTool::new(ReadGoalTool {
+    let mut tools = vec![super::instance::RouteTool::boxed(ReadGoalTool {
         service: service.clone(),
         runtime: Arc::clone(runtime),
     })];
@@ -154,14 +154,14 @@ impl super::instance::RoutedTool for ReadGoalTool {
     fn schema_without_instance(&self) -> Value {
         json!({"type":"object","properties":{"target":target_schema(),"after_version":{"type":"integer","minimum":0,"description":"History cursor only; entries at or before this Goal version are omitted."},"wait":{"type":"object","properties":{"minimum_version":{"type":"integer","minimum":0},"timeout_seconds":{"type":"integer","minimum":1,"maximum":25}},"required":["minimum_version","timeout_seconds"],"additionalProperties":false}},"required":["target"],"additionalProperties":false})
     }
-    fn db(&self) -> &crate::db::Database {
+    fn resolution_db(&self) -> &crate::db::Database {
         self.runtime.db()
     }
     async fn authorize(&self, ctx: &ToolContext) -> Result<(), String> {
         self.service
             .authorize_coordinator(&ctx.conversation_id)
             .await
-            .map_err(|error| self.refusal(error))
+            .map_err(ReadGoalTool::refusal)
     }
     async fn run_routed(
         &self,
@@ -177,11 +177,11 @@ impl super::instance::RoutedTool for ReadGoalTool {
 }
 
 impl ReadGoalTool {
-    fn bad_input(&self, error: &serde_json::Error) -> String {
+    fn bad_input(error: &serde_json::Error) -> String {
         format!("Invalid read_goal input: {error}. Read the tool schema; authority and versions are server-derived.")
     }
 
-    fn refusal(&self, error: crate::api::handlers::AppError) -> String {
+    fn refusal(error: crate::api::handlers::AppError) -> String {
         use crate::api::handlers::AppError;
         let message = match error {
             AppError::Conflict(response) => response.error,
@@ -204,11 +204,11 @@ impl ReadGoalTool {
         route: super::instance::Route<crate::api::federation::ResolvedPeer>,
     ) -> Result<Value, String> {
         let args: ReadInput =
-            serde_json::from_value(input).map_err(|error| self.bad_input(&error))?;
+            serde_json::from_value(input).map_err(|error| ReadGoalTool::bad_input(&error))?;
         self.service
             .authorize_coordinator(&ctx.conversation_id)
             .await
-            .map_err(|error| self.refusal(error))?;
+            .map_err(ReadGoalTool::refusal)?;
         let owner = target(&args.target)?;
         let after = GoalVersion::parse(args.after_version.unwrap_or(0))
             .map_err(|error| error.to_string())?;
@@ -218,7 +218,7 @@ impl ReadGoalTool {
                     .service
                     .read_coordinator(&ctx.conversation_id, &owner, after)
                     .await
-                    .map_err(|error| self.refusal(error))?;
+                    .map_err(ReadGoalTool::refusal)?;
                 Ok(
                     json!({"target":args.target,"current":current,"history":history,"history_page_size":100,"execution_state_included":false}),
                 )
@@ -229,7 +229,7 @@ impl ReadGoalTool {
                     .service
                     .wait_coordinator(&ctx.conversation_id, &owner, after, wait)
                     .await
-                    .map_err(|error| self.refusal(error))?;
+                    .map_err(ReadGoalTool::refusal)?;
                 Ok(
                     json!({"target":args.target,"exact_transcript_id":result.destination_transcript_id(),"current":result.current(),"history":result.history(),"history_page_size":100,"execution_state_included":false,"wait_status":result.status()}),
                 )

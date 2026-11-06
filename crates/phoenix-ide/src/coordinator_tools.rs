@@ -191,14 +191,14 @@ pub(crate) fn research_tools(
 ) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(SearchConversations(service.clone())),
-        instance::RouteTool::new(FederatedReadConversation {
+        instance::RouteTool::boxed(FederatedReadConversation {
             service: service.clone(),
             remote_db: db.clone(),
         }),
         Arc::new(QueryDatabase::Local(service.clone())),
         Arc::new(WorkScopeResearchReadFile(service.clone())),
         Arc::new(WorkScopeCoordinatorBash(service.clone())),
-        instance::RouteTool::new(ResolveReference {
+        instance::RouteTool::boxed(ResolveReference {
             service,
             remote_db: db,
         }),
@@ -271,15 +271,15 @@ pub(crate) fn tools(
     let close_retry = send_chat.clone();
     let mut tools = WritingConversationTools::new(
         Arc::new(SearchConversations(service.clone())),
-        instance::RouteTool::new(FederatedReadConversation {
+        instance::RouteTool::boxed(FederatedReadConversation {
             service: service.clone(),
             remote_db: db.clone(),
         }),
-        instance::RouteTool::new(FederatedQueryDatabase {
+        instance::RouteTool::boxed(FederatedQueryDatabase {
             service: service.clone(),
             remote_db: db.clone(),
         }),
-        instance::RouteTool::new(FederatedSendConversationMessage {
+        instance::RouteTool::boxed(FederatedSendConversationMessage {
             local: SendConversationMessage {
                 service: service.clone(),
                 send_chat,
@@ -292,7 +292,7 @@ pub(crate) fn tools(
     .collect::<Vec<_>>();
     tools.insert(
         3,
-        instance::RouteTool::new(ResolveReference {
+        instance::RouteTool::boxed(ResolveReference {
             service: service.clone(),
             remote_db: db.clone(),
         }),
@@ -305,15 +305,15 @@ pub(crate) fn tools(
     tools.push(Arc::new(CoordinatorPresentSvgTool::new(Arc::new(
         GlobalCoordinatorSvgSourceResolver(service),
     ))));
-    tools.push(instance::RouteTool::new(WatchConversation {
+    tools.push(instance::RouteTool::boxed(WatchConversation {
         db: watch_db.clone(),
         peer_db: db.clone(),
     }));
-    tools.push(instance::RouteTool::new(UnwatchConversation {
+    tools.push(instance::RouteTool::boxed(UnwatchConversation {
         db: watch_db.clone(),
         peer_db: db.clone(),
     }));
-    tools.push(instance::RouteTool::new(ListWatchedConversations {
+    tools.push(instance::RouteTool::boxed(ListWatchedConversations {
         db: watch_db,
         peer_db: db.clone(),
     }));
@@ -430,7 +430,7 @@ impl instance::RoutedTool for WatchConversation {
     fn schema_without_instance(&self) -> Value {
         json!({"type":"object","properties":{"product_conversation_id":{"type":"string","minLength":1,"maxLength":1024}},"required":["product_conversation_id"],"additionalProperties":false})
     }
-    fn db(&self) -> &crate::db::Database {
+    fn resolution_db(&self) -> &crate::db::Database {
         &self.peer_db
     }
     async fn run_routed(
@@ -486,7 +486,7 @@ impl instance::RoutedTool for UnwatchConversation {
     fn schema_without_instance(&self) -> Value {
         json!({"type":"object","properties":{"product_conversation_id":{"type":"string","minLength":1,"maxLength":1024}},"required":["product_conversation_id"],"additionalProperties":false})
     }
-    fn db(&self) -> &crate::db::Database {
+    fn resolution_db(&self) -> &crate::db::Database {
         &self.peer_db
     }
     async fn run_routed(
@@ -543,7 +543,7 @@ impl instance::RoutedTool for ListWatchedConversations {
     fn schema_without_instance(&self) -> Value {
         json!({"type":"object","properties":{},"additionalProperties":false})
     }
-    fn db(&self) -> &crate::db::Database {
+    fn resolution_db(&self) -> &crate::db::Database {
         &self.peer_db
     }
     async fn run_routed(
@@ -955,7 +955,7 @@ impl instance::RoutedTool for FederatedReadConversation {
     fn schema_without_instance(&self) -> Value {
         json!({"type":"object","properties":{"conversation_id":{"oneOf":[{"type":"string","pattern":"^@conv:[^\\s#]+$"},{"type":"string","pattern":"^@transcript:[^\\s#]+(?:#message-[^\\s#]+)?$"}],"description":"Canonical conversation reference; remote @conv is first-page-only and remote continuation uses the exact @transcript:<id> shown in that page's evidence header; @transcript:<conversation_id>#message-<message_id> bounded exact-message context is local-only"},"cursor":{"type":"integer","minimum":0,"maximum":crate::api::global_read::MAX_CONVERSATION_READ_CURSOR,"description":"Page cursor; a nonzero remote cursor requires an exact @transcript:<id> reference"}},"required":["conversation_id"],"additionalProperties":false})
     }
-    fn db(&self) -> &crate::db::Database {
+    fn resolution_db(&self) -> &crate::db::Database {
         &self.remote_db
     }
     async fn run_routed(
@@ -1045,7 +1045,7 @@ impl instance::RoutedTool for FederatedQueryDatabase {
     fn schema_without_instance(&self) -> Value {
         json!({"type":"object","properties":{"sql":{"type":"string","minLength":1}},"required":["sql"],"additionalProperties":false})
     }
-    fn db(&self) -> &crate::db::Database {
+    fn resolution_db(&self) -> &crate::db::Database {
         &self.remote_db
     }
     async fn run_routed(
@@ -1116,7 +1116,7 @@ impl instance::RoutedTool for ResolveReference {
     fn schema_without_instance(&self) -> Value {
         json!({"type":"object","properties":{"reference":{"type":"string","minLength":1}},"required":["reference"],"additionalProperties":false})
     }
-    fn db(&self) -> &crate::db::Database {
+    fn resolution_db(&self) -> &crate::db::Database {
         &self.remote_db
     }
     async fn run_routed(
@@ -1349,7 +1349,7 @@ impl instance::RoutedTool for FederatedSendConversationMessage {
     fn schema_without_instance(&self) -> Value {
         self.local.input_schema()
     }
-    fn db(&self) -> &crate::db::Database {
+    fn resolution_db(&self) -> &crate::db::Database {
         &self.db
     }
     async fn run_routed(
@@ -1744,7 +1744,7 @@ mod tests {
             .await
             .unwrap();
         let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
-        let tool = instance::RouteTool::new(ResolveReference {
+        let tool = instance::RouteTool::boxed(ResolveReference {
             service,
             remote_db: db,
         });
@@ -1767,7 +1767,7 @@ mod tests {
     async fn federated_query_local_selectors_execute_local_query() {
         let db = crate::db::Database::open_in_memory().await.unwrap();
         let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
-        let tool = instance::RouteTool::new(FederatedQueryDatabase {
+        let tool = instance::RouteTool::boxed(FederatedQueryDatabase {
             service,
             remote_db: db,
         });
@@ -1791,7 +1791,7 @@ mod tests {
     async fn federated_query_nonlocal_selectors_never_fall_back_locally() {
         let db = crate::db::Database::open_in_memory().await.unwrap();
         let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
-        let tool = instance::RouteTool::new(FederatedQueryDatabase {
+        let tool = instance::RouteTool::boxed(FederatedQueryDatabase {
             service,
             remote_db: db,
         });
@@ -1829,7 +1829,7 @@ mod tests {
         let db = crate::db::Database::open_in_memory().await.unwrap();
         let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
         let local = QueryDatabase::Local(service.clone());
-        let federated = instance::RouteTool::new(FederatedQueryDatabase {
+        let federated = instance::RouteTool::boxed(FederatedQueryDatabase {
             service,
             remote_db: db,
         });
@@ -1900,28 +1900,28 @@ mod tests {
         let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
         let tools: Vec<(Arc<dyn Tool>, Value)> = vec![
             (
-                instance::RouteTool::new(ResolveReference {
+                instance::RouteTool::boxed(ResolveReference {
                     service: service.clone(),
                     remote_db: db.clone(),
                 }),
                 json!({"reference": format!("@conv:{}", conversation.product_conversation_id)}),
             ),
             (
-                instance::RouteTool::new(FederatedReadConversation {
+                instance::RouteTool::boxed(FederatedReadConversation {
                     service: service.clone(),
                     remote_db: db.clone(),
                 }),
                 json!({"conversation_id": "@transcript:local-transcript#message-local-message"}),
             ),
             (
-                instance::RouteTool::new(FederatedQueryDatabase {
+                instance::RouteTool::boxed(FederatedQueryDatabase {
                     service: service.clone(),
                     remote_db: db.clone(),
                 }),
                 json!({"sql": "SELECT 1"}),
             ),
             (
-                instance::RouteTool::new(FederatedReadConversation {
+                instance::RouteTool::boxed(FederatedReadConversation {
                     service,
                     remote_db: db,
                 }),
@@ -2943,7 +2943,7 @@ mod tests {
             )
             .await;
 
-        let tool = instance::RouteTool::new(FederatedSendConversationMessage {
+        let tool = instance::RouteTool::boxed(FederatedSendConversationMessage {
             local: SendConversationMessage {
                 service: GlobalReadService::new(state.db.clone(), state.message_retriever.clone()),
                 send_chat: Arc::new(crate::send_chat_service::SendChatApplicationService::new(
@@ -3027,7 +3027,7 @@ mod tests {
             .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
             .await
             .unwrap();
-        let tool = instance::RouteTool::new(FederatedSendConversationMessage {
+        let tool = instance::RouteTool::boxed(FederatedSendConversationMessage {
             local: SendConversationMessage {
                 service: GlobalReadService::new(db.clone(), state.message_retriever.clone()),
                 send_chat: Arc::new(SendChatApplicationService::new(db.clone(), state.runtime)),
@@ -3098,7 +3098,7 @@ mod tests {
             .create_conversation("local-target", "target", "/tmp", true, None, None)
             .await
             .unwrap();
-        let tool = instance::RouteTool::new(FederatedSendConversationMessage {
+        let tool = instance::RouteTool::boxed(FederatedSendConversationMessage {
             local: SendConversationMessage {
                 service: GlobalReadService::new(state.db.clone(), state.message_retriever.clone()),
                 send_chat: Arc::new(SendChatApplicationService::new(
@@ -3194,7 +3194,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let tool = instance::RouteTool::new(FederatedSendConversationMessage {
+        let tool = instance::RouteTool::boxed(FederatedSendConversationMessage {
             local: SendConversationMessage {
                 service: GlobalReadService::new(state.db.clone(), state.message_retriever.clone()),
                 send_chat: Arc::new(SendChatApplicationService::new(
@@ -3438,7 +3438,7 @@ mod tests {
             ),
         ));
 
-        let tool = instance::RouteTool::new(FederatedSendConversationMessage {
+        let tool = instance::RouteTool::boxed(FederatedSendConversationMessage {
             local: SendConversationMessage {
                 service: GlobalReadService::new(state.db.clone(), state.message_retriever.clone()),
                 send_chat: Arc::new(SendChatApplicationService::new(
@@ -3494,7 +3494,7 @@ mod tests {
             Arc::new(crate::tools::mcp::McpClientManager::new()),
             None,
         ));
-        let tool = instance::RouteTool::new(FederatedSendConversationMessage {
+        let tool = instance::RouteTool::boxed(FederatedSendConversationMessage {
             local: SendConversationMessage {
                 service: GlobalReadService::new(db.clone(), retriever),
                 send_chat: Arc::new(SendChatApplicationService::new(db.clone(), runtime)),
