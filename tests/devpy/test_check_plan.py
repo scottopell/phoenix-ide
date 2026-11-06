@@ -1,5 +1,6 @@
 import io
 import importlib.util
+import json
 import os
 import tempfile
 import threading
@@ -21,12 +22,23 @@ def load_devpy():
     return module
 
 
+def launcher_artifact(root, executable, *, fresh=False):
+    return {
+        "reason": "compiler-artifact",
+        "manifest_path": str(root / "crates" / "phoenix-ide" / "Cargo.toml"),
+        "target": {"name": "phoenix_ide", "kind": ["bin"]},
+        "executable": str(executable) if executable is not None else None,
+        "fresh": fresh,
+    }
+
+
 class CheckPlanTests(unittest.TestCase):
     def setUp(self):
         env_patch = mock.patch.dict(os.environ)
         env_patch.start()
         self.addCleanup(env_patch.stop)
         os.environ.pop("PHOENIX_CHECK_WORKERS", None)
+        os.environ.pop("CARGO_TARGET_DIR", None)
         self.dev = load_devpy()
 
     def test_git_config_key_validation_preserves_url_subsections(self):
@@ -162,15 +174,21 @@ class CheckPlanTests(unittest.TestCase):
                         self.assertEqual("export_bindings", test_cmd[-1])
                         self.assertIn("export_bindings", codegen_cmd)
 
-    def test_rust_lane_codegen_precedes_compile_and_failures_accumulate(self):
+    def test_rust_lane_builds_launcher_before_codegen_and_tests(self):
         cases = (
-            ("success", 0, False, 0, 0),
-            ("codegen failure", 1, False, 2, 3),
-            ("stale export", 0, True, 2, 3),
-            ("compile failure", 0, False, 1, 0),
+            ("success", 0, 0, False, 0, 0),
+            ("default target", 0, 0, False, 0, 0),
+            ("absolute target", 0, 0, False, 0, 0),
+            ("environment target", 0, 0, False, 0, 0),
+            ("cargo config target", 0, 0, False, 0, 0),
+            ("fresh configured target", 0, 0, False, 0, 0),
+            ("launcher failure", 17, 0, False, 0, 0),
+            ("codegen failure", 0, 1, False, 2, 3),
+            ("stale export", 0, 0, True, 2, 3),
+            ("compile failure", 0, 0, False, 1, 0),
         )
         for nextest in (True, False):
-            for label, codegen_rc, stale, compile_rc, test_rc in cases:
+            for label, launcher_rc, codegen_rc, stale, compile_rc, test_rc in cases:
                 with self.subTest(nextest=nextest, case=label), \
                      tempfile.TemporaryDirectory() as tmp:
                     root = Path(tmp)
@@ -181,27 +199,72 @@ class CheckPlanTests(unittest.TestCase):
                     compile_cmd, test_cmd, codegen_cmd = self.dev._rust_check_commands(
                         nextest, [], [], [], 1, [],
                     )
-                    commands = [codegen_cmd, compile_cmd, test_cmd]
-                    returncodes = [codegen_rc, compile_rc, test_rc]
+                    commands = [["cargo", "build", "-p", "phoenix_ide", "--bin", "phoenix_ide",
+                                 "--message-format=json-render-diagnostics"]]
+                    returncodes = [launcher_rc]
+                    if launcher_rc == 0:
+                        commands += [codegen_cmd, compile_cmd, test_cmd]
+                        returncodes += [codegen_rc, compile_rc, test_rc]
                     launched = []
+                    target_setting = (None if label == "default target" else
+                                      str(root / "absolute-target") if label == "absolute target" else
+                                      "custom-target")
+                    target_dir = root / (target_setting or "target")
+                    stale_launcher = target_dir / "debug" / "phoenix_ide"
+                    stale_launcher.parent.mkdir(parents=True)
+                    stale_launcher.write_text("stale fixture must not skip cargo build")
+                    stale_launcher.chmod(0o755)
+                    configured_target = label in ("environment target", "cargo config target", "fresh configured target")
+                    launcher = (target_dir / "host-triple" / "debug" / "phoenix_ide"
+                                if configured_target else stale_launcher)
+                    launcher.parent.mkdir(parents=True, exist_ok=True)
+                    launcher.write_text("current native launcher")
+                    launcher.chmod(0o755)
+                    launcher_stat = launcher.stat()
+                    if label == "cargo config target":
+                        (root / ".cargo").mkdir()
+                        (root / ".cargo" / "config.toml").write_text('[build]\ntarget = "host-triple"\n')
+                    inherited_fixture = {
+                        "PHOENIX_BASH_LAUNCH_TEST_EXE": "/stale/elsewhere/phoenix_ide",
+                        "PHOENIX_BASH_LAUNCH_TEST_REQUIRED": "0",
+                    }
 
                     def launch(cmd, **kwargs):
                         index = len(launched)
                         self.assertEqual(commands[index], cmd)
                         launched.append(cmd)
-                        if index == 0:
-                            base = Path(kwargs["env"]["TS_RS_EXPORT_DIR"])
+                        env = kwargs["env"]
+                        self.assertEqual(str(root), str(kwargs["cwd"]))
+                        self.assertEqual(target_setting, env.get("CARGO_TARGET_DIR"))
+                        self.assertEqual("/selected/kache", env["RUSTC_WRAPPER"])
+                        for key in ("CARGO_BUILD_JOBS", "RAYON_NUM_THREADS", "RUST_TEST_THREADS"):
+                            self.assertEqual("1", env[key])
+                        if index > 0:
+                            self.assertEqual(str(launcher), env["PHOENIX_BASH_LAUNCH_TEST_EXE"])
+                            self.assertEqual("1", env["PHOENIX_BASH_LAUNCH_TEST_REQUIRED"])
+                        if index == 1:
+                            base = Path(env["TS_RS_EXPORT_DIR"])
                             (base.parents[2] / "Binding.ts").write_text(
                                 content + ("// stale\n" if stale else "")
                             )
-                        proc = mock.Mock(stdout=io.StringIO(""))
+                        artifact = launcher_artifact(root, launcher, fresh=label == "fresh configured target")
+                        # Metadata must survive the bounded console tail and rendered diagnostics.
+                        build_output = json.dumps(artifact) + "\n" + "warning: rendered diagnostic\n" * 205
+                        proc = mock.Mock(stdout=io.StringIO(build_output if index == 0 else ""))
                         proc.wait.return_value = returncodes[index]
                         return proc
 
                     reporter = mock.Mock()
                     output = io.StringIO()
-                    failures = bool(codegen_rc) + bool(stale) + bool(compile_rc) + bool(test_rc)
-                    with mock.patch.dict(os.environ, {"PHOENIX_CHECK_WORKERS": "1"}), \
+                    failures = bool(launcher_rc) + bool(codegen_rc) + bool(stale) + bool(compile_rc) + bool(test_rc)
+                    cache_setup = ("kache", {"RUSTC_WRAPPER": "/selected/kache"})
+                    with mock.patch.dict(os.environ, {
+                             **inherited_fixture,
+                             **({"CARGO_TARGET_DIR": target_setting} if target_setting else {}),
+                             "PHOENIX_CHECK_WORKERS": "1",
+                             **({"CARGO_BUILD_TARGET": "host-triple"}
+                                if label in ("environment target", "fresh configured target") else {}),
+                         }), \
                          mock.patch.object(self.dev, "ROOT", root), \
                          mock.patch.object(self.dev, "_resolve_check_lanes", return_value=({"rust"}, {})), \
                          mock.patch.object(self.dev, "_make_reporter", return_value=reporter), \
@@ -212,19 +275,24 @@ class CheckPlanTests(unittest.TestCase):
                          mock.patch.object(self.dev.sys, "stdout", output):
                         if failures:
                             with self.assertRaises(SystemExit) as raised:
-                                self.dev.cmd_check(gate=False, lanes="rust", compiler_cache_setup=("none", {}))
+                                self.dev.cmd_check(gate=False, lanes="rust", compiler_cache_setup=cache_setup)
                             self.assertEqual(1, raised.exception.code)
                         else:
-                            self.dev.cmd_check(gate=False, lanes="rust", compiler_cache_setup=("none", {}))
+                            self.dev.cmd_check(gate=False, lanes="rust", compiler_cache_setup=cache_setup)
+                        for key, value in inherited_fixture.items():
+                            self.assertEqual(value, os.environ[key])
 
+                    self.assertEqual(launcher_stat, launcher.stat())
                     probe.assert_called_once_with(
                         ["cargo", "nextest", "--version"], capture_output=True, timeout=30,
                     )
                     self.assertEqual(commands, launched)
-                    steps = [("codegen", codegen_rc)]
-                    if codegen_rc == 0:
-                        steps.append(("codegen-stale", int(stale)))
-                    steps += [("cargo test compile", compile_rc), ("cargo test", test_rc)]
+                    steps = [("native bash launcher", launcher_rc)]
+                    if launcher_rc == 0:
+                        steps.append(("codegen", codegen_rc))
+                        if codegen_rc == 0:
+                            steps.append(("codegen-stale", int(stale)))
+                        steps += [("cargo test compile", compile_rc), ("cargo test", test_rc)]
                     self.assertEqual(
                         [name for name, _rc in steps],
                         [call.args[1] for call in reporter.step_start.call_args_list],
@@ -237,9 +305,221 @@ class CheckPlanTests(unittest.TestCase):
                                else f"All {len(steps)} checks passed")
                     self.assertIn(summary, output.getvalue())
 
+    def test_launcher_metadata_fails_closed_before_normal_or_split_consumers(self):
+        cases = (
+            "missing", "malformed", "unrelated", "duplicate", "no executable", "missing executable field",
+            "missing executable", "relative executable", "non-executable", "directory", "build failure",
+        )
+        for split_build in (False, True):
+            for case in cases:
+                with self.subTest(split_build=split_build, case=case), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    stale = root / "target" / "debug" / "phoenix_ide"
+                    stale.parent.mkdir(parents=True)
+                    stale.write_text("stale default executable must not be used")
+                    stale.chmod(0o755)
+                    artifact = launcher_artifact(root, stale)
+                    if case in ("missing", "build failure"):
+                        records = []
+                    elif case == "missing executable field":
+                        artifact.pop("executable")
+                        records = [json.dumps(artifact)]
+                    elif case == "malformed":
+                        records = ["{malformed JSON", "null", '[]']
+                    elif case == "unrelated":
+                        records = [json.dumps({**artifact, "manifest_path": "/dependency/Cargo.toml"}),
+                                   json.dumps({**artifact, "target": {"name": "phoenix_ide", "kind": ["lib"]}}),
+                                   json.dumps({**artifact, "target": {"name": "other", "kind": ["bin"]}}),
+                                   json.dumps({**artifact, "reason": "compiler-message"})]
+                    elif case == "duplicate":
+                        records = [json.dumps(artifact)] * 2
+                    else:
+                        executable = {
+                            "no executable": None,
+                            "missing executable": root / "missing",
+                            "relative executable": "target/debug/phoenix_ide",
+                            "non-executable": root / "non-executable",
+                            "directory": stale.parent,
+                        }[case]
+                        if case == "non-executable":
+                            executable.write_text("not executable")
+                            executable.chmod(0o644)
+                        records = [json.dumps(launcher_artifact(root, executable))]
+                    proc = mock.Mock(stdout=io.StringIO("\n".join(records) + "\nwarning: rendered diagnostic\n"))
+                    build_rc = 17 if case == "build failure" else 0
+                    proc.wait.return_value = build_rc
+                    reporter = mock.Mock()
+                    output = io.StringIO()
+                    split = self.dev.RustSplit(self.dev.RustPhase.BUILD) if split_build else None
+                    with mock.patch.dict(os.environ, {"PHOENIX_CHECK_WORKERS": "1"}), \
+                         mock.patch.object(self.dev, "ROOT", root), \
+                         mock.patch.object(self.dev, "_resolve_check_lanes", return_value=({"rust"}, {})), \
+                         mock.patch.object(self.dev, "_make_reporter", return_value=reporter), \
+                         mock.patch.object(self.dev, "_classify_browser_env"), \
+                         mock.patch.object(self.dev, "_write_rust_split_scope"), \
+                         mock.patch.object(self.dev.subprocess, "Popen", return_value=proc) as launch, \
+                         mock.patch.object(self.dev.subprocess, "run", return_value=mock.Mock(returncode=0)), \
+                         mock.patch.object(self.dev.sys, "stdout", output):
+                        with self.assertRaises(SystemExit) as raised:
+                            self.dev.cmd_check(gate=False, lanes="rust", rust_split=split,
+                                               compiler_cache_setup=("none", {}))
+                    self.assertEqual(1, raised.exception.code)
+                    launch.assert_called_once()
+                    reporter.step_done.assert_called_once_with("rust", "native bash launcher", build_rc or 1, mock.ANY)
+                    if build_rc:
+                        self.assertNotIn("OUTPUT VALIDATION FAILED", output.getvalue())
+                    else:
+                        self.assertIn("OUTPUT VALIDATION FAILED", output.getvalue())
+                    self.assertIn("warning: rendered diagnostic", output.getvalue())
+                    self.assertIn("1 of 1 checks failed", output.getvalue())
+
+    def test_split_rust_launcher_build_and_consumer_phases(self):
+        for phase in self.dev.RustPhase:
+            for launcher_rc in ((0, 17) if phase is self.dev.RustPhase.BUILD else (0,)):
+                with self.subTest(phase=phase.value, launcher_rc=launcher_rc), \
+                     tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    generated = root / "ui" / "src" / "generated"
+                    generated.mkdir(parents=True)
+                    content = "// This file was generated by ts-rs.\nexport type Binding = string;\n"
+                    (generated / "Binding.ts").write_text(content)
+                    launched = []
+                    fixture = str(root / "downloaded-ci-fixture" / "phoenix_ide")
+                    Path(fixture).parent.mkdir(parents=True)
+                    Path(fixture).write_text("#!/bin/sh\nexit 0\n")
+                    Path(fixture).chmod(0o755)
+
+                    def launch(cmd, **kwargs):
+                        launched.append(cmd)
+                        env = kwargs["env"]
+                        self.assertEqual(fixture, env["PHOENIX_BASH_LAUNCH_TEST_EXE"])
+                        if phase is self.dev.RustPhase.TEST and cmd[:2] == ["cargo", "nextest"]:
+                            self.assertEqual("1", env["PHOENIX_BASH_LAUNCH_TEST_REQUIRED"])
+                        if "TS_RS_EXPORT_DIR" in env:
+                            base = Path(env["TS_RS_EXPORT_DIR"])
+                            (base.parents[2] / "Binding.ts").write_text(content)
+                        artifact = launcher_artifact(root, fixture)
+                        proc = mock.Mock(stdout=io.StringIO(json.dumps(artifact) + "\n"))
+                        proc.wait.return_value = launcher_rc if cmd[:2] == ["cargo", "build"] else 0
+                        return proc
+
+                    split = self.dev.RustSplit(phase)
+                    with mock.patch.object(self.dev, "ROOT", root):
+                        split_cmds = self.dev._rust_split_commands(split, [], None, 1, [])
+                    expected = list(split_cmds.values())
+                    if phase is self.dev.RustPhase.BUILD:
+                        expected.insert(0, ["cargo", "build", "-p", "phoenix_ide", "--bin", "phoenix_ide",
+                                            "--message-format=json-render-diagnostics"])
+                        if launcher_rc:
+                            expected = expected[:1]
+                    with mock.patch.dict(os.environ, {
+                             "PHOENIX_CHECK_WORKERS": "1",
+                             "PHOENIX_BASH_LAUNCH_TEST_EXE": fixture,
+                             "PHOENIX_BASH_LAUNCH_TEST_REQUIRED": "0",
+                         }), \
+                         mock.patch.object(self.dev, "ROOT", root), \
+                         mock.patch.object(self.dev, "_resolve_check_lanes", return_value=({"rust"}, {})), \
+                         mock.patch.object(self.dev, "_make_reporter"), \
+                         mock.patch.object(self.dev, "_classify_browser_env"), \
+                         mock.patch.object(self.dev, "_write_rust_split_scope") as write_scope, \
+                         mock.patch.object(self.dev, "_read_rust_split_scope", return_value=None), \
+                         mock.patch.object(self.dev.subprocess, "Popen", side_effect=launch), \
+                         mock.patch.object(self.dev.subprocess, "run", return_value=mock.Mock(returncode=0)), \
+                         mock.patch.object(self.dev.sys, "stdout", io.StringIO()):
+                        if launcher_rc:
+                            with self.assertRaises(SystemExit) as raised:
+                                self.dev.cmd_check(gate=False, lanes="rust", rust_split=split,
+                                                   compiler_cache_setup=("none", {}))
+                            self.assertEqual(1, raised.exception.code)
+                        else:
+                            self.dev.cmd_check(gate=False, lanes="rust", rust_split=split,
+                                               compiler_cache_setup=("none", {}))
+                        self.assertEqual("0", os.environ["PHOENIX_BASH_LAUNCH_TEST_REQUIRED"])
+                    self.assertEqual(expected, launched)
+                    self.assertEqual(phase is self.dev.RustPhase.BUILD, write_scope.called)
+
+    def test_split_test_rejects_invalid_launcher_even_for_empty_partition(self):
+        for case in ("unset", "empty", "missing", "non-executable", "relative", "directory"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                launcher = root / "phoenix_ide"
+                if case == "non-executable":
+                    launcher.write_text("#!/bin/sh\nexit 0\n")
+                    launcher.chmod(0o644)
+                elif case == "directory":
+                    launcher.mkdir()
+                value = "" if case == "empty" else "phoenix_ide" if case == "relative" else str(launcher)
+                split = self.dev.RustSplit(self.dev.RustPhase.TEST, self.dev.RustPartition(2, 4))
+                reporter = mock.Mock()
+                output = io.StringIO()
+                with mock.patch.dict(os.environ, {"PHOENIX_CHECK_WORKERS": "1"}), \
+                     mock.patch.object(self.dev, "ROOT", root), \
+                     mock.patch.object(self.dev, "_resolve_check_lanes", return_value=({"rust"}, {})), \
+                     mock.patch.object(self.dev, "_make_reporter", return_value=reporter), \
+                     mock.patch.object(self.dev, "_classify_browser_env"), \
+                     mock.patch.object(self.dev, "_read_rust_split_scope", return_value=["phoenix-core"]), \
+                     mock.patch.object(self.dev, "_ts_export_crates", return_value={"phoenix_ide"}), \
+                     mock.patch.object(self.dev.subprocess, "Popen") as launch, \
+                     mock.patch.object(self.dev.subprocess, "run", return_value=mock.Mock(returncode=0)), \
+                     mock.patch.object(self.dev.sys, "stdout", output):
+                    if case == "unset":
+                        os.environ.pop("PHOENIX_BASH_LAUNCH_TEST_EXE", None)
+                    else:
+                        os.environ["PHOENIX_BASH_LAUNCH_TEST_EXE"] = value
+                    with self.assertRaises(SystemExit) as raised:
+                        self.dev.cmd_check(gate=False, lanes="rust", rust_split=split,
+                                           compiler_cache_setup=("none", {}))
+                self.assertEqual(1, raised.exception.code)
+                launch.assert_not_called()
+                reporter.step_start.assert_called_once_with("rust", "native bash launcher validation")
+                reporter.step_done.assert_called_once_with(
+                    "rust", "native bash launcher validation", 1, mock.ANY,
+                )
+                self.assertIn("1 of 1 checks failed", output.getvalue())
+                self.assertIn("PHOENIX_BASH_LAUNCH_TEST_EXE", output.getvalue())
+                self.assertIn("existing absolute executable file", output.getvalue())
+
+    def test_split_codegen_does_not_require_launcher(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            generated = root / "ui" / "src" / "generated"
+            generated.mkdir(parents=True)
+            content = "// This file was generated by ts-rs.\nexport type Binding = string;\n"
+            (generated / "Binding.ts").write_text(content)
+            launched = []
+
+            def launch(cmd, **kwargs):
+                launched.append(cmd)
+                env = kwargs["env"]
+                if "TS_RS_EXPORT_DIR" in env:
+                    base = Path(env["TS_RS_EXPORT_DIR"])
+                    (base.parents[2] / "Binding.ts").write_text(content)
+                proc = mock.Mock(stdout=io.StringIO(""))
+                proc.wait.return_value = 0
+                return proc
+
+            split = self.dev.RustSplit(self.dev.RustPhase.CODEGEN)
+            with mock.patch.dict(os.environ, {"PHOENIX_CHECK_WORKERS": "1"}), \
+                 mock.patch.object(self.dev, "ROOT", root), \
+                 mock.patch.object(self.dev, "_resolve_check_lanes", return_value=({"rust"}, {})), \
+                 mock.patch.object(self.dev, "_make_reporter") as reporter, \
+                 mock.patch.object(self.dev, "_classify_browser_env"), \
+                 mock.patch.object(self.dev, "_read_rust_split_scope", return_value=None), \
+                 mock.patch.object(self.dev.subprocess, "Popen", side_effect=launch), \
+                 mock.patch.object(self.dev.subprocess, "run", return_value=mock.Mock(returncode=0)), \
+                 mock.patch.object(self.dev.sys, "stdout", io.StringIO()) as output:
+                os.environ.pop("PHOENIX_BASH_LAUNCH_TEST_EXE", None)
+                self.dev.cmd_check(gate=False, lanes="rust", rust_split=split,
+                                   compiler_cache_setup=("none", {}))
+            self.assertEqual(["tar", "cargo"], [cmd[0] for cmd in launched])
+            self.assertEqual(["extract test archive", "codegen", "codegen-stale"],
+                             [call.args[1] for call in reporter.return_value.step_start.call_args_list])
+            self.assertIn("All 3 checks passed", output.getvalue())
+
     def test_rust_graph_steps_match_lane_order(self):
         self.assertEqual(
-            ["codegen export", "codegen-stale diff", "cargo test (compile)", "cargo test (run)"],
+            ["native bash launcher", "codegen export", "codegen-stale diff",
+             "cargo test (compile)", "cargo test (run)"],
             self.dev._GRAPH_LANE_STEPS["rust"],
         )
 

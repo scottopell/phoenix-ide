@@ -233,6 +233,7 @@ fn assert_immutable_creation_conflict(changed: &ToolOutput) {
 async fn native_creation_read_and_submit_receipt_require_current_snapshot_authority() {
     let (runtime, db, gc) = native_runtime().await;
     let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().canonicalize().unwrap();
     let request_id = uuid::Uuid::new_v4().to_string();
     let registry = tools(runtime.clone(), &gc).await.unwrap();
     let create = registry
@@ -243,7 +244,7 @@ async fn native_creation_read_and_submit_receipt_require_current_snapshot_author
         .run(
             json!({
                 "op":"create", "request_id":request_id,
-                "cwd":dir.path().to_string_lossy(), "objective":"snapshot objective",
+                "cwd":cwd.to_string_lossy(), "objective":"snapshot objective",
                 "start":"submit_objective", "model":"gpt-5.6-sol"
             }),
             native_context(&gc),
@@ -257,7 +258,7 @@ async fn native_creation_read_and_submit_receipt_require_current_snapshot_author
         .run(
             json!({
                 "op":"create", "request_id":request_id,
-                "cwd":dir.path().to_string_lossy(), "objective":"snapshot objective",
+                "cwd":cwd.to_string_lossy(), "objective":"snapshot objective",
                 "start":"submit_objective", "model":"gpt-5.6-sol"
             }),
             native_context(&gc),
@@ -270,7 +271,7 @@ async fn native_creation_read_and_submit_receipt_require_current_snapshot_author
         .run(
             json!({
                 "op":"create", "request_id":request_id,
-                "cwd":dir.path().to_string_lossy(), "objective":"changed objective",
+                "cwd":cwd.to_string_lossy(), "objective":"changed objective",
                 "start":"submit_objective", "model":"gpt-5.6-sol"
             }),
             native_context(&gc),
