@@ -1,4 +1,4 @@
-# ADR-230: HTTP connection recovery retries under existing ownership
+# ADR-240: HTTP connection recovery retries under existing ownership
 
 - **Status:** Accepted
 - **Date:** 2026-11-06

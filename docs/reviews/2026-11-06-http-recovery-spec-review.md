@@ -4,7 +4,7 @@ The two review passes below describe the initial draft. The later owner-approved
 simplification supersedes the retained strict-cleanup disposition; see the final
 section. These were author-performed review passes, not independent agent reviews.
 
-Scope: requirements, Allium, proposed ADR-230 and acceptance scenarios only.
+Scope: requirements, Allium, proposed ADR-240 and acceptance scenarios only.
 These are two author-performed adversarial passes, not independent-agent or
 implementation reviews. Initial draft: commit `6a6372246`. The corrections below
 are part of the reviewed successor. No runtime correctness or deployment claim
@@ -149,7 +149,7 @@ system. Strict remote cleanup remains the consequential retained tradeoff.
 The owner accepted best-effort remote deletion and rejected durable connection
 retry jobs, gateway reconnect/alert controllers and complete outage catch-up.
 Only strict cleanup was an existing guarantee being removed; the latter three
-were alternatives already excluded from the draft. ADR-230 records the decision.
+were alternatives already excluded from the draft. ADR-240 records the decision.
 Accepted Slack requests, conversations, bindings and reply obligations remain
 durable. Local credential-removal intent still survives restart under ADR-086.
 
@@ -267,7 +267,7 @@ was removed. All 192 MCP tests and 28 focused UI tests pass, along with MCP
 all-target Clippy, TypeScript, focused ESLint, formatting and Allium/anchor checks.
 
 CI found that an independently merged decision had taken ADR-229. After rebasing
-onto current main, this unpublished decision is ADR-230; existing accepted
+onto current main, this unpublished decision was renumbered; existing accepted
 decisions are unchanged. The combined spec-shape validator passes locally.
 
 The next GitHub review found idle GET-stream expiry deferred recovery until a
@@ -297,3 +297,6 @@ same read without remote I/O. Settings keep stale catalogs unverified even when
 their previous names were incomplete; a current empty catalog can establish
 missing tools. The obsolete definitions-only cached API was replaced rather
 than retained alongside its replacement. All 196 MCP and 31 focused UI tests pass.
+
+A subsequent main merge took ADR-230 as well. This unpublished decision now uses
+unused ADR-240 to avoid another next-number collision while review runs.
