@@ -43,6 +43,8 @@ enum ToolKind {
     | read_goal
     | read_conversation
     | resolve_reference
+    | read_automatic_continuation
+    | set_automatic_continuation
 }
 
 enum SubscriptionState {
@@ -106,6 +108,46 @@ variant StableMessageTarget : MessageTarget {
 
 variant ExactMessageTarget : MessageTarget {
     transcript_id: String
+}
+
+entity AutomaticContinuationTarget {
+    kind: OrdinaryPreferenceTarget | CoordinatorPreferenceTarget
+}
+
+variant OrdinaryPreferenceTarget : AutomaticContinuationTarget {
+    product_conversation_id: String
+}
+
+variant CoordinatorPreferenceTarget : AutomaticContinuationTarget {}
+
+entity AutomaticContinuationRequest {
+    kind: ReadPreferenceRequest | SetPreferenceRequest
+    caller_instance_id: String
+    destination_instance_id: String
+    target: AutomaticContinuationTarget
+}
+
+variant ReadPreferenceRequest : AutomaticContinuationRequest {}
+
+variant SetPreferenceRequest : AutomaticContinuationRequest {
+    auto_continue_on_context_exhaustion: Boolean
+}
+
+enum PreferenceAggregateKind {
+    ordinary
+    | coordinator
+}
+
+entity ResolvedPreferenceAggregate {
+    kind: PreferenceAggregateKind
+    product_conversation_id: String
+}
+
+entity AutomaticContinuationResult {
+    caller_instance_id: String
+    destination_instance_id: String
+    aggregate: ResolvedPreferenceAggregate
+    auto_continue_on_context_exhaustion: Boolean
 }
 
 entity ToolSelection {
@@ -297,6 +339,7 @@ rule RemoteToolDispatch {
     requires: selection.destination != null
     requires: not selection.failed
     requires: selection.destination.trusted
+    requires: not automatic_continuation_tool(selection.tool)
     ensures: RemoteToolExecution(selection.tool, selection.destination)
 }
 
@@ -314,6 +357,77 @@ rule RemoteDispatchFails {
     requires: selection.instance != null
     ensures: RemoteToolError(selection.tool, selection.instance)
     -- No LocalToolExecution and no dispatch to another peer.
+}
+
+-- REQ-FED-020. The Allium request variants model separate closed wire shapes;
+-- their `kind` is a model discriminant, not an extra wire field. Read has no
+-- value; set has exactly one Boolean value; Coordinator target has no supplied
+-- identity. Optional instance is omitted or a non-null string, including for
+-- read; invalid shapes fail before selection.
+-- Helpers:
+-- local_peer(peer): peer.instance_id is the executing instance's identity.
+-- automatic_continuation_tool(tool): tool is ReadAutomaticContinuation or SetAutomaticContinuation.
+-- source_current(request): trusted tool-call context and executing transcript
+-- belong to the current Coordinator.
+-- destination_authorized(request, peer): authenticated peer equals caller,
+-- destination identity equals local instance, current Federation send authority
+-- holds, and the exact published target resolves in the preference transaction.
+-- result_matches(request, result): caller, destination and target kind match;
+-- an ordinary stable ID matches exactly; a Coordinator result carries a
+-- syntactically valid stable ID returned by that authenticated exact destination
+-- for its Coordinator singleton; a set also matches the Boolean.
+rule RejectSelfAutomaticContinuationSelection {
+    when: DispatchAutomaticContinuation(selection, request)
+    requires: selection.instance != null and not selection.failed
+    requires: selection.destination != null and local_peer(selection.destination)
+    ensures: SelectionError(selection.tool, selection.instance)
+    -- No remote request, local execution or alternate-peer dispatch.
+}
+
+rule DispatchRemoteAutomaticContinuation {
+    when: DispatchAutomaticContinuation(selection, request)
+    requires: selection.instance != null and not selection.failed
+    requires: selection.destination != null and selection.destination.trusted
+    requires: not local_peer(selection.destination)
+    requires: source_current(request)
+    ensures: RemotePreferenceRequestSent(selection.destination, request)
+    @guidance
+        -- Revalidate the current source Coordinator at dispatch and hold its
+        -- aggregate admission gate through the remote request. Unknown,
+        -- ambiguous and self selectors fail without local or alternate dispatch.
+}
+
+rule AdmitRemoteAutomaticContinuationRead {
+    when: ReadRemotePreference(peer, request)
+    requires: request.kind = ReadPreferenceRequest
+    requires: destination_authorized(request, peer)
+    ensures: PreferenceRead(request.target)
+    -- The read does not change the destination preference.
+}
+
+rule AdmitRemoteAutomaticContinuationSet {
+    when: SetRemotePreference(peer, request)
+    requires: request.kind = SetPreferenceRequest
+    requires: destination_authorized(request, peer)
+    ensures: PreferenceSet(request.target, request.auto_continue_on_context_exhaustion)
+    @guidance
+        -- Classify the preference transaction's durability before an ordinary
+        -- result; unclassified durability closes local authority instead.
+        -- No dispatch intent, work admission, wake, retry, rearm, Goal mutation,
+        -- trust change or enrollment is part of this prospective write.
+}
+
+rule VerifyRemoteAutomaticContinuationResponse {
+    when: ReceiveRemotePreferenceResponse(peer, request, result)
+    requires: result_matches(request, result)
+    ensures: PreferenceResultAccepted(result)
+}
+
+rule RejectMismatchedRemoteAutomaticContinuationResponse {
+    when: ReceiveRemotePreferenceResponse(peer, request, result)
+    requires: not result_matches(request, result)
+    ensures: PreferenceResultRejected(request)
+    -- No local execution or alternate-peer dispatch.
 }
 
 rule AdmitRemoteMessage {
@@ -892,9 +1006,19 @@ surface FederationToolSurface {
     provides:
         SendRemoteMessage(peer, message_id, target, content, provenance)
         ReadRemoteGoal(peer, target, requested_version, timeout)
+        ReadRemotePreference(peer, request)
+        SetRemotePreference(peer, request)
     @guarantee DomainParity
         -- Destination domain services enforce the same admission, stable
         -- conversation resolution, version wait, timeout, and result semantics.
+}
+
+surface AutomaticContinuationResponseSurface {
+    facing peer: TrustedPeer
+    context request: AutomaticContinuationRequest
+    context result: AutomaticContinuationResult
+    provides:
+        ReceiveRemotePreferenceResponse(peer, request, result)
 }
 
 surface FederationWatchSurface {

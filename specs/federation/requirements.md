@@ -6,7 +6,7 @@ A Coordinator operating one trusted Phoenix instance needs to use supported coor
 
 ## Scope and related contracts
 
-This specification covers optional `instance` selection on `send_conversation_message`, `read_conversation`, `resolve_reference`, `read_goal`, and `query_database`, durable remote conversation watches, and finite settlement of facts durably staged before a terminal watch gap. Goal mutations (including creation), settings, Continue, conversation creation, and rename are outside this contract.
+This specification covers optional `instance` selection on `send_conversation_message`, `read_conversation`, `resolve_reference`, `read_goal`, `query_database`, `read_automatic_continuation`, and `set_automatic_continuation`; the typed remote automatic-continuation preference operations; durable remote conversation watches; and finite settlement of facts durably staged before a terminal watch gap. Goal mutations (including creation), settings other than this typed automatic-continuation preference, Continue, conversation creation, and rename are outside this contract.
 
 Related contracts remain authoritative for their domains:
 
@@ -22,11 +22,11 @@ Related contracts remain authoritative for their domains:
 
 **REQ-FED-001 — Optional destination selection**
 
-When `send_conversation_message`, federated `read_conversation`, `resolve_reference`, `read_goal`, or Coordinator `query_database` receives the exact, case-sensitive `instance` string `"local"` or omits the selector, the system shall execute the local operation through its existing local service with the same authority checks, validation, result shape, provenance, pagination, waits, message retry identity, SQL policy, budgets, and error semantics applicable to that tool.
+When `send_conversation_message`, federated `read_conversation`, `resolve_reference`, `read_goal`, Coordinator `query_database`, `read_automatic_continuation`, or `set_automatic_continuation` receives the exact, case-sensitive `instance` string `"local"` or omits the selector, the system shall execute the local operation through its existing local service with the same authority checks, validation, result shape, provenance, pagination, waits, message retry identity, SQL policy, budgets, and error semantics applicable to that tool.
 
 When one of these tools receives another string selector, the system shall select the remote destination through saved-peer UUID or unambiguous display-name resolution. Local recognition and remote peer matching shall use the selector exactly as supplied, without trimming whitespace or folding case. The literal `"local"` shall be reserved for the instance executing the tool.
 
-An explicit `null` selector shall select local routing on the read tools, including Coordinator `query_database`; `send_conversation_message` shall reject an explicit `null`. Tools without an optional `instance` parameter shall retain their own input and authority contracts. In particular, non-Coordinator `query_database` registrations shall remain local-only and shall reject an `instance` field.
+An explicit `null` selector shall select local routing on the read tools, including Coordinator `query_database`, except that `read_automatic_continuation` shall reject explicit `null`; `send_conversation_message` and `set_automatic_continuation` shall reject explicit `null`. Tools without an optional `instance` parameter shall retain their own input and authority contracts. In particular, non-Coordinator `query_database` registrations shall remain local-only and shall reject an `instance` field.
 
 **REQ-FED-002 — No destination fallback**
 
@@ -34,7 +34,7 @@ If peer selection, authentication, identity verification, transport, or remote e
 
 **REQ-FED-003 — Destination-owned admission**
 
-When a trusted peer requests an operation, the destination shall authenticate the peer and apply the same domain validation, lifecycle, and concurrency rules used for the equivalent local operation.
+When a trusted peer requests an operation, the destination shall authenticate the peer and apply the same domain validation, lifecycle, concurrency, and local-authority rules used for the equivalent local operation. For a remote automatic-continuation preference operation, the destination shall bind the authenticated caller and requested destination identities, transactionally recheck current Federation send authority with exact target resolution and preference access, and close local authority without publishing an ordinary result if write durability becomes unclassified.
 
 **REQ-FED-004 — Authenticated remote attribution**
 
@@ -56,7 +56,7 @@ When a Goal read selects a peer, the destination shall apply the same stable-con
 
 **REQ-FED-008 — Stable and exact conversation identity**
 
-When a remote operation or watch result refers to a conversation, the result shall identify both the stable ProductConversation and the exact transcript in which the reported fact or mutation occurred.
+When a remote operation or watch result reports a transcript-scoped conversation fact or mutation, the result shall identify both the stable ProductConversation and the exact transcript in which that fact or mutation occurred. ProductConversation-scoped settings that do not report a transcript fact shall identify the stable ProductConversation without fabricating an exact transcript.
 
 ### Durable watches
 
@@ -121,6 +121,16 @@ The system shall resolve concurrent local and remote operations through destinat
 When a peer enrollment or saved peer connection is created or replaced, the system shall trim the display name and reject a blank name or a name equal to `local` ignoring ASCII case. Rejection shall provide a clear input error before replacing a credential or changing the saved connection.
 
 Tool destination selection shall not rename saved peers, change their trust, or rewrite persisted display names.
+
+### Remote automatic-continuation preference
+
+**REQ-FED-020 — Typed remote automatic-continuation control**
+
+When the current source Coordinator invokes `read_automatic_continuation` or `set_automatic_continuation` with a remote selector, the source shall revalidate current-Coordinator authority at the remote-dispatch boundary and hold that source aggregate's admission boundary through the request. The request shall select exactly an ordinary ProductConversation by stable ID or the destination's Coordinator singleton. Read and set shall use distinct closed request shapes; set shall require a Boolean preference value. Unknown fields, unknown target kinds, explicit `null` selectors, missing or `null` set values, and operation-mismatched payloads shall be rejected.
+
+The destination shall authenticate the peer, bind the exact caller and destination instance identities, transactionally recheck the current Federation send authority, and resolve the exact requested aggregate in the same transaction as the preference read or write. The source shall accept a response only when its caller identity and destination identity match the request, its target kind matches the request, an ordinary target's stable ID matches exactly, a Coordinator target carries a syntactically valid stable ProductConversation identity returned by that authenticated exact destination for its Coordinator singleton, and, for a set, the returned Boolean matches the request. A saved-peer selector that resolves to the executing instance shall fail as self-selection rather than issue a remote request.
+
+A remote read shall be side-effect free. A remote set shall change only the prospective automatic-continuation preference and shall preserve the local operation's durability classification. It shall not admit, wake, dispatch, retry, rearm, create, rename, continue, or update a Goal, and shall not alter trust or enrollment. Unknown, ambiguous, self, authentication, identity, target, transport, remote-execution, response-provenance, and unclassified-durability failures shall not execute the operation locally or against another peer. Source-side transport uncertainty shall not be reported as an acknowledged rollback or authorize an automatic retry.
 
 ## Non-goals
 

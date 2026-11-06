@@ -2,7 +2,7 @@
 
 ## Summary
 
-Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance conversation read/resolve support, and optional-instance `send_conversation_message`, `read_goal`, and Coordinator `query_database` routing through destination-owned admission. All five optional-instance tools share a typed selector: omission and exact `"local"` use local services; read tools also treat explicit `null` as local, while other strings retain remote selection. Ordinary non-Coordinator query registrations remain local-only. Durable remote watches remain in progress. Existing subscription groundwork does not by itself establish watch behavior.
+Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance conversation read/resolve support, and optional-instance `send_conversation_message`, `read_goal`, Coordinator `query_database`, and Coordinator `read_automatic_continuation`/`set_automatic_continuation` routing through destination-owned admission. Omission and exact `"local"` use local services; the preference tools reject explicit `null` even on read, while other read tools treat it as local. Other strings select an exact saved peer without fallback. Ordinary non-Coordinator query registrations remain local-only. Durable remote watches remain in progress. Existing subscription groundwork does not by itself establish watch behavior.
 
 ## Requirement status
 
@@ -15,6 +15,7 @@ Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance c
 | REQ-FED-009–016 | Partial | Durable subscription schema and local Coordinator notification admission are groundwork only; remote watch creation, delivery, replay, bounds, close/gap recovery, unsubscribe, and revocation behavior remain. |
 | REQ-FED-017–018 | Defined | Complexity boundaries and non-goals are normative in `requirements.md`. |
 | REQ-FED-019 | Implemented | Enrollment and peer-connection writes require a validated `PeerDisplayName`; constructor/JSON and HTTP tests pass for blank names and case/whitespace variants of local, including rejection without replacing credentials or connections. |
+| REQ-FED-020 | Source-authored; qualification pending | Separate closed remote read/set requests, source Coordinator dispatch gate, authenticated destination transaction, strict preference-only set and response verification are present in the candidate. Focused regressions are authored; no second-process acceptance, full-suite or deployed behavior is established. No generic settings, trust/enrollment or combined enable-and-create operation is included. |
 
 ## Existing foundations
 
@@ -35,4 +36,4 @@ Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance c
 
 ## Exclusions
 
-This slice does not implement Goal mutations (including creation), settings, Continue, conversation creation or rename, reverse enrollment, deployment, or live peer changes.
+This slice does not implement Goal mutations (including creation), generic settings beyond the typed automatic-continuation preference, Continue, conversation creation or rename, reverse enrollment, deployment, live peer changes, or combined enable-and-create.

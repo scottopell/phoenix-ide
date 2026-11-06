@@ -1,4 +1,175 @@
 use super::*;
+use phoenix_core::domain::instance_identity::{FederationCredentialVerifier, InstanceId};
+
+#[tokio::test]
+async fn federated_settings_recheck_authority_and_preserve_target_and_preference() {
+    let db = Database::open_in_memory().await.unwrap();
+    let ordinary = db
+        .create_conversation("peer-target", "peer-target", "/tmp", true, None, None)
+        .await
+        .unwrap();
+    let coordinator = db
+        .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+        .await
+        .unwrap();
+    let caller = InstanceId::new();
+    let verifier = FederationCredentialVerifier::from_bearer(b"automatic-continuation-test");
+    db.replace_federation_enrollment(caller, &"peer".parse().unwrap(), &verifier)
+        .await
+        .unwrap();
+    let authority = crate::FederationSendAuthority::new(caller, verifier);
+    let target = AutomaticContinuationTarget::Ordinary(&ordinary.product_conversation_id);
+    assert_eq!(
+        db.read_federated_automatic_continuation_settings(&authority, target)
+            .await
+            .unwrap()
+            .preference,
+        AutoContinueOnContextExhaustion::Disabled
+    );
+    let set = db
+        .set_federated_automatic_continuation_settings(
+            &authority,
+            target,
+            AutoContinueOnContextExhaustion::Enabled,
+        )
+        .await
+        .established()
+        .expect("write acknowledged")
+        .unwrap();
+    assert_eq!(
+        set.aggregate,
+        ResolvedAutomaticContinuationAggregate::Ordinary(ordinary.product_conversation_id.clone())
+    );
+    assert_eq!(set.preference, AutoContinueOnContextExhaustion::Enabled);
+    assert_eq!(
+        db.read_federated_automatic_continuation_settings(&authority, target)
+            .await
+            .unwrap(),
+        set
+    );
+    let coordinator_set = db
+        .set_federated_automatic_continuation_settings(
+            &authority,
+            AutomaticContinuationTarget::Coordinator,
+            AutoContinueOnContextExhaustion::Enabled,
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        coordinator_set.aggregate,
+        ResolvedAutomaticContinuationAggregate::Coordinator(
+            coordinator.product_conversation_id.clone()
+        )
+    );
+    assert!(db
+        .automatic_continuation_admission(&ordinary.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(db
+        .continuation_dispatch_intent(&ordinary.id)
+        .await
+        .unwrap()
+        .is_none());
+    db.revoke_federation_enrollment(caller).await.unwrap();
+    assert!(matches!(
+        db.read_federated_automatic_continuation_settings(&authority, target)
+            .await,
+        Err(DbError::FederationSendAuthorityInactive)
+    ));
+    assert!(matches!(
+        db.set_federated_automatic_continuation_settings(
+            &authority,
+            target,
+            AutoContinueOnContextExhaustion::Disabled
+        )
+        .await
+        .established()
+        .unwrap(),
+        Err(DbError::FederationSendAuthorityInactive)
+    ));
+    assert_eq!(
+        db.auto_continue_on_context_exhaustion(&ordinary.product_conversation_id)
+            .await
+            .unwrap(),
+        AutoContinueOnContextExhaustion::Enabled
+    );
+}
+
+#[tokio::test]
+async fn federated_settings_reject_transcript_and_missing_targets_without_side_effects() {
+    let db = Database::open_in_memory().await.unwrap();
+    let unrelated = db
+        .create_conversation("unrelated", "unrelated", "/tmp", true, None, None)
+        .await
+        .unwrap();
+    let coordinator = db
+        .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+        .await
+        .unwrap();
+    let caller = InstanceId::new();
+    let verifier = FederationCredentialVerifier::from_bearer(b"automatic-continuation-test");
+    db.replace_federation_enrollment(caller, &"peer".parse().unwrap(), &verifier)
+        .await
+        .unwrap();
+    let authority = crate::FederationSendAuthority::new(caller, verifier);
+
+    db.set_federated_automatic_continuation_settings(
+        &authority,
+        AutomaticContinuationTarget::Ordinary(&unrelated.product_conversation_id),
+        AutoContinueOnContextExhaustion::Enabled,
+    )
+    .await
+    .established()
+    .expect("initial write acknowledged")
+    .unwrap();
+    let before = db.get_conversation(&unrelated.id).await.unwrap();
+    let coordinator_transcript = ProductConversationId::parse(coordinator.id.clone()).unwrap();
+    let missing = ProductConversationId::parse(uuid::Uuid::new_v4().to_string()).unwrap();
+
+    for invalid_target in [&coordinator_transcript, &missing] {
+        assert!(db
+            .read_federated_automatic_continuation_settings(
+                &authority,
+                AutomaticContinuationTarget::Ordinary(invalid_target),
+            )
+            .await
+            .is_err());
+        let rejected = db
+            .set_federated_automatic_continuation_settings(
+                &authority,
+                AutomaticContinuationTarget::Ordinary(invalid_target),
+                AutoContinueOnContextExhaustion::Disabled,
+            )
+            .await
+            .established()
+            .expect("invalid-target rollback acknowledged");
+        assert!(rejected.is_err());
+    }
+
+    let after = db.get_conversation(&unrelated.id).await.unwrap();
+    assert_eq!(after.state, before.state);
+    assert_eq!(after.updated_at, before.updated_at);
+    assert_eq!(after.message_count, before.message_count);
+    assert_eq!(
+        db.auto_continue_on_context_exhaustion(&unrelated.product_conversation_id)
+            .await
+            .unwrap(),
+        AutoContinueOnContextExhaustion::Enabled,
+    );
+    assert!(db
+        .automatic_continuation_admission(&unrelated.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(db
+        .continuation_dispatch_intent(&unrelated.id)
+        .await
+        .unwrap()
+        .is_none());
+}
 
 #[tokio::test]
 async fn native_settings_use_current_coordinator_source_and_exact_ordinary_target() {
