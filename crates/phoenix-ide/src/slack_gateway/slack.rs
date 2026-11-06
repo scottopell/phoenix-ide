@@ -742,7 +742,12 @@ fn parse_page(v: &Value, c: &Config) -> Result<Page, String> {
             observed_at_unix_micros: chrono::Utc::now().timestamp_micros(),
         });
     }
-    if hits.is_empty() && results.trim() != "No results found" {
+    if hits.is_empty()
+        && !matches!(
+            results.trim(),
+            "No results found" | "# Search Results for: \n\nNo results found."
+        )
+    {
         return Err("Unrecognized Slack search format".into());
     }
     Ok(Page { hits, cursor })
@@ -1600,6 +1605,17 @@ mod tests {
             )
             .is_err());
         }
+    }
+    #[test]
+    fn live_empty_search_envelope_completes_the_scan() {
+        let response = json!({
+            "results": "# Search Results for: \n\nNo results found.\n",
+            "pagination_info": "End of results - No more pages available.\\n"
+        });
+        let decoded = decode_result(&response.to_string()).unwrap();
+        let page = parse_page(&decoded, &config()).unwrap();
+        assert!(page.hits.is_empty());
+        assert!(page.cursor.is_none());
     }
     #[test]
     fn search_keeps_exact_thread_and_requires_pagination() {
