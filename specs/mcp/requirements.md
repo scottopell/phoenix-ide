@@ -213,9 +213,15 @@ a lower bound even when it exceeds that
 cap. A deadline in the past SHALL NOT delay recovery; a missing or malformed
 deadline SHALL use ordinary backoff. HTTP delay-seconds and HTTP-date forms
 SHALL both be recognized. Each lifecycle network operation SHALL retain its
-transport timeout and cancellation boundary. An unchanged reload or another caller SHALL join the same
-recovery rather than bypass its deadline or create another retry worker. Successful
-connection SHALL end recovery and reset its backoff.
+transport timeout and cancellation boundary. An unchanged reload or another caller SHALL use the same
+recovery owner rather than bypass its deadline or create another retry worker.
+A caller encountering a scheduled background retry SHALL receive current
+unavailability instead of waiting through that timer; background recovery SHALL
+continue independently without replaying that caller's operation. The admitted
+invocation's configured tool timeout SHALL bound readiness, active recovery and
+any replay together; expiration SHALL cancel only that invocation, retaining
+owned connection recovery and any active browser authorization for later calls.
+Successful connection SHALL end recovery and reset its backoff.
 
 A retry SHALL resume the first unfinished lifecycle step. If replacement
 initialization created a session before the handshake failed, that session SHALL

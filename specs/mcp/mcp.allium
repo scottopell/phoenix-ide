@@ -405,7 +405,9 @@ rule HttpRecoveryRetriesWhenDue {
         -- Resume the unfinished lifecycle step with retained session/credential
         -- ownership. No tools/call is replayed by this event. Every network step
         -- remains bounded and cancellable; recovery does not extend a caller's
-        -- deadline. Reload, callers and status readers join this owner.
+        -- deadline. Reload, callers and status readers use this owner. A caller
+        -- encountering a scheduled retry receives unavailability rather than
+        -- waiting through the timer or being replayed by background recovery.
 }
 
 rule HttpRecoveryHandsAuthenticationToOAuth {
@@ -1293,8 +1295,9 @@ deferred ReAuthCallRetry    -- see: crates/phoenix-tools/src/mcp.rs
     -- an executor continuation, not a connection-lifecycle state, and covers
     -- both re-auth paths symmetrically: a 403 insufficient_scope step-up
     -- (re-authorized with the union scope) and a 401 silent token refresh. In
-    -- both, the in-flight request future awaits the server's return to ready
-    -- and re-issues the same request, so the LLM never sees the interruption.
+    -- both, the in-flight request may await readiness and replay only within
+    -- its admitted timeout budget. A scheduled background retry returns current
+    -- unavailability; background recovery never replays the returned invocation.
     -- The ConnState/OAuthPhase machine models the re-authorization/refresh;
     -- holding and replaying the specific call belongs to the tool-execution
     -- path. Schema-bound calls re-check their admitted definition after recovery

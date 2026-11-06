@@ -2440,13 +2440,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn diagnostic_catalog_does_not_perform_io_or_expose_known_stale_definitions() {
+        let server = TestServer::start(handshake_responses("original")).await;
+        let manager = ready_refreshable_manager(&server).await;
+        let before = server.requests.lock().unwrap().len();
+        let tools = manager.cached_tool_definitions().await;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].0, "remote");
+        assert_eq!(tools[0].1.name, "report");
+        let handle = manager.servers.read().await.get("remote").unwrap().clone();
+        if let crate::supervisor::SupervisorState::Ready(serving) = handle.snapshot().state {
+            serving.tools_changed.store(true, Ordering::Release);
+        } else {
+            panic!("fixture must be ready");
+        }
+        assert!(manager.cached_tool_definitions().await.is_empty());
+        assert_eq!(server.requests.lock().unwrap().len(), before);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tool_throttling_preserves_the_connection_and_does_not_replay() {
+        for status in [429, 503] {
+            let server = TestServer::start(handshake_responses("original")).await;
+            let manager = ready_refreshable_manager(&server).await;
+            server.push_responses(vec![status_response(status, &[("Retry-After", "90")])]);
+            let error = manager
+                .call_tool("remote", "report", serde_json::json!({}))
+                .await
+                .unwrap_err();
+            assert!(error.contains("Retry-After: 90"), "{error}");
+            assert_eq!(manager.status().await[0].state, crate::McpConnState::Ready);
+            manager.await_background_tasks().await;
+            {
+                let requests = server.requests.lock().unwrap();
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|r| r.rpc_method() == "tools/call")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|r| r.rpc_method() == "initialize")
+                        .count(),
+                    1
+                );
+                assert!(!requests.iter().any(|r| r.http_method() == "DELETE"));
+            }
+            manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn originating_deadline_bounds_an_active_recovery_without_stopping_it() {
+        let server = TestServer::start(handshake_responses("original")).await;
+        let manager = Arc::new(McpClientManager::new());
+        let mut config = http_config(&server.url, HttpAuth::None);
+        if let McpServerConfig::Http {
+            tool_call_timeout, ..
+        } = &mut config
+        {
+            *tool_call_timeout = Duration::from_millis(100);
+        }
+        manager
+            .reload_from_configs(vec![("remote".into(), config)])
+            .await;
+        manager.await_background_tasks().await;
+        server.push_responses(vec![status_response(404, &[]), delete_ack()]);
+        let mut replacement = handshake_responses("recovered").into_iter();
+        server.push_responses(vec![delayed(replacement.next().unwrap(), 500)]);
+        server.push_responses(replacement.collect());
+        let result = tokio::time::timeout(
+            Duration::from_millis(400),
+            manager.call_tool("remote", "report", serde_json::json!({})),
+        )
+        .await
+        .expect("an active handshake must not extend the original 100ms call budget");
+        assert!(result.unwrap_err().contains("deadline"));
+        tokio::time::timeout(Duration::from_secs(3), manager.await_background_tasks())
+            .await
+            .unwrap();
+        assert_eq!(manager.status().await[0].state, crate::McpConnState::Ready);
+        assert_eq!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.rpc_method() == "tools/call")
+                .count(),
+            1
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tool_call_does_not_wait_through_scheduled_background_recovery() {
+        let server = TestServer::start(handshake_responses("original")).await;
+        let manager = ready_refreshable_manager(&server).await;
+        *server.routes.delete_bearer.lock().unwrap() = None;
+        server.push_responses(vec![
+            status_response(404, &[]),
+            delete_ack(),
+            status_response(503, &[]),
+        ]);
+        server.push_responses(handshake_responses("recovered"));
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            manager.call_tool("remote", "report", serde_json::json!({})),
+        )
+        .await
+        .expect("the caller must not wait for the five-second retry timer");
+        assert!(result.is_err());
+        assert!(manager.status().await[0].next_retry_at.is_some());
+        tokio::time::timeout(Duration::from_secs(12), manager.await_background_tasks())
+            .await
+            .unwrap();
+        assert_eq!(manager.status().await[0].state, crate::McpConnState::Ready);
+        assert_eq!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.rpc_method() == "tools/call")
+                .count(),
+            1
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn uncertain_one_shot_recovers_connection_without_replaying_operation() {
         let server = TestServer::start(handshake_responses("original")).await;
         let manager = ready_refreshable_manager(&server).await;
         let schema = manager.tool_definitions().await[0].1.input_schema.clone();
         *server.routes.delete_bearer.lock().unwrap() = None;
         server.push_responses(vec![
-            status_response(503, &[]),
+            status_response(404, &[]),
             status_response(401, &[]),
             status_response(503, &[]),
         ]);

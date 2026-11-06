@@ -1225,7 +1225,6 @@ fn should_reestablish(config: &McpServerConfig, error: &McpRequestError) -> bool
             TransportError::Disconnected(_)
                 | TransportError::Timeout(_)
                 | TransportError::SessionExpired
-                | TransportError::RetryableHttp { .. }
         ),
     }
 }
@@ -3332,6 +3331,27 @@ impl McpClientManager {
         statuses
     }
 
+    pub async fn cached_tool_definitions(&self) -> Vec<(String, McpToolDef)> {
+        let handles = self.servers.read().await;
+        handles
+            .iter()
+            .flat_map(|(name, handle)| match handle.snapshot().state {
+                SupervisorState::Ready(server) if !server.tools_changed.load(Ordering::Acquire) => {
+                    server
+                        .tools()
+                        .into_iter()
+                        .map(|tool| (name.clone(), tool))
+                        .collect()
+                }
+                SupervisorState::Ready(_)
+                | SupervisorState::Connecting
+                | SupervisorState::Recovering
+                | SupervisorState::Failed
+                | SupervisorState::Removed => Vec::new(),
+            })
+            .collect()
+    }
+
     pub async fn tool_definitions(&self) -> Vec<(String, McpToolDef)> {
         let handles: Vec<(String, SupervisorHandle)> = self
             .servers
@@ -3618,6 +3638,47 @@ impl McpClientManager {
                 McpToolCallError::Failed(format!("MCP server '{server_name}' is not connected"))
             })?;
         let invocation_config = handle.snapshot().config;
+        let budget = invocation_config.tool_call_timeout();
+        let call_cancel = cancel.child_token();
+        let worker_cancel = call_cancel.clone();
+        let manager = Arc::clone(self);
+        let name = server_name.to_owned();
+        let tool = tool_name.to_owned();
+        let mut call = Box::pin(async move {
+            manager
+                .call_tool_on_connection(
+                    &name,
+                    handle,
+                    invocation_config,
+                    &tool,
+                    arguments,
+                    worker_cancel,
+                    expected_schema,
+                )
+                .await
+        });
+        tokio::select! {
+            biased;
+            result = &mut call => result,
+            () = tokio::time::sleep(budget) => {
+                call_cancel.cancel();
+                self.spawn_background(async move { let _ = call.await; });
+                Err(McpToolCallError::Failed(format!("MCP server '{server_name}': tool call deadline exceeded")))
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn call_tool_on_connection(
+        self: &Arc<Self>,
+        server_name: &str,
+        handle: SupervisorHandle,
+        invocation_config: McpServerConfig,
+        tool_name: &str,
+        arguments: Value,
+        cancel: CancellationToken,
+        expected_schema: Option<Value>,
+    ) -> Result<String, McpToolCallError> {
         let first = self
             .call_actor_when_ready(
                 &handle,
@@ -3837,6 +3898,11 @@ impl McpClientManager {
             }
             RecoveryClaim::Follow(mut snapshots) => loop {
                 let snapshot = snapshots.borrow().clone();
+                if snapshot.next_retry_at.is_some() {
+                    return Err(snapshot.last_error.unwrap_or_else(|| {
+                        "MCP connection recovery is continuing in the background".into()
+                    }));
+                }
                 if !matches!(
                     snapshot.state,
                     SupervisorState::Recovering | SupervisorState::Connecting
@@ -4089,6 +4155,13 @@ impl McpClientManager {
         let mut snapshots = handle.subscribe();
         loop {
             let snapshot = snapshots.borrow().clone();
+            if snapshot.next_retry_at.is_some() {
+                return Err(McpToolCallError::Failed(
+                    snapshot.last_error.unwrap_or_else(|| {
+                        "MCP connection recovery is continuing in the background".into()
+                    }),
+                ));
+            }
             match snapshot.state {
                 SupervisorState::Ready(_) => return Ok(()),
                 SupervisorState::Failed | SupervisorState::Removed => {
