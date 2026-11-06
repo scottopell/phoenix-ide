@@ -2,17 +2,17 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 
 #[derive(Debug, Default)]
-pub(super) enum InstanceSelector {
+pub(crate) enum InstanceSelector {
     #[default]
     Local,
     Remote(RemoteInstanceSelector),
 }
 
 #[derive(Debug)]
-pub(super) struct RemoteInstanceSelector(String);
+pub(crate) struct RemoteInstanceSelector(String);
 
 impl RemoteInstanceSelector {
-    pub(super) fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -29,13 +29,7 @@ impl<'de> Deserialize<'de> for InstanceSelector {
 }
 
 impl InstanceSelector {
-    pub(super) fn deserialize_nullable<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Self, D::Error> {
-        Ok(Option::<Self>::deserialize(deserializer)?.unwrap_or_default())
-    }
-
-    pub(super) fn schema() -> Value {
+    pub(crate) fn schema() -> Value {
         json!({
             "type": "string",
             "minLength": 1,
@@ -43,7 +37,7 @@ impl InstanceSelector {
         })
     }
 
-    pub(super) fn nullable_schema() -> Value {
+    pub(crate) fn nullable_schema() -> Value {
         json!({
             "oneOf": [
                 Self::schema(),
@@ -53,6 +47,123 @@ impl InstanceSelector {
         })
     }
 }
+
+pub(crate) enum Route<T> {
+    Local,
+    Remote(T),
+}
+
+pub(crate) enum PeerResolution {
+    SavedUuidOrName,
+    WatchUuidIdentity,
+}
+
+#[async_trait::async_trait]
+pub(crate) trait RoutedTool: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn description(&self) -> String;
+    fn clearable(&self) -> bool;
+    fn nullable_instance(&self) -> bool {
+        false
+    }
+    fn schema_without_instance(&self) -> Value;
+    fn resolution_db(&self) -> &crate::db::Database;
+    fn peer_resolution(&self) -> PeerResolution {
+        PeerResolution::SavedUuidOrName
+    }
+    async fn authorize(&self, _ctx: &ToolContext) -> Result<(), String> {
+        Ok(())
+    }
+    fn validate_before_peer_lookup(&self, _input: &Value) -> Result<(), String> {
+        Ok(())
+    }
+    async fn run_routed(
+        &self,
+        input: Value,
+        route: Route<crate::api::federation::ResolvedPeer>,
+        ctx: ToolContext,
+    ) -> ToolOutput;
+}
+
+pub(crate) struct RouteTool<T>(T);
+
+impl<T: RoutedTool + 'static> RouteTool<T> {
+    pub(crate) fn boxed(inner: T) -> Arc<dyn Tool> {
+        Arc::new(Self(inner))
+    }
+}
+
+#[async_trait::async_trait]
+impl<T: RoutedTool + 'static> Tool for RouteTool<T> {
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+    fn description(&self) -> String {
+        self.0.description()
+    }
+    fn clearable(&self) -> bool {
+        self.0.clearable()
+    }
+    fn input_schema(&self) -> Value {
+        let mut schema = self.0.schema_without_instance();
+        if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+            properties.insert(
+                "instance".into(),
+                if self.0.nullable_instance() {
+                    InstanceSelector::nullable_schema()
+                } else {
+                    InstanceSelector::schema()
+                },
+            );
+        }
+        schema
+    }
+    async fn run(&self, mut input: Value, ctx: ToolContext) -> ToolOutput {
+        let selector = match input
+            .as_object_mut()
+            .and_then(|object| object.remove("instance"))
+        {
+            None => InstanceSelector::Local,
+            Some(Value::Null) if self.0.nullable_instance() => InstanceSelector::Local,
+            Some(Value::Null) => {
+                return ToolOutput::error(
+                    "invalid instance selector: expected a string".to_string(),
+                );
+            }
+            Some(value) => match serde_json::from_value::<InstanceSelector>(value) {
+                Ok(selector) => selector,
+                Err(error) => {
+                    return ToolOutput::error(format!("invalid instance selector: {error}"));
+                }
+            },
+        };
+        if let Err(error) = self.0.authorize(&ctx).await {
+            return ToolOutput::error(error);
+        }
+        let route = match selector {
+            InstanceSelector::Local => Route::Local,
+            InstanceSelector::Remote(selector) => {
+                if let Err(error) = self.0.validate_before_peer_lookup(&input) {
+                    return ToolOutput::error(error);
+                }
+                match crate::api::federation::resolve_tool_peer(
+                    self.0.resolution_db(),
+                    &selector,
+                    self.0.peer_resolution(),
+                )
+                .await
+                {
+                    Ok(peer) => Route::Remote(peer),
+                    Err(error) => return ToolOutput::error(error.to_string()),
+                }
+            }
+        };
+        self.0.run_routed(input, route, ctx).await
+    }
+}
+
+use crate::tools::{Tool, ToolContext, ToolOutput};
+use std::sync::Arc;
 
 #[cfg(test)]
 mod tests {

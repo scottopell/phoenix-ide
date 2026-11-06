@@ -461,15 +461,11 @@ async fn request_active_peer_subscription(
 
 pub(crate) async fn create_saved_peer_subscription(
     db: &Database,
-    instance: String,
+    resolved: &super::ResolvedPeer,
     product: ProductConversationId,
     requested_id: Option<Uuid>,
 ) -> Result<RemoteWatchReceipt, String> {
-    let selector = InstanceSelector::parse(instance).map_err(|error| error.to_string())?;
-    let peer = db
-        .resolve_federation_peer(&selector)
-        .await
-        .map_err(|error| error.to_string())?;
+    let peer = resolved.connection();
     let reference = SubscriptionReference {
         instance_id: peer.peer_instance_id,
         product_conversation_id: product,
@@ -503,7 +499,7 @@ pub(crate) async fn create_saved_peer_subscription(
         subscription_id: id,
         operation: SubscriptionOperation::Create,
     };
-    let response = request_active_peer_subscription(db, &peer, &request)
+    let response = request_active_peer_subscription(db, peer, &request)
         .await
         .map_err(|error| error.to_string())?;
     let SubscriptionResult::Created { snapshot } = response.result else {
@@ -525,14 +521,10 @@ pub(crate) async fn create_saved_peer_subscription(
 
 pub(crate) async fn unsubscribe_saved_peer(
     db: &Database,
-    instance: String,
+    resolved: &super::ResolvedPeer,
     product: ProductConversationId,
 ) -> Result<RemoteUnsubscribeReceipt, String> {
-    let selector = InstanceSelector::parse(instance).map_err(|error| error.to_string())?;
-    let peer = db
-        .resolve_federation_peer(&selector)
-        .await
-        .map_err(|error| error.to_string())?;
+    let peer = resolved.connection();
     let reference = SubscriptionReference {
         instance_id: peer.peer_instance_id,
         product_conversation_id: product,
@@ -542,7 +534,7 @@ pub(crate) async fn unsubscribe_saved_peer(
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "active or pending remote subscription not found".to_string())?;
-    unsubscribe_remote(db, &peer, &remote).await
+    unsubscribe_remote(db, peer, &remote).await
 }
 
 pub(crate) async fn unsubscribe_remote(
@@ -821,7 +813,10 @@ async fn drain_notifications(
         subscription_id: notification.subscription_id,
         delivery: &notification.content,
     };
-    let text = format!("Federated conversation subscription notification (terminal execution facts or an explicit retention gap; not task completion). {}", serde_json::to_string(&literal).map_err(|error| error.to_string())?);
+    let text = format!(
+        "Federated conversation subscription notification (terminal execution facts or an explicit retention gap; not task completion). {}",
+        serde_json::to_string(&literal).map_err(|error| error.to_string())?
+    );
     let outcome = service
         .send(crate::send_chat_service::SendChatRequest {
             conversation_id: target.clone(),
@@ -929,9 +924,23 @@ pub async fn owner_create(
     State(state): State<AppState>,
     Json(request): Json<OwnerSubscriptionRequest>,
 ) -> Response {
+    let selector = match InstanceSelector::parse(&request.instance) {
+        Ok(selector) => selector,
+        Err(error) => {
+            tracing::debug!(%error, "owner subscription peer resolution failed");
+            return rejected(StatusCode::CONFLICT);
+        }
+    };
+    let peer = match state.db.resolve_federation_peer(&selector).await {
+        Ok(connection) => super::ResolvedPeer { connection },
+        Err(error) => {
+            tracing::debug!(%error, "owner subscription peer resolution failed");
+            return rejected(StatusCode::CONFLICT);
+        }
+    };
     match create_saved_peer_subscription(
         &state.db,
-        request.instance,
+        &peer,
         request.product_conversation_id,
         Some(request.subscription_id),
     )
