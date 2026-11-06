@@ -1865,9 +1865,11 @@ async fn begin_oauth_flow(
     entry: &McpServerConfig,
     www_authenticate: Option<&str>,
     extra_scopes: Vec<String>,
-) -> Result<String, String> {
+) -> Result<String, oauth::OAuthRequestError> {
     let Some(url) = oauth_resource_url(entry) else {
-        return Err("server is not OAuth-eligible".to_string());
+        return Err(oauth::OAuthRequestError::Permanent(
+            "server is not OAuth-eligible".into(),
+        ));
     };
     let configured_oauth = oauth_config(entry);
     let preconfigured = configured_oauth.and_then(|oauth| oauth.client.as_ref());
@@ -1877,21 +1879,20 @@ async fn begin_oauth_flow(
     let loopback_port = preconfigured.and_then(|pre| pre.callback_port);
     let redirect_uri = match loopback_port {
         Some(port) => format!("http://localhost:{port}/callback"),
-        None => oauth_rt
-            .redirect_uri()
-            .ok_or("OAuth redirect base not configured (server address unknown)")?,
+        None => oauth_rt.redirect_uri().ok_or_else(|| {
+            oauth::OAuthRequestError::Permanent(
+                "OAuth redirect base not configured (server address unknown)".into(),
+            )
+        })?,
     };
-    let client = oauth::oauth_http_client()?;
+    let client = oauth::oauth_http_client().map_err(oauth::OAuthRequestError::Permanent)?;
     let challenge = www_authenticate
         .map(oauth::parse_bearer_challenge)
         .unwrap_or_default();
 
-    let prm = oauth::fetch_protected_resource_metadata(&client, url, &challenge)
-        .await
-        .map_err(|e| e.to_string())?;
-    let (metadata, cached_registration) = resolve_authorization_server(oauth_rt, &client, &prm)
-        .await
-        .map_err(|e| e.to_string())?;
+    let prm = oauth::fetch_protected_resource_metadata(&client, url, &challenge).await?;
+    let (metadata, cached_registration) =
+        resolve_authorization_server(oauth_rt, &client, &prm).await?;
 
     let registration = acquire_client_registration(
         oauth_rt,
@@ -1902,7 +1903,8 @@ async fn begin_oauth_flow(
         preconfigured,
         &redirect_uri,
     )
-    .await?;
+    .await
+    .map_err(oauth::OAuthRequestError::Permanent)?;
 
     // Configured and challenge-required scopes form the explicit request. The
     // resource's advertised set is the fallback only when neither is present;
@@ -1932,7 +1934,8 @@ async fn begin_oauth_flow(
         &pkce.challenge,
         &resource,
         &scopes,
-    )?;
+    )
+    .map_err(oauth::OAuthRequestError::Permanent)?;
 
     let flow = PendingAuthFlow {
         www_authenticate: www_authenticate.map(str::to_owned),
@@ -1955,10 +1958,10 @@ async fn begin_oauth_flow(
     // server-route case needs no listener.
     if let Some(port) = loopback_port {
         let Some(base) = oauth_rt.redirect_base() else {
-            return Err(format!(
+            return Err(oauth::OAuthRequestError::Permanent(format!(
                 "MCP server '{name}': loopback OAuth callback needs Phoenix's own address to \
                  bounce to, but none is configured"
-            ));
+            )));
         };
         // Abort and await any prior listener for this server so the port is
         // released before we rebind it (a re-prompt during an active flow).
@@ -1968,10 +1971,10 @@ async fn begin_oauth_flow(
             let _ = prior.await;
         }
         let listeners = bind_loopback_listeners(port).await.map_err(|e| {
-            format!(
+            oauth::OAuthRequestError::Permanent(format!(
                 "MCP server '{name}': cannot bind OAuth callback port {port} on loopback \
                  (already in use?): {e}"
-            )
+            ))
         })?;
         let handle = tokio::spawn(run_loopback_redirect(
             name.to_string(),
@@ -3196,6 +3199,7 @@ impl McpClientManager {
                         }
                     }
                     Err(error) => {
+                        let error = error.to_string();
                         handle.deny_oauth(permit.epoch, error.clone(), plan).await;
                         error
                     }
@@ -4738,13 +4742,29 @@ impl McpClientManager {
             name,
             entry,
             www_authenticate.as_deref(),
-            prior_scopes,
+            prior_scopes.clone(),
         )
         .await
         .map_err(|e| {
-            ConnectFailure::from(format!(
-                "MCP server '{name}': OAuth authorization failed: {e}"
-            ))
+            let minimum = match &e {
+                oauth::OAuthRequestError::Transport(_) => Some(Duration::ZERO),
+                oauth::OAuthRequestError::Retryable { minimum, .. } => Some(*minimum),
+                oauth::OAuthRequestError::Permanent(_) | oauth::OAuthRequestError::Rejected(_) => {
+                    None
+                }
+            };
+            ConnectFailure {
+                message: format!("MCP server '{name}': OAuth authorization failed: {e}"),
+                teardown_retry: None,
+                retry: minimum.map(|minimum| ConnectRetry {
+                    minimum,
+                    action,
+                    plan: Some(OAuthRetryPlan {
+                        scopes: prior_scopes,
+                        www_authenticate,
+                    }),
+                }),
+            }
         })?;
         Err(format!("MCP server '{name}' requires OAuth authorization; open {auth_url}").into())
     }

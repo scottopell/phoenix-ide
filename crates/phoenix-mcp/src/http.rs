@@ -2298,6 +2298,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oauth_metadata_alternatives_survive_temporary_primary_failures() {
+        for status in [408, 429, 500, 502, 503, 504] {
+            for resource_metadata in [true, false] {
+                let server = TestServer::start(vec![]).await;
+                install_oauth_discovery(&server, true);
+                let client = crate::oauth::oauth_http_client().unwrap();
+                if resource_metadata {
+                    server.route(
+                        "/.well-known/oauth-protected-resource/mcp",
+                        status_response(status, &[("Retry-After", "90")]),
+                    );
+                    server.route(
+                        "/.well-known/oauth-protected-resource",
+                        json_doc(&serde_json::json!({ "authorization_servers": [server.base()] })),
+                    );
+                    let metadata = crate::oauth::fetch_protected_resource_metadata(
+                        &client,
+                        &server.url,
+                        &HashMap::new(),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(metadata.authorization_servers, vec![server.base()]);
+                } else {
+                    server.route(
+                        "/.well-known/oauth-authorization-server",
+                        status_response(status, &[("Retry-After", "90")]),
+                    );
+                    server.route("/.well-known/openid-configuration", json_doc(&serde_json::json!({
+                        "issuer": server.base(), "authorization_endpoint": format!("{}/authorize",server.base()),
+                        "token_endpoint": format!("{}/token",server.base()), "code_challenge_methods_supported": ["S256"],
+                    })));
+                    let metadata = crate::oauth::fetch_auth_server_metadata(
+                        &client,
+                        &server.base(),
+                        crate::oauth::IssuerTrust::ResourceAdvertised,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(metadata.issuer, server.base());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_oauth_metadata_outage_recovers_without_reload_or_a_stored_grant() {
+        let server = TestServer::start(vec![]).await;
+        server.push_responses(vec![unauthorized(&server), unauthorized(&server)]);
+        install_oauth_discovery(&server, true);
+        server.route(
+            "/.well-known/oauth-protected-resource",
+            status_response(404, &[]),
+        );
+        server.route(
+            "/.well-known/openid-configuration",
+            status_response(404, &[]),
+        );
+        server.route_seq("/.well-known/oauth-protected-resource/mcp", vec![status_response(503, &[]), json_doc(&serde_json::json!({ "authorization_servers": [server.base()], "scopes_supported": ["mcp.read"] }))]);
+        server.route_seq("/.well-known/oauth-authorization-server", vec![status_response(503, &[]), json_doc(&serde_json::json!({
+            "issuer": server.base(), "authorization_endpoint": format!("{}/authorize",server.base()),
+            "token_endpoint": format!("{}/token",server.base()), "code_challenge_methods_supported": ["S256"],
+        }))]);
+        let manager = McpClientManager::new();
+        manager.set_oauth_redirect_base(REDIRECT_BASE.into());
+        manager
+            .oauth
+            .store()
+            .upsert_registration(&none_registration(&server.base()))
+            .await
+            .unwrap();
+        manager
+            .reload_from_configs(vec![(
+                "remote".into(),
+                http_config(&server.url, HttpAuth::None),
+            )])
+            .await;
+        let settled =
+            tokio::time::timeout(Duration::from_secs(12), manager.await_background_tasks()).await;
+        assert!(
+            settled.is_ok(),
+            "status={:?}; requests={:?}",
+            manager.status().await,
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r.request_line.clone())
+                .collect::<Vec<_>>()
+        );
+        let status = &manager.status().await[0];
+        assert_eq!(status.state, crate::McpConnState::Unauthorized);
+        assert!(status.pending_oauth_url.is_some());
+        {
+            let flows = manager.oauth.pending.lock().unwrap();
+            assert!(flows.get("remote").unwrap().owner.is_some());
+        }
+        assert_eq!(
+            server
+                .recorded_for_path("/.well-known/oauth-protected-resource/mcp")
+                .len(),
+            2
+        );
+        assert!(server.recorded_for_path("/token").is_empty());
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fresh_oauth_metadata_throttle_keeps_retry_after_without_starting_browser_flow() {
+        let server = TestServer::start(vec![]).await;
+        server.push_responses(vec![unauthorized(&server)]);
+        for path in [
+            "/.well-known/oauth-protected-resource/mcp",
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-authorization-server",
+            "/.well-known/openid-configuration",
+        ] {
+            server.route(path, status_response(429, &[("Retry-After", "90")]));
+        }
+        let manager = McpClientManager::new();
+        manager.set_oauth_redirect_base(REDIRECT_BASE.into());
+        manager
+            .reload_from_configs(vec![(
+                "remote".into(),
+                http_config(&server.url, HttpAuth::None),
+            )])
+            .await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if manager.status().await[0].next_retry_at.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let status = &manager.status().await[0];
+        assert_eq!(status.state, crate::McpConnState::Recovering);
+        assert!(status.next_retry_at.unwrap() >= chrono::Utc::now().timestamp() + 88);
+        assert!(status.pending_oauth_url.is_none());
+        assert_eq!(
+            server
+                .recorded_for_path("/.well-known/oauth-protected-resource/mcp")
+                .len(),
+            1
+        );
+        manager.reload_from_configs(vec![]).await;
+        tokio::time::timeout(Duration::from_secs(3), manager.await_background_tasks())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn throttled_lifecycle_preserves_deadline_and_unchanged_reload_joins_it() {
         for phase in ["connection", "grant", "metadata"] {
             let refreshing = phase != "connection";

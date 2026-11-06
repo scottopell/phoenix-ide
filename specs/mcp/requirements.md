@@ -227,7 +227,11 @@ A retry SHALL resume the first unfinished lifecycle step. If replacement
 initialization created a session before the handshake failed, that session SHALL
 also receive best-effort retirement before another replacement is initialized. While awaiting an
 owned browser authorization, THE SYSTEM SHALL wait for that flow rather than
-schedule connection attempts. Denial, expiry or failed authorization setup SHALL
+schedule connection attempts. Transient initial OAuth metadata discovery before
+publication of a browser flow SHALL use the same automatic connection retry
+policy and preserve server-directed retry delays. Denial, expiry, permanent
+metadata failure, client-registration or local callback setup failure, and failed
+setup of an owned re-authorization attempt SHALL
 retain an actionable failure until explicit retry.
 
 Recovery attempts SHALL preserve structured failure category, lifecycle phase,

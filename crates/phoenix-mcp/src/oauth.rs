@@ -473,6 +473,8 @@ pub async fn fetch_protected_resource_metadata(
         candidates.push(from_challenge.clone());
     }
     candidates.extend(prm_well_known_candidates(mcp_url));
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|candidate| seen.insert(candidate.clone()));
 
     let mut errors = Vec::new();
     for candidate in &candidates {
@@ -490,7 +492,6 @@ pub async fn fetch_protected_resource_metadata(
                     scopes_supported: string_list(doc.get("scopes_supported")),
                 });
             }
-            Err(e @ OAuthRequestError::Retryable { .. }) => return Err(e),
             Err(e) => errors.push(e),
         }
     }
@@ -523,7 +524,6 @@ pub async fn fetch_protected_resource_metadata(
                         scopes_supported: Vec::new(),
                     });
                 }
-                Err(e @ OAuthRequestError::Retryable { .. }) => return Err(e),
                 Err(e) => errors.push(e),
             }
         }
@@ -632,7 +632,6 @@ pub async fn fetch_auth_server_metadata(
     for candidate in &candidates {
         let doc = match fetch_json(client, candidate).await {
             Ok(doc) => doc,
-            Err(e @ OAuthRequestError::Retryable { .. }) => return Err(e),
             Err(e) => {
                 errors.push(e);
                 continue;
@@ -861,7 +860,7 @@ pub enum OAuthRequestError {
     /// The request never completed (connect/timeout) or the response was
     /// unreadable.
     Transport(String),
-    /// Invalid configuration/protocol/TLS; explicit action is required.
+    /// Invalid configuration/protocol/TLS or explicit client/callback setup boundary.
     Permanent(String),
     /// Temporary HTTP failure; preserve the server-directed delay.
     Retryable {

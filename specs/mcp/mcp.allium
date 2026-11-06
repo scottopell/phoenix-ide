@@ -327,8 +327,10 @@ rule OAuthFlowFailed {
     ensures: PendingAuthorizationCancelled(srv)
 
     @guidance
-        -- Clear the pending URL and retain the authorization error and scope
-        -- plan for explicit retry. No remote cleanup authorizes another browser
+        -- Temporary metadata failure during initial connection establishment,
+        -- before a browser flow is published, instead takes HttpLifecycleFailed
+        -- and its paced connection retry. Failed owned re-authorization setup
+        -- clears the pending URL and retains the error/scope plan for explicit retry. No remote cleanup authorizes another browser
         -- flow or delays cancellation of an obsolete one.
 }
 

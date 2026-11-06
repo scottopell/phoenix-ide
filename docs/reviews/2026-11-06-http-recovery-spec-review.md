@@ -234,3 +234,17 @@ Focused follow-up validation passes: 185 MCP tests, 26 UI tests, TypeScript,
 focused ESLint and MCP Clippy. The application crate's all-target Clippy passed
 after the cached-catalog API change; the later call-budget change remains internal
 to the separately checked MCP crate. CI qualifies the combined public PR head.
+
+
+The second GitHub review found initial OAuth metadata errors being flattened
+before reaching connection retry selection, and temporary failures preventing
+alternate metadata endpoints from being tried. Initial metadata errors now retain
+the typed category, Retry-After and authorization context through connection
+setup. Discovery tries distinct candidate URLs and aggregates temporary failures
+only when no usable candidate succeeds. Regression coverage includes fresh setup
+without a stored grant, throttled setup without an unowned sign-in URL, and both
+metadata families across all six retryable HTTP status codes.
+The complete MCP suite now passes 188 tests, with MCP all-target Clippy and
+Allium/anchor checks passing. Client-registration/callback setup and failed owned
+re-authorization retain their existing explicit-action boundary; this follow-up
+does not introduce automatic identity-provisioning retries.
