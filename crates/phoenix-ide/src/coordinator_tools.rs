@@ -1940,11 +1940,11 @@ mod tests {
             "d".repeat(43)
         ))
         .unwrap();
-        for (id, name) in [(peer, "selected-peer"), (other, "other-peer")] {
+        for (id, name, port) in [(peer, "selected-peer", 7001), (other, "other-peer", 7002)] {
             db.save_federation_peer_connection(
                 id,
                 &name.parse().unwrap(),
-                &"https://localhost:1".parse().unwrap(),
+                &format!("https://localhost:{port}").parse().unwrap(),
                 &bearer,
                 &phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
             )
