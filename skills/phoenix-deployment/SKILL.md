@@ -34,15 +34,19 @@ Local-HEAD deployment runs `./dev.py check` first and aborts on failure. Publish
 ## ⚠️ Do NOT
 
 - **Do not** run `cargo run` or start the binary directly — use `./dev.py prod deploy`
-- **Do not** run `systemctl stop/start phoenix-ide` or `launchctl load/unload` manually — `./dev.py prod deploy` handles this
+- Use `./dev.py prod deploy` for routine activation. A failed macOS deployment requires operator inspection and manual recovery as described in [LAUNCHD.md](LAUNCHD.md).
 
 ## Mode-specific details
 
 For full details on each mode (ports, paths, log locations, LLM config), read the relevant file:
 
-- **Native launchd (macOS):** read `skills/phoenix-deployment/LAUNCHD.md`
-- **Native systemd (Linux):** read `skills/phoenix-deployment/SYSTEMD.md`
-- **Persistent supervisor (Linux, no systemd):** read `skills/phoenix-deployment/DAEMON.md`
+- **Native launchd (macOS):** read [LAUNCHD.md](LAUNCHD.md)
+- **Native systemd (Linux):** read [SYSTEMD.md](SYSTEMD.md)
+- **Persistent supervisor (Linux, no systemd):** read [DAEMON.md](DAEMON.md)
+
+## macOS failure contract
+
+After disruption, deployment attempts stop and retains a failed claim and transaction. The candidate may have changed the database. Inspect logs and actual service/helper state, preserve evidence, and confirm helper absence before explicit operator marker clearance and a new forward deployment. An older binary requires its matching offline database restore. Active markers are never automatically reclaimed from terminal status. There are no macOS protected-schema, paired, repair, resume or finalization commands. Candidate-owned migration replaces deployment-side scans, snapshots and rehearsals; Linux contracts remain backend-specific.
 
 ## Publishing a Release (GitHub)
 

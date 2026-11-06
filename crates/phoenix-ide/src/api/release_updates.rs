@@ -37,6 +37,7 @@ const USER_AGENT: &str = "phoenix-ide-release-updates";
 const PREVIEW_CACHE_TTL: Duration = Duration::from_secs(300);
 const TERMINAL_STATUS_STATES: &[&str] = &[
     "committed",
+    "failed",
     "precondition_failed",
     "activation_failed_rolled_back",
     "activation_failed_rollback_failed",
@@ -746,6 +747,16 @@ pub async fn approve(
     ) {
         return (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": "release update approval is not authorized on this request" }))).into_response();
     }
+    if matches!(
+        read_status(&state, selected_backend),
+        ReleaseTransactionStatus::Present { state, .. } if state == "failed"
+    ) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "the failed deployment requires manual recovery before another update" })),
+        )
+            .into_response();
+    }
     let preview = match discover_release().await {
         Ok(preview) if valid_approval(&request, &preview) => preview,
         Ok(_) => return (
@@ -961,7 +972,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn rollback_failures_hydrate_as_terminal_with_both_diagnostics() {
+    async fn failures_hydrate_as_terminal_with_diagnostics() {
         let home = tempfile::tempdir().unwrap();
         let mut app = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         app.runtime_env =
@@ -969,6 +980,7 @@ mod tests {
         let path = status_path(&app, ReleaseUpdateBackend::BareLinux).unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         for durable_state in [
+            "failed",
             "ordinary_activation_failed_rollback_failed",
             "activation_failed_rollback_failed",
         ] {

@@ -38,6 +38,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [229](229_simplify-macos-deployment-to-candidate-migration-and-manual-recovery.md) | Simplify macOS deployment to candidate migration and manual recovery | Accepted | REQ-LDD-001–032, REQ-PD-031, REQ-COMP-021, REQ-SDC-001–023, REQ-RU-008 |
 | [208](208_codex-reset-credits-are-manual-and-resume-the-stopped-conversation.md) | Codex reset credits are redeemed manually through a Phoenix proxy, and a redemption from the quota error resumes that conversation | Accepted | REQ-CRR-001–010 |
 | [207](207_creation-receipt-evidence-and-image-payload-lifetime.md) | Retain creation evidence and replay identity, retire delivery images at product deletion | Accepted | REQ-CCR-013, REQ-CCR-014, REQ-CCR-015 |
 | [000](000_adopt-spears-v2.md) | Phoenix adopts spEARS v2 for new specification work | Accepted | methodology-level |
