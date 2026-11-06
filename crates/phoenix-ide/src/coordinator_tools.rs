@@ -430,8 +430,9 @@ fn remote_watch_page(
         if output.len() <= 96 * 1024 {
             return ToolOutput::success(output);
         }
-        if rows.pop().is_none() {
-            return ToolOutput::error("remote subscription exceeds the list output budget".into());
+        rows.pop();
+        if rows.is_empty() {
+            return ToolOutput::error("remote subscription exceeds the list output budget");
         }
         has_more = true;
     }
@@ -2108,6 +2109,29 @@ mod tests {
         assert_eq!(last_page["subscriptions"].as_array().unwrap().len(), 1);
         assert_eq!(last_page["has_more"], false);
         assert!(last_page["next_cursor"].is_null());
+        db.save_remote_subscription(
+            &SubscriptionReference {
+                instance_id: other,
+                product_conversation_id: ProductConversationId::parse(format!(
+                    "oversized-{}",
+                    "y".repeat(105_000)
+                ))
+                .unwrap(),
+            },
+            uuid::Uuid::from_u128(2051),
+        )
+        .await
+        .unwrap();
+        let oversized = tool
+            .run(
+                json!({"instance":other.to_string(),"after":uuid::Uuid::from_u128(2050)}),
+                context("coordinator"),
+            )
+            .await;
+        assert!(!oversized.is_success());
+        assert!(oversized
+            .output()
+            .contains("exceeds the list output budget"));
     }
 
     #[tokio::test]
