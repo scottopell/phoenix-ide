@@ -10,6 +10,12 @@ struct ConversationListView: View {
     @State private var navPath: [String] = []
     @State private var openingCoordinator = false
 
+    static func ordinaryRows(from conversations: [Conversation], coordinatorConversationId: String?) -> [Conversation] {
+        conversations.filter {
+            !$0.isCoordinator && $0.transcriptRowIdentity != coordinatorConversationId
+        }
+    }
+
     var body: some View {
         NavigationStack(path: $navPath) {
             VStack(spacing: 0) {
@@ -183,7 +189,7 @@ struct ConversationListView: View {
 
     @ViewBuilder
     private var list: some View {
-        if model.listStore.conversations.isEmpty {
+        if Self.ordinaryRows(from: model.listStore.conversations, coordinatorConversationId: model.coordinatorConversationId).isEmpty {
             if let error = model.listStore.lastError {
                 ContentUnavailableView {
                     Label("Couldn't load conversations", systemImage: "exclamationmark.icloud")
@@ -215,7 +221,7 @@ struct ConversationListView: View {
                             .listRowSeparator(.hidden)
                     }
                 }
-                ForEach(model.listStore.conversations.filter { !$0.isCoordinator && $0.transcriptRowIdentity != model.coordinatorConversationId }, id: \.aggregateIdentity) { conversation in
+                ForEach(Self.ordinaryRows(from: model.listStore.conversations, coordinatorConversationId: model.coordinatorConversationId), id: \.aggregateIdentity) { conversation in
                     let transcriptRowId = conversation.transcriptRowIdentity
                     let navigationId = conversation.archived == true
                         ? conversation.aggregateIdentity

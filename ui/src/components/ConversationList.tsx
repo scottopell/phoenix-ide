@@ -703,24 +703,28 @@ export function ConversationList({
   const [collapsedChains, setCollapsedChains] = useState<Set<string>>(new Set());
   const menuRef = useRef<HTMLDivElement>(null);
   const listRootRef = useRef<HTMLElement>(null);
+  const effectiveListDensity = listDensity ?? (sidebarMode ? 'sidebar' : 'full');
+  const isSidebarLayout = effectiveListDensity === 'sidebar';
+  const isMobileList = effectiveListDensity === 'mobile';
 
   useLayoutEffect(() => {
     const root = listRootRef.current;
     const header = root?.querySelector<HTMLElement>('.conversation-list-pinned-header');
-    if (!root || !header) return;
+    const scrollOwner = root?.closest<HTMLElement>('[data-app-scroll-owner]');
+    if (!root || !header || !scrollOwner) return;
+    const previousScrollPaddingTop = scrollOwner.style.scrollPaddingTop;
     const updateScrollOffset = () => {
-      root.style.scrollPaddingTop = `${header.getBoundingClientRect().height}px`;
+      scrollOwner.style.scrollPaddingTop = `${header.getBoundingClientRect().height}px`;
     };
     updateScrollOffset();
     const observer = new ResizeObserver(updateScrollOffset);
     observer.observe(header);
-    return () => observer.disconnect();
-  }, []);
+    return () => {
+      observer.disconnect();
+      scrollOwner.style.scrollPaddingTop = previousScrollPaddingTop;
+    };
+  }, [effectiveListDensity, sidebarMode]);
   const lastRevealedActiveSlugRef = useRef<string | null>(null);
-
-  const effectiveListDensity = listDensity ?? (sidebarMode ? 'sidebar' : 'full');
-  const isSidebarLayout = effectiveListDensity === 'sidebar';
-  const isMobileList = effectiveListDensity === 'mobile';
 
   useEffect(() => {
     if (!expandedId) return;

@@ -93,6 +93,7 @@ function renderStateBar({
   availableModels,
   onUpgradeModel,
   conversationExtension,
+  displayName,
 }: {
   conversation?: Conversation;
   convState?: ComponentProps<typeof StateBar>['convState'];
@@ -112,6 +113,7 @@ function renderStateBar({
   availableModels?: ComponentProps<typeof StateBar>['availableModels'];
   onUpgradeModel?: ComponentProps<typeof StateBar>['onUpgradeModel'];
   conversationExtension?: ComponentProps<typeof StateBar>['conversationExtension'];
+  displayName?: string;
 } = {}) {
   const props: ComponentProps<typeof StateBar> = {
     conversation,
@@ -121,6 +123,7 @@ function renderStateBar({
     nextRetryIn: null,
     contextWindowUsed,
     modelContextWindow,
+    displayName,
   };
   if (onOpenFiles !== undefined) {
     props.onOpenFiles = onOpenFiles;
@@ -166,6 +169,12 @@ function renderStateBar({
 }
 
 describe('StateBar conversation extension', () => {
+  it('shows a display name without mutating the persisted conversation slug', () => {
+    const conversation = makeConversation({ slug: 'persisted-slug' });
+    const { container } = renderStateBar({ conversation, displayName: 'Friendly display name' });
+    expect(container.querySelector('.slug-text')).toHaveTextContent('Friendly display name');
+    expect(conversation.slug).toBe('persisted-slug');
+  });
   it('reveals extension recovery details when attention is required', () => {
     setMobileViewport(true);
     renderStateBar({

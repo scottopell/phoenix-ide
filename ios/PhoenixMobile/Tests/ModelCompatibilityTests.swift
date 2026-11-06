@@ -22,6 +22,30 @@ final class ModelCompatibilityTests: XCTestCase {
         XCTAssertTrue(conversation.isCoordinator)
     }
 
+    func testOrdinaryRowsExcludeCoordinatorRoleAndRememberedCoordinatorId() throws {
+        let rows = try [
+            #"{"id":"ordinary-1","slug":"one"}"#,
+            #"{"id":"role-coordinator","slug":"coordinator","runtime_role":"coordinator"}"#,
+            #"{"id":"remembered-coordinator","slug":"remembered"}"#,
+            #"{"id":"ordinary-2","slug":"two"}"#,
+        ].map { try JSONDecoder().decode(Conversation.self, from: Data($0.utf8)) }
+
+        let projected = ConversationListView.ordinaryRows(
+            from: rows,
+            coordinatorConversationId: "remembered-coordinator")
+
+        XCTAssertEqual(projected.map(\.id), ["ordinary-1", "ordinary-2"])
+        XCTAssertTrue(ConversationListView.ordinaryRows(
+            from: rows,
+            coordinatorConversationId: "role-coordinator").allSatisfy { !$0.isCoordinator && $0.id != "role-coordinator" })
+        XCTAssertTrue(ConversationListView.ordinaryRows(
+            from: rows,
+            coordinatorConversationId: nil).allSatisfy { !$0.isCoordinator })
+        XCTAssertTrue(ConversationListView.ordinaryRows(
+            from: [rows[1]],
+            coordinatorConversationId: rows[1].id).isEmpty)
+    }
+
     func testCoordinatorConversationRowUsesEmberJourneyName() throws {
         let conversation = try JSONDecoder().decode(
             Conversation.self,

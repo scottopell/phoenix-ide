@@ -41,6 +41,52 @@ vi.mock('../utils', async () => {
 import { ConversationList, ConversationRow, ChainBlock } from './ConversationList';
 import { productConversationPresentationIndicator } from './ConversationList.presentation';
 
+describe('ConversationList — pinned header scroll offset', () => {
+  it('updates the nearest app scroll owner across densities and restores its prior inline style', () => {
+    const observers: Array<{ callback: ResizeObserverCallback; observed: Element[]; disconnected: boolean }> = [];
+    const OriginalResizeObserver = globalThis.ResizeObserver;
+    class ObserverMock {
+      observed: Element[] = [];
+      disconnected = false;
+      constructor(private callback: ResizeObserverCallback) { observers.push(this); }
+      observe(target: Element) { this.observed.push(target); }
+      unobserve() {}
+      disconnect() { this.disconnected = true; }
+      trigger() { this.callback([], this as unknown as ResizeObserver); }
+    }
+    vi.stubGlobal('ResizeObserver', ObserverMock);
+    try {
+      const { container, rerender, unmount } = render(
+        <MemoryRouter><div data-app-scroll-owner style={{ scrollPaddingTop: '7px' }}>
+          <ConversationList {...defaultProps} conversations={[]} listDensity="mobile" />
+        </div></MemoryRouter>,
+      );
+      const owner = container.querySelector<HTMLElement>('[data-app-scroll-owner]')!;
+      const root = container.querySelector<HTMLElement>('#conversation-list')!;
+      const header = root.querySelector<HTMLElement>('.conversation-list-pinned-header')!;
+      vi.spyOn(header, 'getBoundingClientRect').mockReturnValue({ height: 48 } as DOMRect);
+      act(() => observers.at(-1)!.trigger());
+      expect(owner.style.scrollPaddingTop).toBe('48px');
+      expect(root.style.scrollPaddingTop).toBe('');
+
+      rerender(<MemoryRouter><div data-app-scroll-owner style={{ scrollPaddingTop: '7px' }}>
+        <ConversationList {...defaultProps} conversations={[]} listDensity="full" />
+      </div></MemoryRouter>);
+      expect(observers[0]!.disconnected).toBe(true);
+      expect(owner.style.scrollPaddingTop).toBe('48px');
+      rerender(<MemoryRouter><div data-app-scroll-owner style={{ scrollPaddingTop: '7px' }}>
+        <ConversationList {...defaultProps} conversations={[]} sidebarMode listDensity="sidebar" />
+      </div></MemoryRouter>);
+      expect(observers.at(-1)!.observed).toContain(header);
+      unmount();
+      expect(owner.style.scrollPaddingTop).toBe('7px');
+      expect(observers.at(-1)!.disconnected).toBe(true);
+    } finally {
+      vi.stubGlobal('ResizeObserver', OriginalResizeObserver);
+    }
+  });
+});
+
 describe('ConversationList — global navigation', () => {
   it('pins Ember below the complete mobile list toolbar and navigates with router state', () => {
     function Location() { return <span data-testid="location">{useLocation().pathname}</span>; }
