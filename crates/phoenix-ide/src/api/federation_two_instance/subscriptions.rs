@@ -1885,17 +1885,13 @@ async fn source_revocation_without_pending_notifications_ends_create_or_replay_l
         assert_eq!(ended.admitted_cursor, remote.admitted_cursor);
         assert_eq!(ended.enrolled, enrolled);
         assert!(!ended.pending_unsubscribe);
-        assert_eq!(
-            serde_json::to_value(
-                a.state
-                    .db
-                    .remote_notification_history(&ended, SubscriptionCursor::START)
-                    .await
-                    .unwrap()
-            )
-            .unwrap(),
-            history
-        );
+        let ended_history = a
+            .state
+            .db
+            .remote_notification_history(&ended, SubscriptionCursor::START)
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_value(ended_history).unwrap(), history);
         let after: Vec<(String, i64, i64, i64, i64, i64)> = sqlx::query_as(source_query)
             .fetch_all(b.state.db.pool())
             .await
