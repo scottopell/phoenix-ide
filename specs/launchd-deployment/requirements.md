@@ -40,7 +40,7 @@ Withdrawn; this ID is reserved and grants no deployment or recovery guarantee. S
 
 ### REQ-LDD-009 — Truthful durable result
 
-After exact verification and plist publication, the system shall write `deployed.sha` from the selected source, persist `committed`, and release its owned claim. Status shall remain inspectable after the initiating connection ends and shall expose the active owner even when shared status is missing or belongs to another transaction.
+After exact verification and plist publication, the system shall write `deployed.sha` from the selected source, persist `committed`, and attempt to release its owned claim. Durable `committed` shall be terminal for runtime behavior: claim-release, reporting or cleanup errors shall not stop the verified runtime or change its committed result. Any surviving claim shall remain visible for operator inspection. Status shall remain inspectable after the initiating connection ends and shall expose the active owner even when shared status is missing or belongs to another transaction.
 
 ### REQ-LDD-010 — Interrupted ownership remains visible
 
@@ -124,12 +124,12 @@ After confirmed predecessor stop and candidate installation, the helper shall du
 
 ### REQ-LDD-030 — Manual recovery after disruption
 
-If any step fails after disruption begins, the helper shall attempt target stop, record `failed` with one human-readable failure containing the failed phase, error and any stop uncertainty, and retain its claim and transaction artifacts. It shall not start the predecessor, restore a database, or resume/replay the transaction. In-app deployment approval shall remain blocked pending operator recovery.
+If any step fails after disruption begins and before durable `committed`, the helper shall attempt target stop, record `failed` with one human-readable failure containing the failed phase, error and any stop uncertainty, and retain its claim and transaction artifacts. It shall not start the predecessor, restore a database, or resume/replay the transaction. In-app deployment approval shall remain blocked pending operator recovery.
 
 ### REQ-LDD-031 — Explicit operator recovery boundary
 
 Recovery shall require operator inspection of logs, retained transaction evidence and actual service/helper state. Only after confirming helper absence and resolving the actual runtime state may the operator explicitly clear the ownership marker and deploy a chosen forward candidate. Starting an older binary requires a matching database restore while all database users are stopped. Historical transaction files shall remain diagnostic evidence, without a conversion or retained-helper recovery API.
 
-### REQ-LDD-032 — Best-effort committed cleanup
+### REQ-LDD-032 — Best-effort committed bookkeeping
 
-After successful commit and claim release, the helper may remove only its temporary candidate and previous binary copies. Cleanup failure shall report a warning without stopping the verified runtime or changing the committed result.
+After durable commit, claim release and reporting shall be best effort. If claim release does not complete, the helper shall retain its temporary binary copies and attempt a warning directing operator inspection of ownership. It shall not recreate an already removed claim. After completed claim release, the helper may remove only its temporary candidate and previous binary copies. Cleanup failure shall attempt a warning. Warning or success-report output failure shall not stop the verified runtime, change committed status, or cause a new activation failure.

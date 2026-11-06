@@ -25,9 +25,9 @@
 
 Preparation validates and stages the candidate identity/hash, signature, complete plist, environment and protocol-2 helper before service disruption. The independent one-shot LaunchAgent survives the initiating shell or Phoenix connection. It quarantines the canonical plist into the transaction, observes predecessor stop, atomically installs the candidate, durably records `migration_started`, and invokes that candidate's `--migrate-only` once with a 600-second timeout and output in `activation.log`.
 
-After successful migration it boots the private candidate plist, verifies a stable new PID and exact `/api/version` identity, atomically publishes the same plist inode, writes `deployed.sha` and `committed`, and releases its claim. It then attempts to remove only temporary candidate and previous binary copies; cleanup errors warn without stopping the healthy service. Preparation failure leaves the runtime intact and releases only its owned marker.
+After successful migration it boots the private candidate plist, verifies a stable new PID and exact `/api/version` identity, atomically publishes the same plist inode, writes `deployed.sha` and `committed`, and attempts claim release. Durable committed is terminal for runtime behavior. Claim-release, reporting or cleanup errors preserve the healthy runtime and committed status; warnings are best effort. Incomplete claim release retains binary copies and any surviving marker for operator inspection. After completed release it attempts to remove only temporary candidate and previous binary copies. Preparation failure leaves the runtime intact and releases only its owned marker.
 
-After disruption, any error attempts stop, removes any attempted candidate publication, records `failed` with the phase, error and any teardown failure, and retains the claim and transaction. It never restores a database or starts the predecessor. A teardown attempt is not proof that the service stopped.
+After disruption and before durable committed, any error attempts stop, removes any attempted candidate publication, records `failed` with the phase, error and any teardown failure, and retains the claim and transaction. It never restores a database or starts the predecessor. A teardown attempt is not proof that the service stopped.
 
 ## Manual recovery
 

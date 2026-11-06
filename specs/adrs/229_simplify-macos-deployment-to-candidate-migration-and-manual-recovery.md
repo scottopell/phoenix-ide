@@ -47,13 +47,19 @@ snapshot or rehearse.
 
 After private-plist startup, stable new PID and exact version/full-SHA verification
 permit same-inode canonical plist publication, deployed identity and durable commit,
-then owned claim release. Temporary candidate/previous binary cleanup is best effort;
-a cleanup warning must not stop the committed healthy runtime. Preparation errors
-leave the service intact and release only the transaction's own marker.
+then an owned claim-release attempt. Durable committed is terminal for runtime
+behavior: claim-release, reporting and cleanup errors must not stop the verified
+runtime or change committed status. Failed release leaves any surviving marker
+for manual inspection and retains temporary binary copies; it does not recreate
+an already removed marker. Warnings are best effort even if the log sink fails.
+Temporary candidate/previous binary cleanup follows completed claim release.
+Preparation errors leave the service intact and release only the transaction's
+own marker.
 
-Any post-disruption error attempts stop, removes attempted candidate publication,
-records `failed` with the phase/error and any stop uncertainty, and retains the
-claim and artifacts. Even late publication or claim-release errors take this path.
+Any post-disruption error before durable committed attempts stop, removes
+attempted candidate publication, records `failed` with the phase/error and any
+stop uncertainty, and retains the
+claim and artifacts. Publication errors before durable committed take this path.
 No automatic predecessor startup, database restore, resume, finalization or replay
 exists. Every active deploy/restart marker blocks a new operation until its owner
 releases it or an operator resolves it explicitly; terminal status is not a stale
@@ -108,11 +114,19 @@ Activation, protected schema114/123/128/129, repair, refresh and rollback test
 classes disappear with their withdrawn routes. `test_launchd_deploy.py` shrinks
 from 7,357 to 1,257 lines and retains 53 ordinary installer tests plus seven new
 manual-recovery/isolation tests. Essential failure, exact identity, source,
-configuration and concurrency coverage remains in 21 small-helper tests, 60
+configuration and concurrency coverage remains in 25 small-helper tests, 60
 installer tests and disposable launchd journeys. The removed controller's 54
 files include its own retired tests; no production caller or behavior is lost.
 The prepared validation harness disappears with that unused controller, while the
 ordinary disposable launchd harness remains.
+
+The Rust `current_schema_controller_accepts_compiled_123_and_128_shapes` test and
+its single-use `validate_current_schema_with_controller` Python hook are also
+retired: they assert the withdrawn deployment-side schema123/128 admission
+contract. Actual migration128 data/constraint tests and migration lineage tests
+remain. The maintained macOS app workflow runs the replacement ordinary helper,
+installer, harness-safety and restart suites instead of the removed prepared
+upgrade module; ordinary macOS qualification remains in place.
 
 ## References
 

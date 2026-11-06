@@ -363,6 +363,13 @@ def release_claim(manifest: Manifest) -> bool:
         return True
 
 
+def warn_committed(message: str) -> None:
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
 def activate(manifest: Manifest) -> str:
     validate_manifest_identities(manifest)
     with Path(manifest.lock_path).open("a+") as lock:
@@ -423,11 +430,6 @@ def activate(manifest: Manifest) -> str:
             commit_atomic_install(staged_plist, canonical)
             atomic_write(Path(manifest.deployed_sha_path), (manifest.source_commit + "\n").encode())
             write_status(manifest, "committed")
-            if not release_claim(manifest):
-                raise ActivationError("candidate verified but deployment claim release failed")
-            phase = "committed"
-            print(f"{manifest.transaction_id}: committed", flush=True)
-            return "committed"
         except Exception as exc:
             stop_failure = None
             if disrupted:
@@ -457,14 +459,26 @@ def activate(manifest: Manifest) -> str:
         finally:
             for path in prepared:
                 path.unlink(missing_ok=True)
-            if phase == "committed":
-                candidate = Path(manifest.candidate_binary)
-                for path in (candidate, candidate.parent / "previous-phoenix-ide"):
-                    try:
-                        path.unlink(missing_ok=True)
-                    except OSError as exc:
-                        print(f"Committed deployment left temporary binary {path}: {exc}",
-                              file=sys.stderr, flush=True)
+        claim_released = False
+        try:
+            claim_released = release_claim(manifest)
+        except Exception as exc:
+            warn_committed(f"Committed deployment could not release its claim: {exc}; inspect ownership manually")
+        else:
+            if not claim_released:
+                warn_committed("Committed deployment claim no longer matches; inspect ownership manually")
+        if claim_released:
+            candidate = Path(manifest.candidate_binary)
+            for path in (candidate, candidate.parent / "previous-phoenix-ide"):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:
+                    warn_committed(f"Committed deployment left temporary binary {path}: {exc}")
+        try:
+            print(f"{manifest.transaction_id}: committed", flush=True)
+        except (OSError, ValueError):
+            pass
+        return "committed"
 
 
 def request_helper_bootout(uid: int, helper_label: str) -> None:

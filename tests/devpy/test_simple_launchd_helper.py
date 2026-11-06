@@ -158,6 +158,78 @@ if os.environ.get("FAIL_MIGRATION"):
         self.assertTrue(candidate.is_file())
         self.assertTrue(any("left temporary binary" in str(call) for call in output.call_args_list))
 
+    def test_committed_report_failure_preserves_successful_runtime_and_status(self):
+        def report(*args, **_kwargs):
+            if args == (f"{self.manifest.transaction_id}: committed",):
+                raise OSError("activation log is full")
+
+        with mock.patch("builtins.print", side_effect=report):
+            self.assertEqual(self.activate(), "committed")
+        self.assertEqual(self.launch.stops, 1)
+        self.assertEqual(self.launch.pid, 99)
+        self.assertEqual(self.status()["state"], "committed")
+        self.assertFalse(Path(self.manifest.active_path).exists())
+        self.assertTrue(Path(self.manifest.target_plist).samefile(self.manifest.candidate_plist))
+        self.assertEqual(Path(self.manifest.deployed_sha_path).read_text(), "a" * 40 + "\n")
+
+    def test_committed_cleanup_warning_failure_preserves_success(self):
+        candidate = Path(self.manifest.candidate_binary)
+        unlink = Path.unlink
+
+        def unlink_except_candidate(path, *args, **kwargs):
+            if path == candidate:
+                raise PermissionError("temporary binary is busy")
+            return unlink(path, *args, **kwargs)
+
+        def report(*args, **_kwargs):
+            if args and "left temporary binary" in args[0]:
+                raise OSError("activation log is full")
+
+        with mock.patch.object(Path, "unlink", autospec=True, side_effect=unlink_except_candidate), \
+             mock.patch("builtins.print", side_effect=report):
+            self.assertEqual(self.activate(), "committed")
+        self.assertEqual(self.launch.stops, 1)
+        self.assertEqual(self.launch.pid, 99)
+        self.assertEqual(self.status()["state"], "committed")
+        self.assertFalse(Path(self.manifest.active_path).exists())
+        self.assertTrue(candidate.is_file())
+        self.assertTrue(Path(self.manifest.target_plist).samefile(self.manifest.candidate_plist))
+
+    def test_committed_claim_release_failure_preserves_runtime_and_evidence(self):
+        with mock.patch.object(helper, "release_claim", return_value=False), \
+             mock.patch("builtins.print") as output:
+            self.assertEqual(self.activate(), "committed")
+        self.assertEqual(self.launch.stops, 1)
+        self.assertEqual(self.launch.pid, 99)
+        self.assertEqual(self.status()["state"], "committed")
+        self.assertTrue(Path(self.manifest.active_path).exists())
+        self.assertTrue(Path(self.manifest.candidate_binary).is_file())
+        self.assertTrue(Path(self.manifest.target_plist).samefile(self.manifest.candidate_plist))
+        self.assertTrue(any("claim no longer matches" in str(call) for call in output.call_args_list))
+
+    def test_committed_claim_unlink_fsync_and_warning_failures_preserve_runtime(self):
+        active = Path(self.manifest.active_path)
+        fsync_dir = helper.fsync_dir
+
+        def fail_after_claim_unlink(path):
+            if path == active.parent and not active.exists():
+                raise OSError("claim directory fsync failed")
+            return fsync_dir(path)
+
+        def report(*args, **_kwargs):
+            if args and "could not release its claim" in args[0]:
+                raise OSError("activation log is full")
+
+        with mock.patch.object(helper, "fsync_dir", side_effect=fail_after_claim_unlink), \
+             mock.patch("builtins.print", side_effect=report):
+            self.assertEqual(self.activate(), "committed")
+        self.assertEqual(self.launch.stops, 1)
+        self.assertEqual(self.launch.pid, 99)
+        self.assertEqual(self.status()["state"], "committed")
+        self.assertFalse(active.exists())
+        self.assertTrue(Path(self.manifest.candidate_binary).is_file())
+        self.assertTrue(Path(self.manifest.target_plist).samefile(self.manifest.candidate_plist))
+
     def test_partial_migration_failure_never_starts_a_runtime_or_restores_data(self):
         self.environment["FAIL_MIGRATION"] = "1"
         self.refresh_plist()

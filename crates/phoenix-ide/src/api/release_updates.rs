@@ -686,6 +686,13 @@ fn valid_approval(request: &ApproveReleaseUpdateRequest, preview: &ReleasePrevie
     )
 }
 
+fn durable_status_establishes_handoff(state: &str) -> bool {
+    matches!(
+        state,
+        "activating" | "stopping" | "migration_started" | "starting" | "verifying" | "publishing"
+    ) || TERMINAL_STATUS_STATES.contains(&state)
+}
+
 fn updater_dir(state: &AppState) -> Result<PathBuf, String> {
     let root = state
         .runtime_env
@@ -911,10 +918,7 @@ pub async fn approve(
             ..
         } = &durable
         {
-            if durable_id == &transaction_id
-                && (durable_state == "activating"
-                    || TERMINAL_STATUS_STATES.contains(&durable_state.as_str()))
-            {
+            if durable_id == &transaction_id && durable_status_establishes_handoff(durable_state) {
                 tokio::task::spawn_blocking(move || {
                     if let Err(error) = child.wait() {
                         tracing::warn!(%error, "failed to reap release controller");
@@ -970,6 +974,26 @@ pub async fn approve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launched_backend_states_establish_handoff_before_controller_exit() {
+        for state in [
+            "stopping",
+            "migration_started",
+            "starting",
+            "verifying",
+            "publishing",
+            "activating",
+        ] {
+            assert!(durable_status_establishes_handoff(state), "{state}");
+        }
+        for state in TERMINAL_STATUS_STATES {
+            assert!(durable_status_establishes_handoff(state), "{state}");
+        }
+        for state in ["preparing", "prepared", "unknown"] {
+            assert!(!durable_status_establishes_handoff(state), "{state}");
+        }
+    }
 
     #[tokio::test]
     async fn failures_hydrate_as_terminal_with_diagnostics() {

@@ -45,8 +45,7 @@ entity DeployTransaction {
         starting -> failed
         verifying -> failed
         publishing -> failed
-        committed -> failed
-        terminal: precondition_failed, failed, rejected_concurrent
+        terminal: committed, precondition_failed, failed, rejected_concurrent
     }
 }
 
@@ -215,6 +214,12 @@ rule CommitVerifiedCandidate {
     ensures: transaction.state = committed
     ensures: DurableStatusWritten(transaction)
     ensures: OnlyOwnedClaimReleaseRequested(transaction)
+
+    @guidance
+        -- Durable committed is terminal for runtime behavior. Claim release and
+        -- reporting are best effort; errors preserve committed and the healthy
+        -- job. Retain binary copies if release does not complete, leave any
+        -- surviving claim for operator inspection, and never recreate a claim.
 }
 
 rule CleanCommittedCopies {
@@ -223,13 +228,14 @@ rule CleanCommittedCopies {
     ensures: TemporaryCandidateAndPreviousBinaryCleanupAttempted(transaction)
 
     @guidance
-        -- Cleanup errors warn and preserve committed status and the healthy job.
+        -- Cleanup errors attempt a warning and preserve committed and the job.
+        -- Warning or success-report output failure cannot fail activation.
         -- Retain the private plist/helper/manifest/log as transaction evidence.
 }
 
 rule StopAndRetainFailedDeployment {
     when: ActivationFailed(transaction, phase, error, stop_error)
-    requires: transaction.state in { stopping, migration_started, starting, verifying, publishing, committed }
+    requires: transaction.state in { stopping, migration_started, starting, verifying, publishing }
     ensures: TargetStopAttempted(transaction)
     ensures: PublishedCandidatePlistRemovalAttempted(transaction)
     ensures: transaction.state = failed
@@ -240,7 +246,7 @@ rule StopAndRetainFailedDeployment {
     ensures: ManualOperatorRecoveryRequired(transaction)
 
     @guidance
-        -- Even claim-release/publication failure stops and retains ownership.
+        -- Publication failure before durable committed stops and retains ownership.
         -- Inspect actual target/helper state; stop failure remains explicit.
         -- No predecessor start, database restore, replay, resume or finalization.
 }

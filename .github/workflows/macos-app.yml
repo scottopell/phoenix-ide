@@ -14,8 +14,12 @@ on:
       - "crates/phoenix-ide/src/lib.rs"
       - "dev.py"
       - "scripts/launchd_deploy_helper.py"
+      - "scripts/launchd_restart_helper.py"
       - "tests/devpy/test_launchd_deploy.py"
-      - "tests/devpy/test_current_schema_prepared_upgrade.py"
+      - "tests/devpy/test_simple_launchd_helper.py"
+      - "tests/devpy/test_launchd_deploy_harness.py"
+      - "tests/devpy/test_launchd_restart.py"
+      - "tests/integration/launchd_deploy_harness.py"
       - "ui/src/generated/DeploymentInfo.ts"
       - ".github/workflows/macos-app.yml"
       - ".github/workflows/release.yml"
@@ -40,8 +44,12 @@ on:
       - "crates/phoenix-ide/src/lib.rs"
       - "dev.py"
       - "scripts/launchd_deploy_helper.py"
+      - "scripts/launchd_restart_helper.py"
       - "tests/devpy/test_launchd_deploy.py"
-      - "tests/devpy/test_current_schema_prepared_upgrade.py"
+      - "tests/devpy/test_simple_launchd_helper.py"
+      - "tests/devpy/test_launchd_deploy_harness.py"
+      - "tests/devpy/test_launchd_restart.py"
+      - "tests/integration/launchd_deploy_harness.py"
       - "ui/src/generated/DeploymentInfo.ts"
       - ".github/workflows/macos-app.yml"
       - ".github/workflows/release.yml"
@@ -84,8 +92,11 @@ jobs:
           python3 scripts/test_release_version.py
       - name: Set up uv
         uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
-      - name: Test launchd deployment controller
-        run: uv run --no-project --managed-python --python 3.13 python -m unittest tests.devpy.test_launchd_deploy tests.devpy.test_current_schema_prepared_upgrade
+      - name: Test launchd deployment and installed-runtime restart
+        run: >-
+          uv run --no-project --managed-python --python 3.13 python -m unittest
+          tests.devpy.test_launchd_deploy tests.devpy.test_simple_launchd_helper
+          tests.devpy.test_launchd_deploy_harness tests.devpy.test_launchd_restart
       - name: Build a real unsigned Release package
         run: |
           version=$(grep -m1 '^version' crates/phoenix-ide/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
