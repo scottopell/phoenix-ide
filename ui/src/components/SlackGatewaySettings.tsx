@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useId } from 'react';
 import type { McpServerStatus } from '../api';
+import { slackGatewayArgumentProbes, slackGatewayToolProblem, type SlackToolSchema } from './slackGatewayToolCompatibility';
 import '../pages/SlackGatewayPage.css';
 
 interface Config {
@@ -26,16 +27,35 @@ export function SlackGatewaySettings({ standalone = false }: { standalone?: bool
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [readCheck, setReadCheck] = useState<string | null>(null);
+  const [toolProblem, setToolProblem] = useState<string | null>(null);
+  const updateStatus = useCallback(async (s: GatewayStatus) => {
+    let problem: string | null = null;
+    if (s.config && s.connection?.state === 'ready' && s.connection.enabled) {
+      try {
+        const r = await fetch('/api/slack-gateway/capabilities');
+        if (!r.ok) throw Error('Catalog unavailable');
+        const catalog: { tools?: SlackToolSchema[] } = await r.json();
+        const tools = catalog.tools ?? [];
+        const server = s.config.mcp_server;
+        const knownNames = s.connection.tools;
+        const hasKnownTools = Object.keys(slackGatewayArgumentProbes).every(name => knownNames.filter(tool => tool === name || tool.endsWith('_' + name)).length === 1);
+        problem = !tools.some(tool => tool.server === server) && hasKnownTools
+          ? 'Cannot verify required tool schemas: catalog unavailable or outdated.'
+          : slackGatewayToolProblem(tools, server);
+      } catch { problem = 'Cannot verify required tool schemas: catalog unavailable.'; }
+    }
+    setToolProblem(problem); setStatus(s);
+  }, []);
   const refresh = useCallback(async () => {
     setBusy(true); setError(null);
-    try { const r = await fetch('/api/slack-gateway'); if (!r.ok) throw Error('Could not read Slack gateway status'); const s: GatewayStatus = await r.json(); setStatus(s); setConfig(s.config ?? initial()); }
+    try { const r = await fetch('/api/slack-gateway'); if (!r.ok) throw Error('Could not read Slack gateway status'); const s: GatewayStatus = await r.json(); await updateStatus(s); setConfig(s.config ?? initial()); }
     catch (e) { setError(e instanceof Error ? e.message : 'Gateway unavailable'); }
     finally { setBusy(false); }
-  }, []);
+  }, [updateStatus]);
   useEffect(() => { if (standalone) void refresh(); }, [standalone, refresh]);
   async function save() {
     setBusy(true); setError(null);
-    try { if (config.notification_command && !config.notification_command[0]?.trim()) throw Error('Enter a notification program, or remove the notification command.'); const r = await fetch('/api/slack-gateway', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); const s = await r.json(); if (!r.ok) throw Error(s.error ?? 'Could not save gateway'); setStatus(s); setSaved(true); }
+    try { if (config.notification_command && !config.notification_command[0]?.trim()) throw Error('Enter a notification program, or remove the notification command.'); const r = await fetch('/api/slack-gateway', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); const s = await r.json(); if (!r.ok) throw Error(s.error ?? 'Could not save gateway'); await updateStatus(s); setSaved(true); }
     catch (e) { setError(e instanceof Error ? e.message : 'Gateway unavailable'); }
     finally { setBusy(false); }
   }
@@ -54,8 +74,7 @@ export function SlackGatewaySettings({ standalone = false }: { standalone?: bool
   }
   const fields = [ ['mcp_server', 'Slack MCP server', 'Connection name, such as slack'], ['owner', 'Your Slack user ID', 'The owner whose gestures Phoenix watches'], ['workspace', 'Slack workspace host', 'Permalink host only, without https://'], ['timezone', 'Timezone', 'Used for the four-calendar-date discovery window'], ['phoenix_url', 'Phoenix URL', 'Used in links back to this Phoenix instance'] ] as const;
   const connection = status?.connection;
-  const missingTools = connection?.state === 'ready' && ['slack_read_user_profile', 'slack_search_public_and_private', 'slack_read_thread', 'slack_get_reactions', 'slack_add_reaction', 'slack_send_message'].some(name => connection.tools.filter(tool => tool === name || tool.endsWith('_' + name)).length !== 1);
-  const connectionProblem = status?.config && status.connection === null ? 'Connection unavailable' : connection && !connection.enabled ? 'Connection disabled' : connection?.state === 'unauthorized' ? 'Sign-in required' : connection && connection.state !== 'ready' ? connection.state.replaceAll('_', ' ') : missingTools ? 'Required tools unavailable' : null;
+  const connectionProblem = status?.config && status.connection === null ? 'Connection unavailable' : connection && !connection.enabled ? 'Connection disabled' : connection?.state === 'unauthorized' ? 'Sign-in required' : connection && connection.state !== 'ready' ? connection.state.replaceAll('_', ' ') : toolProblem;
   const discoveryState = !status?.config ? 'Not configured' : !status.config.enabled ? 'Paused' : connectionProblem ?? (!status.scan?.baseline_complete ? 'Initializing' : (status.scan.status ?? 'Initializing').replaceAll('_', ' '));
   const command = config.notification_command ?? [];
   const setCommandPart = (index: number, value: string) => {

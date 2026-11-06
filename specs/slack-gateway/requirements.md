@@ -212,7 +212,12 @@ WHEN the configured MCP connection is unavailable, THE SYSTEM SHALL use its
 connection lifecycle under REQ-MCP-007/012/013 rather than own a separate reconnect
 loop. Gateway status SHALL distinguish connecting or recovering, active sign-in
 required, permanent connection failure, a disabled MCP server, and a ready server
-whose required tools are missing or incompatible. Missing tools on an unavailable
+whose required tools are missing or incompatible. Static schema checks SHALL
+validate the adapter's argument forms against the advertised catalog. Unsupported
+schemas or a known-stale catalog SHALL be reported as unverified rather than
+healthy; static conformance SHALL NOT imply live account or provider access.
+Diagnostic catalog reads SHALL NOT issue MCP calls or start recovery.
+Missing tools on an unavailable
 connection SHALL NOT alone imply that the owner must authorize again.
 
 Owner-facing status SHALL present current connection health separately from the

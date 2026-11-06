@@ -111,3 +111,15 @@ it.each([
   expect(screen.queryByText('healthy')).toBeNull();
   expect(screen.getByText(/Older triggers may have been missed/)).toBeTruthy();
 });
+
+
+it('shows schema incompatibility even when every required tool name is present', async () => {
+  const names = ['slack_read_user_profile', 'slack_search_public_and_private', 'slack_read_thread', 'slack_get_reactions', 'slack_add_reaction', 'slack_send_message'];
+  const config = { enabled: true, mcp_server: 'slack', owner: 'UOWNER', workspace: 'example.slack.com', timezone: 'UTC', phoenix_url: 'https://phoenix.example', notification_command: [] };
+  vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => ({ ok: true, json: async () => url.endsWith('/capabilities')
+    ? { tools: names.map(name => ({ server: 'slack', name, input_schema: name === 'slack_send_message' ? { type: 'object', properties: { message: { type: 'number' } } } : { type: 'object' } })) }
+    : { config, connection: { name: 'slack', state: 'ready', enabled: true, tools: names }, scan: { baseline_complete: true, status: 'healthy' }, requests: [], returns: [] } })));
+  render(<SlackGatewaySettings standalone />);
+  await screen.findByText(/Slack connection: Incompatible tool schema: slack_send_message/);
+  expect(screen.queryByText('healthy')).toBeNull();
+});

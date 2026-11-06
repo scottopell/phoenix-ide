@@ -6,7 +6,7 @@ section. These were author-performed review passes, not independent agent review
 
 Scope: requirements, Allium, proposed ADR-229 and acceptance scenarios only.
 These are two author-performed adversarial passes, not independent-agent or
-implementation reviews. Initial draft: commit `56342e81e`. The corrections below
+implementation reviews. Initial draft: commit `6a6372246`. The corrections below
 are part of the reviewed successor. No runtime correctness or deployment claim
 follows from this review.
 
@@ -214,3 +214,23 @@ plans after the old transport is gone.
   denied. Only pre-existing ts-rs macro attribute notices were emitted.
 - No production deployment, prototype database conversion, live Slack fault
   injection, workflow modification or external message send was performed.
+
+
+## PR code-review follow-up
+
+The first GitHub Codex review found three implementation gaps: ordinary tool
+throttling could reconnect and replay; readiness checked names without schemas;
+and callers could outlive their admitted timeout during recovery. Tool 429/503
+responses now retain Retry-After without reconnect or replay. Settings validate
+the adapter's argument forms against cached schemas, report unsupported schemas
+as unverified, and perform no remote I/O for catalog inspection. Ordinary calls
+retain one configured budget across readiness, recovery and replay; timeout
+cancels the invocation while owned recovery continues. A scheduled background
+retry also returns current unavailability promptly.
+
+An author review additionally reproduced credential-bearing endpoint URLs in
+request errors. Request diagnostics now remove URLs before rendering errors.
+Focused follow-up validation passes: 185 MCP tests, 26 UI tests, TypeScript,
+focused ESLint and MCP Clippy. The application crate's all-target Clippy passed
+after the cached-catalog API change; the later call-budget change remains internal
+to the separately checked MCP crate. CI qualifies the combined public PR head.

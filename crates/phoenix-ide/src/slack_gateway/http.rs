@@ -52,7 +52,7 @@ pub(crate) async fn source(
 }
 
 pub(crate) async fn capabilities(State(s): State<AppState>) -> Json<serde_json::Value> {
-    let tools=s.mcp_manager.tool_definitions().await.into_iter().filter(|(_,t)|t.name.contains("slack")).map(|(server,t)|serde_json::json!({"server":server,"name":t.name,"input_schema":t.input_schema})).collect::<Vec<_>>();
+    let tools=s.mcp_manager.cached_tool_definitions().await.into_iter().filter(|(_,t)|t.name.contains("slack")).map(|(server,t)|serde_json::json!({"server":server,"name":t.name,"input_schema":t.input_schema})).collect::<Vec<_>>();
     Json(serde_json::json!({"tools":tools}))
 }
 
