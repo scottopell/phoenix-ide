@@ -299,6 +299,7 @@ class DevWorkflowArtifactTests(unittest.TestCase):
                 disabled = self.dev._doctor_compiler_cache_result(None, None, None, None, None, None)
             self.assertTrue(disabled.ok)
             self.assertIn("selected=none", disabled.detail)
+            self.assertIn("scope=caller-owned inherited environment", disabled.detail)
 
     def test_doctor_cache_explicit_known_wrapper_preserves_override_despite_probe_warning(self):
         with mock.patch.dict(os.environ, {"RUSTC_WRAPPER": "/usr/bin/sccache"}, clear=True):

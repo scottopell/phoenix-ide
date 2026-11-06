@@ -328,6 +328,17 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertIsNotNone(observed_home)
         self.assertFalse(observed_home.exists())
 
+    def test_kache_version_probe_isolation_failure_is_a_probe_error(self):
+        with mock.patch.object(
+            self.dev.tempfile,
+            "TemporaryDirectory",
+            side_effect=OSError("disk full"),
+        ):
+            version, error = self.dev._kache_version("/bin/kache")
+
+        self.assertIsNone(version)
+        self.assertEqual(error, "cannot isolate kache version probe: disk full")
+
     def test_forced_local_config_and_isolated_paths_ignore_remote_ambient(self):
         import tomllib
 

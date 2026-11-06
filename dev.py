@@ -3805,7 +3805,8 @@ def _doctor_compiler_cache_result(
         if not wrapper:
             return DoctorResult(
                 "compiler-cache", True,
-                f"requested=RUSTC_WRAPPER (empty); selected=none; scope={scope}",
+                "requested=RUSTC_WRAPPER (empty); selected=none; "
+                "scope=caller-owned inherited environment",
             )
         binary = shutil.which(wrapper)
         if binary is None:
@@ -5084,13 +5085,16 @@ def _command_version(
 
 
 def _kache_version(binary: str) -> tuple[str | None, str | None]:
-    with tempfile.TemporaryDirectory(prefix="phoenix-kache-version-") as temporary_home:
-        probe_env = {
-            key: value for key, value in os.environ.items()
-            if not key.startswith("KACHE_")
-        }
-        probe_env.update({"HOME": temporary_home, "TMPDIR": temporary_home})
-        detail, error = _command_version(binary, env=probe_env)
+    try:
+        with tempfile.TemporaryDirectory(prefix="phoenix-kache-version-") as temporary_home:
+            probe_env = {
+                key: value for key, value in os.environ.items()
+                if not key.startswith("KACHE_")
+            }
+            probe_env.update({"HOME": temporary_home, "TMPDIR": temporary_home})
+            detail, error = _command_version(binary, env=probe_env)
+    except OSError as probe_error:
+        return None, f"cannot isolate kache version probe: {probe_error}"
     if error:
         return None, error
     assert detail is not None
