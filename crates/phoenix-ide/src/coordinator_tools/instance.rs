@@ -93,6 +93,11 @@ pub(crate) enum Route<T> {
     Remote(T),
 }
 
+pub(crate) enum PeerResolution {
+    SavedUuidOrName,
+    WatchUuidIdentity,
+}
+
 #[async_trait::async_trait]
 pub(crate) trait RoutedTool: Send + Sync {
     fn name(&self) -> &'static str;
@@ -103,6 +108,9 @@ pub(crate) trait RoutedTool: Send + Sync {
     }
     fn schema_without_instance(&self) -> Value;
     fn db(&self) -> &crate::db::Database;
+    fn peer_resolution(&self) -> PeerResolution {
+        PeerResolution::SavedUuidOrName
+    }
     async fn authorize(&self, _ctx: &ToolContext) -> Result<(), String> {
         Ok(())
     }
@@ -178,7 +186,13 @@ impl<T: RoutedTool + 'static> Tool for RouteTool<T> {
                 if let Err(error) = self.0.validate_before_peer_lookup(&input) {
                     return ToolOutput::error(error);
                 }
-                match crate::api::federation::resolve_tool_peer(self.0.db(), &selector).await {
+                match crate::api::federation::resolve_tool_peer(
+                    self.0.db(),
+                    &selector,
+                    self.0.peer_resolution(),
+                )
+                .await
+                {
                     Ok(peer) => Route::Remote(peer),
                     Err(error) => return ToolOutput::error(error.to_string()),
                 }

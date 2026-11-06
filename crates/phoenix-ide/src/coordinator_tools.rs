@@ -418,6 +418,9 @@ impl instance::RoutedTool for WatchConversation {
     fn name(&self) -> &'static str {
         "watch_conversation"
     }
+    fn peer_resolution(&self) -> instance::PeerResolution {
+        instance::PeerResolution::WatchUuidIdentity
+    }
     fn clearable(&self) -> bool {
         false
     }
@@ -470,6 +473,9 @@ impl instance::RoutedTool for WatchConversation {
 impl instance::RoutedTool for UnwatchConversation {
     fn name(&self) -> &'static str {
         "unwatch_conversation"
+    }
+    fn peer_resolution(&self) -> instance::PeerResolution {
+        instance::PeerResolution::WatchUuidIdentity
     }
     fn clearable(&self) -> bool {
         false
@@ -524,6 +530,9 @@ impl instance::RoutedTool for UnwatchConversation {
 impl instance::RoutedTool for ListWatchedConversations {
     fn name(&self) -> &'static str {
         "list_watched_conversations"
+    }
+    fn peer_resolution(&self) -> instance::PeerResolution {
+        instance::PeerResolution::WatchUuidIdentity
     }
     fn description(&self) -> String {
         "List local active watches, or durable remote subscriptions for one explicit saved instance with lifecycle and admitted cursor (not a live remote snapshot). No remote fallback.".into()

@@ -1340,10 +1340,24 @@ async fn production_coordinator_registry_has_exact_instance_selector_contract() 
             "{name} must expose its standard instance selector"
         );
     }
-    for definition in definitions
-        .iter()
-        .filter(|definition| !selector_tools.contains(&definition.name.as_str()))
-    {
+    for name in ["read_automatic_continuation", "set_automatic_continuation"] {
+        let definition = definitions
+            .iter()
+            .find(|definition| definition.name == name)
+            .unwrap_or_else(|| panic!("missing production coordinator tool {name}"));
+        assert_eq!(
+            definition.input_schema["properties"]["instance"],
+            json!({"type": "string", "minLength": 1}),
+            "{name} retains its existing separate instance contract"
+        );
+    }
+    for definition in definitions.iter().filter(|definition| {
+        !selector_tools.contains(&definition.name.as_str())
+            && !matches!(
+                definition.name.as_str(),
+                "read_automatic_continuation" | "set_automatic_continuation"
+            )
+    }) {
         assert!(
             definition.input_schema["properties"]
                 .get("instance")

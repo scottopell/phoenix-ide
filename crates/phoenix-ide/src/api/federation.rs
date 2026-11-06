@@ -677,7 +677,25 @@ async fn resolve_saved_peer(
 pub(crate) async fn resolve_tool_peer(
     db: &crate::db::Database,
     selector: &crate::coordinator_tools::instance::RemoteInstanceSelector,
+    resolution: crate::coordinator_tools::instance::PeerResolution,
 ) -> Result<ResolvedPeer, FederationClientError> {
+    if matches!(
+        resolution,
+        crate::coordinator_tools::instance::PeerResolution::WatchUuidIdentity
+    ) {
+        if let Ok(id) = InstanceId::from_str(selector.as_str()) {
+            if selector.as_str() == id.to_string() {
+                let connection = db
+                    .federation_peer_connection(id)
+                    .await?
+                    .ok_or(FederationClientError::PeerNotFound)?;
+                return Ok(ResolvedPeer {
+                    instance_id: id,
+                    connection,
+                });
+            }
+        }
+    }
     resolve_saved_peer(db, selector.as_str()).await
 }
 
@@ -2603,6 +2621,43 @@ mod tests {
         missing.as_object_mut().unwrap().remove("next_cursor");
         let error = serde_json::from_value::<RemoteReadConversationResponse>(missing).unwrap_err();
         assert!(error.to_string().contains("missing field `next_cursor`"));
+    }
+
+    #[tokio::test]
+    async fn watch_uuid_selector_does_not_switch_to_another_peers_uuid_shaped_name() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let absent_id = InstanceId::new();
+        let other_id = InstanceId::new();
+        save_test_peer(
+            &state,
+            other_id,
+            &absent_id.to_string(),
+            "https://other.example",
+            "a",
+        )
+        .await;
+        let crate::coordinator_tools::instance::InstanceSelector::Remote(selector) =
+            serde_json::from_value(serde_json::json!(absent_id.to_string())).unwrap()
+        else {
+            panic!("UUID selector must be remote");
+        };
+        assert!(matches!(
+            resolve_tool_peer(
+                &state.db,
+                &selector,
+                crate::coordinator_tools::instance::PeerResolution::WatchUuidIdentity,
+            )
+            .await,
+            Err(FederationClientError::PeerNotFound)
+        ));
+        let peer = resolve_tool_peer(
+            &state.db,
+            &selector,
+            crate::coordinator_tools::instance::PeerResolution::SavedUuidOrName,
+        )
+        .await
+        .unwrap();
+        assert_eq!(peer.instance_id(), other_id);
     }
 
     #[test]
