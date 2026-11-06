@@ -800,6 +800,8 @@ pub enum FederationClientError {
     PeerAmbiguous,
     #[error("peer selector must not be empty")]
     InvalidPeerSelector,
+    #[error("peer selector resolves to this local instance")]
+    SelfPeerSelector,
     #[error("subscription enrollment authentication rejected")]
     SubscriptionAuthenticationRejected,
     #[error("peer navigation URL is invalid: {0}")]
@@ -1124,6 +1126,371 @@ pub struct RemoteReadGoalResponse {
     pub current: Option<GoalHistoryEntry>,
     pub history: Vec<GoalHistoryEntry>,
     pub wait_status: RemoteGoalWaitStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RemoteAutomaticContinuationTarget {
+    Ordinary {
+        product_conversation_id: ProductConversationId,
+    },
+    Coordinator {},
+}
+
+impl RemoteAutomaticContinuationTarget {
+    fn db_target(&self) -> phoenix_db::AutomaticContinuationTarget<'_> {
+        match self {
+            Self::Ordinary {
+                product_conversation_id,
+            } => phoenix_db::AutomaticContinuationTarget::Ordinary(product_conversation_id),
+            Self::Coordinator {} => phoenix_db::AutomaticContinuationTarget::Coordinator,
+        }
+    }
+
+    fn matches_aggregate(
+        &self,
+        aggregate: &crate::api::AutomaticContinuationAggregateView,
+    ) -> bool {
+        match (self, aggregate) {
+            (
+                Self::Ordinary {
+                    product_conversation_id,
+                },
+                crate::api::AutomaticContinuationAggregateView::Ordinary {
+                    product_conversation_id: actual,
+                },
+            ) => product_conversation_id.as_str() == actual,
+            (
+                Self::Coordinator {},
+                crate::api::AutomaticContinuationAggregateView::Coordinator {
+                    product_conversation_id,
+                },
+            ) => ProductConversationId::parse(product_conversation_id).is_ok(),
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteAutomaticContinuationReadRequest {
+    pub destination_instance_id: InstanceId,
+    pub caller_instance_id: InstanceId,
+    pub target: RemoteAutomaticContinuationTarget,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteAutomaticContinuationSetRequest {
+    pub destination_instance_id: InstanceId,
+    pub caller_instance_id: InstanceId,
+    pub target: RemoteAutomaticContinuationTarget,
+    pub auto_continue_on_context_exhaustion: bool,
+}
+
+impl RemoteAutomaticContinuationReadRequest {
+    async fn verify(
+        &self,
+        peer: &PeerAuthenticated,
+        db: &crate::db::Database,
+    ) -> Result<InstanceId, Response> {
+        let destination = db.instance_id().await.map_err(|error| {
+            tracing::error!(%error, "failed to read destination instance identity");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
+        if self.destination_instance_id != destination {
+            return Err(federation_error(
+                StatusCode::CONFLICT,
+                "destination instance mismatch",
+            ));
+        }
+        if self.caller_instance_id != peer.caller_instance_id {
+            return Err(federation_error(
+                StatusCode::UNAUTHORIZED,
+                "caller instance mismatch",
+            ));
+        }
+        Ok(destination)
+    }
+}
+
+fn automatic_continuation_response(
+    result: phoenix_db::DbResult<phoenix_db::AutomaticContinuationSettings>,
+    destination: InstanceId,
+    caller: InstanceId,
+) -> Response {
+    result.map_or_else(
+        |error| {
+            if matches!(error, phoenix_db::DbError::FederationSendAuthorityInactive) {
+                federation_error(
+                    StatusCode::FORBIDDEN,
+                    "Federation send authority is inactive.",
+                )
+            } else {
+                super::product_conversations::db_to_app(error).into_response()
+            }
+        },
+        |settings| {
+            Json(RemoteAutomaticContinuationResponse {
+                destination_instance_id: destination,
+                caller_instance_id: caller,
+                preference: settings.into(),
+            })
+            .into_response()
+        },
+    )
+}
+
+fn verify_automatic_continuation_response(
+    response: RemoteAutomaticContinuationResponse,
+    peer_id: InstanceId,
+    caller: InstanceId,
+    target: &RemoteAutomaticContinuationTarget,
+) -> Result<crate::automatic_continuation_settings::native::PreferenceView, FederationClientError> {
+    if response.destination_instance_id != peer_id {
+        return Err(FederationClientError::DestinationMismatch);
+    }
+    if response.caller_instance_id != caller {
+        return Err(FederationClientError::CallerMismatch);
+    }
+    if !target.matches_aggregate(&response.preference.aggregate) {
+        return Err(FederationClientError::ProvenanceMismatch(
+            "automatic-continuation response changed target".into(),
+        ));
+    }
+    Ok(response.preference)
+}
+
+async fn automatic_continuation_peer(
+    db: &crate::db::Database,
+    selector: &str,
+) -> Result<(InstanceId, InstanceId, phoenix_db::FederationPeerConnection), FederationClientError> {
+    let peer_id = resolve_saved_peer_id(db, selector).await?;
+    let caller = db.instance_id().await?;
+    if peer_id == caller {
+        return Err(FederationClientError::SelfPeerSelector);
+    }
+    let peer = db
+        .federation_peer_connection(peer_id)
+        .await?
+        .ok_or(FederationClientError::PeerNotFound)?;
+    Ok((peer_id, caller, peer))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteAutomaticContinuationResponse {
+    pub destination_instance_id: InstanceId,
+    pub caller_instance_id: InstanceId,
+    pub preference: crate::automatic_continuation_settings::native::PreferenceView,
+}
+
+pub async fn remote_read_automatic_continuation(
+    db: &crate::db::Database,
+    selector: &str,
+    target: RemoteAutomaticContinuationTarget,
+) -> Result<crate::automatic_continuation_settings::native::PreferenceView, FederationClientError> {
+    let (peer_id, caller, peer) = automatic_continuation_peer(db, selector).await?;
+    let request = RemoteAutomaticContinuationReadRequest {
+        destination_instance_id: peer_id,
+        caller_instance_id: caller,
+        target,
+    };
+    let response: RemoteAutomaticContinuationResponse = send_bounded_peer_request(
+        format!(
+            "{}api/federation/peer/read-automatic-continuation",
+            peer.base_url
+        ),
+        peer.bearer_credential.expose(),
+        &peer.tls_trust,
+        &request,
+    )
+    .await?;
+    verify_automatic_continuation_response(response, peer_id, caller, &request.target)
+}
+
+pub async fn remote_set_automatic_continuation(
+    db: &crate::db::Database,
+    selector: &str,
+    target: RemoteAutomaticContinuationTarget,
+    preference: bool,
+) -> Result<crate::automatic_continuation_settings::native::PreferenceView, FederationClientError> {
+    let (peer_id, caller, peer) = automatic_continuation_peer(db, selector).await?;
+    let request = RemoteAutomaticContinuationSetRequest {
+        destination_instance_id: peer_id,
+        caller_instance_id: caller,
+        target,
+        auto_continue_on_context_exhaustion: preference,
+    };
+    let response: RemoteAutomaticContinuationResponse = send_bounded_peer_request(
+        format!(
+            "{}api/federation/peer/set-automatic-continuation",
+            peer.base_url
+        ),
+        peer.bearer_credential.expose(),
+        &peer.tls_trust,
+        &request,
+    )
+    .await?;
+    let result =
+        verify_automatic_continuation_response(response, peer_id, caller, &request.target)?;
+    if result.auto_continue_on_context_exhaustion != preference {
+        return Err(FederationClientError::ProvenanceMismatch(
+            "automatic-continuation response changed preference".into(),
+        ));
+    }
+    Ok(result)
+}
+
+async fn peer_authority_response(
+    runtime: &crate::runtime::RuntimeManager,
+    response: Response,
+) -> Response {
+    if runtime.local_authority_is_closed() {
+        std::future::pending().await
+    } else {
+        response
+    }
+}
+
+async fn peer_write_join_response(
+    runtime: &crate::runtime::RuntimeManager,
+    result: Result<Response, tokio::task::JoinError>,
+) -> Response {
+    match result {
+        Ok(response) => peer_authority_response(runtime, response).await,
+        Err(error) if runtime.local_authority_is_closed() => {
+            tracing::debug!(%error, "federated automatic-continuation write ended after local authority closure");
+            std::future::pending().await
+        }
+        Err(error) => {
+            tracing::error!(%error, "federated automatic-continuation write task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+pub async fn read_automatic_continuation(
+    peer: PeerAuthenticated,
+    State(state): State<AppState>,
+    Json(request): Json<RemoteAutomaticContinuationReadRequest>,
+) -> Response {
+    if state.runtime.local_authority_is_closed() {
+        return std::future::pending().await;
+    }
+    let destination = match request.verify(&peer, &state.db).await {
+        Ok(destination) => destination,
+        Err(response) => {
+            if state.runtime.local_authority_is_closed() {
+                return std::future::pending().await;
+            }
+            return response;
+        }
+    };
+    let Ok(_authority) = state.runtime.acquire_local_authority_pass() else {
+        return std::future::pending().await;
+    };
+    let result = state
+        .db
+        .read_federated_automatic_continuation_settings(
+            &peer.send_authority,
+            request.target.db_target(),
+        )
+        .await;
+    peer_authority_response(
+        &state.runtime,
+        automatic_continuation_response(result, destination, peer.caller_instance_id),
+    )
+    .await
+}
+
+async fn verify_set_automatic_continuation_identity(
+    runtime: &crate::runtime::RuntimeManager,
+    peer: &PeerAuthenticated,
+    request: &RemoteAutomaticContinuationSetRequest,
+    identity: impl std::future::Future<Output = phoenix_db::DbResult<InstanceId>>,
+) -> Result<InstanceId, Response> {
+    let destination = match identity.await {
+        Ok(destination) => destination,
+        Err(error) => {
+            tracing::error!(%error, "failed to read destination instance identity");
+            return Err(peer_authority_response(
+                runtime,
+                StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            )
+            .await);
+        }
+    };
+    if request.destination_instance_id != destination {
+        return Err(peer_authority_response(
+            runtime,
+            federation_error(StatusCode::CONFLICT, "destination instance mismatch"),
+        )
+        .await);
+    }
+    if request.caller_instance_id != peer.caller_instance_id {
+        return Err(peer_authority_response(
+            runtime,
+            federation_error(StatusCode::UNAUTHORIZED, "caller instance mismatch"),
+        )
+        .await);
+    }
+    Ok(destination)
+}
+
+pub async fn set_automatic_continuation(
+    peer: PeerAuthenticated,
+    State(state): State<AppState>,
+    Json(request): Json<RemoteAutomaticContinuationSetRequest>,
+) -> Response {
+    if state.runtime.local_authority_is_closed() {
+        return std::future::pending().await;
+    }
+    let destination = match verify_set_automatic_continuation_identity(
+        &state.runtime,
+        &peer,
+        &request,
+        state.db.instance_id(),
+    )
+    .await
+    {
+        Ok(destination) => destination,
+        Err(response) => return response,
+    };
+    let db = state.db.clone();
+    let runtime = state.runtime.clone();
+    if state.runtime.local_authority_is_closed() {
+        return std::future::pending().await;
+    }
+
+    let operation = async move {
+        let Ok(authority) = runtime.acquire_local_authority_pass() else {
+            return std::future::pending().await;
+        };
+        let pass =
+            crate::automatic_continuation_settings::native::PreferenceWritePass::new(authority);
+        let result = db
+            .set_federated_automatic_continuation_settings(
+                &peer.send_authority,
+                request.target.db_target(),
+                request.auto_continue_on_context_exhaustion.into(),
+            )
+            .await;
+        let result = pass.classify(result);
+        if runtime.local_authority_is_closed() {
+            return std::future::pending().await;
+        }
+        match result {
+            Ok(result) => {
+                automatic_continuation_response(result, destination, peer.caller_instance_id)
+            }
+            Err(error) => {
+                tracing::error!(%error, "federated automatic-continuation setting durability unclassified");
+                std::future::pending().await
+            }
+        }
+    };
+    peer_write_join_response(&state.runtime, tokio::spawn(operation).await).await
 }
 
 pub async fn resolve_saved_peer_id(
@@ -2274,6 +2641,12 @@ mod tests {
             resolve_saved_peer_id(&state.db, "missing").await,
             Err(FederationClientError::PeerNotFound)
         ));
+        let local = state.db.instance_id().await.unwrap();
+        save_test_peer(&state, local, "self", "https://self.example", "9").await;
+        assert!(matches!(
+            automatic_continuation_peer(&state.db, "self").await,
+            Err(FederationClientError::SelfPeerSelector)
+        ));
         for selector in [" unique", "unique ", " unique ", "Unique", "UNIQUE"] {
             assert!(matches!(
                 resolve_saved_peer_id(&state.db, selector).await,
@@ -2647,6 +3020,274 @@ mod tests {
         assert_eq!(pinned.requested, exact_t1());
         assert!(pinned.content.contains("transition T1 message"));
         assert!(!pinned.content.contains("successor-only-marker"));
+    }
+
+    fn automatic_continuation_response(
+        destination_instance_id: InstanceId,
+        caller_instance_id: InstanceId,
+        aggregate: crate::api::AutomaticContinuationAggregateView,
+    ) -> RemoteAutomaticContinuationResponse {
+        RemoteAutomaticContinuationResponse {
+            destination_instance_id,
+            caller_instance_id,
+            preference: crate::automatic_continuation_settings::native::PreferenceView {
+                aggregate,
+                auto_continue_on_context_exhaustion: true,
+            },
+        }
+    }
+
+    #[test]
+    fn automatic_continuation_wire_shapes_and_response_provenance() {
+        let destination = InstanceId::new();
+        let caller = InstanceId::new();
+        let target = RemoteAutomaticContinuationTarget::Coordinator {};
+        let base = serde_json::json!({
+            "destination_instance_id": destination,
+            "caller_instance_id": caller,
+            "target": {"kind":"coordinator"}
+        });
+        assert!(
+            serde_json::from_value::<RemoteAutomaticContinuationReadRequest>(base.clone()).is_ok()
+        );
+        assert!(
+            serde_json::from_value::<RemoteAutomaticContinuationSetRequest>(base.clone()).is_err()
+        );
+        for value in [serde_json::json!(true), serde_json::json!(false)] {
+            let mut set = base.clone();
+            set["auto_continue_on_context_exhaustion"] = value;
+            let request: RemoteAutomaticContinuationSetRequest =
+                serde_json::from_value(set.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&request).unwrap(), set);
+            assert!(serde_json::from_value::<RemoteAutomaticContinuationReadRequest>(set).is_err());
+        }
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!("true"),
+            serde_json::json!(1),
+        ] {
+            let mut set = base.clone();
+            set["auto_continue_on_context_exhaustion"] = value;
+            assert!(serde_json::from_value::<RemoteAutomaticContinuationSetRequest>(set).is_err());
+        }
+        assert!(matches!(
+            verify_automatic_continuation_response(
+                automatic_continuation_response(
+                    InstanceId::new(),
+                    caller,
+                    crate::api::AutomaticContinuationAggregateView::Coordinator {
+                        product_conversation_id: "coordinator".into()
+                    }
+                ),
+                destination,
+                caller,
+                &target
+            ),
+            Err(FederationClientError::DestinationMismatch)
+        ));
+        assert!(matches!(
+            verify_automatic_continuation_response(
+                automatic_continuation_response(
+                    destination,
+                    InstanceId::new(),
+                    crate::api::AutomaticContinuationAggregateView::Coordinator {
+                        product_conversation_id: "coordinator".into()
+                    }
+                ),
+                destination,
+                caller,
+                &target
+            ),
+            Err(FederationClientError::CallerMismatch)
+        ));
+        assert!(matches!(
+            verify_automatic_continuation_response(
+                automatic_continuation_response(
+                    destination,
+                    caller,
+                    crate::api::AutomaticContinuationAggregateView::Ordinary {
+                        product_conversation_id: "other".into()
+                    }
+                ),
+                destination,
+                caller,
+                &target
+            ),
+            Err(FederationClientError::ProvenanceMismatch(_))
+        ));
+        assert!(matches!(
+            verify_automatic_continuation_response(
+                automatic_continuation_response(
+                    destination,
+                    caller,
+                    crate::api::AutomaticContinuationAggregateView::Coordinator {
+                        product_conversation_id: "   ".into()
+                    }
+                ),
+                destination,
+                caller,
+                &target
+            ),
+            Err(FederationClientError::ProvenanceMismatch(_))
+        ));
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn peer_automatic_continuation_roundtrip_rejects_bad_identity_and_revocation() {
+        use tower::ServiceExt as _;
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let ordinary = state
+            .db
+            .create_conversation("peer-settings", "peer-settings", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let destination = state.db.instance_id().await.unwrap();
+        let caller = InstanceId::new();
+        let bearer = format!("phx_peer_{}", "b".repeat(43));
+        state
+            .db
+            .replace_federation_enrollment(
+                caller,
+                &"peer-settings-caller".parse().unwrap(),
+                &FederationCredentialVerifier::from_bearer(bearer.as_bytes()),
+            )
+            .await
+            .unwrap();
+        let app = crate::api::handlers::create_router(state.clone());
+        let target = serde_json::json!({"kind":"ordinary", "product_conversation_id":ordinary.product_conversation_id});
+        let send = |path: &str, body: serde_json::Value, auth: Option<&str>| {
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json");
+            if let Some(token) = auth {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            request
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+        let read_path = "/api/federation/peer/read-automatic-continuation";
+        let set_path = "/api/federation/peer/set-automatic-continuation";
+        let body = serde_json::json!({"destination_instance_id":destination, "caller_instance_id":caller, "target":target});
+        assert_eq!(
+            app.clone()
+                .oneshot(send(read_path, body.clone(), None))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let read = app
+            .clone()
+            .oneshot(send(read_path, body.clone(), Some(&bearer)))
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(read.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response: RemoteAutomaticContinuationResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response.destination_instance_id, destination);
+        assert_eq!(response.caller_instance_id, caller);
+        assert!(!response.preference.auto_continue_on_context_exhaustion);
+        assert_eq!(
+            response.preference.aggregate,
+            crate::api::AutomaticContinuationAggregateView::Ordinary {
+                product_conversation_id: ordinary.product_conversation_id.to_string(),
+            }
+        );
+        let mut read_with_bool = body.clone();
+        read_with_bool["auto_continue_on_context_exhaustion"] = serde_json::json!(false);
+        assert_eq!(
+            app.clone()
+                .oneshot(send(read_path, read_with_bool, Some(&bearer)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(send(set_path, body.clone(), Some(&bearer)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let mut null_set = body.clone();
+        null_set["auto_continue_on_context_exhaustion"] = serde_json::Value::Null;
+        assert_eq!(
+            app.clone()
+                .oneshot(send(set_path, null_set, Some(&bearer)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let mut setting = body.clone();
+        setting["auto_continue_on_context_exhaustion"] = serde_json::json!(true);
+        let mut wrong = setting.clone();
+        wrong["destination_instance_id"] = serde_json::json!(InstanceId::new());
+        assert_eq!(
+            app.clone()
+                .oneshot(send(set_path, wrong, Some(&bearer)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        let mut wrong = setting.clone();
+        wrong["caller_instance_id"] = serde_json::json!(InstanceId::new());
+        assert_eq!(
+            app.clone()
+                .oneshot(send(set_path, wrong, Some(&bearer)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(send(set_path, setting.clone(), Some(&bearer)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let read = app
+            .clone()
+            .oneshot(send(read_path, body.clone(), Some(&bearer)))
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(read.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response: RemoteAutomaticContinuationResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(response.preference.auto_continue_on_context_exhaustion);
+        assert!(state
+            .db
+            .automatic_continuation_admission(&ordinary.id)
+            .await
+            .unwrap()
+            .is_none());
+        state.db.revoke_federation_enrollment(caller).await.unwrap();
+        assert_ne!(
+            app.clone()
+                .oneshot(send(read_path, body, Some(&bearer)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_ne!(
+            app.oneshot(send(set_path, setting, Some(&bearer)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3576,5 +4217,103 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
             serde_json::json!({ "error": "remote query admission limit reached" })
         );
+    }
+
+    #[tokio::test]
+    async fn automatic_continuation_identity_refusals_remain_pending_after_authority_closes() {
+        for mismatch in [StatusCode::CONFLICT, StatusCode::UNAUTHORIZED] {
+            let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+            let runtime = state.runtime.clone();
+            let destination = state.db.instance_id().await.unwrap();
+            let caller = InstanceId::new();
+            let request = RemoteAutomaticContinuationSetRequest {
+                destination_instance_id: if mismatch == StatusCode::CONFLICT {
+                    InstanceId::new()
+                } else {
+                    destination
+                },
+                caller_instance_id: if mismatch == StatusCode::UNAUTHORIZED {
+                    InstanceId::new()
+                } else {
+                    caller
+                },
+                target: RemoteAutomaticContinuationTarget::Coordinator {},
+                auto_continue_on_context_exhaustion: true,
+            };
+            let peer = PeerAuthenticated {
+                send_authority: phoenix_db::FederationSendAuthority::new(
+                    caller,
+                    phoenix_core::domain::instance_identity::FederationCredentialVerifier::from_bearer(
+                        b"peer-test",
+                    ),
+                ),
+                caller_instance_id: caller,
+                caller_display_name: "peer".to_string(),
+            };
+            let owner = runtime.acquire_local_authority_pass().unwrap();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let identity = async move {
+                started_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                Ok(destination)
+            };
+            let verification =
+                verify_set_automatic_continuation_identity(&runtime, &peer, &request, identity);
+            tokio::pin!(verification);
+            tokio::select! {
+                result = &mut verification => panic!("identity verification finished before lookup release: {result:?}"),
+                started = started_rx => started.unwrap(),
+            }
+
+            owner.close("test_identity_lookup_authority_closure");
+            release_tx.send(()).unwrap();
+            assert!(tokio::select! {
+                biased;
+                _ = &mut verification => false,
+                () = std::future::ready(()) => true,
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_authority_closure_and_write_panic_remain_pending() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let runtime = state.runtime.clone();
+        let owner = runtime.acquire_local_authority_pass().unwrap();
+        let pass = crate::automatic_continuation_settings::native::PreferenceWritePass::new(owner);
+        assert!(pass
+            .classify::<()>(phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified)
+            .is_err());
+        assert!(runtime.local_authority_is_closed());
+        let closed_response = peer_authority_response(&runtime, StatusCode::OK.into_response());
+        tokio::pin!(closed_response);
+        assert!(tokio::select! {
+            biased;
+            _ = &mut closed_response => false,
+            () = std::future::ready(()) => true,
+        });
+
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let runtime = state.runtime.clone();
+        let worker_runtime = runtime.clone();
+        let join = tokio::spawn(async move {
+            let owner = worker_runtime.acquire_local_authority_pass().unwrap();
+            let _pass =
+                crate::automatic_continuation_settings::native::PreferenceWritePass::new(owner);
+            panic!("injected write worker panic");
+            #[allow(unreachable_code)]
+            StatusCode::OK.into_response()
+        });
+        let result = join.await;
+        assert!(result.is_err());
+        assert!(runtime.local_authority_is_closed());
+        let response = peer_write_join_response(&runtime, result);
+        tokio::pin!(response);
+        assert!(tokio::select! {
+            biased;
+            _ = &mut response => false,
+            () = std::future::ready(()) => true,
+        });
     }
 }

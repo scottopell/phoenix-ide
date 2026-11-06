@@ -408,8 +408,8 @@ pub struct AutomaticContinuationView {
     pub admission: Option<AutomaticContinuationAdmissionView>,
 }
 
-#[derive(Debug, Clone, Serialize, TS)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub enum AutomaticContinuationAggregateView {
     Ordinary { product_conversation_id: String },
