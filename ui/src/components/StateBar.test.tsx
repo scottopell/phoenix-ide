@@ -123,8 +123,10 @@ function renderStateBar({
     nextRetryIn: null,
     contextWindowUsed,
     modelContextWindow,
-    displayName,
   };
+  if (displayName !== undefined) {
+    props.displayName = displayName;
+  }
   if (onOpenFiles !== undefined) {
     props.onOpenFiles = onOpenFiles;
   }

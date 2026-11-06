@@ -43,7 +43,7 @@ import { productConversationPresentationIndicator } from './ConversationList.pre
 
 describe('ConversationList — pinned header scroll offset', () => {
   it('updates the nearest app scroll owner across densities and restores its prior inline style', () => {
-    const observers: Array<{ callback: ResizeObserverCallback; observed: Element[]; disconnected: boolean }> = [];
+    const observers: Array<{ observed: Element[]; disconnected: boolean; trigger: () => void }> = [];
     const OriginalResizeObserver = globalThis.ResizeObserver;
     class ObserverMock {
       observed: Element[] = [];
