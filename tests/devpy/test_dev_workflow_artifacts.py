@@ -310,6 +310,8 @@ class DevWorkflowArtifactTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertIn("selected=explicit wrapper '/usr/bin/sccache'", result.detail)
         self.assertIn("probe warning: unrecognized version output: garbage", result.detail)
+        self.assertIn("scope=caller-owned inherited environment", result.detail)
+        self.assertNotIn("scope=direct Cargo subprocesses", result.detail)
 
     def test_doctor_cache_explicit_unusable_backend_fails_command(self):
         with mock.patch.dict(os.environ, {"PHOENIX_COMPILER_CACHE": "kache"}, clear=True):

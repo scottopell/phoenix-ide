@@ -307,6 +307,27 @@ class CompilerCacheTests(unittest.TestCase):
                 self.assertEqual(version == "1.2.2", accepted)
                 self.assertEqual(error is None, accepted)
 
+    def test_kache_version_probe_isolates_and_removes_probe_state(self):
+        observed_home = None
+
+        def probe(_binary, *, env):
+            nonlocal observed_home
+            observed_home = Path(env["HOME"])
+            self.assertTrue(observed_home.is_dir())
+            self.assertEqual(env["TMPDIR"], str(observed_home))
+            self.assertFalse(any(key.startswith("KACHE_") for key in env))
+            return "kache 1.2.2", None
+
+        with mock.patch.dict(
+            os.environ,
+            {"KACHE_CONFIG": "/shared/config", "KACHE_REMOTE_URL": "https://remote.invalid"},
+            clear=False,
+        ), mock.patch.object(self.dev, "_command_version", side_effect=probe):
+            self.assertEqual(self.dev._kache_version("/bin/kache"), ("1.2.2", None))
+
+        self.assertIsNotNone(observed_home)
+        self.assertFalse(observed_home.exists())
+
     def test_forced_local_config_and_isolated_paths_ignore_remote_ambient(self):
         import tomllib
 

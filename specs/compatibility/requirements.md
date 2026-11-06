@@ -142,7 +142,7 @@ AND SHALL otherwise select an sccache executable that passes its version probe o
 AND SHALL report the fallback reason and backend actually selected
 
 WHEN an operator runs the development doctor
-THE SYSTEM SHALL inspect compiler-cache availability without installing tools, starting daemons, or creating cache state
+THE SYSTEM SHALL inspect compiler-cache availability without installing tools, starting daemons, or leaving probe-created cache state
 AND SHALL report the effective explicit or automatic request, the backend selected by read-only host and version probes, its executable and scope, and any automatic fallback reasons
 AND SHALL state that Kache runtime readiness is evaluated only when a Cargo command starts
 AND SHALL report an unusable backend explicitly selected through `PHOENIX_COMPILER_CACHE` as an actionable configuration failure while preserving an explicit `RUSTC_WRAPPER`

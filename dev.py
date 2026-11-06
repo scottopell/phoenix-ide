@@ -3824,7 +3824,8 @@ def _doctor_compiler_cache_result(
         return DoctorResult(
             "compiler-cache", True,
             f"requested=RUSTC_WRAPPER; selected=explicit wrapper {wrapper!r}; "
-            f"executable={absolute}; version={probe}; scope={scope}",
+            f"executable={absolute}; version={probe}; "
+            "scope=caller-owned inherited environment",
         )
 
     requested = os.environ.get("PHOENIX_COMPILER_CACHE", "auto")
@@ -5060,7 +5061,11 @@ def _restore_kache_environment(original: dict[str, str]) -> None:
 
 
 
-def _command_version(binary: str) -> tuple[str | None, str | None]:
+def _command_version(
+    binary: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> tuple[str | None, str | None]:
     try:
         result = subprocess.run(
             [binary, "--version"],
@@ -5069,6 +5074,7 @@ def _command_version(binary: str) -> tuple[str | None, str | None]:
             errors="replace",
             timeout=10,
             check=False,
+            env=env,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         return None, str(error)
@@ -5078,7 +5084,13 @@ def _command_version(binary: str) -> tuple[str | None, str | None]:
 
 
 def _kache_version(binary: str) -> tuple[str | None, str | None]:
-    detail, error = _command_version(binary)
+    with tempfile.TemporaryDirectory(prefix="phoenix-kache-version-") as temporary_home:
+        probe_env = {
+            key: value for key, value in os.environ.items()
+            if not key.startswith("KACHE_")
+        }
+        probe_env.update({"HOME": temporary_home, "TMPDIR": temporary_home})
+        detail, error = _command_version(binary, env=probe_env)
     if error:
         return None, error
     assert detail is not None
