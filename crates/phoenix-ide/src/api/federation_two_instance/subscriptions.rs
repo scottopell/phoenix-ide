@@ -281,8 +281,6 @@ async fn registered_watch_unwatch_and_list_route_saved_peer_without_local_watch_
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-#[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn https_subscription_future_only_nonempty_idle_and_busy_admission_ack_and_replacement() {
     let a = TestInstance::start().await;
     let b = TestInstance::start().await;
