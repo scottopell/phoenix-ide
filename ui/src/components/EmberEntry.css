@@ -1,3 +1,7 @@
+#conversation-list:has(> .conversation-list-pinned-header) {
+  flex-shrink: 0;
+}
+
 .ember-entry {
   display: flex;
   align-items: center;
@@ -68,22 +72,21 @@
   gap: 0;
 }
 
-.ember-entry-compact-name {
-  display: none;
+.conversation-list-pinned-header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: var(--bg-primary);
+  padding-top: 1px;
+}
+
+.conversation-list-pinned-header > .ember-entry {
+  width: 100%;
+  margin: 0 0 8px;
 }
 
 @media (width <= 700px) {
-  .conversation-list-title-group {
-    display: flex;
-    flex-direction: column;
-    align-items: stretch;
-    gap: 6px;
-    width: 100%;
-  }
-
-  .conversation-list-header .ember-entry {
-    width: 100%;
-    margin: 0 0 8px;
+  .conversation-list-pinned-header > .ember-entry {
     min-height: 44px;
   }
 }

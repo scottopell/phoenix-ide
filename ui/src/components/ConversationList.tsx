@@ -1,6 +1,6 @@
 import { memo, useState, useEffect, useRef, useMemo, useCallback, useLayoutEffect } from 'react';
 import type { ReactNode } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { getConvDisplayState } from '../api';
 import type { Conversation, CachedPrSummary, ProductConversationListRow } from '../api';
 import { prReviewState } from './prReviewState';
@@ -697,6 +697,7 @@ export function ConversationList({
   footer,
 }: ConversationListProps) {
   const navigate = useNavigate();
+  const location = useLocation();
   const { hasActiveScope } = useFocusScope();
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [collapsedChains, setCollapsedChains] = useState<Set<string>>(new Set());
@@ -876,6 +877,7 @@ export function ConversationList({
   return (
     <section ref={listRootRef} id="conversation-list" className={`view active ${isSidebarLayout ? 'sidebar-mode' : ''} ${isMobileList ? 'mobile-list-density' : ''}`}>
       {!isSidebarLayout && (
+        <div className="conversation-list-pinned-header">
         <div className="view-header conversation-list-header">
           <div className="conversation-list-title-group">
             <button
@@ -888,24 +890,6 @@ export function ConversationList({
               <img src="/phoenix.svg" alt="" className="conversation-list-brand-logo" />
               <span>Phoenix</span>
             </button>
-            <EmberEntry active={window.location.pathname === '/global'} onClick={() => navigate('/global')} />
-            <div className="conversation-list-subnav">
-              <button
-                className={`archive-toggle-text ${!showArchived ? 'active' : ''}`}
-                onClick={() => { if (showArchived) onToggleArchived(); }}
-                disabled={!showArchived}
-              >
-                {usingProductRows ? 'Open' : 'Active'}
-              </button>
-              <span aria-hidden="true">·</span>
-              <button
-                className={`archive-toggle-text ${showArchived ? 'active' : ''}`}
-                onClick={() => { if (!showArchived) onToggleArchived(); }}
-              >
-                History {usingProductRows ? archivedProductConversations.length : archivedConversations.length}
-              </button>
-              {authChip && <span className="conversation-list-auth-chip">{authChip}</span>}
-            </div>
           </div>
           <div className="conversation-list-command-cluster">
             <button
@@ -926,6 +910,25 @@ export function ConversationList({
             >
               + New
             </button>
+          </div>
+        </div>
+          <EmberEntry active={location.pathname === '/global'} onClick={() => navigate('/global')} />
+          <div className="conversation-list-subnav">
+            <button
+              className={`archive-toggle-text ${!showArchived ? 'active' : ''}`}
+              onClick={() => { if (showArchived) onToggleArchived(); }}
+              disabled={!showArchived}
+            >
+              {usingProductRows ? 'Open' : 'Active'}
+            </button>
+            <span aria-hidden="true">·</span>
+            <button
+              className={`archive-toggle-text ${showArchived ? 'active' : ''}`}
+              onClick={() => { if (!showArchived) onToggleArchived(); }}
+            >
+              History {usingProductRows ? archivedProductConversations.length : archivedConversations.length}
+            </button>
+            {authChip && <span className="conversation-list-auth-chip">{authChip}</span>}
           </div>
         </div>
       )}

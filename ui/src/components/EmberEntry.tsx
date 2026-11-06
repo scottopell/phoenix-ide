@@ -20,7 +20,6 @@ export function EmberEntry({
     >
       <span className="ember-entry-mark" aria-hidden="true">✦</span>
       {!compact && <span className="ember-entry-copy"><strong>Ember</strong><small>Global coordinator</small></span>}
-      {compact && <span className="ember-entry-compact-name">Ember</span>}
       {!compact && <span className="ember-entry-arrow" aria-hidden="true">→</span>}
     </button>
   );

@@ -2217,7 +2217,7 @@ function ConversationPageContent({
   ) : null;
 
   const stateBarConversation = routePrefix === '/global' && conversation
-    ? { ...conversation, cwd: '', worktree_path: null }
+    ? { ...conversation, slug: 'Ember', cwd: '', worktree_path: null }
     : conversation;
 
   return (

@@ -280,6 +280,8 @@ struct ConversationRow: View {
     let conversation: Conversation
     var isCoordinator = false
 
+    var displayTitle: String { isCoordinator ? "Ember" : conversation.displayTitle }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
@@ -292,7 +294,7 @@ struct ConversationRow: View {
                         .font(.caption)
                         .foregroundStyle(.tint)
                 }
-                Text(isCoordinator ? "Coordinator" : conversation.displayTitle)
+                Text(displayTitle)
                     .font(.body)
                     .lineLimit(1)
                 Spacer()

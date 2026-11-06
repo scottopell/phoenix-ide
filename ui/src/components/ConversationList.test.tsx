@@ -42,17 +42,36 @@ import { ConversationList, ConversationRow, ChainBlock } from './ConversationLis
 import { productConversationPresentationIndicator } from './ConversationList.presentation';
 
 describe('ConversationList — global navigation', () => {
-  it('exposes a labeled Ember entry from the mobile list header', () => {
+  it('pins Ember below the complete mobile list toolbar and navigates with router state', () => {
     function Location() { return <span data-testid="location">{useLocation().pathname}</span>; }
-    const { getByRole, getByTestId } = render(
+    const { getByRole, getByTestId, container } = render(
       <MemoryRouter initialEntries={['/']}>
         <ConversationList {...defaultProps} conversations={[]} listDensity="mobile" />
         <Location />
       </MemoryRouter>,
     );
 
-    fireEvent.click(getByRole('button', { name: 'Open Ember, Global coordinator' }));
+    const pinnedHeader = container.querySelector('.conversation-list-pinned-header')!;
+    const toolbar = pinnedHeader.querySelector('.conversation-list-header')!;
+    const ember = getByRole('button', { name: 'Open Ember, Global coordinator' });
+    expect(pinnedHeader.firstElementChild).toBe(toolbar);
+    expect(toolbar.contains(ember)).toBe(false);
+    expect(toolbar.nextElementSibling).toBe(ember);
+    expect(pinnedHeader).toContainElement(ember);
+
+    fireEvent.click(ember);
     expect(getByTestId('location')).toHaveTextContent('/global');
+    expect(ember).toHaveAttribute('aria-current', 'page');
+  });
+
+  it('marks Ember active when the router is already at the Global destination', () => {
+    const { getByRole } = render(
+      <MemoryRouter initialEntries={['/global']}>
+        <ConversationList {...defaultProps} conversations={[]} listDensity="mobile" />
+      </MemoryRouter>,
+    );
+
+    expect(getByRole('button', { name: 'Open Ember, Global coordinator' })).toHaveAttribute('aria-current', 'page');
   });
 });
 

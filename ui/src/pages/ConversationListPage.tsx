@@ -11,6 +11,7 @@ import {
 import { NewConversationPage } from './NewConversationPage';
 import { beginNewProductConversationIntent } from '../hooks/useCreateConversation';
 import { ConversationList } from '../components/ConversationList';
+import { EmberEntry } from '../components/EmberEntry';
 import { renamedProductConversationLocation } from '../components/ConversationList.presentation';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { RenameDialog } from '../components/RenameDialog';
@@ -511,12 +512,15 @@ export function ConversationListPage() {
       <main id="main-area" ref={setMainScrollOwner} data-app-scroll-owner>
         {loading ? (
           <section id="conversation-list" className="view active">
-            <div className="view-header">
+            <div className="conversation-list-pinned-header">
+            <div className="view-header conversation-list-header">
               <h2>Conversations</h2>
               <div className="view-header-actions">
                 {authChip}
                 <button className="btn-primary" disabled title="Loading conversations">+ New</button>
               </div>
+            </div>
+              <EmberEntry active={location.pathname === '/global'} onClick={() => navigate('/global')} />
             </div>
             <ConversationListSkeleton count={5} />
           </section>

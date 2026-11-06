@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProductConversationListRow } from '../api';
@@ -8,6 +8,7 @@ import { ConversationListPage } from './ConversationListPage';
 const pageMocks = vi.hoisted(() => ({
   refresh: vi.fn().mockResolvedValue(undefined),
   isOnline: true,
+  isReady: true,
 }));
 
 vi.mock('../api', async () => {
@@ -42,7 +43,7 @@ vi.mock('../hooks', async () => {
 vi.mock('../hooks/useAppMachine', () => ({
   useAppMachine: () => ({
     isOnline: pageMocks.isOnline,
-    isReady: true,
+    isReady: pageMocks.isReady,
     initError: null,
     pendingOpsCount: 0,
     queueOperation: vi.fn(),
@@ -89,10 +90,36 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     vi.clearAllMocks();
     pageMocks.refresh.mockResolvedValue(undefined);
     pageMocks.isOnline = true;
+    pageMocks.isReady = true;
     vi.mocked(api.codexLoginPreflight).mockResolvedValue({} as never);
     vi.mocked(api.listProductConversations).mockResolvedValue({
       product_conversations: [productConversation()],
     });
+  });
+
+  it('orders the pinned mobile header as toolbar, Ember, then Open and History', async () => {
+    render(<MemoryRouter initialEntries={['/']}><ConversationListPage /></MemoryRouter>);
+
+    const open = await screen.findByRole('button', { name: 'Open' });
+    const pinnedHeader = open.closest<HTMLElement>('.conversation-list-pinned-header')!;
+    const toolbar = pinnedHeader.querySelector<HTMLElement>('.conversation-list-header')!;
+    const history = within(pinnedHeader).getByRole('button', { name: /History/ });
+    const ember = pinnedHeader.querySelector<HTMLElement>('.ember-entry')!;
+    expect(toolbar.compareDocumentPosition(ember) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(ember.compareDocumentPosition(open) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(open.compareDocumentPosition(history) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('keeps Ember visible in the pinned header while the conversation list is loading', async () => {
+    pageMocks.isReady = false;
+    vi.mocked(api.listProductConversations).mockReturnValue(new Promise(() => {}));
+    render(<MemoryRouter initialEntries={['/']}><ConversationListPage /></MemoryRouter>);
+
+    const ember = await screen.findByRole('button', { name: 'Open Ember, Global coordinator' });
+    const pinnedHeader = ember.closest('.conversation-list-pinned-header');
+    expect(pinnedHeader).toBeInTheDocument();
+    expect(pinnedHeader?.querySelector('.conversation-list-header')).toBeInTheDocument();
+    expect(screen.getByTitle('Loading conversations')).toBeInTheDocument();
   });
 
   it('renames through the production mobile list touch target', async () => {

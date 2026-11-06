@@ -1,1 +1,0 @@
-Implement approved Ember conversation-list redesign across desktop/mobile web and native iOS. Establish pinned Ember entry and consistent journey naming, preserve ordinary conversation lifecycle separation, update requirements/executives and ADR, add focused regression tests and capture available visual evidence.

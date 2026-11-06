@@ -56,7 +56,7 @@ struct ConversationView: View {
                 ComposerView(session: session, draft: $draft)
             }
         }
-        .navigationTitle(session.conversation?.displayTitle ?? "Conversation")
+        .navigationTitle(navigationTitle)
         .navigationBarTitleDisplayMode(.inline)
         .alert(
             "Server error",
@@ -70,6 +70,19 @@ struct ConversationView: View {
         }
         .onAppear { session.start() }
         .onDisappear { session.closeView() }
+    }
+
+    var navigationTitle: String {
+        Self.navigationTitle(
+            for: session.conversation,
+            coordinatorConversationId: model.coordinatorConversationId)
+    }
+
+    static func navigationTitle(for conversation: Conversation?, coordinatorConversationId: String?) -> String {
+        guard let conversation else { return "Conversation" }
+        return conversation.isCoordinator || coordinatorConversationId == conversation.id
+            ? "Ember"
+            : conversation.displayTitle
     }
 
     /// Cache-age note while disconnected (REQ-IOS-001): only shown when

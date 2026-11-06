@@ -22,6 +22,31 @@ final class ModelCompatibilityTests: XCTestCase {
         XCTAssertTrue(conversation.isCoordinator)
     }
 
+    func testCoordinatorConversationRowUsesEmberJourneyName() throws {
+        let conversation = try JSONDecoder().decode(
+            Conversation.self,
+            from: Data(#"{"id":"fleet","slug":"fleet","runtime_role":"coordinator"}"#.utf8))
+
+        XCTAssertEqual(ConversationRow(conversation: conversation, isCoordinator: true).displayTitle, "Ember")
+        XCTAssertEqual(ConversationRow(conversation: conversation, isCoordinator: false).displayTitle, conversation.displayTitle)
+    }
+
+    func testCoordinatorDestinationUsesEmberJourneyNameFromTrustedIdentity() throws {
+        let coordinator = try JSONDecoder().decode(
+            Conversation.self,
+            from: Data(#"{"id":"fleet","slug":"fleet","runtime_role":"coordinator"}"#.utf8))
+        let remembered = try JSONDecoder().decode(
+            Conversation.self,
+            from: Data(#"{"id":"remembered","slug":"remembered"}"#.utf8))
+        let ordinary = try JSONDecoder().decode(
+            Conversation.self,
+            from: Data(#"{"id":"ordinary","slug":"ordinary"}"#.utf8))
+
+        XCTAssertEqual(ConversationView.navigationTitle(for: coordinator, coordinatorConversationId: nil), "Ember")
+        XCTAssertEqual(ConversationView.navigationTitle(for: remembered, coordinatorConversationId: "remembered"), "Ember")
+        XCTAssertEqual(ConversationView.navigationTitle(for: ordinary, coordinatorConversationId: nil), ordinary.displayTitle)
+    }
+
     func testConversationAggregateIdentityFallsBackToTranscriptId() throws {
         let conversation = try JSONDecoder().decode(
             Conversation.self,
