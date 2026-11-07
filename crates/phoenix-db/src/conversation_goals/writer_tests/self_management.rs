@@ -701,7 +701,7 @@ async fn stale_generation_stop_pause_close_and_continuation_refuse_without_effec
         if mutation == "continuation" {
             assert_eq!(
                 status(&committed.results[0])["reason"],
-                "current_runtime_transcript_required"
+                "transcript_changed"
             );
         }
         assert!(db.conversation_goal(&round.owner).await.unwrap().is_none());
