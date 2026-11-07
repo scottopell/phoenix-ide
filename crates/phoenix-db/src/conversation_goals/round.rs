@@ -453,14 +453,14 @@ async fn finalize_round_tx(
         });
     }
     let assistant = checkpoint.assistant;
+    let self_goal_round = classify_self_goal_round(checkpoint.results);
+    crate::insert_message_tx(tx, assistant).await?;
     for result in checkpoint.results {
         if let ToolRoundResult::PendingSelfGoal { pending, .. } = result {
             super::self_management::verify_source(tx, assistant, checkpoint.execution, pending)
                 .await?;
         }
     }
-    let self_goal_round = classify_self_goal_round(checkpoint.results);
-    crate::insert_message_tx(tx, assistant).await?;
     let mut messages = Vec::with_capacity(checkpoint.results.len());
     let mut committed_goals = Vec::new();
     for (ordinal, result) in checkpoint.results.iter().enumerate() {

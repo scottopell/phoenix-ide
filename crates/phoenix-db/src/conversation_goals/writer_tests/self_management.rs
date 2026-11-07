@@ -513,7 +513,19 @@ async fn mixed_self_goal_checkpoint_cut_preserves_atomic_refusal_and_retry() {
         )
         .await;
         let before = effect_counts(&db).await;
-        assert!(round.cut(&db, cut).await.is_err());
+        let state_before: (String, String) = sqlx::query_as(
+            "SELECT state,state_updated_at FROM conversations WHERE conversation_id=?",
+        )
+        .bind(&round.transcript)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let cut_error = round.cut(&db, cut).await.err().unwrap().to_string();
+        let expected_cut = match cut {
+            CanonicalCommitCut::BeforeCanonicalCommit => "injected failure before canonical commit",
+            CanonicalCommitCut::AfterCanonicalCommit => "injected failure after canonical commit",
+        };
+        assert!(cut_error.contains(expected_cut), "{cut_error}");
         let after = effect_counts(&db).await;
         let retained = matches!(cut, CanonicalCommitCut::AfterCanonicalCommit);
         assert_eq!((after.0, after.1, after.2), (before.0, before.1, before.2));
@@ -521,6 +533,19 @@ async fn mixed_self_goal_checkpoint_cut_preserves_atomic_refusal_and_retry() {
         assert!(!enabled(&db, &round.owner).await);
         if !retained {
             assert!(db.get_messages(&round.transcript).await.unwrap().is_empty());
+            assert!(db
+                .load_provider_replay_state(&round.transcript)
+                .await
+                .unwrap()
+                .is_none());
+            let state_after: (String, String) = sqlx::query_as(
+                "SELECT state,state_updated_at FROM conversations WHERE conversation_id=?",
+            )
+            .bind(&round.transcript)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(state_after, state_before);
         }
         let retry = round.commit(&db, true).await.unwrap();
         assert_eq!(retry.replayed, retained);
@@ -530,6 +555,40 @@ async fn mixed_self_goal_checkpoint_cut_preserves_atomic_refusal_and_retry() {
             .all(|result| { status(result)["reason"] == "mixed_self_goal_operations" }));
         let committed = effect_counts(&db).await;
         assert_eq!(committed.3, before.3 + 1);
+        let selected_state: (String, String) = sqlx::query_as(
+            "SELECT state,state_updated_at FROM conversations WHERE conversation_id=?",
+        )
+        .bind(&round.transcript)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            selected_state,
+            (
+                serde_json::to_string(&ConvState::Idle).unwrap(),
+                round.timestamp.to_rfc3339()
+            )
+        );
+        let ProviderReplayUpdate::Anthropic(expected_replay) = round.replay() else {
+            unreachable!()
+        };
+        assert_eq!(
+            db.load_provider_replay_state(&round.transcript)
+                .await
+                .unwrap()
+                .unwrap()
+                .response_sets,
+            vec![expected_replay]
+        );
+        let messages = db.get_messages(&round.transcript).await.unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
         assert!(!enabled(&db, &round.owner).await);
         assert!(db.conversation_goal(&round.owner).await.unwrap().is_none());
         assert!(round.commit(&db, true).await.unwrap().replayed);
@@ -540,10 +599,11 @@ async fn mixed_self_goal_checkpoint_cut_preserves_atomic_refusal_and_retry() {
 #[tokio::test]
 async fn malformed_later_mixed_source_rolls_back_first_application() {
     let db = fixture().await;
-    let mut round = SelfRound::new(
+    let mut round = SelfRound::with_preference(
         &db,
         "mixed-malformed-later",
         vec![SelfGoalOperation::EnableAutoContinuation, create()],
+        false,
     )
     .await;
     let ToolRoundResult::PendingSelfGoal { pending, .. } = &mut round.results[1] else {
@@ -557,7 +617,8 @@ async fn malformed_later_mixed_source_rolls_back_first_application() {
         .fetch_one(db.pool())
         .await
         .unwrap();
-    assert!(round.commit(&db, false).await.is_err());
+    let error = round.commit(&db, false).await.err().unwrap().to_string();
+    assert!(error.contains("self-goal source block"), "{error}");
     assert_eq!(effect_counts(&db).await, before);
     let after_message_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
         .fetch_one(db.pool())
