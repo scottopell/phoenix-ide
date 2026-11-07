@@ -225,8 +225,35 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   };
   window.addEventListener('product-conversation-fixture-release-older', releaseOlderSnapshotResponse);
 
+  let reminderFailuresRemaining = scenario.reminderFixture?.initialFailures ?? 0;
+  let reminderFailuresAfterLoad = scenario.reminderFixture?.failuresAfterFirstLoad ?? 0;
+  let hasLoadedReminders = false;
+  let reminderRequestCount = 0;
   globalThis.fetch = async (input, init) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    const requestUrl = new URL(url, location.href);
+    const reminderPath = `/api/conversations/${encodeURIComponent(conversation.id)}/reminders`;
+    if (scenario.reminderFixture && requestUrl.pathname === reminderPath && (init?.method ?? 'GET') === 'GET') {
+      reminderRequestCount += 1;
+      record('ReminderRequests', reminderRequestCount);
+      if (reminderFailuresRemaining > 0) {
+        reminderFailuresRemaining -= 1;
+        record('ReminderState', 'failed');
+        return Response.json({ error: 'Fixture reminder service unavailable' }, { status: 503 });
+      }
+      if (hasLoadedReminders && reminderFailuresAfterLoad > 0) {
+        reminderFailuresAfterLoad -= 1;
+        record('ReminderState', 'failed');
+        return Response.json({ error: 'Fixture reminder service unavailable after focus refresh' }, { status: 503 });
+      }
+      hasLoadedReminders = true;
+      record('ReminderState', 'loaded');
+      return Response.json(scenario.reminderFixture.reminders);
+    }
+    if (scenario.reminderFixture?.rejectMutation && requestUrl.pathname.startsWith(`${reminderPath}/`) && init?.method === 'POST') {
+      record('ReminderMutation', 'rejected');
+      return Response.json({ kind: 'revision_conflict', error: 'The reminder changed in this fixture.' }, { status: 409 });
+    }
     if (url.endsWith('/api/telemetry/conversation-open') || url.endsWith('/api/telemetry/product-conversation-open')) {
       return new Response(null, { status: 204 });
     }

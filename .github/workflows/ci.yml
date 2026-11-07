@@ -820,6 +820,8 @@ jobs:
           npm i -g corepack@latest
           corepack enable
           pnpm install --frozen-lockfile
+          node --check scripts/capture-reminders.mjs
+          node --test scripts/capture-reminders.contract.test.mjs
           python3 -m unittest discover -s ../scripts/ci -p 'test_isolate_geometry_apt_source.py'
           sudo python3 ../scripts/ci/isolate_geometry_apt_source.py
           pnpm exec playwright install --with-deps chromium
@@ -854,6 +856,7 @@ jobs:
           node scripts/capture-subagent-task-details.mjs
           node scripts/capture-composer-rejection.mjs
           node scripts/capture-review-reading-position.mjs
+          node scripts/capture-reminders.mjs
 
       - uses: actions/upload-artifact@v6
         if: always()

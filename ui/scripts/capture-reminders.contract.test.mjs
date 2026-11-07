@@ -1,0 +1,22 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import test from 'node:test';
+
+const [stories, mockApi, capture] = await Promise.all([
+  readFile(new URL('../src/stories/product-conversation.stories.tsx', import.meta.url), 'utf8'),
+  readFile(new URL('../src/fixtures/productConversation/mockApi.ts', import.meta.url), 'utf8'),
+  readFile(new URL('./capture-reminders.mjs', import.meta.url), 'utf8'),
+]);
+
+test('Reminders capture contract has typed scenarios, conversation-scoped GETs and bounded journeys', () => {
+  for (const id of ['reminders-initial-failure', 'reminders-loaded-stale-upcoming', 'reminders-retry-mutation-rejection']) {
+    assert.ok(stories.includes(`withReminders('${id}'`), `Missing Reminders story scenario ${id}`);
+  }
+  assert.doesNotMatch(stories, /as ProductConversationScenarioId/);
+  assert.match(mockApi, /`\/api\/conversations\/\$\{encodeURIComponent\(conversation\.id\)\}\/reminders`/);
+  assert.match(mockApi, /failuresAfterFirstLoad/);
+  assert.match(mockApi, /status: 409/);
+  assert.match(capture, /storyPrefix: 'product-conversation--reminders-'/);
+  assert.match(capture, /'mobile-375x667'.*'mobile-393x852'/s);
+  assert.match(capture, /409/);
+});
