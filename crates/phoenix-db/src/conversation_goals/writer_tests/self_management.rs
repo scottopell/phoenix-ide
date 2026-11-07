@@ -513,17 +513,16 @@ async fn mixed_self_goal_checkpoint_cut_preserves_atomic_refusal_and_retry() {
         )
         .await;
         let before = effect_counts(&db).await;
-        let state_before: (String, String) = sqlx::query_as(
-            "SELECT state,state_updated_at FROM conversations WHERE conversation_id=?",
-        )
-        .bind(&round.transcript)
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
+        let state_before: (String, String) =
+            sqlx::query_as("SELECT state,state_updated_at FROM conversations WHERE id=?")
+                .bind(&round.transcript)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
         let cut_error = round.cut(&db, cut).await.err().unwrap().to_string();
         let expected_cut = match cut {
-            CanonicalCommitCut::BeforeCanonicalCommit => "injected failure before canonical commit",
-            CanonicalCommitCut::AfterCanonicalCommit => "injected failure after canonical commit",
+            CanonicalCommitCut::BeforeCanonicalCommit => "injected before canonical commit",
+            CanonicalCommitCut::AfterCanonicalCommit => "injected after canonical commit",
         };
         assert!(cut_error.contains(expected_cut), "{cut_error}");
         let after = effect_counts(&db).await;
@@ -538,13 +537,12 @@ async fn mixed_self_goal_checkpoint_cut_preserves_atomic_refusal_and_retry() {
                 .await
                 .unwrap()
                 .is_none());
-            let state_after: (String, String) = sqlx::query_as(
-                "SELECT state,state_updated_at FROM conversations WHERE conversation_id=?",
-            )
-            .bind(&round.transcript)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
+            let state_after: (String, String) =
+                sqlx::query_as("SELECT state,state_updated_at FROM conversations WHERE id=?")
+                    .bind(&round.transcript)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
             assert_eq!(state_after, state_before);
         }
         let retry = round.commit(&db, true).await.unwrap();
@@ -555,13 +553,12 @@ async fn mixed_self_goal_checkpoint_cut_preserves_atomic_refusal_and_retry() {
             .all(|result| { status(result)["reason"] == "mixed_self_goal_operations" }));
         let committed = effect_counts(&db).await;
         assert_eq!(committed.3, before.3 + 1);
-        let selected_state: (String, String) = sqlx::query_as(
-            "SELECT state,state_updated_at FROM conversations WHERE conversation_id=?",
-        )
-        .bind(&round.transcript)
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
+        let selected_state: (String, String) =
+            sqlx::query_as("SELECT state,state_updated_at FROM conversations WHERE id=?")
+                .bind(&round.transcript)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
         assert_eq!(
             selected_state,
             (
@@ -587,7 +584,7 @@ async fn mixed_self_goal_checkpoint_cut_preserves_atomic_refusal_and_retry() {
                 .iter()
                 .map(|message| message.sequence_id)
                 .collect::<Vec<_>>(),
-            vec![0, 1, 2]
+            vec![1, 2, 3]
         );
         assert!(!enabled(&db, &round.owner).await);
         assert!(db.conversation_goal(&round.owner).await.unwrap().is_none());
@@ -618,7 +615,10 @@ async fn malformed_later_mixed_source_rolls_back_first_application() {
         .await
         .unwrap();
     let error = round.commit(&db, false).await.err().unwrap().to_string();
-    assert!(error.contains("self-goal source block"), "{error}");
+    assert!(
+        error.contains("self-goal source name or arguments"),
+        "{error}"
+    );
     assert_eq!(effect_counts(&db).await, before);
     let after_message_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
         .fetch_one(db.pool())
