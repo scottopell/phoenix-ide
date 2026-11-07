@@ -2427,6 +2427,8 @@ impl RuntimeManager {
                             let identity = identity.clone();
                             let cleanup_plan = cleanup_plan.clone();
                             let writer_probe = CloseWriterProbe {
+                                #[cfg(test)]
+                                clean_writer_fixture: self.clean_close_writer_fixture,
                                 db: self.db().clone(),
                                 runtime: tokio::runtime::Handle::current(),
                                 run: run.clone(),
@@ -2566,6 +2568,8 @@ impl RuntimeManager {
                             let confirmed_snapshot = confirmed.snapshot;
                             let identity = identity.clone();
                             let writer_probe = CloseWriterProbe {
+                                #[cfg(test)]
+                                clean_writer_fixture: self.clean_close_writer_fixture,
                                 db: self.db().clone(),
                                 runtime: tokio::runtime::Handle::current(),
                                 run: run.clone(),
@@ -2762,6 +2766,8 @@ impl RuntimeManager {
                             let runtime = tokio::runtime::Handle::current();
                             let persistence_runtime = runtime.clone();
                             let writer_probe = CloseWriterProbe {
+                                #[cfg(test)]
+                                clean_writer_fixture: self.clean_close_writer_fixture,
                                 db: self.db().clone(),
                                 runtime: runtime.clone(),
                                 run: run.clone(),
@@ -5166,7 +5172,7 @@ fn resume_final_worktree_tombstone(
 ) -> FinalTombstoneRecovery {
     resume_final_worktree_tombstone_with_writer_probe(tombstone, identity, confirmed, move |path| {
         Ok(probe
-            .retain(quarantine_has_external_writer(path)?)?
+            .observe(path, quarantine_has_external_writer)?
             .blocks_retirement())
     })
 }
@@ -5639,6 +5645,8 @@ fn writer_gap(
 
 #[derive(Clone)]
 struct CloseWriterProbe {
+    #[cfg(test)]
+    clean_writer_fixture: bool,
     db: crate::db::Database,
     runtime: tokio::runtime::Handle,
     run: CloseRunRef,
@@ -5648,6 +5656,18 @@ struct CloseWriterProbe {
 }
 
 impl CloseWriterProbe {
+    fn observe(
+        &self,
+        path: &Path,
+        production: fn(&Path) -> Result<ExternalWriterEvidence, String>,
+    ) -> Result<ExternalWriterEvidence, String> {
+        #[cfg(test)]
+        if self.clean_writer_fixture {
+            return Ok(ExternalWriterEvidence::NoPositiveEvidence);
+        }
+        self.retain(production(path)?)
+    }
+
     fn retain(&self, evidence: ExternalWriterEvidence) -> Result<ExternalWriterEvidence, String> {
         if let ExternalWriterEvidence::Blocked(observation) = &evidence {
             self.runtime
@@ -6795,11 +6815,11 @@ impl CloseWorktreeEffects {
         Self {
             stop_fsmonitor: Box::new(stop_bound_fsmonitor_daemons),
             observe_open_descriptors: Box::new(move |path| {
-                descriptor_probe.retain(quarantine_has_open_descriptors(path)?)
+                descriptor_probe.observe(path, quarantine_has_open_descriptors)
             }),
             observe_external_writer: Box::new(move |path| {
                 Ok(probe
-                    .retain(quarantine_has_external_writer(path)?)?
+                    .observe(path, quarantine_has_external_writer)?
                     .blocks_retirement())
             }),
         }

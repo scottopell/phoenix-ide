@@ -13132,7 +13132,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_history_aggregate_cannot_delete_writer_evidence_before_product_deletion() {
+    async fn history_members_and_writer_evidence_cannot_be_deleted_outside_product_teardown() {
         let db = Database::open_in_memory().await.unwrap();
         let (request, mut failure) = writer_observation_fixture(&db).await;
         failure.stop_certainty =
@@ -13142,11 +13142,29 @@ mod tests {
             .await
             .unwrap();
         let mut tx = db.pool().begin().await.unwrap();
-        sqlx::query("DELETE FROM conversations WHERE product_conversation_id = ?1")
+        let members_before = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM conversations WHERE product_conversation_id = ?1",
+        )
+        .bind(failure.source_product_conversation_id.as_str())
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert!(members_before > 0);
+        // Raw member deletion would cascade through Close authority while its
+        // product still owns immutable writer evidence. That intermediate state
+        // is structurally forbidden; public permanent Delete orders teardown.
+        let error = sqlx::query("DELETE FROM conversations WHERE product_conversation_id = ?1")
             .bind(failure.source_product_conversation_id.as_str())
             .execute(&mut *tx)
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(
+            error.as_database_error().is_some_and(|error| {
+                error.code().as_deref() == Some("1811")
+                    && error.message() == "FOREIGN KEY constraint failed"
+            }),
+            "{error}"
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM conversations WHERE product_conversation_id = ?1"
@@ -13155,7 +13173,7 @@ mod tests {
             .fetch_one(&mut *tx)
             .await
             .unwrap(),
-            0
+            members_before
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
