@@ -485,12 +485,12 @@ impl GoalTool {
                         .map_err(GoalTool::refusal_message)?;
                     let accepted = matches!(
                         response.result,
-                        crate::api::federation::RemoteGoalResult::Accepted { .. }
+                        crate::api::federation::RemoteGoalApplyClassification::Accepted
                     );
                     Ok::<_, String>((
                         accepted,
                         json!({
-                            "request_id":response.request_id,
+                            "action_reference":response.action_reference,
                             "result":response.result
                         }),
                     ))

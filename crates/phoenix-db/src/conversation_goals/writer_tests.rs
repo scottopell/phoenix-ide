@@ -53,10 +53,10 @@ async fn public_goal_writers_reject_remote_coordinator_attribution() {
         tool_use_id: GoalText::parse("remote-tool").unwrap(),
     };
     let actor = GoalActor::RemoteCoordinator(
-        phoenix_core::domain::conversation_goal::RemoteGoalAgentSource {
-            instance_id: phoenix_core::domain::instance_identity::InstanceId::new(),
+        phoenix_core::domain::conversation_goal::EnrolledRemoteGoalAgentSource::new(
+            Uuid::new_v4(),
             source,
-        },
+        ),
     );
     mutation.attribution.requested_by = actor.clone();
     mutation.attribution.applied_by = actor;

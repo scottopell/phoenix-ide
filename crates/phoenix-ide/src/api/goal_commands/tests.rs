@@ -1050,3 +1050,128 @@ async fn product_busy_command_rechecks_authority_after_receipt_before_publicatio
 async fn transcript_busy_command_rechecks_authority_after_receipt_before_publication() {
     assert_command_rechecks_authority(CommandPublicationPath::TranscriptBusy).await;
 }
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn concurrent_remote_apply_waits_for_classification_and_replays_receipt() {
+    use phoenix_core::domain::{
+        conversation_goal::{
+            GoalAgentSource, GoalExecution, GoalPreparationSource, GoalText, RemoteGoalAgentSource,
+        },
+        instance_identity::{FederationCredentialVerifier, InstanceId},
+    };
+    use phoenix_db::conversation_goals::prepared::{
+        install_remote_goal_claim_pause, GoalPreparationIntent, RemoteGoalClaimPause,
+    };
+
+    let fixture = Fixture::new().await;
+    let db = fixture.state.runtime.db();
+    let caller = InstanceId::new();
+    let verifier = FederationCredentialVerifier::from_bearer(b"concurrent-goal-apply");
+    db.replace_federation_enrollment(caller, &"concurrent Goal peer".parse().unwrap(), &verifier)
+        .await
+        .unwrap();
+    let authority = phoenix_db::FederationSendAuthority::new(caller, verifier);
+    let source = RemoteGoalAgentSource {
+        instance_id: caller,
+        source: GoalAgentSource {
+            product_conversation_id: ProductConversationId::new(),
+            transcript_id: GoalText::parse(uuid::Uuid::new_v4().to_string()).unwrap(),
+            execution: GoalExecution::parse(1, 1).unwrap(),
+            message_id: GoalText::parse("concurrent-goal-message").unwrap(),
+            tool_use_id: GoalText::parse("concurrent-goal-tool").unwrap(),
+        },
+    };
+    let action = db
+        .prepare_remote_coordinator_goal_action(
+            &authority,
+            &source,
+            &fixture.owner,
+            GoalPreparationIntent::Create {
+                objective: GoalText::parse("exactly once remote objective").unwrap(),
+            },
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert_eq!(action.source, GoalPreparationSource::Remote(source.clone()));
+
+    let pause = RemoteGoalClaimPause::new();
+    install_remote_goal_claim_pause(action.reference, pause.clone());
+    let service = super::service::GoalCommandService::new(fixture.state.runtime.clone());
+    let first_service = service.clone();
+    let first_authority = authority.clone();
+    let reference = action.reference;
+    let first = tokio::spawn(async move {
+        first_service
+            .apply_remote(&first_authority, reference)
+            .await
+    });
+    pause.wait_until_claimed().await;
+
+    let (state, receipt_count): (String, i64) = sqlx::query_as(
+        "SELECT apply_state,
+                (SELECT COUNT(*) FROM conversation_goal_coordinator_receipts
+                 WHERE preparation_reference=?1)
+         FROM conversation_goal_preparations WHERE reference=?1",
+    )
+    .bind(reference.as_bytes().as_slice())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(state, "claimed");
+    assert_eq!(receipt_count, 0);
+
+    let gate_arrival = fixture
+        .state
+        .runtime
+        .observe_next_remote_goal_apply_gate_arrival(reference)
+        .await;
+    let second_service = service.clone();
+    let second_authority = authority.clone();
+    let second = tokio::spawn(async move {
+        second_service
+            .apply_remote(&second_authority, reference)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), gate_arrival.notified())
+        .await
+        .expect("duplicate apply should reach the held reference gate");
+    assert!(
+        !second.is_finished(),
+        "duplicate apply completed while the first request held the reference gate"
+    );
+
+    pause.resume();
+    let first_result = tokio::time::timeout(std::time::Duration::from_secs(30), first)
+        .await
+        .expect("first remote apply timed out")
+        .unwrap()
+        .unwrap();
+    let second_result = tokio::time::timeout(std::time::Duration::from_secs(30), second)
+        .await
+        .expect("duplicate remote apply timed out")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_result, second_result);
+
+    let history_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_goal_history WHERE owner_id=?1")
+            .bind(fixture.owner.as_str())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let receipt_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_goal_coordinator_receipts
+         WHERE preparation_reference=?1",
+    )
+    .bind(reference.as_bytes().as_slice())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(history_count, 1);
+    assert_eq!(receipt_count, 1);
+    assert!(!fixture.state.runtime.fatal_local_authority_is_latched());
+    assert!(fixture.state.runtime.acquire_local_authority_pass().is_ok());
+}

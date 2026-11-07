@@ -459,6 +459,22 @@ async fn remote_preparation_reference_is_scoped_to_current_enrollment_peer() {
         .established()
         .unwrap()
         .unwrap();
+    let first_receipt = db
+        .apply_remote_coordinator_goal_command(
+            &authority,
+            prepared.reference,
+            false,
+            || Ok(at()),
+            || panic!("unexpected authority loss"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        first_receipt.result,
+        GoalUserResult::Accepted { .. }
+    ));
     let other_id = InstanceId::new();
     let other_verifier = FederationCredentialVerifier::from_bearer(b"other remote peer");
     db.replace_federation_enrollment(
@@ -504,13 +520,45 @@ async fn remote_preparation_reference_is_scoped_to_current_enrollment_peer() {
             &replaced,
             &source,
             &owner,
-            create_intent("new enrollment objective"),
+            GoalPreparationIntent::State {
+                disposition:
+                    phoenix_core::domain::conversation_goal::GoalCommandDisposition::Complete(
+                        GoalText::parse("done").unwrap(),
+                    ),
+            },
         )
         .await
         .established()
         .unwrap()
         .unwrap();
     assert_ne!(replacement_preparation.reference, prepared.reference);
+    let enrollment_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT enrollment_id FROM conversation_goal_preparations WHERE reference IN (?, ?) ORDER BY reference",
+    )
+    .bind(prepared.reference.as_bytes().as_slice())
+    .bind(replacement_preparation.reference.as_bytes().as_slice())
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(enrollment_ids.len(), 2);
+    assert_ne!(enrollment_ids[0], enrollment_ids[1]);
+    assert_eq!(preparation_count(&db).await, 2);
+    let second_receipt = db
+        .apply_remote_coordinator_goal_command(
+            &replaced,
+            replacement_preparation.reference,
+            false,
+            || Ok(at()),
+            || panic!("replacement enrollment should admit the same source tuple"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        second_receipt.result,
+        GoalUserResult::Accepted { .. }
+    ));
     assert_eq!(preparation_count(&db).await, 2);
     db.revoke_federation_enrollment(source.instance_id)
         .await
@@ -1180,11 +1228,11 @@ async fn remote_apply_retains_receipt_and_history_decodes_remote_coordinator() {
     assert_eq!(history.len(), 1);
     assert!(matches!(
         &history[0].mutation().attribution.requested_by,
-        phoenix_core::domain::conversation_goal::GoalActor::RemoteCoordinator(remote) if remote == &source
+        phoenix_core::domain::conversation_goal::GoalActor::RemoteCoordinator(remote) if remote.source == source.source
     ));
     assert!(matches!(
         &history[0].mutation().attribution.applied_by,
-        phoenix_core::domain::conversation_goal::GoalActor::RemoteCoordinator(remote) if remote == &source
+        phoenix_core::domain::conversation_goal::GoalActor::RemoteCoordinator(remote) if remote.source == source.source
     ));
     let replacement = FederationCredentialVerifier::from_bearer(b"receipt replacement credential");
     db.replace_federation_enrollment(

@@ -205,6 +205,22 @@ pub struct RemoteGoalAgentSource {
     pub source: GoalAgentSource,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnrolledRemoteGoalAgentSource {
+    pub enrollment_id: uuid::Uuid,
+    pub source: GoalAgentSource,
+}
+
+impl EnrolledRemoteGoalAgentSource {
+    #[must_use]
+    pub const fn new(enrollment_id: uuid::Uuid, source: GoalAgentSource) -> Self {
+        Self {
+            enrollment_id,
+            source,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalPreparationSource {
     Local(GoalAgentSource),
@@ -235,7 +251,7 @@ pub enum GoalActor {
     },
     OwningAgent(GoalAgentSource),
     Coordinator(GoalAgentSource),
-    RemoteCoordinator(RemoteGoalAgentSource),
+    RemoteCoordinator(EnrolledRemoteGoalAgentSource),
     GeneratedHost {
         action_id: GoalText,
     },

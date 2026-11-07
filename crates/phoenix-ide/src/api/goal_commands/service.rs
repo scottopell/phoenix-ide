@@ -5,8 +5,7 @@ use phoenix_db::conversation_goals::prepared::{GoalPreparationIntent, PreparedGo
 use phoenix_db::workflow::LocalAuthorityResult;
 
 use phoenix_core::domain::conversation_goal::{
-    GoalAgentSource, GoalHistoryEntry, GoalPreparationSource, GoalSnapshot, GoalTimestampUs,
-    GoalVersion,
+    GoalAgentSource, GoalHistoryEntry, GoalPreparationSource, GoalTimestampUs, GoalVersion,
 };
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use phoenix_db::conversation_goals::user_commands::{
@@ -285,7 +284,8 @@ impl GoalCommandService {
         &self,
         authority: &phoenix_db::FederationSendAuthority,
         reference: uuid::Uuid,
-    ) -> Result<(PreparedGoalAction, Option<GoalSnapshot>, GoalUserReceipt), AppError> {
+    ) -> Result<(PreparedGoalAction, GoalUserReceipt), AppError> {
+        let _action_gate = self.runtime.lock_remote_goal_apply(reference).await;
         let admission = self
             .runtime
             .acquire_local_authority_pass()
@@ -295,31 +295,12 @@ impl GoalCommandService {
             .read_remote_coordinator_goal_preparation(authority, reference)
             .await
             .map_err(goal_error)?;
-        let previous = if action.expected_version == GoalVersion::INITIAL {
-            None
-        } else {
-            let after = GoalVersion::parse(action.expected_version.get() - 1)
-                .map_err(|error| AppError::Internal(error.to_string()))?;
-            let entry = db
-                .conversation_goal_history(&action.owner, after)
-                .await
-                .map_err(goal_error)?
-                .into_iter()
-                .next()
-                .filter(|entry| entry.snapshot().version() == action.expected_version)
-                .ok_or_else(|| {
-                    AppError::Internal(
-                        "remote goal preparation previous snapshot is unavailable".into(),
-                    )
-                })?;
-            Some(entry.snapshot().clone())
-        };
         if let Some(receipt) = db
             .retained_remote_coordinator_goal_command(authority, reference)
             .await
             .map_err(goal_error)?
         {
-            return self.publication_result(Ok((action, previous, receipt)));
+            return self.publication_result(Ok((action, receipt)));
         }
         let clock = || {
             GoalTimestampUs::parse(chrono::Utc::now().timestamp_micros())
@@ -339,7 +320,7 @@ impl GoalCommandService {
                 db.apply_remote_coordinator_goal_command(authority, reference, true, clock, lost)
                     .await,
             )?;
-            return self.publication_result(Ok((action, previous, receipt)));
+            return self.publication_result(Ok((action, receipt)));
         };
         let transcript = db
             .get_ordinary_product_conversation(&action.owner)
@@ -358,7 +339,7 @@ impl GoalCommandService {
             )
             .await,
         )?;
-        self.publication_result(Ok((action, previous, receipt)))
+        self.publication_result(Ok((action, receipt)))
     }
 
     pub(crate) async fn prepare_coordinator(

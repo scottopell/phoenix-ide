@@ -18,7 +18,7 @@ CREATE TABLE conversation_goal_actors_new (
     actor_id INTEGER PRIMARY KEY,
     owner_id TEXT NOT NULL REFERENCES product_conversations(id) ON DELETE CASCADE,
     kind TEXT NOT NULL CHECK (kind IN ('user_api','owning_agent','coordinator','remote_coordinator','generated_host','user_control')),
-    source_instance_id TEXT,
+    enrollment_id TEXT REFERENCES federation_enrollments(id) ON DELETE NO ACTION,
     source_product_id TEXT,
     transcript_id TEXT,
     workflow_id INTEGER,
@@ -37,31 +37,31 @@ CREATE TABLE conversation_goal_actors_new (
         REFERENCES conversation_goal_user_requests(owner_id,principal_id,request_id,outcome,command,result_version),
     FOREIGN KEY (owner_id,control_result_version,actor_id,control_applied_actor_id)
         REFERENCES conversation_goal_history(owner_id,version,requested_actor_id,applied_actor_id) DEFERRABLE INITIALLY DEFERRED,
-    CHECK ((kind = 'user_control' AND source_instance_id IS NULL AND source_product_id IS NULL AND transcript_id IS NULL
+    CHECK ((kind = 'user_control' AND enrollment_id IS NULL AND source_product_id IS NULL AND transcript_id IS NULL
         AND workflow_id IS NULL AND turn_id IS NULL AND message_id IS NULL AND tool_use_id IS NULL AND host_action_id IS NULL
         AND control_principal_id IS NOT NULL AND typeof(control_principal_id) = 'blob' AND length(control_principal_id) = 16
         AND control_request_id IS NOT NULL AND typeof(control_request_id) = 'blob' AND length(control_request_id) = 16
         AND control_command IS NOT NULL AND control_command IN ('create','state')
         AND control_result_version IS NOT NULL AND typeof(control_result_version) = 'integer' AND control_result_version > 0)
       OR (kind <> 'user_control' AND control_principal_id IS NULL AND control_request_id IS NULL AND control_command IS NULL AND control_result_version IS NULL AND (
-        (kind = 'user_api' AND source_instance_id IS NULL AND source_product_id IS NULL AND transcript_id IS NOT NULL
+        (kind = 'user_api' AND enrollment_id IS NULL AND source_product_id IS NULL AND transcript_id IS NOT NULL
          AND workflow_id IS NULL AND turn_id IS NULL AND message_id IS NOT NULL
          AND tool_use_id IS NULL AND host_action_id IS NULL)
         OR (kind IN ('owning_agent','coordinator','remote_coordinator') AND source_product_id IS NOT NULL
          AND transcript_id IS NOT NULL AND workflow_id IS NOT NULL AND turn_id IS NOT NULL
          AND message_id IS NOT NULL AND tool_use_id IS NOT NULL AND trim(tool_use_id) <> ''
-         AND host_action_id IS NULL AND ((kind = 'remote_coordinator' AND source_instance_id IS NOT NULL
-             AND trim(source_instance_id) <> '') OR (kind <> 'remote_coordinator' AND source_instance_id IS NULL)))
-        OR (kind = 'generated_host' AND source_instance_id IS NULL AND source_product_id IS NULL AND transcript_id IS NULL
+         AND host_action_id IS NULL AND ((kind = 'remote_coordinator' AND enrollment_id IS NOT NULL)
+             OR (kind <> 'remote_coordinator' AND enrollment_id IS NULL)))
+        OR (kind = 'generated_host' AND enrollment_id IS NULL AND source_product_id IS NULL AND transcript_id IS NULL
          AND workflow_id IS NULL AND turn_id IS NULL AND message_id IS NULL
          AND tool_use_id IS NULL AND host_action_id IS NOT NULL AND trim(host_action_id) <> '')
     )))
 );
 INSERT INTO conversation_goal_actors_new
   (actor_id,owner_id,kind,source_product_id,transcript_id,workflow_id,turn_id,message_id,tool_use_id,host_action_id,
-   control_principal_id,control_request_id,control_command,control_result_version)
+   control_principal_id,control_request_id,control_command,control_result_version,enrollment_id)
 SELECT actor_id,owner_id,kind,source_product_id,transcript_id,workflow_id,turn_id,message_id,tool_use_id,host_action_id,
-       control_principal_id,control_request_id,control_command,control_result_version
+       control_principal_id,control_request_id,control_command,control_result_version,NULL
 FROM conversation_goal_actors;
 DROP TABLE conversation_goal_actors;
 ALTER TABLE conversation_goal_actors_new RENAME TO conversation_goal_actors;
@@ -260,7 +260,7 @@ SELECT r.preparation_reference,r.owner_id,r.result_version,h.version,
     p.expected_version,h.change_kind,h.recorded_at_us,r.recorded_at_us AS receipt_recorded_at_us,
     p.objective,g.objective AS history_objective,p.disposition,p.reason,h.state,h.reason AS history_reason,
     p.observed_goal_id,h.goal_id,
-    p.source_kind,e.caller_instance_id AS source_instance_id,p.source_product_id,p.caller_conversation_id,p.workflow_id,p.turn_id,p.message_id,p.tool_use_id,
+    p.source_kind,p.enrollment_id,e.caller_instance_id AS source_instance_id,p.source_product_id,p.caller_conversation_id,p.workflow_id,p.turn_id,p.message_id,p.tool_use_id,
     h.requested_actor_id,h.applied_actor_id
 FROM conversation_goal_coordinator_receipts r
 JOIN conversation_goal_preparations p ON p.reference=r.preparation_reference
@@ -276,7 +276,8 @@ WHERE v.command<>v.change_kind OR v.recorded_at_us<>v.receipt_recorded_at_us
  OR EXISTS (SELECT 1 FROM conversation_goal_actors a
     WHERE a.actor_id IN (v.requested_actor_id,v.applied_actor_id)
       AND (a.kind<>CASE v.source_kind WHEN 'local' THEN 'coordinator' ELSE 'remote_coordinator' END OR a.owner_id<>v.owner_id
-        OR a.source_instance_id IS NOT v.source_instance_id
+        OR a.enrollment_id IS NOT v.enrollment_id
+        OR (v.source_kind='remote' AND v.source_instance_id IS NULL)
         OR a.source_product_id IS NOT v.source_product_id OR a.transcript_id IS NOT v.caller_conversation_id
         OR a.workflow_id IS NOT v.workflow_id OR a.turn_id IS NOT v.turn_id
         OR a.message_id IS NOT v.message_id OR a.tool_use_id IS NOT v.tool_use_id));

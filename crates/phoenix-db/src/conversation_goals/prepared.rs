@@ -339,7 +339,9 @@ fn prepare_observation(
             if matches!(disposition, GoalCommandDisposition::Underway)
                 && matches!(current.state(), GoalState::Suspended(_))
             {
-                return Err(GoalDbError::Invalid("Suspended Goal requires explicit Start; disposition tools cannot reactivate it"));
+                return Err(GoalDbError::Invalid(
+                    "Suspended Goal requires explicit Start; disposition tools cannot reactivate it",
+                ));
             }
             (current.version(), Some(current.goal_id().clone()))
         }
@@ -361,6 +363,7 @@ pub(super) enum RemoteCoordinatorGoalClaim {
 
 pub(super) struct RemoteClaimedGoalAction {
     pub(super) command: super::user_commands::GoalUserCommand,
+    pub(super) enrollment_id: Uuid,
     pub(super) source: RemoteGoalAgentSource,
 }
 
@@ -380,6 +383,7 @@ async fn remote_claim_state_tx(
     let GoalPreparationSource::Remote(source) = prepared.source else {
         return Err(GoalDbError::Integrity("remote preparation source"));
     };
+    let enrollment_id = require_remote_peer(tx, authority, source.instance_id).await?;
     if let Some(receipt) = super::user_commands::retained_tx(
         tx,
         &input,
@@ -399,6 +403,7 @@ async fn remote_claim_state_tx(
         "prepared" => Ok(RemoteCoordinatorGoalClaimState::Prepared(Box::new(
             RemoteClaimedGoalAction {
                 command: input,
+                enrollment_id,
                 source,
             },
         ))),
@@ -415,21 +420,80 @@ pub(super) enum RemoteGoalClaimCommitCut {
     RolledBack,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone)]
-pub(super) struct RemoteGoalClaimPause {
-    pub(super) claimed: std::sync::Arc<tokio::sync::Notify>,
-    pub(super) resume: std::sync::Arc<tokio::sync::Notify>,
+/// Test synchronization point after a remote Goal claim commits and before mutation.
+pub struct RemoteGoalClaimPause {
+    claimed: std::sync::Arc<tokio::sync::Notify>,
+    resume: std::sync::Arc<tokio::sync::Notify>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl RemoteGoalClaimPause {
+    /// Creates an unpaused synchronization point.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            claimed: std::sync::Arc::new(tokio::sync::Notify::new()),
+            resume: std::sync::Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Waits until the apply path has durably claimed the preparation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the claim does not reach the synchronization point within 30 seconds.
+    pub async fn wait_until_claimed(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), self.claimed.notified())
+            .await
+            .expect("remote Goal claim test did not reach the pause within 30 seconds");
+    }
+
+    /// Allows the paused apply path to proceed to Goal mutation.
+    pub fn resume(&self) {
+        self.resume.notify_one();
+    }
+
     pub(super) async fn after_claim(&self) {
         self.claimed.notify_one();
         tokio::time::timeout(std::time::Duration::from_secs(30), self.resume.notified())
             .await
             .expect("remote Goal claim test did not resume within 30 seconds");
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Default for RemoteGoalClaimPause {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "test-support")]
+static REMOTE_GOAL_CLAIM_PAUSES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<Uuid, RemoteGoalClaimPause>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(feature = "test-support")]
+/// Installs a one-shot post-claim pause for the exact preparation reference.
+///
+/// # Panics
+///
+/// Panics when another test poisoned the pause registry mutex.
+pub fn install_remote_goal_claim_pause(reference: Uuid, pause: RemoteGoalClaimPause) {
+    REMOTE_GOAL_CLAIM_PAUSES
+        .lock()
+        .expect("remote Goal claim pause registry poisoned")
+        .insert(reference, pause);
+}
+
+#[cfg(feature = "test-support")]
+pub(super) fn take_remote_goal_claim_pause(reference: Uuid) -> Option<RemoteGoalClaimPause> {
+    REMOTE_GOAL_CLAIM_PAUSES
+        .lock()
+        .expect("remote Goal claim pause registry poisoned")
+        .remove(&reference)
 }
 
 impl Database {

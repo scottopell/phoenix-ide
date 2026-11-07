@@ -268,6 +268,7 @@ enum GoalControlAuthority<'a> {
         source: &'a GoalAgentSource,
     },
     RemoteCoordinator {
+        enrollment_id: Uuid,
         source: phoenix_core::domain::conversation_goal::RemoteGoalAgentSource,
     },
 }
@@ -291,7 +292,15 @@ impl GoalControlAuthority<'_> {
                 command: input.change.command().1,
             },
             Self::Coordinator { source, .. } => GoalActor::Coordinator((*source).clone()),
-            Self::RemoteCoordinator { source } => GoalActor::RemoteCoordinator(source.clone()),
+            Self::RemoteCoordinator {
+                enrollment_id,
+                source,
+            } => GoalActor::RemoteCoordinator(
+                phoenix_core::domain::conversation_goal::EnrolledRemoteGoalAgentSource::new(
+                    *enrollment_id,
+                    source.source.clone(),
+                ),
+            ),
         }
     }
 }
@@ -384,16 +393,27 @@ impl Database {
             .await
         {
             Ok(super::prepared::RemoteCoordinatorGoalClaim::Claimed(action)) => {
+                #[cfg(feature = "test-support")]
+                if let Some(pause) = super::prepared::take_remote_goal_claim_pause(reference) {
+                    pause.after_claim().await;
+                }
                 #[cfg(test)]
                 if let Some(pause) = claim_pause {
                     pause.after_claim().await;
                 }
-                let super::prepared::RemoteClaimedGoalAction { command, source } = *action;
+                let super::prepared::RemoteClaimedGoalAction {
+                    command,
+                    enrollment_id,
+                    source,
+                } = *action;
                 let result = self
                     .control_goal_command_with_notification(
                         &command,
                         "",
-                        GoalControlAuthority::RemoteCoordinator { source },
+                        GoalControlAuthority::RemoteCoordinator {
+                            enrollment_id,
+                            source,
+                        },
                         clock,
                         host_gate_busy,
                         || {},
