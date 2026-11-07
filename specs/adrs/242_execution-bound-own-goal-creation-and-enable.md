@@ -1,8 +1,8 @@
 # ADR-242: Execution-bound own Goal creation and explicit continuation enable
 
-Status: Accepted
-Date: 2026-11-07
-Affects: REQ-SGT-001–008, REQ-GOAL-AC-001–004
+- **Status:** Accepted
+- **Date:** 2026-11-07
+- **Affects:** REQ-SGT-001–008, REQ-GOAL-AC-001–004
 
 ## Context
 
@@ -18,7 +18,7 @@ Represent effects as typed pending tool-round results and finalize them in the e
 
 Add a durable per-owner disable epoch and a normalized per-turn admission row. Every explicit disable advances the epoch, including false-to-false writes. A self-operation compares its immutable admitted epoch and execution/control generation inside the mutation transaction. Existing canonical receipts bind the pending authority and selected result evidence; retained replay returns history without repeating the write.
 
-## Alternatives considered
+## Options considered
 
 - Calling the settled-target HTTP path would reject the active caller or require weakening unrelated admission.
 - Mutating preferences in tool execution before checkpointing could lose the paired result and overwrite a later human disable on retry.

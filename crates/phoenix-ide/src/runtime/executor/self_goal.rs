@@ -1,5 +1,6 @@
 use super::*;
 use phoenix_core::domain::conversation_goal::{SelfGoalOperation, ToolRoundResult};
+use phoenix_core::domain::sm_state::AssistantMessage;
 
 fn definitions() -> Vec<phoenix_llm::ToolDefinition> {
     vec![
@@ -53,7 +54,9 @@ fn apply_self_goal_round_commit(
     }
 }
 
-impl<S: Storage + 'static, L: LlmClient + 'static, T: ToolExecutor + 'static> Executor<S, L, T> {
+impl<S: Storage + 'static, L: LlmClient + 'static, T: ToolExecutor + 'static>
+    ConversationRuntime<S, L, T>
+{
     pub(super) async fn prepare_self_goal(&self, tool: ToolCall) -> Result<Option<Event>, String> {
         let result = if self.context.is_coordinator || self.context.is_sub_agent {
             ToolResult::error(tool.id.clone(), "ordinary_role_required".into()).into()

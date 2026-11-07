@@ -54,7 +54,7 @@ rule AdmitTurn {
 }
 
 rule AcceptEnable {
-    when: Checkpoint(operation: Operation)
+    when: Checkpoint(operation)
     requires:
         operation.state = pending
         operation.kind = enable
@@ -72,7 +72,7 @@ rule AcceptEnable {
 }
 
 rule AcceptCreate {
-    when: Checkpoint(operation: Operation)
+    when: Checkpoint(operation)
     requires:
         operation.state = pending
         operation.kind = create
