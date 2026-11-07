@@ -64,9 +64,17 @@ runSurfaceCapture({
       await page.screenshot({ path: path.join(outDir, `${id}--${viewport.name}--retry-focused.png`), fullPage: false });
       await retry.press('Enter');
       await page.locator('.reminders-fetch-status').waitFor({ state: 'hidden' });
+      const beforeConflictRequests = Number(await page.locator('html').getAttribute('data-product-conversation-fixture-reminder-requests'));
       await page.getByRole('button', { name: 'Cancel reminder' }).click();
       await page.getByRole('alert').filter({ hasText: 'This reminder changed. Review its current time before trying again.' }).waitFor({ state: 'visible' });
-      journey.push('loaded → focus refresh failure → keyboard-focusable retry succeeds → mutation receives 409');
+      await page.getByText('Check the release candidate — revised on server').waitFor({ state: 'visible' });
+      const conflictEvidence = await page.evaluate(() => ({
+        requests: Number(document.documentElement.dataset['productConversationFixtureReminderRequests']),
+        mutations: Number(document.documentElement.dataset['productConversationFixtureReminderMutations']),
+      }));
+      assert.ok(conflictEvidence.requests > beforeConflictRequests, '409 must refresh the changed server record');
+      assert.equal(conflictEvidence.mutations, 1, '409 must not replay the rejected mutation');
+      journey.push('loaded → focus refresh failure → keyboard retry → 409 alert → server revision refetched, mutation not replayed');
     }
 
     const evidence = await page.evaluate(() => {
