@@ -99,6 +99,20 @@ BEGIN
     SELECT RAISE(ABORT, 'Close writer observations are immutable');
 END;
 CREATE TRIGGER close_writer_observations_no_delete BEFORE DELETE ON close_writer_observations
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM close_runs run
+    JOIN close_obligations obligation ON obligation.attempt_id = run.attempt_id
+    JOIN product_conversations product ON product.id = obligation.product_conversation_id
+    WHERE run.attempt_id = OLD.attempt_id
+      AND run.run_ordinal = OLD.run_ordinal
+      AND product.kind = 'ordinary'
+      AND product.ordinary_lifecycle = 'history'
+      AND NOT EXISTS (
+          SELECT 1 FROM conversations
+          WHERE product_conversation_id = product.id
+      )
+)
 BEGIN
-    SELECT RAISE(ABORT, 'Close writer observations are immutable');
+    SELECT RAISE(ABORT, 'Close writer observations are immutable until permanent Delete');
 END;

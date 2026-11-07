@@ -5663,10 +5663,15 @@ impl CloseWriterProbe {
                 .map_err(|error| {
                     format!("cannot persist Close writer observation; target preserved: {error}")
                 })?;
-            if let CloseWriterObservation::InspectionGap { .. } = observation {
-                return Err(
-                    "Close writer inspection is incomplete; retained typed inspection gap".into(),
-                );
+            if let CloseWriterObservation::InspectionGap {
+                detector,
+                pid,
+                reason,
+            } = observation
+            {
+                return Err(format!(
+                    "Close writer inspection is incomplete; retained typed inspection gap: detector={detector:?}, pid={pid:?}, reason={reason:?}"
+                ));
             }
         }
         Ok(evidence)
@@ -6072,7 +6077,61 @@ impl LinuxProcessEffectiveUid {
 enum LinuxProcessOwner {
     Relevant,
     Unrelated,
+    Zombie,
     Vanished,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_is_zombie(status: &str) -> Result<bool, String> {
+    let mut states = status
+        .lines()
+        .filter_map(|line| line.strip_prefix("State:"));
+    let state = states.next().ok_or("status State field is missing")?;
+    if states.next().is_some() {
+        return Err("status State field is ambiguous".into());
+    }
+    match state.split_whitespace().next() {
+        Some("Z") => Ok(true),
+        Some("R" | "S" | "D" | "T" | "t" | "X" | "x" | "K" | "W" | "P" | "I") => Ok(false),
+        _ => Err("status State field is malformed or unsupported".into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_zombie_has_no_sibling_threads(process: &Path, status: &str) -> Result<(), String> {
+    let validate = |sample: &str| -> Result<(), String> {
+        let mut counts = sample
+            .lines()
+            .filter_map(|line| line.strip_prefix("Threads:"));
+        if counts.next().map(str::trim) != Some("1")
+            || counts.next().is_some()
+            || !linux_process_is_zombie(sample)?
+        {
+            return Err("zombie thread-group leader has siblings or uncertain thread state".into());
+        }
+        Ok(())
+    };
+    validate(status)?;
+    // A zombie group leader can coexist with live sibling threads. Only exclude
+    // the single-task group, never infer absence from the leader's state alone.
+    let mut tasks = std::fs::read_dir(process.join("task"))
+        .map_err(|error| format!("cannot inspect zombie thread group: {error}"))?;
+    let task = tasks
+        .next()
+        .ok_or("zombie thread inventory is empty")?
+        .map_err(|error| format!("cannot inspect zombie thread: {error}"))?;
+    if Some(task.file_name().as_os_str()) != process.file_name() || tasks.next().is_some() {
+        return Err("zombie thread inventory contains siblings or is unstable".into());
+    }
+    let after = std::fs::read_to_string(process.join("status"))
+        .map_err(|error| format!("cannot recheck zombie state: {error}"))?;
+    validate(&after)?;
+    if LinuxProcessEffectiveUid::parse_status(status)?
+        != LinuxProcessEffectiveUid::parse_status(&after)?
+    {
+        return Err("zombie credentials changed during inspection".into());
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -6107,7 +6166,14 @@ fn linux_process_owner(
     // ownership, it is not rewritten to root when a same-user target is nondumpable.
     Ok(
         if process_effective_uid == LinuxProcessEffectiveUid(effective_uid) {
-            LinuxProcessOwner::Relevant
+            // Exclude only a positively single-task zombie, not a zombie leader
+            // whose live sibling threads may still retain shared write authority.
+            if linux_process_is_zombie(&status)? {
+                linux_zombie_has_no_sibling_threads(&process.path(), &status)?;
+                LinuxProcessOwner::Zombie
+            } else {
+                LinuxProcessOwner::Relevant
+            }
         } else {
             LinuxProcessOwner::Unrelated
         },
@@ -6178,7 +6244,7 @@ fn linux_writer_scan(
             continue;
         };
         match linux_process_owner(&process, effective_uid, detector.as_str()) {
-            Ok(LinuxProcessOwner::Unrelated) => continue,
+            Ok(LinuxProcessOwner::Unrelated | LinuxProcessOwner::Zombie) => continue,
             Ok(LinuxProcessOwner::Relevant) => {}
             _ => return Ok(writer_gap(detector, Some(pid), CloseWriterGap::Unavailable)),
         }
@@ -11819,7 +11885,7 @@ mod tests {
         std::fs::write(proc_root.join("sys/kernel/random/boot_id"), "test-boot").unwrap();
         std::fs::write(
             process.join("status"),
-            format!("Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
+            format!("State:\tS (sleeping)\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
         )
         .unwrap();
         let mut fields = vec!["0".to_owned(); 20];
@@ -11834,6 +11900,146 @@ mod tests {
         std::os::unix::fs::symlink("/outside", process.join("cwd")).unwrap();
         std::fs::write(process.join("maps"), "").unwrap();
         process
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_zombie_classification_requires_unambiguous_kernel_state() {
+        assert_eq!(
+            super::linux_process_is_zombie("State:\tZ (zombie)\n"),
+            Ok(true)
+        );
+        assert_eq!(
+            super::linux_process_is_zombie("State:\tS (sleeping)\nName: zombie\n"),
+            Ok(false)
+        );
+        for status in [
+            "",
+            "State:\n",
+            "State: unknown\n",
+            "State: ZZ\n",
+            "State: Z\nState: S\n",
+        ] {
+            assert!(super::linux_process_is_zombie(status).is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_zombie_without_executable_does_not_hide_writers_or_live_gaps() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let proc_root = temp.path().join("proc");
+        std::fs::create_dir(&quarantine).unwrap();
+        let zombie = fake_linux_process(&proc_root, 3, 1, 42);
+        std::fs::write(
+            zombie.join("status"),
+            "State:\tZ (zombie)\nThreads:\t1\nUid:\t1\t1\t1\t1\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(zombie.join("task/3")).unwrap();
+        let stat = std::fs::read_to_string(zombie.join("stat")).unwrap();
+        std::fs::write(zombie.join("stat"), stat.replace(") S ", ") Z ")).unwrap();
+        for name in ["exe", "cwd", "maps"] {
+            std::fs::remove_file(zombie.join(name)).unwrap();
+        }
+        for detector in [
+            super::CloseWriterDetector::LinuxDescriptor,
+            super::CloseWriterDetector::LinuxCwd,
+            super::CloseWriterDetector::LinuxMapping,
+        ] {
+            let scan = || {
+                super::linux_writer_scan(&quarantine, &proc_root, 1, detector, |_, _| {
+                    Ok(Some((
+                        quarantine.clone(),
+                        super::CloseWriterAuthority::WorkingDirectory,
+                    )))
+                })
+                .unwrap()
+            };
+            assert!(matches!(
+                scan(),
+                super::ExternalWriterEvidence::NoPositiveEvidence
+            ));
+            let live = fake_linux_process(&proc_root, 4, 1, 43);
+            assert!(
+                matches!(scan(), super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::Authority { process, .. }) if process.pid == 4)
+            );
+            std::fs::remove_file(live.join("exe")).unwrap();
+            assert!(matches!(
+                scan(),
+                super::ExternalWriterEvidence::Blocked(
+                    super::CloseWriterObservation::InspectionGap { pid: Some(4), .. }
+                )
+            ));
+            std::fs::remove_dir_all(live).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_zombie_leader_with_sibling_threads_remains_a_gap() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let proc_root = temp.path().join("proc");
+        std::fs::create_dir(&quarantine).unwrap();
+        let leader = fake_linux_process(&proc_root, 3, 1, 42);
+        std::fs::create_dir_all(leader.join("task/3")).unwrap();
+        std::fs::create_dir(leader.join("task/4")).unwrap();
+        std::fs::remove_file(leader.join("exe")).unwrap();
+        for threads in ["2", "1", "unknown"] {
+            std::fs::write(
+                leader.join("status"),
+                format!("State:\tZ (zombie)\nThreads:\t{threads}\nUid:\t1\t1\t1\t1\n"),
+            )
+            .unwrap();
+            let evidence = super::linux_writer_scan(
+                &quarantine,
+                &proc_root,
+                1,
+                super::CloseWriterDetector::LinuxCwd,
+                |_, _| Ok(None),
+            )
+            .unwrap();
+            assert!(matches!(
+                evidence,
+                super::ExternalWriterEvidence::Blocked(
+                    super::CloseWriterObservation::InspectionGap { pid: Some(3), .. }
+                )
+            ));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_live_to_zombie_during_observation_is_a_gap() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let proc_root = temp.path().join("proc");
+        std::fs::create_dir(&quarantine).unwrap();
+        let process = fake_linux_process(&proc_root, 3, 1, 42);
+        let evidence = super::linux_writer_scan(
+            &quarantine,
+            &proc_root,
+            1,
+            super::CloseWriterDetector::LinuxCwd,
+            |_, _| {
+                std::fs::write(
+                    process.join("status"),
+                    "State:\tZ (zombie)\nThreads:\t1\nUid:\t1\t1\t1\t1\n",
+                )
+                .unwrap();
+                Ok(None)
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            evidence,
+            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::InspectionGap {
+                reason: super::CloseWriterGap::ProcessChanged,
+                ..
+            })
+        ));
     }
 
     #[cfg(target_os = "linux")]

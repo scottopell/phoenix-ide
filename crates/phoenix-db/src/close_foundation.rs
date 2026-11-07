@@ -13051,6 +13051,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn permanent_delete_removes_writer_observations_only_after_history_aggregate_is_empty() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "other-aggregate").await;
+        let (request, mut failure) = writer_observation_fixture(&db).await;
+        failure.stop_certainty =
+            CloseStopCertainty::ConversationAndProcessesStopped { confirmed_at_us: 1 };
+        db.record_close_writer_observation(&request).await.unwrap();
+
+        assert!(sqlx::query("DELETE FROM close_writer_observations")
+            .execute(db.pool())
+            .await
+            .is_err());
+        db.terminalize_initial_close_cleanup_failure(&failure)
+            .await
+            .unwrap();
+        assert!(sqlx::query("DELETE FROM close_writer_observations")
+            .execute(db.pool())
+            .await
+            .is_err());
+        for sql in [
+            "UPDATE close_writer_observations SET pid = 124",
+            "INSERT OR REPLACE INTO close_writer_observations
+             SELECT attempt_id, run_ordinal, scope, inspection_generation, inspection_fingerprint,
+                    resource_kind, identity_kind, identity_codec, identity_value, detector,
+                    999, incarnation, executable, matched_path, matched_kind, access, authority, gap
+             FROM close_writer_observations",
+        ] {
+            assert!(sqlx::query(sql).execute(db.pool()).await.is_err());
+        }
+
+        assert_eq!(
+            db.list_close_writer_observations(&request.run, &request.scope)
+                .await
+                .unwrap(),
+            vec![request]
+        );
+        db.delete_conversation("root").await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_writer_observations")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            1
+        );
+        db.delete_conversation("latest").await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_writer_observations")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(db.get_conversation("other-aggregate").await.is_ok());
+    }
+
+    #[tokio::test]
     async fn writer_observation_replacement_is_rejected_with_recursive_triggers_disabled() {
         let db = Database::open_in_memory().await.unwrap();
         let (request, _) = writer_observation_fixture(&db).await;
