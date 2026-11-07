@@ -447,6 +447,16 @@ rule AmbiguousPrivateDirectoryIdentityPreservesSafeLeftover {
         -- deadline ends the run immediately with typed failure; Phoenix does not
         -- continue into quarantine or the descriptor scan after that failed stop.
         -- Phoenix never changes the user's fsmonitor configuration or index state.
+        -- External-writer scans classify directory descriptors and cwd as
+        -- path-relative authority, writable regular-file descriptors as direct
+        -- authority, and writable shared mappings independently of descriptors.
+        -- Process incarnation and descriptor identity must remain stable;
+        -- incomplete attributable inspection blocks deletion. Under admitted-run
+        -- authority, a positive writer or inspection gap is persisted as an
+        -- immutable child observation of the exact run, scope, inspection snapshot
+        -- and resource before returning the blocker. Failed evidence persistence
+        -- preserves the target (REQ-WL-002e). Pre-admission retry probes cannot
+        -- write observations under a hypothetical ordinal.
 }
 
 rule RetirementStepSuccessRecordsTypedEvidence {

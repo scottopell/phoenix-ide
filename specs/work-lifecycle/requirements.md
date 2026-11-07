@@ -190,6 +190,27 @@ AND SHALL NOT create, rename, move, fast-forward, merge, delete, push, close, or
 
 ---
 
+### REQ-WL-002e: Durable External Writer Authority Evidence
+
+WHEN an admitted Close run blocks worktree retirement because it observes an external writer or an inspection gap
+THE SYSTEM SHALL persist an immutable child observation bound to the exact attempt, admitted run ordinal, WorkScope, inspection generation and fingerprint, and captured resource identity before returning that blocker
+AND SHALL distinguish positive authority from an inspection gap
+
+Positive evidence shall retain the detector, PID and process incarnation, executable when observable, matched path and object kind, access mode, and authority kind. A gap shall retain its detector, reason, and PID when attributable; it shall not fabricate process identity or writer authority. A reused PID shall not identify the same process without an equal incarnation.
+
+Directory descriptors, including read-only directory descriptors, and process working directories inside the worktree confer path-relative write authority. Ordinary regular-file descriptors confer authority only when writable. A writable shared mapping confers authority independently of ordinary descriptors. A changing read position on a read-only regular-file descriptor shall not constitute writer authority or an inspection gap when its identity and access classification remain stable. Changed process incarnation or unstable descriptor identity shall be an inspection gap.
+
+An unavailable or malformed process inventory, or malformed, inaccessible, or changing evidence for a same-user candidate, shall be a fail-closed inspection gap. Access denial for an unattributed ambient candidate shall not constitute positive writer evidence. A Linux candidate positively identified as a single-task zombie by unambiguous kernel State and Threads fields, a matching singleton task inventory, and stable reinspection shall not require an executable link. A zombie thread-group leader with remaining or uncertain sibling threads shall remain a fail-closed inspection gap. Missing or ambiguous state shall remain an inspection gap; transition from a live candidate during inspection shall remain unstable evidence.
+
+Observations shall be normalized child rows, not embedded collections or a parallel JSON payload. Writes shall require the exact active run, captured scope, inspection and resource binding. An identical replay may succeed without changing the row; replacement, mutation, deletion and conflicting replay shall be rejected during the owning aggregate's lifetime. Authoritative permanent Delete of an ordinary History aggregate shall remove these children by the owning product's deletion cascade in the same transaction, only after no conversation members remain. Empty membership alone shall not authorize child deletion while the owning product still exists. Observations from earlier runs shall remain attached to their original ordinal and shall not authorize a retry or process termination.
+
+IF the blocking observation cannot be persisted
+THE SYSTEM SHALL preserve the target and fail the retirement step rather than deleting without durable evidence
+
+A pre-admission retry probe shall not invent a run ordinal or write admitted-run evidence. These observations confer no authority to terminate an external process and require no browser API or UI surface.
+
+---
+
 ### REQ-WL-002d: Durable Tmux Instance Authority
 
 WHEN Phoenix creates a tmux server for a `WorkScope`

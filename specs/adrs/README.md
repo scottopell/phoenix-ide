@@ -227,6 +227,8 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [228](228_coordinator-inline-child-bash-controller-retirement.md) | Coordinator inline children retire their Bash controllers before parent acceptance | Accepted | REQ-GR-007, REQ-BASH-017, REQ-BASH-018, REQ-SA-003, REQ-SA-004, REQ-SA-005 |
 | [240](240_http-connection-recovery-retries-under-existing-ownership.md) | HTTP connection recovery retries under existing ownership | Accepted | REQ-MCP-003/005/007/012/013/018; REQ-SG-017 |
 
+| [241](241_close-writer-authority-is-immutable-run-evidence.md) | Close writer authority is immutable run evidence | Accepted | REQ-WL-002b, REQ-WL-002c, REQ-WL-002e |
+
 ## For agents: which decisions bind your task
 
 Consult the relevant ADRs before starting work of each kind.
