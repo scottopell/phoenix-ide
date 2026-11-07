@@ -447,3 +447,213 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
         "finish approved work"
     );
 }
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // The parameterized fixture exercises the production producer, reducer, and terminal checkpoint path.
+async fn database_runtime_mixed_self_goal_round_refuses_both_intents_in_either_order() {
+    for enabled in [
+        AutoContinueOnContextExhaustion::Disabled,
+        AutoContinueOnContextExhaustion::Enabled,
+    ] {
+        for create_first in [false, true] {
+            let db = crate::db::Database::open_in_memory().await.unwrap();
+            let cwd = tempfile::tempdir().unwrap();
+            let preference_name = if enabled.is_enabled() { "on" } else { "off" };
+            let suffix = format!("{preference_name}-{create_first}");
+            let transcript = format!("runtime-mixed-self-goal-{suffix}");
+            db.create_conversation(
+                &transcript,
+                &transcript,
+                cwd.path().to_str().unwrap(),
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let owner = db
+                .get_conversation(&transcript)
+                .await
+                .unwrap()
+                .product_conversation_id;
+            db.set_auto_continue_on_context_exhaustion(&owner, enabled)
+                .await
+                .unwrap();
+            let active = admit(&db, &transcript, &format!("turn-{suffix}")).await;
+            let turn_id = i64::try_from(active.turn_id.0).unwrap();
+            let binding_before: (Option<i64>, Option<String>) = sqlx::query_as(
+                "SELECT observed_version,goal_id FROM conversation_goal_bindings WHERE turn_id=?",
+            )
+            .bind(turn_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+
+            let create = ToolCall::new(
+                "create-id",
+                ToolInput::Unknown {
+                    name: "create_goal".into(),
+                    input: serde_json::json!({"objective":"finish approved work"}),
+                },
+            );
+            let enable = ToolCall::new(
+                "enable-id",
+                ToolInput::Unknown {
+                    name: "enable_auto_continuation".into(),
+                    input: serde_json::json!({}),
+                },
+            );
+            let (first, second) = if create_first {
+                (create, enable)
+            } else {
+                (enable, create)
+            };
+            let assistant = AssistantMessage::new(
+                format!("assistant-{suffix}"),
+                [&first, &second]
+                    .into_iter()
+                    .map(|tool| ContentBlock::ToolUse {
+                        id: tool.id.clone(),
+                        name: tool.name().into(),
+                        input: tool.input.to_value(),
+                    })
+                    .collect(),
+                None,
+                None,
+            );
+            let initial = ConvState::ToolExecuting {
+                current_tool: first.clone(),
+                remaining_tools: vec![second.clone()],
+                completed_results: vec![],
+                pending_sub_agents: vec![],
+                assistant_message: assistant,
+            };
+            let initial_timestamp = Utc::now();
+            db.update_conversation_state_at(&transcript, &initial, initial_timestamp)
+                .await
+                .unwrap();
+            let (tx, rx) = mpsc::channel(16);
+            let tools = Arc::new(MockToolExecutor::new());
+            let llm = Arc::new(MockLlmClient::new("test-model"));
+            llm.queue_response(phoenix_llm::LlmResponse {
+                provider_replay: None,
+                content: vec![],
+                end_turn: true,
+                usage: phoenix_llm::Usage::default(),
+                usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            });
+            let last_sequence = db.get_last_sequence_id(&transcript).await.unwrap();
+            let mut runtime = ConversationRuntime::new(
+                ConvContext::new(
+                    &transcript,
+                    cwd.path().to_path_buf(),
+                    "test-model",
+                    200_000,
+                    16_384,
+                ),
+                initial,
+                DatabaseStorage::new(db.clone()),
+                llm.clone(),
+                tools.clone(),
+                Arc::new(BrowserSessionManager::default()),
+                Arc::new(crate::tools::BashHandleRegistry::new()),
+                Arc::new(crate::tools::TmuxRegistry::new()),
+                Arc::new(ModelRegistry::new_empty()),
+                crate::terminal::ActiveTerminals::new(),
+                rx,
+                tx,
+                SseBroadcaster::new(128, last_sequence),
+            )
+            .with_state_updated_at(initial_timestamp);
+            runtime.active_direct_turn = Some(Box::new(active));
+            let (_, declarations) = runtime.prepare_overhead_without_recall().await.unwrap();
+            for expected in ["create_goal", "enable_auto_continuation"] {
+                assert!(declarations.iter().any(|tool| tool.name == expected));
+            }
+            let callable = declarations.iter().map(|tool| tool.name.clone()).collect();
+            db.prepare_tool_availability(
+                &transcript,
+                "test-route",
+                None,
+                &declarations,
+                &callable,
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+
+            let first_event = runtime
+                .execute_effect(Effect::ExecuteTool {
+                    tool: first.clone(),
+                })
+                .await
+                .unwrap()
+                .expect("first own-tool producer returns a round result");
+            assert!(matches!(
+                &first_event,
+                Event::ToolRoundComplete {
+                    result: ToolRoundResult::PendingSelfGoal { .. },
+                    ..
+                }
+            ));
+            runtime.process_event(first_event).await.unwrap();
+
+            assert!(matches!(runtime.state, ConvState::LlmRequesting { .. }));
+            let (generation, outcome) = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                runtime.llm_outcome_rx.recv(),
+            )
+            .await
+            .expect("provider outcome forwarder must complete")
+            .expect("runtime owns the provider outcome channel");
+            runtime
+                .process_generation_tagged_llm_outcome(generation, outcome)
+                .await;
+            assert!(matches!(runtime.state, ConvState::Idle));
+            assert!(runtime.active_direct_turn.is_none());
+            assert!(runtime.terminal_transition_retry.is_none());
+            assert!(tools.recorded_executions().is_empty());
+            assert_eq!(llm.recorded_requests().len(), 1);
+
+            assert_eq!(db.conversation_goal(&owner).await.unwrap(), None);
+            assert_eq!(
+                db.auto_continue_on_context_exhaustion(&owner)
+                    .await
+                    .unwrap(),
+                enabled
+            );
+            let binding_after: (Option<i64>, Option<String>) = sqlx::query_as(
+                "SELECT observed_version,goal_id FROM conversation_goal_bindings WHERE turn_id=?",
+            )
+            .bind(turn_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(binding_after, binding_before);
+            let persisted = db.get_conversation(&transcript).await.unwrap();
+            assert!(matches!(persisted.state, ConvState::Idle));
+            assert_eq!(persisted.state_updated_at, runtime.state_updated_at);
+            let messages = db.get_messages(&transcript).await.unwrap();
+            for call in [&first, &second] {
+                let result = messages
+                    .iter()
+                    .find_map(|message| match &message.content {
+                        MessageContent::Tool(result) if result.tool_use_id == call.id => {
+                            Some(result)
+                        }
+                        _ => None,
+                    })
+                    .expect("canonical checkpoint persists each own-tool result");
+                let content: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+                assert_eq!(content["status"], "refused");
+                assert_eq!(content["reason"], "mixed_self_goal_operations");
+            }
+            assert!(messages.iter().any(|message| {
+                message.message_id == format!("assistant-{suffix}")
+                    && matches!(&message.content, MessageContent::Agent(_))
+            }));
+        }
+    }
+}

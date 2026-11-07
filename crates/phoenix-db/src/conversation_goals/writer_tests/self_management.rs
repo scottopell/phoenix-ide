@@ -422,6 +422,153 @@ async fn off_create_refuses_then_enable_then_create_in_separate_rounds_without_d
 }
 
 #[tokio::test]
+async fn mixed_self_goal_rounds_refuse_every_intent_without_mutation() {
+    for initially_enabled in [false, true] {
+        for create_first in [false, true] {
+            let db = fixture().await;
+            let operations = if create_first {
+                vec![create(), SelfGoalOperation::EnableAutoContinuation]
+            } else {
+                vec![SelfGoalOperation::EnableAutoContinuation, create()]
+            };
+            let round =
+                SelfRound::with_preference(&db, "mixed-round", operations, initially_enabled).await;
+            let before = effect_counts(&db).await;
+            let results = round.commit(&db, false).await.unwrap().results;
+            assert_eq!(results.len(), 2);
+            for result in &results {
+                assert_eq!(status(result)["status"], "refused");
+                assert_eq!(status(result)["reason"], "mixed_self_goal_operations");
+            }
+            assert_eq!(enabled(&db, &round.owner).await, initially_enabled);
+            assert!(db.conversation_goal(&round.owner).await.unwrap().is_none());
+            let after = effect_counts(&db).await;
+            assert_eq!((after.0, after.1, after.2), (before.0, before.1, before.2));
+        }
+    }
+}
+
+#[tokio::test]
+async fn refused_mixed_round_replays_its_receipt_after_preference_changes() {
+    let db = fixture().await;
+    let round = SelfRound::with_preference(
+        &db,
+        "mixed-replay",
+        vec![SelfGoalOperation::EnableAutoContinuation, create()],
+        false,
+    )
+    .await;
+    let first = round.commit(&db, true).await.unwrap();
+    assert_eq!(
+        status(&first.results[0])["reason"],
+        "mixed_self_goal_operations"
+    );
+    db.set_auto_continue_on_context_exhaustion(
+        &round.owner,
+        crate::AutoContinueOnContextExhaustion::Enabled,
+    )
+    .await
+    .unwrap();
+    db.set_auto_continue_on_context_exhaustion(
+        &round.owner,
+        crate::AutoContinueOnContextExhaustion::Disabled,
+    )
+    .await
+    .unwrap();
+    let counts = effect_counts(&db).await;
+    let replayed = round.commit(&db, true).await.unwrap();
+    assert!(replayed.replayed);
+    assert_eq!(
+        serde_json::to_value(&replayed.results).unwrap(),
+        serde_json::to_value(&first.results).unwrap()
+    );
+    assert!(!enabled(&db, &round.owner).await);
+    assert_eq!(effect_counts(&db).await, counts);
+
+    let mut changed_source = round;
+    let MessageContent::Agent(blocks) = &mut changed_source.assistant.content else {
+        unreachable!()
+    };
+    let ContentBlock::ToolUse { input, .. } = &mut blocks[0] else {
+        unreachable!()
+    };
+    *input = serde_json::json!({"unexpected":true});
+    assert!(changed_source.commit(&db, true).await.is_err());
+    assert_eq!(effect_counts(&db).await, counts);
+}
+
+#[tokio::test]
+async fn mixed_self_goal_checkpoint_cut_preserves_atomic_refusal_and_retry() {
+    for cut in [
+        CanonicalCommitCut::BeforeCanonicalCommit,
+        CanonicalCommitCut::AfterCanonicalCommit,
+    ] {
+        let db = Database::open(":memory:").await.unwrap();
+        crate::run_pending_migrations(db.pool()).await.unwrap();
+        let round = SelfRound::with_preference(
+            &db,
+            "mixed-cut",
+            vec![SelfGoalOperation::EnableAutoContinuation, create()],
+            false,
+        )
+        .await;
+        let before = effect_counts(&db).await;
+        assert!(round.cut(&db, cut).await.is_err());
+        let after = effect_counts(&db).await;
+        let retained = matches!(cut, CanonicalCommitCut::AfterCanonicalCommit);
+        assert_eq!((after.0, after.1, after.2), (before.0, before.1, before.2));
+        assert_eq!(after.3, before.3 + i64::from(retained));
+        assert!(!enabled(&db, &round.owner).await);
+        if !retained {
+            assert!(db.get_messages(&round.transcript).await.unwrap().is_empty());
+        }
+        let retry = round.commit(&db, true).await.unwrap();
+        assert_eq!(retry.replayed, retained);
+        assert!(retry
+            .results
+            .iter()
+            .all(|result| { status(result)["reason"] == "mixed_self_goal_operations" }));
+        let committed = effect_counts(&db).await;
+        assert_eq!(committed.3, before.3 + 1);
+        assert!(!enabled(&db, &round.owner).await);
+        assert!(db.conversation_goal(&round.owner).await.unwrap().is_none());
+        assert!(round.commit(&db, true).await.unwrap().replayed);
+        assert_eq!(effect_counts(&db).await, committed);
+    }
+}
+
+#[tokio::test]
+async fn malformed_later_mixed_source_rolls_back_first_application() {
+    let db = fixture().await;
+    let mut round = SelfRound::new(
+        &db,
+        "mixed-malformed-later",
+        vec![SelfGoalOperation::EnableAutoContinuation, create()],
+    )
+    .await;
+    let ToolRoundResult::PendingSelfGoal { pending, .. } = &mut round.results[1] else {
+        unreachable!()
+    };
+    pending.operation = SelfGoalOperation::Create {
+        objective: text("mismatched later objective"),
+    };
+    let before = effect_counts(&db).await;
+    let message_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert!(round.commit(&db, false).await.is_err());
+    assert_eq!(effect_counts(&db).await, before);
+    let after_message_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(after_message_count, message_count);
+    assert!(!enabled(&db, &round.owner).await);
+    assert!(db.conversation_goal(&round.owner).await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn repeated_human_false_and_aba_disable_win_and_refused_receipts_remain_permanent() {
     for aba in [false, true] {
         for replay in [false, true] {

@@ -415,6 +415,31 @@ pub(crate) async fn retained_round_tx(
     Ok(Some(messages))
 }
 
+fn classify_self_goal_round(
+    results: &[ToolRoundResult],
+) -> super::self_management::SelfGoalRoundAdmission {
+    let mut enable = false;
+    let mut create = false;
+    for result in results {
+        if let ToolRoundResult::PendingSelfGoal { pending, .. } = result {
+            match &pending.operation {
+                phoenix_core::domain::conversation_goal::SelfGoalOperation::EnableAutoContinuation => {
+                    enable = true;
+                }
+                phoenix_core::domain::conversation_goal::SelfGoalOperation::Create { .. } => {
+                    create = true;
+                }
+            }
+        }
+    }
+    match (enable, create) {
+        (false, false) | (true, false) | (false, true) => {
+            super::self_management::SelfGoalRoundAdmission::SeparateOperations
+        }
+        (true, true) => super::self_management::SelfGoalRoundAdmission::MixedOperations,
+    }
+}
+
 async fn finalize_round_tx(
     tx: &mut GoalTx<'_>,
     checkpoint: &GoalRoundCheckpoint<'_>,
@@ -428,6 +453,13 @@ async fn finalize_round_tx(
         });
     }
     let assistant = checkpoint.assistant;
+    for result in checkpoint.results {
+        if let ToolRoundResult::PendingSelfGoal { pending, .. } = result {
+            super::self_management::verify_source(tx, assistant, checkpoint.execution, pending)
+                .await?;
+        }
+    }
+    let self_goal_round = classify_self_goal_round(checkpoint.results);
     crate::insert_message_tx(tx, assistant).await?;
     let mut messages = Vec::with_capacity(checkpoint.results.len());
     let mut committed_goals = Vec::new();
@@ -437,10 +469,14 @@ async fn finalize_round_tx(
                 pending,
                 duration_ms,
             } => {
-                super::self_management::verify_source(tx, assistant, checkpoint.execution, pending)
-                    .await?;
-                let (result, notification) =
-                    super::self_management::finalize(tx, pending, *duration_ms, policies).await?;
+                let (result, notification) = super::self_management::finalize(
+                    tx,
+                    pending,
+                    *duration_ms,
+                    policies,
+                    self_goal_round,
+                )
+                .await?;
                 if let Some(notification) = notification {
                     committed_goals.push(notification);
                 }
