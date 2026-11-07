@@ -4,6 +4,7 @@ use super::{
 };
 use crate::runtime::testing::{MockLlmClient, MockToolExecutor};
 use crate::runtime::traits::{ActiveDirectTurn, DatabaseStorage};
+use phoenix_core::domain::db_schema::{tool_result_transcript_content, ToolContent, ToolResult};
 use phoenix_core::domain::product_conversation::AutoContinueOnContextExhaustion;
 use phoenix_core::domain::sm_event::{
     PreparedDirectTurnDelivery, PreparedDirectTurnPayload, SubmittedDirectTurnExpansionPolicy,
@@ -69,7 +70,7 @@ async fn terminal_self_tool(
     name: &str,
     input: serde_json::Value,
     cancel_before_checkpoint: bool,
-) -> serde_json::Value {
+) -> ToolContent {
     let active = admit(db, transcript, key).await;
     let turn_id = i64::try_from(active.turn_id.0).unwrap();
     let binding_before: (Option<i64>, Option<String>) = sqlx::query_as(
@@ -118,6 +119,7 @@ async fn terminal_self_tool(
         usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
         stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
     });
+    let last_sequence = db.get_last_sequence_id(transcript).await.unwrap();
     let mut runtime = ConversationRuntime::new(
         ConvContext::new(transcript, cwd.to_path_buf(), "test-model", 200_000, 16_384),
         initial,
@@ -131,7 +133,7 @@ async fn terminal_self_tool(
         crate::terminal::ActiveTerminals::new(),
         rx,
         tx,
-        SseBroadcaster::new(128, 0),
+        SseBroadcaster::new(128, last_sequence),
     )
     .with_state_updated_at(initial_timestamp);
     runtime.active_direct_turn = Some(Box::new(active));
@@ -255,7 +257,7 @@ async fn terminal_self_tool(
             _ => None,
         })
         .expect("checkpoint publishes a finalized provider-visible tool result");
-    serde_json::from_str(&result.content).unwrap()
+    result.clone()
 }
 
 #[tokio::test]
@@ -292,7 +294,13 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
         true,
     ))
     .await;
-    assert_eq!(cancelled["reason"], "conversation_stopped_or_paused");
+    assert_eq!(
+        cancelled,
+        tool_result_transcript_content(&ToolResult::cancelled(
+            "cancelled-enable".into(),
+            "Cancelled by user"
+        ))
+    );
     assert_eq!(
         db.auto_continue_on_context_exhaustion(&owner)
             .await
@@ -309,6 +317,7 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
         false,
     ))
     .await;
+    let refused: serde_json::Value = serde_json::from_str(&refused.content).unwrap();
     assert_eq!(refused["reason"], "auto_continuation_disabled");
     assert!(db.conversation_goal(&owner).await.unwrap().is_none());
     let enabled = Box::pin(terminal_self_tool(
@@ -321,6 +330,7 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
         false,
     ))
     .await;
+    let enabled: serde_json::Value = serde_json::from_str(&enabled.content).unwrap();
     assert_eq!(enabled["status"], "auto_continuation_enabled");
     assert!(db.conversation_goal(&owner).await.unwrap().is_none());
     let created = Box::pin(terminal_self_tool(
@@ -333,6 +343,7 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
         false,
     ))
     .await;
+    let created: serde_json::Value = serde_json::from_str(&created.content).unwrap();
     assert_eq!(created["status"], "goal_created");
     assert_eq!(
         db.conversation_goal(&owner)
