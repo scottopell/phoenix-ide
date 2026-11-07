@@ -1469,6 +1469,32 @@ pub async fn continue_conversation(
     State(state): State<AppState>,
     Json(request): Json<RemoteContinueRequest>,
 ) -> Response {
+    continue_conversation_with_authority(
+        &state.runtime,
+        continue_conversation_inner(peer, &state, request),
+    )
+    .await
+}
+
+async fn continue_conversation_with_authority<F>(
+    runtime: &crate::runtime::RuntimeManager,
+    operation: F,
+) -> Response
+where
+    F: std::future::Future<Output = Response>,
+{
+    if runtime.local_authority_is_closed() {
+        return std::future::pending().await;
+    }
+    let response = operation.await;
+    peer_authority_response(runtime, response).await
+}
+
+async fn continue_conversation_inner(
+    peer: PeerAuthenticated,
+    state: &AppState,
+    request: RemoteContinueRequest,
+) -> Response {
     let Ok(destination) = state.db.instance_id().await else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
@@ -5015,6 +5041,59 @@ mod tests {
                 () = std::future::ready(()) => true,
             });
         }
+    }
+
+    #[tokio::test]
+    async fn peer_continue_conversation_never_starts_after_authority_closes() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let runtime = state.runtime.clone();
+        runtime
+            .acquire_local_authority_pass()
+            .unwrap()
+            .close("peer_continue_preclosed_response_test");
+        let operation_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let operation_started_in_future = operation_started.clone();
+        let operation = async move {
+            operation_started_in_future.store(true, std::sync::atomic::Ordering::SeqCst);
+            StatusCode::OK.into_response()
+        };
+
+        let response = continue_conversation_with_authority(&runtime, operation);
+        tokio::pin!(response);
+        assert!(tokio::select! {
+            biased;
+            _ = &mut response => false,
+            () = std::future::ready(()) => true,
+        });
+        assert!(!operation_started.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn peer_continue_conversation_never_responds_when_authority_closes_mid_operation() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let runtime = state.runtime.clone();
+        let owner = runtime.acquire_local_authority_pass().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let operation = async move {
+            started_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            StatusCode::OK.into_response()
+        };
+        let response = continue_conversation_with_authority(&runtime, operation);
+        tokio::pin!(response);
+        tokio::select! {
+            _ = &mut response => panic!("continuation response completed before operation release"),
+            started = started_rx => started.unwrap(),
+        }
+
+        owner.close("peer_continue_mid_operation_response_test");
+        release_tx.send(()).unwrap();
+        assert!(tokio::select! {
+            biased;
+            _ = &mut response => false,
+            () = std::future::ready(()) => true,
+        });
     }
 
     #[tokio::test]
