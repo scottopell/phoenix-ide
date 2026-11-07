@@ -999,12 +999,15 @@ async fn remote_admitted_apply_survives_enrollment_replacement() {
     remote_claimed_action_survives_enrollment_change(true).await;
 }
 
-#[tokio::test]
-async fn remote_target_becoming_history_after_claim_retains_replayable_transition_refusal() {
-    use crate::workflow::LocalAuthorityResult;
-    use std::sync::Arc;
-    use tokio::sync::Notify;
+struct TargetHistoryRaceFixture {
+    db: Database,
+    authority: crate::FederationSendAuthority,
+    owner: ProductConversationId,
+    reference: Uuid,
+    history_before: i64,
+}
 
+async fn target_history_race_fixture() -> TargetHistoryRaceFixture {
     let db = fixture().await;
     let (authority, source, owner) = remote_source(&db, "remote-target-history-race").await;
     let prepared = db
@@ -1057,7 +1060,6 @@ async fn remote_target_becoming_history_after_claim_retains_replayable_transitio
             .version()
             > GoalVersion::INITIAL
     );
-
     let history_before = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM conversation_goal_history WHERE owner_id=?",
     )
@@ -1065,7 +1067,28 @@ async fn remote_target_becoming_history_after_claim_retains_replayable_transitio
     .fetch_one(db.pool())
     .await
     .unwrap();
+    TargetHistoryRaceFixture {
+        db,
+        authority,
+        owner,
+        reference: prepared.reference,
+        history_before,
+    }
+}
 
+#[tokio::test]
+async fn remote_target_becoming_history_after_claim_retains_replayable_transition_refusal() {
+    use crate::workflow::LocalAuthorityResult;
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    let TargetHistoryRaceFixture {
+        db,
+        authority,
+        owner,
+        reference,
+        history_before,
+    } = target_history_race_fixture().await;
     let claimed = Arc::new(Notify::new());
     let resume = Arc::new(Notify::new());
     let pause = RemoteGoalClaimPause {
@@ -1074,7 +1097,6 @@ async fn remote_target_becoming_history_after_claim_retains_replayable_transitio
     };
     let apply_db = db.clone();
     let apply_authority = authority.clone();
-    let reference = prepared.reference;
     let apply = tokio::spawn(async move {
         apply_db
             .apply_remote_coordinator_goal_command_with_claim_commit(

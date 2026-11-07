@@ -1308,7 +1308,7 @@ async fn expired_remote_apply_returns_typed_outcome_without_closing_authority() 
         panic!("known expired preparation must remain classified");
     };
 
-    assert_eq!(returned_action, expired_action);
+    assert_eq!(*returned_action, expired_action);
     assert_eq!(
         outcome,
         RemoteGoalApplyOutcome::Expired {

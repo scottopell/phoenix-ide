@@ -3139,16 +3139,15 @@ mod tests {
         };
         use tower::ServiceExt as _;
 
-        let state = make_test_state().await;
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         let peer = InstanceId::new();
-        let bearer = "phx_peer_unknown_goal_reference";
+        let bearer = format!("phx_peer_{}", "u".repeat(43));
         state
             .db
             .replace_federation_enrollment(
                 peer,
-                "peer-a",
-                &peer_bearer_verifier(bearer).unwrap(),
-                1,
+                &"peer-a".parse().unwrap(),
+                &FederationCredentialVerifier::from_bearer(bearer.as_bytes()),
             )
             .await
             .unwrap();

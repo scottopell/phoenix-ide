@@ -19,7 +19,7 @@ use crate::runtime::{AdmittedOperation, RuntimeManager};
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum RemoteGoalApplyServiceResult {
-    Classified(PreparedGoalAction, RemoteGoalApplyOutcome),
+    Classified(Box<PreparedGoalAction>, RemoteGoalApplyOutcome),
     ReferenceUnavailable,
 }
 
@@ -323,7 +323,7 @@ impl GoalCommandService {
         {
             Ok(Some(receipt)) => {
                 return self.publication_result(Ok(RemoteGoalApplyServiceResult::Classified(
-                    action,
+                    Box::new(action),
                     RemoteGoalApplyOutcome::Receipt(receipt),
                 )));
             }
@@ -390,7 +390,8 @@ impl GoalCommandService {
             .await;
         let outcome = RemoteGoalApplyAuthorityPass::new(admission).complete(outcome)?;
         self.publication_result(Ok(RemoteGoalApplyServiceResult::Classified(
-            action, outcome,
+            Box::new(action),
+            outcome,
         )))
     }
 
