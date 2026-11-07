@@ -396,8 +396,7 @@ pub(crate) async fn retained_round_tx(
             } => {
                 super::self_management::verify_source(tx, assistant, checkpoint.execution, pending)
                     .await?;
-                super::self_management::retained_result_tx(tx, pending, *duration_ms, &actual)
-                    .await?
+                super::self_management::retained_result(pending, *duration_ms, &actual)?
             }
             ToolRoundResult::Finalized(result) => result.clone(),
             ToolRoundResult::PendingGoalReport { report, .. } => {

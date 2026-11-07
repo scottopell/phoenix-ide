@@ -16265,7 +16265,18 @@ fn build_materialized_tool_round(
                 phoenix_core::domain::llm_types::ContentBlock::ToolUse { id, .. } => {
                     Some(id.as_str())
                 }
-                _ => None,
+                phoenix_core::domain::llm_types::ContentBlock::Text { .. }
+                | phoenix_core::domain::llm_types::ContentBlock::Image { .. }
+                | phoenix_core::domain::llm_types::ContentBlock::ToolResult { .. }
+                | phoenix_core::domain::llm_types::ContentBlock::ServerToolUse { .. }
+                | phoenix_core::domain::llm_types::ContentBlock::ToolSearchToolResult { .. }
+                | phoenix_core::domain::llm_types::ContentBlock::WebSearchToolResult { .. }
+                | phoenix_core::domain::llm_types::ContentBlock::WebFetchToolResult { .. }
+                | phoenix_core::domain::llm_types::ContentBlock::CodeExecutionToolResult { .. }
+                | phoenix_core::domain::llm_types::ContentBlock::BashCodeExecutionToolResult { .. }
+                | phoenix_core::domain::llm_types::ContentBlock::TextEditorCodeExecutionToolResult { .. }
+                | phoenix_core::domain::llm_types::ContentBlock::McpToolUse { .. }
+                | phoenix_core::domain::llm_types::ContentBlock::McpToolResult { .. } => None,
             }),
         results.iter().map(|result| result.tool_use_id.as_str()),
     )?;
@@ -26769,7 +26780,8 @@ mod tests {
                 }),
             ),
             remaining_tools: Vec::new(),
-            completed_results: Vec::<ToolResult>::new(),
+            completed_results: Vec::<phoenix_core::domain::conversation_goal::ToolRoundResult>::new(
+            ),
             pending_sub_agents: Vec::new(),
             assistant_message: AssistantMessage::new(
                 "stable-assistant".to_string(),

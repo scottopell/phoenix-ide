@@ -60,6 +60,8 @@ use tracing::Instrument;
 mod capacity;
 mod continuation;
 mod self_goal;
+#[cfg(test)]
+mod self_goal_tests;
 mod tool_execution;
 use capacity::{CapacityDecision, CountingBudget, RequestCapacity, SuccessorCapacity};
 use tool_execution::ToolExecutionSlot;

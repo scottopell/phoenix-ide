@@ -67,9 +67,8 @@ pub(super) async fn verify_source(
             "self-goal checkpoint source identity",
         ));
     }
-    let expected = match &assistant.content {
-        MessageContent::Agent(blocks) => blocks,
-        _ => return Err(GoalDbError::Integrity("self-goal assistant blocks")),
+    let MessageContent::Agent(expected) = &assistant.content else {
+        return Err(GoalDbError::Integrity("self-goal assistant blocks"));
     };
     let content: Option<String> = sqlx::query_scalar(
         "SELECT m.content FROM messages m
@@ -208,7 +207,7 @@ pub(super) async fn finalize(
         match &pending.operation {
             SelfGoalOperation::EnableAutoContinuation => {
                 crate::automatic_continuation_settings::write_preference_on(
-                    &mut **tx,
+                    tx,
                     &pending.owner,
                     phoenix_core::domain::product_conversation::AutoContinueOnContextExhaustion::Enabled,
                 ).await?;
@@ -282,8 +281,7 @@ fn canonical_result(
     }
 }
 
-pub(super) async fn retained_result_tx(
-    _tx: &mut GoalTx<'_>,
+pub(super) fn retained_result(
     pending: &PendingSelfGoal,
     duration_ms: Option<u64>,
     actual: &Message,

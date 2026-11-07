@@ -1,6 +1,7 @@
 use super::*;
 use crate::conversation_goals::round::{CommittedGoalRound, GoalRoundCheckpoint, ToolRoundWrite};
 use crate::provider_replay::CanonicalCommitCut;
+use chrono::Utc;
 use phoenix_core::domain::conversation_goal::{
     PendingSelfGoal, SelfGoalOperation, ToolRoundResult,
 };
@@ -241,10 +242,9 @@ fn create() -> SelfGoalOperation {
 }
 
 async fn enabled(db: &Database, owner: &ProductConversationId) -> bool {
-    db.automatic_continuation_settings(owner)
+    db.auto_continue_on_context_exhaustion(owner)
         .await
         .unwrap()
-        .preference
         .is_enabled()
 }
 
@@ -369,7 +369,10 @@ async fn repeated_human_false_and_aba_disable_win_and_refused_receipts_remain_pe
             let counts = effect_counts(&db).await;
             let retried = round.commit(&db, replay).await.unwrap();
             assert!(retried.replayed);
-            assert_eq!(retried.results, first.results);
+            assert_eq!(
+                serde_json::to_value(&retried.results).unwrap(),
+                serde_json::to_value(&first.results).unwrap()
+            );
             assert_eq!(effect_counts(&db).await, counts);
         }
     }
