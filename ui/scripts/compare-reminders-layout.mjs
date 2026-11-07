@@ -6,14 +6,14 @@ const afterDir = process.env.REMINDERS_QA_OUT ?? 'qa-artifacts/reminders';
 const beforeDir = process.env.REMINDERS_BASELINE_QA_OUT ?? 'qa-artifacts/reminders-baseline';
 const viewports = ['mobile-375x667', 'mobile-393x852', 'desktop'];
 const comparisons = [];
-for (const story of ['initial-failure', 'standalone-initial-failure']) {
+for (const story of ['initial-failure', 'alias-fallback-initial-failure']) {
   for (const viewport of viewports) {
     const stem = `${story}--${viewport}--initial-failure.json`;
     const before = JSON.parse(await readFile(path.join(beforeDir, stem), 'utf8'));
     const after = JSON.parse(await readFile(path.join(afterDir, stem), 'utf8'));
     const oldPanel = before.geometry['.reminders-panel'];
     const newStatus = after.geometry['.reminders-fetch-status'];
-    const transcriptSelector = story === 'standalone-initial-failure' ? '#app > .conversation-column #chat-view' : '.product-conversation-page__transcript';
+    const transcriptSelector = story === 'alias-fallback-initial-failure' ? '.conversation-alias-fallback #app .conversation-column #chat-view' : '.product-conversation-page__transcript';
     const oldTranscript = before.geometry[transcriptSelector];
     const newTranscript = after.geometry[transcriptSelector];
     assert.ok(oldPanel && newStatus && oldTranscript && newTranscript, `${stem}: required bounds missing`);

@@ -82,12 +82,12 @@ const withReminders = (id: Extract<ProductConversationScenarioId, `reminders-${s
 });
 export const RemindersInitialFailure: Story = () => <ProductConversationFixture scenario={withReminders('reminders-initial-failure', 1)} />;
 RemindersInitialFailure.storyName = 'reminders-initial-failure';
-export const RemindersStandaloneInitialFailure: Story = () => <ProductConversationFixture scenario={{
-  ...withReminders('reminders-standalone-initial-failure', 1),
+export const RemindersAliasFallbackInitialFailure: Story = () => <ProductConversationFixture scenario={{
+  ...withReminders('reminders-alias-fallback-initial-failure', 1),
   initialEntry: `/c/${reminderMember}`,
-  renderStandaloneConversation: true,
+  aliasFallbackNotFound: true,
 }} />;
-RemindersStandaloneInitialFailure.storyName = 'reminders-standalone-initial-failure';
+RemindersAliasFallbackInitialFailure.storyName = 'reminders-alias-fallback-initial-failure';
 export const RemindersLoadedStaleAndUpcoming: Story = () => <ProductConversationFixture scenario={withReminders('reminders-loaded-stale-upcoming', 0, false, 1)} />;
 RemindersLoadedStaleAndUpcoming.storyName = 'reminders-loaded-stale-upcoming';
 export const RemindersRetryAndMutationRejection: Story = () => <ProductConversationFixture scenario={withReminders('reminders-retry-mutation-rejection', 0, true, 1)} />;

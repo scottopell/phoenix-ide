@@ -3,7 +3,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { runSurfaceCapture } from './capture-ladle-surface.mjs';
 
-process.env.CAPTURE_STORIES = 'initial-failure,standalone-initial-failure';
+process.env.CAPTURE_STORIES = 'initial-failure,alias-fallback-initial-failure';
 
 runSurfaceCapture({
   surface: 'product-conversation-reminders',
@@ -15,12 +15,15 @@ runSurfaceCapture({
     { name: 'mobile-393x852', width: 393, height: 852, isMobile: true, hasTouch: true },
     { name: 'desktop', width: 1440, height: 900 },
   ],
-  expectedConsoleErrors: new Map([['initial-failure', ['Network response 503']]]),
+  expectedConsoleErrors: new Map([
+    ['initial-failure', ['Network response 503']],
+    ['alias-fallback-initial-failure', ['Network response 503']],
+  ]),
   captureStory: async ({ page, id, outDir, viewport }) => {
     await page.getByText('Failed to load reminders').waitFor({ state: 'visible' });
     const evidence = await page.evaluate(() => {
       const geometry = Object.fromEntries(
-        ['.reminders-panel', '#input-area', '.product-conversation-page__composer', '.product-conversation-page__transcript', '#app > .conversation-column #chat-view'].map((selector) => {
+        ['.reminders-panel', '#input-area', '.product-conversation-page__composer', '.product-conversation-page__transcript', '.conversation-alias-fallback #app .conversation-column #chat-view'].map((selector) => {
           const element = document.querySelector(selector);
           const bounds = element?.getBoundingClientRect();
           return [selector, bounds ? { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height, bottom: bounds.bottom, border: getComputedStyle(element).borderTopWidth } : null];
@@ -29,7 +32,7 @@ runSurfaceCapture({
       return { geometry, document: { width: document.documentElement.clientWidth, scrollWidth: document.documentElement.scrollWidth } };
     });
     assert.ok(evidence.geometry['.reminders-panel']?.height > 0, 'baseline must render the failure panel');
-    const transcriptSelector = id === 'standalone-initial-failure' ? '#app > .conversation-column #chat-view' : '.product-conversation-page__transcript';
+    const transcriptSelector = id === 'alias-fallback-initial-failure' ? '.conversation-alias-fallback #app .conversation-column #chat-view' : '.product-conversation-page__transcript';
     assert.ok(evidence.geometry[transcriptSelector]?.height > 0, 'baseline must render the route transcript');
     assert.notEqual(evidence.geometry['.reminders-panel']?.border, '0px', 'baseline must have a border');
     const composer = evidence.geometry['#input-area'];

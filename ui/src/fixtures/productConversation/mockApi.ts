@@ -1,4 +1,4 @@
-import { api, type Conversation, type Message } from '../../api';
+import { api, ApiResponseError, type Conversation, type Message } from '../../api';
 import { coordinatorSnapshot } from './scenarios';
 import type { ProductConversationScenario } from './types';
 
@@ -113,6 +113,9 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   };
 
   api.getProductConversationSnapshot = async (reference, options = {}) => {
+    if (scenario.aliasFallbackNotFound && reference === scenario.snapshot?.latest_transcript_row_id) {
+      throw new ApiResponseError('Conversation aggregate not found', 404);
+    }
     const history = await api.getProductConversationHistorySnapshot(reference, options);
     const { boundaries, segments, ...metadata } = history;
     const pages = scenario.kind === 'coordinator' ? [] : [scenario.snapshot, scenario.olderSnapshot, ...Object.values(scenario.olderPages ?? {})];

@@ -5,7 +5,7 @@ import { runSurfaceCapture } from './capture-ladle-surface.mjs';
 
 const storyIds = [
   'initial-failure',
-  'standalone-initial-failure',
+  'alias-fallback-initial-failure',
   'loaded-stale-upcoming',
   'retry-mutation-rejection',
 ];
@@ -31,7 +31,7 @@ runSurfaceCapture({
       assert.equal(await page.getByRole('region', { name: 'Reminders' }).count(), 0, 'initial GET failure must not produce a bordered panel');
       assert.ok(await page.locator('.reminders-fetch-status').evaluate((node) => node.getBoundingClientRect().height < 60), 'initial fetch failure must stay compact');
       const initialFailure = await page.evaluate(() => {
-        const selectors = ['.reminders-fetch-status', '#input-area', '.product-conversation-page__composer', '.product-conversation-page__transcript', '#app > .conversation-column #chat-view'];
+        const selectors = ['.reminders-fetch-status', '#input-area', '.product-conversation-page__composer', '.product-conversation-page__transcript', '.conversation-alias-fallback #app .conversation-column #chat-view'];
         const geometry = Object.fromEntries(selectors.map((selector) => {
           const rect = document.querySelector(selector)?.getBoundingClientRect();
           return [selector, rect ? { x: rect.x, y: rect.y, width: rect.width, height: rect.height, bottom: rect.bottom } : null];
@@ -41,17 +41,17 @@ runSurfaceCapture({
       const composer = initialFailure.geometry['#input-area'];
       assert.ok(composer?.height > 0 && composer.y >= 0 && composer.bottom <= viewport.height, 'composer must remain inside the viewport on failed fetch');
       assert.ok(initialFailure.document.scrollWidth <= initialFailure.document.width + 1, 'failed fetch must not overflow horizontally');
-      const transcriptSelector = id === 'standalone-initial-failure' ? '#app > .conversation-column #chat-view' : '.product-conversation-page__transcript';
+      const transcriptSelector = id === 'alias-fallback-initial-failure' ? '.conversation-alias-fallback #app .conversation-column #chat-view' : '.product-conversation-page__transcript';
       assert.ok(initialFailure.geometry[transcriptSelector]?.height > 0, 'failed fetch must render the route transcript');
       const initialStem = `${id}--${viewport.name}--initial-failure`;
       await page.screenshot({ path: path.join(outDir, `${initialStem}.png`), fullPage: false });
       await writeFile(path.join(outDir, `${initialStem}.json`), JSON.stringify({ id, viewport, ...initialFailure }, null, 2));
       await retry.focus();
       assert.equal(await retry.evaluate((button) => document.activeElement === button), true, 'Retry must be keyboard-focusable');
-      if (id === 'standalone-initial-failure') {
+      if (id === 'alias-fallback-initial-failure') {
         await page.screenshot({ path: path.join(outDir, `${id}--${viewport.name}--retry-focused.png`), fullPage: false });
       }
-      if (id === 'standalone-initial-failure') {
+      if (id === 'alias-fallback-initial-failure') {
         await retry.press('Enter');
       } else {
         await retry.click();
