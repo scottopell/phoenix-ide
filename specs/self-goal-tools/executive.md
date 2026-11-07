@@ -13,4 +13,4 @@ Implementation candidate: separate ordinary-agent create-only Goal and enable-on
 | REQ-SGT-007 no execution authority | 🔄 | No dispatch effect; current-turn admission retained; scope review pending |
 | REQ-SGT-008 existing boundaries | 🔄 | Coordinator and remote APIs unchanged; owning regressions pending execution |
 
-Decision: [ADR-241](../adrs/241_execution-bound-own-goal-creation-and-enable.md). Normative contracts: [requirements](requirements.md) and [checkpoint behavior](self-goal-tools.allium).
+Decision: [ADR-242](../adrs/242_execution-bound-own-goal-creation-and-enable.md). Normative contracts: [requirements](requirements.md) and [checkpoint behavior](self-goal-tools.allium).

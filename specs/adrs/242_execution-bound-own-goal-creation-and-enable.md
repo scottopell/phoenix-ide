@@ -1,4 +1,4 @@
-# ADR-241: Execution-bound own Goal creation and explicit continuation enable
+# ADR-242: Execution-bound own Goal creation and explicit continuation enable
 
 Status: Accepted
 Date: 2026-11-07

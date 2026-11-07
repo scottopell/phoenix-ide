@@ -723,6 +723,9 @@ pub struct RuntimeManager {
     pub terminals: crate::terminal::ActiveTerminals,
     pub(crate) close_retirement_leases:
         AsyncMutex<HashMap<(String, WorkScopeId), close_retirement::CloseResourceLease>>,
+    /// Isolates fake-tmux lifecycle fixtures from ambient host processes.
+    #[cfg(test)]
+    clean_close_writer_fixture: bool,
     close_retirement_execution: ConversationMutexGates,
     runtimes: RwLock<HashMap<String, ConversationHandle>>,
     /// Per-conversation single-flight results for slow runtime materialization.
@@ -2610,6 +2613,8 @@ impl RuntimeManager {
             mcp_manager,
             terminals,
             close_retirement_leases: AsyncMutex::new(HashMap::new()),
+            #[cfg(test)]
+            clean_close_writer_fixture: false,
             close_retirement_execution: ConversationMutexGates::default(),
             runtimes: RwLock::new(HashMap::new()),
             runtime_creations: AsyncMutex::new(HashMap::new()),
@@ -9783,6 +9788,8 @@ mod scope_liveness_tests {
         let fake = phoenix_tools::tmux::fake_backend::FakeTmuxBackend::new();
         let mut manager = test_manager().await;
         manager.tmux_registry = fake_tmux_registry(socket_dir.path(), &fake);
+        // These fixtures test tmux identity, not the runner's process inventory.
+        manager.clean_close_writer_fixture = true;
         let (_repository, attempt_id, scope, socket, stale_token) =
             prepare_clean_close_with_tmux(&manager, "live-tmux-close", "live-tmux-attempt").await;
         let replacement_token =
@@ -9820,6 +9827,8 @@ mod scope_liveness_tests {
         let fake = phoenix_tools::tmux::fake_backend::FakeTmuxBackend::new();
         let mut manager = test_manager().await;
         manager.tmux_registry = fake_tmux_registry(socket_dir.path(), &fake);
+        // These fixtures test tmux identity, not the runner's process inventory.
+        manager.clean_close_writer_fixture = true;
         let (_repository, attempt_id, scope, socket, stale_token) =
             prepare_clean_close_with_tmux(&manager, "restart-tmux-close", "restart-tmux-attempt")
                 .await;
