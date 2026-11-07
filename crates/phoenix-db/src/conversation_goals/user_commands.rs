@@ -1,6 +1,4 @@
-use phoenix_core::domain::conversation_goal::{
-    GoalAgentSource, GoalPreparationSource, RemoteGoalAgentSource,
-};
+use phoenix_core::domain::conversation_goal::GoalAgentSource;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -147,7 +145,7 @@ pub(super) enum GoalReceiptStore {
 }
 
 impl GoalControlAuthority<'_> {
-    fn receipts(self) -> GoalReceiptStore {
+    fn receipts(&self) -> GoalReceiptStore {
         match self {
             Self::Owner => GoalReceiptStore::Owner,
             Self::Coordinator { .. } | Self::RemoteCoordinator { .. } => {
@@ -232,7 +230,7 @@ pub(super) async fn retained_tx(
 async fn reject_tx(
     tx: &mut GoalTx<'_>,
     input: &GoalUserCommand,
-    authority: GoalControlAuthority<'_>,
+    authority: &GoalControlAuthority<'_>,
     reason: GoalUserRefusal,
     observed_version: GoalVersion,
     at: GoalTimestampUs,
@@ -263,42 +261,38 @@ async fn reject_tx(
     })
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum GoalControlAuthority<'a> {
+enum GoalControlAuthority<'a> {
     Owner,
     Coordinator {
         caller: &'a str,
         source: &'a GoalAgentSource,
     },
     RemoteCoordinator {
-        authority: &'a crate::federation_enrollment::FederationSendAuthority,
-        source: &'a RemoteGoalAgentSource,
+        source: phoenix_core::domain::conversation_goal::RemoteGoalAgentSource,
     },
 }
 
 impl GoalControlAuthority<'_> {
-    async fn require(self, tx: &mut GoalTx<'_>) -> Result<()> {
+    async fn require(&self, tx: &mut GoalTx<'_>) -> Result<()> {
         match self {
             Self::Coordinator { caller, .. } => {
-                super::prepared::require_coordinator(tx, caller).await?
+                super::prepared::require_coordinator(tx, caller).await?;
             }
-            Self::RemoteCoordinator { authority, source } => {
-                super::prepared::require_remote_peer(tx, authority, source.instance_id).await?;
-            }
+            Self::RemoteCoordinator { .. } => {}
             Self::Owner => {}
         }
         Ok(())
     }
 
-    fn actor(self, input: &GoalUserCommand) -> GoalActor {
+    fn actor(&self, input: &GoalUserCommand) -> GoalActor {
         match self {
             Self::Owner => GoalActor::UserControl {
                 principal_id: input.principal_id,
                 request_id: input.request_id,
                 command: input.change.command().1,
             },
-            Self::Coordinator { source, .. } => GoalActor::Coordinator(source.clone()),
-            Self::RemoteCoordinator { source, .. } => GoalActor::RemoteCoordinator(source.clone()),
+            Self::Coordinator { source, .. } => GoalActor::Coordinator((*source).clone()),
+            Self::RemoteCoordinator { source } => GoalActor::RemoteCoordinator(source.clone()),
         }
     }
 }
@@ -328,6 +322,10 @@ impl Database {
     }
 
     /// Read an immutable remote receipt, scoped to the peer that prepared the reference.
+    ///
+    /// # Errors
+    /// Rejects a non-current peer, a missing or changed preparation, conflicting
+    /// receipt identity, malformed retained data, or a storage failure.
     pub async fn retained_remote_coordinator_goal_command(
         &self,
         authority: &crate::federation_enrollment::FederationSendAuthority,
@@ -359,10 +357,13 @@ impl Database {
             on_authority_lost,
             #[cfg(test)]
             super::prepared::RemoteGoalClaimCommitCut::None,
+            #[cfg(test)]
+            None,
         )
         .await
     }
 
+    #[cfg_attr(test, allow(clippy::too_many_arguments))]
     pub(super) async fn apply_remote_coordinator_goal_command_with_claim_commit<F: FnOnce()>(
         &self,
         authority: &crate::federation_enrollment::FederationSendAuthority,
@@ -371,6 +372,7 @@ impl Database {
         clock: impl FnOnce() -> Result<GoalTimestampUs>,
         on_authority_lost: F,
         #[cfg(test)] claim_commit: super::prepared::RemoteGoalClaimCommitCut,
+        #[cfg(test)] claim_pause: Option<super::prepared::RemoteGoalClaimPause>,
     ) -> LocalAuthorityResult<Result<GoalUserReceipt>> {
         let mut claim_authority = super::control::ControlCommitAuthority::new(on_authority_lost);
         match self
@@ -382,52 +384,42 @@ impl Database {
             )
             .await
         {
-            Ok(super::prepared::RemoteCoordinatorGoalClaim::Claimed) => {}
+            Ok(super::prepared::RemoteCoordinatorGoalClaim::Claimed(action)) => {
+                #[cfg(test)]
+                if let Some(pause) = claim_pause {
+                    pause.after_claim().await;
+                }
+                let super::prepared::RemoteClaimedGoalAction { command, source } = action;
+                let result = self
+                    .control_goal_command_with_notification(
+                        &command,
+                        "",
+                        GoalControlAuthority::RemoteCoordinator { source },
+                        clock,
+                        host_gate_busy,
+                        || {},
+                        #[cfg(test)]
+                        UserCommitCut::None,
+                    )
+                    .await;
+                if matches!(&result, LocalAuthorityResult::DurableFactEstablished(_)) {
+                    claim_authority.classified();
+                }
+                self.notify_goal_command_outcome(&result);
+                Self::without_goal_notification(result)
+            }
             Ok(super::prepared::RemoteCoordinatorGoalClaim::Replay(receipt)) => {
                 claim_authority.classified();
-                return LocalAuthorityResult::DurableFactEstablished(Ok(receipt));
+                LocalAuthorityResult::DurableFactEstablished(Ok(receipt))
             }
             Ok(super::prepared::RemoteCoordinatorGoalClaim::Unclassified) => {
-                return LocalAuthorityResult::DurableFactUnclassified;
+                LocalAuthorityResult::DurableFactUnclassified
             }
             Err(error) => {
                 claim_authority.classified();
-                return LocalAuthorityResult::DurableFactEstablished(Err(error));
+                LocalAuthorityResult::DurableFactEstablished(Err(error))
             }
         }
-        let prepared = match self
-            .read_remote_coordinator_goal_preparation(authority, reference)
-            .await
-        {
-            Ok(prepared) => prepared,
-            Err(_) => return LocalAuthorityResult::DurableFactUnclassified,
-        };
-        let input = match prepared.command(Uuid::nil()) {
-            Ok(input) => input,
-            Err(_) => return LocalAuthorityResult::DurableFactUnclassified,
-        };
-        let phoenix_core::domain::conversation_goal::GoalPreparationSource::Remote(source) =
-            &prepared.source
-        else {
-            return LocalAuthorityResult::DurableFactUnclassified;
-        };
-        let result = self
-            .control_goal_command_with_notification(
-                &input,
-                "",
-                GoalControlAuthority::RemoteCoordinator { authority, source },
-                clock,
-                host_gate_busy,
-                || {},
-                #[cfg(test)]
-                UserCommitCut::None,
-            )
-            .await;
-        if matches!(&result, LocalAuthorityResult::DurableFactEstablished(_)) {
-            claim_authority.classified();
-        }
-        self.notify_goal_command_outcome(&result);
-        Self::without_goal_notification(result)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -535,29 +527,14 @@ impl Database {
         tx: &mut GoalTx<'_>,
         input: &GoalUserCommand,
         expected_transcript: &str,
-        requester: GoalControlAuthority<'_>,
+        requester: &GoalControlAuthority<'_>,
         clock: impl FnOnce() -> Result<GoalTimestampUs>,
         host_gate_busy: bool,
     ) -> Result<GoalUserCommandOutcome> {
         requester.require(tx).await?;
         let live = Self::get_ordinary_product_conversation_on(tx, &input.owner).await?;
-        match requester {
-            GoalControlAuthority::Coordinator { caller, source } => {
-                super::prepared::require_exact_preparation(tx, caller, source, input).await?;
-            }
-            GoalControlAuthority::RemoteCoordinator { authority, source } => {
-                let prepared =
-                    super::prepared::remote_preparation_tx(tx, authority, input.request_id).await?;
-                let expected = prepared.command(input.principal_id)?;
-                if prepared.source != GoalPreparationSource::Remote(source.clone())
-                    || prepared.owner != input.owner
-                    || expected.expected_version != input.expected_version
-                    || expected.change != input.change
-                {
-                    return Err(GoalDbError::RetryConflict);
-                }
-            }
-            GoalControlAuthority::Owner => {}
+        if let GoalControlAuthority::Coordinator { caller, source } = requester {
+            super::prepared::require_exact_preparation(tx, caller, source, input).await?;
         }
         if let Some(retained) = retained_tx(tx, input, requester.receipts()).await? {
             return Ok(GoalUserCommandOutcome {
@@ -767,7 +744,7 @@ impl Database {
         on_authority_lost: F,
         #[cfg(test)] cut: UserCommitCut,
     ) -> LocalAuthorityResult<Result<GoalUserCommandOutcome>> {
-        let remote_claimed = matches!(requester, GoalControlAuthority::RemoteCoordinator { .. });
+        let remote_claimed = matches!(&requester, GoalControlAuthority::RemoteCoordinator { .. });
         let mut on_authority_lost = Some(on_authority_lost);
         let authority = remote_claimed.then(|| {
             super::control::ControlCommitAuthority::new(
@@ -806,7 +783,7 @@ impl Database {
                 &mut tx,
                 input,
                 expected_transcript,
-                requester,
+                &requester,
                 clock,
                 host_gate_busy,
             )
@@ -865,7 +842,7 @@ impl Database {
             return LocalAuthorityResult::DurableFactUnclassified;
         };
         let retained = async {
-            if let GoalControlAuthority::Coordinator { caller, source } = requester {
+            if let GoalControlAuthority::Coordinator { caller, source } = &requester {
                 super::prepared::require_exact_preparation(&mut lookup, caller, source, input)
                     .await?;
             }

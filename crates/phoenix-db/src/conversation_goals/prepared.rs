@@ -355,13 +355,18 @@ fn prepare_observation(
 }
 
 pub(super) enum RemoteCoordinatorGoalClaim {
-    Claimed,
+    Claimed(RemoteClaimedGoalAction),
     Replay(super::user_commands::GoalUserReceipt),
     Unclassified,
 }
 
+pub(super) struct RemoteClaimedGoalAction {
+    pub(super) command: super::user_commands::GoalUserCommand,
+    pub(super) source: RemoteGoalAgentSource,
+}
+
 enum RemoteCoordinatorGoalClaimState {
-    Prepared,
+    Prepared(RemoteClaimedGoalAction),
     Claimed,
     Replay(super::user_commands::GoalUserReceipt),
 }
@@ -373,6 +378,9 @@ async fn remote_claim_state_tx(
 ) -> Result<RemoteCoordinatorGoalClaimState> {
     let prepared = remote_preparation_tx(tx, authority, reference).await?;
     let input = prepared.command(Uuid::nil())?;
+    let GoalPreparationSource::Remote(source) = prepared.source else {
+        return Err(GoalDbError::Integrity("remote preparation source"));
+    };
     if let Some(receipt) = super::user_commands::retained_tx(
         tx,
         &input,
@@ -389,7 +397,12 @@ async fn remote_claim_state_tx(
     .fetch_one(&mut **tx)
     .await?;
     match state.as_str() {
-        "prepared" => Ok(RemoteCoordinatorGoalClaimState::Prepared),
+        "prepared" => Ok(RemoteCoordinatorGoalClaimState::Prepared(
+            RemoteClaimedGoalAction {
+                command: input,
+                source,
+            },
+        )),
         "claimed" => Ok(RemoteCoordinatorGoalClaimState::Claimed),
         _ => Err(GoalDbError::Integrity("remote Goal claim state")),
     }
@@ -401,6 +414,21 @@ pub(super) enum RemoteGoalClaimCommitCut {
     None,
     LostAcknowledgement,
     RolledBack,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(super) struct RemoteGoalClaimPause {
+    pub(super) claimed: std::sync::Arc<tokio::sync::Notify>,
+    pub(super) resume: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl RemoteGoalClaimPause {
+    pub(super) async fn after_claim(&self) {
+        self.claimed.notify_one();
+        self.resume.notified().await;
+    }
 }
 
 impl Database {
@@ -653,6 +681,10 @@ impl Database {
     }
 
     /// Resolve a remote preparation only for its authenticated, enrolled peer.
+    ///
+    /// # Errors
+    /// Rejects a non-current peer, a missing or changed preparation, malformed
+    /// retained data, or a storage failure.
     pub async fn read_remote_coordinator_goal_preparation(
         &self,
         authority: &crate::federation_enrollment::FederationSendAuthority,
@@ -671,7 +703,7 @@ impl Database {
         #[cfg(test)] commit: RemoteGoalClaimCommitCut,
     ) -> Result<RemoteCoordinatorGoalClaim> {
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
-        match remote_claim_state_tx(&mut tx, authority, reference).await? {
+        let action = match remote_claim_state_tx(&mut tx, authority, reference).await? {
             RemoteCoordinatorGoalClaimState::Replay(receipt) => {
                 tx.rollback().await?;
                 return Ok(RemoteCoordinatorGoalClaim::Replay(receipt));
@@ -680,8 +712,8 @@ impl Database {
                 let _ = tx.rollback().await;
                 return Ok(RemoteCoordinatorGoalClaim::Unclassified);
             }
-            RemoteCoordinatorGoalClaimState::Prepared => {}
-        }
+            RemoteCoordinatorGoalClaimState::Prepared(action) => action,
+        };
         let changed = sqlx::query(
             "UPDATE conversation_goal_preparations SET apply_state='claimed'
              WHERE reference=? AND apply_state='prepared'
@@ -707,7 +739,7 @@ impl Database {
             }
         };
         match committed {
-            Ok(()) => Ok(RemoteCoordinatorGoalClaim::Claimed),
+            Ok(()) => Ok(RemoteCoordinatorGoalClaim::Claimed(action)),
             Err(error) => {
                 self.classify_remote_coordinator_goal_claim(authority, reference, error.into())
                     .await
@@ -732,7 +764,7 @@ impl Database {
             Ok(RemoteCoordinatorGoalClaimState::Replay(receipt)) => {
                 Ok(RemoteCoordinatorGoalClaim::Replay(receipt))
             }
-            Ok(RemoteCoordinatorGoalClaimState::Prepared) => Err(attempted),
+            Ok(RemoteCoordinatorGoalClaimState::Prepared(_)) => Err(attempted),
             Ok(RemoteCoordinatorGoalClaimState::Claimed) | Err(_) => {
                 Ok(RemoteCoordinatorGoalClaim::Unclassified)
             }

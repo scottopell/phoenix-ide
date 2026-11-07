@@ -13373,7 +13373,10 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::raw_sql(&source_trigger).execute(&pool).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(source_trigger))
+            .execute(&pool)
+            .await
+            .unwrap();
         let before: Vec<(String, String)> = sqlx::query_as(
             "SELECT type,name FROM sqlite_schema
              WHERE name LIKE 'conversation_goal_%'
@@ -13456,10 +13459,11 @@ mod tests {
             ("conversation_goal_preparations", 1),
             ("conversation_goal_coordinator_receipts", 1),
         ] {
-            let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+            let count: i64 =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
             assert_eq!(count, expected, "{table}");
         }
         let local: (Option<String>, Option<i64>) = sqlx::query_as(

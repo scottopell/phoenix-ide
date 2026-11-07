@@ -698,6 +698,7 @@ async fn remote_unclassified_claim_closes_receiptless_retry(
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             },
             claim_commit,
+            None,
         )
         .await;
     assert!(matches!(
@@ -762,6 +763,144 @@ async fn remote_unclassified_claim_closes_receiptless_retry(
     );
 }
 
+async fn remote_claimed_action_survives_enrollment_change(replace: bool) {
+    use crate::federation_enrollment::FederationCredentialVerifier;
+    use crate::workflow::LocalAuthorityResult;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::sync::Notify;
+
+    let db = fixture().await;
+    let (authority, source, owner) = remote_source(
+        &db,
+        if replace {
+            "remote-claim-replaced"
+        } else {
+            "remote-claim-revoked"
+        },
+    )
+    .await;
+    let prepared = db
+        .prepare_remote_coordinator_goal_action(
+            &authority,
+            &source,
+            &owner,
+            create_intent("admitted before enrollment change"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    let claimed = Arc::new(Notify::new());
+    let resume = Arc::new(Notify::new());
+    let pause = RemoteGoalClaimPause {
+        claimed: Arc::clone(&claimed),
+        resume: Arc::clone(&resume),
+    };
+    let callback_count = Arc::new(AtomicUsize::new(0));
+    let callback_count_for_apply = Arc::clone(&callback_count);
+    let apply_db = db.clone();
+    let apply_authority = authority.clone();
+    let reference = prepared.reference;
+    let apply = tokio::spawn(async move {
+        apply_db
+            .apply_remote_coordinator_goal_command_with_claim_commit(
+                &apply_authority,
+                reference,
+                false,
+                || Ok(at()),
+                move || {
+                    callback_count_for_apply.fetch_add(1, Ordering::SeqCst);
+                },
+                RemoteGoalClaimCommitCut::None,
+                Some(pause),
+            )
+            .await
+    });
+
+    claimed.notified().await;
+    let new_authority = if replace {
+        let verifier = FederationCredentialVerifier::from_bearer(b"replacement-credential");
+        db.replace_federation_enrollment(
+            source.instance_id,
+            &"replacement remote goal peer".parse().unwrap(),
+            &verifier,
+        )
+        .await
+        .unwrap();
+        Some(crate::FederationSendAuthority::new(
+            source.instance_id,
+            verifier,
+        ))
+    } else {
+        assert!(db
+            .revoke_federation_enrollment(source.instance_id)
+            .await
+            .unwrap());
+        None
+    };
+    resume.notify_one();
+
+    let result = apply.await.unwrap();
+    let LocalAuthorityResult::DurableFactEstablished(Ok(receipt)) = result else {
+        panic!("admitted Goal action must finish after enrollment changes: {result:?}");
+    };
+    assert_eq!(receipt.request_id, reference);
+    assert_eq!(callback_count.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM conversation_goal_coordinator_receipts WHERE preparation_reference=?",
+        )
+        .bind(reference.as_bytes().as_slice())
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        1
+    );
+    assert!(db.conversation_goal(&owner).await.unwrap().is_some());
+
+    let stale_retry = db
+        .apply_remote_coordinator_goal_command(
+            &authority,
+            reference,
+            false,
+            || panic!("a retry with stale authority must be denied"),
+            || panic!("a denied retry is classified without authority-loss callback"),
+        )
+        .await;
+    assert!(matches!(
+        stale_retry,
+        LocalAuthorityResult::DurableFactEstablished(Err(GoalDbError::TargetChanged))
+    ));
+    if let Some(new_authority) = new_authority {
+        let replacement_retry = db
+            .apply_remote_coordinator_goal_command(
+                &new_authority,
+                reference,
+                false,
+                || panic!("replacement authority cannot claim an old-enrollment action"),
+                || panic!("a denied retry is classified without authority-loss callback"),
+            )
+            .await;
+        assert!(matches!(
+            replacement_retry,
+            LocalAuthorityResult::DurableFactEstablished(Err(GoalDbError::TargetChanged))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn remote_admitted_apply_survives_enrollment_revocation() {
+    remote_claimed_action_survives_enrollment_change(false).await;
+}
+
+#[tokio::test]
+async fn remote_admitted_apply_survives_enrollment_replacement() {
+    remote_claimed_action_survives_enrollment_change(true).await;
+}
+
 #[tokio::test]
 async fn remote_post_claim_failure_is_unclassified_and_closes_receiptless_retry() {
     remote_unclassified_claim_closes_receiptless_retry(RemoteGoalClaimCommitCut::None).await;
@@ -799,6 +938,7 @@ async fn rolled_back_remote_claim_is_proven_prepared_and_can_be_applied_once() {
             || panic!("a rolled-back claim must not execute"),
             || panic!("a freshly proven prepared action retains authority"),
             RemoteGoalClaimCommitCut::RolledBack,
+            None,
         )
         .await
         .established()
@@ -866,7 +1006,7 @@ async fn unreadable_remote_claim_commit_classification_is_unclassified() {
         )
         .await
         .unwrap(),
-        RemoteCoordinatorGoalClaim::Claimed
+        RemoteCoordinatorGoalClaim::Claimed(_)
     ));
     db.pool().close().await;
     assert!(matches!(
