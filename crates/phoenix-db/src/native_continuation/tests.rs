@@ -297,7 +297,7 @@ async fn federated_receipt_binds_all_attestation_fields_before_and_after_intent_
                 .unwrap();
             assert!(fixture
                 .db
-                .get_continuation_dispatch_intent(&fixture.predecessor_id)
+                .continuation_dispatch_intent(&fixture.predecessor_id)
                 .await
                 .unwrap()
                 .is_none());
@@ -462,6 +462,154 @@ async fn federated_receipt_digest_is_immutable_and_rejects_changed_summary_conte
         ),
         "{replay:?}"
     );
+}
+
+#[tokio::test]
+async fn continuation_identity_is_reserved_across_federated_direct_and_steering_journals() {
+    use crate::workflow::{AcceptAuthoritativeTurn, WorkflowRepository};
+    use phoenix_core::domain::{
+        db_schema::InputOrigin,
+        sm_event::{
+            PreparedDirectTurnDelivery, PreparedDirectTurnPayload, SteerEntry,
+            SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
+        },
+    };
+    use phoenix_workflow::{AcceptedDisposition, ConversationAuthority, PreparedTurn};
+
+    let fixture = Fixture::new().await;
+    let (_, authority) = fixture.federated_authority().await;
+    let key = "federated-cross-journal-identity";
+    let first = fixture
+        .db
+        .continue_from_federated_coordinator(fixture.federated_request(&authority, key))
+        .await;
+    let LocalAuthorityResult::DurableFactEstablished(Ok((
+        ContinueOutcome::Created(successor),
+        CoordinatorContinuationOpening::Pending(opening),
+    ))) = first
+    else {
+        panic!("expected federated continuation with a pending opening");
+    };
+
+    let direct_payload = PreparedDirectTurnPayload::from_parts(
+        SubmittedDirectTurnIdentity {
+            origin: InputOrigin::UnknownHistorical,
+            text: "direct attempt".into(),
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: key.into(),
+            user_agent: None,
+            skill_invocation: None,
+            expansion_policy: SubmittedDirectTurnExpansionPolicy::ExpandReferences,
+        },
+        PreparedDirectTurnDelivery {
+            text: "direct attempt".into(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            user_agent: None,
+            skill_invocation: None,
+        },
+    );
+    let target = ConversationAuthority(fixture.predecessor_id.clone());
+    let direct = AcceptAuthoritativeTurn {
+        client_key: ClientTurnKey::try_from(key).unwrap(),
+        prepared: PreparedTurn::from_exact_payload(
+            &target,
+            direct_payload.to_exact_bytes().unwrap(),
+        ),
+        disposition: AcceptedDisposition::Runtime,
+        accepted_at: phoenix_workflow::Timestamp(2),
+    };
+    let repo = WorkflowRepository::new(fixture.db.pool().clone());
+    let steering = SteerEntry {
+        origin: InputOrigin::UnknownHistorical,
+        text: "steering attempt".into(),
+        llm_text: None,
+        images: Vec::new(),
+        files: Vec::new(),
+        message_id: key.into(),
+        user_agent: None,
+        skill_invocation: None,
+    };
+
+    let direct_result = repo
+        .accept_federated_authoritative_turn(&direct, &authority)
+        .await
+        .established()
+        .expect("direct-turn admission durability should be classified");
+    assert!(matches!(
+        direct_result,
+        Err(DbError::FederationSendIdentityConflict)
+    ));
+    assert!(matches!(
+        fixture
+            .db
+            .append_federated_steering_entry(
+                &fixture.predecessor_id,
+                &steering,
+                "cross-journal-steering-fingerprint",
+                &authority,
+            )
+            .await,
+        Err(DbError::FederationSendIdentityConflict)
+    ));
+
+    let direct_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM durable_turns WHERE client_turn_key = ?1")
+            .bind(key)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+    let steering_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM steering_acceptance_receipts WHERE message_id = ?1",
+    )
+    .bind(key)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    let steering_message_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM steering_messages WHERE message_id = ?1")
+            .bind(key)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+    let receipt_before: (String, String, String, String) = sqlx::query_as(
+        "SELECT caller_instance_id, request_digest, predecessor_transcript_id, successor_transcript_id
+         FROM federated_continuation_receipts WHERE first_message_id = ?1",
+    )
+    .bind(key)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(direct_count, 0);
+    assert_eq!(steering_count, 0);
+    assert_eq!(steering_message_count, 0);
+    assert_eq!(fixture.successor_count().await, 1);
+
+    let replay = fixture
+        .db
+        .continue_from_federated_coordinator(fixture.federated_request(&authority, key))
+        .await;
+    let LocalAuthorityResult::DurableFactEstablished(Ok((
+        ContinueOutcome::AlreadyContinued(replayed_successor),
+        CoordinatorContinuationOpening::Pending(replayed_opening),
+    ))) = replay
+    else {
+        panic!("expected the original federated continuation to replay");
+    };
+    assert_eq!(replayed_successor.id, successor.id);
+    assert_eq!(replayed_opening, opening);
+    let receipt_after: (String, String, String, String) = sqlx::query_as(
+        "SELECT caller_instance_id, request_digest, predecessor_transcript_id, successor_transcript_id
+         FROM federated_continuation_receipts WHERE first_message_id = ?1",
+    )
+    .bind(key)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(receipt_after, receipt_before);
+    assert_eq!(fixture.successor_count().await, 1);
 }
 
 #[tokio::test]

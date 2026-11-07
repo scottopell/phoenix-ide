@@ -76,6 +76,114 @@ impl std::fmt::Display for NativeContinueError {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FederatedNativeOpeningEvidence {
+    Pending { message_id: String },
+    Accepted { message_id: String },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FederatedNativePendingDispatch {
+    Accepted,
+    AlreadyExists,
+    DispatchFailed { error: String },
+}
+
+impl FederatedNativePendingDispatch {
+    fn from_parts(
+        status: ContinueConversationStatus,
+        error: Option<String>,
+    ) -> Result<Self, NativeContinueError> {
+        match (status, error) {
+            (ContinueConversationStatus::Accepted, None) => Ok(Self::Accepted),
+            (ContinueConversationStatus::AlreadyExists, None) => Ok(Self::AlreadyExists),
+            (ContinueConversationStatus::DispatchFailed, Some(error)) if !error.is_empty() => {
+                Ok(Self::DispatchFailed { error })
+            }
+            _ => Err(NativeContinueError::Message(
+                "continuation dispatch returned an inconsistent status/error pair".into(),
+            )),
+        }
+    }
+
+    fn into_parts(self) -> (ContinueConversationStatus, Option<String>) {
+        match self {
+            Self::Accepted => (ContinueConversationStatus::Accepted, None),
+            Self::AlreadyExists => (ContinueConversationStatus::AlreadyExists, None),
+            Self::DispatchFailed { error } => {
+                (ContinueConversationStatus::DispatchFailed, Some(error))
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum FederatedNativeContinueResult {
+    Pending {
+        conversation_id: String,
+        slug: Option<String>,
+        opening_message_id: String,
+        dispatch: FederatedNativePendingDispatch,
+    },
+    Accepted {
+        conversation_id: String,
+        slug: Option<String>,
+        opening_message_id: String,
+    },
+}
+
+impl FederatedNativeContinueResult {
+    fn into_response(self) -> ContinueConversationResponse {
+        self.into_response_and_opening().0
+    }
+
+    pub(crate) fn into_response_and_opening(
+        self,
+    ) -> (ContinueConversationResponse, FederatedNativeOpeningEvidence) {
+        match self {
+            Self::Pending {
+                conversation_id,
+                slug,
+                opening_message_id,
+                dispatch,
+            } => {
+                let (status, error) = dispatch.into_parts();
+                (
+                    ContinueConversationResponse {
+                        conversation_id,
+                        slug,
+                        status,
+                        error,
+                    },
+                    FederatedNativeOpeningEvidence::Pending {
+                        message_id: opening_message_id,
+                    },
+                )
+            }
+            Self::Accepted {
+                conversation_id,
+                slug,
+                opening_message_id,
+            } => (
+                ContinueConversationResponse {
+                    conversation_id,
+                    slug,
+                    status: ContinueConversationStatus::AlreadyExists,
+                    error: None,
+                },
+                FederatedNativeOpeningEvidence::Accepted {
+                    message_id: opening_message_id,
+                },
+            ),
+        }
+    }
+}
+
+pub(crate) enum FederatedNativeContinueCompletion {
+    Established(Result<FederatedNativeContinueResult, NativeContinueError>),
+    LocalAuthorityClosed,
+}
+
 pub(crate) enum NativeContinueCompletion {
     Established(Result<ContinueConversationResponse, NativeContinueError>),
     LocalAuthorityClosed,
@@ -133,14 +241,21 @@ impl ContinuationApplicationService {
             summary_message_id: request.summary_message_id,
             first_message_id: request.first_message_id,
         };
-        self.continue_with_admission(request).await
+        match self.continue_with_admission(request).await {
+            FederatedNativeContinueCompletion::Established(result) => {
+                NativeContinueCompletion::Established(result.map(|result| result.into_response()))
+            }
+            FederatedNativeContinueCompletion::LocalAuthorityClosed => {
+                NativeContinueCompletion::LocalAuthorityClosed
+            }
+        }
     }
 
     pub(crate) async fn continue_from_federated_coordinator(
         &self,
         request: FederatedNativeContinueRequest,
         authority: phoenix_db::FederationSendAuthority,
-    ) -> NativeContinueCompletion {
+    ) -> FederatedNativeContinueCompletion {
         let request = NativeContinueOwnedRequest {
             admission: NativeContinueAdmission::FederatedPeer {
                 authority,
@@ -157,7 +272,7 @@ impl ContinuationApplicationService {
     async fn continue_with_admission(
         &self,
         request: NativeContinueOwnedRequest,
-    ) -> NativeContinueCompletion {
+    ) -> FederatedNativeContinueCompletion {
         let runtime = self.runtime.clone();
         let result = tokio::spawn(async move {
             Self::new(runtime)
@@ -167,9 +282,9 @@ impl ContinuationApplicationService {
         .await
         .unwrap_or_else(|error| Err(NativeContinueError::Message(error.to_string())));
         if self.runtime.local_authority_is_closed() {
-            NativeContinueCompletion::LocalAuthorityClosed
+            FederatedNativeContinueCompletion::LocalAuthorityClosed
         } else {
-            NativeContinueCompletion::Established(result)
+            FederatedNativeContinueCompletion::Established(result)
         }
     }
 
@@ -180,7 +295,7 @@ impl ContinuationApplicationService {
     async fn continue_from_coordinator_owned(
         &self,
         mut request: NativeContinueOwnedRequest,
-    ) -> Result<ContinueConversationResponse, NativeContinueError> {
+    ) -> Result<FederatedNativeContinueResult, NativeContinueError> {
         let mut owner = self.runtime.acquire_local_authority_pass().map_err(|()| {
             "runtime admission closed after fatal local authority loss".to_string()
         })?;
@@ -298,11 +413,16 @@ impl ContinuationApplicationService {
                 );
             }
         };
-        let (status, error) = match opening {
+        let result = match opening {
             CoordinatorContinuationOpening::Accepted {
-                accepted_message_id: _,
-            } => (ContinueConversationStatus::AlreadyExists, None),
+                accepted_message_id,
+            } => FederatedNativeContinueResult::Accepted {
+                conversation_id: successor.id,
+                slug: successor.slug,
+                opening_message_id: accepted_message_id,
+            },
             CoordinatorContinuationOpening::Pending(intent) => {
+                let opening_message_id = intent.message_id.to_string();
                 let review = self
                     .runtime
                     .review_reserved_continuation_opening(intent.clone())
@@ -321,7 +441,12 @@ impl ContinuationApplicationService {
                 } else {
                     status
                 };
-                (status, error)
+                FederatedNativeContinueResult::Pending {
+                    conversation_id: successor.id,
+                    slug: successor.slug,
+                    opening_message_id,
+                    dispatch: FederatedNativePendingDispatch::from_parts(status, error)?,
+                }
             }
         };
         if self.runtime.local_authority_is_closed() {
@@ -329,12 +454,7 @@ impl ContinuationApplicationService {
                 .to_string()
                 .into());
         }
-        Ok(ContinueConversationResponse {
-            conversation_id: successor.id,
-            slug: successor.slug,
-            status,
-            error,
-        })
+        Ok(result)
     }
 }
 

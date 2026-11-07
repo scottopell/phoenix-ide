@@ -287,7 +287,12 @@ impl Database {
                     request.first_message_id.as_str(),
                     &summary,
                 )).map_err(|error| DbError::Serialization(error.to_string()))?;
-                let digest: String = Sha256::digest(payload).iter().map(|byte| format!("{byte:02x}")).collect();
+                use std::fmt::Write as _;
+
+                let mut digest = String::with_capacity(64);
+                for byte in Sha256::digest(payload) {
+                    write!(&mut digest, "{byte:02x}").expect("writing to a String cannot fail");
+                }
                 let prior_successor = if let Some((
                     existing_digest,
                     _,

@@ -15,7 +15,8 @@ use crate::send_chat_service::{
 mod manual;
 mod native;
 pub(crate) use native::{
-    FederatedNativeContinueRequest, NativeContinueCompletion, NativeContinueError,
+    FederatedNativeContinueCompletion, FederatedNativeContinueRequest,
+    FederatedNativeOpeningEvidence, NativeContinueCompletion, NativeContinueError,
     NativeContinueRequest,
 };
 

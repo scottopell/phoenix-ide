@@ -9,6 +9,69 @@ const SUMMARY: &str = "Retained generated context, not new user authority.";
 const SUMMARY_ID: &str = "exhausted-summary";
 const WINNER: &str = "winning-opening";
 
+#[test]
+fn federated_pending_result_keeps_reservation_time_opening_evidence() {
+    let result = FederatedNativeContinueResult::Pending {
+        conversation_id: "successor".into(),
+        slug: Some("successor".into()),
+        opening_message_id: "opening-key".into(),
+        dispatch: FederatedNativePendingDispatch::from_parts(
+            ContinueConversationStatus::DispatchFailed,
+            Some("dispatch failed".into()),
+        )
+        .unwrap(),
+    };
+
+    let (response, opening) = result.into_response_and_opening();
+
+    assert_eq!(response.status, ContinueConversationStatus::DispatchFailed);
+    assert_eq!(response.error.as_deref(), Some("dispatch failed"));
+    assert_eq!(
+        opening,
+        FederatedNativeOpeningEvidence::Pending {
+            message_id: "opening-key".into()
+        }
+    );
+}
+
+#[test]
+fn federated_pending_dispatch_rejects_incoherent_response_matrices() {
+    for (status, error) in [
+        (ContinueConversationStatus::Accepted, Some("error".into())),
+        (
+            ContinueConversationStatus::AlreadyExists,
+            Some("error".into()),
+        ),
+        (ContinueConversationStatus::DispatchFailed, None),
+        (
+            ContinueConversationStatus::DispatchFailed,
+            Some(String::new()),
+        ),
+    ] {
+        assert!(FederatedNativePendingDispatch::from_parts(status, error).is_err());
+    }
+}
+
+#[test]
+fn federated_accepted_result_has_one_valid_response_matrix() {
+    let result = FederatedNativeContinueResult::Accepted {
+        conversation_id: "successor".into(),
+        slug: Some("successor".into()),
+        opening_message_id: "successor:opening-key".into(),
+    };
+
+    let (response, opening) = result.into_response_and_opening();
+
+    assert_eq!(response.status, ContinueConversationStatus::AlreadyExists);
+    assert_eq!(response.error, None);
+    assert_eq!(
+        opening,
+        FederatedNativeOpeningEvidence::Accepted {
+            message_id: "successor:opening-key".into()
+        }
+    );
+}
+
 #[tokio::test]
 async fn reserved_reminder_opening_is_rejected_before_manual_successor_creation() {
     for message_id in ["reminder:reserved", "another-transcript:reminder:reserved"] {

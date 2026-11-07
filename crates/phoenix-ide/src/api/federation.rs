@@ -1513,8 +1513,10 @@ pub async fn continue_conversation(
             )
             .await;
     let result = match completion {
-        crate::continuation_service::NativeContinueCompletion::Established(Ok(result)) => result,
-        crate::continuation_service::NativeContinueCompletion::Established(Err(error)) => {
+        crate::continuation_service::FederatedNativeContinueCompletion::Established(Ok(result)) => {
+            result
+        }
+        crate::continuation_service::FederatedNativeContinueCompletion::Established(Err(error)) => {
             let status = if matches!(
                 error,
                 crate::continuation_service::NativeContinueError::Database(
@@ -1527,50 +1529,19 @@ pub async fn continue_conversation(
             };
             return federation_error(status, &error.to_string());
         }
-        crate::continuation_service::NativeContinueCompletion::LocalAuthorityClosed => {
+        crate::continuation_service::FederatedNativeContinueCompletion::LocalAuthorityClosed => {
             return federation_error(StatusCode::SERVICE_UNAVAILABLE, "local authority closed");
         }
     };
-    let opening = match state
-        .db
-        .read_continuation_opening(&result.conversation_id)
-        .await
-    {
-        Ok(opening) => opening,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    let (result, opening) = result.into_response_and_opening();
+    let (opening_message_id, opening_status) = match opening {
+        crate::continuation_service::FederatedNativeOpeningEvidence::Pending { message_id } => {
+            (message_id, RemoteContinueOpeningStatus::Pending)
+        }
+        crate::continuation_service::FederatedNativeOpeningEvidence::Accepted { message_id } => {
+            (message_id, RemoteContinueOpeningStatus::Accepted)
+        }
     };
-    let (edge, opening_message_id, opening_status, authority) = match opening {
-        phoenix_db::ContinuationOpeningRead::Pending {
-            edge,
-            client_turn_key,
-            opening_authority,
-        } => (
-            edge,
-            client_turn_key.to_string(),
-            RemoteContinueOpeningStatus::Pending,
-            opening_authority,
-        ),
-        phoenix_db::ContinuationOpeningRead::Accepted {
-            edge,
-            accepted_message_id,
-            opening_authority,
-            ..
-        } => (
-            edge,
-            accepted_message_id,
-            RemoteContinueOpeningStatus::Accepted,
-            opening_authority,
-        ),
-        phoenix_db::ContinuationOpeningRead::None => return StatusCode::CONFLICT.into_response(),
-    };
-    if edge.product_conversation_id != request.product_conversation_id
-        || edge.predecessor_transcript_row_id != request.predecessor_transcript_id
-        || edge.successor_transcript_row_id != result.conversation_id
-        || edge.continuation_message_id != request.summary_message_id
-        || authority != phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext
-    {
-        return StatusCode::CONFLICT.into_response();
-    }
     if state.runtime.local_authority_is_closed() {
         return federation_error(StatusCode::SERVICE_UNAVAILABLE, "local authority closed");
     }
