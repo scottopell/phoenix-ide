@@ -132,7 +132,7 @@ async fn terminal_self_tool(
     let llm = Arc::new(MockLlmClient::new("test-model"));
     llm.queue_response(phoenix_llm::LlmResponse {
         provider_replay: None,
-        content: vec![ContentBlock::text("done")],
+        content: vec![],
         end_turn: true,
         usage: phoenix_llm::Usage::default(),
         usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
@@ -262,17 +262,22 @@ async fn terminal_self_tool(
     runtime.process_event(completion).await.unwrap();
     if !cancelled {
         assert!(matches!(runtime.state, ConvState::LlmRequesting { .. }));
+        let (generation, outcome) = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            runtime.llm_outcome_rx.recv(),
+        )
+        .await
+        .expect("provider outcome forwarder must complete")
+        .expect("runtime owns the provider outcome channel");
         runtime
-            .llm_task_handle
-            .take()
-            .expect("next provider request is owned")
-            .await
-            .unwrap();
-        while let Ok(event) = runtime.event_rx.try_recv() {
-            runtime.process_event(event).await.unwrap();
-        }
+            .process_generation_tagged_llm_outcome(generation, outcome)
+            .await;
     }
-    assert!(matches!(runtime.state, ConvState::Idle));
+    assert!(
+        matches!(runtime.state, ConvState::Idle),
+        "{key} did not settle to Idle: {:?}",
+        runtime.state
+    );
     assert!(
         runtime.active_direct_turn.is_none(),
         "terminal settlement must finish"
