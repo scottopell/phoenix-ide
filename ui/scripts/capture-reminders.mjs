@@ -51,7 +51,11 @@ runSurfaceCapture({
       if (id === 'standalone-initial-failure') {
         await page.screenshot({ path: path.join(outDir, `${id}--${viewport.name}--retry-focused.png`), fullPage: false });
       }
-      await retry.click();
+      if (id === 'standalone-initial-failure') {
+        await retry.press('Enter');
+      } else {
+        await retry.click();
+      }
       await page.getByRole('region', { name: 'Reminders' }).waitFor({ state: 'visible' });
       journey.push('initial GET failure → retry → loaded reminders');
     } else if (id === 'loaded-stale-upcoming') {
