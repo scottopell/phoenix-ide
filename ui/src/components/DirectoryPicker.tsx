@@ -280,6 +280,7 @@ export function DirectoryPicker({ inputId, value, onChange, onStatusChange, onGi
       clearTimeout(blurTimeoutRef.current);
       blurTimeoutRef.current = null;
     }
+    setShowRecent(false);
     setShowDropdown(true);
   }, []);
 
@@ -393,7 +394,10 @@ export function DirectoryPicker({ inputId, value, onChange, onStatusChange, onGi
             className="directory-picker-recent-toggle"
             aria-expanded={showRecent}
             aria-controls={recentListId}
-            onClick={() => setShowRecent(open => !open)}
+            onClick={() => {
+              setShowDropdown(false);
+              setShowRecent(open => !open);
+            }}
           >
             <ChevronRight size={14} aria-hidden="true" />
             Choose recent location ({recentPaths.length})
