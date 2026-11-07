@@ -97,6 +97,93 @@ enum ApplyRecord {
     Outcome(Value),
 }
 
+fn classify_remote_apply_response(
+    response: crate::api::federation::RemoteApplyGoalResponse,
+) -> (bool, ApplyRecord, &'static str) {
+    let result = response.result;
+    let (accepted, unretained, next_action) = match &result {
+        crate::api::federation::RemoteGoalApplyClassification::Accepted {} => (
+            true,
+            false,
+            "No dispatch performed. Use read_goal to inspect history.",
+        ),
+        crate::api::federation::RemoteGoalApplyClassification::Rejected {
+            reason: crate::api::federation::RemoteGoalApplyRefusal::Unknown,
+        } => (
+            false,
+            true,
+            "Unknown action reference: no Goal or receipt changed. Prepare a new explicit action before applying.",
+        ),
+        crate::api::federation::RemoteGoalApplyClassification::Rejected {
+            reason:
+                crate::api::federation::RemoteGoalApplyRefusal::Version
+                | crate::api::federation::RemoteGoalApplyRefusal::Busy
+                | crate::api::federation::RemoteGoalApplyRefusal::Transition,
+        } => (
+            false,
+            false,
+            "Retained refusal: same reference will return the same refusal. Read current Goal/history and explicitly reconsider; do not automatically reprepare.",
+        ),
+        crate::api::federation::RemoteGoalApplyClassification::Expired {} => (
+            false,
+            true,
+            "Preparation expired without changing the Goal or creating a receipt. Prepare a new explicit action before applying.",
+        ),
+    };
+    let value = json!({
+        "action_reference": response.action_reference,
+        "result": result,
+    });
+    let record = if unretained {
+        ApplyRecord::Outcome(value)
+    } else {
+        ApplyRecord::Receipt(value)
+    };
+    (accepted, record, next_action)
+}
+
+#[cfg(test)]
+mod classify_remote_apply_response_tests {
+    use super::*;
+    use crate::api::federation::{
+        RemoteApplyGoalResponse, RemoteGoalApplyClassification, RemoteGoalApplyRefusal,
+    };
+    use phoenix_core::domain::instance_identity::InstanceId;
+
+    #[test]
+    fn distinguishes_receipts_from_unretained_outcomes() {
+        let response = |result| RemoteApplyGoalResponse {
+            caller_instance_id: InstanceId::new(),
+            destination_instance_id: InstanceId::new(),
+            action_reference: Uuid::new_v4(),
+            result,
+        };
+
+        let (accepted, record, _) =
+            classify_remote_apply_response(response(RemoteGoalApplyClassification::Accepted {}));
+        assert!(accepted);
+        assert!(matches!(record, ApplyRecord::Receipt(_)));
+
+        let (accepted, record, _) =
+            classify_remote_apply_response(response(RemoteGoalApplyClassification::Rejected {
+                reason: RemoteGoalApplyRefusal::Transition,
+            }));
+        assert!(!accepted);
+        assert!(matches!(record, ApplyRecord::Receipt(_)));
+
+        for result in [
+            RemoteGoalApplyClassification::Expired {},
+            RemoteGoalApplyClassification::Rejected {
+                reason: RemoteGoalApplyRefusal::Unknown,
+            },
+        ] {
+            let (accepted, record, _) = classify_remote_apply_response(response(result));
+            assert!(!accepted);
+            assert!(matches!(record, ApplyRecord::Outcome(_)));
+        }
+    }
+}
+
 fn target(value: &str) -> Result<ProductConversationId, String> {
     let id = value.strip_prefix("@conv:").filter(|id| !id.is_empty() && !id.chars().any(char::is_whitespace) && !id.contains('#'))
         .ok_or_else(|| "Use a stable @conv:<product-conversation-id> target returned by conversation discovery; transcript IDs and bare IDs are refused".to_string())?;
@@ -124,18 +211,6 @@ impl super::instance::RoutedTool for GoalTool {
     }
     fn resolution_db(&self) -> &crate::db::Database {
         self.runtime.db()
-    }
-    async fn resolve_remote_peer(
-        &self,
-        selector: &super::instance::RemoteInstanceSelector,
-    ) -> Result<crate::api::federation::ResolvedPeer, crate::api::federation::FederationClientError>
-    {
-        crate::api::federation::resolve_goal_mutation_peer(
-            self.resolution_db(),
-            selector,
-            self.peer_resolution(),
-        )
-        .await
     }
     async fn authorize(&self, ctx: &ToolContext) -> Result<(), String> {
         self.service
@@ -207,6 +282,18 @@ impl super::instance::RoutedTool for ReadGoalTool {
     }
     fn resolution_db(&self) -> &crate::db::Database {
         self.runtime.db()
+    }
+    async fn resolve_remote_peer(
+        &self,
+        selector: &super::instance::RemoteInstanceSelector,
+    ) -> Result<crate::api::federation::ResolvedPeer, crate::api::federation::FederationClientError>
+    {
+        crate::api::federation::resolve_tool_peer_allow_self(
+            self.resolution_db(),
+            selector,
+            self.peer_resolution(),
+        )
+        .await
     }
     async fn authorize(&self, ctx: &ToolContext) -> Result<(), String> {
         self.service
@@ -518,48 +605,7 @@ impl GoalTool {
                         .authorize_coordinator(&coordinator)
                         .await
                         .map_err(GoalTool::refusal_message)?;
-                    let (accepted, next_action) = match &response.result {
-                        crate::api::federation::RemoteGoalApplyClassification::Accepted {} => (
-                            true,
-                            "No dispatch performed. Use read_goal to inspect history.",
-                        ),
-                        crate::api::federation::RemoteGoalApplyClassification::Rejected {
-                            reason: crate::api::federation::RemoteGoalApplyRefusal::Unknown,
-                        } => (
-                            false,
-                            "Unknown action reference: no Goal or receipt changed. Prepare a new explicit action before applying.",
-                        ),
-                        crate::api::federation::RemoteGoalApplyClassification::Rejected {
-                            reason:
-                                crate::api::federation::RemoteGoalApplyRefusal::Version
-                                | crate::api::federation::RemoteGoalApplyRefusal::Busy
-                                | crate::api::federation::RemoteGoalApplyRefusal::Transition,
-                        } => (
-                            false,
-                            "Retained refusal: same reference will return the same refusal. Read current Goal/history and explicitly reconsider; do not automatically reprepare.",
-                        ),
-                        crate::api::federation::RemoteGoalApplyClassification::Expired {} => (
-                            false,
-                            "Preparation expired without changing the Goal or creating a receipt. Prepare a new explicit action before applying.",
-                        ),
-                    };
-                    let unretained = matches!(
-                        &response.result,
-                        crate::api::federation::RemoteGoalApplyClassification::Expired {}
-                            | crate::api::federation::RemoteGoalApplyClassification::Rejected {
-                                reason: crate::api::federation::RemoteGoalApplyRefusal::Unknown,
-                            }
-                    );
-                    let value = json!({
-                        "action_reference":response.action_reference,
-                        "result":response.result
-                    });
-                    let record = if unretained {
-                        ApplyRecord::Outcome(value)
-                    } else {
-                        ApplyRecord::Receipt(value)
-                    };
-                    Ok::<_, String>((accepted, record, next_action))
+                    Ok::<_, String>(classify_remote_apply_response(response))
                 })
                 .await
                 .map_err(|error| format!("apply_goal remote operation did not settle: {error}"))??

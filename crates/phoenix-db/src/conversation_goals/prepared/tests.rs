@@ -995,7 +995,9 @@ async fn remote_claimed_action_survives_enrollment_change(replace: bool) {
         .await;
     assert!(matches!(
         stale_retry,
-        LocalAuthorityResult::DurableFactEstablished(Err(GoalDbError::TargetChanged))
+        LocalAuthorityResult::DurableFactEstablished(Err(GoalDbError::Admission(
+            crate::DbError::FederationSendAuthorityInactive
+        )))
     ));
     if let Some(new_authority) = new_authority {
         let replacement_retry = db

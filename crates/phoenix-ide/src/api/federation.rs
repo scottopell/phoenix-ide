@@ -671,7 +671,7 @@ async fn resolve_saved_peer(
     Ok(ResolvedPeer { connection })
 }
 
-pub(crate) async fn resolve_tool_peer(
+pub(crate) async fn resolve_tool_peer_allow_self(
     db: &crate::db::Database,
     selector: &crate::coordinator_tools::instance::RemoteInstanceSelector,
     resolution: crate::coordinator_tools::instance::PeerResolution,
@@ -693,7 +693,7 @@ pub(crate) async fn resolve_tool_peer(
     resolve_saved_peer(db, selector.as_str()).await
 }
 
-pub(crate) async fn resolve_goal_mutation_peer(
+pub(crate) async fn resolve_tool_peer(
     db: &crate::db::Database,
     selector: &crate::coordinator_tools::instance::RemoteInstanceSelector,
     resolution: crate::coordinator_tools::instance::PeerResolution,
@@ -703,7 +703,7 @@ pub(crate) async fn resolve_goal_mutation_peer(
             return Err(FederationClientError::SelfPeerSelector);
         }
     }
-    let peer = resolve_tool_peer(db, selector, resolution).await?;
+    let peer = resolve_tool_peer_allow_self(db, selector, resolution).await?;
     if peer.instance_id() == db.instance_id().await? {
         return Err(FederationClientError::SelfPeerSelector);
     }
@@ -3104,6 +3104,39 @@ mod tests {
         assert!(serde_json::to_vec(&encoded).unwrap().len() < MAX_REMOTE_RESPONSE_BYTES);
         assert!(!encoded.to_string().contains(&large_objective));
 
+        assert!(
+            serde_json::from_value::<RemoteApplyGoalResponse>(serde_json::json!({
+                "caller_instance_id": caller,
+                "destination_instance_id": destination,
+                "action_reference": action_reference,
+                "result": {
+                    "outcome": "accepted",
+                    "entry": {"objective": large_objective},
+                },
+            }))
+            .is_err()
+        );
+
+        assert!(
+            serde_json::from_value::<RemoteGoalApplyClassification>(serde_json::json!({
+                "outcome": "accepted",
+                "entry": {"objective": large_objective},
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn remote_apply_goal_expired_and_rejected_responses_are_bounded() {
+        let caller = InstanceId::new();
+        let destination = InstanceId::new();
+        let action_reference = uuid::Uuid::new_v4();
+        let response = RemoteApplyGoalResponse {
+            caller_instance_id: caller,
+            destination_instance_id: destination,
+            action_reference,
+            result: RemoteGoalApplyClassification::Accepted {},
+        };
         let expired = RemoteApplyGoalResponse {
             result: RemoteGoalApplyClassification::Expired {},
             ..response.clone()
@@ -3135,29 +3168,7 @@ mod tests {
             );
             assert!(serde_json::to_vec(&value).unwrap().len() < MAX_REMOTE_RESPONSE_BYTES);
         }
-
-        assert!(
-            serde_json::from_value::<RemoteApplyGoalResponse>(serde_json::json!({
-                "caller_instance_id": caller,
-                "destination_instance_id": destination,
-                "action_reference": action_reference,
-                "result": {
-                    "outcome": "accepted",
-                    "entry": {"objective": large_objective},
-                },
-            }))
-            .is_err()
-        );
-
-        assert!(
-            serde_json::from_value::<RemoteGoalApplyClassification>(serde_json::json!({
-                "outcome": "accepted",
-                "entry": {"objective": large_objective},
-            }))
-            .is_err()
-        );
     }
-
     #[tokio::test]
     async fn apply_goal_unknown_reference_is_unavailable_without_goal_mutation() {
         use axum::{
@@ -3313,7 +3324,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn self_peer_rejection_is_specific_to_goal_mutations() {
+    async fn read_policy_can_allow_self_while_default_routing_rejects() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         let local_id = state.db.instance_id().await.unwrap();
         save_test_peer(&state, local_id, "self-alias", "https://self.example", "s").await;
@@ -3328,12 +3339,12 @@ mod tests {
                 crate::coordinator_tools::instance::PeerResolution::SavedUuidOrName,
                 crate::coordinator_tools::instance::PeerResolution::WatchUuidIdentity,
             ] {
-                let peer = resolve_tool_peer(&state.db, &selector, resolution)
+                let peer = resolve_tool_peer_allow_self(&state.db, &selector, resolution)
                     .await
                     .unwrap();
                 assert_eq!(peer.instance_id(), local_id);
                 assert!(matches!(
-                    resolve_goal_mutation_peer(&state.db, &selector, resolution).await,
+                    resolve_tool_peer(&state.db, &selector, resolution).await,
                     Err(FederationClientError::SelfPeerSelector)
                 ));
             }
