@@ -131,6 +131,7 @@ async fn table_data(pool: &SqlitePool) -> Vec<(String, Vec<Vec<String>>)> {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent() {
     for through in (142..=153).chain([155]) {
         let directory = tempfile::tempdir().unwrap();

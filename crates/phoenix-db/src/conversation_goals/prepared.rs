@@ -427,7 +427,9 @@ pub(super) struct RemoteGoalClaimPause {
 impl RemoteGoalClaimPause {
     pub(super) async fn after_claim(&self) {
         self.claimed.notify_one();
-        self.resume.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), self.resume.notified())
+            .await
+            .expect("remote Goal claim test did not resume within 30 seconds");
     }
 }
 

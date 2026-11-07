@@ -2,6 +2,7 @@ use super::*;
 use crate::conversation_goals::user_commands::{GoalUserRefusal, GoalUserResult};
 use crate::conversation_goals::writer_tests::{at, counts, fixture, ordinary};
 use phoenix_core::domain::db_schema::{InputOrigin, MessageContent};
+use phoenix_core::domain::instance_identity::FederationCredentialVerifier;
 use phoenix_core::domain::llm_types::ContentBlock;
 use phoenix_core::domain::sm_event::{
     CancelCause, DirectTurnTurnId, PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
@@ -654,7 +655,9 @@ async fn expired_remote_preparation_replays_retained_receipt() {
     ] {
         match classified.unwrap() {
             RemoteCoordinatorGoalClaim::Replay(receipt) => assert_eq!(receipt, replay),
-            _ => panic!("retained receipt must win over a claimed or expired preparation"),
+            RemoteCoordinatorGoalClaim::Claimed(_) | RemoteCoordinatorGoalClaim::Unclassified => {
+                panic!("retained receipt must win over a claimed or expired preparation")
+            }
         }
     }
     let history = db
@@ -763,9 +766,9 @@ async fn remote_unclassified_claim_closes_receiptless_retry(
     );
 }
 
+#[allow(clippy::too_many_lines)]
 async fn remote_claimed_action_survives_enrollment_change(replace: bool) {
     use crate::workflow::LocalAuthorityResult;
-    use phoenix_core::domain::instance_identity::FederationCredentialVerifier;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -820,7 +823,9 @@ async fn remote_claimed_action_survives_enrollment_change(replace: bool) {
             .await
     });
 
-    claimed.notified().await;
+    tokio::time::timeout(std::time::Duration::from_secs(30), claimed.notified())
+        .await
+        .expect("remote Goal claim did not commit within 30 seconds");
     let new_authority = if replace {
         let verifier = FederationCredentialVerifier::from_bearer(b"replacement-credential");
         db.replace_federation_enrollment(
@@ -1102,6 +1107,7 @@ async fn remote_disabled_auto_continue_is_a_terminal_replayable_rejection() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn remote_apply_retains_receipt_and_history_decodes_remote_coordinator() {
     let db = fixture().await;
     let (authority, source, owner) = remote_source(&db, "remote-apply-replay").await;
@@ -1144,7 +1150,9 @@ async fn remote_apply_retains_receipt_and_history_decodes_remote_coordinator() {
         .unwrap()
     {
         RemoteCoordinatorGoalClaim::Replay(receipt) => assert_eq!(receipt, first),
-        _ => panic!("a receipt committed after an empty preflight must win claim arbitration"),
+        RemoteCoordinatorGoalClaim::Claimed(_) | RemoteCoordinatorGoalClaim::Unclassified => {
+            panic!("a receipt committed after an empty preflight must win claim arbitration")
+        }
     }
     assert_eq!(
         db.retained_remote_coordinator_goal_command(&authority, prepared.reference)
@@ -1178,7 +1186,6 @@ async fn remote_apply_retains_receipt_and_history_decodes_remote_coordinator() {
         &history[0].mutation().attribution.applied_by,
         phoenix_core::domain::conversation_goal::GoalActor::RemoteCoordinator(remote) if remote == &source
     ));
-    use phoenix_core::domain::instance_identity::FederationCredentialVerifier;
     let replacement = FederationCredentialVerifier::from_bearer(b"receipt replacement credential");
     db.replace_federation_enrollment(
         source.instance_id,
@@ -1358,6 +1365,7 @@ async fn goal_preparation_migration_follows_conversation_tool_migrations() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn prepare_retains_exact_source_and_payload_without_mutating_or_dispatching() {
     let db = fixture().await;
     let (caller, source_product, source_call, turn) = coordinator_source(&db, "prep-retry").await;

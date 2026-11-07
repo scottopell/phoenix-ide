@@ -333,170 +333,179 @@ impl GoalTool {
             .authorize_coordinator(&ctx.conversation_id)
             .await
             .map_err(|error| self.refusal(error))?;
-        let output = match self.operation {
+
+        match self.operation {
             Operation::Prepare => {
-                let args: PrepareInput =
-                    serde_json::from_value(input).map_err(|error| self.bad_input(&error))?;
-                let owner = target(&args.target)?;
-                let source = ctx.source_tool_call().ok_or(
-                    "Missing server-bound assistant/tool invocation; cannot prepare a Goal action",
-                )?;
-                let turn_id = ctx.direct_turn_id().ok_or("Goal preparation requires server-bound durable turn provenance; caller-supplied execution IDs are refused")?;
-                let (reference, observed, version, intent, expires_at_us) = match route {
-                    super::instance::Route::Local => {
-                        let action = self
-                            .service
-                            .prepare_coordinator(
-                                &ctx.conversation_id,
-                                &source,
-                                &owner,
-                                args.action,
-                                turn_id,
-                            )
-                            .await
-                            .map_err(|error| self.refusal(error))?;
-                        (
-                            action.reference,
-                            action.observed_goal_id,
-                            action.expected_version,
-                            action.intent,
-                            None,
-                        )
-                    }
-                    super::instance::Route::Remote(peer) => {
-                        let runtime = Arc::clone(&self.runtime);
-                        let service = self.service.clone();
-                        let coordinator = ctx.conversation_id.clone();
-                        let result = tokio::spawn(async move {
-                            let _authority = runtime
-                                .acquire_local_authority_pass()
-                                .map_err(|()| "local authority is closed".to_owned())?;
-                            let (_product_admission, source) = service
-                                .admit_remote_source(&coordinator, &source, turn_id, "prepare_goal")
-                                .await
-                                .map_err(GoalTool::refusal_message)?;
-                            service
-                                .authorize_coordinator(&coordinator)
-                                .await
-                                .map_err(GoalTool::refusal_message)?;
-                            let action = crate::api::federation::prepare_remote_goal(
-                                runtime.db(),
-                                &peer,
-                                owner,
-                                args.action,
-                                source,
-                            )
-                            .await
-                            .map_err(|error| {
-                                format!("prepare_goal remote preparation failed: {error}")
-                            })?;
-                            service
-                                .authorize_coordinator(&coordinator)
-                                .await
-                                .map_err(GoalTool::refusal_message)?;
-                            Ok::<_, String>((
-                                action.action_reference,
-                                action.observed_goal_id,
-                                action.expected_version,
-                                action.intent,
-                                Some(action.expires_at_us),
-                            ))
-                        })
-                        .await
-                        .map_err(|error| {
-                            format!("prepare_goal remote operation did not settle: {error}")
-                        })??;
-                        result
-                    }
-                };
-                let mut output = json!({"action_reference":reference,"target":args.target,"observed_goal_id":observed,"expected_version":version,"action":intent,"next_tool":"apply_goal","note":"Frozen observation only; Goal unchanged. Review before applying. Replacement creates a new Goal ID and preserves history."});
-                if let Some(expires_at_us) = expires_at_us {
-                    output["expires_at_us"] = json!(expires_at_us);
-                }
-                output
+                let output = self.prepare(input, ctx, route).await?;
+                Ok(ToolOutput::success(
+                    serde_json::to_string(&output).map_err(|error| error.to_string())?,
+                ))
             }
-            Operation::Apply => {
-                let args: ApplyInput =
-                    serde_json::from_value(input).map_err(|error| self.bad_input(&error))?;
-                let (accepted, receipt) = match route {
-                    super::instance::Route::Local => {
-                        let receipt = self
-                            .service
-                            .apply_prepared(&ctx.conversation_id, args.action_reference)
-                            .await
-                            .map_err(|error| self.refusal(error))?;
-                        (
-                            matches!(receipt.result, GoalUserResult::Accepted { .. }),
-                            json!(receipt),
-                        )
-                    }
-                    super::instance::Route::Remote(peer) => {
-                        let source_call = ctx.source_tool_call().ok_or("Missing server-bound assistant/tool invocation; cannot apply a Goal action")?;
-                        let turn = ctx.direct_turn_id().ok_or(
-                            "Goal application requires server-bound durable turn provenance",
-                        )?;
-                        let runtime = Arc::clone(&self.runtime);
-                        let service = self.service.clone();
-                        let coordinator = ctx.conversation_id.clone();
-                        let action_reference = args.action_reference;
-                        tokio::spawn(async move {
-                            let _authority = runtime
-                                .acquire_local_authority_pass()
-                                .map_err(|()| "local authority is closed".to_owned())?;
-                            let (_product_admission, _source) = service
-                                .admit_remote_source(&coordinator, &source_call, turn, "apply_goal")
-                                .await
-                                .map_err(GoalTool::refusal_message)?;
-                            service
-                                .authorize_coordinator(&coordinator)
-                                .await
-                                .map_err(GoalTool::refusal_message)?;
-                            let response = crate::api::federation::apply_remote_goal(
-                                runtime.db(),
-                                &peer,
-                                action_reference,
-                            )
-                            .await
-                            .map_err(|error| {
-                                format!("apply_goal remote application failed: {error}")
-                            })?;
-                            service
-                                .authorize_coordinator(&coordinator)
-                                .await
-                                .map_err(GoalTool::refusal_message)?;
-                            let accepted = matches!(
-                                response.result,
-                                crate::api::federation::RemoteGoalResult::Accepted { .. }
-                            );
-                            Ok::<_, String>((
-                                accepted,
-                                json!({
-                                    "request_id":response.request_id,
-                                    "result":response.result
-                                }),
-                            ))
-                        })
+            Operation::Apply => self.apply(input, ctx, route).await,
+        }
+    }
+
+    async fn prepare(
+        &self,
+        input: Value,
+        ctx: &ToolContext,
+        route: super::instance::Route<crate::api::federation::ResolvedPeer>,
+    ) -> Result<Value, String> {
+        let args: PrepareInput =
+            serde_json::from_value(input).map_err(|error| self.bad_input(&error))?;
+        let owner = target(&args.target)?;
+        let source = ctx.source_tool_call().ok_or(
+            "Missing server-bound assistant/tool invocation; cannot prepare a Goal action",
+        )?;
+        let turn_id = ctx.direct_turn_id().ok_or("Goal preparation requires server-bound durable turn provenance; caller-supplied execution IDs are refused")?;
+        let (reference, observed, version, intent, expires_at_us) = match route {
+            super::instance::Route::Local => {
+                let action = self
+                    .service
+                    .prepare_coordinator(
+                        &ctx.conversation_id,
+                        &source,
+                        &owner,
+                        args.action,
+                        turn_id,
+                    )
+                    .await
+                    .map_err(|error| self.refusal(error))?;
+                (
+                    action.reference,
+                    action.observed_goal_id,
+                    action.expected_version,
+                    action.intent,
+                    None,
+                )
+            }
+            super::instance::Route::Remote(peer) => {
+                let runtime = Arc::clone(&self.runtime);
+                let service = self.service.clone();
+                let coordinator = ctx.conversation_id.clone();
+                tokio::spawn(async move {
+                    let _authority = runtime
+                        .acquire_local_authority_pass()
+                        .map_err(|()| "local authority is closed".to_owned())?;
+                    let (_product_admission, source) = service
+                        .admit_remote_source(&coordinator, &source, turn_id, "prepare_goal")
                         .await
-                        .map_err(|error| {
-                            format!("apply_goal remote operation did not settle: {error}")
-                        })??
-                    }
-                };
-                let value = json!({"action_reference":args.action_reference,"receipt":receipt,"next_action":if accepted {"No dispatch performed. Use read_goal to inspect history."} else {"Retained refusal: same reference will return the same refusal. Read current Goal/history and explicitly reconsider; do not automatically reprepare."}});
-                return if accepted {
-                    Ok(ToolOutput::success(
-                        serde_json::to_string(&value).map_err(|error| error.to_string())?,
+                        .map_err(GoalTool::refusal_message)?;
+                    service
+                        .authorize_coordinator(&coordinator)
+                        .await
+                        .map_err(GoalTool::refusal_message)?;
+                    let action = crate::api::federation::prepare_remote_goal(
+                        runtime.db(),
+                        &peer,
+                        owner,
+                        args.action,
+                        source,
+                    )
+                    .await
+                    .map_err(|error| format!("prepare_goal remote preparation failed: {error}"))?;
+                    service
+                        .authorize_coordinator(&coordinator)
+                        .await
+                        .map_err(GoalTool::refusal_message)?;
+                    Ok::<_, String>((
+                        action.action_reference,
+                        action.observed_goal_id,
+                        action.expected_version,
+                        action.intent,
+                        Some(action.expires_at_us),
                     ))
-                } else {
-                    Ok(ToolOutput::error(
-                        serde_json::to_string(&value).map_err(|error| error.to_string())?,
-                    ))
-                };
+                })
+                .await
+                .map_err(|error| {
+                    format!("prepare_goal remote operation did not settle: {error}")
+                })??
             }
         };
-        Ok(ToolOutput::success(
-            serde_json::to_string(&output).map_err(|error| error.to_string())?,
-        ))
+        let mut output = json!({"action_reference":reference,"target":args.target,"observed_goal_id":observed,"expected_version":version,"action":intent,"next_tool":"apply_goal","note":"Frozen observation only; Goal unchanged. Review before applying. Replacement creates a new Goal ID and preserves history."});
+        if let Some(expires_at_us) = expires_at_us {
+            output["expires_at_us"] = json!(expires_at_us);
+        }
+        Ok(output)
+    }
+
+    async fn apply(
+        &self,
+        input: Value,
+        ctx: &ToolContext,
+        route: super::instance::Route<crate::api::federation::ResolvedPeer>,
+    ) -> Result<ToolOutput, String> {
+        let args: ApplyInput =
+            serde_json::from_value(input).map_err(|error| self.bad_input(&error))?;
+        let (accepted, receipt) = match route {
+            super::instance::Route::Local => {
+                let receipt = self
+                    .service
+                    .apply_prepared(&ctx.conversation_id, args.action_reference)
+                    .await
+                    .map_err(|error| self.refusal(error))?;
+                (
+                    matches!(receipt.result, GoalUserResult::Accepted { .. }),
+                    json!(receipt),
+                )
+            }
+            super::instance::Route::Remote(peer) => {
+                let source_call = ctx.source_tool_call().ok_or(
+                    "Missing server-bound assistant/tool invocation; cannot apply a Goal action",
+                )?;
+                let turn = ctx
+                    .direct_turn_id()
+                    .ok_or("Goal application requires server-bound durable turn provenance")?;
+                let runtime = Arc::clone(&self.runtime);
+                let service = self.service.clone();
+                let coordinator = ctx.conversation_id.clone();
+                let action_reference = args.action_reference;
+                tokio::spawn(async move {
+                    let _authority = runtime
+                        .acquire_local_authority_pass()
+                        .map_err(|()| "local authority is closed".to_owned())?;
+                    let (_product_admission, _source) = service
+                        .admit_remote_source(&coordinator, &source_call, turn, "apply_goal")
+                        .await
+                        .map_err(GoalTool::refusal_message)?;
+                    service
+                        .authorize_coordinator(&coordinator)
+                        .await
+                        .map_err(GoalTool::refusal_message)?;
+                    let response = crate::api::federation::apply_remote_goal(
+                        runtime.db(),
+                        &peer,
+                        action_reference,
+                    )
+                    .await
+                    .map_err(|error| format!("apply_goal remote application failed: {error}"))?;
+                    service
+                        .authorize_coordinator(&coordinator)
+                        .await
+                        .map_err(GoalTool::refusal_message)?;
+                    let accepted = matches!(
+                        response.result,
+                        crate::api::federation::RemoteGoalResult::Accepted { .. }
+                    );
+                    Ok::<_, String>((
+                        accepted,
+                        json!({
+                            "request_id":response.request_id,
+                            "result":response.result
+                        }),
+                    ))
+                })
+                .await
+                .map_err(|error| format!("apply_goal remote operation did not settle: {error}"))??
+            }
+        };
+        let value = json!({"action_reference":args.action_reference,"receipt":receipt,"next_action":if accepted {"No dispatch performed. Use read_goal to inspect history."} else {"Retained refusal: same reference will return the same refusal. Read current Goal/history and explicitly reconsider; do not automatically reprepare."}});
+        let output = serde_json::to_string(&value).map_err(|error| error.to_string())?;
+        Ok(if accepted {
+            ToolOutput::success(output)
+        } else {
+            ToolOutput::error(output)
+        })
     }
 }
 

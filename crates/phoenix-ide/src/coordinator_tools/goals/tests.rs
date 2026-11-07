@@ -228,7 +228,6 @@ async fn assert_remote_source_race_refused(operation: Operation, terminalize: bo
         .get_conversation(&f.caller)
         .await
         .unwrap()
-        .unwrap()
         .product_conversation_id;
     let admission = f
         .runtime

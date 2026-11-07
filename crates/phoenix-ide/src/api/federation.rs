@@ -1323,14 +1323,14 @@ impl RemoteApplyGoalResponse {
         prepared: phoenix_db::conversation_goals::prepared::PreparedGoalAction,
         previous: Option<GoalSnapshot>,
         receipt: phoenix_db::conversation_goals::user_commands::GoalUserReceipt,
-    ) -> Result<Self, Response> {
+    ) -> Result<Self, Box<Response>> {
         use phoenix_core::domain::conversation_goal::GoalPreparationSource;
         use phoenix_db::conversation_goals::user_commands::GoalUserResult;
         let GoalPreparationSource::Remote(source) = prepared.source else {
-            return Err(federation_error(
+            return Err(Box::new(federation_error(
                 StatusCode::CONFLICT,
                 "non-remote preparation",
-            ));
+            )));
         };
         let result = match receipt.result {
             GoalUserResult::Accepted { entry } => RemoteGoalResult::Accepted {
@@ -1572,7 +1572,7 @@ pub async fn apply_goal(
                     receipt,
                 ) {
                     Ok(response) => Json(response).into_response(),
-                    Err(error) => error,
+                    Err(error) => *error,
                 },
                 Err(error) => error.into_response(),
             },

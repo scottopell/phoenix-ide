@@ -13335,6 +13335,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn migration_156_preserves_populated_local_goal_ledger_and_schema() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
