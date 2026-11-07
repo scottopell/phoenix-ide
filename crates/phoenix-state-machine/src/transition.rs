@@ -24,6 +24,7 @@ use super::state::{
     ToolCall, ToolInput,
 };
 use super::{ConvContext, ConvState, Effect, Event};
+use phoenix_core::domain::conversation_goal::ToolRoundResult;
 use phoenix_core::domain::db_schema::{ErrorKind, ToolResult, UsageData};
 use phoenix_core::domain::llm_error_kind::LlmAttemptReason;
 use phoenix_core::domain::mode_context::ModeContext;
@@ -467,6 +468,21 @@ pub fn transition(
         validate_response_tool_calls(content, tool_calls)?;
     }
     let event = match event {
+        Event::ToolRoundComplete {
+            tool_use_id,
+            result,
+        } => {
+            if result.tool_use_id() != tool_use_id {
+                return Err(TransitionError::InvalidTransition {
+                    state: state.variant_name(),
+                    event: "ToolRoundComplete",
+                });
+            }
+            Event::ToolRoundComplete {
+                tool_use_id,
+                result,
+            }
+        }
         Event::ToolComplete {
             tool_use_id,
             result,
@@ -847,6 +863,18 @@ pub fn transition_core(
     context: &ConvContext,
     event: CoreEvent,
 ) -> Result<CoreTransitionResult, TransitionError> {
+    if let CoreEvent::ToolComplete {
+        tool_use_id,
+        result,
+    } = &event
+    {
+        if result.tool_use_id() != tool_use_id {
+            return Err(TransitionError::InvalidTransition {
+                state: state.variant_name(),
+                event: "ToolComplete",
+            });
+        }
+    }
     match (state, &event) {
         // User Message Handling (REQ-BED-002)
         (
@@ -1261,7 +1289,7 @@ fn handle_core_tool_complete(
             spawned,
         } if tool_use_id == current_tool.id && !remaining_tools.is_empty() => {
             let mut new_results = completed_results.clone();
-            new_results.push(result);
+            new_results.push(result.into());
 
             let mut new_pending = pending_sub_agents.clone();
             new_pending.extend(spawned);
@@ -3603,6 +3631,18 @@ pub fn transition_sub_agent(
 ) -> Result<SubAgentTransitionResult, TransitionError> {
     use crate::state::SubAgentOutcome;
 
+    if matches!(
+        &event,
+        SubAgentEvent::Core(CoreEvent::ToolComplete {
+            result: ToolRoundResult::PendingSelfGoal { .. },
+            ..
+        })
+    ) {
+        return Err(TransitionError::InvalidTransition {
+            state: state.variant_name(),
+            event: "ToolRoundComplete",
+        });
+    }
     match (state, event) {
         // ============================================================
         // Terminal state absorption (Completed / Failed)
@@ -4595,6 +4635,158 @@ mod tests {
         )
     }
 
+    fn pending_self_goal(id: &str) -> ToolRoundResult {
+        use phoenix_core::domain::conversation_goal::{
+            GoalExecution, GoalReportCall, GoalText, PendingSelfGoal, SelfGoalOperation,
+        };
+        ToolRoundResult::PendingSelfGoal {
+            pending: PendingSelfGoal {
+                owner: phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                    "test-conv",
+                )
+                .unwrap(),
+                execution: GoalExecution::parse(7, 13).unwrap(),
+                generation: 11,
+                call: GoalReportCall {
+                    transcript_id: GoalText::parse("test-conv").unwrap(),
+                    message_id: GoalText::parse("assistant").unwrap(),
+                    tool_use_id: GoalText::parse(id).unwrap(),
+                },
+                operation: SelfGoalOperation::EnableAutoContinuation,
+            },
+            duration_ms: Some(3),
+        }
+    }
+
+    #[test]
+    fn pending_self_goal_is_carried_until_the_whole_round_checkpoint() {
+        let ctx = test_context();
+        let tool = |id: &str| {
+            ToolCall::new(
+                id,
+                ToolInput::Think(crate::state::ThinkInput {
+                    thoughts: "test".into(),
+                }),
+            )
+        };
+        let assistant = AssistantMessage::new(
+            "assistant".into(),
+            vec![
+                ContentBlock::tool_use("goal", "enable_auto_continuation", serde_json::json!({})),
+                ContentBlock::tool_use("other", "think", serde_json::json!({"thoughts":"test"})),
+            ],
+            None,
+            None,
+        );
+        let state = ConvState::ToolExecuting {
+            current_tool: tool("goal"),
+            remaining_tools: vec![tool("other")],
+            completed_results: vec![],
+            assistant_message: assistant,
+            pending_sub_agents: vec![],
+        };
+        let pending = pending_self_goal("goal");
+        let first = transition(
+            &state,
+            Event::ToolRoundComplete {
+                tool_use_id: "goal".into(),
+                result: pending.clone(),
+            },
+            &ctx,
+        )
+        .unwrap();
+        let ConvState::ToolExecuting {
+            completed_results, ..
+        } = &first.new_state
+        else {
+            panic!("expected next tool");
+        };
+        assert_eq!(completed_results, &[pending.clone()]);
+        assert!(!first
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistCheckpoint { .. })));
+        let restored: ConvState =
+            serde_json::from_str(&serde_json::to_string(&first.new_state).unwrap()).unwrap();
+        assert_eq!(restored, first.new_state);
+        let cancelling = transition(
+            &restored,
+            Event::UserCancel {
+                reason: None,
+                cause: CancelCause::UserRequested,
+            },
+            &ctx,
+        )
+        .unwrap();
+        let aborted = transition(
+            &cancelling.new_state,
+            Event::ToolAborted {
+                tool_use_id: "other".into(),
+            },
+            &ctx,
+        )
+        .unwrap();
+        let terminal_round = aborted
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::PersistCheckpoint {
+                    data: CheckpointData::ToolRound(round),
+                } => Some(round),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(terminal_round.results()[0], pending);
+        assert!(terminal_round.results()[1].finalized().unwrap().is_error());
+        let second = transition(
+            &restored,
+            Event::ToolComplete {
+                tool_use_id: "other".into(),
+                result: ToolResult {
+                    tool_use_id: "other".into(),
+                    outcome: ToolOutcome::TrustedInstructions {
+                        output: "trusted".into(),
+                    },
+                    duration_ms: None,
+                },
+            },
+            &ctx,
+        )
+        .unwrap();
+        let round = second
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::PersistCheckpoint {
+                    data: CheckpointData::ToolRound(round),
+                } => Some(round),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(round.results()[0], pending);
+        assert!(round.results()[1].finalized().is_some());
+        assert!(matches!(second.new_state, ConvState::LlmRequesting { .. }));
+    }
+
+    #[test]
+    fn pending_self_goal_cannot_cross_invocation_or_subagent_boundary() {
+        let pending = pending_self_goal("goal");
+        assert!(SubAgentEvent::try_from(Event::ToolRoundComplete {
+            tool_use_id: "goal".into(),
+            result: pending.clone()
+        })
+        .is_err());
+        assert!(transition(
+            &ConvState::Idle,
+            Event::ToolRoundComplete {
+                tool_use_id: "different".into(),
+                result: pending
+            },
+            &test_context()
+        )
+        .is_err());
+    }
+
     #[test]
     fn malformed_response_identities_fail_before_parent_and_terminal_interceptions() {
         use crate::state::{ProposeTaskInput, SubmitResultInput};
@@ -4740,6 +4932,9 @@ mod tests {
         assert!(round.assistant_message().display_data.is_none());
         assert_eq!(round.results().len(), tool_calls.len());
         for (error, call) in round.results().iter().zip(tool_calls) {
+            let error = error
+                .finalized()
+                .expect("rejected tool result is finalized");
             assert_eq!(error.tool_use_id, call.id);
             assert!(error.is_error());
             assert!(error.output().contains(expected), "{}", error.output());
@@ -4826,10 +5021,13 @@ mod tests {
                 }
             })
             .unwrap();
-        assert_eq!(round.results()[0].tool_use_id, "expected");
-        assert!(round.results()[0].is_error());
-        assert!(round.results()[0].output().contains("different invocation"));
-        assert!(!round.results()[0].output().contains("unowned"));
+        let error = round.results()[0]
+            .finalized()
+            .expect("mismatched completion is finalized as an error");
+        assert_eq!(error.tool_use_id, "expected");
+        assert!(error.is_error());
+        assert!(error.output().contains("different invocation"));
+        assert!(!error.output().contains("unowned"));
         assert!(matches!(result.new_state, ConvState::LlmRequesting { .. }));
     }
 
@@ -8173,7 +8371,11 @@ mod tests {
         let CheckpointData::ToolRound(round) = checkpoint;
         let tool_results = round.results();
         assert_eq!(tool_results.len(), 1);
-        match &tool_results[0].outcome {
+        match &tool_results[0]
+            .finalized()
+            .expect("rejected tool result is finalized")
+            .outcome
+        {
             ToolOutcome::Error { output, .. } => {
                 assert!(
                     output.contains("parent"),
@@ -9784,7 +9986,10 @@ mod tests {
             let CheckpointData::ToolRound(round) = checkpoint;
             let tool_results = round.results();
             assert!(matches!(
-                &tool_results[0].outcome,
+                &tool_results[0]
+                    .finalized()
+                    .expect("rejected tool result is finalized")
+                    .outcome,
                 ToolOutcome::Error { output, .. }
                     if output == "propose_task is unavailable for this conversation."
             ));

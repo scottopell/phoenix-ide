@@ -1,7 +1,8 @@
 //! Conversation state types
 
 use crate::domain::bash_types::{BashInvocation, BashToolInput};
-use crate::domain::db_schema::{ConversationCreationPhase, ErrorKind, ToolResult, UsageData};
+use crate::domain::conversation_goal::ToolRoundResult;
+use crate::domain::db_schema::{ConversationCreationPhase, ErrorKind, UsageData};
 use crate::domain::llm_types::ContentBlock;
 use crate::domain::patch_types::PatchInput;
 use chrono::{DateTime, Utc};
@@ -1499,7 +1500,7 @@ pub enum ConvState {
         remaining_tools: Vec<ToolCall>,
         /// Completed tool results — single source of truth (FM-4 Prevention).
         /// No parallel `persisted_tool_ids` tracking set.
-        completed_results: Vec<ToolResult>,
+        completed_results: Vec<ToolRoundResult>,
         /// Sub-agents spawned during this tool execution phase
         pending_sub_agents: Vec<PendingSubAgent>,
         /// Assistant message held until all tools complete (not yet persisted)
@@ -1518,7 +1519,7 @@ pub enum ConvState {
         /// Tools that were skipped
         skipped_tools: Vec<ToolCall>,
         /// Tool results completed before cancellation
-        completed_results: Vec<ToolResult>,
+        completed_results: Vec<ToolRoundResult>,
         /// Assistant message held for atomic persistence
         assistant_message: AssistantMessage,
         /// Sub-agents spawned earlier in this tool round, awaiting cancellation.
@@ -1687,7 +1688,7 @@ pub enum CoreState {
     ToolExecuting {
         current_tool: ToolCall,
         remaining_tools: Vec<ToolCall>,
-        completed_results: Vec<ToolResult>,
+        completed_results: Vec<ToolRoundResult>,
         pending_sub_agents: Vec<PendingSubAgent>,
         assistant_message: AssistantMessage,
     },
@@ -1695,7 +1696,7 @@ pub enum CoreState {
         tool_use_id: String,
         cause: crate::domain::sm_event::CancelCause,
         skipped_tools: Vec<ToolCall>,
-        completed_results: Vec<ToolResult>,
+        completed_results: Vec<ToolRoundResult>,
         assistant_message: AssistantMessage,
         pending_sub_agents: Vec<PendingSubAgent>,
     },

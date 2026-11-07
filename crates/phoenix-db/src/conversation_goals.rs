@@ -46,6 +46,7 @@ pub mod control;
 pub mod execution;
 pub mod prepared;
 pub mod round;
+mod self_management;
 pub mod user_commands;
 
 pub use round::{CommittedGoalRound, GoalRoundCheckpoint};
@@ -545,6 +546,12 @@ pub(crate) async fn capture_goal_at_new_turn_tx(
     tx: &mut GoalTx<'_>,
     execution: GoalExecution,
 ) -> std::result::Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO ordinary_self_goal_admissions (turn_id,workflow_id,generation,owner_id,transcript_id,disable_epoch)
+        SELECT t.turn_id,t.workflow_id,t.generation,p.id,c.id,p.auto_continue_disable_epoch
+        FROM durable_turns t JOIN conversations c ON c.id=t.conversation_id
+        JOIN product_conversations p ON p.id=c.product_conversation_id
+        WHERE t.turn_id=? AND t.workflow_id=? AND p.kind='ordinary'")
+        .bind(execution.turn_id()).bind(execution.workflow_id()).execute(&mut **tx).await?;
     sqlx::query(
         "INSERT INTO conversation_goal_bindings (turn_id,workflow_id,owner_id,observed_version,goal_id)
          SELECT t.turn_id,t.workflow_id,p.id,h.version,

@@ -1,5 +1,6 @@
 //! Events that can occur in a conversation
 
+use super::conversation_goal::ToolRoundResult;
 use crate::domain::db_schema::{ErrorKind, FileAttachment, ImageData, ToolResult};
 use crate::domain::skill_invocation::SkillInvocation;
 use chrono::{DateTime, Utc};
@@ -628,6 +629,11 @@ pub enum Event {
         tool_use_id: String,
         result: ToolResult,
     },
+
+    ToolRoundComplete {
+        tool_use_id: String,
+        result: ToolRoundResult,
+    },
     /// Tool was aborted due to cancellation
     ToolAborted {
         tool_use_id: String,
@@ -808,6 +814,7 @@ impl Event {
             Event::OverloadRetryDeadlineExpired => "OverloadRetryDeadlineExpired",
             Event::RetryTimeout { .. } => "RetryTimeout",
             Event::ToolComplete { .. } => "ToolComplete",
+            Event::ToolRoundComplete { .. } => "ToolRoundComplete",
             Event::ToolAborted { .. } => "ToolAborted",
             Event::SpawnAgentsComplete { .. } => "SpawnAgentsComplete",
             Event::SubAgentResult { .. } => "SubAgentResult",
@@ -907,7 +914,7 @@ pub enum CoreEvent {
     },
     ToolComplete {
         tool_use_id: String,
-        result: ToolResult,
+        result: ToolRoundResult,
     },
     ToolAborted {
         tool_use_id: String,
@@ -1154,6 +1161,13 @@ impl TryFrom<Event> for ParentEvent {
                 result,
             } => Ok(ParentEvent::Core(CoreEvent::ToolComplete {
                 tool_use_id,
+                result: result.into(),
+            })),
+            Event::ToolRoundComplete {
+                tool_use_id,
+                result,
+            } => Ok(ParentEvent::Core(CoreEvent::ToolComplete {
+                tool_use_id,
                 result,
             })),
             Event::ToolAborted { tool_use_id } => {
@@ -1377,7 +1391,7 @@ impl TryFrom<Event> for SubAgentEvent {
                 result,
             } => Ok(SubAgentEvent::Core(CoreEvent::ToolComplete {
                 tool_use_id,
-                result,
+                result: result.into(),
             })),
             Event::ToolAborted { tool_use_id } => {
                 Ok(SubAgentEvent::Core(CoreEvent::ToolAborted { tool_use_id }))
@@ -1448,7 +1462,8 @@ impl TryFrom<Event> for SubAgentEvent {
             // SteerDrainedUserMessages is parent-only: steering is a parent-
             // conversation feature, and the executor's drain detector guards
             // against firing for sub-agents.
-            Event::TaskApprovalDecided { .. }
+            Event::ToolRoundComplete { .. }
+            | Event::TaskApprovalDecided { .. }
             | Event::TaskHandoffComplete { .. }
             | Event::UserQuestionResponse { .. }
             | Event::UserQuestionDismissed { .. }

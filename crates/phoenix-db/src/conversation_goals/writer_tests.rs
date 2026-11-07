@@ -8,6 +8,7 @@ use phoenix_core::domain::conversation_goal::{
 use uuid::Uuid;
 
 mod checkpoint;
+mod self_management;
 
 pub(super) async fn fixture() -> Database {
     Database::open_in_memory()

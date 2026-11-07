@@ -222,7 +222,7 @@ fn trusted_prefix_state(cancelling: bool) -> (ConvState, AssistantMessage, ToolC
             cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
             tool_use_id: "unfinished".into(),
             skipped_tools: vec![queued],
-            completed_results,
+            completed_results: completed_results.into_iter().map(Into::into).collect(),
             assistant_message: assistant.clone(),
             pending_sub_agents: vec![],
         }
@@ -230,7 +230,7 @@ fn trusted_prefix_state(cancelling: bool) -> (ConvState, AssistantMessage, ToolC
         ConvState::ToolExecuting {
             current_tool: think("unfinished"),
             remaining_tools: vec![queued],
-            completed_results,
+            completed_results: completed_results.into_iter().map(Into::into).collect(),
             assistant_message: assistant.clone(),
             pending_sub_agents: vec![],
         }
@@ -278,8 +278,23 @@ async fn malformed_restart_rounds_retain_durable_state_and_write_no_messages() {
                 "count" => {
                     results.pop();
                 }
-                "duplicate_result" => results[1].tool_use_id = results[0].tool_use_id.clone(),
-                "unknown_result" => results[1].tool_use_id = "unknown".into(),
+                "duplicate_result" => {
+                    let id = results[0].tool_use_id().to_owned();
+                    let phoenix_core::domain::conversation_goal::ToolRoundResult::Finalized(result) =
+                        &mut results[1]
+                    else {
+                        unreachable!()
+                    };
+                    result.tool_use_id = id;
+                }
+                "unknown_result" => {
+                    let phoenix_core::domain::conversation_goal::ToolRoundResult::Finalized(result) =
+                        &mut results[1]
+                    else {
+                        unreachable!()
+                    };
+                    result.tool_use_id = "unknown".into();
+                }
                 "duplicate_call" => {
                     assistant.content[1] = assistant.content[0].clone();
                 }
@@ -378,7 +393,7 @@ async fn malformed_child_round_is_validated_before_parent_recovery_mutates_it() 
                     tool_use_id: "wait".into(),
                     cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
                     skipped_tools: vec![],
-                    completed_results: completed,
+                    completed_results: completed.into_iter().map(Into::into).collect(),
                     assistant_message: parent_assistant,
                     pending_sub_agents: pending,
                 }
@@ -391,7 +406,7 @@ async fn malformed_child_round_is_validated_before_parent_recovery_mutates_it() 
                         }),
                     ),
                     remaining_tools: vec![],
-                    completed_results: completed,
+                    completed_results: completed.into_iter().map(Into::into).collect(),
                     assistant_message: parent_assistant,
                     pending_sub_agents: pending,
                 }
@@ -411,7 +426,12 @@ async fn malformed_child_round_is_validated_before_parent_recovery_mutates_it() 
                 unreachable!()
             };
             assistant_message.message_id = "child-round".into();
-            completed_results[1].tool_use_id = if duplicate { "trusted" } else { "unknown" }.into();
+            let phoenix_core::domain::conversation_goal::ToolRoundResult::Finalized(result) =
+                &mut completed_results[1]
+            else {
+                panic!("fixture result must be finalized");
+            };
+            result.tool_use_id = if duplicate { "trusted" } else { "unknown" }.into();
             db.update_conversation_state(parent_id, &parent)
                 .await
                 .unwrap();

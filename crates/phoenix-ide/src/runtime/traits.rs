@@ -391,6 +391,29 @@ pub trait MessageStore: Send + Sync {
         proposal: &crate::db::ForkProposal,
     ) -> Result<(), String>;
 
+    async fn prepare_self_goal_tool(
+        &self,
+        transcript: &str,
+        turn: &ActiveDirectTurn,
+        message_id: &str,
+        tool_use_id: &str,
+        operation: phoenix_core::domain::conversation_goal::SelfGoalOperation,
+    ) -> Result<phoenix_core::domain::conversation_goal::PendingSelfGoal, String> {
+        let _ = (transcript, turn, message_id, tool_use_id, operation);
+        Err("self-goal tools require durable runtime storage".into())
+    }
+
+    async fn persist_self_goal_round(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        replay: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+        settlement: Option<&ActiveDirectTurnSettlement>,
+        proposal: Option<&crate::db::ForkProposal>,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+        let _ = (checkpoint, replay, settlement, proposal);
+        Err("self-goal checkpoint requires durable runtime storage".into())
+    }
+
     async fn persist_tool_round_and_state(
         &self,
         conv_id: &str,
@@ -1148,6 +1171,31 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
                 tool_results,
                 proposal,
             )
+            .await
+    }
+
+    async fn prepare_self_goal_tool(
+        &self,
+        transcript: &str,
+        turn: &ActiveDirectTurn,
+        message_id: &str,
+        tool_use_id: &str,
+        operation: phoenix_core::domain::conversation_goal::SelfGoalOperation,
+    ) -> Result<phoenix_core::domain::conversation_goal::PendingSelfGoal, String> {
+        (**self)
+            .prepare_self_goal_tool(transcript, turn, message_id, tool_use_id, operation)
+            .await
+    }
+
+    async fn persist_self_goal_round(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        replay: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+        settlement: Option<&ActiveDirectTurnSettlement>,
+        proposal: Option<&crate::db::ForkProposal>,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+        (**self)
+            .persist_self_goal_round(checkpoint, replay, settlement, proposal)
             .await
     }
 
@@ -2354,6 +2402,69 @@ impl MessageStore for DatabaseStorage {
             )
             .await
             .map_err(|e| e.to_string())
+    }
+
+    async fn prepare_self_goal_tool(
+        &self,
+        transcript: &str,
+        turn: &ActiveDirectTurn,
+        message_id: &str,
+        tool_use_id: &str,
+        operation: phoenix_core::domain::conversation_goal::SelfGoalOperation,
+    ) -> Result<phoenix_core::domain::conversation_goal::PendingSelfGoal, String> {
+        let turn_id = i64::try_from(turn.turn_id.0).map_err(|e| e.to_string())?;
+        let generation = i64::try_from(turn.generation.0).map_err(|e| e.to_string())?;
+        self.db
+            .prepare_self_goal_tool(
+                transcript,
+                turn_id,
+                generation,
+                message_id,
+                tool_use_id,
+                operation,
+            )
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn persist_self_goal_round(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        replay: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+        settlement: Option<&ActiveDirectTurnSettlement>,
+        proposal: Option<&crate::db::ForkProposal>,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+        if let Some(proposal) = proposal {
+            if settlement.is_some() {
+                return Err("fork proposal cannot be committed with terminal settlement".into());
+            }
+            self.db
+                .persist_goal_tool_round_state_replay_and_fork_proposal(
+                    checkpoint, replay, proposal,
+                )
+                .await
+                .map_err(|e| e.to_string())
+        } else if let Some(settlement) = settlement {
+            let obligation = terminal_obligation(settlement, None);
+            self.db
+                .persist_goal_tool_round_state_with_terminal_obligation(
+                    checkpoint,
+                    &obligation,
+                    replay,
+                )
+                .await
+                .map_err(|e| e.to_string())
+        } else if let Some(replay) = replay {
+            self.db
+                .persist_goal_tool_round_state_and_replay(checkpoint, replay)
+                .await
+                .map_err(|e| e.to_string())
+        } else {
+            self.db
+                .persist_goal_tool_round_and_state(checkpoint)
+                .await
+                .map_err(|e| e.to_string())
+        }
     }
 
     async fn persist_tool_round_and_state(

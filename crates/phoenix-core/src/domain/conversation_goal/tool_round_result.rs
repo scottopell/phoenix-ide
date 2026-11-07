@@ -6,6 +6,10 @@ use super::GoalPendingReport;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolRoundResult {
+    PendingSelfGoal {
+        pending: super::PendingSelfGoal,
+        duration_ms: Option<u64>,
+    },
     Finalized(ToolResult),
     PendingGoalReport {
         report: GoalPendingReport,
@@ -20,10 +24,19 @@ impl From<ToolResult> for ToolRoundResult {
 }
 
 impl ToolRoundResult {
+    /// A finalized-only sink must refuse, not omit, an unfinished entry.
+    pub fn into_finalized(self) -> Result<ToolResult, Box<Self>> {
+        match self {
+            Self::Finalized(result) => Ok(result),
+            pending => Err(Box::new(pending)),
+        }
+    }
+
     #[must_use]
     pub fn tool_use_id(&self) -> &str {
         match self {
             Self::Finalized(result) => &result.tool_use_id,
+            Self::PendingSelfGoal { pending, .. } => pending.call.tool_use_id.as_str(),
             Self::PendingGoalReport { report, .. } => report.call().tool_use_id.as_str(),
         }
     }
@@ -32,6 +45,7 @@ impl ToolRoundResult {
     pub fn duration_ms(&self) -> Option<u64> {
         match self {
             Self::Finalized(result) => result.duration_ms,
+            Self::PendingSelfGoal { duration_ms, .. } => *duration_ms,
             Self::PendingGoalReport { duration_ms, .. } => Some(*duration_ms),
         }
     }
@@ -40,7 +54,7 @@ impl ToolRoundResult {
     pub fn finalized(&self) -> Option<&ToolResult> {
         match self {
             Self::Finalized(result) => Some(result),
-            Self::PendingGoalReport { .. } => None,
+            Self::PendingGoalReport { .. } | Self::PendingSelfGoal { .. } => None,
         }
     }
 }
@@ -49,6 +63,21 @@ impl Serialize for ToolRoundResult {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Self::Finalized(result) => result.serialize(serializer),
+            Self::PendingSelfGoal {
+                pending,
+                duration_ms,
+            } => {
+                #[derive(Serialize)]
+                struct Pending<'a> {
+                    pending_self_goal: &'a super::PendingSelfGoal,
+                    duration_ms: Option<u64>,
+                }
+                Pending {
+                    pending_self_goal: pending,
+                    duration_ms: *duration_ms,
+                }
+                .serialize(serializer)
+            }
             Self::PendingGoalReport {
                 report,
                 duration_ms,
@@ -71,7 +100,20 @@ impl Serialize for ToolRoundResult {
 impl<'de> Deserialize<'de> for ToolRoundResult {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = serde_json::Value::deserialize(deserializer)?;
-        if value.get("pending_goal_report").is_some() {
+        if value.get("pending_self_goal").is_some() {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Pending {
+                pending_self_goal: super::PendingSelfGoal,
+                duration_ms: Option<u64>,
+            }
+            let pending: Pending =
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+            Ok(Self::PendingSelfGoal {
+                pending: pending.pending_self_goal,
+                duration_ms: pending.duration_ms,
+            })
+        } else if value.get("pending_goal_report").is_some() {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
             struct Pending {
@@ -85,8 +127,9 @@ impl<'de> Deserialize<'de> for ToolRoundResult {
                 duration_ms: pending.duration_ms,
             })
         } else {
-            let result = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
-            Ok(Self::Finalized(result))
+            let result: ToolResult =
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+            Ok(Self::from(result))
         }
     }
 }
@@ -174,5 +217,56 @@ mod tests {
         value["tool_use_id"] = serde_json::json!("round-call");
         value["tool_name"] = serde_json::json!("goal_report");
         assert!(serde_json::from_value::<ToolRoundResult>(value).is_err());
+    }
+}
+
+#[cfg(test)]
+mod finalized_sink_tests {
+    use super::*;
+    use crate::domain::conversation_goal::{
+        GoalExecution, GoalReportCall, GoalText, SelfGoalOperation,
+    };
+
+    fn pending() -> ToolRoundResult {
+        ToolRoundResult::PendingSelfGoal {
+            pending: super::super::PendingSelfGoal {
+                owner: crate::domain::product_conversation::ProductConversationId::parse("owner")
+                    .unwrap(),
+                execution: GoalExecution::parse(9, 13).unwrap(),
+                generation: 17,
+                call: GoalReportCall {
+                    transcript_id: GoalText::parse("owner").unwrap(),
+                    message_id: GoalText::parse("assistant").unwrap(),
+                    tool_use_id: GoalText::parse("call").unwrap(),
+                },
+                operation: SelfGoalOperation::EnableAutoContinuation,
+            },
+            duration_ms: Some(2),
+        }
+    }
+
+    #[test]
+    fn finalized_carrier_preserves_the_existing_serialization() {
+        let result = ToolResult::success("call".into(), "ok".into());
+        let legacy = serde_json::to_value(&result).unwrap();
+        let carrier = ToolRoundResult::from(result.clone());
+        assert_eq!(serde_json::to_value(&carrier).unwrap(), legacy);
+        assert_eq!(
+            serde_json::from_value::<ToolRoundResult>(legacy).unwrap(),
+            carrier
+        );
+        assert_eq!(carrier.into_finalized().unwrap(), result);
+    }
+
+    #[test]
+    fn pending_roundtrip_preserves_authority_and_refuses_finalized_sink() {
+        let pending = pending();
+        let restored =
+            serde_json::from_str::<ToolRoundResult>(&serde_json::to_string(&pending).unwrap())
+                .unwrap();
+        assert_eq!(restored, pending);
+        assert_eq!(restored.tool_use_id(), "call");
+        assert!(restored.finalized().is_none());
+        assert_eq!(*restored.into_finalized().unwrap_err(), pending);
     }
 }
