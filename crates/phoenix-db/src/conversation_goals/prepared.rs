@@ -358,6 +358,7 @@ fn prepare_observation(
 pub(super) enum RemoteCoordinatorGoalClaim {
     Claimed(Box<RemoteClaimedGoalAction>),
     Replay(super::user_commands::GoalUserReceipt),
+    Expired { action_reference: Uuid },
     Unclassified,
 }
 
@@ -368,9 +369,17 @@ pub(super) struct RemoteClaimedGoalAction {
 }
 
 enum RemoteCoordinatorGoalClaimState {
-    Prepared(Box<RemoteClaimedGoalAction>),
+    Prepared {
+        action: Box<RemoteClaimedGoalAction>,
+        expires_at_us: i64,
+    },
     Claimed,
+    Expired,
     Replay(super::user_commands::GoalUserReceipt),
+}
+
+fn remote_preparation_expired(expires_at_us: i64, now_us: i64) -> bool {
+    expires_at_us <= now_us
 }
 
 async fn remote_claim_state_tx(
@@ -400,13 +409,22 @@ async fn remote_claim_state_tx(
     .fetch_one(&mut **tx)
     .await?;
     match state.as_str() {
-        "prepared" => Ok(RemoteCoordinatorGoalClaimState::Prepared(Box::new(
-            RemoteClaimedGoalAction {
-                command: input,
-                enrollment_id,
-                source,
-            },
-        ))),
+        "prepared" => {
+            let expires_at_us: i64 = sqlx::query_scalar(
+                "SELECT expires_at_us FROM conversation_goal_preparations WHERE reference=?",
+            )
+            .bind(reference.as_bytes().as_slice())
+            .fetch_one(&mut **tx)
+            .await?;
+            Ok(RemoteCoordinatorGoalClaimState::Prepared {
+                action: Box::new(RemoteClaimedGoalAction {
+                    command: input,
+                    enrollment_id,
+                    source,
+                }),
+                expires_at_us,
+            })
+        }
         "claimed" => Ok(RemoteCoordinatorGoalClaimState::Claimed),
         _ => Err(GoalDbError::Integrity("remote Goal claim state")),
     }
@@ -768,23 +786,40 @@ impl Database {
         #[cfg(test)] commit: RemoteGoalClaimCommitCut,
     ) -> Result<RemoteCoordinatorGoalClaim> {
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
-        let action = match remote_claim_state_tx(&mut tx, authority, reference).await? {
-            RemoteCoordinatorGoalClaimState::Replay(receipt) => {
-                tx.rollback().await?;
-                return Ok(RemoteCoordinatorGoalClaim::Replay(receipt));
-            }
-            RemoteCoordinatorGoalClaimState::Claimed => {
-                let _ = tx.rollback().await;
-                return Ok(RemoteCoordinatorGoalClaim::Unclassified);
-            }
-            RemoteCoordinatorGoalClaimState::Prepared(action) => action,
-        };
+        let (action, expires_at_us) =
+            match remote_claim_state_tx(&mut tx, authority, reference).await? {
+                RemoteCoordinatorGoalClaimState::Replay(receipt) => {
+                    tx.rollback().await?;
+                    return Ok(RemoteCoordinatorGoalClaim::Replay(receipt));
+                }
+                RemoteCoordinatorGoalClaimState::Claimed => {
+                    let _ = tx.rollback().await;
+                    return Ok(RemoteCoordinatorGoalClaim::Unclassified);
+                }
+                RemoteCoordinatorGoalClaimState::Expired => {
+                    tx.rollback().await?;
+                    return Ok(RemoteCoordinatorGoalClaim::Expired {
+                        action_reference: reference,
+                    });
+                }
+                RemoteCoordinatorGoalClaimState::Prepared {
+                    action,
+                    expires_at_us,
+                } => (action, expires_at_us),
+            };
+        let now_us = chrono::Utc::now().timestamp_micros();
+        if remote_preparation_expired(expires_at_us, now_us) {
+            tx.rollback().await?;
+            return Ok(RemoteCoordinatorGoalClaim::Expired {
+                action_reference: reference,
+            });
+        }
         let changed = sqlx::query(
             "UPDATE conversation_goal_preparations SET apply_state='claimed'
-             WHERE reference=? AND apply_state='prepared'
-               AND expires_at_us > (unixepoch('now') * 1000000 + CAST(substr(strftime('%f','now'),4,3) AS INTEGER) * 1000)",
+             WHERE reference=? AND apply_state='prepared' AND expires_at_us > ?",
         )
         .bind(reference.as_bytes().as_slice())
+        .bind(now_us)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -820,16 +855,39 @@ impl Database {
     ) -> Result<RemoteCoordinatorGoalClaim> {
         let classified = async {
             let mut lookup = self.pool().begin_with("BEGIN IMMEDIATE").await?;
-            let state = remote_claim_state_tx(&mut lookup, authority, reference).await;
+            let state = match remote_claim_state_tx(&mut lookup, authority, reference).await? {
+                RemoteCoordinatorGoalClaimState::Prepared {
+                    action,
+                    expires_at_us,
+                } => {
+                    if remote_preparation_expired(
+                        expires_at_us,
+                        chrono::Utc::now().timestamp_micros(),
+                    ) {
+                        RemoteCoordinatorGoalClaimState::Expired
+                    } else {
+                        RemoteCoordinatorGoalClaimState::Prepared {
+                            action,
+                            expires_at_us,
+                        }
+                    }
+                }
+                state => state,
+            };
             lookup.rollback().await?;
-            state
+            Ok::<_, GoalDbError>(state)
         }
         .await;
         match classified {
             Ok(RemoteCoordinatorGoalClaimState::Replay(receipt)) => {
                 Ok(RemoteCoordinatorGoalClaim::Replay(receipt))
             }
-            Ok(RemoteCoordinatorGoalClaimState::Prepared(_)) => Err(attempted),
+            Ok(RemoteCoordinatorGoalClaimState::Expired) => {
+                Ok(RemoteCoordinatorGoalClaim::Expired {
+                    action_reference: reference,
+                })
+            }
+            Ok(RemoteCoordinatorGoalClaimState::Prepared { .. }) => Err(attempted),
             Ok(RemoteCoordinatorGoalClaimState::Claimed) | Err(_) => {
                 Ok(RemoteCoordinatorGoalClaim::Unclassified)
             }

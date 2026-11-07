@@ -1545,6 +1545,19 @@ async fn goal_tools_omit_or_accept_exact_local_instance_and_reject_invalid_remot
     assert_eq!(omitted["target"], local["target"]);
     assert_eq!(omitted["action"], local["action"]);
     assert_eq!(omitted["expected_version"], local["expected_version"]);
+    assert!(local.get("observed_goal_id").is_some());
+    assert!(local.get("instance_id").is_none());
+    let prepare_description = f
+        .runtime
+        .coordinator_tool_registry(&f.caller, None)
+        .await
+        .unwrap()
+        .definitions()
+        .into_iter()
+        .find(|definition| definition.name == "prepare_goal")
+        .unwrap()
+        .description;
+    assert!(prepare_description.contains("identifies the selected peer"));
     let before = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM conversation_goal_preparations WHERE owner_id=?",
     )
@@ -1562,6 +1575,46 @@ async fn goal_tools_omit_or_accept_exact_local_instance_and_reject_invalid_remot
         let output = f.invoke("prepare_goal", json!({"target":f.target(),"instance":selector,"action":{"operation":"create","objective":"no fallback"}})).await;
         assert!(!output.is_success());
     }
+    use phoenix_core::domain::instance_identity::{PeerBearerCredential, PeerTlsTrust};
+    let local_id = f.db.instance_id().await.unwrap();
+    f.db.save_federation_peer_connection(
+        local_id,
+        &"self-alias".parse().unwrap(),
+        &"https://self.invalid".parse().unwrap(),
+        &PeerBearerCredential::parse(format!("phx_peer_{}", "s".repeat(43))).unwrap(),
+        &PeerTlsTrust::PlatformRoots,
+    )
+    .await
+    .unwrap();
+    let work_before = f.work_counts().await;
+    let receipts_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_goal_coordinator_receipts")
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+    for selector in [local_id.to_string(), "self-alias".to_owned()] {
+        let prepare = f
+            .invoke(
+                "prepare_goal",
+                json!({"target":f.target(),"instance":selector,"action":{"operation":"create","objective":"never routed to self"}}),
+            )
+            .await;
+        assert!(!prepare.is_success(), "{}", prepare.output());
+        let apply = f
+            .invoke(
+                "apply_goal",
+                json!({"instance":selector,"action_reference":Uuid::new_v4()}),
+            )
+            .await;
+        assert!(!apply.is_success(), "{}", apply.output());
+    }
+    let receipts_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_goal_coordinator_receipts")
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(f.work_counts().await, work_before);
+    assert_eq!(receipts_after, receipts_before);
     let after = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM conversation_goal_preparations WHERE owner_id=?",
     )

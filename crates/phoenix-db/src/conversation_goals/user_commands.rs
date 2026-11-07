@@ -138,6 +138,30 @@ pub struct GoalUserReceipt {
     pub result: GoalUserResult,
 }
 
+/// Result of applying a remotely prepared Goal action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteGoalApplyOutcome {
+    /// A retained accepted or refused receipt for the referenced preparation.
+    Receipt(GoalUserReceipt),
+    /// The preparation expired before it could be claimed; no Goal mutation or receipt was made.
+    Expired {
+        /// The expired preparation's opaque action reference.
+        action_reference: Uuid,
+    },
+}
+
+impl From<GoalUserReceipt> for RemoteGoalApplyOutcome {
+    fn from(receipt: GoalUserReceipt) -> Self {
+        Self::Receipt(receipt)
+    }
+}
+
+impl RemoteGoalApplyOutcome {
+    fn from_result(result: Result<GoalUserReceipt>) -> Result<Self> {
+        result.map(Self::Receipt)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum GoalReceiptStore {
     Owner,
@@ -356,7 +380,7 @@ impl Database {
         host_gate_busy: bool,
         clock: impl FnOnce() -> Result<GoalTimestampUs>,
         on_authority_lost: F,
-    ) -> LocalAuthorityResult<Result<GoalUserReceipt>> {
+    ) -> LocalAuthorityResult<Result<RemoteGoalApplyOutcome>> {
         self.apply_remote_coordinator_goal_command_with_claim_commit(
             authority,
             reference,
@@ -381,7 +405,7 @@ impl Database {
         on_authority_lost: F,
         #[cfg(test)] claim_commit: super::prepared::RemoteGoalClaimCommitCut,
         #[cfg(test)] claim_pause: Option<super::prepared::RemoteGoalClaimPause>,
-    ) -> LocalAuthorityResult<Result<GoalUserReceipt>> {
+    ) -> LocalAuthorityResult<Result<RemoteGoalApplyOutcome>> {
         let mut claim_authority = super::control::ControlCommitAuthority::new(on_authority_lost);
         match self
             .claim_remote_coordinator_goal_preparation(
@@ -425,11 +449,28 @@ impl Database {
                     claim_authority.classified();
                 }
                 self.notify_goal_command_outcome(&result);
-                Self::without_goal_notification(result)
+                match Self::without_goal_notification(result) {
+                    LocalAuthorityResult::DurableFactEstablished(result) => {
+                        LocalAuthorityResult::DurableFactEstablished(
+                            RemoteGoalApplyOutcome::from_result(result),
+                        )
+                    }
+                    LocalAuthorityResult::DurableFactUnclassified => {
+                        LocalAuthorityResult::DurableFactUnclassified
+                    }
+                }
             }
             Ok(super::prepared::RemoteCoordinatorGoalClaim::Replay(receipt)) => {
                 claim_authority.classified();
-                LocalAuthorityResult::DurableFactEstablished(Ok(receipt))
+                LocalAuthorityResult::DurableFactEstablished(Ok(RemoteGoalApplyOutcome::Receipt(
+                    receipt,
+                )))
+            }
+            Ok(super::prepared::RemoteCoordinatorGoalClaim::Expired { action_reference }) => {
+                claim_authority.classified();
+                LocalAuthorityResult::DurableFactEstablished(Ok(RemoteGoalApplyOutcome::Expired {
+                    action_reference,
+                }))
             }
             Ok(super::prepared::RemoteCoordinatorGoalClaim::Unclassified) => {
                 LocalAuthorityResult::DurableFactUnclassified

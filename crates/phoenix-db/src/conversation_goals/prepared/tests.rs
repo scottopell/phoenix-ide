@@ -1,6 +1,16 @@
 use super::*;
-use crate::conversation_goals::user_commands::{GoalUserRefusal, GoalUserResult};
+use crate::conversation_goals::user_commands::{
+    GoalUserRefusal, GoalUserResult, RemoteGoalApplyOutcome,
+};
 use crate::conversation_goals::writer_tests::{at, counts, fixture, ordinary};
+
+#[test]
+fn remote_preparation_expiry_uses_exact_microsecond_boundary() {
+    let expiry = 1_700_000_000_123_456;
+    assert!(remote_preparation_expired(expiry, expiry));
+    assert!(remote_preparation_expired(expiry, expiry + 1));
+    assert!(!remote_preparation_expired(expiry, expiry - 1));
+}
 use phoenix_core::domain::db_schema::{InputOrigin, MessageContent};
 use phoenix_core::domain::instance_identity::FederationCredentialVerifier;
 use phoenix_core::domain::llm_types::ContentBlock;
@@ -472,6 +482,9 @@ async fn remote_preparation_reference_is_scoped_to_current_enrollment_peer() {
         .established()
         .unwrap()
         .unwrap();
+    let RemoteGoalApplyOutcome::Receipt(first_receipt) = first_receipt else {
+        panic!("newly admitted action must return its receipt");
+    };
     assert!(matches!(
         first_receipt.result,
         GoalUserResult::Accepted { .. }
@@ -556,6 +569,9 @@ async fn remote_preparation_reference_is_scoped_to_current_enrollment_peer() {
         .established()
         .unwrap()
         .unwrap();
+    let RemoteGoalApplyOutcome::Receipt(second_receipt) = second_receipt else {
+        panic!("newly admitted action must return its receipt");
+    };
     assert!(matches!(
         second_receipt.result,
         GoalUserResult::Accepted { .. }
@@ -611,8 +627,22 @@ async fn expired_remote_preparation_cannot_be_applied_before_a_receipt() {
         )
         .await
         .established()
+        .unwrap()
         .unwrap();
-    assert!(matches!(result, Err(GoalDbError::TargetChanged)));
+    assert_eq!(
+        result,
+        RemoteGoalApplyOutcome::Expired {
+            action_reference: expired,
+        }
+    );
+    let apply_state: String = sqlx::query_scalar(
+        "SELECT apply_state FROM conversation_goal_preparations WHERE reference=?",
+    )
+    .bind(expired.as_bytes().as_slice())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(apply_state, "prepared");
     let receipts: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM conversation_goal_coordinator_receipts WHERE preparation_reference=?",
     )
@@ -621,6 +651,12 @@ async fn expired_remote_preparation_cannot_be_applied_before_a_receipt() {
     .await
     .unwrap();
     assert_eq!(receipts, 0);
+    assert!(db.conversation_goal(&owner).await.unwrap().is_none());
+    assert!(db
+        .conversation_goal_history(&owner, GoalVersion::INITIAL)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -679,6 +715,9 @@ async fn expired_remote_preparation_replays_retained_receipt() {
         .established()
         .unwrap()
         .unwrap();
+    let RemoteGoalApplyOutcome::Receipt(replay) = replay else {
+        panic!("retained receipt must replay after expiry");
+    };
     assert_eq!(replay.request_id, expired);
     assert_eq!(
         replay.result,
@@ -704,7 +743,9 @@ async fn expired_remote_preparation_replays_retained_receipt() {
     ] {
         match classified.unwrap() {
             RemoteCoordinatorGoalClaim::Replay(receipt) => assert_eq!(receipt, replay),
-            RemoteCoordinatorGoalClaim::Claimed(_) | RemoteCoordinatorGoalClaim::Unclassified => {
+            RemoteCoordinatorGoalClaim::Claimed(_)
+            | RemoteCoordinatorGoalClaim::Expired { .. }
+            | RemoteCoordinatorGoalClaim::Unclassified => {
                 panic!("retained receipt must win over a claimed or expired preparation")
             }
         }
@@ -901,6 +942,9 @@ async fn remote_claimed_action_survives_enrollment_change(replace: bool) {
     let LocalAuthorityResult::DurableFactEstablished(Ok(receipt)) = result else {
         panic!("admitted Goal action must finish after enrollment changes: {result:?}");
     };
+    let RemoteGoalApplyOutcome::Receipt(receipt) = receipt else {
+        panic!("claimed action must return its receipt");
+    };
     assert_eq!(receipt.request_id, reference);
     assert_eq!(callback_count.load(Ordering::SeqCst), 0);
     assert_eq!(
@@ -1027,6 +1071,9 @@ async fn rolled_back_remote_claim_is_proven_prepared_and_can_be_applied_once() {
         .established()
         .unwrap()
         .unwrap();
+    let RemoteGoalApplyOutcome::Receipt(receipt) = receipt else {
+        panic!("retry after rollback must return its receipt");
+    };
     assert!(matches!(receipt.result, GoalUserResult::Accepted { .. }));
     assert_eq!(
         db.conversation_goal_history(&owner, GoalVersion::INITIAL)
@@ -1110,6 +1157,9 @@ async fn remote_disabled_auto_continue_is_a_terminal_replayable_rejection() {
         .established()
         .unwrap()
         .unwrap();
+    let RemoteGoalApplyOutcome::Receipt(receipt) = receipt else {
+        panic!("classified refusal must return its receipt");
+    };
     assert_eq!(
         receipt.result,
         GoalUserResult::Rejected {
@@ -1136,7 +1186,7 @@ async fn remote_disabled_auto_continue_is_a_terminal_replayable_rejection() {
         .established()
         .unwrap()
         .unwrap(),
-        receipt
+        RemoteGoalApplyOutcome::Receipt(receipt.clone())
     );
     assert_eq!(counts(&db).await, before);
     assert!(db.conversation_goal(&owner).await.unwrap().is_none());
@@ -1188,6 +1238,9 @@ async fn remote_apply_retains_receipt_and_history_decodes_remote_coordinator() {
         .established()
         .unwrap()
         .unwrap();
+    let RemoteGoalApplyOutcome::Receipt(first) = first else {
+        panic!("applied action must return its receipt");
+    };
     assert!(matches!(&first.result, GoalUserResult::Accepted { .. }));
     match db
         .claim_remote_coordinator_goal_preparation(
@@ -1199,7 +1252,9 @@ async fn remote_apply_retains_receipt_and_history_decodes_remote_coordinator() {
         .unwrap()
     {
         RemoteCoordinatorGoalClaim::Replay(receipt) => assert_eq!(receipt, first),
-        RemoteCoordinatorGoalClaim::Claimed(_) | RemoteCoordinatorGoalClaim::Unclassified => {
+        RemoteCoordinatorGoalClaim::Claimed(_)
+        | RemoteCoordinatorGoalClaim::Expired { .. }
+        | RemoteCoordinatorGoalClaim::Unclassified => {
             panic!("a receipt committed after an empty preflight must win claim arbitration")
         }
     }
@@ -1221,7 +1276,7 @@ async fn remote_apply_retains_receipt_and_history_decodes_remote_coordinator() {
         .established()
         .unwrap()
         .unwrap();
-    assert_eq!(replay, first);
+    assert_eq!(replay, RemoteGoalApplyOutcome::Receipt(first));
     let history = db
         .conversation_goal_history(&owner, GoalVersion::INITIAL)
         .await

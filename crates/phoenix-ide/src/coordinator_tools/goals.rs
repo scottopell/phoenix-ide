@@ -142,7 +142,7 @@ impl super::instance::RoutedTool for GoalTool {
     }
     fn description(&self) -> String {
         match self.operation {
-            Operation::Prepare => "Prepare an immutable Goal action against the observed saved Goal. Coordinator only. create refuses an existing Goal; replace is an explicit new Goal identity retaining old history; state updates disposition. Applying create/replace requires the target's persisted autoContinue preference to be explicitly enabled; preparation does not enable it. Returns a server-created action_reference and frozen expected version/Goal identity. Review this observation, then pass only action_reference to apply_goal. Never invent UUIDs or versions. A conflict requires deliberate reconsideration, NOT reread-and-overwrite/reprepare. No automatic scheduling, Start/Stop, Suspended disposition, or Suspended reactivation.",
+            Operation::Prepare => "Prepare an immutable Goal action against the observed saved Goal. Coordinator only. create refuses an existing Goal; replace is an explicit new Goal identity retaining old history; state updates disposition. Applying create/replace requires the target's persisted autoContinue preference to be explicitly enabled; preparation does not enable it. Returns a server-created action_reference. Remote preparation also returns an expiry and identifies the selected peer without exposing its observation; local preparation returns the frozen expected version/Goal identity. Review the returned information, then pass only action_reference to apply_goal using the same instance selector. Never invent UUIDs or versions. A conflict requires deliberate reconsideration, NOT reread-and-overwrite/reprepare. No automatic scheduling, Start/Stop, Suspended disposition, or Suspended reactivation.",
             Operation::Apply => "Apply or reconcile a previously prepared Goal action by its server-issued action_reference. Coordinator only. Never accepts target, version, authority, or replacement content. Exact retries replay the immutable accepted or refused receipt, including across restart/Coordinator continuation. New create/replace requires the target's persisted autoContinue preference to be explicitly enabled; refusal does not enable it or dispatch work. On conflict or busy refusal do NOT blindly prepare another action; read Goal/history and reconsider explicitly. Does not dispatch or schedule work, Start/Stop, or reactivate Suspended Goals.",
         }.to_owned()
     }
@@ -358,7 +358,8 @@ impl GoalTool {
             "Missing server-bound assistant/tool invocation; cannot prepare a Goal action",
         )?;
         let turn_id = ctx.direct_turn_id().ok_or("Goal preparation requires server-bound durable turn provenance; caller-supplied execution IDs are refused")?;
-        let (reference, observed, version, intent, expires_at_us) = match route {
+        let selected_intent = args.action.clone();
+        let (reference, observation, intent, expires_at_us, remote_instance_id) = match route {
             super::instance::Route::Local => {
                 let action = self
                     .service
@@ -373,13 +374,15 @@ impl GoalTool {
                     .map_err(|error| self.refusal(error))?;
                 (
                     action.reference,
-                    action.observed_goal_id,
-                    action.expected_version,
+                    Some((action.observed_goal_id, action.expected_version)),
                     action.intent,
+                    None,
                     None,
                 )
             }
             super::instance::Route::Remote(peer) => {
+                let remote_instance_id = peer.instance_id();
+                let remote_intent = selected_intent;
                 let runtime = Arc::clone(&self.runtime);
                 let service = self.service.clone();
                 let coordinator = ctx.conversation_id.clone();
@@ -399,7 +402,7 @@ impl GoalTool {
                         runtime.db(),
                         &peer,
                         owner,
-                        args.action,
+                        remote_intent.clone(),
                         source,
                     )
                     .await
@@ -410,10 +413,10 @@ impl GoalTool {
                         .map_err(GoalTool::refusal_message)?;
                     Ok::<_, String>((
                         action.action_reference,
-                        action.observed_goal_id,
-                        action.expected_version,
-                        action.intent,
+                        None,
+                        remote_intent,
                         Some(action.expires_at_us),
+                        Some(remote_instance_id),
                     ))
                 })
                 .await
@@ -422,9 +425,21 @@ impl GoalTool {
                 })??
             }
         };
-        let mut output = json!({"action_reference":reference,"target":args.target,"observed_goal_id":observed,"expected_version":version,"action":intent,"next_tool":"apply_goal","note":"Frozen observation only; Goal unchanged. Review before applying. Replacement creates a new Goal ID and preserves history."});
+        let note = if remote_instance_id.is_some() {
+            "Destination persisted a frozen preparation; its observation is intentionally opaque. Apply only with this reference and selected peer."
+        } else {
+            "Frozen observation only; Goal unchanged. Review before applying. Replacement creates a new Goal ID and preserves history."
+        };
+        let mut output = json!({"action_reference":reference,"target":args.target,"action":intent,"next_tool":"apply_goal","note":note});
+        if let Some((observed, version)) = observation {
+            output["observed_goal_id"] = json!(observed);
+            output["expected_version"] = json!(version);
+        }
         if let Some(expires_at_us) = expires_at_us {
             output["expires_at_us"] = json!(expires_at_us);
+        }
+        if let Some(instance_id) = remote_instance_id {
+            output["instance_id"] = json!(instance_id);
         }
         Ok(output)
     }
@@ -435,19 +450,27 @@ impl GoalTool {
         ctx: &ToolContext,
         route: super::instance::Route<crate::api::federation::ResolvedPeer>,
     ) -> Result<ToolOutput, String> {
+        enum ApplyRecord {
+            Receipt(Value),
+            Expired(Value),
+        }
+
         let args: ApplyInput =
             serde_json::from_value(input).map_err(|error| self.bad_input(&error))?;
-        let (accepted, receipt) = match route {
+        let (accepted, record, next_action) = match route {
             super::instance::Route::Local => {
                 let receipt = self
                     .service
                     .apply_prepared(&ctx.conversation_id, args.action_reference)
                     .await
                     .map_err(|error| self.refusal(error))?;
-                (
-                    matches!(receipt.result, GoalUserResult::Accepted { .. }),
-                    json!(receipt),
-                )
+                let accepted = matches!(receipt.result, GoalUserResult::Accepted { .. });
+                let next_action = if accepted {
+                    "No dispatch performed. Use read_goal to inspect history."
+                } else {
+                    "Retained refusal: same reference will return the same refusal. Read current Goal/history and explicitly reconsider; do not automatically reprepare."
+                };
+                (accepted, ApplyRecord::Receipt(json!(receipt)), next_action)
             }
             super::instance::Route::Remote(peer) => {
                 let source_call = ctx.source_tool_call().ok_or(
@@ -483,23 +506,47 @@ impl GoalTool {
                         .authorize_coordinator(&coordinator)
                         .await
                         .map_err(GoalTool::refusal_message)?;
-                    let accepted = matches!(
-                        response.result,
-                        crate::api::federation::RemoteGoalApplyClassification::Accepted {}
+                    let (accepted, next_action) = match &response.result {
+                        crate::api::federation::RemoteGoalApplyClassification::Accepted {} => (
+                            true,
+                            "No dispatch performed. Use read_goal to inspect history.",
+                        ),
+                        crate::api::federation::RemoteGoalApplyClassification::Rejected { .. } => (
+                            false,
+                            "Retained refusal: same reference will return the same refusal. Read current Goal/history and explicitly reconsider; do not automatically reprepare.",
+                        ),
+                        crate::api::federation::RemoteGoalApplyClassification::Expired {} => (
+                            false,
+                            "Preparation expired without changing the Goal or creating a receipt. Prepare a new explicit action before applying.",
+                        ),
+                    };
+                    let expired = matches!(
+                        &response.result,
+                        crate::api::federation::RemoteGoalApplyClassification::Expired {}
                     );
-                    Ok::<_, String>((
-                        accepted,
-                        json!({
-                            "action_reference":response.action_reference,
-                            "result":response.result
-                        }),
-                    ))
+                    let value = json!({
+                        "action_reference":response.action_reference,
+                        "result":response.result
+                    });
+                    let record = if expired {
+                        ApplyRecord::Expired(value)
+                    } else {
+                        ApplyRecord::Receipt(value)
+                    };
+                    Ok::<_, String>((accepted, record, next_action))
                 })
                 .await
                 .map_err(|error| format!("apply_goal remote operation did not settle: {error}"))??
             }
         };
-        let value = json!({"action_reference":args.action_reference,"receipt":receipt,"next_action":if accepted {"No dispatch performed. Use read_goal to inspect history."} else {"Retained refusal: same reference will return the same refusal. Read current Goal/history and explicitly reconsider; do not automatically reprepare."}});
+        let mut value = json!({
+            "action_reference": args.action_reference,
+            "next_action": next_action
+        });
+        match record {
+            ApplyRecord::Receipt(receipt) => value["receipt"] = receipt,
+            ApplyRecord::Expired(outcome) => value["outcome"] = outcome,
+        }
         let output = serde_json::to_string(&value).map_err(|error| error.to_string())?;
         Ok(if accepted {
             ToolOutput::success(output)

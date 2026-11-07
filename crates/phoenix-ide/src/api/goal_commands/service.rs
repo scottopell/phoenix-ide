@@ -9,7 +9,7 @@ use phoenix_core::domain::conversation_goal::{
 };
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use phoenix_db::conversation_goals::user_commands::{
-    GoalUserChange, GoalUserCommand, GoalUserReceipt,
+    GoalUserChange, GoalUserCommand, GoalUserReceipt, RemoteGoalApplyOutcome,
 };
 use phoenix_db::conversation_goals::{CoordinatorGoalWaitRequest, CoordinatorGoalWaitResult};
 
@@ -284,7 +284,7 @@ impl GoalCommandService {
         &self,
         authority: &phoenix_db::FederationSendAuthority,
         reference: uuid::Uuid,
-    ) -> Result<(PreparedGoalAction, GoalUserReceipt), AppError> {
+    ) -> Result<(PreparedGoalAction, RemoteGoalApplyOutcome), AppError> {
         let _action_gate = self.runtime.lock_remote_goal_apply(reference).await;
         let admission = self
             .runtime
@@ -300,7 +300,7 @@ impl GoalCommandService {
             .await
             .map_err(goal_error)?
         {
-            return self.publication_result(Ok((action, receipt)));
+            return self.publication_result(Ok((action, RemoteGoalApplyOutcome::Receipt(receipt))));
         }
         let clock = || {
             GoalTimestampUs::parse(chrono::Utc::now().timestamp_micros())
@@ -316,11 +316,11 @@ impl GoalCommandService {
             .await
         else {
             let pass = RemoteGoalApplyAuthorityPass::new(admission);
-            let receipt = pass.complete(
+            let outcome = pass.complete(
                 db.apply_remote_coordinator_goal_command(authority, reference, true, clock, lost)
                     .await,
             )?;
-            return self.publication_result(Ok((action, receipt)));
+            return self.publication_result(Ok((action, outcome)));
         };
         let transcript = db
             .get_ordinary_product_conversation(&action.owner)
@@ -329,7 +329,7 @@ impl GoalCommandService {
             .latest_transcript_row_id;
         let acceptance = self.runtime.try_lock_message_acceptance(&transcript).await;
         let pass = RemoteGoalApplyAuthorityPass::new(admission);
-        let receipt = pass.complete(
+        let outcome = pass.complete(
             db.apply_remote_coordinator_goal_command(
                 authority,
                 reference,
@@ -339,7 +339,7 @@ impl GoalCommandService {
             )
             .await,
         )?;
-        self.publication_result(Ok((action, receipt)))
+        self.publication_result(Ok((action, outcome)))
     }
 
     pub(crate) async fn prepare_coordinator(
