@@ -239,6 +239,7 @@ fn trusted_prefix_state(cancelling: bool) -> (ConvState, AssistantMessage, ToolC
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // The fault matrix shares one durable-state and no-message-write oracle.
 async fn malformed_restart_rounds_retain_durable_state_and_write_no_messages() {
     for cancelling in [false, true] {
         for fault in [

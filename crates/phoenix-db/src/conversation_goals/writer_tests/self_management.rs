@@ -289,7 +289,7 @@ async fn no_policy_installers_allow_canonical_enable_then_create() {
 #[tokio::test]
 async fn first_control_initialization_invalidates_operations_admitted_without_control() {
     let db = Database::open_in_memory().await.unwrap();
-    let mut round = SelfRound::with_preference(
+    let round = SelfRound::with_preference(
         &db,
         "first-control-initialization",
         vec![SelfGoalOperation::EnableAutoContinuation, create()],
@@ -892,4 +892,32 @@ async fn retained_self_results_validate_full_canonical_shape_and_pending_evidenc
         assert!(round.commit(&db, true).await.is_err(), "{field}");
         assert_eq!(effect_counts(&db).await, counts);
     }
+}
+
+#[tokio::test]
+async fn deleting_ordinary_conversation_cascades_its_runtime_admission() {
+    let db = Database::open_in_memory().await.unwrap();
+    let (transcript, _owner) = ordinary(&db, "delete-admitted-conversation").await;
+    let execution = accept_execution(
+        &db.workflow_repository(),
+        &runtime_input(&transcript, "delete-turn"),
+    )
+    .await;
+
+    let admission_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ordinary_self_goal_admissions WHERE turn_id=?")
+            .bind(execution.turn_id())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(admission_count, 1, "the accepted ordinary turn is admitted");
+
+    db.delete_conversation(&transcript).await.unwrap();
+
+    let remaining_admissions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ordinary_self_goal_admissions")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(remaining_admissions, 0);
 }

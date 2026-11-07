@@ -14352,6 +14352,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Historical topology cases share the same preservation checks.
     async fn historical_continuation_preserves_unproven_or_ambiguous_openings() {
         // Rows precede migration 100's consume trigger; malformed topology is negative preservation evidence.
         let cases = [

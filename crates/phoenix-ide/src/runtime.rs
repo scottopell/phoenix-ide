@@ -15333,7 +15333,7 @@ mod scope_liveness_tests {
                         ),
                     ),
                     remaining_tools: Vec::new(),
-                    completed_results: Vec::<ToolRoundResult>::new(),
+                    completed_results: vec![],
                     pending_sub_agents: Vec::new(),
                     assistant_message: AssistantMessage::new(
                         "restart-assistant-tool-use".to_string(),
@@ -15478,7 +15478,7 @@ mod scope_liveness_tests {
                         }),
                     ),
                     remaining_tools: Vec::new(),
-                    completed_results: Vec::<ToolRoundResult>::new(),
+                    completed_results: vec![],
                     pending_sub_agents: Vec::new(),
                     assistant_message: AssistantMessage::new(
                         "older-assistant".to_string(),
@@ -15837,7 +15837,7 @@ mod scope_liveness_tests {
                         ),
                     ),
                     remaining_tools: Vec::new(),
-                    completed_results: Vec::<ToolRoundResult>::new(),
+                    completed_results: vec![],
                     pending_sub_agents: Vec::new(),
                     assistant_message: AssistantMessage::new(
                         "global-deploy-assistant".to_string(),

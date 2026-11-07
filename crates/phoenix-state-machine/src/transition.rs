@@ -4622,6 +4622,7 @@ pub fn llm_error_to_db_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use phoenix_core::domain::db_schema::ToolOutcome;
     use phoenix_core::domain::llm_types::ContentBlock;
     use std::path::PathBuf;
 
@@ -4658,7 +4659,9 @@ mod tests {
         }
     }
 
+    // This regression follows one pending result through success, cancellation, and recovery.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn pending_self_goal_is_carried_until_the_whole_round_checkpoint() {
         let ctx = test_context();
         let tool = |id: &str| {
@@ -4688,11 +4691,11 @@ mod tests {
         let pending = pending_self_goal("goal");
         let first = transition(
             &state,
+            &ctx,
             Event::ToolRoundComplete {
                 tool_use_id: "goal".into(),
                 result: pending.clone(),
             },
-            &ctx,
         )
         .unwrap();
         let ConvState::ToolExecuting {
@@ -4701,7 +4704,7 @@ mod tests {
         else {
             panic!("expected next tool");
         };
-        assert_eq!(completed_results, &[pending.clone()]);
+        assert_eq!(completed_results, std::slice::from_ref(&pending));
         assert!(!first
             .effects
             .iter()
@@ -4711,19 +4714,19 @@ mod tests {
         assert_eq!(restored, first.new_state);
         let cancelling = transition(
             &restored,
+            &ctx,
             Event::UserCancel {
                 reason: None,
                 cause: CancelCause::UserRequested,
             },
-            &ctx,
         )
         .unwrap();
         let aborted = transition(
             &cancelling.new_state,
+            &ctx,
             Event::ToolAborted {
                 tool_use_id: "other".into(),
             },
-            &ctx,
         )
         .unwrap();
         let terminal_round = aborted
@@ -4740,6 +4743,7 @@ mod tests {
         assert!(terminal_round.results()[1].finalized().unwrap().is_error());
         let second = transition(
             &restored,
+            &ctx,
             Event::ToolComplete {
                 tool_use_id: "other".into(),
                 result: ToolResult {
@@ -4750,7 +4754,6 @@ mod tests {
                     duration_ms: None,
                 },
             },
-            &ctx,
         )
         .unwrap();
         let round = second
@@ -4778,11 +4781,11 @@ mod tests {
         .is_err());
         assert!(transition(
             &ConvState::Idle,
+            &test_context(),
             Event::ToolRoundComplete {
                 tool_use_id: "different".into(),
                 result: pending
-            },
-            &test_context()
+            }
         )
         .is_err());
     }
