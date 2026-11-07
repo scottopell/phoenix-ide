@@ -18,8 +18,20 @@ entity Admission {
     executing_tools: Boolean
 }
 
+entity CheckpointRound {
+    operations: Operation with round = this
+    mixed_operations: operations.any(operation => operation.kind = enable)
+        and operations.any(operation => operation.kind = create)
+
+    @invariant CanonicalSource
+        -- Membership is the complete own-management operation set from one canonical
+        -- assistant tool round. Source and integrity failures abort the transaction.
+        -- Classification applies only on first application, after retained replay.
+}
+
 entity Operation {
     admission: Admission
+    round: CheckpointRound
     kind: enable | create
     state: pending | accepted | refused
     source_matches: Boolean
@@ -58,6 +70,7 @@ rule AcceptEnable {
     requires:
         operation.state = pending
         operation.kind = enable
+        not operation.round.mixed_operations
         operation.source_matches
         operation.admission.live_current_ordinary_execution
         operation.admission.generation_matches
@@ -76,6 +89,7 @@ rule AcceptCreate {
     requires:
         operation.state = pending
         operation.kind = create
+        not operation.round.mixed_operations
         operation.source_matches
         operation.admission.live_current_ordinary_execution
         operation.admission.generation_matches
@@ -89,4 +103,30 @@ rule AcceptCreate {
         operation.admission.owner.goal_exists = true
         operation.state = accepted
         operation.canonical_result_retained = true
+}
+
+rule RefuseMixedOperations {
+    when: Checkpoint(operation)
+    requires:
+        operation.state = pending
+        not operation.canonical_result_retained
+        operation.round.mixed_operations
+        operation.source_matches
+        operation.admission.live_current_ordinary_execution
+        operation.admission.generation_matches
+        operation.admission.controls_allow
+        operation.admission.open_current_transcript
+        operation.admission.executing_tools
+        operation.admission.disable_epoch = operation.admission.owner.disable_epoch
+    ensures:
+        operation.state = refused
+        operation.canonical_result_retained = true
+
+    @guidance
+        -- Every own-management intent in the mixed round receives the refusal
+        -- mixed_self_goal_operations without Goal or preference mutation, regardless
+        -- of initial preference or order. Admission and human-control refusals retain
+        -- precedence. Other tool results remain in the same atomic checkpoint.
+        -- Exact retained evidence replays before first-application classification;
+        -- integrity failures still abort rather than becoming semantic refusals.
 }

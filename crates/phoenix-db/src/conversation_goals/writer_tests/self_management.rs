@@ -14,6 +14,7 @@ use phoenix_core::domain::provider_replay::{
 };
 use phoenix_core::domain::sm_state::{AssistantMessage, ConvState, ToolCall, ToolInput};
 
+#[derive(Clone)]
 struct SelfRound {
     transcript: String,
     owner: ProductConversationId,
@@ -422,6 +423,214 @@ async fn off_create_refuses_then_enable_then_create_in_separate_rounds_without_d
 }
 
 #[tokio::test]
+async fn mixed_self_goal_rounds_refuse_every_intent_without_mutation() {
+    for initially_enabled in [false, true] {
+        for create_first in [false, true] {
+            let db = fixture().await;
+            let operations = if create_first {
+                vec![create(), SelfGoalOperation::EnableAutoContinuation]
+            } else {
+                vec![SelfGoalOperation::EnableAutoContinuation, create()]
+            };
+            let round =
+                SelfRound::with_preference(&db, "mixed-round", operations, initially_enabled).await;
+            let before = effect_counts(&db).await;
+            let results = round.commit(&db, false).await.unwrap().results;
+            assert_eq!(results.len(), 2);
+            for result in &results {
+                assert_eq!(status(result)["status"], "refused");
+                assert_eq!(status(result)["reason"], "mixed_self_goal_operations");
+            }
+            assert_eq!(enabled(&db, &round.owner).await, initially_enabled);
+            assert!(db.conversation_goal(&round.owner).await.unwrap().is_none());
+            let after = effect_counts(&db).await;
+            assert_eq!((after.0, after.1, after.2), (before.0, before.1, before.2));
+        }
+    }
+}
+
+#[tokio::test]
+async fn refused_mixed_round_replays_its_receipt_after_preference_changes() {
+    let db = fixture().await;
+    let round = SelfRound::with_preference(
+        &db,
+        "mixed-replay",
+        vec![SelfGoalOperation::EnableAutoContinuation, create()],
+        false,
+    )
+    .await;
+    let first = round.commit(&db, true).await.unwrap();
+    assert_eq!(
+        status(&first.results[0])["reason"],
+        "mixed_self_goal_operations"
+    );
+    db.set_auto_continue_on_context_exhaustion(
+        &round.owner,
+        crate::AutoContinueOnContextExhaustion::Enabled,
+    )
+    .await
+    .unwrap();
+    db.set_auto_continue_on_context_exhaustion(
+        &round.owner,
+        crate::AutoContinueOnContextExhaustion::Disabled,
+    )
+    .await
+    .unwrap();
+    let counts = effect_counts(&db).await;
+    let replayed = round.commit(&db, true).await.unwrap();
+    assert!(replayed.replayed);
+    assert_eq!(
+        serde_json::to_value(&replayed.results).unwrap(),
+        serde_json::to_value(&first.results).unwrap()
+    );
+    assert!(!enabled(&db, &round.owner).await);
+    assert_eq!(effect_counts(&db).await, counts);
+
+    let mut changed_source = round;
+    let MessageContent::Agent(blocks) = &mut changed_source.assistant.content else {
+        unreachable!()
+    };
+    let ContentBlock::ToolUse { input, .. } = &mut blocks[0] else {
+        unreachable!()
+    };
+    *input = serde_json::json!({"unexpected":true});
+    assert!(changed_source.commit(&db, true).await.is_err());
+    assert_eq!(effect_counts(&db).await, counts);
+}
+
+#[tokio::test]
+async fn mixed_self_goal_checkpoint_cut_preserves_atomic_refusal_and_retry() {
+    for cut in [
+        CanonicalCommitCut::BeforeCanonicalCommit,
+        CanonicalCommitCut::AfterCanonicalCommit,
+    ] {
+        let db = Database::open(":memory:").await.unwrap();
+        crate::run_pending_migrations(db.pool()).await.unwrap();
+        let round = SelfRound::with_preference(
+            &db,
+            "mixed-cut",
+            vec![SelfGoalOperation::EnableAutoContinuation, create()],
+            false,
+        )
+        .await;
+        let before = effect_counts(&db).await;
+        let state_before: (String, String) =
+            sqlx::query_as("SELECT state,state_updated_at FROM conversations WHERE id=?")
+                .bind(&round.transcript)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let cut_error = round.cut(&db, cut).await.err().unwrap().to_string();
+        let expected_cut = match cut {
+            CanonicalCommitCut::BeforeCanonicalCommit => "injected before canonical commit",
+            CanonicalCommitCut::AfterCanonicalCommit => "injected after canonical commit",
+        };
+        assert!(cut_error.contains(expected_cut), "{cut_error}");
+        let after = effect_counts(&db).await;
+        let retained = matches!(cut, CanonicalCommitCut::AfterCanonicalCommit);
+        assert_eq!((after.0, after.1, after.2), (before.0, before.1, before.2));
+        assert_eq!(after.3, before.3 + i64::from(retained));
+        assert!(!enabled(&db, &round.owner).await);
+        if !retained {
+            assert!(db.get_messages(&round.transcript).await.unwrap().is_empty());
+            assert!(db
+                .load_provider_replay_state(&round.transcript)
+                .await
+                .unwrap()
+                .is_none());
+            let state_after: (String, String) =
+                sqlx::query_as("SELECT state,state_updated_at FROM conversations WHERE id=?")
+                    .bind(&round.transcript)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(state_after, state_before);
+        }
+        let retry = round.commit(&db, true).await.unwrap();
+        assert_eq!(retry.replayed, retained);
+        assert!(retry
+            .results
+            .iter()
+            .all(|result| { status(result)["reason"] == "mixed_self_goal_operations" }));
+        let committed = effect_counts(&db).await;
+        assert_eq!(committed.3, before.3 + 1);
+        let selected_state: (String, String) =
+            sqlx::query_as("SELECT state,state_updated_at FROM conversations WHERE id=?")
+                .bind(&round.transcript)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            selected_state,
+            (
+                serde_json::to_string(&ConvState::Idle).unwrap(),
+                round.timestamp.to_rfc3339()
+            )
+        );
+        let ProviderReplayUpdate::Anthropic(expected_replay) = round.replay() else {
+            unreachable!()
+        };
+        assert_eq!(
+            db.load_provider_replay_state(&round.transcript)
+                .await
+                .unwrap()
+                .unwrap()
+                .response_sets,
+            vec![expected_replay]
+        );
+        let messages = db.get_messages(&round.transcript).await.unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(!enabled(&db, &round.owner).await);
+        assert!(db.conversation_goal(&round.owner).await.unwrap().is_none());
+        assert!(round.commit(&db, true).await.unwrap().replayed);
+        assert_eq!(effect_counts(&db).await, committed);
+    }
+}
+
+#[tokio::test]
+async fn malformed_later_mixed_source_rolls_back_first_application() {
+    let db = fixture().await;
+    let mut round = SelfRound::with_preference(
+        &db,
+        "mixed-malformed-later",
+        vec![SelfGoalOperation::EnableAutoContinuation, create()],
+        false,
+    )
+    .await;
+    let ToolRoundResult::PendingSelfGoal { pending, .. } = &mut round.results[1] else {
+        unreachable!()
+    };
+    pending.operation = SelfGoalOperation::Create {
+        objective: text("mismatched later objective"),
+    };
+    let before = effect_counts(&db).await;
+    let message_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let error = round.commit(&db, false).await.err().unwrap().to_string();
+    assert!(
+        error.contains("self-goal source name or arguments"),
+        "{error}"
+    );
+    assert_eq!(effect_counts(&db).await, before);
+    let after_message_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(after_message_count, message_count);
+    assert!(!enabled(&db, &round.owner).await);
+    assert!(db.conversation_goal(&round.owner).await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn repeated_human_false_and_aba_disable_win_and_refused_receipts_remain_permanent() {
     for aba in [false, true] {
         for replay in [false, true] {
@@ -753,14 +962,7 @@ async fn every_existing_goal_disposition_refuses_creation_and_enable_does_not_re
             .await
             .unwrap();
         }
-        let round = SelfRound::admit(
-            &db,
-            transcript,
-            owner,
-            "existing-turn",
-            vec![create(), SelfGoalOperation::EnableAutoContinuation],
-        )
-        .await;
+        let round = SelfRound::admit(&db, transcript, owner, "existing-turn", vec![create()]).await;
         let before = db.conversation_goal(&round.owner).await.unwrap();
         let counts = effect_counts(&db).await;
         let committed = round.commit(&db, true).await.unwrap();
@@ -768,12 +970,23 @@ async fn every_existing_goal_disposition_refuses_creation_and_enable_does_not_re
             status(&committed.results[0])["reason"],
             "goal_already_exists"
         );
+        let mut enable = round.clone();
+        enable
+            .next(
+                &db,
+                "existing-goal-enable",
+                vec![SelfGoalOperation::EnableAutoContinuation],
+            )
+            .await;
+        assert_eq!(enable.execution, round.execution);
+        let enabled_result = enable.commit(&db, true).await.unwrap();
         assert_eq!(
-            status(&committed.results[1])["status"],
+            status(&enabled_result.results[0])["status"],
             "auto_continuation_enabled"
         );
         assert_eq!(db.conversation_goal(&round.owner).await.unwrap(), before);
         assert!(round.commit(&db, true).await.unwrap().replayed);
+        assert!(enable.commit(&db, true).await.unwrap().replayed);
         let after = effect_counts(&db).await;
         assert_eq!((after.0, after.1, after.2), (counts.0, counts.1, counts.2));
     }

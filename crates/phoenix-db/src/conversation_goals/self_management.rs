@@ -126,12 +126,19 @@ pub(super) async fn verify_source(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum SelfGoalRoundAdmission {
+    SeparateOperations,
+    MixedOperations,
+}
+
 #[allow(clippy::too_many_lines)] // One transaction validates admission and applies the operation atomically.
 pub(super) async fn finalize(
     tx: &mut GoalTx<'_>,
     pending: &PendingSelfGoal,
     duration_ms: Option<u64>,
     policies: super::execution::GoalWritePolicies,
+    round_admission: SelfGoalRoundAdmission,
 ) -> Result<(ToolResult, Option<super::GoalVersionCommittedNotification>)> {
     let row = sqlx::query("SELECT p.kind,p.ordinary_lifecycle,p.auto_continue_on_context_exhaustion AS enabled,
         p.auto_continue_disable_epoch AS epoch,c.state,c.continued_in_conv_id,
@@ -193,7 +200,10 @@ pub(super) async fn finalize(
     {
         Some("human_disable_since_admission")
     } else {
-        None
+        match round_admission {
+            SelfGoalRoundAdmission::SeparateOperations => None,
+            SelfGoalRoundAdmission::MixedOperations => Some("mixed_self_goal_operations"),
+        }
     };
     let mut notification = None;
     let output = if let Some(reason) = refusal {
