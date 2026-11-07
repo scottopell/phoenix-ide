@@ -24,6 +24,20 @@ entity Operation {
     state: pending | accepted | refused
     source_matches: Boolean
     canonical_result_retained: Boolean
+    @invariant AtomicCheckpoint
+        -- Effect or semantic refusal, retained tool result, selected state and carried
+        -- provider replay, task proposal or terminal obligation commit atomically.
+        -- Source and storage integrity failures abort the checkpoint, not a tool refusal.
+
+    @invariant ImmutableReplay
+        -- A retained accepted or refused result is historical and immutable. Exact replay
+        -- does not reapply the effect, refresh admission, or overwrite a later disable.
+        -- Changed source, arguments, authority or canonical evidence rejects replay.
+
+    @invariant NoExecutionAuthority
+        -- These operations cannot dispatch work, release Stop or pause, rearm exhaustion,
+        -- reactivate a Goal, change current-turn Goal binding, expand scope, or target
+        -- another conversation. Create never enables automation; enable never creates.
 }
 
 rule ExplicitDisable {
@@ -75,22 +89,4 @@ rule AcceptCreate {
         operation.admission.owner.goal_exists = true
         operation.state = accepted
         operation.canonical_result_retained = true
-}
-
-@invariant AtomicCheckpoint {
-    Effect or semantic refusal, retained tool result, selected state and carried
-    provider replay, task proposal or terminal obligation commit atomically.
-    Source and storage integrity failures abort the checkpoint, not a tool refusal.
-}
-
-@invariant ImmutableReplay {
-    A retained accepted or refused result is historical and immutable. Exact replay
-    does not reapply the effect, refresh admission, or overwrite a later disable.
-    Changed source, arguments, authority or canonical evidence rejects replay.
-}
-
-@invariant NoExecutionAuthority {
-    These operations cannot dispatch work, release Stop or pause, rearm exhaustion,
-    reactivate a Goal, change current-turn Goal binding, expand scope, or target
-    another conversation. Create never enables automation; enable never creates.
 }

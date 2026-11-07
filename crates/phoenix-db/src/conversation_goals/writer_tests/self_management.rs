@@ -511,10 +511,7 @@ async fn stale_generation_stop_pause_close_and_continuation_refuse_without_effec
             "admission-generation" => {
                 sqlx::query("UPDATE ordinary_self_goal_admissions SET generation=generation+1 WHERE turn_id=?").bind(round.execution.turn_id()).execute(db.pool()).await.unwrap();
             }
-            "admission-control" => {
-                sqlx::query("UPDATE conversation_goal_control_bindings SET control_version=control_version+1 WHERE turn_id=?").bind(round.execution.turn_id()).execute(db.pool()).await.unwrap();
-            }
-            "stop" => {
+            "admission-control" | "stop" => {
                 let current = db
                     .ordinary_goal_control(&round.owner)
                     .await
@@ -525,7 +522,11 @@ async fn stale_generation_stop_pause_close_and_continuation_refuse_without_effec
                         owner: round.owner.clone(),
                         principal_id: Uuid::nil(),
                         request_id: Uuid::new_v4(),
-                        command: ControlCommand::Stop,
+                        command: if mutation == "stop" {
+                            ControlCommand::Stop
+                        } else {
+                            ControlCommand::Release
+                        },
                         expected_control_version: current.version(),
                     },
                     at(),
@@ -615,8 +616,8 @@ async fn every_existing_goal_disposition_refuses_creation_and_enable_without_rea
                 expected_version: first.snapshot().version(),
                 action_id: text("existing-state"),
                 attribution: GoalAttribution {
-                    requested_by: GoalActor::GeneratedHost,
-                    applied_by: GoalActor::GeneratedHost,
+                    requested_by: actor.clone(),
+                    applied_by: actor,
                 },
                 change: GoalChange::SetDisposition {
                     goal_id: first.snapshot().goal_id().clone(),
@@ -669,6 +670,9 @@ async fn real_lost_acknowledgements_reopen_and_replay_without_duplicate_effects(
         let db = Database::open(path.to_str().unwrap())
             .await
             .unwrap()
+            .install_goal_controls_for_tests()
+            .await
+            .unwrap()
             .install_goal_execution_for_tests(GoalRequestLimit::parse(2).unwrap())
             .await
             .unwrap();
@@ -682,6 +686,9 @@ async fn real_lost_acknowledgements_reopen_and_replay_without_duplicate_effects(
         assert_eq!(after.3, before.3 + i64::from(retained));
         db.pool().close().await;
         let reopened = Database::open(path.to_str().unwrap())
+            .await
+            .unwrap()
+            .install_goal_controls_for_tests()
             .await
             .unwrap()
             .install_goal_execution_for_tests(GoalRequestLimit::parse(2).unwrap())

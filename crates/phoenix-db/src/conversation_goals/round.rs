@@ -589,7 +589,7 @@ impl Database {
         checkpoint: &GoalRoundCheckpoint<'_>,
         obligation: &crate::workflow::DirectTurnTerminalObligationInput,
         replay: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
-    ) -> DbResult<CommittedGoalRound> {
+    ) -> DbResult<CommittedGoalTerminalRound> {
         if u64::try_from(checkpoint.execution.turn_id()).ok() != Some(obligation.turn_id.0)
             || checkpoint.state != &obligation.projection.state
             || checkpoint.state_updated_at != obligation.projection.state_updated_at
@@ -610,6 +610,10 @@ impl Database {
             crate::TerminalEvidenceTransactionCut::None,
         )
         .await
+        .map(|committed| CommittedGoalTerminalRound {
+            results: committed.results,
+            replayed: committed.replayed,
+        })
     }
 
     /// Commit report evidence and the existing terminal obligation without projecting state.

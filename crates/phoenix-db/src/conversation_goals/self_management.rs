@@ -145,7 +145,9 @@ pub(super) async fn finalize(
         {
             Ok(()) => true,
             Err(super::control::ControlError::AdmissionStopped) => false,
-            Err(super::control::ControlError::Sqlx(error)) => return Err(GoalDbError::Sqlx(error)),
+            Err(super::control::ControlError::Storage(error)) => {
+                return Err(GoalDbError::Sqlx(error))
+            }
             Err(_) => return Err(GoalDbError::Integrity("self-goal control authority")),
         };
     let refusal = if row.try_get::<String, _>("kind")? != "ordinary" {

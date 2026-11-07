@@ -77,6 +77,11 @@ impl ActiveDirectTurnTerminal {
     }
 }
 
+pub(crate) enum SelfGoalRoundCommit {
+    StateProjected(phoenix_db::conversation_goals::round::CommittedGoalRound),
+    Terminal(phoenix_db::conversation_goals::round::CommittedGoalTerminalRound),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActiveDirectTurnSettlement {
     pub turn: ActiveDirectTurn,
@@ -409,7 +414,7 @@ pub trait MessageStore: Send + Sync {
         replay: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
         settlement: Option<&ActiveDirectTurnSettlement>,
         proposal: Option<&crate::db::ForkProposal>,
-    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+    ) -> Result<SelfGoalRoundCommit, String> {
         let _ = (checkpoint, replay, settlement, proposal);
         Err("self-goal checkpoint requires durable runtime storage".into())
     }
@@ -1193,7 +1198,7 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         replay: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
         settlement: Option<&ActiveDirectTurnSettlement>,
         proposal: Option<&crate::db::ForkProposal>,
-    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+    ) -> Result<SelfGoalRoundCommit, String> {
         (**self)
             .persist_self_goal_round(checkpoint, replay, settlement, proposal)
             .await
@@ -2433,7 +2438,7 @@ impl MessageStore for DatabaseStorage {
         replay: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
         settlement: Option<&ActiveDirectTurnSettlement>,
         proposal: Option<&crate::db::ForkProposal>,
-    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+    ) -> Result<SelfGoalRoundCommit, String> {
         if let Some(proposal) = proposal {
             if settlement.is_some() {
                 return Err("fork proposal cannot be committed with terminal settlement".into());
@@ -2443,6 +2448,7 @@ impl MessageStore for DatabaseStorage {
                     checkpoint, replay, proposal,
                 )
                 .await
+                .map(SelfGoalRoundCommit::StateProjected)
                 .map_err(|e| e.to_string())
         } else if let Some(settlement) = settlement {
             let obligation = terminal_obligation(settlement, None);
@@ -2453,16 +2459,19 @@ impl MessageStore for DatabaseStorage {
                     replay,
                 )
                 .await
+                .map(SelfGoalRoundCommit::Terminal)
                 .map_err(|e| e.to_string())
         } else if let Some(replay) = replay {
             self.db
                 .persist_goal_tool_round_state_and_replay(checkpoint, replay)
                 .await
+                .map(SelfGoalRoundCommit::StateProjected)
                 .map_err(|e| e.to_string())
         } else {
             self.db
                 .persist_goal_tool_round_and_state(checkpoint)
                 .await
+                .map(SelfGoalRoundCommit::StateProjected)
                 .map_err(|e| e.to_string())
         }
     }

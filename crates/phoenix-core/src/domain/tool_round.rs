@@ -296,7 +296,8 @@ mod tests {
             let error = ToolRoundAssembly::new(
                 assistant(&["a"]),
                 vec![],
-                (0..count).map(|_| ToolResult::error("a".into(), "error".into()).into()),
+                (0..count)
+                    .map(|_| ToolRoundResult::from(ToolResult::error("a".into(), "error".into()))),
             )
             .unwrap_err();
             assert_eq!(
@@ -324,9 +325,14 @@ mod tests {
                 assistant(&calls),
                 results
                     .into_iter()
-                    .map(|id| ToolResult::success(id.into(), "retained output".into()))
+                    .map(|id| {
+                        ToolRoundResult::from(ToolResult::success(
+                            id.into(),
+                            "retained output".into(),
+                        ))
+                    })
                     .collect(),
-                [],
+                std::iter::empty::<ToolRoundResult>(),
             )
             .is_err());
         }

@@ -15307,6 +15307,7 @@ mod scope_liveness_tests {
 
     #[tokio::test]
     async fn startup_resumes_materialized_tool_result_baton_without_browser_kick() {
+        use phoenix_core::domain::conversation_goal::ToolRoundResult;
         use phoenix_core::domain::db_schema::ToolResult;
         use phoenix_core::domain::llm_types::ContentBlock;
         use phoenix_core::domain::sm_state::{AssistantMessage, ToolCall, ToolInput};
@@ -15334,7 +15335,7 @@ mod scope_liveness_tests {
                         ),
                     ),
                     remaining_tools: Vec::new(),
-                    completed_results: Vec::<ToolResult>::new(),
+                    completed_results: Vec::<ToolRoundResult>::new(),
                     pending_sub_agents: Vec::new(),
                     assistant_message: AssistantMessage::new(
                         "restart-assistant-tool-use".to_string(),
@@ -15457,6 +15458,7 @@ mod scope_liveness_tests {
 
     #[tokio::test]
     async fn newer_queued_input_joins_owed_baton_before_single_dispatch() {
+        use phoenix_core::domain::conversation_goal::ToolRoundResult;
         use phoenix_core::domain::db_schema::{MessageContent, ToolResult};
         use phoenix_core::domain::llm_types::ContentBlock;
         use phoenix_core::domain::sm_state::{AssistantMessage, ThinkInput, ToolCall, ToolInput};
@@ -15479,7 +15481,7 @@ mod scope_liveness_tests {
                         }),
                     ),
                     remaining_tools: Vec::new(),
-                    completed_results: Vec::<ToolResult>::new(),
+                    completed_results: Vec::<ToolRoundResult>::new(),
                     pending_sub_agents: Vec::new(),
                     assistant_message: AssistantMessage::new(
                         "older-assistant".to_string(),
@@ -15808,6 +15810,7 @@ mod scope_liveness_tests {
 
     #[tokio::test]
     async fn global_startup_resumes_materialized_tool_result_baton() {
+        use phoenix_core::domain::conversation_goal::ToolRoundResult;
         use phoenix_core::domain::db_schema::ToolResult;
         use phoenix_core::domain::llm_types::ContentBlock;
         use phoenix_core::domain::sm_state::{AssistantMessage, ToolCall, ToolInput};
@@ -15839,7 +15842,7 @@ mod scope_liveness_tests {
                         ),
                     ),
                     remaining_tools: Vec::new(),
-                    completed_results: Vec::<ToolResult>::new(),
+                    completed_results: Vec::<ToolRoundResult>::new(),
                     pending_sub_agents: Vec::new(),
                     assistant_message: AssistantMessage::new(
                         "global-deploy-assistant".to_string(),

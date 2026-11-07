@@ -30,6 +30,29 @@ pub(super) fn add_definitions(tools: &mut Vec<phoenix_llm::ToolDefinition>, ordi
     }
 }
 
+fn apply_self_goal_round_commit(
+    state: &mut ConvState,
+    state_updated_at: &mut DateTime<Utc>,
+    terminal_fact: &mut TerminalFactDurability,
+    commit: crate::runtime::traits::SelfGoalRoundCommit,
+    terminal_obligation_timestamp: Option<DateTime<Utc>>,
+) -> (Vec<crate::db::Message>, bool) {
+    match commit {
+        crate::runtime::traits::SelfGoalRoundCommit::StateProjected(committed) => {
+            *state = committed.state;
+            *state_updated_at = committed.state_updated_at;
+            (committed.results, committed.replayed)
+        }
+        crate::runtime::traits::SelfGoalRoundCommit::Terminal(committed) => {
+            *terminal_fact = TerminalFactDurability::Durable {
+                state_updated_at: terminal_obligation_timestamp
+                    .expect("terminal commit requires obligation timestamp"),
+            };
+            (committed.results, committed.replayed)
+        }
+    }
+}
+
 impl<S: Storage + 'static, L: LlmClient + 'static, T: ToolExecutor + 'static> Executor<S, L, T> {
     pub(super) async fn prepare_self_goal(&self, tool: ToolCall) -> Result<Option<Event>, String> {
         let result = if self.context.is_coordinator || self.context.is_sub_agent {
@@ -139,22 +162,22 @@ impl<S: Storage + 'static, L: LlmClient + 'static, T: ToolExecutor + 'static> Ex
                 error
             })?;
         self.pending_provider_replay_update = None;
-        self.state = committed.state;
-        self.state_updated_at = committed.state_updated_at;
-        if settlement.is_some() {
-            self.direct_turn_terminal_fact = TerminalFactDurability::Durable {
-                state_updated_at: self.state_updated_at,
-            };
-        }
+        let (results, replayed) = apply_self_goal_round_commit(
+            &mut self.state,
+            &mut self.state_updated_at,
+            &mut self.direct_turn_terminal_fact,
+            committed,
+            settlement.map(|settlement| settlement.state_updated_at),
+        );
         merge_trusted_tool_results(&mut self.pending_trusted_tool_results, new_trusted_results);
-        if committed.replayed {
+        if replayed {
             return Ok(None);
         }
         let _ = self
             .broadcast_tx
             .admitted_publication(admitted)
             .persisted_message(assistant);
-        for message in committed.results {
+        for message in results {
             let _ = self
                 .broadcast_tx
                 .admitted_publication(admitted)
@@ -168,6 +191,38 @@ impl<S: Storage + 'static, L: LlmClient + 'static, T: ToolExecutor + 'static> Ex
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn terminal_commit_preserves_reducer_state_and_uses_obligation_timestamp() {
+        let mut state = ConvState::Idle;
+        let proposed_timestamp = Utc::now();
+        let obligation_timestamp = proposed_timestamp + chrono::Duration::seconds(1);
+        let mut state_updated_at = proposed_timestamp;
+        let mut terminal_fact = TerminalFactDurability::ProcessOnly;
+
+        let (_, replayed) = apply_self_goal_round_commit(
+            &mut state,
+            &mut state_updated_at,
+            &mut terminal_fact,
+            crate::runtime::traits::SelfGoalRoundCommit::Terminal(
+                phoenix_db::conversation_goals::round::CommittedGoalTerminalRound {
+                    results: Vec::new(),
+                    replayed: false,
+                },
+            ),
+            Some(obligation_timestamp),
+        );
+
+        assert!(!replayed);
+        assert!(matches!(state, ConvState::Idle));
+        assert_eq!(state_updated_at, proposed_timestamp);
+        assert_eq!(
+            terminal_fact,
+            TerminalFactDurability::Durable {
+                state_updated_at: obligation_timestamp,
+            }
+        );
+    }
+
     #[test]
     fn discovery_is_ordinary_only_and_has_no_identity_arguments() {
         let mut tools = vec![];
