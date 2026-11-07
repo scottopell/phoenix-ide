@@ -98,7 +98,7 @@ enum ApplyRecord {
 }
 
 fn classify_remote_apply_response(
-    response: crate::api::federation::RemoteApplyGoalResponse,
+    response: &crate::api::federation::RemoteApplyGoalResponse,
 ) -> (bool, ApplyRecord, &'static str) {
     let result = response.result;
     let (accepted, unretained, next_action) = match &result {
@@ -152,22 +152,22 @@ mod classify_remote_apply_response_tests {
 
     #[test]
     fn distinguishes_receipts_from_unretained_outcomes() {
-        let response = |result| RemoteApplyGoalResponse {
+        let make_response = |result| RemoteApplyGoalResponse {
             caller_instance_id: InstanceId::new(),
             destination_instance_id: InstanceId::new(),
             action_reference: Uuid::new_v4(),
             result,
         };
 
-        let (accepted, record, _) =
-            classify_remote_apply_response(response(RemoteGoalApplyClassification::Accepted {}));
+        let response = make_response(RemoteGoalApplyClassification::Accepted {});
+        let (accepted, record, _) = classify_remote_apply_response(&response);
         assert!(accepted);
         assert!(matches!(record, ApplyRecord::Receipt(_)));
 
-        let (accepted, record, _) =
-            classify_remote_apply_response(response(RemoteGoalApplyClassification::Rejected {
-                reason: RemoteGoalApplyRefusal::Transition,
-            }));
+        let response = make_response(RemoteGoalApplyClassification::Rejected {
+            reason: RemoteGoalApplyRefusal::Transition,
+        });
+        let (accepted, record, _) = classify_remote_apply_response(&response);
         assert!(!accepted);
         assert!(matches!(record, ApplyRecord::Receipt(_)));
 
@@ -177,7 +177,8 @@ mod classify_remote_apply_response_tests {
                 reason: RemoteGoalApplyRefusal::Unknown,
             },
         ] {
-            let (accepted, record, _) = classify_remote_apply_response(response(result));
+            let response = make_response(result);
+            let (accepted, record, _) = classify_remote_apply_response(&response);
             assert!(!accepted);
             assert!(matches!(record, ApplyRecord::Outcome(_)));
         }
@@ -605,7 +606,7 @@ impl GoalTool {
                         .authorize_coordinator(&coordinator)
                         .await
                         .map_err(GoalTool::refusal_message)?;
-                    Ok::<_, String>(classify_remote_apply_response(response))
+                    Ok::<_, String>(classify_remote_apply_response(&response))
                 })
                 .await
                 .map_err(|error| format!("apply_goal remote operation did not settle: {error}"))??
