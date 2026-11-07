@@ -1030,7 +1030,7 @@ proptest! {
 
         if let Some(Effect::PersistCheckpoint { data }) = persist {
             let CheckpointData::ToolRound(round) = data;
-            let tool_results = round.results();
+            let tool_results: Vec<_> = round.results().iter().map(|entry| entry.finalized().expect("finalized-only test round").clone()).collect();
             // aborted(1) + skipped (completed_results is empty in this test)
             let expected_len = 1 + skipped.len();
             prop_assert_eq!(tool_results.len(), expected_len);
@@ -1091,7 +1091,7 @@ proptest! {
         // Should still use synthetic results (all failed), not the actual success
         if let Some(Effect::PersistCheckpoint { data }) = tr.effects.iter().find(|e| matches!(e, Effect::PersistCheckpoint { .. })) {
             let CheckpointData::ToolRound(round) = data;
-            let tool_results = round.results();
+            let tool_results: Vec<_> = round.results().iter().map(|entry| entry.finalized().expect("finalized-only test round").clone()).collect();
             // Find the result for our tool - it should be marked as cancelled, not successful
             let our_result = tool_results.iter().find(|r| r.tool_use_id == tool_use_id);
             prop_assert!(our_result.is_some());
@@ -1496,7 +1496,7 @@ fn test_cancel_mid_tool_chain() {
                 )),
             ),
         ],
-        completed_results: vec![t1_result.clone()],
+        completed_results: vec![t1_result.clone().into()],
         pending_sub_agents: vec![],
         assistant_message,
     };
@@ -1546,7 +1546,16 @@ fn test_cancel_mid_tool_chain() {
 
     if let Some(Effect::PersistCheckpoint { data }) = persist_effect {
         let CheckpointData::ToolRound(round) = data;
-        let tool_results = round.results();
+        let tool_results: Vec<_> = round
+            .results()
+            .iter()
+            .map(|entry| {
+                entry
+                    .finalized()
+                    .expect("finalized-only test round")
+                    .clone()
+            })
+            .collect();
         // Should have results for completed (t1) + aborted (t2) + skipped (t3, t4) = 4 total
         assert_eq!(
             tool_results.len(),

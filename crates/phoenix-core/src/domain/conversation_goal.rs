@@ -1,5 +1,8 @@
 //! Ordinary-conversation goal storage and checkpoint vocabulary.
 
+mod self_management;
+pub use self_management::{PendingSelfGoal, SelfGoalOperation};
+
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::product_conversation::ProductConversationId;

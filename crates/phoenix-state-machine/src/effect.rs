@@ -55,8 +55,12 @@ impl CheckpointData {
         assistant_message: AssistantMessage,
         tool_results: Vec<ToolResult>,
     ) -> Result<Self, PersistError> {
-        ToolRoundAssembly::new(assistant_message, tool_results, std::iter::empty())
-            .map(Self::ToolRound)
+        ToolRoundAssembly::new(
+            assistant_message,
+            tool_results.into_iter().map(Into::into).collect(),
+            std::iter::empty::<ToolResult>(),
+        )
+        .map(Self::ToolRound)
     }
 }
 

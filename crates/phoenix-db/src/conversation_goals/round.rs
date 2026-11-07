@@ -38,6 +38,7 @@ pub struct CommittedGoalTerminalRound {
     pub replayed: bool,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) enum ToolRoundWrite<'a> {
     Finalized(&'a [FinalizedToolResult]),
     Pending {
@@ -128,12 +129,13 @@ pub(crate) async fn persist_finalized_round_tx(
                 "tool round result owning assistant differs".into(),
             ));
         }
-        if *name == "goal_report"
-            && matches!(
-                finalized.disposition(),
-                FinalizedToolDisposition::Success | FinalizedToolDisposition::TrustedInstructions
-            )
-        {
+        if matches!(
+            *name,
+            "goal_report" | "create_goal" | "enable_auto_continuation"
+        ) && matches!(
+            finalized.disposition(),
+            FinalizedToolDisposition::Success | FinalizedToolDisposition::TrustedInstructions
+        ) {
             return Err(DbError::Serialization(
                 "goal report success requires pending round finalization".into(),
             ));
@@ -346,7 +348,7 @@ pub(crate) fn validate_round_shape(checkpoint: &GoalRoundCheckpoint<'_>) -> Resu
     for result in checkpoint.results {
         if let ToolRoundResult::Finalized(result) = result {
             if result.is_success() && blocks.iter().any(|block| matches!(block,
-                ContentBlock::ToolUse { id, name, .. } if id == &result.tool_use_id && name == "goal_report")) {
+                ContentBlock::ToolUse { id, name, .. } if id == &result.tool_use_id && matches!(name.as_str(), "goal_report" | "create_goal" | "enable_auto_continuation"))) {
                 return Err(GoalDbError::Integrity("goal report result finalized before commit"));
             }
         }
@@ -388,6 +390,14 @@ pub(crate) async fn retained_round_tx(
     for (ordinal, (intent, actual)) in checkpoint.results.iter().zip(retained).enumerate() {
         let actual = actual.ok_or(GoalDbError::Integrity("retained round missing result"))?;
         let finalized = match intent {
+            ToolRoundResult::PendingSelfGoal {
+                pending,
+                duration_ms,
+            } => {
+                super::self_management::verify_source(tx, assistant, checkpoint.execution, pending)
+                    .await?;
+                super::self_management::retained_result(pending, *duration_ms, &actual)?
+            }
             ToolRoundResult::Finalized(result) => result.clone(),
             ToolRoundResult::PendingGoalReport { report, .. } => {
                 super::checkpoint::verify_source_tx(tx, assistant, checkpoint.execution, report)
@@ -423,6 +433,19 @@ async fn finalize_round_tx(
     let mut committed_goals = Vec::new();
     for (ordinal, result) in checkpoint.results.iter().enumerate() {
         let resolved = match result {
+            ToolRoundResult::PendingSelfGoal {
+                pending,
+                duration_ms,
+            } => {
+                super::self_management::verify_source(tx, assistant, checkpoint.execution, pending)
+                    .await?;
+                let (result, notification) =
+                    super::self_management::finalize(tx, pending, *duration_ms, policies).await?;
+                if let Some(notification) = notification {
+                    committed_goals.push(notification);
+                }
+                result
+            }
             ToolRoundResult::Finalized(result) => result.clone(),
             ToolRoundResult::PendingGoalReport {
                 report,
@@ -556,6 +579,42 @@ impl Database {
         .await
     }
 
+    /// Commit a Goal-aware terminal round, returning the durable state selected by its owner.
+    ///
+    /// # Errors
+    /// Rejects mismatched terminal projections, invalid provenance, or failed persistence.
+    pub async fn persist_goal_tool_round_state_with_terminal_obligation(
+        &self,
+        checkpoint: &GoalRoundCheckpoint<'_>,
+        obligation: &crate::workflow::DirectTurnTerminalObligationInput,
+        replay: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> DbResult<CommittedGoalTerminalRound> {
+        if u64::try_from(checkpoint.execution.turn_id()).ok() != Some(obligation.turn_id.0)
+            || checkpoint.state != &obligation.projection.state
+            || checkpoint.state_updated_at != obligation.projection.state_updated_at
+        {
+            return Err(DbError::Serialization(
+                "goal terminal projection differs".into(),
+            ));
+        }
+        self.persist_tool_round_with_terminal_obligation_input_at_cut(
+            &checkpoint.assistant.conversation_id,
+            checkpoint.assistant,
+            ToolRoundWrite::Pending {
+                execution: checkpoint.execution,
+                results: checkpoint.results,
+            },
+            obligation,
+            replay,
+            crate::TerminalEvidenceTransactionCut::None,
+        )
+        .await
+        .map(|committed| CommittedGoalTerminalRound {
+            results: committed.results,
+            replayed: committed.replayed,
+        })
+    }
+
     /// Commit report evidence and the existing terminal obligation without projecting state.
     ///
     /// # Errors
@@ -573,15 +632,20 @@ impl Database {
                 "goal report terminal turn differs".into(),
             ));
         }
-        self.persist_tool_round_with_terminal_obligation_input_at_cut(
-            &assistant.conversation_id,
-            assistant,
-            ToolRoundWrite::Pending { execution, results },
-            obligation,
-            replay,
-            crate::TerminalEvidenceTransactionCut::None,
-        )
-        .await
+        let committed = self
+            .persist_tool_round_with_terminal_obligation_input_at_cut(
+                &assistant.conversation_id,
+                assistant,
+                ToolRoundWrite::Pending { execution, results },
+                obligation,
+                replay,
+                crate::TerminalEvidenceTransactionCut::None,
+            )
+            .await?;
+        Ok(CommittedGoalTerminalRound {
+            results: committed.results,
+            replayed: committed.replayed,
+        })
     }
 }
 

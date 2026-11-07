@@ -41,6 +41,7 @@ use crate::system_prompt::{
 };
 use crate::tools::{BashProgressSink, BrowserSessionManager, ToolContext};
 use chrono::{DateTime, Utc};
+use phoenix_core::domain::conversation_goal::ToolRoundResult;
 use phoenix_core::domain::db_schema::{
     merge_duration_into_display_data, tool_result_message_content, tool_result_transcript_content,
     FinalizedToolResult,
@@ -58,6 +59,9 @@ use tracing::Instrument;
 
 mod capacity;
 mod continuation;
+mod self_goal;
+#[cfg(test)]
+mod self_goal_tests;
 mod tool_execution;
 use capacity::{CapacityDecision, CountingBudget, RequestCapacity, SuccessorCapacity};
 use tool_execution::ToolExecutionSlot;
@@ -794,12 +798,23 @@ struct PendingTrustedToolResult {
     output: String,
 }
 
-fn trusted_tool_results(
+fn finalized_round_results(results: Vec<ToolRoundResult>) -> Result<Vec<ToolResult>, String> {
+    results
+        .into_iter()
+        .map(|result| {
+            result.into_finalized().map_err(|_| {
+                "unfinished tool result requires an atomic goal checkpoint".to_string()
+            })
+        })
+        .collect()
+}
+
+fn trusted_tool_results<'a>(
     assistant_message_id: &str,
-    results: &[ToolResult],
+    results: impl IntoIterator<Item = &'a ToolResult>,
 ) -> Vec<PendingTrustedToolResult> {
     results
-        .iter()
+        .into_iter()
         .filter_map(|result| match &result.outcome {
             ToolOutcome::TrustedInstructions { output } => Some(PendingTrustedToolResult {
                 tool_result_message_id: tool_result_message_id(
@@ -4147,10 +4162,14 @@ where
                 (&self.state, &terminal_event),
                 (
                     ConvState::ToolExecuting { .. },
-                    Event::ToolComplete { .. } | Event::SpawnAgentsComplete { .. }
+                    Event::ToolComplete { .. }
+                        | Event::ToolRoundComplete { .. }
+                        | Event::SpawnAgentsComplete { .. }
                 ) | (
                     ConvState::CancellingTool { .. },
-                    Event::ToolAborted { .. } | Event::ToolComplete { .. }
+                    Event::ToolAborted { .. }
+                        | Event::ToolComplete { .. }
+                        | Event::ToolRoundComplete { .. }
                 )
             ) && !authority.accepts_registered_feature_owner()
                 && self.pending_direct_turn_terminal.is_none()
@@ -9638,6 +9657,9 @@ where
                 ),
             }));
         }
+        if matches!(tool.name(), "create_goal" | "enable_auto_continuation") {
+            return self.prepare_self_goal(tool).await;
+        }
         if tool.name() == "spawn_agents" {
             let advertised = self
                 .tool_executor
@@ -9887,6 +9909,22 @@ where
     ) -> Result<Option<Event>, String> {
         let CheckpointData::ToolRound(round) = data;
         let (assistant_message, tool_results) = round.into_parts();
+        if tool_results
+            .iter()
+            .any(|result| matches!(result, ToolRoundResult::PendingSelfGoal { .. }))
+        {
+            return self
+                .persist_self_goal_checkpoint(
+                    assistant_message,
+                    tool_results,
+                    Some(settlement),
+                    None,
+                    admitted,
+                )
+                .await;
+        }
+
+        let tool_results = finalized_round_results(tool_results)?;
         let new_trusted_results =
             trusted_tool_results(&assistant_message.message_id, &tool_results);
         let conv_id = self.context.conversation_id.clone();
@@ -9969,6 +10007,22 @@ where
         match data {
             CheckpointData::ToolRound(round) => {
                 let (assistant_message, tool_results) = round.into_parts();
+                if tool_results
+                    .iter()
+                    .any(|result| matches!(result, ToolRoundResult::PendingSelfGoal { .. }))
+                {
+                    return self
+                        .persist_self_goal_checkpoint(
+                            assistant_message,
+                            tool_results,
+                            None,
+                            None,
+                            admitted,
+                        )
+                        .await;
+                }
+
+                let tool_results = finalized_round_results(tool_results)?;
                 let new_trusted_results =
                     trusted_tool_results(&assistant_message.message_id, &tool_results);
                 let conv_id = self.context.conversation_id.clone();
@@ -10101,6 +10155,36 @@ where
 
         let conv_id = self.context.conversation_id.clone();
 
+        let proposal = crate::db::ForkProposal {
+            id: proposal_id,
+            origin_conversation_id: conv_id.clone(),
+            task_file: normalized_task_file,
+            title,
+            priority: priority.as_str().to_string(),
+            body,
+            status: crate::db::ForkProposalStatus::Pending,
+            fork_conversation_id: None,
+            refinement_conversation_id: None,
+            created_at: Utc::now(),
+            resolved_at: None,
+        };
+
+        if tool_results
+            .iter()
+            .any(|result| matches!(result, ToolRoundResult::PendingSelfGoal { .. }))
+        {
+            return self
+                .persist_self_goal_checkpoint(
+                    assistant_message,
+                    tool_results,
+                    None,
+                    Some(&proposal),
+                    admitted,
+                )
+                .await;
+        }
+        let tool_results = finalized_round_results(tool_results)?;
+
         // Build the assistant message row with a seq strictly greater than any
         // ephemeral event broadcast earlier (mirrors `persist_checkpoint`).
         let (reserved_broadcast_range, reserved_seqs) = self
@@ -10142,20 +10226,6 @@ where
                 merged_display,
             ));
         }
-
-        let proposal = crate::db::ForkProposal {
-            id: proposal_id,
-            origin_conversation_id: conv_id.clone(),
-            task_file: normalized_task_file,
-            title,
-            priority: priority.as_str().to_string(),
-            body,
-            status: crate::db::ForkProposalStatus::Pending,
-            fork_conversation_id: None,
-            refinement_conversation_id: None,
-            created_at: Utc::now(),
-            resolved_at: None,
-        };
 
         self.storage
             .persist_fork_proposal_with_tool_round(&conv_id, &agent_msg, &tool_msgs, &proposal)
@@ -10499,6 +10569,10 @@ where
         let explore_bash = self.context.explore_bash;
 
         let mut available_tools = tool_executor.definitions_for_language(llm_language).await;
+        self_goal::add_definitions(
+            &mut available_tools,
+            !is_coordinator && !self.context.is_sub_agent,
+        );
         if let Some(tool) = available_tools
             .iter_mut()
             .find(|tool| tool.name == "spawn_agents")
@@ -24093,10 +24167,9 @@ mod steer_drain_detector_tests {
                         serde_json::json!({"tasks": []}),
                     ),
                 );
-                completed_results.push(ToolResult::success(
-                    "spawn-1".into(),
-                    "Spawning sub-agents".into(),
-                ));
+                completed_results.push(
+                    ToolResult::success("spawn-1".into(), "Spawning sub-agents".into()).into(),
+                );
             }
             db.update_conversation_state(id, &initial).await.unwrap();
             let (event_tx, event_rx) = mpsc::channel(16);
@@ -30154,11 +30227,26 @@ mod goal_report_cancellation_checkpoint_tests {
         let results = tool_results.to_vec();
         assert_eq!(results.len(), 2);
         for result in &results {
+            let result = result
+                .finalized()
+                .expect("cancelled round result is finalized");
             assert!(matches!(result.outcome, ToolOutcome::Cancelled { .. }));
             assert!(!result.is_error());
         }
-        assert_eq!(results[0].output(), "Cancelled by user");
-        assert_eq!(results[1].output(), "Skipped due to cancellation");
+        assert_eq!(
+            results[0]
+                .finalized()
+                .expect("cancelled round result is finalized")
+                .output(),
+            "Cancelled by user"
+        );
+        assert_eq!(
+            results[1]
+                .finalized()
+                .expect("cancelled round result is finalized")
+                .output(),
+            "Skipped due to cancellation"
+        );
         let (event_tx, event_rx) = mpsc::channel(8);
         let mut runtime = ConversationRuntime::new(
             context,
@@ -30196,6 +30284,9 @@ mod goal_report_cancellation_checkpoint_tests {
         assert!(matches!(&assistant.content, MessageContent::Agent(blocks) if blocks.len() == 2));
         let mut finalized = Vec::new();
         for result in results {
+            let result = result
+                .finalized()
+                .expect("cancelled round result is finalized");
             let id = tool_result_message_id(&assistant.message_id, &result.tool_use_id);
             let row = messages
                 .iter()
@@ -30213,7 +30304,7 @@ mod goal_report_cancellation_checkpoint_tests {
                 conversation_id,
                 row.sequence_id,
                 row.created_at,
-                &result,
+                result,
             );
             assert_eq!(
                 serde_json::to_value(result.row()).unwrap(),
