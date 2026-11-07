@@ -819,7 +819,7 @@ async fn accepted_retry_rollover_before_receipt_lookup_preserves_receipt_over_bu
         .try_lock_product_message_admission(fixture.owner.as_str())
         .await
         .unwrap();
-    let receipt = command_across_real_rollover(&fixture, &request)
+    let receipt = Box::pin(command_across_real_rollover(&fixture, &request))
         .await
         .unwrap();
     assert_eq!(serde_json::to_value(receipt).unwrap(), expected);
@@ -840,7 +840,7 @@ async fn accepted_retry_rollover_before_receipt_lookup_preserves_receipt_over_bu
 async fn new_command_rollover_before_receipt_lookup_commits_on_live_successor() {
     let fixture = Fixture::new().await;
     let request = create_request(0, "new command after rollover");
-    let receipt = command_across_real_rollover(&fixture, &request)
+    let receipt = Box::pin(command_across_real_rollover(&fixture, &request))
         .await
         .unwrap();
     assert!(matches!(
@@ -873,7 +873,7 @@ async fn new_command_rollover_before_receipt_lookup_retains_durable_busy_refusal
         .try_lock_product_message_admission(fixture.owner.as_str())
         .await
         .unwrap();
-    let receipt = command_across_real_rollover(&fixture, &request)
+    let receipt = Box::pin(command_across_real_rollover(&fixture, &request))
         .await
         .unwrap();
     assert!(matches!(
@@ -1033,22 +1033,34 @@ async fn assert_command_rechecks_authority(path: CommandPublicationPath) {
 
 #[tokio::test]
 async fn retained_command_rechecks_authority_after_lookup_before_publication() {
-    assert_command_rechecks_authority(CommandPublicationPath::Retained).await;
+    Box::pin(assert_command_rechecks_authority(
+        CommandPublicationPath::Retained,
+    ))
+    .await;
 }
 
 #[tokio::test]
 async fn accepted_command_rechecks_authority_after_commit_before_publication() {
-    assert_command_rechecks_authority(CommandPublicationPath::Accepted).await;
+    Box::pin(assert_command_rechecks_authority(
+        CommandPublicationPath::Accepted,
+    ))
+    .await;
 }
 
 #[tokio::test]
 async fn product_busy_command_rechecks_authority_after_receipt_before_publication() {
-    assert_command_rechecks_authority(CommandPublicationPath::ProductBusy).await;
+    Box::pin(assert_command_rechecks_authority(
+        CommandPublicationPath::ProductBusy,
+    ))
+    .await;
 }
 
 #[tokio::test]
 async fn transcript_busy_command_rechecks_authority_after_receipt_before_publication() {
-    assert_command_rechecks_authority(CommandPublicationPath::TranscriptBusy).await;
+    Box::pin(assert_command_rechecks_authority(
+        CommandPublicationPath::TranscriptBusy,
+    ))
+    .await;
 }
 
 #[allow(clippy::too_many_lines)]
