@@ -251,6 +251,40 @@ pub(super) async fn retained_tx(
     }))
 }
 
+fn is_target_unavailable(error: &GoalDbError) -> bool {
+    matches!(
+        error,
+        GoalDbError::Admission(
+            crate::DbError::ConversationNotFound(_)
+                | crate::DbError::ProductConversationUnavailable(_)
+                | crate::DbError::CloseAdmissionFenced(_)
+        )
+    )
+}
+
+async fn reject_unavailable_target_tx(
+    tx: &mut GoalTx<'_>,
+    input: &GoalUserCommand,
+    requester: &GoalControlAuthority<'_>,
+    clock: impl FnOnce() -> Result<GoalTimestampUs>,
+) -> Result<GoalUserCommandOutcome> {
+    let at = clock()?;
+    let observed = input.expected_version;
+    let receipt = reject_tx(
+        tx,
+        input,
+        requester,
+        GoalUserRefusal::Transition,
+        observed,
+        at,
+    )
+    .await?;
+    Ok(GoalUserCommandOutcome {
+        receipt,
+        committed_goal: None,
+    })
+}
+
 async fn reject_tx(
     tx: &mut GoalTx<'_>,
     input: &GoalUserCommand,
@@ -592,7 +626,18 @@ impl Database {
         host_gate_busy: bool,
     ) -> Result<GoalUserCommandOutcome> {
         requester.require(tx).await?;
-        let live = Self::get_ordinary_product_conversation_on(tx, &input.owner).await?;
+        let live = match Self::get_ordinary_product_conversation_on(tx, &input.owner).await {
+            Ok(live) => live,
+            Err(error) => {
+                let error = GoalDbError::from(error);
+                if matches!(requester, GoalControlAuthority::RemoteCoordinator { .. })
+                    && is_target_unavailable(&error)
+                {
+                    return reject_unavailable_target_tx(tx, input, requester, clock).await;
+                }
+                return Err(error);
+            }
+        };
         if let GoalControlAuthority::Coordinator { caller, source } = requester {
             super::prepared::require_exact_preparation(tx, caller, source, input).await?;
         }
@@ -621,7 +666,14 @@ impl Database {
         } else {
             expected_transcript
         };
-        admission::require_target_tx(tx, &input.owner, target).await?;
+        if let Err(error) = admission::require_target_tx(tx, &input.owner, target).await {
+            if matches!(requester, GoalControlAuthority::RemoteCoordinator { .. })
+                && is_target_unavailable(&error)
+            {
+                return reject_unavailable_target_tx(tx, input, requester, clock).await;
+            }
+            return Err(error);
+        }
         let at = clock()?;
         let current = current_tx(tx, &input.owner).await?;
         let observed = current

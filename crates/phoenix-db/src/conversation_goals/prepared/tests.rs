@@ -1000,6 +1000,158 @@ async fn remote_admitted_apply_survives_enrollment_replacement() {
 }
 
 #[tokio::test]
+async fn remote_target_becoming_history_after_claim_retains_replayable_transition_refusal() {
+    use crate::workflow::LocalAuthorityResult;
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    let db = fixture().await;
+    let (authority, source, owner) = remote_source(&db, "remote-target-history-race").await;
+    let prepared = db
+        .prepare_remote_coordinator_goal_action(
+            &authority,
+            &source,
+            &owner,
+            create_intent("target closes after claim"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    let transcript: String = sqlx::query_scalar(
+        "SELECT id FROM conversations WHERE product_conversation_id=? AND runtime_role='user' AND parent_conversation_id IS NULL",
+    )
+    .bind(owner.as_str())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let intervention = crate::conversation_goals::user_commands::GoalUserCommand {
+        owner: owner.clone(),
+        principal_id: Uuid::new_v4(),
+        request_id: Uuid::new_v4(),
+        expected_version: GoalVersion::INITIAL,
+        change: crate::conversation_goals::user_commands::GoalUserChange::Create {
+            objective: GoalText::parse("intervening objective").unwrap(),
+        },
+    };
+    let intervention_receipt = db
+        .apply_user_goal_command(
+            &intervention,
+            &transcript,
+            || Ok(at()),
+            || panic!("the intervening owner write must retain authority"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        intervention_receipt.result,
+        GoalUserResult::Accepted { .. }
+    ));
+    assert!(
+        db.conversation_goal(&owner)
+            .await
+            .unwrap()
+            .unwrap()
+            .version()
+            > GoalVersion::INITIAL
+    );
+
+    let history_before = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM conversation_goal_history WHERE owner_id=?",
+    )
+    .bind(owner.as_str())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+
+    let claimed = Arc::new(Notify::new());
+    let resume = Arc::new(Notify::new());
+    let pause = RemoteGoalClaimPause {
+        claimed: Arc::clone(&claimed),
+        resume: Arc::clone(&resume),
+    };
+    let apply_db = db.clone();
+    let apply_authority = authority.clone();
+    let reference = prepared.reference;
+    let apply = tokio::spawn(async move {
+        apply_db
+            .apply_remote_coordinator_goal_command_with_claim_commit(
+                &apply_authority,
+                reference,
+                false,
+                || Ok(at()),
+                || panic!("the target remains classified by a retained refusal"),
+                RemoteGoalClaimCommitCut::None,
+                Some(pause),
+            )
+            .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), claimed.notified())
+        .await
+        .expect("remote Goal claim did not commit within 30 seconds");
+    sqlx::query(
+        "UPDATE product_conversations SET ordinary_lifecycle='history' WHERE id=? AND kind='ordinary'",
+    )
+    .bind(owner.as_str())
+    .execute(db.pool())
+    .await
+    .unwrap();
+    resume.notify_one();
+
+    let LocalAuthorityResult::DurableFactEstablished(Ok(RemoteGoalApplyOutcome::Receipt(receipt))) =
+        apply.await.unwrap()
+    else {
+        panic!("target-unavailable claimed action must retain a refusal");
+    };
+    assert_eq!(receipt.request_id, reference);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM conversation_goal_history WHERE owner_id=?",
+        )
+        .bind(owner.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        history_before
+    );
+    assert!(matches!(
+        &receipt.result,
+        GoalUserResult::Rejected {
+            reason: GoalUserRefusal::Transition,
+            observed_version: GoalVersion::INITIAL,
+            ..
+        }
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM conversation_goal_coordinator_receipts WHERE preparation_reference=?",
+        )
+        .bind(reference.as_bytes().as_slice())
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.apply_remote_coordinator_goal_command(
+            &authority,
+            reference,
+            false,
+            || panic!("receipt replay must not consult the clock"),
+            || panic!("receipt replay retains authority"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap(),
+        RemoteGoalApplyOutcome::Receipt(receipt)
+    );
+}
+
+#[tokio::test]
 async fn remote_post_claim_failure_is_unclassified_and_closes_receiptless_retry() {
     remote_unclassified_claim_closes_receiptless_retry(RemoteGoalClaimCommitCut::None).await;
 }

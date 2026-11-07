@@ -17,6 +17,21 @@ use super::goal_error;
 use crate::api::{auth::OwnerAuthenticated, handlers::AppError};
 use crate::runtime::{AdmittedOperation, RuntimeManager};
 
+#[derive(Debug, PartialEq)]
+pub(crate) enum RemoteGoalApplyServiceResult {
+    Classified(PreparedGoalAction, RemoteGoalApplyOutcome),
+    ReferenceUnavailable,
+}
+
+fn target_is_unavailable(error: &phoenix_db::DbError) -> bool {
+    matches!(
+        error,
+        phoenix_db::DbError::ConversationNotFound(_)
+            | phoenix_db::DbError::ProductConversationUnavailable(_)
+            | phoenix_db::DbError::CloseAdmissionFenced(_)
+    )
+}
+
 pub(super) struct CoordinatorGoalPreparationAuthorityPass {
     owner: Option<AdmittedOperation>,
 }
@@ -284,62 +299,99 @@ impl GoalCommandService {
         &self,
         authority: &phoenix_db::FederationSendAuthority,
         reference: uuid::Uuid,
-    ) -> Result<(PreparedGoalAction, RemoteGoalApplyOutcome), AppError> {
+    ) -> Result<RemoteGoalApplyServiceResult, AppError> {
         let _action_gate = self.runtime.lock_remote_goal_apply(reference).await;
         let admission = self
             .runtime
             .acquire_local_authority_pass()
             .map_err(|()| AppError::Internal("local authority is closed".into()))?;
         let db = self.runtime.db();
-        let action = db
+        let action = match db
             .read_remote_coordinator_goal_preparation(authority, reference)
             .await
-            .map_err(goal_error)?;
-        if let Some(receipt) = db
+        {
+            Ok(action) => action,
+            Err(phoenix_db::conversation_goals::GoalDbError::TargetChanged) => {
+                return self
+                    .publication_result(Ok(RemoteGoalApplyServiceResult::ReferenceUnavailable));
+            }
+            Err(error) => return Err(goal_error(error)),
+        };
+        match db
             .retained_remote_coordinator_goal_command(authority, reference)
             .await
-            .map_err(goal_error)?
         {
-            return self.publication_result(Ok((action, RemoteGoalApplyOutcome::Receipt(receipt))));
+            Ok(Some(receipt)) => {
+                return self.publication_result(Ok(RemoteGoalApplyServiceResult::Classified(
+                    action,
+                    RemoteGoalApplyOutcome::Receipt(receipt),
+                )));
+            }
+            Ok(None) => {}
+            Err(phoenix_db::conversation_goals::GoalDbError::TargetChanged) => {
+                return self
+                    .publication_result(Ok(RemoteGoalApplyServiceResult::ReferenceUnavailable));
+            }
+            Err(error) => return Err(goal_error(error)),
         }
-        let clock = || {
-            GoalTimestampUs::parse(chrono::Utc::now().timestamp_micros())
-                .map_err(phoenix_db::conversation_goals::GoalDbError::from)
-        };
-        let lost = || {
-            self.runtime
-                .signal_fatal_local_authority("remote_coordinator_goal_command_write");
-        };
         let Some(_product_guard) = self
             .runtime
             .try_lock_product_message_admission(action.owner.as_str())
             .await
         else {
-            let pass = RemoteGoalApplyAuthorityPass::new(admission);
-            let outcome = pass.complete(
-                db.apply_remote_coordinator_goal_command(authority, reference, true, clock, lost)
-                    .await,
-            )?;
-            return self.publication_result(Ok((action, outcome)));
+            return self
+                .execute_remote_apply(admission, authority, reference, action, true)
+                .await;
         };
-        let transcript = db
-            .get_ordinary_product_conversation(&action.owner)
-            .await
-            .map_err(crate::api::product_conversations::db_to_app)?
-            .latest_transcript_row_id;
+        let transcript = match db.get_ordinary_product_conversation(&action.owner).await {
+            Ok(target) => target.latest_transcript_row_id,
+            Err(error) if target_is_unavailable(&error) => {
+                return self
+                    .execute_remote_apply(admission, authority, reference, action, false)
+                    .await;
+            }
+            Err(error) => return Err(crate::api::product_conversations::db_to_app(error)),
+        };
         let acceptance = self.runtime.try_lock_message_acceptance(&transcript).await;
-        let pass = RemoteGoalApplyAuthorityPass::new(admission);
-        let outcome = pass.complete(
-            db.apply_remote_coordinator_goal_command(
+        self.execute_remote_apply(
+            admission,
+            authority,
+            reference,
+            action,
+            acceptance.is_none(),
+        )
+        .await
+    }
+
+    async fn execute_remote_apply(
+        &self,
+        admission: AdmittedOperation,
+        authority: &phoenix_db::FederationSendAuthority,
+        reference: uuid::Uuid,
+        action: PreparedGoalAction,
+        host_gate_busy: bool,
+    ) -> Result<RemoteGoalApplyServiceResult, AppError> {
+        let outcome = self
+            .runtime
+            .db()
+            .apply_remote_coordinator_goal_command(
                 authority,
                 reference,
-                acceptance.is_none(),
-                clock,
-                lost,
+                host_gate_busy,
+                || {
+                    GoalTimestampUs::parse(chrono::Utc::now().timestamp_micros())
+                        .map_err(phoenix_db::conversation_goals::GoalDbError::from)
+                },
+                || {
+                    self.runtime
+                        .signal_fatal_local_authority("remote_coordinator_goal_command_write");
+                },
             )
-            .await,
-        )?;
-        self.publication_result(Ok((action, outcome)))
+            .await;
+        let outcome = RemoteGoalApplyAuthorityPass::new(admission).complete(outcome)?;
+        self.publication_result(Ok(RemoteGoalApplyServiceResult::Classified(
+            action, outcome,
+        )))
     }
 
     pub(crate) async fn prepare_coordinator(

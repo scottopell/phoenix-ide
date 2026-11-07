@@ -1187,9 +1187,12 @@ async fn concurrent_remote_apply_waits_for_classification_and_replays_receipt() 
         .apply_remote(&authority, expired_reference)
         .await
         .unwrap();
-    let phoenix_db::conversation_goals::user_commands::RemoteGoalApplyOutcome::Receipt(
-        replay_receipt,
-    ) = &replay_after_expiry.1
+    let super::service::RemoteGoalApplyServiceResult::Classified(
+        _,
+        phoenix_db::conversation_goals::user_commands::RemoteGoalApplyOutcome::Receipt(
+            replay_receipt,
+        ),
+    ) = &replay_after_expiry
     else {
         panic!("expired preparation with a receipt must replay that receipt");
     };
@@ -1296,10 +1299,14 @@ async fn expired_remote_apply_returns_typed_outcome_without_closing_authority() 
             .await
             .unwrap();
     let service = super::service::GoalCommandService::new(fixture.state.runtime.clone());
-    let (returned_action, outcome) = service
-        .apply_remote(&authority, expired_reference)
-        .await
-        .unwrap();
+    let super::service::RemoteGoalApplyServiceResult::Classified(returned_action, outcome) =
+        service
+            .apply_remote(&authority, expired_reference)
+            .await
+            .unwrap()
+    else {
+        panic!("known expired preparation must remain classified");
+    };
 
     assert_eq!(returned_action, expired_action);
     assert_eq!(

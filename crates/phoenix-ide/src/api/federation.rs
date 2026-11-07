@@ -1432,7 +1432,10 @@ pub async fn apply_goal(
         peer_authority_response(
             &runtime,
             match result {
-                Ok((action, outcome)) => match RemoteApplyGoalResponse::from_outcome(
+                Ok(crate::api::goal_commands::RemoteGoalApplyServiceResult::Classified(
+                    action,
+                    outcome,
+                )) => match RemoteApplyGoalResponse::from_outcome(
                     peer.caller_instance_id,
                     destination,
                     request.action_reference,
@@ -1442,6 +1445,12 @@ pub async fn apply_goal(
                     Ok(response) => Json(response).into_response(),
                     Err(error) => *error,
                 },
+                Ok(
+                    crate::api::goal_commands::RemoteGoalApplyServiceResult::ReferenceUnavailable,
+                ) => federation_error(
+                    StatusCode::CONFLICT,
+                    "remote Goal action reference is unavailable",
+                ),
                 Err(error) => error.into_response(),
             },
         )
@@ -3120,6 +3129,73 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn apply_goal_unknown_reference_is_unavailable_without_goal_mutation() {
+        use axum::{
+            body::{to_bytes, Body},
+            http::{header, Request},
+        };
+        use tower::ServiceExt as _;
+
+        let state = make_test_state().await;
+        let peer = InstanceId::new();
+        let bearer = "phx_peer_unknown_goal_reference";
+        state
+            .db
+            .replace_federation_enrollment(
+                peer,
+                "peer-a",
+                &peer_bearer_verifier(bearer).unwrap(),
+                1,
+            )
+            .await
+            .unwrap();
+        let before: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT COUNT(*) FROM conversation_goal_preparations),
+                (SELECT COUNT(*) FROM conversation_goal_coordinator_receipts),
+                (SELECT COUNT(*) FROM conversation_goal_ids),
+                (SELECT COUNT(*) FROM conversation_goal_history)",
+        )
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        let action_reference = uuid::Uuid::new_v4();
+
+        let response = crate::api::handlers::create_router(state.clone())
+            .oneshot(
+                Request::post("/api/federation/peer/apply-goal")
+                    .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&RemoteApplyGoalRequest { action_reference }).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), MAX_REMOTE_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"error": "remote Goal action reference is unavailable"})
+        );
+        let after: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT COUNT(*) FROM conversation_goal_preparations),
+                (SELECT COUNT(*) FROM conversation_goal_coordinator_receipts),
+                (SELECT COUNT(*) FROM conversation_goal_ids),
+                (SELECT COUNT(*) FROM conversation_goal_history)",
+        )
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(after, before);
     }
 
     #[test]
