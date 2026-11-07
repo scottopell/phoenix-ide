@@ -53,7 +53,9 @@ impl SelfRound {
         name: &str,
         operations: Vec<SelfGoalOperation>,
     ) -> Self {
-        release(db, &owner).await;
+        if db.goal_control_installation() == GoalControlInstallation::Installed {
+            release(db, &owner).await;
+        }
         let execution =
             accept_execution(&db.workflow_repository(), &runtime_input(&transcript, name)).await;
         let mut round = Self {
@@ -260,6 +262,117 @@ async fn effect_counts(db: &Database) -> (i64, i64, i64, i64) {
 }
 
 #[tokio::test]
+async fn no_policy_installers_allow_canonical_enable_then_create() {
+    let db = Database::open_in_memory().await.unwrap();
+    let mut round = SelfRound::with_preference(&db, "uninstalled-policies", vec![], false).await;
+
+    round
+        .next(
+            &db,
+            "enable",
+            vec![SelfGoalOperation::EnableAutoContinuation],
+        )
+        .await;
+    assert_eq!(
+        status(&round.commit(&db, false).await.unwrap().results[0])["status"],
+        "auto_continuation_enabled"
+    );
+
+    round.next(&db, "create", vec![create()]).await;
+    assert_eq!(
+        status(&round.commit(&db, false).await.unwrap().results[0])["status"],
+        "goal_created"
+    );
+    assert!(db.conversation_goal(&round.owner).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn first_control_initialization_invalidates_operations_admitted_without_control() {
+    let db = Database::open_in_memory().await.unwrap();
+    let mut round = SelfRound::with_preference(
+        &db,
+        "first-control-initialization",
+        vec![SelfGoalOperation::EnableAutoContinuation, create()],
+        false,
+    )
+    .await;
+    let admitted_control: Option<i64> = sqlx::query_scalar(
+        "SELECT control_version FROM ordinary_self_goal_admissions WHERE turn_id=?",
+    )
+    .bind(round.execution.turn_id())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(admitted_control, None);
+
+    let controls = db.clone().install_goal_controls_for_tests().await.unwrap();
+    controls
+        .apply_goal_control(
+            &ControlRequest {
+                owner: round.owner.clone(),
+                principal_id: Uuid::nil(),
+                request_id: Uuid::new_v4(),
+                command: ControlCommand::Release,
+                expected_control_version: 0,
+            },
+            at(),
+            || panic!("lost authority"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+
+    let before = effect_counts(&db).await;
+    let committed = round.commit(&db, false).await.unwrap();
+    for result in &committed.results {
+        assert_eq!(status(result)["reason"], "conversation_stopped_or_paused");
+    }
+    assert!(db.conversation_goal(&round.owner).await.unwrap().is_none());
+    assert!(!enabled(&db, &round.owner).await);
+    let after = effect_counts(&db).await;
+    assert_eq!((after.0, after.1, after.2), (before.0, before.1, before.2));
+}
+
+#[tokio::test]
+async fn stop_then_release_control_aba_invalidates_admitted_operation() {
+    let db = fixture().await;
+    let round = SelfRound::new(&db, "control-aba", vec![create()]).await;
+    for command in [ControlCommand::Stop, ControlCommand::Release] {
+        let current = db
+            .ordinary_goal_control(&round.owner)
+            .await
+            .unwrap()
+            .unwrap();
+        db.apply_goal_control(
+            &ControlRequest {
+                owner: round.owner.clone(),
+                principal_id: Uuid::nil(),
+                request_id: Uuid::new_v4(),
+                command,
+                expected_control_version: current.version(),
+            },
+            at(),
+            || panic!("lost authority"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    }
+
+    let before = effect_counts(&db).await;
+    let committed = round.commit(&db, false).await.unwrap();
+    assert_eq!(
+        status(&committed.results[0])["reason"],
+        "conversation_stopped_or_paused"
+    );
+    assert!(db.conversation_goal(&round.owner).await.unwrap().is_none());
+    let after = effect_counts(&db).await;
+    assert_eq!((after.0, after.1, after.2), (before.0, before.1, before.2));
+}
+
+#[tokio::test]
 async fn off_create_refuses_then_enable_then_create_in_separate_rounds_without_dispatch_or_rebinding(
 ) {
     for replay in [false, true] {
@@ -416,7 +529,7 @@ async fn forged_pending_source_is_not_an_argument_error_or_a_finalized_success()
         let before = effect_counts(&db).await;
         match field {
             "owner" => {
-                round.pending_mut().owner = ProductConversationId::parse("other-owner").unwrap()
+                round.pending_mut().owner = ProductConversationId::parse("other-owner").unwrap();
             }
             "execution" => {
                 let execution = GoalExecution::parse(
@@ -735,14 +848,14 @@ async fn retained_self_results_validate_full_canonical_shape_and_pending_evidenc
             match field {
                 "status" => {
                     content["content"] =
-                        serde_json::json!("{\"status\":\"auto_continuation_enabled\"}")
+                        serde_json::json!("{\"status\":\"auto_continuation_enabled\"}");
                 }
                 "error" => content["is_error"] = serde_json::json!(true),
                 "duration" | "display" => {}
 
                 "images" => {
                     content["images"] =
-                        serde_json::json!([{"media_type":"image/png","data":"AA=="}])
+                        serde_json::json!([{"media_type":"image/png","data":"AA=="}]);
                 }
                 "identity" => content["tool_use_id"] = serde_json::json!("other-call"),
                 _ => unreachable!(),

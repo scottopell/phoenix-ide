@@ -78,7 +78,7 @@ impl ActiveDirectTurnTerminal {
 }
 
 pub(crate) enum SelfGoalRoundCommit {
-    StateProjected(phoenix_db::conversation_goals::round::CommittedGoalRound),
+    StateProjected(Box<phoenix_db::conversation_goals::round::CommittedGoalRound>),
     Terminal(phoenix_db::conversation_goals::round::CommittedGoalTerminalRound),
 }
 
@@ -2448,7 +2448,7 @@ impl MessageStore for DatabaseStorage {
                     checkpoint, replay, proposal,
                 )
                 .await
-                .map(SelfGoalRoundCommit::StateProjected)
+                .map(|committed| SelfGoalRoundCommit::StateProjected(Box::new(committed)))
                 .map_err(|e| e.to_string())
         } else if let Some(settlement) = settlement {
             let obligation = terminal_obligation(settlement, None);
@@ -2465,13 +2465,13 @@ impl MessageStore for DatabaseStorage {
             self.db
                 .persist_goal_tool_round_state_and_replay(checkpoint, replay)
                 .await
-                .map(SelfGoalRoundCommit::StateProjected)
+                .map(|committed| SelfGoalRoundCommit::StateProjected(Box::new(committed)))
                 .map_err(|e| e.to_string())
         } else {
             self.db
                 .persist_goal_tool_round_and_state(checkpoint)
                 .await
-                .map(SelfGoalRoundCommit::StateProjected)
+                .map(|committed| SelfGoalRoundCommit::StateProjected(Box::new(committed)))
                 .map_err(|e| e.to_string())
         }
     }

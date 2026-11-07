@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    merge_trusted_tool_results, trusted_tool_results, ActiveDirectTurnSettlement, ConvState,
+    ConversationRuntime, DateTime, Event, LlmClient, MessageContent, RuntimeRecoveryDisposition,
+    Storage, TerminalFactDurability, ToolCall, ToolExecutor, ToolResult, Utc,
+};
 use phoenix_core::domain::conversation_goal::{SelfGoalOperation, ToolRoundResult};
 use phoenix_core::domain::sm_state::AssistantMessage;
 
@@ -71,11 +75,11 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                         .active_direct_turn
                         .as_ref()
                         .ok_or("self-goal tool has no active turn authority")?;
-                    let assistant_message = match &self.state {
-                        ConvState::ToolExecuting {
-                            assistant_message, ..
-                        } => assistant_message,
-                        _ => return Err("self-goal tool outside executing state".into()),
+                    let ConvState::ToolExecuting {
+                        assistant_message, ..
+                    } = &self.state
+                    else {
+                        return Err("self-goal tool outside executing state".into());
                     };
                     let pending = self
                         .storage
@@ -160,9 +164,8 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                 proposal,
             )
             .await
-            .map_err(|error| {
+            .inspect_err(|_| {
                 self.recovery_disposition = RuntimeRecoveryDisposition::RecreateFromDatabase;
-                error
             })?;
         self.pending_provider_replay_update = None;
         let (results, replayed) = apply_self_goal_round_commit(

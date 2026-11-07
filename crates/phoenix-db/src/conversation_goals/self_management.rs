@@ -135,13 +135,16 @@ pub(super) async fn finalize(
 ) -> Result<(ToolResult, Option<super::GoalVersionCommittedNotification>)> {
     let row = sqlx::query("SELECT p.kind,p.ordinary_lifecycle,p.auto_continue_on_context_exhaustion AS enabled,
         p.auto_continue_disable_epoch AS epoch,c.state,c.continued_in_conv_id,
-        t.disposition,t.generation,w.generation AS workflow_generation,w.status AS workflow_status,
+        t.disposition,t.generation,t.owns_conversation,t.terminal_kind,
+        w.generation AS workflow_generation,w.status AS workflow_status,
+        (ctl.control_version IS a.control_version AND COALESCE(ctl.stopped,0)=0) AS control_current,
         a.disable_epoch AS admitted_epoch,a.generation AS admitted_generation,
         a.owner_id AS admitted_owner,a.transcript_id AS admitted_transcript
         FROM durable_turns t JOIN conversations c ON c.id=t.conversation_id
         JOIN workflows w ON w.workflow_id=t.workflow_id
         JOIN product_conversations p ON p.id=c.product_conversation_id
         LEFT JOIN ordinary_self_goal_admissions a ON a.turn_id=t.turn_id AND a.workflow_id=t.workflow_id
+        LEFT JOIN conversation_goal_controls ctl ON ctl.owner_id=p.id
         WHERE t.turn_id=? AND t.workflow_id=? AND p.id=? AND c.id=?")
         .bind(pending.execution.turn_id()).bind(pending.execution.workflow_id())
         .bind(pending.owner.as_str()).bind(pending.call.transcript_id.as_str())
@@ -156,17 +159,7 @@ pub(super) async fn finalize(
     .bind(pending.owner.as_str())
     .fetch_one(&mut **tx)
     .await?;
-    let control_current =
-        match super::control::require_current_control_tx(tx, &pending.owner, pending.execution)
-            .await
-        {
-            Ok(()) => true,
-            Err(super::control::ControlError::AdmissionStopped) => false,
-            Err(super::control::ControlError::Storage(error)) => {
-                return Err(GoalDbError::Sqlx(error));
-            }
-            Err(_) => return Err(GoalDbError::Integrity("self-goal control authority")),
-        };
+    let control_current: bool = row.try_get("control_current")?;
     let refusal = if row.try_get::<String, _>("kind")? != "ordinary" {
         Some("ordinary_role_required")
     } else if row.try_get::<String, _>("ordinary_lifecycle")? != "open" || pending_close {
@@ -178,7 +171,9 @@ pub(super) async fn finalize(
         .is_some()
     {
         Some("transcript_changed")
-    } else if row.try_get::<String, _>("disposition")? != "Runtime"
+    } else if !row.try_get::<bool, _>("owns_conversation")?
+        || row.try_get::<Option<String>, _>("terminal_kind")?.is_some()
+        || row.try_get::<String, _>("disposition")? != "Runtime"
         || row.try_get::<i64, _>("generation")? != pending.generation
         || row.try_get::<i64, _>("workflow_generation")? != pending.generation
         || row.try_get::<String, _>("workflow_status")? != "Active"

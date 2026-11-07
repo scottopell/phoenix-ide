@@ -1,8 +1,10 @@
-use super::*;
+use super::{
+    mpsc, Arc, BrowserSessionManager, ContentBlock, ConvContext, ConvState, ConversationRuntime,
+    Effect, Event, MessageContent, ModelRegistry, Path, SseBroadcaster, ToolRoundResult, Utc,
+};
 use crate::runtime::testing::{MockLlmClient, MockToolExecutor};
 use crate::runtime::traits::{ActiveDirectTurn, DatabaseStorage};
-use phoenix_core::domain::conversation_goal::{GoalRequestLimit, GoalTimestampUs};
-use phoenix_core::domain::goal_control::{ControlCommand, ControlRequest};
+use phoenix_core::domain::product_conversation::AutoContinueOnContextExhaustion;
 use phoenix_core::domain::sm_event::{
     PreparedDirectTurnDelivery, PreparedDirectTurnPayload, SubmittedDirectTurnExpansionPolicy,
     SubmittedDirectTurnIdentity,
@@ -12,7 +14,6 @@ use phoenix_core::domain::sm_state::{ToolCall, ToolInput};
 use phoenix_workflow::{
     AcceptedDisposition, ClientTurnKey, ConversationAuthority, PreparedTurn, Timestamp, TurnOutcome,
 };
-use uuid::Uuid;
 
 async fn admit(db: &crate::db::Database, transcript: &str, key: &str) -> ActiveDirectTurn {
     let payload = PreparedDirectTurnPayload::from_parts(
@@ -44,7 +45,7 @@ async fn admit(db: &crate::db::Database, transcript: &str, key: &str) -> ActiveD
                 payload.to_exact_bytes().unwrap(),
             ),
             disposition: AcceptedDisposition::Runtime,
-            accepted_at: Timestamp(chrono::Utc::now().timestamp_micros()),
+            accepted_at: Timestamp(chrono::Utc::now().timestamp_micros().try_into().unwrap()),
         })
         .await
         .established()
@@ -54,18 +55,12 @@ async fn admit(db: &crate::db::Database, transcript: &str, key: &str) -> ActiveD
         panic!("fresh direct turn expected")
     };
     ActiveDirectTurn {
-        workflow_id: repository
-            .workflow_id_for_turn(turn_id)
-            .await
-            .unwrap()
-            .unwrap(),
         turn_id,
         generation: 0,
-        first_user_message_id: Some(key.into()),
     }
 }
 
-#[allow(clippy::too_many_lines)] // Real producer, canonical checkpoint, and terminal projection share this fixture.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Shared real-runtime fixture owns admission, checkpoint, and terminal settlement assertions.
 async fn terminal_self_tool(
     db: &crate::db::Database,
     transcript: &str,
@@ -73,6 +68,7 @@ async fn terminal_self_tool(
     key: &str,
     name: &str,
     input: serde_json::Value,
+    cancel_before_checkpoint: bool,
 ) -> serde_json::Value {
     let active = admit(db, transcript, key).await;
     let turn_id = i64::try_from(active.turn_id.0).unwrap();
@@ -100,10 +96,11 @@ async fn terminal_self_tool(
         None,
         None,
     );
-    let initial = ConvState::CancellingTool {
-        executing_tool: tool.clone(),
+    let initial = ConvState::ToolExecuting {
+        current_tool: tool.clone(),
         remaining_tools: vec![],
         completed_results: vec![],
+        pending_sub_agents: vec![],
         assistant_message: assistant,
     };
     let initial_timestamp = Utc::now();
@@ -113,6 +110,14 @@ async fn terminal_self_tool(
     let (tx, rx) = mpsc::channel(16);
     let tools = Arc::new(MockToolExecutor::new());
     let llm = Arc::new(MockLlmClient::new("test-model"));
+    llm.queue_response(phoenix_llm::LlmResponse {
+        provider_replay: None,
+        content: vec![ContentBlock::text("done")],
+        end_turn: true,
+        usage: phoenix_llm::Usage::default(),
+        usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
+        stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+    });
     let mut runtime = ConversationRuntime::new(
         ConvContext::new(transcript, cwd.to_path_buf(), "test-model", 200_000, 16_384),
         initial,
@@ -129,7 +134,7 @@ async fn terminal_self_tool(
         SseBroadcaster::new(128, 0),
     )
     .with_state_updated_at(initial_timestamp);
-    runtime.active_direct_turn = Some(active);
+    runtime.active_direct_turn = Some(Box::new(active));
     let (_, declarations) = runtime.prepare_overhead_without_recall().await.unwrap();
     for expected in ["create_goal", "enable_auto_continuation"] {
         assert!(declarations.iter().any(|tool| tool.name == expected));
@@ -172,7 +177,8 @@ async fn terminal_self_tool(
     assert!(matches!(
         &event,
         Event::ToolRoundComplete {
-            result: ToolRoundResult::PendingSelfGoal { .. }
+            result: ToolRoundResult::PendingSelfGoal { .. },
+            ..
         }
     ));
     let owner = db
@@ -193,7 +199,29 @@ async fn terminal_self_tool(
         .unwrap()
         .iter()
         .all(|message| message.message_id != format!("assistant-{key}")));
+    if cancel_before_checkpoint {
+        runtime
+            .process_event(Event::UserCancel {
+                reason: None,
+                cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(runtime.state, ConvState::CancellingTool { .. }));
+    }
     runtime.process_event(event).await.unwrap();
+    if !cancel_before_checkpoint {
+        assert!(matches!(runtime.state, ConvState::LlmRequesting { .. }));
+        runtime
+            .llm_task_handle
+            .take()
+            .expect("next provider request is owned")
+            .await
+            .unwrap();
+        while let Ok(event) = runtime.event_rx.try_recv() {
+            runtime.process_event(event).await.unwrap();
+        }
+    }
     assert!(matches!(runtime.state, ConvState::Idle));
     assert!(
         runtime.active_direct_turn.is_none(),
@@ -204,9 +232,9 @@ async fn terminal_self_tool(
     assert_eq!(persisted.state_updated_at, runtime.state_updated_at);
     assert!(runtime.terminal_transition_retry.is_none());
     assert!(tools.recorded_executions().is_empty());
-    assert!(
-        llm.recorded_requests().is_empty(),
-        "self tools do not dispatch another execution"
+    assert_eq!(
+        llm.recorded_requests().len(),
+        usize::from(!cancel_before_checkpoint)
     );
     let binding_after: (Option<i64>, Option<String>) = sqlx::query_as(
         "SELECT observed_version,goal_id FROM conversation_goal_bindings WHERE turn_id=?",
@@ -234,13 +262,6 @@ async fn terminal_self_tool(
 #[allow(clippy::too_many_lines)] // One real runtime journey exercises distinct enable/create calls and terminal settlement.
 async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_without_rebinding() {
     let db = crate::db::Database::open_in_memory().await.unwrap();
-    let db = db
-        .install_goal_controls_for_tests()
-        .await
-        .unwrap()
-        .install_goal_execution_for_tests(GoalRequestLimit::parse(2).unwrap())
-        .await
-        .unwrap();
     let cwd = tempfile::tempdir().unwrap();
     let transcript = "runtime-self-goal";
     db.create_conversation(
@@ -258,27 +279,26 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
         .await
         .unwrap()
         .product_conversation_id;
-    db.set_auto_continue_on_context_exhaustion(
-        &owner,
-        phoenix_db::AutoContinueOnContextExhaustion::Disabled,
+    db.set_auto_continue_on_context_exhaustion(&owner, AutoContinueOnContextExhaustion::Disabled)
+        .await
+        .unwrap();
+    let cancelled = terminal_self_tool(
+        &db,
+        transcript,
+        cwd.path(),
+        "cancelled-enable",
+        "enable_auto_continuation",
+        serde_json::json!({}),
+        true,
     )
-    .await
-    .unwrap();
-    db.apply_goal_control(
-        &ControlRequest {
-            owner: owner.clone(),
-            principal_id: Uuid::new_v4(),
-            request_id: Uuid::new_v4(),
-            command: ControlCommand::Release,
-            expected_control_version: 0,
-        },
-        GoalTimestampUs::parse(Utc::now().timestamp_micros()).unwrap(),
-        || panic!("lost control authority"),
-    )
-    .await
-    .established()
-    .unwrap()
-    .unwrap();
+    .await;
+    assert_eq!(cancelled["reason"], "conversation_stopped_or_paused");
+    assert_eq!(
+        db.auto_continue_on_context_exhaustion(&owner)
+            .await
+            .unwrap(),
+        AutoContinueOnContextExhaustion::Disabled
+    );
     let refused = terminal_self_tool(
         &db,
         transcript,
@@ -286,6 +306,7 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
         "off",
         "create_goal",
         serde_json::json!({"objective":"finish approved work"}),
+        false,
     )
     .await;
     assert_eq!(refused["reason"], "auto_continuation_disabled");
@@ -297,6 +318,7 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
         "enable",
         "enable_auto_continuation",
         serde_json::json!({}),
+        false,
     )
     .await;
     assert_eq!(enabled["status"], "auto_continuation_enabled");
@@ -308,6 +330,7 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
         "create",
         "create_goal",
         serde_json::json!({"objective":"finish approved work"}),
+        false,
     )
     .await;
     assert_eq!(created["status"], "goal_created");

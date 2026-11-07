@@ -546,10 +546,11 @@ pub(crate) async fn capture_goal_at_new_turn_tx(
     tx: &mut GoalTx<'_>,
     execution: GoalExecution,
 ) -> std::result::Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO ordinary_self_goal_admissions (turn_id,workflow_id,generation,owner_id,transcript_id,disable_epoch)
-        SELECT t.turn_id,t.workflow_id,t.generation,p.id,c.id,p.auto_continue_disable_epoch
+    sqlx::query("INSERT INTO ordinary_self_goal_admissions (turn_id,workflow_id,generation,owner_id,transcript_id,disable_epoch,control_version)
+        SELECT t.turn_id,t.workflow_id,t.generation,p.id,c.id,p.auto_continue_disable_epoch,ctl.control_version
         FROM durable_turns t JOIN conversations c ON c.id=t.conversation_id
         JOIN product_conversations p ON p.id=c.product_conversation_id
+        LEFT JOIN conversation_goal_controls ctl ON ctl.owner_id=p.id
         WHERE t.turn_id=? AND t.workflow_id=? AND p.kind='ordinary'")
         .bind(execution.turn_id()).bind(execution.workflow_id()).execute(&mut **tx).await?;
     sqlx::query(

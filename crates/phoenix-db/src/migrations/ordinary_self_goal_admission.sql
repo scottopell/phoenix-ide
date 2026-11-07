@@ -12,5 +12,6 @@ CREATE TABLE ordinary_self_goal_admissions (
     generation INTEGER NOT NULL CHECK(generation >= 0),
     owner_id TEXT NOT NULL REFERENCES product_conversations(id),
     transcript_id TEXT NOT NULL REFERENCES conversations(id),
-    disable_epoch INTEGER NOT NULL CHECK(disable_epoch >= 0)
+    disable_epoch INTEGER NOT NULL CHECK(disable_epoch >= 0),
+    control_version INTEGER CHECK(control_version > 0)
 ) STRICT;
