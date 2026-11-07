@@ -71,7 +71,11 @@ ten-page refresh cap, current continuation/Coordinator targets and History
 exclusion.
 
 The web panel displays saved-zone times, immutable due cards and scheduled-only
-management. Editing retains the opening revision; conflicts reload saved truth.
+management. Editing retains the opening revision; conflicts attempt to reload
+saved truth. A failed list fetch uses a compact retry/details status rather than
+an empty claim or a full card; previously loaded cards remain visible with a
+stale indication. Confirmed mutations hide obsolete state and actions until a
+fresh list arrives, while rejected mutations retain actionable errors.
 Abortable, non-overlapping polling runs at five seconds and on visibility, focus
 and network return. Browser alerts use existing permission/settings/focus policy,
 persisted `notify_reminder` defaulting enabled, a quiet initial baseline and
