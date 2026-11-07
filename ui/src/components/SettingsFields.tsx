@@ -1,3 +1,4 @@
+import { useId } from 'react';
 import type { EffortCapabilities, ModelEffort, ModelsResponse, ModelInfo } from '../api';
 import { DirectoryPicker } from './DirectoryPicker';
 
@@ -50,6 +51,8 @@ export function SettingsFields({
   setShowAllModels: (v: boolean) => void;
   recentPaths?: readonly string[];
 }) {
+  const directoryId = useId();
+
   // Filter and group models
   const filteredModels = models?.models.filter(m => showAllModels || m.recommended) || [];
   const totalCount = models?.models.length || 0;
@@ -72,9 +75,10 @@ export function SettingsFields({
 
   return (
     <>
-      <label className="settings-field">
-        <span className="settings-field-label">Directory</span>
+      <div className="settings-field">
+        <label className="settings-field-label" htmlFor={directoryId}>Directory</label>
         <DirectoryPicker
+          inputId={directoryId}
           value={cwd}
           onChange={setCwd}
           onStatusChange={onDirStatusChange}
@@ -82,7 +86,7 @@ export function SettingsFields({
           recentPaths={recentPaths}
           className="settings-input"
         />
-      </label>
+      </div>
       <label className="settings-field">
         <span className="settings-field-label">Model</span>
         <select

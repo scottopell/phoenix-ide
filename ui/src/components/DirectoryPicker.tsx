@@ -1,8 +1,9 @@
-import { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react';
+import { useState, useEffect, useRef, useCallback, useLayoutEffect, useId } from 'react';
 import { Folder, ChevronRight, ChevronLeft } from 'lucide-react';
 import { api } from '../api';
 import { Skeleton } from './Skeleton';
 import type { DirStatus } from './SettingsFields';
+import './DirectoryPicker.css';
 
 interface DirectoryEntry {
   name: string;
@@ -10,6 +11,7 @@ interface DirectoryEntry {
 }
 
 interface DirectoryPickerProps {
+  inputId?: string;
   value: string;
   onChange: (path: string) => void;
   onStatusChange?: (status: DirStatus) => void;
@@ -48,7 +50,12 @@ function parsePath(value: string): { parentPath: string; partial: string } {
   return { parentPath: parent, partial };
 }
 
-export function DirectoryPicker({ value, onChange, onStatusChange, onGitStatusChange, onDismiss, placeholder = '/path/to/project', className = '', recentPaths = [] }: DirectoryPickerProps) {
+export function DirectoryPicker({ inputId, value, onChange, onStatusChange, onGitStatusChange, onDismiss, placeholder = '/path/to/project', className = '', recentPaths = [] }: DirectoryPickerProps) {
+  const [showRecent, setShowRecent] = useState(false);
+  const [recentQuery, setRecentQuery] = useState('');
+  const recentListId = useId();
+  const recentButtonRef = useRef<HTMLButtonElement>(null);
+  const filteredRecentPaths = recentPaths.filter(path => path.toLowerCase().includes(recentQuery.trim().toLowerCase()));
   const [suggestions, setSuggestions] = useState<DirectoryEntry[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(-1);
@@ -298,16 +305,11 @@ export function DirectoryPicker({ value, onChange, onStatusChange, onGitStatusCh
 
   return (
     <div className="directory-picker">
-      {recentPaths.length > 0 && (
-        <div className="directory-picker-recent" aria-label="Recent directories">
-          {recentPaths.map((path) => (
-            <button key={path} type="button" onClick={() => onChange(path)}>{path}</button>
-          ))}
-        </div>
-      )}
       <div className="path-input-container">
         <input
           ref={inputRef}
+          id={inputId}
+          aria-label={inputId ? undefined : 'Directory path'}
           type="text"
           className={`${className} ${statusClass}`}
           value={value}
@@ -383,6 +385,66 @@ export function DirectoryPicker({ value, onChange, onStatusChange, onGitStatusCh
           </div>
         )}
       </div>
+      {recentPaths.length > 0 && (
+        <div className="directory-picker-recent">
+          <button
+            ref={recentButtonRef}
+            type="button"
+            className="directory-picker-recent-toggle"
+            aria-expanded={showRecent}
+            aria-controls={recentListId}
+            onClick={() => setShowRecent(open => !open)}
+          >
+            <ChevronRight size={14} aria-hidden="true" />
+            Choose recent location ({recentPaths.length})
+          </button>
+          {showRecent && (
+            <div
+              id={recentListId}
+              className="directory-picker-recent-panel"
+              onKeyDown={event => {
+                if (event.key === 'Escape') {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  setShowRecent(false);
+                  recentButtonRef.current?.focus();
+                }
+              }}
+            >
+              <input
+                autoFocus
+                type="search"
+                value={recentQuery}
+                onChange={event => setRecentQuery(event.target.value)}
+                aria-label="Search recent locations"
+                placeholder="Search recent locations"
+                className="settings-input directory-picker-recent-search"
+              />
+              <div className="directory-picker-recent-list" aria-label="Recent locations">
+                {filteredRecentPaths.length === 0 ? (
+                  <span className="directory-picker-recent-empty">No matching locations</span>
+                ) : filteredRecentPaths.map(path => (
+                  <button
+                    key={path}
+                    type="button"
+                    className="directory-picker-recent-entry"
+                    title={path}
+                    aria-current={path === value ? 'true' : undefined}
+                    onClick={() => {
+                      onChange(path);
+                      setRecentQuery('');
+                      setShowRecent(false);
+                      recentButtonRef.current?.focus();
+                    }}
+                  >
+                    {path}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
