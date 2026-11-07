@@ -208,7 +208,8 @@ entity RemoteContinueReservation {
 }
 
 -- Flattened semantic projection of the closed destination wire response. The
--- nested local Continue result contributes conversation_id, receipt and error.
+-- successor transcript is represented once at the response boundary; the
+-- nested Continue result contributes receipt and error.
 entity RemoteContinueResult {
     caller_instance_id: String
     destination_instance_id: String
@@ -218,7 +219,6 @@ entity RemoteContinueResult {
     successor_transcript_id: String
     opening_message_id: String
     opening_status: ContinueOpeningState
-    conversation_id: String
     receipt: ContinueDispatchReceipt
     error: String?
 }
@@ -544,13 +544,15 @@ rule RejectMismatchedRemoteAutomaticContinuationResponse {
 -- conversation/predecessor/summary boundary and the destination-computed
 -- payload digest all match.
 -- continue_response_matches(peer, request, result): authenticated selected
--- destination binds caller, destination, exact boundary, reserved successor and
--- destination-retained, source-derived opening. result.conversation_id equals
+-- destination binds caller, destination, exact boundary, the single canonical
+-- successor identity and destination-retained, source-derived opening. The
+-- source reconstructs the unchanged local Continue result conversation_id from
 -- result.successor_transcript_id. Pending opening_message_id equals
 -- request.first_message_id. Once accepted, it is the request key or
 -- successor:key for that reserved successor. Receipt, error and durable opening
 -- status must each be consistent with their own evidence. Unknown request,
--- response and nested-result fields are rejected.
+-- response and nested-result fields are rejected, including any second successor
+-- identity nested inside the result.
 rule DispatchLocalContinue {
     when: DispatchContinue(selection, request)
     requires: valid_continue_selector(selection, request)

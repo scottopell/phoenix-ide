@@ -1315,7 +1315,6 @@ enum RemoteContinueOpeningStatus {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RemoteContinueWireResult {
-    conversation_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     slug: Option<String>,
     status: crate::api::ContinueConversationStatus,
@@ -1323,24 +1322,32 @@ struct RemoteContinueWireResult {
     error: Option<String>,
 }
 
-impl From<crate::api::ContinueConversationResponse> for RemoteContinueWireResult {
-    fn from(result: crate::api::ContinueConversationResponse) -> Self {
-        Self {
-            conversation_id: result.conversation_id,
-            slug: result.slug,
-            status: result.status,
-            error: result.error,
-        }
+impl RemoteContinueWireResult {
+    fn split_response(
+        result: crate::api::ContinueConversationResponse,
+    ) -> (String, RemoteContinueWireResult) {
+        let crate::api::ContinueConversationResponse {
+            conversation_id,
+            slug,
+            status,
+            error,
+        } = result;
+        (
+            conversation_id,
+            RemoteContinueWireResult {
+                slug,
+                status,
+                error,
+            },
+        )
     }
-}
 
-impl From<RemoteContinueWireResult> for crate::api::ContinueConversationResponse {
-    fn from(result: RemoteContinueWireResult) -> Self {
-        Self {
-            conversation_id: result.conversation_id,
-            slug: result.slug,
-            status: result.status,
-            error: result.error,
+    fn into_response(self, conversation_id: String) -> crate::api::ContinueConversationResponse {
+        crate::api::ContinueConversationResponse {
+            conversation_id,
+            slug: self.slug,
+            status: self.status,
+            error: self.error,
         }
     }
 }
@@ -1372,7 +1379,6 @@ fn verify_remote_continue(
     if response.product_conversation_id != request.product_conversation_id
         || response.predecessor_transcript_id != request.predecessor_transcript_id
         || response.summary_message_id != request.summary_message_id
-        || response.successor_transcript_id != response.result.conversation_id
         || response.successor_transcript_id.trim().is_empty()
         || !match response.opening_status {
             RemoteContinueOpeningStatus::Pending => {
@@ -1406,7 +1412,9 @@ fn verify_remote_continue(
             "continuation boundary changed".into(),
         ));
     }
-    Ok(response.result.into())
+    Ok(response
+        .result
+        .into_response(response.successor_transcript_id))
 }
 
 pub async fn remote_continue_conversation(
@@ -1556,6 +1564,7 @@ async fn continue_conversation_inner(
         }
     };
     let (result, opening) = result.into_response_and_opening();
+    let (successor_transcript_id, result) = RemoteContinueWireResult::split_response(result);
     let (opening_message_id, opening_status) = match opening {
         crate::continuation_service::FederatedNativeOpeningEvidence::Pending { message_id } => {
             (message_id, RemoteContinueOpeningStatus::Pending)
@@ -1573,10 +1582,10 @@ async fn continue_conversation_inner(
         product_conversation_id: request.product_conversation_id,
         predecessor_transcript_id: request.predecessor_transcript_id,
         summary_message_id: request.summary_message_id,
-        successor_transcript_id: result.conversation_id.clone(),
+        successor_transcript_id,
         opening_message_id,
         opening_status,
-        result: result.into(),
+        result,
     })
     .into_response()
 }
@@ -2919,7 +2928,6 @@ mod tests {
             opening_message_id,
             opening_status,
             result: RemoteContinueWireResult {
-                conversation_id: "successor".into(),
                 slug: None,
                 status,
                 error: None,
@@ -2995,7 +3003,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_continue_response_rejects_unknown_boundary_and_result_fields() {
+    fn remote_continue_response_has_one_successor_id_and_rejects_unknown_fields() {
         let request = remote_continue_fixture();
         let response = remote_continue_response(
             &request,
@@ -3004,6 +3012,8 @@ mod tests {
             request.first_message_id.clone(),
         );
         let mut serialized = serde_json::to_value(response).unwrap();
+        assert_eq!(serialized["successor_transcript_id"], "successor");
+        assert!(serialized["result"].get("conversation_id").is_none());
         serialized["unexpected"] = serde_json::json!(true);
         assert!(serde_json::from_value::<RemoteContinueResponse>(serialized).is_err());
 
@@ -3014,8 +3024,29 @@ mod tests {
             request.first_message_id.clone(),
         );
         let mut serialized = serde_json::to_value(response).unwrap();
-        serialized["result"]["unexpected"] = serde_json::json!(true);
+        serialized["result"]["conversation_id"] = serde_json::json!("other-successor");
         assert!(serde_json::from_value::<RemoteContinueResponse>(serialized).is_err());
+    }
+
+    #[test]
+    fn remote_continue_response_reconstructs_unchanged_local_result() {
+        let request = remote_continue_fixture();
+        let mut response = remote_continue_response(
+            &request,
+            crate::api::ContinueConversationStatus::Accepted,
+            RemoteContinueOpeningStatus::Accepted,
+            request.first_message_id.clone(),
+        );
+        response.result.slug = Some("successor-slug".into());
+
+        let result = verify_remote_continue(response, &request).unwrap();
+        assert_eq!(result.conversation_id, "successor");
+        assert_eq!(result.slug.as_deref(), Some("successor-slug"));
+        assert_eq!(
+            result.status,
+            crate::api::ContinueConversationStatus::Accepted
+        );
+        assert_eq!(result.error, None);
     }
 
     #[test]
@@ -3096,7 +3127,7 @@ mod tests {
             RemoteContinueOpeningStatus::Accepted,
             request.first_message_id.clone(),
         );
-        response.result.conversation_id = "different-successor".into();
+        response.successor_transcript_id.clear();
         assert!(matches!(
             verify_remote_continue(response, &request),
             Err(FederationClientError::ProvenanceMismatch(_))
