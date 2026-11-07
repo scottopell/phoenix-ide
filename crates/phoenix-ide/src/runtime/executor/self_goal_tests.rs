@@ -61,6 +61,13 @@ async fn admit(db: &crate::db::Database, transcript: &str, key: &str) -> ActiveD
     }
 }
 
+#[derive(Clone, Copy)]
+enum RoundEnding {
+    Complete,
+    CancelCurrent,
+    CancelFollowing,
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Shared real-runtime fixture owns admission, checkpoint, and terminal settlement assertions.
 async fn terminal_self_tool(
     db: &crate::db::Database,
@@ -69,7 +76,7 @@ async fn terminal_self_tool(
     key: &str,
     name: &str,
     input: serde_json::Value,
-    cancel_before_checkpoint: bool,
+    ending: RoundEnding,
 ) -> ToolContent {
     let active = admit(db, transcript, key).await;
     let turn_id = i64::try_from(active.turn_id.0).unwrap();
@@ -87,19 +94,31 @@ async fn terminal_self_tool(
             input: input.clone(),
         },
     );
-    let assistant = AssistantMessage::new(
-        format!("assistant-{key}"),
-        vec![ContentBlock::ToolUse {
-            id: tool.id.clone(),
-            name: name.into(),
-            input,
-        }],
-        None,
-        None,
-    );
+    let following = matches!(ending, RoundEnding::CancelFollowing).then(|| {
+        ToolCall::new(
+            format!("{key}-following"),
+            ToolInput::Unknown {
+                name: "think".into(),
+                input: serde_json::json!({"thoughts":"next tool"}),
+            },
+        )
+    });
+    let mut blocks = vec![ContentBlock::ToolUse {
+        id: tool.id.clone(),
+        name: name.into(),
+        input,
+    }];
+    if let Some(following) = &following {
+        blocks.push(ContentBlock::ToolUse {
+            id: following.id.clone(),
+            name: following.name().into(),
+            input: following.input.to_value(),
+        });
+    }
+    let assistant = AssistantMessage::new(format!("assistant-{key}"), blocks, None, None);
     let initial = ConvState::ToolExecuting {
         current_tool: tool.clone(),
-        remaining_tools: vec![],
+        remaining_tools: following.clone().into_iter().collect(),
         completed_results: vec![],
         pending_sub_agents: vec![],
         assistant_message: assistant,
@@ -201,7 +220,36 @@ async fn terminal_self_tool(
         .unwrap()
         .iter()
         .all(|message| message.message_id != format!("assistant-{key}")));
-    if cancel_before_checkpoint {
+    let completion = if let Some(following) = &following {
+        let next =
+            crate::state_machine::transition(&runtime.state, &runtime.context, event).unwrap();
+        let ConvState::ToolExecuting {
+            current_tool,
+            completed_results,
+            ..
+        } = &next.new_state
+        else {
+            panic!("pending self-goal must advance to the following tool");
+        };
+        assert_eq!(current_tool.id, following.id);
+        assert!(matches!(
+            completed_results.as_slice(),
+            [ToolRoundResult::PendingSelfGoal { .. }]
+        ));
+        runtime.state = next.new_state;
+        runtime.state_updated_at = Utc::now();
+        // The following tool is staged without dispatching its executor.
+        db.update_conversation_state_at(transcript, &runtime.state, runtime.state_updated_at)
+            .await
+            .unwrap();
+        Event::ToolAborted {
+            tool_use_id: following.id.clone(),
+        }
+    } else {
+        event
+    };
+    let cancelled = !matches!(ending, RoundEnding::Complete);
+    if cancelled {
         runtime
             .process_event(Event::UserCancel {
                 reason: None,
@@ -211,8 +259,8 @@ async fn terminal_self_tool(
             .unwrap();
         assert!(matches!(runtime.state, ConvState::CancellingTool { .. }));
     }
-    runtime.process_event(event).await.unwrap();
-    if !cancel_before_checkpoint {
+    runtime.process_event(completion).await.unwrap();
+    if !cancelled {
         assert!(matches!(runtime.state, ConvState::LlmRequesting { .. }));
         runtime
             .llm_task_handle
@@ -234,10 +282,7 @@ async fn terminal_self_tool(
     assert_eq!(persisted.state_updated_at, runtime.state_updated_at);
     assert!(runtime.terminal_transition_retry.is_none());
     assert!(tools.recorded_executions().is_empty());
-    assert_eq!(
-        llm.recorded_requests().len(),
-        usize::from(!cancel_before_checkpoint)
-    );
+    assert_eq!(llm.recorded_requests().len(), usize::from(!cancelled));
     let binding_after: (Option<i64>, Option<String>) = sqlx::query_as(
         "SELECT observed_version,goal_id FROM conversation_goal_bindings WHERE turn_id=?",
     )
@@ -250,6 +295,31 @@ async fn terminal_self_tool(
         "the current turn is never rebound"
     );
     let messages = db.get_messages(transcript).await.unwrap();
+    if cancelled {
+        assert_eq!(db.conversation_goal(&owner).await.unwrap(), goal_before);
+        assert_eq!(
+            db.auto_continue_on_context_exhaustion(&owner)
+                .await
+                .unwrap(),
+            preference_before
+        );
+    }
+    if let Some(following) = &following {
+        let following_result = messages
+            .iter()
+            .find_map(|message| match &message.content {
+                MessageContent::Tool(result) if result.tool_use_id == following.id => Some(result),
+                _ => None,
+            })
+            .expect("following tool cancellation is durable in the same round");
+        assert_eq!(
+            following_result,
+            &tool_result_transcript_content(&ToolResult::cancelled(
+                following.id.clone(),
+                "Cancelled by user"
+            ))
+        );
+    }
     let result = messages
         .iter()
         .find_map(|message| match &message.content {
@@ -291,7 +361,7 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
         "cancelled-enable",
         "enable_auto_continuation",
         serde_json::json!({}),
-        true,
+        RoundEnding::CancelCurrent,
     ))
     .await;
     assert_eq!(
@@ -307,6 +377,23 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
             .unwrap(),
         AutoContinueOnContextExhaustion::Disabled
     );
+    let pending_cancelled = Box::pin(terminal_self_tool(
+        &db,
+        transcript,
+        cwd.path(),
+        "pending-enable",
+        "enable_auto_continuation",
+        serde_json::json!({}),
+        RoundEnding::CancelFollowing,
+    ))
+    .await;
+    let pending_cancelled: serde_json::Value =
+        serde_json::from_str(&pending_cancelled.content).unwrap();
+    assert_eq!(pending_cancelled["status"], "refused");
+    assert_eq!(
+        pending_cancelled["reason"],
+        "conversation_stopped_or_paused"
+    );
     let refused = Box::pin(terminal_self_tool(
         &db,
         transcript,
@@ -314,7 +401,7 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
         "off",
         "create_goal",
         serde_json::json!({"objective":"finish approved work"}),
-        false,
+        RoundEnding::Complete,
     ))
     .await;
     let refused: serde_json::Value = serde_json::from_str(&refused.content).unwrap();
@@ -327,7 +414,7 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
         "enable",
         "enable_auto_continuation",
         serde_json::json!({}),
-        false,
+        RoundEnding::Complete,
     ))
     .await;
     let enabled: serde_json::Value = serde_json::from_str(&enabled.content).unwrap();
@@ -340,7 +427,7 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
         "create",
         "create_goal",
         serde_json::json!({"objective":"finish approved work"}),
-        false,
+        RoundEnding::Complete,
     ))
     .await;
     let created: serde_json::Value = serde_json::from_str(&created.content).unwrap();
