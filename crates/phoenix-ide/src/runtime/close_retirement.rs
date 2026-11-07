@@ -4538,6 +4538,8 @@ enum FinalTombstoneRecovery {
     Residual(String),
 }
 
+// Keep the exact-removal adapter's explicit identity, plan and effect bindings together.
+#[allow(clippy::too_many_arguments)]
 fn inspect_and_remove_exact_worktree<B>(
     runtime: &tokio::runtime::Handle,
     identity: &WorktreeIdentity,
@@ -5799,9 +5801,13 @@ fn quarantine_has_writable_mappings_in(
                 let mut remainder = mapping;
                 for _ in 0..5 {
                     remainder = remainder.trim_start();
-                    remainder = &remainder[remainder
-                        .find(char::is_whitespace)
-                        .unwrap_or(remainder.len())..];
+                    remainder = remainder
+                        .get(
+                            remainder
+                                .find(char::is_whitespace)
+                                .unwrap_or(remainder.len())..,
+                        )
+                        .ok_or(CloseWriterGap::Malformed)?;
                 }
                 let mapped_path = PathBuf::from(remainder.trim_start());
                 if permissions.len() != 4 {
@@ -6121,7 +6127,7 @@ fn linux_writer_process(
     let stat =
         std::fs::read_to_string(process.join("stat")).map_err(|_| CloseWriterGap::Unavailable)?;
     let (_, tail) = stat.rsplit_once(')').ok_or(CloseWriterGap::Malformed)?;
-    let start = tail
+    let start_ticks = tail
         .split_whitespace()
         .nth(19)
         .ok_or(CloseWriterGap::Malformed)?
@@ -6131,7 +6137,7 @@ fn linux_writer_process(
         std::fs::read_link(process.join("exe")).map_err(|_| CloseWriterGap::Unavailable)?;
     Ok(CloseWriterProcess {
         pid,
-        incarnation: OpaqueIdentity::parse(format!("{boot_id}:{start}"))
+        incarnation: OpaqueIdentity::parse(format!("{boot_id}:{start_ticks}"))
             .map_err(|_| CloseWriterGap::Malformed)?,
         executable,
     })
@@ -6333,8 +6339,8 @@ fn mac_descriptor_authority(
         _ => return Err(CloseWriterGap::Unsupported),
     };
     Ok(descriptor_authority(
-        mode & 0o170000 == 0o040000,
-        mode & 0o170000 == 0o100000,
+        mode & 0o170_000 == 0o040_000,
+        mode & 0o170_000 == 0o100_000,
         access,
     ))
 }
@@ -6401,7 +6407,7 @@ fn stable_writer_observation(
     observed: Option<(PathBuf, CloseWriterAuthority)>,
     after: Result<Option<CloseWriterProcess>, CloseWriterGap>,
 ) -> ExternalWriterEvidence {
-    if after.as_ref().ok().and_then(Option::as_ref) != Some(&before) {
+    if after.ok().flatten().as_ref() != Some(&before) {
         return writer_gap(detector, Some(before.pid), CloseWriterGap::ProcessChanged);
     }
     match observed {
@@ -6734,6 +6740,8 @@ impl CloseWorktreeEffects {
     }
 }
 
+// Forward the existing exact-removal bindings and injected effects without hiding authority.
+#[allow(clippy::too_many_arguments)]
 async fn quarantine_and_remove_exact_worktree<F, B>(
     identity: &WorktreeIdentity,
     confirmed_snapshot: &CloseRetirementSnapshot,
@@ -11738,20 +11746,20 @@ mod tests {
             CloseDescriptorAccess as Access, CloseFileWriteAccess as Write,
             CloseWriterAuthority as Authority,
         };
-        assert_eq!(super::mac_descriptor_authority(0o100644, 1), Ok(None));
+        assert_eq!(super::mac_descriptor_authority(0o100_644, 1), Ok(None));
         assert_eq!(
-            super::mac_descriptor_authority(0o100644, 2),
+            super::mac_descriptor_authority(0o100_644, 2),
             Ok(Some(Authority::WritableFile(Write::WriteOnly)))
         );
         assert_eq!(
-            super::mac_descriptor_authority(0o100644, 3),
+            super::mac_descriptor_authority(0o100_644, 3),
             Ok(Some(Authority::WritableFile(Write::ReadWrite)))
         );
         assert_eq!(
-            super::mac_descriptor_authority(0o040755, 1),
+            super::mac_descriptor_authority(0o040_755, 1),
             Ok(Some(Authority::DirectoryDescriptor(Access::ReadOnly)))
         );
-        assert!(super::mac_descriptor_authority(0o100644, 0).is_err());
+        assert!(super::mac_descriptor_authority(0o100_644, 0).is_err());
         for share_mode in 0..10 {
             assert!(!super::mac_mapping_is_writer(1, share_mode));
             assert_eq!(
