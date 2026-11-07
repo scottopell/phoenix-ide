@@ -212,6 +212,7 @@ pub enum GoalPreparationSource {
 }
 
 impl GoalPreparationSource {
+    #[must_use]
     pub fn source(&self) -> &GoalAgentSource {
         match self {
             Self::Local(source) => source,

@@ -278,7 +278,7 @@ impl GoalCommandService {
             .db()
             .prepare_remote_coordinator_goal_action(authority, source, owner, intent)
             .await;
-        self.publication_result(pass.complete(outcome)?)
+        self.publication_result(pass.complete(outcome))
     }
 
     pub(crate) async fn apply_remote(
