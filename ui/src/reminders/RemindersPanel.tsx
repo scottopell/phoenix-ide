@@ -23,7 +23,7 @@ function OwnedRemindersPanel({ conversationId, readOnly }: { conversationId: str
   const changeEpoch = useRef(0);
   const [refreshVersion, setRefreshVersion] = useState(0);
   const load = useCallback(async (signal: AbortSignal) => {
-    const epoch = changeEpoch.current;
+    const epoch = refreshVersion;
     const rows = await api.listReminders(conversationId, signal);
     return { rows, epoch };
   }, [conversationId, refreshVersion]);
@@ -95,7 +95,7 @@ function OwnedRemindersPanel({ conversationId, readOnly }: { conversationId: str
 function ReminderFetchStatus({ error, loaded, retry }: { error: string | null; loaded: boolean; retry: () => void }) {
   const message = loaded ? 'Reminders may be out of date' : 'Reminders not loaded';
   return <>
-    <span className="reminders-announcement" role="status">{error && `Reminder list: ${message}`}</span>
+    <span className="reminders-announcement" aria-live="polite" aria-atomic="true">{error && `Reminder list: ${message}`}</span>
     {error && <div className="reminders-fetch-status">
       <span aria-hidden="true">{message}</span>
       <button type="button" onClick={retry}>Retry reminders</button>

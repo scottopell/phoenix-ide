@@ -22,8 +22,9 @@ describe('reminder visibility and management', () => {
     vi.mocked(api.listReminders).mockRejectedValueOnce(new Error('Load failed')).mockResolvedValue([]);
     render(<RemindersPanel conversationId="owner" />);
     await screen.findByText('Reminders not loaded');
-    const status = screen.getByRole('status');
+    const status = document.querySelector('.reminders-announcement');
     expect(status).toHaveTextContent('Reminder list: Reminders not loaded');
+    expect(status).toHaveAttribute('aria-live', 'polite');
     expect(screen.queryByRole('region', { name: 'Reminders' })).not.toBeInTheDocument();
     const details = screen.getByText('Details').closest('details');
     expect(details).not.toHaveAttribute('open');
@@ -40,7 +41,7 @@ describe('reminder visibility and management', () => {
     let reject!: (error: Error) => void;
     vi.mocked(api.listReminders).mockImplementationOnce(() => new Promise<Reminder[]>((_resolve, fail) => { reject = fail; }));
     render(<RemindersPanel conversationId="owner" />);
-    const status = screen.getByRole('status');
+    const status = document.querySelector('.reminders-announcement');
     expect(status).toBeEmptyDOMElement();
     await act(async () => { reject(new Error('Load failed')); });
     expect(status).toHaveTextContent('Reminder list: Reminders not loaded');
@@ -54,13 +55,13 @@ describe('reminder visibility and management', () => {
     expect(await screen.findByText('Reminder due')).toBeInTheDocument();
     fireEvent.focus(window);
     await screen.findByText('Reminders may be out of date');
-    const status = screen.getByRole('status');
+    const status = document.querySelector('.reminders-announcement');
     expect(status).toHaveTextContent('Reminder list: Reminders may be out of date');
     expect(screen.getByText('Inspect Safari')).toBeInTheDocument();
-    expect(screen.getAllByRole('status')).toHaveLength(1);
+    expect(document.querySelectorAll('.reminders-announcement')).toHaveLength(1);
     fireEvent.focus(window);
     await waitFor(() => expect(api.listReminders).toHaveBeenCalledTimes(3));
-    expect(screen.getAllByRole('status')).toHaveLength(1);
+    expect(document.querySelectorAll('.reminders-announcement')).toHaveLength(1);
     window.dispatchEvent(new Event('online'));
     await waitFor(() => expect(screen.queryByText('Reminders may be out of date')).not.toBeInTheDocument());
     expect(screen.getByText('Reminder due')).toBeInTheDocument();
@@ -73,7 +74,7 @@ describe('reminder visibility and management', () => {
     await waitFor(() => expect(api.listReminders).toHaveBeenCalledTimes(1));
     fireEvent.focus(window);
     await screen.findByText('Reminders may be out of date');
-    expect(screen.getByRole('status')).toHaveTextContent('Reminders may be out of date');
+    expect(document.querySelector('.reminders-announcement')).toHaveTextContent('Reminders may be out of date');
     expect(screen.queryByRole('region', { name: 'Reminders' })).not.toBeInTheDocument();
   });
 
@@ -85,7 +86,7 @@ describe('reminder visibility and management', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Could not cancel reminder: Network error');
     expect(screen.getByText('Upcoming')).toBeInTheDocument();
     await screen.findByText('Reminders may be out of date');
-    expect(screen.getByRole('status')).toHaveTextContent('Reminders may be out of date');
+    expect(document.querySelector('.reminders-announcement')).toHaveTextContent('Reminders may be out of date');
     expect(api.manageReminder).toHaveBeenCalledTimes(1);
   });
 
@@ -98,7 +99,7 @@ describe('reminder visibility and management', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Could not reschedule reminder: Invalid local date');
     expect(screen.getByRole('button', { name: 'Save reminder time' })).toBeInTheDocument();
     await screen.findByText('Reminders may be out of date');
-    expect(screen.getByRole('status')).toHaveTextContent('Reminders may be out of date');
+    expect(document.querySelector('.reminders-announcement')).toHaveTextContent('Reminders may be out of date');
     expect(api.manageReminder).toHaveBeenCalledTimes(1);
   });
 
@@ -107,7 +108,7 @@ describe('reminder visibility and management', () => {
     render(<RemindersPanel conversationId="owner" />);
     fireEvent.click(await screen.findByRole('button', { name: 'Cancel reminder' }));
     await screen.findByText('Reminders may be out of date');
-    expect(screen.getByRole('status')).toHaveTextContent('Reminders may be out of date');
+    expect(document.querySelector('.reminders-announcement')).toHaveTextContent('Reminders may be out of date');
     expect(screen.getByText('Cancellation saved — list not refreshed')).toBeInTheDocument();
     expect(screen.queryByText('Upcoming')).not.toBeInTheDocument();
     expect(screen.queryByText('Cancelled')).not.toBeInTheDocument();
@@ -120,7 +121,7 @@ describe('reminder visibility and management', () => {
       .mockRejectedValue(new Error('Load failed'));
     render(<RemindersPanel conversationId="owner" />);
     expect(await screen.findByText('Second task')).toBeInTheDocument();
-    fireEvent.click(screen.getAllByRole('button', { name: 'Cancel reminder' })[0]);
+    fireEvent.click(screen.getAllByRole('button', { name: 'Cancel reminder' })[0]!);
     await screen.findByText('Cancellation saved — list not refreshed');
     expect(screen.getByRole('button', { name: 'Cancel reminder' })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Cancel reminder' }));
