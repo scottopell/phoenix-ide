@@ -24,6 +24,158 @@ use crate::{
     Database, DbError, DbResult,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseWriterDetector {
+    LinuxDescriptor,
+    LinuxCwd,
+    LinuxMapping,
+    MacDescriptor,
+    MacCwd,
+    MacMapping,
+}
+
+impl CloseWriterDetector {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LinuxDescriptor => "linux_descriptor",
+            Self::LinuxCwd => "linux_cwd",
+            Self::LinuxMapping => "linux_mapping",
+            Self::MacDescriptor => "mac_descriptor",
+            Self::MacCwd => "mac_cwd",
+            Self::MacMapping => "mac_mapping",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseDescriptorAccess {
+    ReadOnly,
+    WriteOnly,
+    ReadWrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseFileWriteAccess {
+    WriteOnly,
+    ReadWrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseWriterAuthority {
+    DirectoryDescriptor(CloseDescriptorAccess),
+    WritableFile(CloseFileWriteAccess),
+    WorkingDirectory,
+    WritableSharedMapping,
+}
+
+impl CloseWriterAuthority {
+    fn columns(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::DirectoryDescriptor(access) => (
+                "directory",
+                match access {
+                    CloseDescriptorAccess::ReadOnly => "read_only",
+                    CloseDescriptorAccess::WriteOnly => "write_only",
+                    CloseDescriptorAccess::ReadWrite => "read_write",
+                },
+                "namespace",
+            ),
+            Self::WritableFile(access) => (
+                "regular_file",
+                match access {
+                    CloseFileWriteAccess::WriteOnly => "write_only",
+                    CloseFileWriteAccess::ReadWrite => "read_write",
+                },
+                "content",
+            ),
+            Self::WorkingDirectory => ("cwd", "relative_lookup", "namespace"),
+            Self::WritableSharedMapping => ("mapping", "write_shared", "content"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseWriterGap {
+    Unavailable,
+    Malformed,
+    ProcessChanged,
+    DescriptorChanged,
+    Unsupported,
+}
+
+impl CloseWriterGap {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::Malformed => "malformed",
+            Self::ProcessChanged => "process_changed",
+            Self::DescriptorChanged => "descriptor_changed",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseWriterProcess {
+    pub pid: u32,
+    pub incarnation: OpaqueIdentity,
+    pub executable: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseWriterObservation {
+    Authority {
+        detector: CloseWriterDetector,
+        process: CloseWriterProcess,
+        matched_path: std::path::PathBuf,
+        authority: CloseWriterAuthority,
+    },
+    InspectionGap {
+        detector: CloseWriterDetector,
+        pid: Option<u32>,
+        reason: CloseWriterGap,
+    },
+}
+
+impl CloseWriterObservation {
+    #[must_use]
+    pub fn detector(&self) -> CloseWriterDetector {
+        match self {
+            Self::Authority { detector, .. } | Self::InspectionGap { detector, .. } => *detector,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordCloseWriterObservationRequest {
+    pub run: CloseRunRef,
+    pub scope: WorkScopeId,
+    pub snapshot: CloseRetirementSnapshot,
+    pub resource: RetiredResourceIdentity,
+    pub observation: CloseWriterObservation,
+}
+
+fn decode_close_writer_path(bytes: Vec<u8>) -> DbResult<std::path::PathBuf> {
+    if bytes.is_empty() || bytes.contains(&0) {
+        return Err(DbError::Serialization(
+            "invalid Close writer path bytes".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+        Ok(std::ffi::OsString::from_vec(bytes).into())
+    }
+    #[cfg(not(unix))]
+    {
+        Err(DbError::Serialization(
+            "Close writer native paths require Unix".into(),
+        ))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CloseFoundationTopologyMember {
     pub conversation: Conversation,
@@ -4658,6 +4810,221 @@ impl Database {
         sqlx::query("SELECT attempt_id, run_ordinal, status FROM close_runs WHERE status = 'running' ORDER BY attempt_id, run_ordinal")
             .fetch_all(&self.pool).await?.into_iter()
             .map(|row| parse_close_run_row(row).map(|run| run.run)).collect()
+    }
+
+    /// # Errors
+    /// Rejects conflicting observations and new evidence without exact active dispatch authority.
+    pub async fn record_close_writer_observation(
+        &self,
+        request: &RecordCloseWriterObservationRequest,
+    ) -> DbResult<()> {
+        let (pid, incarnation, executable, matched_path, kind, access, authority, gap) =
+            match &request.observation {
+                CloseWriterObservation::Authority {
+                    process,
+                    matched_path,
+                    authority,
+                    ..
+                } => {
+                    decode_close_writer_path(
+                        process.executable.as_os_str().as_encoded_bytes().to_vec(),
+                    )?;
+                    decode_close_writer_path(matched_path.as_os_str().as_encoded_bytes().to_vec())?;
+                    let (kind, access, authority) = authority.columns();
+                    (
+                        Some(process.pid),
+                        Some(process.incarnation.as_str()),
+                        Some(process.executable.as_os_str().as_encoded_bytes()),
+                        Some(matched_path.as_os_str().as_encoded_bytes()),
+                        Some(kind),
+                        Some(access),
+                        Some(authority),
+                        None,
+                    )
+                }
+                CloseWriterObservation::InspectionGap { pid, reason, .. } => (
+                    *pid,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(reason.as_str()),
+                ),
+            };
+        let identity = request.resource.identity();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let LossItemIdentity::Worktree(worktree) = identity else {
+            return Err(close_precondition(
+                "writer observation requires a captured worktree",
+            ));
+        };
+        let captured: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM close_attempt_scopes
+             WHERE attempt_id = ?1 AND scope = ?2 AND captured_worktree_identity = ?3
+               AND captured_worktree_fingerprint = ?4 AND captured_worktree_locator = ?5)",
+        )
+        .bind(request.run.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(worktree.id().as_str())
+        .bind(worktree.fingerprint().as_str())
+        .bind(worktree.locator().encode())
+        .fetch_one(&mut *tx)
+        .await?;
+        if !captured {
+            return Err(close_precondition(
+                "writer observation does not match the captured worktree",
+            ));
+        }
+        // Exact replays are no-ops even after the run stops; conflicts never overwrite evidence.
+        let inserted = sqlx::query(
+            "INSERT INTO close_writer_observations
+             (attempt_id, run_ordinal, scope, inspection_generation, inspection_fingerprint,
+              resource_kind, identity_kind, identity_codec, identity_value,
+              detector, pid, incarnation, executable, matched_path, matched_kind, access, authority, gap)
+             SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18
+             WHERE NOT EXISTS (SELECT 1 FROM close_writer_observations
+               WHERE attempt_id=?1 AND run_ordinal=?2 AND scope=?3 AND detector=?10)",
+        )
+        .bind(request.run.attempt_id.as_str()).bind(request.run.ordinal.get())
+        .bind(request.scope.as_str()).bind(request.snapshot.generation()).bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str()).bind(identity.identity_kind()).bind(identity.codec()).bind(identity.value())
+        .bind(request.observation.detector().as_str()).bind(pid).bind(incarnation).bind(executable).bind(matched_path)
+        .bind(kind).bind(access).bind(authority).bind(gap).execute(&mut *tx).await?;
+        if inserted.rows_affected() == 0 {
+            let exact: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM close_writer_observations
+                 WHERE attempt_id=?1 AND run_ordinal=?2 AND scope=?3
+                   AND inspection_generation=?4 AND inspection_fingerprint=?5
+                   AND resource_kind=?6 AND identity_kind=?7 AND identity_codec=?8 AND identity_value=?9
+                   AND detector=?10 AND pid IS ?11 AND incarnation IS ?12 AND executable IS ?13
+                   AND matched_path IS ?14 AND matched_kind IS ?15 AND access IS ?16 AND authority IS ?17 AND gap IS ?18)",
+            )
+            .bind(request.run.attempt_id.as_str()).bind(request.run.ordinal.get())
+            .bind(request.scope.as_str()).bind(request.snapshot.generation()).bind(request.snapshot.fingerprint())
+            .bind(request.resource.kind().as_str()).bind(identity.identity_kind()).bind(identity.codec()).bind(identity.value())
+            .bind(request.observation.detector().as_str()).bind(pid).bind(incarnation).bind(executable).bind(matched_path)
+            .bind(kind).bind(access).bind(authority).bind(gap).fetch_one(&mut *tx).await?;
+            if !exact {
+                return Err(close_precondition(
+                    "writer observation conflicts with immutable evidence",
+                ));
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns persistence or decoding errors without dropping malformed evidence.
+    pub async fn list_close_writer_observations(
+        &self,
+        run: &CloseRunRef,
+        scope: &WorkScopeId,
+    ) -> DbResult<Vec<RecordCloseWriterObservationRequest>> {
+        sqlx::query(
+            "SELECT observation.*, captured.captured_worktree_fingerprint,
+                    captured.captured_worktree_locator, captured.captured_worktree_identity
+             FROM close_writer_observations observation
+             LEFT JOIN close_attempt_scopes captured
+               ON captured.attempt_id = observation.attempt_id AND captured.scope = observation.scope
+             WHERE observation.attempt_id = ?1 AND observation.run_ordinal = ?2 AND observation.scope = ?3
+             ORDER BY observation.detector",
+        )
+        .bind(run.attempt_id.as_str())
+        .bind(run.ordinal.get())
+        .bind(scope.as_str())
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            let invalid = || DbError::Serialization("malformed Close writer observation".into());
+            let detector = match row.try_get::<&str, _>("detector")? {
+                "linux_descriptor" => CloseWriterDetector::LinuxDescriptor,
+                "linux_cwd" => CloseWriterDetector::LinuxCwd,
+                "linux_mapping" => CloseWriterDetector::LinuxMapping,
+                "mac_descriptor" => CloseWriterDetector::MacDescriptor,
+                "mac_cwd" => CloseWriterDetector::MacCwd,
+                "mac_mapping" => CloseWriterDetector::MacMapping,
+                _ => return Err(invalid()),
+            };
+            let pid = row.try_get::<Option<i64>, _>("pid")?
+                .map(|pid| u32::try_from(pid).ok().filter(|pid| *pid != 0).ok_or_else(invalid))
+                .transpose()?;
+            let incarnation: Option<String> = row.try_get("incarnation")?;
+            let executable: Option<Vec<u8>> = row.try_get("executable")?;
+            let matched_path: Option<Vec<u8>> = row.try_get("matched_path")?;
+            let kind: Option<&str> = row.try_get("matched_kind")?;
+            let access: Option<&str> = row.try_get("access")?;
+            let authority: Option<&str> = row.try_get("authority")?;
+            let gap: Option<&str> = row.try_get("gap")?;
+            let observation = match (gap, incarnation, executable, matched_path, kind, access, authority) {
+                (Some(gap), None, None, None, None, None, None) => {
+                    let reason = match gap {
+                        "unavailable" => CloseWriterGap::Unavailable,
+                        "malformed" => CloseWriterGap::Malformed,
+                        "process_changed" => CloseWriterGap::ProcessChanged,
+                        "descriptor_changed" => CloseWriterGap::DescriptorChanged,
+                        "unsupported" => CloseWriterGap::Unsupported,
+                        _ => return Err(invalid()),
+                    };
+                    CloseWriterObservation::InspectionGap { detector, pid, reason }
+                }
+                (None, Some(incarnation), Some(executable), Some(matched_path), Some(kind), Some(access), Some(authority)) => {
+                    let authority = match (detector, kind, access, authority) {
+                        (CloseWriterDetector::LinuxDescriptor | CloseWriterDetector::MacDescriptor, "directory", access, "namespace") => {
+                            CloseWriterAuthority::DirectoryDescriptor(match access {
+                                "read_only" => CloseDescriptorAccess::ReadOnly,
+                                "write_only" => CloseDescriptorAccess::WriteOnly,
+                                "read_write" => CloseDescriptorAccess::ReadWrite,
+                                _ => return Err(invalid()),
+                            })
+                        }
+                        (CloseWriterDetector::LinuxDescriptor | CloseWriterDetector::MacDescriptor, "regular_file", access, "content") => {
+                            CloseWriterAuthority::WritableFile(match access {
+                                "write_only" => CloseFileWriteAccess::WriteOnly,
+                                "read_write" => CloseFileWriteAccess::ReadWrite,
+                                _ => return Err(invalid()),
+                            })
+                        }
+                        (CloseWriterDetector::LinuxCwd | CloseWriterDetector::MacCwd, "cwd", "relative_lookup", "namespace") => CloseWriterAuthority::WorkingDirectory,
+                        (CloseWriterDetector::LinuxMapping | CloseWriterDetector::MacMapping, "mapping", "write_shared", "content") => CloseWriterAuthority::WritableSharedMapping,
+                        _ => return Err(invalid()),
+                    };
+                    CloseWriterObservation::Authority {
+                        detector,
+                        process: CloseWriterProcess {
+                            pid: pid.ok_or_else(invalid)?,
+                            incarnation: OpaqueIdentity::parse(incarnation)
+                                .map_err(|error| DbError::Serialization(error.to_string()))?,
+                            executable: decode_close_writer_path(executable)?,
+                        },
+                        matched_path: decode_close_writer_path(matched_path)?,
+                        authority,
+                    }
+                }
+                _ => return Err(invalid()),
+            };
+            let resource = parse_cleanup_resource_identity(&row)?;
+            if resource.kind() != RetiredResourceKind::Worktree
+                || row.try_get::<&str, _>("identity_value")?
+                    != row.try_get::<&str, _>("captured_worktree_identity")?
+            {
+                return Err(invalid());
+            }
+            Ok(RecordCloseWriterObservationRequest {
+                run: run.clone(),
+                scope: scope.clone(),
+                snapshot: CloseRetirementSnapshot::parse(
+                    row.try_get::<String, _>("inspection_generation")?,
+                    row.try_get::<String, _>("inspection_fingerprint")?,
+                ).map_err(|error| DbError::Serialization(error.to_string()))?,
+                resource,
+                observation,
+            })
+        })
+        .collect()
     }
 
     /// # Errors
@@ -12459,6 +12826,459 @@ mod tests {
                     .len(),
                 1
             );
+        }
+    }
+
+    async fn writer_observation_fixture(
+        db: &Database,
+    ) -> (
+        RecordCloseWriterObservationRequest,
+        TerminalizeInitialCloseCleanupFailureRequest,
+    ) {
+        let failure =
+            initial_cleanup_failure_fixture(db, CloseStopCertainty::ShutdownUncertain).await;
+        let CloseCleanupFailureAuthority::ExpectedResource {
+            scope,
+            snapshot,
+            resource,
+        } = &failure.authority
+        else {
+            panic!("expected exact worktree")
+        };
+        set_close_phase(
+            db,
+            failure.attempt_id.as_str(),
+            ClosePhase::RetirementRequested,
+        )
+        .await;
+        db.record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
+            attempt_id: failure.attempt_id.clone(),
+            scope: scope.clone(),
+            snapshot: snapshot.clone(),
+            resource: resource.clone(),
+        })
+        .await
+        .unwrap();
+        let run = db
+            .get_close_attempt_dto(&failure.attempt_id)
+            .await
+            .unwrap()
+            .runs
+            .current()
+            .run
+            .clone();
+        (
+            RecordCloseWriterObservationRequest {
+                run,
+                scope: scope.clone(),
+                snapshot: snapshot.clone(),
+                resource: resource.clone(),
+                observation: CloseWriterObservation::Authority {
+                    detector: CloseWriterDetector::LinuxDescriptor,
+                    process: CloseWriterProcess {
+                        pid: 123,
+                        incarnation: OpaqueIdentity::parse("boot:44").unwrap(),
+                        executable: "/test/writer".into(),
+                    },
+                    matched_path: "/test/quarantine/file".into(),
+                    authority: CloseWriterAuthority::WritableFile(CloseFileWriteAccess::ReadWrite),
+                },
+            },
+            failure,
+        )
+    }
+
+    #[tokio::test]
+    async fn writer_observation_is_normalized_immutable_idempotent_and_run_bound() {
+        let db = Database::open_in_memory().await.unwrap();
+        let (request, failure) = writer_observation_fixture(&db).await;
+        db.record_close_writer_observation(&request).await.unwrap();
+        db.record_close_writer_observation(&request).await.unwrap();
+        assert_eq!(
+            db.list_close_writer_observations(&request.run, &request.scope)
+                .await
+                .unwrap(),
+            vec![request.clone()]
+        );
+        assert!(db
+            .list_close_writer_observations(
+                &request.run,
+                &WorkScopeId::parse("other-scope").unwrap()
+            )
+            .await
+            .unwrap()
+            .is_empty());
+        let row: (i64, String, Vec<u8>, Vec<u8>, String, String, String) = sqlx::query_as(
+            "SELECT pid, incarnation, executable, matched_path, matched_kind, access, authority FROM close_writer_observations",
+        ).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(
+            row,
+            (
+                123,
+                "boot:44".into(),
+                b"/test/writer".to_vec(),
+                b"/test/quarantine/file".to_vec(),
+                "regular_file".into(),
+                "read_write".into(),
+                "content".into()
+            )
+        );
+        let mut conflict = request.clone();
+        if let CloseWriterObservation::Authority { matched_path, .. } = &mut conflict.observation {
+            *matched_path = "/different".into();
+        }
+        assert!(db.record_close_writer_observation(&conflict).await.is_err());
+        for sql in [
+            "UPDATE close_writer_observations SET pid = 124",
+            "DELETE FROM close_writer_observations",
+        ] {
+            assert!(sqlx::query(sql).execute(db.pool()).await.is_err());
+        }
+        let mut gap = request.clone();
+        gap.observation = CloseWriterObservation::InspectionGap {
+            detector: CloseWriterDetector::LinuxCwd,
+            pid: Some(124),
+            reason: CloseWriterGap::ProcessChanged,
+        };
+        db.record_close_writer_observation(&gap).await.unwrap();
+        let gap_row: (String, Option<String>, Option<Vec<u8>>) = sqlx::query_as(
+            "SELECT gap, incarnation, matched_path FROM close_writer_observations WHERE detector='linux_cwd'",
+        ).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(gap_row, ("process_changed".into(), None, None));
+        assert_eq!(
+            db.list_close_writer_observations(&request.run, &request.scope)
+                .await
+                .unwrap(),
+            vec![gap.clone(), request.clone()]
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            let mut native = request.clone();
+            if let CloseWriterObservation::Authority {
+                detector,
+                process,
+                matched_path,
+                ..
+            } = &mut native.observation
+            {
+                *detector = CloseWriterDetector::MacDescriptor;
+                process.executable =
+                    std::ffi::OsString::from_vec(b"/test/writer-\xff".to_vec()).into();
+                *matched_path = std::ffi::OsString::from_vec(b"/test/path-\xfe".to_vec()).into();
+            }
+            db.record_close_writer_observation(&native).await.unwrap();
+            assert_eq!(
+                db.list_close_writer_observations(&request.run, &request.scope)
+                    .await
+                    .unwrap(),
+                vec![gap.clone(), request.clone(), native]
+            );
+        }
+        assert!(decode_close_writer_path(Vec::new()).is_err());
+        assert!(decode_close_writer_path(b"/nul\0path".to_vec()).is_err());
+        db.terminalize_initial_close_cleanup_failure(&failure)
+            .await
+            .unwrap();
+        db.record_close_writer_observation(&request).await.unwrap();
+        db.record_close_writer_observation(&gap).await.unwrap();
+        gap.observation = CloseWriterObservation::InspectionGap {
+            detector: CloseWriterDetector::LinuxMapping,
+            pid: None,
+            reason: CloseWriterGap::Unavailable,
+        };
+        assert!(db.record_close_writer_observation(&gap).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn writer_observation_replacement_is_rejected_with_recursive_triggers_disabled() {
+        let db = Database::open_in_memory().await.unwrap();
+        let (request, _) = writer_observation_fixture(&db).await;
+        db.record_close_writer_observation(&request).await.unwrap();
+        let mut conn = db.pool().acquire().await.unwrap();
+        sqlx::query("PRAGMA recursive_triggers = OFF")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let error = sqlx::query(
+            "INSERT OR REPLACE INTO close_writer_observations
+            SELECT attempt_id, run_ordinal, scope, inspection_generation, inspection_fingerprint,
+                   resource_kind, identity_kind, identity_codec, identity_value, detector,
+                   999, incarnation, executable, matched_path, matched_kind, access, authority, gap
+            FROM close_writer_observations",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("immutable"), "{error}");
+        let pid: i64 = sqlx::query_scalar("SELECT pid FROM close_writer_observations")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(pid, 123);
+        drop(conn);
+        db.record_close_writer_observation(&request).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_observation_retry_binds_admitted_ordinal_and_retains_reused_pid_incarnations() {
+        let db = Database::open_in_memory().await.unwrap();
+        let (initial, failure) = writer_observation_fixture(&db).await;
+        db.record_close_writer_observation(&initial).await.unwrap();
+        db.terminalize_initial_close_cleanup_failure(&failure)
+            .await
+            .unwrap();
+        let run = db
+            .admit_close_safe_retry(&safe_retry_request(&failure))
+            .await
+            .unwrap();
+        assert_eq!(run.ordinal.get(), 2);
+        let mut retry = initial.clone();
+        retry.run = run.clone();
+        if let CloseWriterObservation::Authority { process, .. } = &mut retry.observation {
+            process.incarnation = OpaqueIdentity::parse("boot:45").unwrap();
+        }
+        let mut stale_run = initial.clone();
+        stale_run.observation = CloseWriterObservation::InspectionGap {
+            detector: CloseWriterDetector::LinuxCwd,
+            pid: Some(123),
+            reason: CloseWriterGap::ProcessChanged,
+        };
+        let mut stale_snapshot = retry.clone();
+        stale_snapshot.snapshot = CloseRetirementSnapshot::parse("stale", "stale").unwrap();
+        let mut wrong_scope = retry.clone();
+        wrong_scope.scope = WorkScopeId::parse("other-scope").unwrap();
+        let mut wrong_resource = retry.clone();
+        wrong_resource.resource =
+            cleanup_process_resource(RetiredResourceKind::BrowserSession, "other");
+        for invalid in [stale_run, stale_snapshot, wrong_scope, wrong_resource] {
+            assert!(db.record_close_writer_observation(&invalid).await.is_err());
+        }
+        db.record_close_writer_observation(&retry).await.unwrap();
+        db.record_close_writer_observation(&retry).await.unwrap();
+        let rows: Vec<(i64, i64, String)> = sqlx::query_as(
+            "SELECT run_ordinal, pid, incarnation FROM close_writer_observations ORDER BY run_ordinal",
+        ).fetch_all(db.pool()).await.unwrap();
+        assert_eq!(
+            rows,
+            vec![(1, 123, "boot:44".into()), (2, 123, "boot:45".into())]
+        );
+        assert_eq!(
+            db.list_close_writer_observations(&initial.run, &initial.scope)
+                .await
+                .unwrap(),
+            vec![initial.clone()]
+        );
+        assert_eq!(
+            db.list_close_writer_observations(&retry.run, &retry.scope)
+                .await
+                .unwrap(),
+            vec![retry.clone()]
+        );
+        let mut conflicting = retry.clone();
+        if let CloseWriterObservation::Authority { process, .. } = &mut conflicting.observation {
+            process.incarnation = OpaqueIdentity::parse("boot:46").unwrap();
+        }
+        assert!(db
+            .record_close_writer_observation(&conflicting)
+            .await
+            .is_err());
+        let mut failed_retry = failure;
+        failed_retry.failure_occurrence_id = run.failure_occurrence_id();
+        db.terminalize_close_run_cleanup_failure(&run, &failed_retry)
+            .await
+            .unwrap();
+        retry.observation = CloseWriterObservation::InspectionGap {
+            detector: CloseWriterDetector::LinuxMapping,
+            pid: None,
+            reason: CloseWriterGap::Unavailable,
+        };
+        assert!(db.record_close_writer_observation(&retry).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn writer_observation_rejects_same_id_wrong_fingerprint_or_locator_before_write_and_replay(
+    ) {
+        let db = Database::open_in_memory().await.unwrap();
+        let (request, failure) = writer_observation_fixture(&db).await;
+        let LossItemIdentity::Worktree(worktree) = request.resource.identity() else {
+            panic!("expected captured worktree")
+        };
+        let mismatches = [
+            WorktreeIdentity::from_parts(
+                worktree.id().clone(),
+                phoenix_core::domain::close::WorktreeFingerprint::parse("wrong-fingerprint")
+                    .unwrap(),
+                worktree.locator().clone(),
+            ),
+            WorktreeIdentity::from_parts(
+                worktree.id().clone(),
+                worktree.fingerprint().clone(),
+                GitPathIdentity::from_bytes(b"/wrong/worktree".to_vec()),
+            ),
+        ];
+        for retained in [false, true] {
+            if retained {
+                db.record_close_writer_observation(&request).await.unwrap();
+                db.terminalize_initial_close_cleanup_failure(&failure)
+                    .await
+                    .unwrap();
+                db.record_close_writer_observation(&request).await.unwrap();
+            }
+            for mismatch in &mismatches {
+                let mut changed = request.clone();
+                changed.resource = RetiredResourceIdentity::parse(
+                    RetiredResourceKind::Worktree,
+                    LossItemIdentity::Worktree(mismatch.clone()),
+                )
+                .unwrap();
+                assert!(db.record_close_writer_observation(&changed).await.is_err());
+                assert_eq!(
+                    db.list_close_writer_observations(&request.run, &request.scope)
+                        .await
+                        .unwrap(),
+                    if retained {
+                        vec![request.clone()]
+                    } else {
+                        vec![]
+                    },
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_observation_rejects_empty_and_nul_paths_before_write_and_replay() {
+        let db = Database::open_in_memory().await.unwrap();
+        let (request, _) = writer_observation_fixture(&db).await;
+        for retained in [false, true] {
+            if retained {
+                db.record_close_writer_observation(&request).await.unwrap();
+            }
+            for path in ["", "/test/nul\0path"] {
+                for executable in [false, true] {
+                    let mut changed = request.clone();
+                    let CloseWriterObservation::Authority {
+                        process,
+                        matched_path,
+                        ..
+                    } = &mut changed.observation
+                    else {
+                        panic!("expected authority")
+                    };
+                    if executable {
+                        process.executable = path.into();
+                    } else {
+                        *matched_path = path.into();
+                    }
+                    assert!(db.record_close_writer_observation(&changed).await.is_err());
+                    assert_eq!(
+                        db.list_close_writer_observations(&request.run, &request.scope)
+                            .await
+                            .unwrap(),
+                        if retained {
+                            vec![request.clone()]
+                        } else {
+                            vec![]
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_observation_sql_constraints_reject_empty_and_nul_path_blobs() {
+        let db = Database::open_in_memory().await.unwrap();
+        let (request, _) = writer_observation_fixture(&db).await;
+        db.record_close_writer_observation(&request).await.unwrap();
+        for path in [b"".as_slice(), b"/test/nul\0path".as_slice()] {
+            for executable in [false, true] {
+                let error = sqlx::query("INSERT INTO close_writer_observations
+                    SELECT attempt_id, run_ordinal, scope, inspection_generation, inspection_fingerprint,
+                           resource_kind, identity_kind, identity_codec, identity_value, 'mac_descriptor',
+                           pid, incarnation, ?1, ?2, matched_kind, access, authority, gap
+                    FROM close_writer_observations WHERE detector='linux_descriptor'")
+                    .bind(if executable { path } else { b"/test/writer".as_slice() })
+                    .bind(if executable { b"/test/file".as_slice() } else { path })
+                    .execute(db.pool()).await.unwrap_err();
+                assert!(
+                    error.to_string().contains("CHECK constraint failed"),
+                    "{error}"
+                );
+            }
+        }
+        assert_eq!(
+            db.list_close_writer_observations(&request.run, &request.scope)
+                .await
+                .unwrap(),
+            vec![request],
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_observation_rejects_stale_or_cross_bound_authority() {
+        let db = Database::open_in_memory().await.unwrap();
+        let (request, _) = writer_observation_fixture(&db).await;
+        let mut mutations = Vec::new();
+        let mut changed = request.clone();
+        changed.scope = WorkScopeId::parse("other-scope").unwrap();
+        mutations.push(changed);
+        let mut changed = request.clone();
+        changed.snapshot =
+            CloseRetirementSnapshot::parse("wrong-generation", request.snapshot.fingerprint())
+                .unwrap();
+        mutations.push(changed);
+        let mut changed = request.clone();
+        changed.snapshot =
+            CloseRetirementSnapshot::parse(request.snapshot.generation(), "wrong-fingerprint")
+                .unwrap();
+        mutations.push(changed);
+        let mut changed = request.clone();
+        changed.run.attempt_id = CloseAttemptId::parse("other-attempt").unwrap();
+        mutations.push(changed);
+        let mut changed = request.clone();
+        changed.run.ordinal = phoenix_core::domain::CloseRunOrdinal::parse(2).unwrap();
+        mutations.push(changed);
+        let mut changed = request.clone();
+        changed.resource =
+            cleanup_process_resource(RetiredResourceKind::BrowserSession, "wrong-resource");
+        mutations.push(changed);
+        for changed in mutations {
+            assert!(db.record_close_writer_observation(&changed).await.is_err());
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_writer_observations")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0
+        );
+        db.record_close_writer_observation(&request).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_observation_sql_constraints_reject_readonly_file_and_incomplete_positive() {
+        let db = Database::open_in_memory().await.unwrap();
+        let (request, _) = writer_observation_fixture(&db).await;
+        db.record_close_writer_observation(&request).await.unwrap();
+        for (pid, access, matched_path, gap) in [
+            (123_i64, "read_only", Some(b"/test/file".as_slice()), None),
+            (0, "read_write", Some(b"/test/file".as_slice()), None),
+            (123, "read_write", None, None),
+            (
+                123,
+                "read_write",
+                Some(b"/test/file".as_slice()),
+                Some("unavailable"),
+            ),
+        ] {
+            assert!(sqlx::query("INSERT INTO close_writer_observations
+                SELECT attempt_id, run_ordinal, scope, inspection_generation, inspection_fingerprint,
+                       resource_kind, identity_kind, identity_codec, identity_value, 'mac_descriptor',
+                       ?1, incarnation, executable, ?2, matched_kind, ?3, authority, ?4
+                FROM close_writer_observations WHERE detector='linux_descriptor'")
+                .bind(pid).bind(matched_path).bind(access).bind(gap).execute(db.pool()).await.is_err());
         }
     }
 

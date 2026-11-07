@@ -41,6 +41,11 @@ use crate::db::{
     ReplaceCloseInspectionRequest, ReplaceCloseInspectionScopeRequest,
     TerminalizeInitialCloseCleanupFailureRequest,
 };
+use crate::db::{
+    CloseDescriptorAccess, CloseFileWriteAccess, CloseWriterAuthority, CloseWriterDetector,
+    CloseWriterGap, CloseWriterObservation, CloseWriterProcess,
+    RecordCloseWriterObservationRequest,
+};
 
 /// Process-local capability retained from inventory sealing through per-resource
 /// teardown. Durable inventory stores only the permit's stable instance identity.
@@ -2421,6 +2426,14 @@ impl RuntimeManager {
                             let confirmed_snapshot = confirmed.snapshot;
                             let identity = identity.clone();
                             let cleanup_plan = cleanup_plan.clone();
+                            let writer_probe = CloseWriterProbe {
+                                db: self.db().clone(),
+                                runtime: tokio::runtime::Handle::current(),
+                                run: run.clone(),
+                                scope: scope.clone(),
+                                snapshot: snapshot.clone(),
+                                resource: target.resource.clone(),
+                            };
                             let recovery = tokio::task::spawn_blocking(move || {
                                 match resume_final_worktree_tombstone(
                                     cleanup_plan
@@ -2429,6 +2442,7 @@ impl RuntimeManager {
                                         .expect("filtered above"),
                                     &identity,
                                     &confirmed_snapshot,
+                                    writer_probe,
                                 ) {
                                     FinalTombstoneRecovery::Completed => {}
                                     FinalTombstoneRecovery::Residual(detail) => return Err(detail),
@@ -2551,12 +2565,21 @@ impl RuntimeManager {
                                 })?;
                             let confirmed_snapshot = confirmed.snapshot;
                             let identity = identity.clone();
+                            let writer_probe = CloseWriterProbe {
+                                db: self.db().clone(),
+                                runtime: tokio::runtime::Handle::current(),
+                                run: run.clone(),
+                                scope: scope.clone(),
+                                snapshot: snapshot.clone(),
+                                resource: target.resource.clone(),
+                            };
                             let recovery = tokio::task::spawn_blocking(move || {
                                 if let Some(tombstone) = &cleanup_plan.final_tombstone {
                                     match resume_final_worktree_tombstone(
                                         tombstone,
                                         &identity,
                                         &confirmed_snapshot,
+                                        writer_probe,
                                     ) {
                                         FinalTombstoneRecovery::Completed => {}
                                         FinalTombstoneRecovery::Residual(detail) => {
@@ -2738,6 +2761,14 @@ impl RuntimeManager {
                             let snapshot_for_tombstone = snapshot.clone();
                             let runtime = tokio::runtime::Handle::current();
                             let persistence_runtime = runtime.clone();
+                            let writer_probe = CloseWriterProbe {
+                                db: self.db().clone(),
+                                runtime: runtime.clone(),
+                                run: run.clone(),
+                                scope: scope.clone(),
+                                snapshot: snapshot.clone(),
+                                resource: target.resource.clone(),
+                            };
                             let final_removal = tokio::task::spawn_blocking(move || {
                                 inspect_and_remove_exact_worktree(
                                     &runtime,
@@ -2746,6 +2777,7 @@ impl RuntimeManager {
                                     &cleanup_plan.administrative_dir,
                                     &cleanup_plan.administrative_dir_incarnation,
                                     cleanup_plan.final_tombstone.as_ref(),
+                                    CloseWorktreeEffects::production(writer_probe),
                                     move |root, (device, inode), object| {
                                         if let Some((object_device, object_inode)) = object {
                                             persistence_runtime
@@ -4513,6 +4545,7 @@ fn inspect_and_remove_exact_worktree<B>(
     administrative_dir: &Path,
     administrative_dir_incarnation: &str,
     final_tombstone: Option<&CloseWorktreeFinalTombstone>,
+    effects: CloseWorktreeEffects,
     bind_tombstone: B,
 ) -> Result<ExactWorktreeRemoval, String>
 where
@@ -4527,6 +4560,7 @@ where
         final_tombstone,
         bind_tombstone,
         |_| {},
+        effects,
     )
 }
 
@@ -4556,6 +4590,7 @@ where
         None,
         |_, _, _| Ok(()),
         after_quarantine,
+        tests::injected_close_worktree_effects(|_| Ok(FsmonitorStop::NotRunning)),
     )
 }
 
@@ -4569,6 +4604,7 @@ fn inspect_and_remove_exact_worktree_with_hook_and_plan<F, B>(
     final_tombstone: Option<&CloseWorktreeFinalTombstone>,
     bind_tombstone: B,
     after_quarantine: F,
+    effects: CloseWorktreeEffects,
 ) -> Result<ExactWorktreeRemoval, String>
 where
     F: FnOnce(&Path) + Send + 'static,
@@ -4611,6 +4647,7 @@ where
         final_tombstone.cloned(),
         bind_tombstone,
         after_quarantine,
+        effects,
     ))
 }
 
@@ -5123,13 +5160,13 @@ fn resume_final_worktree_tombstone(
     tombstone: &CloseWorktreeFinalTombstone,
     identity: &WorktreeIdentity,
     confirmed: &CloseRetirementSnapshot,
+    probe: CloseWriterProbe,
 ) -> FinalTombstoneRecovery {
-    resume_final_worktree_tombstone_with_writer_probe(
-        tombstone,
-        identity,
-        confirmed,
-        quarantine_has_external_writer,
-    )
+    resume_final_worktree_tombstone_with_writer_probe(tombstone, identity, confirmed, move |path| {
+        Ok(probe
+            .retain(quarantine_has_external_writer(path)?)?
+            .blocks_retirement())
+    })
 }
 
 #[cfg(unix)]
@@ -5410,6 +5447,7 @@ fn resume_final_worktree_tombstone(
     _tombstone: &CloseWorktreeFinalTombstone,
     _identity: &WorktreeIdentity,
     _confirmed: &CloseRetirementSnapshot,
+    _probe: CloseWriterProbe,
 ) -> FinalTombstoneRecovery {
     FinalTombstoneRecovery::Residual(
         "recorded final tombstone deletion is unsupported on this platform".to_string(),
@@ -5567,15 +5605,69 @@ fn stop_bound_fsmonitor_daemons(path: &Path) -> Result<FsmonitorStop, String> {
     classify_fsmonitor_stop(&worktree)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ExternalWriterEvidence {
-    PositiveWriterFound,
+    Blocked(CloseWriterObservation),
     NoPositiveEvidence,
 }
 
 impl ExternalWriterEvidence {
-    fn found(self) -> bool {
-        matches!(self, Self::PositiveWriterFound)
+    fn blocks_retirement(&self) -> bool {
+        matches!(self, Self::Blocked(_))
+    }
+}
+
+fn writer_gap(
+    detector: CloseWriterDetector,
+    pid: Option<u32>,
+    reason: CloseWriterGap,
+) -> ExternalWriterEvidence {
+    tracing::debug!(
+        detector = detector.as_str(),
+        pid,
+        reason = reason.as_str(),
+        "Close writer inspection incomplete; target preserved"
+    );
+    ExternalWriterEvidence::Blocked(CloseWriterObservation::InspectionGap {
+        detector,
+        pid,
+        reason,
+    })
+}
+
+#[derive(Clone)]
+struct CloseWriterProbe {
+    db: crate::db::Database,
+    runtime: tokio::runtime::Handle,
+    run: CloseRunRef,
+    scope: WorkScopeId,
+    snapshot: CloseRetirementSnapshot,
+    resource: RetiredResourceIdentity,
+}
+
+impl CloseWriterProbe {
+    fn retain(&self, evidence: ExternalWriterEvidence) -> Result<ExternalWriterEvidence, String> {
+        if let ExternalWriterEvidence::Blocked(observation) = &evidence {
+            self.runtime
+                .block_on(self.db.record_close_writer_observation(
+                    &RecordCloseWriterObservationRequest {
+                        run: self.run.clone(),
+                        scope: self.scope.clone(),
+                        snapshot: self.snapshot.clone(),
+                        resource: self.resource.clone(),
+                        observation: observation.clone(),
+                    },
+                ))
+                .map_err(|error| {
+                    format!("cannot persist Close writer observation; target preserved: {error}")
+                })?;
+            if let CloseWriterObservation::InspectionGap { .. } = observation {
+                return Err(
+                    "Close writer inspection is incomplete; retained typed inspection gap".into(),
+                );
+            }
+        }
+        Ok(evidence)
     }
 }
 
@@ -5584,7 +5676,7 @@ impl ExternalWriterEvidence {
 /// writer can hold it; `Present` carries the writer evidence for an existing
 /// target. Separating observation from the admission decision lets the decision
 /// be exercised without touching the filesystem or `/proc`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum RetryTargetObservation {
     Absent,
     Present(ExternalWriterEvidence),
@@ -5604,13 +5696,25 @@ where
         .into_iter()
         .flatten()
     {
-        if let RetryTargetObservation::Present(ExternalWriterEvidence::PositiveWriterFound) =
-            observe(path)?
-        {
-            return Err(format!(
-                "external writer holds exact retry target {}; no new run admitted",
-                path.display()
-            ));
+        match observe(path)? {
+            RetryTargetObservation::Present(ExternalWriterEvidence::Blocked(
+                CloseWriterObservation::InspectionGap { .. },
+            )) => {
+                return Err(format!(
+                    "incomplete external-writer inspection at {}; no new run admitted",
+                    path.display()
+                ))
+            }
+            RetryTargetObservation::Present(ExternalWriterEvidence::Blocked(
+                CloseWriterObservation::Authority { .. },
+            )) => {
+                return Err(format!(
+                    "external writer holds exact retry target {}; no new run admitted",
+                    path.display()
+                ))
+            }
+            RetryTargetObservation::Absent
+            | RetryTargetObservation::Present(ExternalWriterEvidence::NoPositiveEvidence) => {}
         }
     }
     Ok(())
@@ -5629,11 +5733,7 @@ fn probe_retry_worktree_writers(
             return Ok(RetryTargetObservation::Absent);
         }
         Ok(RetryTargetObservation::Present(
-            if quarantine_has_external_writer(path)? {
-                ExternalWriterEvidence::PositiveWriterFound
-            } else {
-                ExternalWriterEvidence::NoPositiveEvidence
-            },
+            quarantine_has_external_writer(path)?,
         ))
     })
 }
@@ -5653,14 +5753,22 @@ async fn verify_retained_worktree(
     Ok(())
 }
 
-fn quarantine_has_external_writer(path: &Path) -> Result<bool, String> {
-    Ok(quarantine_has_open_descriptors(path)?.found()
-        || quarantine_has_process_cwd(path)?
-        || quarantine_has_writable_mappings(path)?)
+fn quarantine_has_external_writer(path: &Path) -> Result<ExternalWriterEvidence, String> {
+    for probe in [
+        quarantine_has_open_descriptors,
+        quarantine_has_process_cwd,
+        quarantine_has_writable_mappings,
+    ] {
+        let evidence = probe(path)?;
+        if evidence.blocks_retirement() {
+            return Ok(evidence);
+        }
+    }
+    Ok(ExternalWriterEvidence::NoPositiveEvidence)
 }
 
 #[cfg(target_os = "linux")]
-fn quarantine_has_writable_mappings(path: &Path) -> Result<bool, String> {
+fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidence, String> {
     // SAFETY: `geteuid` has no preconditions.
     let effective_uid = unsafe { libc::geteuid() };
     quarantine_has_writable_mappings_in(path, Path::new("/proc"), effective_uid)
@@ -5671,43 +5779,51 @@ fn quarantine_has_writable_mappings_in(
     path: &Path,
     proc_root: &Path,
     effective_uid: libc::uid_t,
-) -> Result<bool, String> {
-    let canonical = std::fs::canonicalize(path).map_err(|error| {
-        format!("cannot canonicalize quarantine before mapping inspection: {error}")
-    })?;
-    let Ok(processes) = std::fs::read_dir(proc_root) else {
-        return Ok(false);
-    };
-    for process in processes.flatten() {
-        if !linux_process_is_relevant(&process, effective_uid, "mapping") {
-            continue;
-        }
-        let Ok(mappings) = std::fs::read_to_string(process.path().join("maps")) else {
-            continue;
-        };
-        for mapping in mappings.lines() {
-            let mut fields = mapping
-                .splitn(6, char::is_whitespace)
-                .filter(|field| !field.is_empty());
-            let _address = fields.next();
-            let permissions = fields.next().unwrap_or_default();
-            let _offset = fields.next();
-            let _device = fields.next();
-            let _inode = fields.next();
-            let mapped_path = fields.next().unwrap_or_default().trim_start();
-            if permissions.as_bytes().get(1) == Some(&b'w')
-                && permissions.as_bytes().get(3) == Some(&b's')
-                && path_is_within(Path::new(mapped_path), &canonical)
-            {
-                return Ok(true);
+) -> Result<ExternalWriterEvidence, String> {
+    linux_writer_scan(
+        path,
+        proc_root,
+        effective_uid,
+        CloseWriterDetector::LinuxMapping,
+        |process, canonical| {
+            let mappings = std::fs::read_to_string(process.join("maps"))
+                .map_err(|_| CloseWriterGap::Unavailable)?;
+            for mapping in mappings.lines() {
+                let mut fields = mapping.split_whitespace();
+                let _address = fields.next().ok_or(CloseWriterGap::Malformed)?;
+                let permissions = fields.next().ok_or(CloseWriterGap::Malformed)?;
+                let _offset = fields.next().ok_or(CloseWriterGap::Malformed)?;
+                let _device = fields.next().ok_or(CloseWriterGap::Malformed)?;
+                let _inode = fields.next().ok_or(CloseWriterGap::Malformed)?;
+                // The first five fields contain no spaces; the remaining bytes are the path.
+                let mut remainder = mapping;
+                for _ in 0..5 {
+                    remainder = remainder.trim_start();
+                    remainder = &remainder[remainder
+                        .find(char::is_whitespace)
+                        .unwrap_or(remainder.len())..];
+                }
+                let mapped_path = PathBuf::from(remainder.trim_start());
+                if permissions.len() != 4 {
+                    return Err(CloseWriterGap::Malformed);
+                }
+                if permissions.as_bytes()[1] == b'w'
+                    && permissions.as_bytes()[3] == b's'
+                    && path_is_within(&mapped_path, canonical)
+                {
+                    return Ok(Some((
+                        mapped_path,
+                        CloseWriterAuthority::WritableSharedMapping,
+                    )));
+                }
             }
-        }
-    }
-    Ok(false)
+            Ok(None)
+        },
+    )
 }
 
 #[cfg(target_os = "macos")]
-fn quarantine_has_writable_mappings(path: &Path) -> Result<bool, String> {
+fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidence, String> {
     use std::ffi::CStr;
     use std::mem::{size_of, MaybeUninit};
     use std::os::unix::ffi::OsStrExt as _;
@@ -5744,16 +5860,7 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<bool, String> {
     }
 
     const PROC_PIDREGIONPATHINFO: i32 = 8;
-    const SM_SHARED: u32 = 4;
-    const SM_TRUESHARED: u32 = 5;
-    const SM_SHARED_ALIASED: u32 = 7;
-    let canonical = std::fs::canonicalize(path).map_err(|error| {
-        format!("cannot canonicalize quarantine before mapping inspection: {error}")
-    })?;
-    let Some(pids) = macos_all_pids() else {
-        return Ok(false);
-    };
-    for pid in pids.into_iter().filter(|pid| *pid > 0) {
+    mac_writer_scan(path, CloseWriterDetector::MacMapping, |pid, canonical| {
         let mut address = 0_u64;
         loop {
             let mut info = MaybeUninit::<ProcRegionWithPathInfo>::zeroed();
@@ -5767,51 +5874,56 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<bool, String> {
                         .expect("region path info fits i32"),
                 )
             };
-            if bytes == 0 {
-                break;
-            }
-            if bytes
-                != i32::try_from(size_of::<ProcRegionWithPathInfo>())
-                    .expect("region path info size fits i32")
+            if bytes == 0
+                && address > 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL)
             {
-                // Ambient process inspection is observational. A short kernel
-                // result proves nothing about this process, so skip it.
-                break;
+                return Ok(None);
             }
+            if bytes == 0 {
+                return Err(CloseWriterGap::Unavailable);
+            }
+            if usize::try_from(bytes).ok() != Some(size_of::<ProcRegionWithPathInfo>()) {
+                return Err(CloseWriterGap::Malformed);
+            }
+            // SAFETY: the complete C structure was initialized by the successful call.
             let info = unsafe { info.assume_init() };
-            let Some(next) = info.region.address.checked_add(info.region.size) else {
-                break;
-            };
+            let next = info
+                .region
+                .address
+                .checked_add(info.region.size)
+                .ok_or(CloseWriterGap::Malformed)?;
             if next <= address {
-                break;
+                return Err(CloseWriterGap::Malformed);
             }
             address = next;
             let path_bytes = info.vnode.vip_path.as_flattened();
-            let mapped_path = unsafe { CStr::from_ptr(path_bytes.as_ptr()) };
-            if info.region.protection & u32::try_from(libc::VM_PROT_WRITE).unwrap() != 0
-                && matches!(
-                    info.region.share_mode,
-                    SM_SHARED | SM_TRUESHARED | SM_SHARED_ALIASED
-                )
-                && path_is_within(
-                    Path::new(std::ffi::OsStr::from_bytes(mapped_path.to_bytes())),
-                    &canonical,
-                )
+            // SAFETY: reinterpret the initialized, bounded C character buffer as bytes.
+            let path_bytes = unsafe {
+                std::slice::from_raw_parts(path_bytes.as_ptr().cast::<u8>(), path_bytes.len())
+            };
+            let mapped_path =
+                CStr::from_bytes_until_nul(path_bytes).map_err(|_| CloseWriterGap::Malformed)?;
+            let mapped_path = PathBuf::from(std::ffi::OsStr::from_bytes(mapped_path.to_bytes()));
+            if mac_mapping_is_writer(info.region.protection, info.region.share_mode)
+                && path_is_within(&mapped_path, canonical)
             {
-                return Ok(true);
+                return Ok(Some((
+                    mapped_path,
+                    CloseWriterAuthority::WritableSharedMapping,
+                )));
             }
         }
-    }
-    Ok(false)
+    })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn quarantine_has_writable_mappings(_path: &Path) -> Result<bool, String> {
+fn quarantine_has_writable_mappings(_path: &Path) -> Result<ExternalWriterEvidence, String> {
     Err("writable memory-mapping inspection is unsupported on this platform".to_string())
 }
 
 #[cfg(target_os = "linux")]
-fn quarantine_has_process_cwd(path: &Path) -> Result<bool, String> {
+fn quarantine_has_process_cwd(path: &Path) -> Result<ExternalWriterEvidence, String> {
     // SAFETY: `geteuid` has no preconditions.
     let effective_uid = unsafe { libc::geteuid() };
     quarantine_has_process_cwd_in(path, Path::new("/proc"), effective_uid)
@@ -5822,24 +5934,24 @@ fn quarantine_has_process_cwd_in(
     path: &Path,
     proc_root: &Path,
     effective_uid: libc::uid_t,
-) -> Result<bool, String> {
-    let canonical = std::fs::canonicalize(path).map_err(|error| {
-        format!("cannot canonicalize quarantine before cwd inspection: {error}")
-    })?;
-    let Ok(processes) = std::fs::read_dir(proc_root) else {
-        return Ok(false);
-    };
-    for process in processes.flatten() {
-        if !linux_process_is_relevant(&process, effective_uid, "cwd") {
-            continue;
-        }
-        if std::fs::read_link(process.path().join("cwd"))
-            .is_ok_and(|cwd| path_is_within(&cwd, &canonical))
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+) -> Result<ExternalWriterEvidence, String> {
+    linux_writer_scan(
+        path,
+        proc_root,
+        effective_uid,
+        CloseWriterDetector::LinuxCwd,
+        |process, canonical| {
+            let cwd =
+                std::fs::read_link(process.join("cwd")).map_err(|_| CloseWriterGap::Unavailable)?;
+            let repeated =
+                std::fs::read_link(process.join("cwd")).map_err(|_| CloseWriterGap::Unavailable)?;
+            if cwd != repeated {
+                return Err(CloseWriterGap::ProcessChanged);
+            }
+            Ok(path_is_within(&cwd, canonical)
+                .then_some((cwd, CloseWriterAuthority::WorkingDirectory)))
+        },
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -5859,7 +5971,7 @@ fn macos_all_pids_with(mut list: impl FnMut(*mut libc::c_void, i32) -> i32) -> O
         let capacity_bytes = pids.len().checked_mul(size_of::<i32>())?;
         let capacity_bytes_i32 = i32::try_from(capacity_bytes).ok()?;
         let pid_bytes = list(pids.as_mut_ptr().cast(), capacity_bytes_i32);
-        if pid_bytes < 0 {
+        if pid_bytes <= 0 {
             return None;
         }
         let pid_bytes = usize::try_from(pid_bytes).ok()?;
@@ -5871,23 +5983,19 @@ fn macos_all_pids_with(mut list: impl FnMut(*mut libc::c_void, i32) -> i32) -> O
             pids.truncate(pid_bytes / size_of::<i32>());
             return Some(pids);
         }
-        capacity = capacity.checked_mul(2)?;
+        capacity = capacity
+            .checked_mul(2)
+            .filter(|capacity| *capacity <= 1_048_576)?;
     }
 }
 
 #[cfg(target_os = "macos")]
-fn quarantine_has_process_cwd(path: &Path) -> Result<bool, String> {
+fn quarantine_has_process_cwd(path: &Path) -> Result<ExternalWriterEvidence, String> {
     use std::ffi::CStr;
     use std::mem::{size_of, MaybeUninit};
     use std::os::unix::ffi::OsStrExt as _;
 
-    let canonical = std::fs::canonicalize(path).map_err(|error| {
-        format!("cannot canonicalize quarantine before cwd inspection: {error}")
-    })?;
-    let Some(pids) = macos_all_pids() else {
-        return Ok(false);
-    };
-    for pid in pids.into_iter().filter(|pid| *pid > 0) {
+    mac_writer_scan(path, CloseWriterDetector::MacCwd, |pid, canonical| {
         let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
         let bytes = unsafe {
             libc::proc_pidinfo(
@@ -5903,23 +6011,25 @@ fn quarantine_has_process_cwd(path: &Path) -> Result<bool, String> {
             != i32::try_from(size_of::<libc::proc_vnodepathinfo>())
                 .expect("vnode path info size fits i32")
         {
-            continue;
+            return Err(CloseWriterGap::Unavailable);
         }
+        // SAFETY: the complete C structure was initialized above.
         let info = unsafe { info.assume_init() };
         let cwd_bytes = info.pvi_cdir.vip_path.as_flattened();
-        let cwd = unsafe { CStr::from_ptr(cwd_bytes.as_ptr()) };
-        if path_is_within(
-            Path::new(std::ffi::OsStr::from_bytes(cwd.to_bytes())),
-            &canonical,
-        ) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+        // SAFETY: reinterpret the initialized bounded C path buffer as bytes.
+        let cwd_bytes =
+            unsafe { std::slice::from_raw_parts(cwd_bytes.as_ptr().cast::<u8>(), cwd_bytes.len()) };
+        let cwd = CStr::from_bytes_until_nul(cwd_bytes).map_err(|_| CloseWriterGap::Malformed)?;
+        let cwd = PathBuf::from(std::ffi::OsStr::from_bytes(cwd.to_bytes()));
+        Ok(
+            path_is_within(&cwd, canonical)
+                .then_some((cwd, CloseWriterAuthority::WorkingDirectory)),
+        )
+    })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn quarantine_has_process_cwd(_path: &Path) -> Result<bool, String> {
+fn quarantine_has_process_cwd(_path: &Path) -> Result<ExternalWriterEvidence, String> {
     Err("process working-directory inspection is unsupported on this platform".to_string())
 }
 
@@ -5999,28 +6109,142 @@ fn linux_process_owner(
 }
 
 #[cfg(target_os = "linux")]
-fn linux_process_is_relevant(
-    process: &std::fs::DirEntry,
-    effective_uid: libc::uid_t,
-    inventory: &str,
-) -> bool {
-    process
+fn linux_writer_process(
+    process: &Path,
+    boot_id: &str,
+) -> Result<CloseWriterProcess, CloseWriterGap> {
+    let pid = process
         .file_name()
-        .as_encoded_bytes()
-        .iter()
-        .all(u8::is_ascii_digit)
-        && matches!(
-            linux_process_owner(process, effective_uid, inventory),
-            Ok(LinuxProcessOwner::Relevant)
-        )
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.parse().ok())
+        .ok_or(CloseWriterGap::Malformed)?;
+    let stat =
+        std::fs::read_to_string(process.join("stat")).map_err(|_| CloseWriterGap::Unavailable)?;
+    let (_, tail) = stat.rsplit_once(')').ok_or(CloseWriterGap::Malformed)?;
+    let start = tail
+        .split_whitespace()
+        .nth(19)
+        .ok_or(CloseWriterGap::Malformed)?
+        .parse::<u64>()
+        .map_err(|_| CloseWriterGap::Malformed)?;
+    let executable =
+        std::fs::read_link(process.join("exe")).map_err(|_| CloseWriterGap::Unavailable)?;
+    Ok(CloseWriterProcess {
+        pid,
+        incarnation: OpaqueIdentity::parse(format!("{boot_id}:{start}"))
+            .map_err(|_| CloseWriterGap::Malformed)?,
+        executable,
+    })
 }
 
 #[cfg(target_os = "linux")]
-fn linux_descriptor_target_is_within(
-    target: std::io::Result<PathBuf>,
-    canonical_worktree: &Path,
-) -> bool {
-    target.is_ok_and(|candidate| path_is_within(&candidate, canonical_worktree))
+fn linux_writer_scan(
+    path: &Path,
+    proc_root: &Path,
+    effective_uid: libc::uid_t,
+    detector: CloseWriterDetector,
+    mut inspect: impl FnMut(
+        &Path,
+        &Path,
+    ) -> Result<Option<(PathBuf, CloseWriterAuthority)>, CloseWriterGap>,
+) -> Result<ExternalWriterEvidence, String> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("cannot bind Close writer target: {error}"))?;
+    let Ok(boot_id) = std::fs::read_to_string(proc_root.join("sys/kernel/random/boot_id")) else {
+        return Ok(writer_gap(detector, None, CloseWriterGap::Unavailable));
+    };
+    if boot_id.trim().is_empty() {
+        return Ok(writer_gap(detector, None, CloseWriterGap::Malformed));
+    }
+    let Ok(processes) = std::fs::read_dir(proc_root) else {
+        return Ok(writer_gap(detector, None, CloseWriterGap::Unavailable));
+    };
+    for process in processes {
+        let Ok(process) = process else {
+            return Ok(writer_gap(detector, None, CloseWriterGap::Unavailable));
+        };
+        let Some(pid) = process
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        match linux_process_owner(&process, effective_uid, detector.as_str()) {
+            Ok(LinuxProcessOwner::Unrelated) => continue,
+            Ok(LinuxProcessOwner::Relevant) => {}
+            _ => return Ok(writer_gap(detector, Some(pid), CloseWriterGap::Unavailable)),
+        }
+        let before = match linux_writer_process(&process.path(), boot_id.trim()) {
+            Ok(identity) => identity,
+            Err(reason) => return Ok(writer_gap(detector, Some(pid), reason)),
+        };
+        let observed = match inspect(&process.path(), &canonical) {
+            Ok(observed) => observed,
+            Err(reason) => return Ok(writer_gap(detector, Some(pid), reason)),
+        };
+        let after = linux_writer_process(&process.path(), boot_id.trim());
+        if after.as_ref() != Ok(&before)
+            || linux_process_owner(&process, effective_uid, detector.as_str())
+                != Ok(LinuxProcessOwner::Relevant)
+        {
+            return Ok(writer_gap(
+                detector,
+                Some(pid),
+                CloseWriterGap::ProcessChanged,
+            ));
+        }
+        if let Some((matched_path, authority)) = observed {
+            return Ok(ExternalWriterEvidence::Blocked(
+                CloseWriterObservation::Authority {
+                    detector,
+                    process: before,
+                    matched_path,
+                    authority,
+                },
+            ));
+        }
+    }
+    Ok(ExternalWriterEvidence::NoPositiveEvidence)
+}
+
+fn descriptor_authority(
+    is_directory: bool,
+    is_regular_file: bool,
+    access: CloseDescriptorAccess,
+) -> Option<CloseWriterAuthority> {
+    if is_directory {
+        return Some(CloseWriterAuthority::DirectoryDescriptor(access));
+    }
+    if !is_regular_file {
+        return None;
+    }
+    match access {
+        CloseDescriptorAccess::ReadOnly => None,
+        CloseDescriptorAccess::WriteOnly => Some(CloseWriterAuthority::WritableFile(
+            CloseFileWriteAccess::WriteOnly,
+        )),
+        CloseDescriptorAccess::ReadWrite => Some(CloseWriterAuthority::WritableFile(
+            CloseFileWriteAccess::ReadWrite,
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fd_access(info: &str) -> Result<CloseDescriptorAccess, CloseWriterGap> {
+    let mut flags = info.lines().filter_map(|line| line.strip_prefix("flags:"));
+    let value = flags.next().ok_or(CloseWriterGap::Malformed)?;
+    if flags.next().is_some() {
+        return Err(CloseWriterGap::Malformed);
+    }
+    let value = u32::from_str_radix(value.trim(), 8).map_err(|_| CloseWriterGap::Malformed)?;
+    match value & 3 {
+        0 => Ok(CloseDescriptorAccess::ReadOnly),
+        1 => Ok(CloseDescriptorAccess::WriteOnly),
+        2 => Ok(CloseDescriptorAccess::ReadWrite),
+        _ => Err(CloseWriterGap::Malformed),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -6033,30 +6257,62 @@ fn quarantine_has_open_descriptors_in(
     path: &Path,
     proc_root: &Path,
 ) -> Result<ExternalWriterEvidence, String> {
-    let canonical = std::fs::canonicalize(path).map_err(|error| {
-        format!("cannot canonicalize quarantined worktree before descriptor inspection: {error}")
-    })?;
-    let Ok(processes) = std::fs::read_dir(proc_root) else {
-        return Ok(ExternalWriterEvidence::NoPositiveEvidence);
-    };
-    for process in processes.flatten().filter(|process| {
-        process
-            .file_name()
-            .as_encoded_bytes()
-            .iter()
-            .all(u8::is_ascii_digit)
-    }) {
-        let Ok(descriptors) = std::fs::read_dir(process.path().join("fd")) else {
-            continue;
-        };
-        for descriptor in descriptors.flatten() {
-            if linux_descriptor_target_is_within(std::fs::read_link(descriptor.path()), &canonical)
-            {
-                return Ok(ExternalWriterEvidence::PositiveWriterFound);
+    quarantine_has_open_descriptors_with_info_reader(path, proc_root, |path| {
+        std::fs::read_to_string(path)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_has_open_descriptors_with_info_reader(
+    path: &Path,
+    proc_root: &Path,
+    mut read_info: impl FnMut(&Path) -> std::io::Result<String>,
+) -> Result<ExternalWriterEvidence, String> {
+    use std::os::unix::fs::MetadataExt as _;
+    // SAFETY: geteuid has no preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
+    linux_writer_scan(
+        path,
+        proc_root,
+        effective_uid,
+        CloseWriterDetector::LinuxDescriptor,
+        |process, canonical| {
+            let descriptors =
+                std::fs::read_dir(process.join("fd")).map_err(|_| CloseWriterGap::Unavailable)?;
+            for descriptor in descriptors {
+                let descriptor = descriptor.map_err(|_| CloseWriterGap::Unavailable)?;
+                let candidate = std::fs::read_link(descriptor.path())
+                    .map_err(|_| CloseWriterGap::DescriptorChanged)?;
+                if !path_is_within(&candidate, canonical) {
+                    continue;
+                }
+                let metadata = std::fs::metadata(descriptor.path())
+                    .map_err(|_| CloseWriterGap::DescriptorChanged)?;
+                let info_path = process.join("fdinfo").join(descriptor.file_name());
+                let info = read_info(&info_path).map_err(|_| CloseWriterGap::DescriptorChanged)?;
+                let access = linux_fd_access(&info)?;
+                let repeated = std::fs::metadata(descriptor.path())
+                    .map_err(|_| CloseWriterGap::DescriptorChanged)?;
+                if (metadata.dev(), metadata.ino()) != (repeated.dev(), repeated.ino())
+                    || std::fs::read_link(descriptor.path()).ok().as_ref() != Some(&candidate)
+                    || linux_fd_access(
+                        &read_info(&info_path).map_err(|_| CloseWriterGap::DescriptorChanged)?,
+                    )? != access
+                {
+                    return Err(CloseWriterGap::DescriptorChanged);
+                }
+                if let Some(authority) =
+                    descriptor_authority(metadata.is_dir(), metadata.is_file(), access)
+                {
+                    return Ok(Some((candidate, authority)));
+                }
+                if !metadata.is_file() {
+                    return Err(CloseWriterGap::Unsupported);
+                }
             }
-        }
-    }
-    Ok(ExternalWriterEvidence::NoPositiveEvidence)
+            Ok(None)
+        },
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -6064,7 +6320,143 @@ fn descriptor_inventory_may_be_truncated(returned_bytes: usize, capacity_bytes: 
     returned_bytes >= capacity_bytes
 }
 
-#[allow(clippy::too_many_lines)]
+#[cfg(any(target_os = "macos", test))]
+fn mac_descriptor_authority(
+    mode: u16,
+    open_flags: u32,
+) -> Result<Option<CloseWriterAuthority>, CloseWriterGap> {
+    // proc_fileinfo.fi_openflags uses kernel FREAD/FWRITE, not user O_ACCMODE.
+    let access = match open_flags & 3 {
+        1 => CloseDescriptorAccess::ReadOnly,
+        2 => CloseDescriptorAccess::WriteOnly,
+        3 => CloseDescriptorAccess::ReadWrite,
+        _ => return Err(CloseWriterGap::Unsupported),
+    };
+    Ok(descriptor_authority(
+        mode & 0o170000 == 0o040000,
+        mode & 0o170000 == 0o100000,
+        access,
+    ))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn mac_mapping_is_writer(protection: u32, share_mode: u32) -> bool {
+    protection & 2 != 0 && matches!(share_mode, 4 | 5 | 7)
+}
+
+#[cfg(target_os = "macos")]
+fn mac_writer_process(
+    pid: libc::pid_t,
+    effective_uid: libc::uid_t,
+) -> Result<Option<CloseWriterProcess>, CloseWriterGap> {
+    use std::mem::{size_of, MaybeUninit};
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    // SAFETY: output buffer matches PROC_PIDTBSDINFO and is valid for the call.
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            i32::try_from(size_of::<libc::proc_bsdinfo>()).expect("bsd info fits i32"),
+        )
+    };
+    if usize::try_from(bytes).ok() != Some(size_of::<libc::proc_bsdinfo>()) {
+        return Err(CloseWriterGap::Unavailable);
+    }
+    // SAFETY: the complete structure was initialized above.
+    let info = unsafe { info.assume_init() };
+    if info.pbi_uid != effective_uid {
+        return Ok(None);
+    }
+    let mut executable = [0_u8; 4096];
+    // SAFETY: executable is a writable buffer with the declared length.
+    let bytes = unsafe { libc::proc_pidpath(pid, executable.as_mut_ptr().cast(), 4096) };
+    if bytes <= 0 {
+        return Err(CloseWriterGap::Unavailable);
+    }
+    let end = executable
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or(CloseWriterGap::Malformed)?;
+    if end == 0 {
+        return Err(CloseWriterGap::Malformed);
+    }
+    Ok(Some(CloseWriterProcess {
+        pid: u32::try_from(pid).map_err(|_| CloseWriterGap::Malformed)?,
+        incarnation: OpaqueIdentity::parse(format!(
+            "{}:{}",
+            info.pbi_start_tvsec, info.pbi_start_tvusec
+        ))
+        .map_err(|_| CloseWriterGap::Malformed)?,
+        executable: PathBuf::from(std::ffi::OsStr::from_bytes(&executable[..end])),
+    }))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn stable_writer_observation(
+    detector: CloseWriterDetector,
+    before: CloseWriterProcess,
+    observed: Option<(PathBuf, CloseWriterAuthority)>,
+    after: Result<Option<CloseWriterProcess>, CloseWriterGap>,
+) -> ExternalWriterEvidence {
+    if after.as_ref().ok().and_then(Option::as_ref) != Some(&before) {
+        return writer_gap(detector, Some(before.pid), CloseWriterGap::ProcessChanged);
+    }
+    match observed {
+        Some((matched_path, authority)) => {
+            ExternalWriterEvidence::Blocked(CloseWriterObservation::Authority {
+                detector,
+                process: before,
+                matched_path,
+                authority,
+            })
+        }
+        None => ExternalWriterEvidence::NoPositiveEvidence,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_writer_scan(
+    path: &Path,
+    detector: CloseWriterDetector,
+    mut inspect: impl FnMut(
+        libc::pid_t,
+        &Path,
+    ) -> Result<Option<(PathBuf, CloseWriterAuthority)>, CloseWriterGap>,
+) -> Result<ExternalWriterEvidence, String> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("cannot bind Close writer target: {error}"))?;
+    let Some(pids) = macos_all_pids() else {
+        return Ok(writer_gap(detector, None, CloseWriterGap::Unavailable));
+    };
+    // SAFETY: geteuid has no preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
+    for pid in pids.into_iter().filter(|pid| *pid > 0) {
+        let before = match mac_writer_process(pid, effective_uid) {
+            Ok(Some(identity)) => identity,
+            Ok(None) => continue,
+            Err(reason) => return Ok(writer_gap(detector, u32::try_from(pid).ok(), reason)),
+        };
+        let observed = match inspect(pid, &canonical) {
+            Ok(observed) => observed,
+            Err(reason) => return Ok(writer_gap(detector, Some(before.pid), reason)),
+        };
+        let evidence = stable_writer_observation(
+            detector,
+            before,
+            observed,
+            mac_writer_process(pid, effective_uid),
+        );
+        if evidence.blocks_retirement() {
+            return Ok(evidence);
+        }
+    }
+    Ok(ExternalWriterEvidence::NoPositiveEvidence)
+}
+
 #[cfg(target_os = "macos")]
 fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence, String> {
     use std::ffi::CStr;
@@ -6086,85 +6478,107 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
     }
 
     const PROC_PIDFDVNODEPATHINFO: i32 = 2;
-    let canonical = std::fs::canonicalize(path).map_err(|error| {
-        format!("cannot canonicalize quarantined worktree before descriptor inspection: {error}")
-    })?;
-    let Some(pids) = macos_all_pids() else {
-        return Ok(ExternalWriterEvidence::NoPositiveEvidence);
-    };
-    for pid in pids.into_iter().filter(|pid| *pid > 0) {
-        let mut descriptor_capacity = 256_usize;
-        let descriptors = loop {
-            let mut descriptors = vec![
-                libc::proc_fdinfo {
-                    proc_fd: 0,
-                    proc_fdtype: 0
-                };
-                descriptor_capacity
-            ];
-            let capacity_bytes = descriptors.len() * size_of::<libc::proc_fdinfo>();
-            let Ok(capacity_bytes_i32) = i32::try_from(capacity_bytes) else {
-                break Vec::new();
-            };
-            // SAFETY: the vector provides writable storage for exactly the byte count passed.
-            let descriptor_bytes = unsafe {
-                libc::proc_pidinfo(
-                    pid,
-                    libc::PROC_PIDLISTFDS,
-                    0,
-                    descriptors.as_mut_ptr().cast(),
-                    capacity_bytes_i32,
-                )
-            };
-            if descriptor_bytes <= 0 {
-                break Vec::new();
-            }
-            let descriptor_bytes =
-                usize::try_from(descriptor_bytes).expect("positive descriptor byte count");
-            if !descriptor_inventory_may_be_truncated(descriptor_bytes, capacity_bytes) {
-                descriptors.truncate(descriptor_bytes / size_of::<libc::proc_fdinfo>());
-                break descriptors;
-            }
-            let Some(next_capacity) = descriptor_capacity.checked_mul(2) else {
-                break Vec::new();
-            };
-            descriptor_capacity = next_capacity;
+    let read_info = |pid, fd| {
+        let mut output = MaybeUninit::<VnodeFdInfoWithPath>::zeroed();
+        let length = i32::try_from(size_of::<VnodeFdInfoWithPath>()).expect("vnode info fits i32");
+        // SAFETY: output is valid writable storage of the requested C structure size.
+        let bytes = unsafe {
+            libc::proc_pidfdinfo(
+                pid,
+                fd,
+                PROC_PIDFDVNODEPATHINFO,
+                output.as_mut_ptr().cast(),
+                length,
+            )
         };
-        for descriptor in descriptors
-            .into_iter()
-            .filter(|descriptor| descriptor.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32)
-        {
-            let mut info = MaybeUninit::<VnodeFdInfoWithPath>::uninit();
-            // SAFETY: proc_pidfdinfo initializes the declared C-compatible structure on success.
-            let bytes = unsafe {
-                libc::proc_pidfdinfo(
-                    pid,
-                    descriptor.proc_fd,
-                    PROC_PIDFDVNODEPATHINFO,
-                    info.as_mut_ptr().cast(),
-                    i32::try_from(size_of::<VnodeFdInfoWithPath>()).expect("vnode info fits i32"),
-                )
-            };
-            if bytes
-                != i32::try_from(size_of::<VnodeFdInfoWithPath>())
-                    .expect("vnode info size fits i32")
-            {
-                continue;
-            }
-            // SAFETY: the exact structure size was reported as initialized above.
-            let info = unsafe { info.assume_init() };
-            let path_bytes = info.vnode.vip_path.as_flattened();
-            // SAFETY: the kernel returns a NUL-terminated MAXPATHLEN path buffer.
-            let candidate = unsafe { CStr::from_ptr(path_bytes.as_ptr()) };
-            if path_is_within(
-                Path::new(std::ffi::OsStr::from_bytes(candidate.to_bytes())),
-                &canonical,
-            ) {
-                return Ok(ExternalWriterEvidence::PositiveWriterFound);
-            }
+        if bytes != length {
+            return Err(CloseWriterGap::DescriptorChanged);
         }
-    }
-    Ok(ExternalWriterEvidence::NoPositiveEvidence)
+        // SAFETY: the complete structure was initialized by the successful call.
+        Ok(unsafe { output.assume_init() })
+    };
+    mac_writer_scan(
+        path,
+        CloseWriterDetector::MacDescriptor,
+        |pid, canonical| {
+            let mut descriptor_capacity = 256_usize;
+            let descriptors = loop {
+                let mut descriptors = vec![
+                    libc::proc_fdinfo {
+                        proc_fd: 0,
+                        proc_fdtype: 0
+                    };
+                    descriptor_capacity
+                ];
+                let capacity_bytes = descriptors.len() * size_of::<libc::proc_fdinfo>();
+                let Ok(capacity_bytes_i32) = i32::try_from(capacity_bytes) else {
+                    return Err(CloseWriterGap::Unavailable);
+                };
+                // SAFETY: the vector provides writable storage for exactly the byte count passed.
+                let descriptor_bytes = unsafe {
+                    libc::proc_pidinfo(
+                        pid,
+                        libc::PROC_PIDLISTFDS,
+                        0,
+                        descriptors.as_mut_ptr().cast(),
+                        capacity_bytes_i32,
+                    )
+                };
+                if descriptor_bytes <= 0 {
+                    return Err(CloseWriterGap::Unavailable);
+                }
+                let descriptor_bytes =
+                    usize::try_from(descriptor_bytes).expect("positive descriptor byte count");
+                if descriptor_bytes % size_of::<libc::proc_fdinfo>() != 0 {
+                    return Err(CloseWriterGap::Malformed);
+                }
+                if !descriptor_inventory_may_be_truncated(descriptor_bytes, capacity_bytes) {
+                    descriptors.truncate(descriptor_bytes / size_of::<libc::proc_fdinfo>());
+                    break descriptors;
+                }
+                let Some(next_capacity) = descriptor_capacity.checked_mul(2) else {
+                    return Err(CloseWriterGap::Unavailable);
+                };
+                if next_capacity > 1_048_576 {
+                    return Err(CloseWriterGap::Unavailable);
+                }
+                descriptor_capacity = next_capacity;
+            };
+            for descriptor in descriptors
+                .into_iter()
+                .filter(|descriptor| descriptor.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32)
+            {
+                let info = read_info(pid, descriptor.proc_fd)?;
+                let path_bytes = info.vnode.vip_path.as_flattened();
+                // SAFETY: path_bytes points to the initialized kernel path buffer; bounded below.
+                let path_bytes = unsafe {
+                    std::slice::from_raw_parts(path_bytes.as_ptr().cast::<u8>(), path_bytes.len())
+                };
+                let candidate = CStr::from_bytes_until_nul(path_bytes)
+                    .map_err(|_| CloseWriterGap::Malformed)?;
+                let candidate = PathBuf::from(std::ffi::OsStr::from_bytes(candidate.to_bytes()));
+                if !path_is_within(&candidate, canonical) {
+                    continue;
+                }
+                let repeated = read_info(pid, descriptor.proc_fd)?;
+                if info.file.open_flags != repeated.file.open_flags
+                    || info.vnode.vip_vi.vi_stat.vst_dev != repeated.vnode.vip_vi.vi_stat.vst_dev
+                    || info.vnode.vip_vi.vi_stat.vst_ino != repeated.vnode.vip_vi.vi_stat.vst_ino
+                    || info.vnode.vip_vi.vi_stat.vst_mode != repeated.vnode.vip_vi.vi_stat.vst_mode
+                    || info.vnode.vip_path != repeated.vnode.vip_path
+                {
+                    return Err(CloseWriterGap::DescriptorChanged);
+                }
+                if let Some(authority) = mac_descriptor_authority(
+                    info.vnode.vip_vi.vi_stat.vst_mode,
+                    info.file.open_flags,
+                )? {
+                    return Ok(Some((candidate, authority)));
+                }
+            }
+            Ok(None)
+        },
+    )
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -6304,11 +6718,18 @@ struct CloseWorktreeEffects {
 }
 
 impl CloseWorktreeEffects {
-    fn production() -> Self {
+    fn production(probe: CloseWriterProbe) -> Self {
+        let descriptor_probe = probe.clone();
         Self {
             stop_fsmonitor: Box::new(stop_bound_fsmonitor_daemons),
-            observe_open_descriptors: Box::new(quarantine_has_open_descriptors),
-            observe_external_writer: Box::new(quarantine_has_external_writer),
+            observe_open_descriptors: Box::new(move |path| {
+                descriptor_probe.retain(quarantine_has_open_descriptors(path)?)
+            }),
+            observe_external_writer: Box::new(move |path| {
+                Ok(probe
+                    .retain(quarantine_has_external_writer(path)?)?
+                    .blocks_retirement())
+            }),
         }
     }
 }
@@ -6321,6 +6742,7 @@ async fn quarantine_and_remove_exact_worktree<F, B>(
     final_tombstone: Option<CloseWorktreeFinalTombstone>,
     bind_tombstone: B,
     after_quarantine: F,
+    effects: CloseWorktreeEffects,
 ) -> Result<ExactWorktreeRemoval, String>
 where
     F: FnOnce(&Path) + Send + 'static,
@@ -6334,7 +6756,7 @@ where
         final_tombstone,
         bind_tombstone,
         after_quarantine,
-        CloseWorktreeEffects::production(),
+        effects,
     )
     .await
 }
@@ -6463,7 +6885,7 @@ where
         }
 
         after_quarantine(&path);
-        if observe_open_descriptors(&quarantine)?.found() {
+        if observe_open_descriptors(&quarantine)?.blocks_retirement() {
             return Ok(ExactWorktreeRemoval::Residual {
                 detail: format!(
                     "open descriptors can still modify the confirmed worktree; retained at {}",
@@ -7279,9 +7701,10 @@ mod tests {
     };
     use crate::db::{CloseCleanupResourceDisposition, CloseWorktreeFinalTombstone};
     use phoenix_core::domain::close::{
-        CloseLossItem, GitPathIdentity, WorktreeFingerprint, WorktreeId, WorktreeIdentity,
+        CloseLossItem, GitPathIdentity, OpaqueIdentity, WorktreeFingerprint, WorktreeId,
+        WorktreeIdentity,
     };
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn empty_process_identity_sets_require_fresh_registry_absence_verification() {
@@ -9260,6 +9683,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_process_inventory_failures_are_absent_evidence() {
+        assert_eq!(super::macos_all_pids_with(|_, _| 0), None);
         assert_eq!(super::macos_all_pids_with(|_, _| -1), None);
         assert_eq!(super::macos_all_pids_with(|_, _| 3), None);
     }
@@ -9794,6 +10218,9 @@ mod tests {
             &administrative,
             &incarnation,
             None,
+            injected_close_worktree_effects_rejecting_scans(|_| {
+                panic!("ignored data must prevent fsmonitor effects")
+            }),
             |_, _, _| Ok(()),
         )
         .err()
@@ -9918,10 +10345,22 @@ mod tests {
 
     /// Deterministic quarantine/removal effects for tests: the supplied
     /// `stop_fsmonitor` observation replaces the real fsmonitor shutdown, while
-    /// the descriptor and external-writer probes report no positive evidence
-    /// without touching the host `/proc`. No default test launches the real
-    /// fsmonitor shutdown or a global host scan through this adapter.
-    fn injected_close_worktree_effects(
+    fn injected_writer_evidence() -> super::ExternalWriterEvidence {
+        super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::Authority {
+            detector: super::CloseWriterDetector::MacDescriptor,
+            process: super::CloseWriterProcess {
+                pid: 123,
+                incarnation: OpaqueIdentity::parse("birth-123").unwrap(),
+                executable: PathBuf::from("/test/writer"),
+            },
+            matched_path: PathBuf::from("/test/quarantine/file"),
+            authority: super::CloseWriterAuthority::WritableFile(
+                super::CloseFileWriteAccess::ReadWrite,
+            ),
+        })
+    }
+
+    pub(super) fn injected_close_worktree_effects(
         stop_fsmonitor: impl FnOnce(&Path) -> Result<super::FsmonitorStop, String> + Send + 'static,
     ) -> super::CloseWorktreeEffects {
         super::CloseWorktreeEffects {
@@ -9963,7 +10402,7 @@ mod tests {
             let mut effects =
                 injected_close_worktree_effects(|_| Ok(super::FsmonitorStop::NotRunning));
             effects.observe_open_descriptors = Box::new(move |_| match observation {
-                0 => Ok(super::ExternalWriterEvidence::PositiveWriterFound),
+                0 => Ok(injected_writer_evidence()),
                 1 => Err("injected descriptor observation failure".into()),
                 _ => Ok(super::ExternalWriterEvidence::NoPositiveEvidence),
             });
@@ -10086,9 +10525,7 @@ mod tests {
         let quarantine = Path::new("/captured/quarantine");
         let error = super::probe_retry_worktree_writers_with(original, quarantine, None, |path| {
             Ok(if path == quarantine {
-                super::RetryTargetObservation::Present(
-                    super::ExternalWriterEvidence::PositiveWriterFound,
-                )
+                super::RetryTargetObservation::Present(injected_writer_evidence())
             } else {
                 super::RetryTargetObservation::Absent
             })
@@ -10684,6 +11121,7 @@ mod tests {
                 None,
                 |_, _, _| Ok(()),
                 |_| {},
+                injected_close_worktree_effects(|_| Ok(super::FsmonitorStop::NotRunning)),
             )
         })
         .await
@@ -11294,137 +11732,338 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mac_descriptor_flags_distinguish_readers_and_namespace_authority() {
+        use super::{
+            CloseDescriptorAccess as Access, CloseFileWriteAccess as Write,
+            CloseWriterAuthority as Authority,
+        };
+        assert_eq!(super::mac_descriptor_authority(0o100644, 1), Ok(None));
+        assert_eq!(
+            super::mac_descriptor_authority(0o100644, 2),
+            Ok(Some(Authority::WritableFile(Write::WriteOnly)))
+        );
+        assert_eq!(
+            super::mac_descriptor_authority(0o100644, 3),
+            Ok(Some(Authority::WritableFile(Write::ReadWrite)))
+        );
+        assert_eq!(
+            super::mac_descriptor_authority(0o040755, 1),
+            Ok(Some(Authority::DirectoryDescriptor(Access::ReadOnly)))
+        );
+        assert!(super::mac_descriptor_authority(0o100644, 0).is_err());
+        for share_mode in 0..10 {
+            assert!(!super::mac_mapping_is_writer(1, share_mode));
+            assert_eq!(
+                super::mac_mapping_is_writer(3, share_mode),
+                matches!(share_mode, 4 | 5 | 7)
+            );
+        }
+    }
+
+    #[test]
+    fn process_disappearance_and_pid_reuse_are_gaps_not_writers_or_clean() {
+        let super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::Authority {
+            process,
+            ..
+        }) = injected_writer_evidence()
+        else {
+            panic!("fixture")
+        };
+        let mut reused = process.clone();
+        reused.incarnation = OpaqueIdentity::parse("different-birth").unwrap();
+        for after in [
+            Ok(None),
+            Err(super::CloseWriterGap::Unavailable),
+            Ok(Some(reused)),
+        ] {
+            for observed in [
+                None,
+                Some((
+                    PathBuf::from("/target"),
+                    super::CloseWriterAuthority::WorkingDirectory,
+                )),
+            ] {
+                assert!(matches!(
+                    super::stable_writer_observation(
+                        super::CloseWriterDetector::MacCwd,
+                        process.clone(),
+                        observed,
+                        after.clone()
+                    ),
+                    super::ExternalWriterEvidence::Blocked(
+                        super::CloseWriterObservation::InspectionGap {
+                            reason: super::CloseWriterGap::ProcessChanged,
+                            ..
+                        }
+                    )
+                ));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fake_linux_process(proc_root: &Path, pid: u32, uid: u32, start: u64) -> PathBuf {
+        let process = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(process.join("fd")).unwrap();
+        std::fs::create_dir(process.join("fdinfo")).unwrap();
+        std::fs::create_dir_all(proc_root.join("sys/kernel/random")).unwrap();
+        std::fs::write(proc_root.join("sys/kernel/random/boot_id"), "test-boot").unwrap();
+        std::fs::write(
+            process.join("status"),
+            format!("Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
+        )
+        .unwrap();
+        let mut fields = vec!["0".to_owned(); 20];
+        fields[0] = "S".into();
+        fields[19] = start.to_string();
+        std::fs::write(
+            process.join("stat"),
+            format!("{pid} (fake process) {}\n", fields.join(" ")),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("/test/executable", process.join("exe")).unwrap();
+        std::os::unix::fs::symlink("/outside", process.join("cwd")).unwrap();
+        std::fs::write(process.join("maps"), "").unwrap();
+        process
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
-    fn descriptor_scan_skips_unreadable_links() {
-        let worktree = Path::new("/quarantine/worktree");
-        for kind in [
-            std::io::ErrorKind::NotFound,
-            std::io::ErrorKind::PermissionDenied,
-            std::io::ErrorKind::InvalidData,
+    fn linux_descriptor_scan_classifies_access_and_retains_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let proc_root = temp.path().join("proc");
+        std::fs::create_dir(&quarantine).unwrap();
+        let file = quarantine.join("open-file");
+        std::fs::write(&file, "data").unwrap();
+        // SAFETY: geteuid has no preconditions and does not inspect processes.
+        let uid = unsafe { libc::geteuid() };
+        let process = fake_linux_process(&proc_root, 1274, uid, 44);
+        std::os::unix::fs::symlink(&file, process.join("fd/3")).unwrap();
+        std::fs::write(process.join("fdinfo/3"), "pos:\t0\nflags:\t0100000\n").unwrap();
+        assert_eq!(
+            super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap(),
+            super::ExternalWriterEvidence::NoPositiveEvidence
+        );
+        for (flags, expected) in [
+            ("0100001", super::CloseFileWriteAccess::WriteOnly),
+            ("0100002", super::CloseFileWriteAccess::ReadWrite),
         ] {
-            assert!(!super::linux_descriptor_target_is_within(
-                Err(std::io::Error::from(kind)),
-                worktree,
-            ));
+            std::fs::write(process.join("fdinfo/3"), format!("flags:\t{flags}\n")).unwrap();
+            assert!(
+                matches!(super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap(),
+                super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::Authority { detector: super::CloseWriterDetector::LinuxDescriptor, process, matched_path, authority: super::CloseWriterAuthority::WritableFile(access) })
+                if process.pid == 1274 && process.incarnation.as_str() == "test-boot:44" && process.executable == Path::new("/test/executable") && matched_path == file && access == expected)
+            );
         }
-        assert!(super::linux_descriptor_target_is_within(
-            Ok(worktree.join("open-file")),
-            worktree,
+        std::fs::remove_file(process.join("fd/3")).unwrap();
+        std::os::unix::fs::symlink(&quarantine, process.join("fd/3")).unwrap();
+        std::fs::write(process.join("fdinfo/3"), "flags:\t0100000\n").unwrap();
+        assert!(matches!(
+            super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap(),
+            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::Authority {
+                authority: super::CloseWriterAuthority::DirectoryDescriptor(
+                    super::CloseDescriptorAccess::ReadOnly
+                ),
+                ..
+            })
         ));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn descriptor_scan_ignores_ambient_failures_and_finds_readable_writer() {
+    fn linux_readonly_descriptor_position_changes_are_not_writer_gaps() {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
-        let ambient = proc_root.join("1273");
-        let writer = proc_root.join("1274");
-        std::fs::create_dir_all(&ambient).unwrap();
-        std::fs::create_dir_all(writer.join("fd")).unwrap();
         std::fs::create_dir(&quarantine).unwrap();
-        std::fs::write(ambient.join("fd"), b"not a descriptor directory").unwrap();
-        std::os::unix::fs::symlink(quarantine.join("open-file"), writer.join("fd/3")).unwrap();
-
-        assert_eq!(
-            super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap(),
-            super::ExternalWriterEvidence::PositiveWriterFound,
-        );
+        let file = quarantine.join("read-only-file");
+        std::fs::write(&file, "data").unwrap();
+        // SAFETY: geteuid has no preconditions and does not inspect processes.
+        let process = fake_linux_process(&proc_root, 1274, unsafe { libc::geteuid() }, 44);
+        std::os::unix::fs::symlink(&file, process.join("fd/3")).unwrap();
+        std::fs::write(process.join("fdinfo/3"), "pos:\t0\nflags:\t0100000\n").unwrap();
+        let mut reads = 0;
+        let evidence = super::quarantine_has_open_descriptors_with_info_reader(
+            &quarantine,
+            &proc_root,
+            |path| {
+                let info = std::fs::read_to_string(path)?;
+                reads += 1;
+                std::fs::write(path, "pos:\t4\nflags:\t0100000\n")?;
+                Ok(info)
+            },
+        )
+        .unwrap();
+        assert_eq!(reads, 2);
+        assert_eq!(evidence, super::ExternalWriterEvidence::NoPositiveEvidence);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn descriptor_scan_reports_no_evidence_for_unavailable_or_unrelated_inventory() {
+    fn linux_descriptor_scan_retains_inventory_and_descriptor_gaps() {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
         std::fs::create_dir(&quarantine).unwrap();
-
-        assert_eq!(
+        assert!(matches!(
             super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap(),
-            super::ExternalWriterEvidence::NoPositiveEvidence,
-        );
+            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::InspectionGap {
+                pid: None,
+                ..
+            })
+        ));
+        // SAFETY: geteuid has no preconditions.
+        let process = fake_linux_process(&proc_root, 1274, unsafe { libc::geteuid() }, 44);
+        std::os::unix::fs::symlink(&quarantine, process.join("fd/3")).unwrap();
+        assert!(matches!(
+            super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap(),
+            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::InspectionGap {
+                reason: super::CloseWriterGap::DescriptorChanged,
+                ..
+            })
+        ));
+        std::fs::write(process.join("fdinfo/3"), "flags:\tnot-octal\n").unwrap();
+        assert!(matches!(
+            super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap(),
+            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::InspectionGap {
+                reason: super::CloseWriterGap::Malformed,
+                ..
+            })
+        ));
+        std::fs::remove_file(process.join("fd/3")).unwrap();
+        std::fs::write(process.join("fd/3"), "not a link").unwrap();
+        assert!(matches!(
+            super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap(),
+            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::InspectionGap {
+                reason: super::CloseWriterGap::DescriptorChanged,
+                ..
+            })
+        ));
+    }
 
-        let descriptors = proc_root.join("1273/fd");
-        std::fs::create_dir_all(&descriptors).unwrap();
-        std::os::unix::fs::symlink(temp.path().join("outside"), descriptors.join("3")).unwrap();
-        std::os::unix::fs::symlink(temp.path().join("missing"), descriptors.join("4")).unwrap();
-        std::fs::create_dir_all(proc_root.join("self/fd")).unwrap();
-        std::os::unix::fs::symlink(quarantine.join("ignored"), proc_root.join("self/fd/5"))
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_cwd_scan_proves_namespace_authority_and_fails_closed_on_gaps() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let proc_root = temp.path().join("proc");
+        std::fs::create_dir(&quarantine).unwrap();
+        let process = fake_linux_process(&proc_root, 3, 1, 42);
+        std::fs::remove_file(process.join("cwd")).unwrap();
+        assert!(matches!(
+            super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).unwrap(),
+            super::ExternalWriterEvidence::Blocked(
+                super::CloseWriterObservation::InspectionGap { .. }
+            )
+        ));
+        std::os::unix::fs::symlink(&quarantine, process.join("cwd")).unwrap();
+        assert!(matches!(
+            super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).unwrap(),
+            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::Authority {
+                authority: super::CloseWriterAuthority::WorkingDirectory,
+                ..
+            })
+        ));
+        std::fs::write(process.join("status"), "malformed credentials").unwrap();
+        assert!(matches!(
+            super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).unwrap(),
+            super::ExternalWriterEvidence::Blocked(
+                super::CloseWriterObservation::InspectionGap { .. }
+            )
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_mapping_scan_requires_writable_shared_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let proc_root = temp.path().join("proc");
+        std::fs::create_dir(&quarantine).unwrap();
+        let process = fake_linux_process(&proc_root, 3, 1, 42);
+        let mapped = quarantine.join("mapped file");
+        for permissions in ["r--s", "rw-p", "rw-s"] {
+            std::fs::write(
+                process.join("maps"),
+                format!(
+                    "00000000-00001000 {permissions} 00000000 00:00 1 {}\n",
+                    mapped.display()
+                ),
+            )
             .unwrap();
-
-        assert_eq!(
-            super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap(),
-            super::ExternalWriterEvidence::NoPositiveEvidence,
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn cwd_scan_ignores_ambient_unreadability_and_finds_readable_writer() {
-        let temp = tempfile::tempdir().unwrap();
-        let quarantine = temp.path().join("quarantine");
-        let proc_root = temp.path().join("proc");
-        let unreadable_status = proc_root.join("1");
-        let unreadable_cwd = proc_root.join("2");
-        let writer = proc_root.join("3");
-        std::fs::create_dir_all(unreadable_status.join("status")).unwrap();
-        std::fs::create_dir_all(&unreadable_cwd).unwrap();
-        std::fs::create_dir_all(&writer).unwrap();
-        std::fs::create_dir(&quarantine).unwrap();
-        std::fs::write(
-            unreadable_cwd.join("status"),
-            "Name:\ttest\nUid:\t1\t1\t1\t1\n",
-        )
-        .unwrap();
-        std::fs::write(unreadable_cwd.join("cwd"), b"not a symlink").unwrap();
-        std::fs::write(writer.join("status"), "Name:\twriter\nUid:\t1\t1\t1\t1\n").unwrap();
-        std::os::unix::fs::symlink(quarantine.join("nested"), writer.join("cwd")).unwrap();
-
-        assert!(super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).unwrap());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn mapping_scan_ignores_ambient_unreadability_and_finds_readable_writer() {
-        let temp = tempfile::tempdir().unwrap();
-        let quarantine = temp.path().join("quarantine");
-        let proc_root = temp.path().join("proc");
-        let unreadable_status = proc_root.join("1");
-        let unreadable_maps = proc_root.join("2");
-        let writer = proc_root.join("3");
-        std::fs::create_dir_all(unreadable_status.join("status")).unwrap();
-        std::fs::create_dir_all(unreadable_maps.join("maps")).unwrap();
-        std::fs::create_dir_all(&writer).unwrap();
-        std::fs::create_dir(&quarantine).unwrap();
-        for process in [&unreadable_maps, &writer] {
-            std::fs::write(process.join("status"), "Name:\ttest\nUid:\t1\t1\t1\t1\n").unwrap();
+            let evidence =
+                super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 1).unwrap();
+            if permissions == "rw-s" {
+                assert!(
+                    matches!(evidence, super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::Authority { matched_path, authority: super::CloseWriterAuthority::WritableSharedMapping, .. }) if matched_path == mapped)
+                );
+            } else {
+                assert_eq!(evidence, super::ExternalWriterEvidence::NoPositiveEvidence);
+            }
         }
-        std::fs::write(
-            writer.join("maps"),
-            format!(
-                "00000000-00001000 rw-s 00000000 00:00 1 {}\n",
-                quarantine.join("mapped-file").display()
-            ),
-        )
-        .unwrap();
-
-        assert!(super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 1).unwrap());
+        std::fs::remove_file(process.join("maps")).unwrap();
+        assert!(matches!(
+            super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 1).unwrap(),
+            super::ExternalWriterEvidence::Blocked(
+                super::CloseWriterObservation::InspectionGap { .. }
+            )
+        ));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cwd_and_mapping_scans_treat_unavailable_proc_inventory_as_no_evidence() {
+    fn cwd_and_mapping_scans_treat_unavailable_proc_inventory_as_gap() {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
         std::fs::create_dir(&quarantine).unwrap();
         std::fs::write(&proc_root, b"not a proc directory").unwrap();
 
-        assert!(!super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).unwrap());
-        assert!(!super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 1).unwrap());
+        for evidence in [
+            super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).unwrap(),
+            super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 1).unwrap(),
+        ] {
+            assert!(matches!(
+                evidence,
+                super::ExternalWriterEvidence::Blocked(
+                    super::CloseWriterObservation::InspectionGap { .. }
+                )
+            ));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_pid_reuse_during_observation_retains_gap() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let proc_root = temp.path().join("proc");
+        std::fs::create_dir(&quarantine).unwrap();
+        let process = fake_linux_process(&proc_root, 3, 1, 42);
+        let evidence = super::linux_writer_scan(
+            &quarantine,
+            &proc_root,
+            1,
+            super::CloseWriterDetector::LinuxCwd,
+            |_, _| {
+                let stat = std::fs::read_to_string(process.join("stat")).unwrap();
+                std::fs::write(process.join("stat"), stat.replace(" 42", " 43")).unwrap();
+                Ok(Some((
+                    quarantine.clone(),
+                    super::CloseWriterAuthority::WorkingDirectory,
+                )))
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            evidence,
+            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::InspectionGap {
+                reason: super::CloseWriterGap::ProcessChanged,
+                ..
+            })
+        ));
     }
 
     #[cfg(target_os = "linux")]

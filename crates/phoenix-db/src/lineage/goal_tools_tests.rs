@@ -132,7 +132,7 @@ async fn table_data(pool: &SqlitePool) -> Vec<(String, Vec<Vec<String>>)> {
 
 #[tokio::test]
 async fn canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent() {
-    for through in 142..=152 {
+    for through in 142..=153 {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("goal-tools.db");
         let db = Database::open(path.to_str().unwrap()).await.unwrap();
@@ -153,7 +153,7 @@ async fn canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent() {
             crate::migrations::run_pending_migrations(db.pool())
                 .await
                 .unwrap(),
-            152 - through
+            153 - through
         );
         assert_goal_rows(&db, &owner, source.is_some()).await;
         let tail: Vec<i64> = sqlx::query_scalar(
@@ -162,7 +162,10 @@ async fn canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent() {
         .fetch_all(db.pool())
         .await
         .unwrap();
-        assert_eq!(tail, vec![143, 144, 145, 146, 147, 148, 149, 150, 151, 152]);
+        assert_eq!(
+            tail,
+            vec![143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153]
+        );
         let before = snapshot(db.pool()).await;
         assert_eq!(
             crate::migrations::run_pending_migrations(db.pool())
