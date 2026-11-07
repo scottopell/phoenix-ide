@@ -3145,6 +3145,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn remote_goal_apply_verifies_previous_snapshot_and_transition() {
         use phoenix_core::domain::conversation_goal::{
             GoalActor, GoalAttribution, GoalChange, GoalCommandDisposition, GoalDisposition,
