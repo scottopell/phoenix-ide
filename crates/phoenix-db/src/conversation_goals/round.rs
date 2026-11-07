@@ -432,11 +432,10 @@ fn classify_self_goal_round(
             }
         }
     }
-    match (enable, create) {
-        (false, false) | (true, false) | (false, true) => {
-            super::self_management::SelfGoalRoundAdmission::SeparateOperations
-        }
-        (true, true) => super::self_management::SelfGoalRoundAdmission::MixedOperations,
+    if enable && create {
+        super::self_management::SelfGoalRoundAdmission::MixedOperations
+    } else {
+        super::self_management::SelfGoalRoundAdmission::SeparateOperations
     }
 }
 
