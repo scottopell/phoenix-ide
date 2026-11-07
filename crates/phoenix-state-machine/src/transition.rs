@@ -4743,7 +4743,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(terminal_round.results()[0], pending);
-        assert!(terminal_round.results()[1].finalized().unwrap().is_error());
+        assert_eq!(
+            terminal_round.results()[1].finalized().unwrap(),
+            &ToolResult::cancelled("other".into(), "Cancelled by user")
+        );
         let second = transition(
             &restored,
             &ctx,
