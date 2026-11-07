@@ -2,10 +2,11 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-const [stories, mockApi, capture] = await Promise.all([
+const [stories, mockApi, capture, fixture] = await Promise.all([
   readFile(new URL('../src/stories/product-conversation.stories.tsx', import.meta.url), 'utf8'),
   readFile(new URL('../src/fixtures/productConversation/mockApi.ts', import.meta.url), 'utf8'),
   readFile(new URL('./capture-reminders.mjs', import.meta.url), 'utf8'),
+  readFile(new URL('../src/fixtures/productConversation/renderFixture.tsx', import.meta.url), 'utf8'),
 ]);
 
 test('Reminders capture contract has typed scenarios, conversation-scoped GETs and bounded journeys', () => {
@@ -13,6 +14,8 @@ test('Reminders capture contract has typed scenarios, conversation-scoped GETs a
     assert.ok(stories.includes(`withReminders('${id}'`), `Missing Reminders story scenario ${id}`);
   }
   assert.doesNotMatch(stories, /as ProductConversationScenarioId/);
+  assert.match(capture, /readyAttribute: 'data-reminders-fixture-ready'/);
+  assert.match(fixture, /'data-reminders-fixture-ready': scenario.id.slice\('reminders-'.length\)/);
   assert.match(mockApi, /`\/api\/conversations\/\$\{encodeURIComponent\(conversation\.id\)\}\/reminders`/);
   assert.match(mockApi, /failuresAfterFirstLoad/);
   assert.match(mockApi, /status: 409/);

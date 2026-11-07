@@ -112,6 +112,7 @@ function ProductConversationFixtureBody({ scenario }: Props) {
       ref={rootRef}
       data-product-conversation-fixture={scenario.id}
       {...(ready ? { 'data-product-conversation-fixture-ready': scenario.id } : {})}
+      {...(ready && scenario.reminderFixture ? { 'data-reminders-fixture-ready': scenario.id.slice('reminders-'.length) } : {})}
     >
       <FixtureRouter initialEntry={new URLSearchParams(window.location.search).get('fixtureEntry') ?? (scenario.initialEntry ?? (scenario.kind === 'coordinator' ? `/global/${scenario.snapshot.latest_transcript_row_id}${fixtureHash}` : `/product-conversations/fixture-product-conversation${fixtureHash}`))}>
         <FixtureLocation />

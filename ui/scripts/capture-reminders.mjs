@@ -17,7 +17,7 @@ const viewports = [
 runSurfaceCapture({
   surface: 'product-conversation-reminders',
   storyPrefix: 'product-conversation--reminders-',
-  readyAttribute: 'data-product-conversation-fixture-ready',
+  readyAttribute: 'data-reminders-fixture-ready',
   outDir: process.env.REMINDERS_QA_OUT ?? 'qa-artifacts/reminders',
   viewportMatrix: viewports,
   expectedConsoleErrors: new Map(storyIds.map((id) => [id, ['Network response 503', 'Network response 409']])),
@@ -33,6 +33,13 @@ runSurfaceCapture({
       await retry.click();
       await page.getByRole('region', { name: 'Reminders' }).waitFor({ state: 'visible' });
       journey.push('initial GET failure → retry → loaded reminders');
+    } else if (id === storyIds[1]) {
+      await page.getByRole('region', { name: 'Reminders' }).waitFor({ state: 'visible' });
+      await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+      await retry.waitFor({ state: 'visible' });
+      await page.getByText('Reminder due').waitFor({ state: 'visible' });
+      await page.getByText('Check the release candidate').waitFor({ state: 'visible' });
+      journey.push('loaded due/upcoming reminders → focus refresh failure retains both with stale warning');
     } else if (id === storyIds[2]) {
       await page.getByRole('region', { name: 'Reminders' }).waitFor({ state: 'visible' });
       await page.evaluate(() => window.dispatchEvent(new Event('focus')));

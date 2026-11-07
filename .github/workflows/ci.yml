@@ -821,7 +821,7 @@ jobs:
           corepack enable
           pnpm install --frozen-lockfile
           node --check scripts/capture-reminders.mjs
-          node --test scripts/capture-reminders.contract.test.mjs
+          node --test scripts/capture-reminders.contract.check.mjs
           python3 -m unittest discover -s ../scripts/ci -p 'test_isolate_geometry_apt_source.py'
           sudo python3 ../scripts/ci/isolate_geometry_apt_source.py
           pnpm exec playwright install --with-deps chromium
