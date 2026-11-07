@@ -45,6 +45,7 @@ enum ToolKind {
     | resolve_reference
     | read_automatic_continuation
     | set_automatic_continuation
+    | continue_conversation
 }
 
 enum SubscriptionState {
@@ -149,6 +150,79 @@ entity AutomaticContinuationResult {
     aggregate: ResolvedPreferenceAggregate
     auto_continue_on_context_exhaustion: Boolean
 }
+
+-- REQ-FED-021–022. Continue accepts only the generated ordinary handoff
+-- boundary; source identity and retry identity come from trusted execution.
+entity ContinueSelector {
+    kind: OmittedContinueSelector | LocalContinueSelector | NullContinueSelector | PeerContinueSelector
+}
+
+variant OmittedContinueSelector : ContinueSelector {}
+
+variant LocalContinueSelector : ContinueSelector {}
+
+variant NullContinueSelector : ContinueSelector {}
+
+variant PeerContinueSelector : ContinueSelector {
+    instance: String
+}
+
+-- Flattened semantic projection of the closed destination wire request. Every
+-- field is mandatory; the source-side selector and destination-computed digest
+-- are not wire fields.
+entity RemoteContinueRequest {
+    caller_instance_id: String
+    destination_instance_id: String
+    source_product_conversation_id: String
+    source_transcript_id: String
+    source_message_id: String
+    source_tool_use_id: String
+    first_message_id: String
+    product_conversation_id: String
+    predecessor_transcript_id: String
+    summary_message_id: String
+}
+
+enum ContinueOpeningState {
+    pending
+    | accepted
+}
+
+enum ContinueDispatchReceipt {
+    accepted
+    | already_exists
+    | dispatch_failed
+}
+
+entity RemoteContinueReservation {
+    caller_instance_id: String
+    retry_identity: String
+    product_conversation_id: String
+    predecessor_transcript_id: String
+    generated_summary_message_id: String
+    payload_digest: String
+    successor_transcript_id: String
+    opening_identity: String
+    state: ContinueOpeningState
+    accepted_opening_id: String?
+}
+
+-- Flattened semantic projection of the closed destination wire response. The
+-- nested local Continue result contributes conversation_id, receipt and error.
+entity RemoteContinueResult {
+    caller_instance_id: String
+    destination_instance_id: String
+    product_conversation_id: String
+    predecessor_transcript_id: String
+    summary_message_id: String
+    successor_transcript_id: String
+    opening_message_id: String
+    opening_status: ContinueOpeningState
+    conversation_id: String
+    receipt: ContinueDispatchReceipt
+    error: String?
+}
+
 
 entity ToolSelection {
     tool: ToolKind
@@ -328,6 +402,7 @@ rule RemoteSelectionFails {
 
 rule LocalToolDispatch {
     when: DispatchTool(selection)
+    requires: selection.tool != continue_conversation
     requires: selection.instance = null
     requires: not selection.failed
     ensures: LocalToolExecution(selection.tool)
@@ -335,6 +410,7 @@ rule LocalToolDispatch {
 
 rule RemoteToolDispatch {
     when: DispatchTool(selection)
+    requires: selection.tool != continue_conversation
     requires: selection.instance != null
     requires: selection.destination != null
     requires: not selection.failed
@@ -429,6 +505,131 @@ rule RejectMismatchedRemoteAutomaticContinuationResponse {
     ensures: PreferenceResultRejected(request)
     -- No local execution or alternate-peer dispatch.
 }
+
+-- REQ-FED-021: omission, explicit JSON null and exact "local" route locally
+-- before SelectTool normalizes local selection.
+-- Helpers:
+-- valid_continue_selector(selection, request): selection contains an
+-- OmittedContinueSelector, NullContinueSelector or LocalContinueSelector
+-- for local routing, or a PeerContinueSelector with an exact saved peer
+-- for remote routing; ambiguous/unknown peer and selected self-peer are invalid.
+-- The selector is consumed before dispatch and is not sent to the destination.
+-- source_continue_current(request): the authenticated executing source is the
+-- current Coordinator, its source ProductConversation/transcript/message/tool-use
+-- IDs are trusted context, and its aggregate admission gate remains held
+-- throughout remote dispatch.
+-- continue_retry_derived(request): request.first_message_id is a bounded identity
+-- derived from authenticated caller instance, source message ID and source
+-- tool-use ID, never agent input.
+-- continue_destination_authorized(peer, request): peer is authenticated and
+-- equals caller, destination identity equals this instance, the enrolled peer's
+-- source attestation is trusted, and current Federation send authority is
+-- checked transactionally with exact ordinary generated-handoff reservation
+-- or accepted-opening replay (including revocation/replacement).
+-- exact_generated_handoff(request): REQ-GR-019's published user-initiated
+-- ordinary ProductConversation predecessor is ContextExhausted and its exact
+-- current persisted system-generated summary matches the request.
+-- destination_successor(request): the single reserved REQ-GR-019 successor.
+-- destination_continue_payload_digest(request): the destination-computed digest
+-- over the authenticated source attestation, exact destination boundary and
+-- destination-persisted summary content; callers do not supply this digest.
+-- derived_opening_identity(request): the winning pending opening identity is
+-- the exact request key (request.first_message_id), derived from caller and the
+-- trusted source message/tool-use pair and retained by the destination.
+-- destination_accepted_opening(reservation): the exact accepted first opening
+-- in the reserved successor under REQ-GR-019, never supplied by the caller.
+-- other_retry_identity(reservation): any retry identity distinct from this
+-- reservation identity, scoped to its ProductConversation and predecessor.
+-- same_continue_payload(request, prior): caller, retry identity, exact
+-- conversation/predecessor/summary boundary and the destination-computed
+-- payload digest all match.
+-- continue_response_matches(peer, request, result): authenticated selected
+-- destination binds caller, destination, exact boundary, reserved successor and
+-- destination-retained, source-derived opening. result.conversation_id equals
+-- result.successor_transcript_id. Pending opening_message_id equals
+-- request.first_message_id. Once accepted, it is the request key or
+-- successor:key for that reserved successor. Receipt, error and durable opening
+-- status must each be consistent with their own evidence. Unknown request,
+-- response and nested-result fields are rejected.
+rule DispatchLocalContinue {
+    when: DispatchContinue(selection, request)
+    requires: valid_continue_selector(selection, request)
+    requires: selection.instance = null
+    ensures: LocalContinueUnderGlobalRecall(request)
+}
+
+rule DispatchRemoteContinue {
+    when: DispatchContinue(selection, request)
+    requires: valid_continue_selector(selection, request)
+    requires: selection.instance != null and selection.destination != null
+    requires: selection.destination.trusted
+    requires: source_continue_current(request)
+    requires: continue_retry_derived(request)
+    ensures: RemoteContinueRequestSent(selection.destination, request)
+}
+
+rule RejectInvalidContinueSelection {
+    when: DispatchContinue(selection, request)
+    requires: not valid_continue_selector(selection, request)
+    ensures: ContinueSelectionError(request)
+    -- Neither local execution nor another peer is substituted.
+}
+
+rule ReserveRemoteContinue {
+    when: ReceiveRemoteContinue(peer, request)
+    requires: continue_destination_authorized(peer, request)
+    requires: exact_generated_handoff(request)
+    requires: continue_retry_derived(request)
+    requires: not exists RemoteContinueReservation{caller_instance_id: request.caller_instance_id, retry_identity: request.first_message_id}
+    requires: not exists RemoteContinueReservation{product_conversation_id: request.product_conversation_id, predecessor_transcript_id: request.predecessor_transcript_id}
+    ensures: RemoteContinueReservation.created(caller_instance_id: request.caller_instance_id, retry_identity: request.first_message_id, product_conversation_id: request.product_conversation_id, predecessor_transcript_id: request.predecessor_transcript_id, generated_summary_message_id: request.summary_message_id, payload_digest: destination_continue_payload_digest(request), successor_transcript_id: destination_successor(request), opening_identity: derived_opening_identity(request), state: pending, accepted_opening_id: null)
+    @guidance
+        -- Reserve under the same transaction as current send-authority and
+        -- exact handoff checks. Opening follows REQ-GR-019 capacity and
+        -- generated-predecessor-context rules; no user text or Goal mutation.
+}
+
+rule ReplayRemoteContinue {
+    when: ReceiveRemoteContinue(peer, request)
+    let prior = RemoteContinueReservation{caller_instance_id: request.caller_instance_id, retry_identity: request.first_message_id}
+    requires: exists prior
+    requires: continue_destination_authorized(peer, request)
+    requires: same_continue_payload(request, prior)
+    ensures: RetainedContinueResultReturned(prior)
+    -- Pending replay reviews current successor capacity without replacing the
+    -- retained opening identity; accepted replay returns accepted opening
+    -- without another capacity check or dispatch, even after lost ack.
+}
+
+rule RejectConflictingRemoteContinue {
+    when: ReceiveRemoteContinue(peer, request)
+    let prior = RemoteContinueReservation{caller_instance_id: request.caller_instance_id, retry_identity: request.first_message_id}
+    requires: continue_destination_authorized(peer, request)
+    requires: exists prior and not same_continue_payload(request, prior)
+    ensures: ContinueConflict(request)
+}
+
+rule RejectChangedContinueIdentity {
+    when: ReceiveRemoteContinue(peer, request)
+    let prior = RemoteContinueReservation{product_conversation_id: request.product_conversation_id, predecessor_transcript_id: request.predecessor_transcript_id}
+    requires: continue_destination_authorized(peer, request)
+    requires: exists prior and prior.retry_identity != request.first_message_id
+    ensures: ContinueConflict(request)
+}
+
+rule VerifyRemoteContinueResult {
+    when: ReceiveRemoteContinueResult(peer, request, result)
+    requires: continue_response_matches(peer, request, result)
+    ensures: ContinueResultAccepted(result)
+}
+
+rule RejectInvalidRemoteContinueResult {
+    when: ReceiveRemoteContinueResult(peer, request, result)
+    requires: not continue_response_matches(peer, request, result)
+    ensures: ContinueResultRejected(request)
+    -- No fallback or fabricated accepted opening.
+}
+
 
 rule AdmitRemoteMessage {
     when: SendRemoteMessage(source, message_id, target, content, provenance)
@@ -968,6 +1169,28 @@ invariant TerminalEvidenceDoesNotExpandReplay {
     -- event and never makes failed_gap eligible for normal ordered pulling.
 }
 
+-- REQ-FED-021–022: durable reservations, not retry-cache age, own the
+-- handoff's winning opening and cannot be replaced by a different call.
+rule CompleteRemoteContinueOpening {
+    when: CompleteRemoteContinueOpening(reservation, accepted_opening_id)
+    requires: reservation.state = pending
+    requires: accepted_opening_id = destination_accepted_opening(reservation)
+    ensures: reservation.state = accepted
+    ensures: reservation.accepted_opening_id = accepted_opening_id
+}
+
+invariant RemoteContinueOpeningMatchesState {
+    for reservation in RemoteContinueReservations:
+        reservation.state = accepted or reservation.accepted_opening_id = null
+        reservation.state = pending or reservation.accepted_opening_id != null
+        reservation.opening_identity = reservation.retry_identity
+        reservation.state = pending or reservation.accepted_opening_id = reservation.retry_identity or reservation.accepted_opening_id = reservation.successor_transcript_id + ":" + reservation.retry_identity
+}
+
+invariant RemoteContinueReservationOwnsBoundary {
+    for reservation in RemoteContinueReservations:
+        not exists RemoteContinueReservation{product_conversation_id: reservation.product_conversation_id, predecessor_transcript_id: reservation.predecessor_transcript_id, retry_identity: other_retry_identity(reservation)}
+}
 invariant RemoteSelectionNeverFallsBack {
     for s in ToolSelections where s.instance != null:
         s.destination != null or s.failed
@@ -1003,14 +1226,24 @@ actor TrustedPeer {
 
 surface FederationToolSurface {
     facing peer: TrustedPeer
+    context continue_request: RemoteContinueRequest
     provides:
         SendRemoteMessage(peer, message_id, target, content, provenance)
         ReadRemoteGoal(peer, target, requested_version, timeout)
         ReadRemotePreference(peer, request)
         SetRemotePreference(peer, request)
+        ReceiveRemoteContinue(peer, continue_request)
     @guarantee DomainParity
         -- Destination domain services enforce the same admission, stable
         -- conversation resolution, version wait, timeout, and result semantics.
+}
+
+surface ContinueResponseSurface {
+    facing peer: TrustedPeer
+    context request: RemoteContinueRequest
+    context result: RemoteContinueResult
+    provides:
+        ReceiveRemoteContinueResult(peer, request, result)
 }
 
 surface AutomaticContinuationResponseSurface {
