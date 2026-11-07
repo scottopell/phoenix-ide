@@ -6083,11 +6083,11 @@ enum LinuxProcessOwner {
 
 #[cfg(target_os = "linux")]
 fn linux_process_is_zombie(status: &str) -> Result<bool, String> {
-    let mut states = status
+    let mut fields = status
         .lines()
         .filter_map(|line| line.strip_prefix("State:"));
-    let state = states.next().ok_or("status State field is missing")?;
-    if states.next().is_some() {
+    let state = fields.next().ok_or("status State field is missing")?;
+    if fields.next().is_some() {
         return Err("status State field is ambiguous".into());
     }
     match state.split_whitespace().next() {

@@ -5025,10 +5025,11 @@ impl Database {
         // Exact replays are no-ops even after the run stops; conflicts never overwrite evidence.
         let inserted = sqlx::query(
             "INSERT INTO close_writer_observations
-             (attempt_id, run_ordinal, scope, inspection_generation, inspection_fingerprint,
+             (product_conversation_id, attempt_id, run_ordinal, scope, inspection_generation, inspection_fingerprint,
               resource_kind, identity_kind, identity_codec, identity_value,
               detector, pid, incarnation, executable, matched_path, matched_kind, access, authority, gap)
-             SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18
+             SELECT (SELECT product_conversation_id FROM close_obligations WHERE attempt_id=?1),
+                    ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18
              WHERE NOT EXISTS (SELECT 1 FROM close_writer_observations
                WHERE attempt_id=?1 AND run_ordinal=?2 AND scope=?3 AND detector=?10)",
         )
@@ -13073,7 +13074,7 @@ mod tests {
         for sql in [
             "UPDATE close_writer_observations SET pid = 124",
             "INSERT OR REPLACE INTO close_writer_observations
-             SELECT attempt_id, run_ordinal, scope, inspection_generation, inspection_fingerprint,
+             SELECT product_conversation_id, attempt_id, run_ordinal, scope, inspection_generation, inspection_fingerprint,
                     resource_kind, identity_kind, identity_codec, identity_value, detector,
                     999, incarnation, executable, matched_path, matched_kind, access, authority, gap
              FROM close_writer_observations",
@@ -13107,6 +13108,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writer_observation_rejects_unrelated_product_lifetime_owner() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "other-aggregate").await;
+        let (request, _) = writer_observation_fixture(&db).await;
+        db.record_close_writer_observation(&request).await.unwrap();
+        let other_product: String = sqlx::query_scalar(
+            "SELECT product_conversation_id FROM conversations WHERE id='other-aggregate'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let error = sqlx::query("INSERT INTO close_writer_observations
+            SELECT ?1, attempt_id, run_ordinal, scope, inspection_generation, inspection_fingerprint,
+                   resource_kind, identity_kind, identity_codec, identity_value, 'mac_descriptor',
+                   pid, incarnation, executable, matched_path, matched_kind, access, authority, gap
+            FROM close_writer_observations WHERE detector='linux_descriptor'")
+            .bind(other_product).execute(db.pool()).await.unwrap_err();
+        assert!(
+            error.to_string().contains("exact active Close authority"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_history_aggregate_cannot_delete_writer_evidence_before_product_deletion() {
+        let db = Database::open_in_memory().await.unwrap();
+        let (request, mut failure) = writer_observation_fixture(&db).await;
+        failure.stop_certainty =
+            CloseStopCertainty::ConversationAndProcessesStopped { confirmed_at_us: 1 };
+        db.record_close_writer_observation(&request).await.unwrap();
+        db.terminalize_initial_close_cleanup_failure(&failure)
+            .await
+            .unwrap();
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::query("DELETE FROM conversations WHERE product_conversation_id = ?1")
+            .bind(failure.source_product_conversation_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM conversations WHERE product_conversation_id = ?1"
+            )
+            .bind(failure.source_product_conversation_id.as_str())
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM product_conversations WHERE id = ?1"
+            )
+            .bind(failure.source_product_conversation_id.as_str())
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap(),
+            1
+        );
+        let error = sqlx::query("DELETE FROM close_writer_observations")
+            .execute(&mut *tx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("immutable"), "{error}");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_writer_observations")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap(),
+            1
+        );
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn writer_observation_replacement_is_rejected_with_recursive_triggers_disabled() {
         let db = Database::open_in_memory().await.unwrap();
         let (request, _) = writer_observation_fixture(&db).await;
@@ -13118,7 +13194,7 @@ mod tests {
             .unwrap();
         let error = sqlx::query(
             "INSERT OR REPLACE INTO close_writer_observations
-            SELECT attempt_id, run_ordinal, scope, inspection_generation, inspection_fingerprint,
+            SELECT product_conversation_id, attempt_id, run_ordinal, scope, inspection_generation, inspection_fingerprint,
                    resource_kind, identity_kind, identity_codec, identity_value, detector,
                    999, incarnation, executable, matched_path, matched_kind, access, authority, gap
             FROM close_writer_observations",
@@ -13311,7 +13387,7 @@ mod tests {
         for path in [b"".as_slice(), b"/test/nul\0path".as_slice()] {
             for executable in [false, true] {
                 let error = sqlx::query("INSERT INTO close_writer_observations
-                    SELECT attempt_id, run_ordinal, scope, inspection_generation, inspection_fingerprint,
+                    SELECT product_conversation_id, attempt_id, run_ordinal, scope, inspection_generation, inspection_fingerprint,
                            resource_kind, identity_kind, identity_codec, identity_value, 'mac_descriptor',
                            pid, incarnation, ?1, ?2, matched_kind, access, authority, gap
                     FROM close_writer_observations WHERE detector='linux_descriptor'")
@@ -13390,7 +13466,7 @@ mod tests {
             ),
         ] {
             assert!(sqlx::query("INSERT INTO close_writer_observations
-                SELECT attempt_id, run_ordinal, scope, inspection_generation, inspection_fingerprint,
+                SELECT product_conversation_id, attempt_id, run_ordinal, scope, inspection_generation, inspection_fingerprint,
                        resource_kind, identity_kind, identity_codec, identity_value, 'mac_descriptor',
                        ?1, incarnation, executable, ?2, matched_kind, ?3, authority, ?4
                 FROM close_writer_observations WHERE detector='linux_descriptor'")

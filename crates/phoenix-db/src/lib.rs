@@ -11756,23 +11756,6 @@ impl Database {
         product_conversation_id: &str,
     ) -> DbResult<bool> {
         sqlx::query(
-            "DELETE FROM close_writer_observations
-             WHERE attempt_id IN (
-                 SELECT obligation.attempt_id FROM close_obligations obligation
-                 JOIN product_conversations product ON product.id = obligation.product_conversation_id
-                 WHERE obligation.product_conversation_id = ?1
-                   AND product.kind = 'ordinary'
-                   AND product.ordinary_lifecycle = 'history'
-             )
-               AND NOT EXISTS (
-                   SELECT 1 FROM conversations
-                   WHERE product_conversation_id = ?1
-               )",
-        )
-        .bind(product_conversation_id)
-        .execute(&mut *connection)
-        .await?;
-        sqlx::query(
             "DELETE FROM close_worktree_cleanup_plans
              WHERE attempt_id IN (
                  SELECT attempt_id FROM close_obligations

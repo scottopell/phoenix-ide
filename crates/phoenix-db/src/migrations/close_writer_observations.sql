@@ -1,4 +1,5 @@
 CREATE TABLE close_writer_observations (
+    product_conversation_id TEXT NOT NULL REFERENCES product_conversations(id) ON DELETE CASCADE,
     attempt_id TEXT NOT NULL,
     run_ordinal INTEGER NOT NULL,
     scope TEXT NOT NULL,
@@ -20,11 +21,11 @@ CREATE TABLE close_writer_observations (
     authority TEXT,
     gap TEXT,
     PRIMARY KEY (attempt_id, run_ordinal, scope, detector),
-    FOREIGN KEY (attempt_id, run_ordinal) REFERENCES close_runs(attempt_id, run_ordinal) ON DELETE RESTRICT,
+    FOREIGN KEY (attempt_id, run_ordinal) REFERENCES close_runs(attempt_id, run_ordinal) ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
     FOREIGN KEY (attempt_id, scope, inspection_generation, inspection_fingerprint,
                  resource_kind, identity_kind, identity_value)
         REFERENCES close_retirement_resource_dispatches(attempt_id, scope, inspection_generation,
-                 inspection_fingerprint, resource_kind, identity_kind, identity_value) ON DELETE RESTRICT,
+                 inspection_fingerprint, resource_kind, identity_kind, identity_value) ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
     CHECK (
         (gap IS NOT NULL AND gap IN ('unavailable', 'malformed', 'process_changed', 'descriptor_changed', 'unsupported')
          AND incarnation IS NULL AND executable IS NULL AND matched_path IS NULL
@@ -63,7 +64,7 @@ WHEN NOT EXISTS (
       AND inventory.inspection_fingerprint = dispatch.inspection_fingerprint AND inventory.sealed = 1
     WHERE run.attempt_id = NEW.attempt_id AND run.run_ordinal = NEW.run_ordinal AND run.status = 'running'
       AND run.run_ordinal = (SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = run.attempt_id)
-      AND product.kind = 'ordinary'
+      AND product.kind = 'ordinary' AND product.id = NEW.product_conversation_id
       AND obligation.inspection_generation = NEW.inspection_generation
       AND obligation.inspection_fingerprint = NEW.inspection_fingerprint
       AND captured.captured_worktree_identity = NEW.identity_value
@@ -98,21 +99,10 @@ CREATE TRIGGER close_writer_observations_no_update BEFORE UPDATE ON close_writer
 BEGIN
     SELECT RAISE(ABORT, 'Close writer observations are immutable');
 END;
-CREATE TRIGGER close_writer_observations_no_delete BEFORE DELETE ON close_writer_observations
-WHEN NOT EXISTS (
-    SELECT 1
-    FROM close_runs run
-    JOIN close_obligations obligation ON obligation.attempt_id = run.attempt_id
-    JOIN product_conversations product ON product.id = obligation.product_conversation_id
-    WHERE run.attempt_id = OLD.attempt_id
-      AND run.run_ordinal = OLD.run_ordinal
-      AND product.kind = 'ordinary'
-      AND product.ordinary_lifecycle = 'history'
-      AND NOT EXISTS (
-          SELECT 1 FROM conversations
-          WHERE product_conversation_id = product.id
-      )
-)
+-- Only the aggregate's actual deletion cascade may remove its retained evidence.
+-- Deferred run/dispatch FKs permit existing teardown ordering, not orphan commits.
+CREATE TRIGGER close_writer_observations_no_delete AFTER DELETE ON close_writer_observations
+WHEN EXISTS (SELECT 1 FROM product_conversations WHERE id = OLD.product_conversation_id)
 BEGIN
     SELECT RAISE(ABORT, 'Close writer observations are immutable until permanent Delete');
 END;
