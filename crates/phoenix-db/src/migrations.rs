@@ -15954,7 +15954,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(run_through_for_test(db.pool(), 152).await.unwrap(), 1);
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 2);
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 3);
         assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
         let ledger: Vec<(i64, String)> = sqlx::query_as(
             "SELECT version, name FROM _migrations WHERE version >= 150 ORDER BY version",
@@ -15970,6 +15970,7 @@ mod tests {
                 (152, "goal_preparation_inflight_source".into()),
                 (153, "close_writer_observations".into()),
                 (155, "ordinary_self_goal_admission".into()),
+                (156, "remote_coordinator_goals".into()),
             ]
         );
     }
@@ -15979,6 +15980,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (156, "remote_coordinator_goals"),
             (155, "ordinary_self_goal_admission"),
             (153, "close_writer_observations"),
             (152, "goal_preparation_inflight_source"),
@@ -20279,7 +20281,7 @@ mod tests {
         }
         sqlx::query("UPDATE product_creation_jobs SET status = 'published', published_product_id = 'deleted-product', published_conversation_id = 'deleted-transcript' WHERE request_id = 'orphan-image'")
             .execute(&pool).await.unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 6);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 7);
         let identity: Vec<(String, String)> = sqlx::query_as(
             "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
         ).fetch_all(&pool).await.unwrap();
@@ -20333,7 +20335,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 6);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 7);
         let retained: (String, String, String) = sqlx::query_as(
             "SELECT status, published_product_id, published_conversation_id
              FROM product_creation_jobs WHERE request_id = 'orphan-text'",

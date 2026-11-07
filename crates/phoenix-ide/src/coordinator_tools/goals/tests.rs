@@ -220,7 +220,7 @@ async fn assert_remote_source_race_refused(operation: Operation, terminalize: bo
         runtime: Arc::clone(&f.runtime),
         operation,
     });
-    let task = tokio::spawn(async move { tool.run(input, &context).await });
+    let task = tokio::spawn(async move { tool.run(input, context).await });
     barrier.wait().await;
     let product = f
         .runtime
