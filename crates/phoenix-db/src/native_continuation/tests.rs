@@ -1,5 +1,12 @@
 use super::*;
-use crate::{workflow::LocalAuthorityResult, ConvState, MessageContent, ProductConversationId};
+use crate::{
+    workflow::{AcceptAuthoritativeTurn, LocalAuthorityResult, WorkflowRepository},
+    ConvState, MessageContent, ProductConversationId,
+};
+use phoenix_core::domain::sm_event::{
+    PreparedDirectTurnDelivery, PreparedDirectTurnPayload, SteerEntry,
+    SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
+};
 use phoenix_core::{
     domain::{
         db_schema::InputOrigin,
@@ -7,6 +14,7 @@ use phoenix_core::{
     },
     llm_language::LlmLanguage,
 };
+use phoenix_workflow::{AcceptedDisposition, ConversationAuthority, PreparedTurn};
 
 const SUMMARY: &str = "generated summary for continuation";
 
@@ -261,6 +269,10 @@ async fn completed_local_continuation_identity_cannot_be_claimed_by_federation()
     assert_eq!(receipt_count, 0);
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the mutation matrix must share one established receipt and replay boundary"
+)]
 #[tokio::test]
 async fn federated_receipt_binds_all_attestation_fields_before_and_after_intent_deletion() {
     let fixture = Fixture::new().await;
@@ -311,7 +323,7 @@ async fn federated_receipt_binds_all_attestation_fields_before_and_after_intent_
                         phoenix_core::domain::close::TranscriptConversationId::parse(
                             "changed-source",
                         )
-                        .unwrap()
+                        .unwrap();
                 }
                 2 => source.message_id = "changed-message".into(),
                 3 => source.tool_use_id = "changed-tool".into(),
@@ -464,18 +476,12 @@ async fn federated_receipt_digest_is_immutable_and_rejects_changed_summary_conte
     );
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the cross-journal invariant requires one identity and one transaction history"
+)]
 #[tokio::test]
 async fn continuation_identity_is_reserved_across_federated_direct_and_steering_journals() {
-    use crate::workflow::{AcceptAuthoritativeTurn, WorkflowRepository};
-    use phoenix_core::domain::{
-        db_schema::InputOrigin,
-        sm_event::{
-            PreparedDirectTurnDelivery, PreparedDirectTurnPayload, SteerEntry,
-            SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
-        },
-    };
-    use phoenix_workflow::{AcceptedDisposition, ConversationAuthority, PreparedTurn};
-
     let fixture = Fixture::new().await;
     let (_, authority) = fixture.federated_authority().await;
     let key = "federated-cross-journal-identity";
@@ -674,6 +680,10 @@ async fn federated_continuation_rechecks_active_authority_and_replays_exact_winn
     );
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the boundary replay checks must reuse one accepted opening identity"
+)]
 #[tokio::test]
 async fn federated_accepted_opening_key_cannot_cross_continuation_boundaries() {
     let fixture = Fixture::new().await;

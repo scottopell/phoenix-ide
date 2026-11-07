@@ -132,7 +132,7 @@ async fn table_data(pool: &SqlitePool) -> Vec<(String, Vec<Vec<String>>)> {
 
 #[tokio::test]
 async fn canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent() {
-    for through in 142..=153 {
+    for through in 142..=154 {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("goal-tools.db");
         let db = Database::open(path.to_str().unwrap()).await.unwrap();
@@ -153,7 +153,7 @@ async fn canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent() {
             crate::migrations::run_pending_migrations(db.pool())
                 .await
                 .unwrap(),
-            153 - through
+            154 - through
         );
         assert_goal_rows(&db, &owner, source.is_some()).await;
         let tail: Vec<i64> = sqlx::query_scalar(
@@ -164,7 +164,7 @@ async fn canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent() {
         .unwrap();
         assert_eq!(
             tail,
-            vec![143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153]
+            vec![143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154]
         );
         let before = snapshot(db.pool()).await;
         assert_eq!(
@@ -297,7 +297,7 @@ async fn real_145_provenance_and_tools_retention_survive_upgrade_delete_and_reop
         crate::migrations::run_pending_migrations(db.pool())
             .await
             .unwrap(),
-        8
+        9
     );
     sqlx::query("INSERT INTO product_creation_initial_execution_receipts(request_id,terminal_kind,failure_reason) VALUES ('joint-create','Completed',NULL)")
         .execute(db.pool()).await.unwrap();

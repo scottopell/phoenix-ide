@@ -1469,9 +1469,8 @@ pub async fn continue_conversation(
     State(state): State<AppState>,
     Json(request): Json<RemoteContinueRequest>,
 ) -> Response {
-    let destination = match state.db.instance_id().await {
-        Ok(id) => id,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    let Ok(destination) = state.db.instance_id().await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     if request.destination_instance_id != destination {
         return federation_error(StatusCode::CONFLICT, "destination instance mismatch");
@@ -1490,14 +1489,11 @@ pub async fn continue_conversation(
             "invalid continuation fields",
         );
     }
-    let first_message_id = match remote_continue_request_key(&request) {
-        Some(id) => id,
-        None => {
-            return federation_error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "continuation opening identity does not match source attestation",
-            )
-        }
+    let Some(first_message_id) = remote_continue_request_key(&request) else {
+        return federation_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "continuation opening identity does not match source attestation",
+        );
     };
     let completion =
         crate::continuation_service::ContinuationApplicationService::new(state.runtime.clone())

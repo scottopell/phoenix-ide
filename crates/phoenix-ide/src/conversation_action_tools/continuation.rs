@@ -65,7 +65,7 @@ impl ContinueConversation {
             .acquire_local_authority_pass()
             .map_err(|()| "Local mutation authority is closed".to_string())?;
         crate::api::federation::remote_continue_conversation(
-            &db,
+            db,
             &peer,
             request.product_conversation_id,
             request.predecessor_transcript_id.0,
@@ -133,7 +133,7 @@ impl RoutedTool for ContinueConversation {
         }
     }
     fn resolution_db(&self) -> &crate::db::Database {
-        &self.0.db()
+        self.0.db()
     }
 
     fn schema_without_instance(&self) -> Value {

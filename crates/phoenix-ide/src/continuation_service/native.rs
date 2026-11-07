@@ -243,7 +243,9 @@ impl ContinuationApplicationService {
         };
         match self.continue_with_admission(request).await {
             FederatedNativeContinueCompletion::Established(result) => {
-                NativeContinueCompletion::Established(result.map(|result| result.into_response()))
+                NativeContinueCompletion::Established(
+                    result.map(FederatedNativeContinueResult::into_response),
+                )
             }
             FederatedNativeContinueCompletion::LocalAuthorityClosed => {
                 NativeContinueCompletion::LocalAuthorityClosed

@@ -3,7 +3,9 @@ use phoenix_core::{
     work_scope::RuntimeRole,
 };
 use phoenix_workflow::ClientTurnKey;
+use sha2::{Digest, Sha256};
 use sqlx::{Connection, Row};
+use std::fmt::Write as _;
 
 use crate::{
     workflow::LocalAuthorityResult, ContinuationDispatchIntent, ContinueOutcome, ConvState,
@@ -272,7 +274,6 @@ impl Database {
             }
 
             let remote_reservation = if let ContinuationAdmission::FederatedPeer { authority, source } = &request.admission {
-                use sha2::{Digest, Sha256};
                 let payload = serde_json::to_vec(&(
                     "federated-continuation-v1",
                     authority.caller_instance_id().to_string(),
@@ -287,7 +288,6 @@ impl Database {
                     request.first_message_id.as_str(),
                     &summary,
                 )).map_err(|error| DbError::Serialization(error.to_string()))?;
-                use std::fmt::Write as _;
 
                 let mut digest = String::with_capacity(64);
                 for byte in Sha256::digest(payload) {
