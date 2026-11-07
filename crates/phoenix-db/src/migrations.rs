@@ -13342,38 +13342,41 @@ mod tests {
         let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
         let pool = db.pool().clone();
         run_through_for_test(&pool, 155).await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let source_product_id = coordinator.product_conversation_id.to_string();
         sqlx::raw_sql(
             "INSERT INTO product_conversations(id,kind,ordinary_lifecycle) VALUES('owner','ordinary','open');
              INSERT INTO conversation_goal_ids(goal_id,objective,owner_id) VALUES('goal','objective','owner');
              INSERT INTO conversation_goal_actors(actor_id,owner_id,kind,host_action_id)
                  VALUES(1,'owner','generated_host','host-action');
              INSERT INTO conversation_goal_history(owner_id,version,goal_id,state,action_id,change_kind,requested_actor_id,applied_actor_id,recorded_at_us)
-                 VALUES('owner',1,'goal','underway','goal-action','create',1,1,100);",
+                 VALUES('owner',1,'goal','underway','goal-action','create',1,1,100);
+             INSERT INTO workflows(workflow_id,profile_kind,profile_version,runtime_acceptance_enabled,external_acceptance_enabled,version,generation,status,snapshot_codec_family,snapshot_codec_version,snapshot_payload,created_at,updated_at)
+                 VALUES(1,'direct_turn',1,0,1,1,0,'Active','direct_turn.snapshot',1,X'01',1,1);",
         )
         .execute(&pool)
         .await
         .unwrap();
-        // A local preparation's source is historical data; the fixture has no running coordinator.
-        let source_trigger: String = sqlx::query_scalar(
-            "SELECT sql FROM sqlite_schema WHERE name='conversation_goal_preparations_source'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        sqlx::query("DROP TRIGGER conversation_goal_preparations_source")
+        sqlx::query("INSERT INTO durable_turns(turn_id,workflow_id,conversation_id,client_turn_key,prepared_fingerprint,prepared_payload,disposition,generation,owns_conversation,origin_kind,canonical_message_id,materialized) VALUES(1,1,?,'migration-turn','migration-fingerprint',X'01','Runtime',0,1,'user_api',NULL,0)")
+            .bind(&coordinator.id)
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::raw_sql(
-            "INSERT INTO conversation_goal_preparations(reference,owner_id,caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,tool_use_id,operation,expected_version,objective)
-                 VALUES(zeroblob(16),'owner','local-transcript','local-product',1,1,'message','tool','create',0,'prepared objective');
-             INSERT INTO conversation_goal_coordinator_receipts(preparation_reference,owner_id,outcome,result_version,recorded_at_us)
-                 VALUES(zeroblob(16),'owner','rejected_busy',0,101);",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::raw_sql(sqlx::AssertSqlSafe(source_trigger))
+        sqlx::query("INSERT INTO messages(message_id,conversation_id,sequence_id,message_type,content,created_at) VALUES('message',?,1,'agent','{}','2026-10-31T00:00:00Z')")
+            .bind(&coordinator.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO conversation_goal_preparations(reference,owner_id,caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,tool_use_id,operation,expected_version,objective) VALUES(zeroblob(16),'owner',?,?,1,1,'message','tool','create',0,'prepared objective')")
+            .bind(&coordinator.id)
+            .bind(&source_product_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO conversation_goal_coordinator_receipts(preparation_reference,owner_id,outcome,result_version,recorded_at_us) VALUES(zeroblob(16),'owner','rejected_busy',0,101)")
             .execute(&pool)
             .await
             .unwrap();

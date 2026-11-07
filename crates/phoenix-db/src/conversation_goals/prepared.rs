@@ -872,7 +872,9 @@ impl Database {
                         }
                     }
                 }
-                state => state,
+                state @ (RemoteCoordinatorGoalClaimState::Replay(_)
+                | RemoteCoordinatorGoalClaimState::Claimed
+                | RemoteCoordinatorGoalClaimState::Expired) => state,
             };
             lookup.rollback().await?;
             Ok::<_, GoalDbError>(state)
