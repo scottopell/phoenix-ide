@@ -14,6 +14,7 @@ use phoenix_core::domain::provider_replay::{
 };
 use phoenix_core::domain::sm_state::{AssistantMessage, ConvState, ToolCall, ToolInput};
 
+#[derive(Clone)]
 struct SelfRound {
     transcript: String,
     owner: ProductConversationId,
@@ -969,7 +970,8 @@ async fn every_existing_goal_disposition_refuses_creation_and_enable_does_not_re
             status(&committed.results[0])["reason"],
             "goal_already_exists"
         );
-        let enable = round
+        let mut enable = round.clone();
+        enable
             .next(
                 &db,
                 "existing-goal-enable",
