@@ -961,14 +961,7 @@ async fn every_existing_goal_disposition_refuses_creation_and_enable_does_not_re
             .await
             .unwrap();
         }
-        let round = SelfRound::admit(
-            &db,
-            transcript,
-            owner,
-            "existing-turn",
-            vec![create(), SelfGoalOperation::EnableAutoContinuation],
-        )
-        .await;
+        let round = SelfRound::admit(&db, transcript, owner, "existing-turn", vec![create()]).await;
         let before = db.conversation_goal(&round.owner).await.unwrap();
         let counts = effect_counts(&db).await;
         let committed = round.commit(&db, true).await.unwrap();
@@ -976,12 +969,22 @@ async fn every_existing_goal_disposition_refuses_creation_and_enable_does_not_re
             status(&committed.results[0])["reason"],
             "goal_already_exists"
         );
+        let enable = round
+            .next(
+                &db,
+                "existing-goal-enable",
+                vec![SelfGoalOperation::EnableAutoContinuation],
+            )
+            .await;
+        assert_eq!(enable.execution, round.execution);
+        let enabled_result = enable.commit(&db, true).await.unwrap();
         assert_eq!(
-            status(&committed.results[1])["status"],
+            status(&enabled_result.results[0])["status"],
             "auto_continuation_enabled"
         );
         assert_eq!(db.conversation_goal(&round.owner).await.unwrap(), before);
         assert!(round.commit(&db, true).await.unwrap().replayed);
+        assert!(enable.commit(&db, true).await.unwrap().replayed);
         let after = effect_counts(&db).await;
         assert_eq!((after.0, after.1, after.2), (counts.0, counts.1, counts.2));
     }
