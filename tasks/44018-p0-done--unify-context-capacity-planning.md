@@ -26,13 +26,17 @@ User approved 2026-10-25 during voice review: ordinary continuation inherits the
 
 2026-10-25 voice review: the user does not select a numeric counting timeout. Check real supported provider routes during implementation and choose a reasonable finite deadline. REQ-LLM-004k retains one remote attempt across the logical planning operation, no retry, and visible local fallback; the numeric two-second proposal in earlier planning/review text is superseded. No new operator setting is implied.
 
-## Current delivery gates
+## Completion and production acceptance
 
 Implementation, recovery/usage UI, real model-switch qualification and exact native launchd129-to131 qualification are complete in source. ADR-147 resolves manual-opening authority wording. The isolated terminal handoff test passes after narrowly scoped orphan cleanup; PTY headroom remains tracked separately in task44019.
 
 Two independent implementation review rounds are complete: round one's two findings were repaired in 3ab36bdc0 and regression-tested; round two reported no actionable findings on that full implementation. See docs/reviews/context-capacity-implementation-review.md for immutable targets and limitations. PR #977 tracks review and hosted checks.
 
-The full UI suite passes 4,100 tests across 186 files (two skipped); production UI build, TypeScript and lint pass. Historical fixture failures from adding migrations130/131 are corrected using immutable historical registry evidence; 185 systemd helper tests pass after the last fixture repair. The final complete ./dev.py check --all and hosted CI remain acceptance gates. Source review is not production acceptance: merge, native activation and supported repair of the two affected conversations remain pending. No production modifications have been made.
+All 20 local validation gates and hosted checks passed. GitHub Codex completed review of cd7edd35e with no findings. PR #977 merged as 3b602a0b6dd7f92a3304b97c475a66b4eafc2113. The deployment reran all 20 gates on that merged commit before building and activating the release.
+
+Native launchd deployment committed on 2026-10-25 at 23:02 UTC, running the exact merged commit and schema131. All 19 prior installed configuration entries were preserved. Both affected conversations regenerated real summaries through the supported API; the Coordinator continued automatically and the user conversation continued with an explicit generated-summary source. Each has one completed handoff receipt and one successor, preserving model, role and product identity. Both successors completed ordinary provider requests and tool rounds with the full 128,000-token output reservation. The accepted openings are typed Continuation content containing the exact generated English summary; the deployed renderer presents readable escaped context rather than base64. Original transcript rows were not rewritten.
+
+This operational acceptance covers the two incident conversations on their existing Codex-auth routes; it does not claim live qualification of every provider or lossless semantic summarization. The PTY investigation remains task44019, local native-launcher bootstrap remains task44020, and misleading status warnings during live preparation are captured in task44021.
 
 ## Implementation history (chronological)
 
