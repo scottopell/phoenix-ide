@@ -821,7 +821,10 @@ async fn native_continue_requires_tool_call_identity_and_refuses_non_coordinator
         .await
         .unwrap();
     let product = native_continue_predecessor(&db, &predecessor.id, "retained summary").await;
-    let tool = continuation::ContinueConversation(runtime.clone());
+    let tool = crate::coordinator_tools::instance::RouteTool::boxed(
+        continuation::ContinueConversation(runtime.clone()),
+    );
+    assert!(!tool.clearable());
     let input = native_continue_input(&product, &predecessor.id);
     let missing_identity = tool
         .run(input.clone(), native_context_without_source_identity(&gc))
@@ -862,9 +865,83 @@ async fn native_continue_adapter_is_a_pending_sink_after_local_authority_closes(
 
     let (runtime, _, gc) = native_runtime().await;
     runtime.fence_fatal_local_authority().await;
-    let tool = continuation::ContinueConversation(runtime);
+    let tool = crate::coordinator_tools::instance::RouteTool::boxed(
+        continuation::ContinueConversation(runtime),
+    );
     let future = tool.run(json!({"unexpected":"input"}), native_context(&gc));
     assert!(future.now_or_never().is_none());
+}
+
+#[tokio::test]
+async fn native_continue_local_routes_preserve_exact_legacy_error_output() {
+    let (runtime, _, gc) = native_runtime().await;
+    let tool = crate::coordinator_tools::instance::RouteTool::boxed(
+        continuation::ContinueConversation(runtime),
+    );
+    for instance in [None, Some(Value::Null), Some(json!("local"))] {
+        let mut input = json!({"unexpected":"input"});
+        if let Some(instance) = instance {
+            input["instance"] = instance;
+        }
+        let error =
+            serde_json::from_value::<continuation::ContinueRequest>(json!({"unexpected":"input"}))
+                .unwrap_err()
+                .to_string();
+        let actual = tool.run(input, native_context(&gc)).await;
+        assert!(matches!(actual, ToolOutput::Error { .. }));
+        assert_eq!(
+            actual.output(),
+            json!({"status":"error", "error":error}).to_string()
+        );
+    }
+    for instance in [None, Some(Value::Null), Some(json!("local"))] {
+        let mut input = json!({"product_conversation_id":"product", "predecessor_transcript_id":"predecessor", "summary_message_id":"summary"});
+        if let Some(instance) = instance {
+            input["instance"] = instance;
+        }
+        let actual = tool
+            .run(input, native_context_without_source_identity(&gc))
+            .await;
+        assert_eq!(
+            actual.output(),
+            json!({"status":"error", "error":"Trusted source tool-call identity unavailable"})
+                .to_string()
+        );
+    }
+    let remote = tool
+        .run(
+            json!({"instance":"unlisted-peer", "unexpected":"input"}),
+            native_context(&gc),
+        )
+        .await;
+    assert!(matches!(remote, ToolOutput::Error { .. }));
+    assert!(!remote.output().contains("\"status\":\"error\""));
+}
+
+#[tokio::test]
+async fn native_continue_preclosed_authority_sinks_every_wrapper_failure() {
+    use futures::FutureExt;
+    let (runtime, _, gc) = native_runtime().await;
+    runtime.fence_fatal_local_authority().await;
+    let tool = crate::coordinator_tools::instance::RouteTool::boxed(
+        continuation::ContinueConversation(runtime),
+    );
+    let ordinary = "not-a-coordinator";
+    for (input, context) in [
+        (json!({"instance":42}), native_context(&gc)),
+        (
+            json!({"instance":"local", "unexpected":true}),
+            native_context(&gc),
+        ),
+        (json!({"instance":"missing-peer"}), native_context(&gc)),
+        (
+            json!({"instance":"missing-peer", "unexpected":true}),
+            native_context(&gc),
+        ),
+        (json!({"instance":"local"}), native_context(ordinary)),
+    ] {
+        assert!(tool.run(input, context).now_or_never().is_none());
+    }
 }
 
 #[tokio::test]
@@ -916,7 +993,9 @@ async fn native_continue_replays_completed_opening_without_replacing_its_message
         .unwrap()
         .is_none());
 
-    let tool = continuation::ContinueConversation(runtime.clone());
+    let tool = crate::coordinator_tools::instance::RouteTool::boxed(
+        continuation::ContinueConversation(runtime.clone()),
+    );
     let replay = tool
         .run(
             native_continue_input(&product, &predecessor.id),

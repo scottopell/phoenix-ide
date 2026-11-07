@@ -8,6 +8,7 @@ use phoenix_core::domain::sm_state::ConvState;
 use phoenix_db::workflow::LocalAuthorityResult;
 use phoenix_db::{
     ContinueOutcome, CoordinatorContinuationOpening, CurrentCoordinatorContinuationRequest,
+    FederatedCoordinatorContinuationRequest,
 };
 use phoenix_workflow::ClientTurnKey;
 
@@ -25,8 +26,58 @@ pub(crate) struct NativeContinueRequest {
     pub source_gate_wait: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
+#[derive(Debug)]
+pub(crate) struct FederatedNativeContinueRequest {
+    pub source: phoenix_db::FederatedContinuationSource,
+    pub product_conversation_id: ProductConversationId,
+    pub predecessor_transcript_id: String,
+    pub summary_message_id: String,
+    pub first_message_id: ClientTurnKey,
+}
+
+enum NativeContinueAdmission {
+    CurrentCoordinator {
+        source_transcript_id: String,
+        #[cfg(test)]
+        source_gate_wait: Option<tokio::sync::oneshot::Sender<()>>,
+    },
+    FederatedPeer {
+        authority: phoenix_db::FederationSendAuthority,
+        source: phoenix_db::FederatedContinuationSource,
+    },
+}
+
+struct NativeContinueOwnedRequest {
+    admission: NativeContinueAdmission,
+    product_conversation_id: ProductConversationId,
+    predecessor_transcript_id: String,
+    summary_message_id: String,
+    first_message_id: ClientTurnKey,
+}
+
+#[derive(Debug)]
+pub(crate) enum NativeContinueError {
+    Message(String),
+    Database(phoenix_db::DbError),
+}
+
+impl From<String> for NativeContinueError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl std::fmt::Display for NativeContinueError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Message(message) => formatter.write_str(message),
+            Self::Database(error) => error.fmt(formatter),
+        }
+    }
+}
+
 pub(crate) enum NativeContinueCompletion {
-    Established(Result<ContinueConversationResponse, String>),
+    Established(Result<ContinueConversationResponse, NativeContinueError>),
     LocalAuthorityClosed,
 }
 
@@ -34,7 +85,7 @@ pub(crate) enum NativeContinueCompletion {
 impl NativeContinueCompletion {
     fn established(self) -> Result<ContinueConversationResponse, String> {
         match self {
-            Self::Established(result) => result,
+            Self::Established(result) => result.map_err(|error| error.to_string()),
             Self::LocalAuthorityClosed => panic!("ordinary reply requires open local authority"),
         }
     }
@@ -71,6 +122,42 @@ impl ContinuationApplicationService {
         &self,
         request: NativeContinueRequest,
     ) -> NativeContinueCompletion {
+        let request = NativeContinueOwnedRequest {
+            admission: NativeContinueAdmission::CurrentCoordinator {
+                source_transcript_id: request.source_transcript_id,
+                #[cfg(test)]
+                source_gate_wait: request.source_gate_wait,
+            },
+            product_conversation_id: request.product_conversation_id,
+            predecessor_transcript_id: request.predecessor_transcript_id,
+            summary_message_id: request.summary_message_id,
+            first_message_id: request.first_message_id,
+        };
+        self.continue_with_admission(request).await
+    }
+
+    pub(crate) async fn continue_from_federated_coordinator(
+        &self,
+        request: FederatedNativeContinueRequest,
+        authority: phoenix_db::FederationSendAuthority,
+    ) -> NativeContinueCompletion {
+        let request = NativeContinueOwnedRequest {
+            admission: NativeContinueAdmission::FederatedPeer {
+                authority,
+                source: request.source,
+            },
+            product_conversation_id: request.product_conversation_id,
+            predecessor_transcript_id: request.predecessor_transcript_id,
+            summary_message_id: request.summary_message_id,
+            first_message_id: request.first_message_id,
+        };
+        self.continue_with_admission(request).await
+    }
+
+    async fn continue_with_admission(
+        &self,
+        request: NativeContinueOwnedRequest,
+    ) -> NativeContinueCompletion {
         let runtime = self.runtime.clone();
         let result = tokio::spawn(async move {
             Self::new(runtime)
@@ -78,7 +165,7 @@ impl ContinuationApplicationService {
                 .await
         })
         .await
-        .unwrap_or_else(|error| Err(error.to_string()));
+        .unwrap_or_else(|error| Err(NativeContinueError::Message(error.to_string())));
         if self.runtime.local_authority_is_closed() {
             NativeContinueCompletion::LocalAuthorityClosed
         } else {
@@ -92,33 +179,45 @@ impl ContinuationApplicationService {
     )]
     async fn continue_from_coordinator_owned(
         &self,
-        request: NativeContinueRequest,
-    ) -> Result<ContinueConversationResponse, String> {
+        mut request: NativeContinueOwnedRequest,
+    ) -> Result<ContinueConversationResponse, NativeContinueError> {
         let mut owner = self.runtime.acquire_local_authority_pass().map_err(|()| {
             "runtime admission closed after fatal local authority loss".to_string()
         })?;
         let db = self.runtime.db();
-        db.require_current_coordinator_transcript(&request.source_transcript_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let source = db
-            .get_conversation(&request.source_transcript_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        if source.product_conversation_id == request.product_conversation_id {
-            return Err("native Continue cannot rotate its Coordinator source".to_string());
-        }
-        #[cfg(test)]
-        if let Some(waiting) = request.source_gate_wait {
-            let _ = waiting.send(());
-        }
-        let _source_gate = self
-            .runtime
-            .lock_product_message_admission(source.product_conversation_id.as_str())
-            .await;
-        db.require_current_coordinator_transcript(&request.source_transcript_id)
-            .await
-            .map_err(|error| error.to_string())?;
+        let _source_gate = match &mut request.admission {
+            NativeContinueAdmission::CurrentCoordinator {
+                source_transcript_id,
+                #[cfg(test)]
+                source_gate_wait,
+            } => {
+                db.require_current_coordinator_transcript(source_transcript_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let source = db
+                    .get_conversation(source_transcript_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if source.product_conversation_id == request.product_conversation_id {
+                    return Err("native Continue cannot rotate its Coordinator source"
+                        .to_string()
+                        .into());
+                }
+                #[cfg(test)]
+                if let Some(waiting) = source_gate_wait.take() {
+                    let _ = waiting.send(());
+                }
+                let gate = self
+                    .runtime
+                    .lock_product_message_admission(source.product_conversation_id.as_str())
+                    .await;
+                db.require_current_coordinator_transcript(source_transcript_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Some(gate)
+            }
+            NativeContinueAdmission::FederatedPeer { .. } => None,
+        };
         let _target_gate = self
             .runtime
             .lock_product_message_admission(request.product_conversation_id.as_str())
@@ -134,11 +233,13 @@ impl ContinuationApplicationService {
             .await
             .map_err(|error| error.to_string())?;
         if predecessor.product_conversation_id != request.product_conversation_id {
-            return Err("predecessor does not belong to the requested product".to_string());
+            return Err("predecessor does not belong to the requested product"
+                .to_string()
+                .into());
         }
         if predecessor.continued_in_conv_id.is_none() {
             let ConvState::ContextExhausted { summary, .. } = &predecessor.state else {
-                return Err("predecessor is not context-exhausted".to_string());
+                return Err("predecessor is not context-exhausted".to_string().into());
             };
             let review = self
                 .runtime
@@ -152,31 +253,49 @@ impl ContinuationApplicationService {
                 return Err(format!(
                     "generated handoff exceeds successor capacity: {:?}",
                     review.source
-                ));
+                )
+                .into());
             }
         }
         let pass = ReservationPass {
             owner: Some(owner.reborrow()),
         };
-        let (outcome, opening) = pass
-            .classify(
-                db.continue_from_current_coordinator(CurrentCoordinatorContinuationRequest {
-                    source_transcript_id: &request.source_transcript_id,
+        let reservation = match &request.admission {
+            NativeContinueAdmission::FederatedPeer { authority, source } => {
+                db.continue_from_federated_coordinator(FederatedCoordinatorContinuationRequest {
+                    authority,
+                    source,
                     product_conversation_id: &request.product_conversation_id,
                     predecessor_transcript_id: &request.predecessor_transcript_id,
                     summary_message_id: &request.summary_message_id,
-                    first_message_id: request.first_message_id,
+                    first_message_id: request.first_message_id.clone(),
                 })
-                .await,
-            )?
-            .map_err(|error| error.to_string())?;
+                .await
+            }
+            NativeContinueAdmission::CurrentCoordinator {
+                source_transcript_id,
+                ..
+            } => {
+                db.continue_from_current_coordinator(CurrentCoordinatorContinuationRequest {
+                    source_transcript_id,
+                    product_conversation_id: &request.product_conversation_id,
+                    predecessor_transcript_id: &request.predecessor_transcript_id,
+                    summary_message_id: &request.summary_message_id,
+                    first_message_id: request.first_message_id.clone(),
+                })
+                .await
+            }
+        };
+        let (outcome, opening) = pass
+            .classify(reservation)?
+            .map_err(NativeContinueError::Database)?;
         let (successor, existed) = match outcome {
             ContinueOutcome::Created(successor) => (successor, false),
             ContinueOutcome::AlreadyContinued(successor) => (successor, true),
             ContinueOutcome::ParentNotContextExhausted { state_variant } => {
-                return Err(format!(
-                    "predecessor is not context-exhausted: {state_variant}"
-                ));
+                return Err(
+                    format!("predecessor is not context-exhausted: {state_variant}").into(),
+                );
             }
         };
         let (status, error) = match opening {
@@ -192,7 +311,8 @@ impl ContinuationApplicationService {
                     return Err(format!(
                         "generated handoff exceeds reserved successor capacity: {:?}",
                         review.source
-                    ));
+                    )
+                    .into());
                 }
                 let (status, error) =
                     super::manual::dispatch_continuation_handoff(self, intent).await;
@@ -205,7 +325,9 @@ impl ContinuationApplicationService {
             }
         };
         if self.runtime.local_authority_is_closed() {
-            return Err("runtime admission closed after fatal local authority loss".to_string());
+            return Err("runtime admission closed after fatal local authority loss"
+                .to_string()
+                .into());
         }
         Ok(ContinueConversationResponse {
             conversation_id: successor.id,

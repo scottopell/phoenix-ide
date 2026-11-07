@@ -14,7 +14,10 @@ use crate::send_chat_service::{
 
 mod manual;
 mod native;
-pub(crate) use native::{NativeContinueCompletion, NativeContinueRequest};
+pub(crate) use native::{
+    FederatedNativeContinueRequest, NativeContinueCompletion, NativeContinueError,
+    NativeContinueRequest,
+};
 
 #[cfg(test)]
 pub(crate) use manual::{automatic_retry_phase_for_turn_state, continuation_message_id};
