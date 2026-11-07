@@ -67,7 +67,7 @@ CompactEventsGlobal.storyName = 'compact-events-global';
 
 const reminderBase = getProductConversationScenario('mobile-open');
 const reminderOwner = reminderBase.snapshot?.product_conversation_id;
-if (!reminderOwner) throw new Error('Reminders fixture requires a product conversation owner');
+if (!reminderOwner) throw new globalThis.Error('Reminders fixture requires a product conversation owner');
 const reminderRows = [
   { id: 'due-fixture', product_conversation_id: reminderOwner, text: 'Review the stale incident report', due_at_us: 1782907200000000, timezone: 'America/Los_Angeles', revision: 1, created_at_us: 1782900000000000, state: { kind: 'due', occurred_at_us: 1782907200000000 } },
   { id: 'upcoming-fixture', product_conversation_id: reminderOwner, text: 'Check the release candidate', due_at_us: 1782993600000000, timezone: 'America/Los_Angeles', revision: 4, created_at_us: 1782900000000000, state: { kind: 'scheduled' } },

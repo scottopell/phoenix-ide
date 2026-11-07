@@ -74,6 +74,7 @@ runSurfaceCapture({
       }));
       assert.ok(conflictEvidence.requests > beforeConflictRequests, '409 must refresh the changed server record');
       assert.equal(conflictEvidence.mutations, 1, '409 must not replay the rejected mutation');
+      await page.getByRole('alert').filter({ hasText: 'This reminder changed. Review its current time before trying again.' }).scrollIntoViewIfNeeded();
       await page.screenshot({ path: path.join(outDir, `${id}--${viewport.name}--mutation-conflict.png`), fullPage: false });
       await page.getByRole('button', { name: 'Cancel reminder' }).click();
       await page.getByText('Cancelled').waitFor({ state: 'visible' });
