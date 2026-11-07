@@ -77,12 +77,14 @@ runSurfaceCapture({
       await page.screenshot({ path: path.join(outDir, `${id}--${viewport.name}--mutation-conflict.png`), fullPage: false });
       await page.getByRole('button', { name: 'Cancel reminder' }).click();
       await page.getByText('Cancelled').waitFor({ state: 'visible' });
+      await page.waitForFunction(() => document.documentElement.dataset['productConversationFixtureReminderServedRevision'] === '6');
       const retriedMutation = await page.evaluate(() => ({
         revision: Number(document.documentElement.dataset['productConversationFixtureLastReminderRevision']),
         mutations: Number(document.documentElement.dataset['productConversationFixtureReminderMutations']),
         outcome: document.documentElement.dataset['productConversationFixtureReminderMutation'],
+        acceptedRevision: Number(document.documentElement.dataset['productConversationFixtureReminderAcceptedRevision']),
       }));
-      assert.deepEqual(retriedMutation, { revision: 5, mutations: 2, outcome: 'accepted' }, 'explicit user retry must use the fresh revision');
+      assert.deepEqual(retriedMutation, { revision: 5, mutations: 2, outcome: 'accepted', acceptedRevision: 6 }, 'explicit user retry must use the fresh revision and advance it');
       journey.push('loaded → focus refresh failure → keyboard retry → 409 alert → server row refetched without replay → explicit retry at revision 5 succeeds');
     }
 

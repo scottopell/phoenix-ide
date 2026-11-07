@@ -253,7 +253,9 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       }
       hasLoadedReminders = true;
       record('ReminderState', 'loaded');
-      return Response.json(conflictRows ?? scenario.reminderFixture.reminders);
+      const rows = conflictRows ?? scenario.reminderFixture.reminders;
+      record('ReminderServedRevision', rows.find((row) => row.id === 'upcoming-fixture')?.revision ?? 0);
+      return Response.json(rows);
     }
     if (scenario.reminderFixture?.rejectMutation && requestUrl.pathname.startsWith(`${reminderPath}/`) && init?.method === 'POST') {
       reminderMutationCount += 1;
@@ -273,9 +275,10 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
         return Response.json({ kind: 'revision_conflict', error: 'The reminder changed in this fixture.', current: latest }, { status: 409 });
       }
       conflictRows = conflictRows.map((row) => row.id === latest.id
-        ? { ...row, state: { kind: 'cancelled', cancelled_at_us: 1783000000000000 } }
+        ? { ...row, revision: row.revision + 1, state: { kind: 'cancelled', cancelled_at_us: 1783000000000000 } }
         : row);
       record('ReminderMutation', 'accepted');
+      record('ReminderAcceptedRevision', conflictRows.find((row) => row.id === latest.id)?.revision ?? 0);
       return Response.json({ reminder: conflictRows.find((row) => row.id === latest.id) });
     }
     if (url.endsWith('/api/telemetry/conversation-open') || url.endsWith('/api/telemetry/product-conversation-open')) {
