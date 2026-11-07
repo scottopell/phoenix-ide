@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use super::instance::RoutedTool as _;
 use crate::api::GoalCommandService;
 use crate::runtime::RuntimeManager;
 use crate::tools::{Tool, ToolContext, ToolOutput};
@@ -22,6 +23,7 @@ enum Operation {
 
 struct GoalTool {
     service: GoalCommandService,
+    runtime: Arc<RuntimeManager>,
     operation: Operation,
 }
 
@@ -40,10 +42,11 @@ pub(super) fn tools(runtime: &Arc<RuntimeManager>) -> Vec<Arc<dyn Tool>> {
         [Operation::Prepare, Operation::Apply]
             .into_iter()
             .map(|operation| {
-                Arc::new(GoalTool {
+                super::instance::RouteTool::boxed(GoalTool {
                     service: service.clone(),
+                    runtime: Arc::clone(runtime),
                     operation,
-                }) as Arc<dyn Tool>
+                })
             }),
     );
     tools
@@ -104,12 +107,38 @@ fn text_schema() -> Value {
 }
 
 #[async_trait]
-impl Tool for GoalTool {
-    fn name(&self) -> &str {
+impl super::instance::RoutedTool for GoalTool {
+    fn name(&self) -> &'static str {
         match self.operation {
             Operation::Prepare => "prepare_goal",
             Operation::Apply => "apply_goal",
         }
+    }
+    fn clearable(&self) -> bool {
+        true
+    }
+    fn resolution_db(&self) -> &crate::db::Database {
+        self.runtime.db()
+    }
+    async fn authorize(&self, ctx: &ToolContext) -> Result<(), String> {
+        self.service
+            .authorize_coordinator(&ctx.conversation_id)
+            .await
+            .map_err(|error| self.refusal(error))
+    }
+    fn validate_before_peer_lookup(&self, input: &Value) -> Result<(), String> {
+        match self.operation {
+            Operation::Prepare => {
+                let args: PrepareInput = serde_json::from_value(input.clone())
+                    .map_err(|error| self.bad_input(&error))?;
+                target(&args.target)?;
+            }
+            Operation::Apply => {
+                let _: ApplyInput = serde_json::from_value(input.clone())
+                    .map_err(|error| self.bad_input(&error))?;
+            }
+        }
+        Ok(())
     }
     fn description(&self) -> String {
         match self.operation {
@@ -117,7 +146,7 @@ impl Tool for GoalTool {
             Operation::Apply => "Apply or reconcile a previously prepared Goal action by its server-issued action_reference. Coordinator only. Never accepts target, version, authority, or replacement content. Exact retries replay the immutable accepted or refused receipt, including across restart/Coordinator continuation. New create/replace requires the target's persisted autoContinue preference to be explicitly enabled; refusal does not enable it or dispatch work. On conflict or busy refusal do NOT blindly prepare another action; read Goal/history and reconsider explicitly. Does not dispatch or schedule work, Start/Stop, or reactivate Suspended Goals.",
         }.to_owned()
     }
-    fn input_schema(&self) -> Value {
+    fn schema_without_instance(&self) -> Value {
         match self.operation {
             Operation::Apply => {
                 json!({"type":"object","properties":{"action_reference":{"type":"string","format":"uuid","description":"Copy the opaque reference returned by prepare_goal; do not generate one."}},"required":["action_reference"],"additionalProperties":false})
@@ -129,8 +158,13 @@ impl Tool for GoalTool {
             }
         }
     }
-    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
-        match self.execute(input, &ctx).await {
+    async fn run_routed(
+        &self,
+        input: Value,
+        route: super::instance::Route<crate::api::federation::ResolvedPeer>,
+        ctx: ToolContext,
+    ) -> ToolOutput {
+        match self.execute(input, &ctx, route).await {
             Ok(output) => output,
             Err(error) => ToolOutput::error(error),
         }
@@ -178,7 +212,9 @@ impl super::instance::RoutedTool for ReadGoalTool {
 
 impl ReadGoalTool {
     fn bad_input(error: &serde_json::Error) -> String {
-        format!("Invalid read_goal input: {error}. Read the tool schema; authority and versions are server-derived.")
+        format!(
+            "Invalid read_goal input: {error}. Read the tool schema; authority and versions are server-derived."
+        )
     }
 
     fn refusal(error: crate::api::handlers::AppError) -> String {
@@ -194,7 +230,9 @@ impl ReadGoalTool {
             | AppError::TypedInternal { .. }
             | AppError::UnprocessableEntity(_)) => super::app_error_message(other),
         };
-        format!("read_goal refused: {message}. Verify current Coordinator authority and an ordinary open @conv target.")
+        format!(
+            "read_goal refused: {message}. Verify current Coordinator authority and an ordinary open @conv target."
+        )
     }
 
     async fn read(
@@ -260,6 +298,14 @@ impl GoalTool {
     }
 
     fn refusal(&self, error: crate::api::handlers::AppError) -> String {
+        Self::refusal_message_with_name(error, self.name())
+    }
+
+    fn refusal_message(error: crate::api::handlers::AppError) -> String {
+        Self::refusal_message_with_name(error, "Goal operation")
+    }
+
+    fn refusal_message_with_name(error: crate::api::handlers::AppError, name: &str) -> String {
         use crate::api::handlers::AppError;
         let message = match error {
             AppError::Conflict(response) => response.error,
@@ -273,13 +319,16 @@ impl GoalTool {
             | AppError::UnprocessableEntity(_)) => super::app_error_message(other),
         };
         format!(
-            "{} refused: {}. Verify current Coordinator authority and an ordinary open @conv target. Read Goal/history before explicitly reconsidering; do not blind-retry with a fresh preparation.",
-            self.name(),
-            message
+            "{name} refused: {message}. Verify current Coordinator authority and an ordinary open @conv target. Read Goal/history before explicitly reconsidering; do not blind-retry with a fresh preparation."
         )
     }
 
-    async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, String> {
+    async fn execute(
+        &self,
+        input: Value,
+        ctx: &ToolContext,
+        route: super::instance::Route<crate::api::federation::ResolvedPeer>,
+    ) -> Result<ToolOutput, String> {
         self.service
             .authorize_coordinator(&ctx.conversation_id)
             .await
@@ -293,28 +342,146 @@ impl GoalTool {
                     "Missing server-bound assistant/tool invocation; cannot prepare a Goal action",
                 )?;
                 let turn_id = ctx.direct_turn_id().ok_or("Goal preparation requires server-bound durable turn provenance; caller-supplied execution IDs are refused")?;
-                let action = self
-                    .service
-                    .prepare_coordinator(
-                        &ctx.conversation_id,
-                        &source,
-                        &owner,
-                        args.action,
-                        turn_id,
-                    )
-                    .await
-                    .map_err(|error| self.refusal(error))?;
-                json!({"action_reference":action.reference,"target":args.target,"observed_goal_id":action.observed_goal_id,"expected_version":action.expected_version,"action":action.intent,"next_tool":"apply_goal","note":"Frozen observation only; Goal unchanged. Review before applying. Replacement creates a new Goal ID and preserves history."})
+                let (reference, observed, version, intent, expires_at_us) = match route {
+                    super::instance::Route::Local => {
+                        let action = self
+                            .service
+                            .prepare_coordinator(
+                                &ctx.conversation_id,
+                                &source,
+                                &owner,
+                                args.action,
+                                turn_id,
+                            )
+                            .await
+                            .map_err(|error| self.refusal(error))?;
+                        (
+                            action.reference,
+                            action.observed_goal_id,
+                            action.expected_version,
+                            action.intent,
+                            None,
+                        )
+                    }
+                    super::instance::Route::Remote(peer) => {
+                        let runtime = Arc::clone(&self.runtime);
+                        let service = self.service.clone();
+                        let coordinator = ctx.conversation_id.clone();
+                        let result = tokio::spawn(async move {
+                            let _authority = runtime
+                                .acquire_local_authority_pass()
+                                .map_err(|()| "local authority is closed".to_owned())?;
+                            let (_product_admission, source) = service
+                                .admit_remote_source(&coordinator, &source, turn_id, "prepare_goal")
+                                .await
+                                .map_err(GoalTool::refusal_message)?;
+                            service
+                                .authorize_coordinator(&coordinator)
+                                .await
+                                .map_err(GoalTool::refusal_message)?;
+                            let action = crate::api::federation::prepare_remote_goal(
+                                runtime.db(),
+                                &peer,
+                                owner,
+                                args.action,
+                                source,
+                            )
+                            .await
+                            .map_err(|error| {
+                                format!("prepare_goal remote preparation failed: {error}")
+                            })?;
+                            service
+                                .authorize_coordinator(&coordinator)
+                                .await
+                                .map_err(GoalTool::refusal_message)?;
+                            Ok::<_, String>((
+                                action.action_reference,
+                                action.observed_goal_id,
+                                action.expected_version,
+                                action.intent,
+                                Some(action.expires_at_us),
+                            ))
+                        })
+                        .await
+                        .map_err(|error| {
+                            format!("prepare_goal remote operation did not settle: {error}")
+                        })??;
+                        result
+                    }
+                };
+                let mut output = json!({"action_reference":reference,"target":args.target,"observed_goal_id":observed,"expected_version":version,"action":intent,"next_tool":"apply_goal","note":"Frozen observation only; Goal unchanged. Review before applying. Replacement creates a new Goal ID and preserves history."});
+                if let Some(expires_at_us) = expires_at_us {
+                    output["expires_at_us"] = json!(expires_at_us);
+                }
+                output
             }
             Operation::Apply => {
                 let args: ApplyInput =
                     serde_json::from_value(input).map_err(|error| self.bad_input(&error))?;
-                let receipt = self
-                    .service
-                    .apply_prepared(&ctx.conversation_id, args.action_reference)
-                    .await
-                    .map_err(|error| self.refusal(error))?;
-                let accepted = matches!(receipt.result, GoalUserResult::Accepted { .. });
+                let (accepted, receipt) = match route {
+                    super::instance::Route::Local => {
+                        let receipt = self
+                            .service
+                            .apply_prepared(&ctx.conversation_id, args.action_reference)
+                            .await
+                            .map_err(|error| self.refusal(error))?;
+                        (
+                            matches!(receipt.result, GoalUserResult::Accepted { .. }),
+                            json!(receipt),
+                        )
+                    }
+                    super::instance::Route::Remote(peer) => {
+                        let source_call = ctx.source_tool_call().ok_or("Missing server-bound assistant/tool invocation; cannot apply a Goal action")?;
+                        let turn = ctx.direct_turn_id().ok_or(
+                            "Goal application requires server-bound durable turn provenance",
+                        )?;
+                        let runtime = Arc::clone(&self.runtime);
+                        let service = self.service.clone();
+                        let coordinator = ctx.conversation_id.clone();
+                        let action_reference = args.action_reference;
+                        tokio::spawn(async move {
+                            let _authority = runtime
+                                .acquire_local_authority_pass()
+                                .map_err(|()| "local authority is closed".to_owned())?;
+                            let (_product_admission, _source) = service
+                                .admit_remote_source(&coordinator, &source_call, turn, "apply_goal")
+                                .await
+                                .map_err(GoalTool::refusal_message)?;
+                            service
+                                .authorize_coordinator(&coordinator)
+                                .await
+                                .map_err(GoalTool::refusal_message)?;
+                            let response = crate::api::federation::apply_remote_goal(
+                                runtime.db(),
+                                &peer,
+                                action_reference,
+                            )
+                            .await
+                            .map_err(|error| {
+                                format!("apply_goal remote application failed: {error}")
+                            })?;
+                            service
+                                .authorize_coordinator(&coordinator)
+                                .await
+                                .map_err(GoalTool::refusal_message)?;
+                            let accepted = matches!(
+                                response.result,
+                                crate::api::federation::RemoteGoalResult::Accepted { .. }
+                            );
+                            Ok::<_, String>((
+                                accepted,
+                                json!({
+                                    "request_id":response.request_id,
+                                    "result":response.result
+                                }),
+                            ))
+                        })
+                        .await
+                        .map_err(|error| {
+                            format!("apply_goal remote operation did not settle: {error}")
+                        })??
+                    }
+                };
                 let value = json!({"action_reference":args.action_reference,"receipt":receipt,"next_action":if accepted {"No dispatch performed. Use read_goal to inspect history."} else {"Retained refusal: same reference will return the same refusal. Read current Goal/history and explicitly reconsider; do not automatically reprepare."}});
                 return if accepted {
                     Ok(ToolOutput::success(

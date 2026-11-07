@@ -188,6 +188,892 @@ async fn preparation_count(db: &Database) -> i64 {
         .unwrap()
 }
 
+async fn remote_source(
+    db: &Database,
+    key: &str,
+) -> (
+    crate::FederationSendAuthority,
+    phoenix_core::domain::conversation_goal::RemoteGoalAgentSource,
+    ProductConversationId,
+) {
+    use phoenix_core::domain::conversation_goal::{
+        GoalAgentSource, GoalExecution, RemoteGoalAgentSource,
+    };
+    use phoenix_core::domain::instance_identity::{FederationCredentialVerifier, InstanceId};
+
+    let (transcript, source_owner, source_call, turn) = coordinator_source(db, key).await;
+    let turn_row_id = i64::try_from(turn.0).unwrap();
+    let owner = ordinary(db, &format!("{key}-owner")).await.1;
+    let instance_id = InstanceId::new();
+    let verifier = FederationCredentialVerifier::from_bearer(key.as_bytes());
+    db.replace_federation_enrollment(instance_id, &"remote goal peer".parse().unwrap(), &verifier)
+        .await
+        .unwrap();
+    let authority = crate::FederationSendAuthority::new(instance_id, verifier);
+    let workflow_id: i64 =
+        sqlx::query_scalar("SELECT workflow_id FROM durable_turns WHERE turn_id=?")
+            .bind(turn_row_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let source = RemoteGoalAgentSource {
+        instance_id,
+        source: GoalAgentSource {
+            product_conversation_id: source_owner,
+            transcript_id: GoalText::parse(transcript).unwrap(),
+            execution: GoalExecution::parse(workflow_id, turn_row_id).unwrap(),
+            message_id: GoalText::parse(source_call.message_id).unwrap(),
+            tool_use_id: GoalText::parse(source_call.tool_use_id).unwrap(),
+        },
+    };
+    (authority, source, owner)
+}
+
+#[tokio::test]
+async fn local_busy_refusals_use_live_transcript_and_replay_after_continuation() {
+    let db = fixture().await;
+    let (caller, _, source_call, turn) = coordinator_source(&db, "local-busy-live").await;
+    let (sampled, owner) = ordinary(&db, "local-busy-live-owner").await;
+    let action = db
+        .prepare_coordinator_goal_action(
+            &caller,
+            &owner,
+            &source_call,
+            turn,
+            create_intent("local busy objective"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    let command = action.command(Uuid::new_v4()).unwrap();
+    db.update_conversation_state(
+        &sampled,
+        &crate::ConvState::ContextExhausted {
+            summary: "continue before local busy refusal".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let crate::ContinueOutcome::Created(successor) =
+        db.continue_conversation(&sampled).await.unwrap()
+    else {
+        panic!("expected a successor transcript");
+    };
+    assert_ne!(successor.id, sampled);
+    let mut expected_counts = counts(&db).await;
+    expected_counts.6 += 1;
+    let owner_receipt = db
+        .reject_busy_user_goal_command(
+            &command,
+            &sampled,
+            || Ok(at()),
+            || panic!("an owner busy refusal retains authority"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    let coordinator_receipt = db
+        .apply_coordinator_goal_command(
+            &caller,
+            action.source.source(),
+            &command,
+            &sampled,
+            true,
+            || Ok(at()),
+            || panic!("a Coordinator busy refusal retains authority"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    for receipt in [&owner_receipt, &coordinator_receipt] {
+        assert!(matches!(
+            &receipt.result,
+            GoalUserResult::Rejected {
+                reason: GoalUserRefusal::Busy,
+                ..
+            }
+        ));
+    }
+    assert_eq!(
+        db.apply_user_goal_command(
+            &command,
+            &sampled,
+            || panic!("an owner busy receipt must replay"),
+            || panic!("an owner replay retains authority"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap(),
+        owner_receipt
+    );
+    assert_eq!(
+        db.apply_coordinator_goal_command(
+            &caller,
+            action.source.source(),
+            &command,
+            &sampled,
+            false,
+            || panic!("a Coordinator busy receipt must replay"),
+            || panic!("a Coordinator replay retains authority"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap(),
+        coordinator_receipt
+    );
+    assert_eq!(counts(&db).await, expected_counts);
+    assert!(db.conversation_goal(&owner).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn disabled_auto_continue_remains_an_ordinary_error_for_local_commands() {
+    let db = fixture().await;
+    let (caller, _, source_call, turn) = coordinator_source(&db, "local-disabled-create").await;
+    let (transcript, owner) = ordinary(&db, "local-disabled-create-owner").await;
+    let action = db
+        .prepare_coordinator_goal_action(
+            &caller,
+            &owner,
+            &source_call,
+            turn,
+            create_intent("local disabled create"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    let command = action.command(Uuid::new_v4()).unwrap();
+    db.set_auto_continue_on_context_exhaustion(
+        &owner,
+        crate::AutoContinueOnContextExhaustion::Disabled,
+    )
+    .await
+    .unwrap();
+    let before = counts(&db).await;
+    let owner_result = db
+        .apply_user_goal_command(
+            &command,
+            &transcript,
+            || Ok(at()),
+            || panic!("a local rollback retains authority"),
+        )
+        .await
+        .established()
+        .unwrap();
+    let coordinator_result = db
+        .apply_coordinator_goal_command(
+            &caller,
+            action.source.source(),
+            &command,
+            &transcript,
+            false,
+            || Ok(at()),
+            || panic!("a local Coordinator rollback retains authority"),
+        )
+        .await
+        .established()
+        .unwrap();
+    for result in [owner_result, coordinator_result] {
+        assert!(matches!(result, Err(GoalDbError::AutoContinueDisabled)));
+    }
+    assert_eq!(counts(&db).await, before);
+    assert!(db
+        .retained_coordinator_goal_command(&caller, &command)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(db.conversation_goal(&owner).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn remote_preparation_replay_is_idempotent_and_changed_payload_conflicts() {
+    let db = fixture().await;
+    let (authority, source, owner) = remote_source(&db, "remote-preparation-replay").await;
+    let first = db
+        .prepare_remote_coordinator_goal_action(
+            &authority,
+            &source,
+            &owner,
+            create_intent("remote objective"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    let expires_at_us: i64 = sqlx::query_scalar(
+        "SELECT expires_at_us FROM conversation_goal_preparations WHERE reference=?",
+    )
+    .bind(first.reference.as_bytes().as_slice())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let now = chrono::Utc::now().timestamp_micros();
+    assert!((now + 899_000_000..=now + 901_000_000).contains(&expires_at_us));
+    let replay = db
+        .prepare_remote_coordinator_goal_action(
+            &authority,
+            &source,
+            &owner,
+            create_intent("remote objective"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay, first);
+    assert!(matches!(
+        db.prepare_remote_coordinator_goal_action(
+            &authority,
+            &source,
+            &owner,
+            create_intent("changed objective")
+        )
+        .await
+        .established()
+        .unwrap(),
+        Err(GoalDbError::RetryConflict)
+    ));
+    assert_eq!(preparation_count(&db).await, 1);
+}
+
+#[tokio::test]
+async fn remote_preparation_reference_is_scoped_to_current_enrollment_peer() {
+    use phoenix_core::domain::instance_identity::{FederationCredentialVerifier, InstanceId};
+
+    let db = fixture().await;
+    let (authority, source, owner) = remote_source(&db, "remote-preparation-scope").await;
+    let prepared = db
+        .prepare_remote_coordinator_goal_action(
+            &authority,
+            &source,
+            &owner,
+            create_intent("scoped objective"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    let other_id = InstanceId::new();
+    let other_verifier = FederationCredentialVerifier::from_bearer(b"other remote peer");
+    db.replace_federation_enrollment(
+        other_id,
+        &"other remote peer".parse().unwrap(),
+        &other_verifier,
+    )
+    .await
+    .unwrap();
+    let other = crate::FederationSendAuthority::new(other_id, other_verifier);
+    assert!(db
+        .read_remote_coordinator_goal_preparation(&other, prepared.reference)
+        .await
+        .is_err());
+
+    let replacement = FederationCredentialVerifier::from_bearer(b"replacement credential");
+    db.replace_federation_enrollment(
+        source.instance_id,
+        &"replacement peer".parse().unwrap(),
+        &replacement,
+    )
+    .await
+    .unwrap();
+    let replaced = crate::FederationSendAuthority::new(source.instance_id, replacement);
+    assert!(db
+        .read_remote_coordinator_goal_preparation(&replaced, prepared.reference)
+        .await
+        .is_err());
+    assert!(db
+        .apply_remote_coordinator_goal_command(
+            &replaced,
+            prepared.reference,
+            false,
+            || panic!("replacement must not apply old preparation"),
+            || panic!("unexpected authority loss"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .is_err());
+    let replacement_preparation = db
+        .prepare_remote_coordinator_goal_action(
+            &replaced,
+            &source,
+            &owner,
+            create_intent("new enrollment objective"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert_ne!(replacement_preparation.reference, prepared.reference);
+    assert_eq!(preparation_count(&db).await, 2);
+    db.revoke_federation_enrollment(source.instance_id)
+        .await
+        .unwrap();
+    assert!(db
+        .read_remote_coordinator_goal_preparation(&replaced, replacement_preparation.reference)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn expired_remote_preparation_cannot_be_applied_before_a_receipt() {
+    let db = fixture().await;
+    let (authority, source, owner) = remote_source(&db, "remote-expiry").await;
+    let prepared = db
+        .prepare_remote_coordinator_goal_action(
+            &authority,
+            &source,
+            &owner,
+            create_intent("expiry"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    let expired = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO conversation_goal_preparations(
+           reference,owner_id,source_kind,enrollment_id,expires_at_us,
+           caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,tool_use_id,
+           operation,expected_version,observed_goal_id,objective,disposition,reason)
+         SELECT ?,owner_id,source_kind,enrollment_id,0,
+           caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,'expired-call',
+           operation,expected_version,observed_goal_id,objective,disposition,reason
+         FROM conversation_goal_preparations WHERE reference=?",
+    )
+    .bind(expired.as_bytes().as_slice())
+    .bind(prepared.reference.as_bytes().as_slice())
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let result = db
+        .apply_remote_coordinator_goal_command(
+            &authority,
+            expired,
+            false,
+            || panic!("expired preparation must not invoke clock"),
+            || panic!("unexpected authority loss"),
+        )
+        .await
+        .established()
+        .unwrap();
+    assert!(matches!(result, Err(GoalDbError::TargetChanged)));
+    let receipts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_goal_coordinator_receipts WHERE preparation_reference=?",
+    )
+    .bind(expired.as_bytes().as_slice())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(receipts, 0);
+}
+
+#[tokio::test]
+async fn expired_remote_preparation_replays_retained_receipt() {
+    let db = fixture().await;
+    let (authority, source, owner) = remote_source(&db, "remote-expired-receipt-replay").await;
+    let prepared = db
+        .prepare_remote_coordinator_goal_action(
+            &authority,
+            &source,
+            &owner,
+            create_intent("expired retained refusal"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    let expired = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO conversation_goal_preparations(
+           reference,owner_id,source_kind,enrollment_id,expires_at_us,
+           caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,tool_use_id,
+           operation,expected_version,observed_goal_id,objective,disposition,reason,apply_state)
+         SELECT ?,owner_id,source_kind,enrollment_id,0,
+           caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,'expired-receipt-call',
+           operation,expected_version,observed_goal_id,objective,disposition,reason,'claimed'
+         FROM conversation_goal_preparations WHERE reference=?",
+    )
+    .bind(expired.as_bytes().as_slice())
+    .bind(prepared.reference.as_bytes().as_slice())
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let recorded_at = at();
+    sqlx::query(
+        "INSERT INTO conversation_goal_coordinator_receipts(
+           preparation_reference,owner_id,outcome,result_version,recorded_at_us)
+         VALUES (?,?,'rejected_version',0,?)",
+    )
+    .bind(expired.as_bytes().as_slice())
+    .bind(owner.as_str())
+    .bind(recorded_at.get())
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let replay = db
+        .apply_remote_coordinator_goal_command(
+            &authority,
+            expired,
+            false,
+            || panic!("retained receipt must be replayed before expiry admission"),
+            || panic!("unexpected authority loss"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay.request_id, expired);
+    assert_eq!(
+        replay.result,
+        GoalUserResult::Rejected {
+            reason: GoalUserRefusal::Version,
+            observed_version: GoalVersion::INITIAL,
+            recorded_at,
+        }
+    );
+    for classified in [
+        db.claim_remote_coordinator_goal_preparation(
+            &authority,
+            expired,
+            RemoteGoalClaimCommitCut::None,
+        )
+        .await,
+        db.classify_remote_coordinator_goal_claim(
+            &authority,
+            expired,
+            GoalDbError::Invalid("injected lost claim commit acknowledgement"),
+        )
+        .await,
+    ] {
+        match classified.unwrap() {
+            RemoteCoordinatorGoalClaim::Replay(receipt) => assert_eq!(receipt, replay),
+            _ => panic!("retained receipt must win over a claimed or expired preparation"),
+        }
+    }
+    let history = db
+        .conversation_goal_history(&owner, GoalVersion::INITIAL)
+        .await
+        .unwrap();
+    assert!(history.is_empty());
+}
+
+async fn remote_unclassified_claim_closes_receiptless_retry(
+    claim_commit: RemoteGoalClaimCommitCut,
+) {
+    let db = fixture().await;
+    let (authority, source, owner) = remote_source(&db, "remote-claimed-unclassified").await;
+    let prepared = db
+        .prepare_remote_coordinator_goal_action(
+            &authority,
+            &source,
+            &owner,
+            create_intent("claimed without receipt"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+
+    let before = counts(&db).await;
+    let first_authority_losses = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let first_authority_losses_for_callback = std::sync::Arc::clone(&first_authority_losses);
+    let first = db
+        .apply_remote_coordinator_goal_command_with_claim_commit(
+            &authority,
+            prepared.reference,
+            false,
+            || {
+                assert!(matches!(claim_commit, RemoteGoalClaimCommitCut::None));
+                Err(GoalDbError::Invalid("injected post-claim clock failure"))
+            },
+            move || {
+                first_authority_losses_for_callback
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+            claim_commit,
+        )
+        .await;
+    assert!(matches!(
+        first,
+        crate::workflow::LocalAuthorityResult::DurableFactUnclassified
+    ));
+    assert_eq!(
+        first_authority_losses.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    let apply_state: String = sqlx::query_scalar(
+        "SELECT apply_state FROM conversation_goal_preparations WHERE reference=?",
+    )
+    .bind(prepared.reference.as_bytes().as_slice())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(apply_state, "claimed");
+    let receipts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_goal_coordinator_receipts WHERE preparation_reference=?",
+    )
+    .bind(prepared.reference.as_bytes().as_slice())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(receipts, 0);
+
+    let retry_authority_losses = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let retry_authority_losses_for_callback = std::sync::Arc::clone(&retry_authority_losses);
+    let retry = db
+        .apply_remote_coordinator_goal_command(
+            &authority,
+            prepared.reference,
+            false,
+            || panic!("claimed preparation must not execute again"),
+            move || {
+                retry_authority_losses_for_callback
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await;
+    assert!(matches!(
+        retry,
+        crate::workflow::LocalAuthorityResult::DurableFactUnclassified
+    ));
+    assert_eq!(
+        retry_authority_losses.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        first_authority_losses.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(counts(&db).await, before);
+    assert!(db.conversation_goal(&owner).await.unwrap().is_none());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_goal_coordinator_receipts")
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn remote_post_claim_failure_is_unclassified_and_closes_receiptless_retry() {
+    remote_unclassified_claim_closes_receiptless_retry(RemoteGoalClaimCommitCut::None).await;
+}
+
+#[tokio::test]
+async fn remote_claim_lost_commit_ack_is_unclassified_and_closes_receiptless_retry() {
+    remote_unclassified_claim_closes_receiptless_retry(
+        RemoteGoalClaimCommitCut::LostAcknowledgement,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn rolled_back_remote_claim_is_proven_prepared_and_can_be_applied_once() {
+    let db = fixture().await;
+    let (authority, source, owner) = remote_source(&db, "remote-claim-rollback").await;
+    let prepared = db
+        .prepare_remote_coordinator_goal_action(
+            &authority,
+            &source,
+            &owner,
+            create_intent("claim rollback"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    let before = counts(&db).await;
+    let result = db
+        .apply_remote_coordinator_goal_command_with_claim_commit(
+            &authority,
+            prepared.reference,
+            false,
+            || panic!("a rolled-back claim must not execute"),
+            || panic!("a freshly proven prepared action retains authority"),
+            RemoteGoalClaimCommitCut::RolledBack,
+        )
+        .await
+        .established()
+        .unwrap();
+    assert!(matches!(
+        result,
+        Err(GoalDbError::Sqlx(sqlx::Error::WorkerCrashed))
+    ));
+    let state: String = sqlx::query_scalar(
+        "SELECT apply_state FROM conversation_goal_preparations WHERE reference=?",
+    )
+    .bind(prepared.reference.as_bytes().as_slice())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(state, "prepared");
+    assert_eq!(counts(&db).await, before);
+    assert!(db
+        .retained_remote_coordinator_goal_command(&authority, prepared.reference)
+        .await
+        .unwrap()
+        .is_none());
+    let receipt = db
+        .apply_remote_coordinator_goal_command(
+            &authority,
+            prepared.reference,
+            false,
+            || Ok(at()),
+            || panic!("retry after a proven rollback retains authority"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(receipt.result, GoalUserResult::Accepted { .. }));
+    assert_eq!(
+        db.conversation_goal_history(&owner, GoalVersion::INITIAL)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn unreadable_remote_claim_commit_classification_is_unclassified() {
+    let db = fixture().await;
+    let (authority, source, owner) = remote_source(&db, "remote-claim-unreadable").await;
+    let prepared = db
+        .prepare_remote_coordinator_goal_action(
+            &authority,
+            &source,
+            &owner,
+            create_intent("unreadable claim"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        db.claim_remote_coordinator_goal_preparation(
+            &authority,
+            prepared.reference,
+            RemoteGoalClaimCommitCut::None,
+        )
+        .await
+        .unwrap(),
+        RemoteCoordinatorGoalClaim::Claimed
+    ));
+    db.pool().close().await;
+    assert!(matches!(
+        db.classify_remote_coordinator_goal_claim(
+            &authority,
+            prepared.reference,
+            GoalDbError::Invalid("injected lost claim commit acknowledgement"),
+        )
+        .await
+        .unwrap(),
+        RemoteCoordinatorGoalClaim::Unclassified
+    ));
+}
+
+#[tokio::test]
+async fn remote_disabled_auto_continue_is_a_terminal_replayable_rejection() {
+    let db = fixture().await;
+    let (authority, source, owner) = remote_source(&db, "remote-disabled-auto-continue").await;
+    let prepared = db
+        .prepare_remote_coordinator_goal_action(
+            &authority,
+            &source,
+            &owner,
+            create_intent("disabled auto-continue"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    db.set_auto_continue_on_context_exhaustion(
+        &owner,
+        crate::AutoContinueOnContextExhaustion::Disabled,
+    )
+    .await
+    .unwrap();
+    let before = counts(&db).await;
+    let recorded_at = at();
+    let receipt = db
+        .apply_remote_coordinator_goal_command(
+            &authority,
+            prepared.reference,
+            false,
+            || Ok(recorded_at),
+            || panic!("a deterministic create refusal must retain authority"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        receipt.result,
+        GoalUserResult::Rejected {
+            reason: GoalUserRefusal::Transition,
+            observed_version: GoalVersion::INITIAL,
+            recorded_at,
+        }
+    );
+    db.set_auto_continue_on_context_exhaustion(
+        &owner,
+        crate::AutoContinueOnContextExhaustion::Enabled,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.apply_remote_coordinator_goal_command(
+            &authority,
+            prepared.reference,
+            false,
+            || panic!("a rejected claim must never execute again"),
+            || panic!("replaying a rejection must retain authority"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap(),
+        receipt
+    );
+    assert_eq!(counts(&db).await, before);
+    assert!(db.conversation_goal(&owner).await.unwrap().is_none());
+    assert_eq!(
+        db.retained_remote_coordinator_goal_command(&authority, prepared.reference)
+            .await
+            .unwrap(),
+        Some(receipt)
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_goal_coordinator_receipts")
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn remote_apply_retains_receipt_and_history_decodes_remote_coordinator() {
+    let db = fixture().await;
+    let (authority, source, owner) = remote_source(&db, "remote-apply-replay").await;
+    let prepared = db
+        .prepare_remote_coordinator_goal_action(
+            &authority,
+            &source,
+            &owner,
+            create_intent("remote applied objective"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert!(db
+        .retained_remote_coordinator_goal_command(&authority, prepared.reference)
+        .await
+        .unwrap()
+        .is_none());
+    let first = db
+        .apply_remote_coordinator_goal_command(
+            &authority,
+            prepared.reference,
+            false,
+            || Ok(at()),
+            || panic!("unexpected authority loss"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(&first.result, GoalUserResult::Accepted { .. }));
+    match db
+        .claim_remote_coordinator_goal_preparation(
+            &authority,
+            prepared.reference,
+            RemoteGoalClaimCommitCut::None,
+        )
+        .await
+        .unwrap()
+    {
+        RemoteCoordinatorGoalClaim::Replay(receipt) => assert_eq!(receipt, first),
+        _ => panic!("a receipt committed after an empty preflight must win claim arbitration"),
+    }
+    assert_eq!(
+        db.retained_remote_coordinator_goal_command(&authority, prepared.reference)
+            .await
+            .unwrap(),
+        Some(first.clone())
+    );
+    let replay = db
+        .apply_remote_coordinator_goal_command(
+            &authority,
+            prepared.reference,
+            false,
+            || panic!("retained receipt must bypass clock"),
+            || panic!("unexpected authority loss"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay, first);
+    let history = db
+        .conversation_goal_history(&owner, GoalVersion::INITIAL)
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert!(matches!(
+        &history[0].mutation().attribution.requested_by,
+        phoenix_core::domain::conversation_goal::GoalActor::RemoteCoordinator(remote) if remote == &source
+    ));
+    assert!(matches!(
+        &history[0].mutation().attribution.applied_by,
+        phoenix_core::domain::conversation_goal::GoalActor::RemoteCoordinator(remote) if remote == &source
+    ));
+    use phoenix_core::domain::instance_identity::FederationCredentialVerifier;
+    let replacement = FederationCredentialVerifier::from_bearer(b"receipt replacement credential");
+    db.replace_federation_enrollment(
+        source.instance_id,
+        &"receipt replacement peer".parse().unwrap(),
+        &replacement,
+    )
+    .await
+    .unwrap();
+    let replacement_authority =
+        crate::FederationSendAuthority::new(source.instance_id, replacement);
+    assert!(db
+        .retained_remote_coordinator_goal_command(&authority, prepared.reference)
+        .await
+        .is_err());
+    assert!(db
+        .retained_remote_coordinator_goal_command(&replacement_authority, prepared.reference)
+        .await
+        .is_err());
+    db.revoke_federation_enrollment(source.instance_id)
+        .await
+        .unwrap();
+    assert!(db
+        .retained_remote_coordinator_goal_command(&replacement_authority, prepared.reference)
+        .await
+        .is_err());
+    let retained_receipts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_goal_coordinator_receipts WHERE preparation_reference=?",
+    )
+    .bind(prepared.reference.as_bytes().as_slice())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(retained_receipts, 1);
+}
+
 #[tokio::test]
 async fn prepare_accepts_current_in_flight_prepare_goal_without_agent_message() {
     let db = fixture().await;
@@ -216,9 +1102,12 @@ async fn prepare_accepts_current_in_flight_prepare_goal_without_agent_message() 
         .expect("preparation authority classified")
         .unwrap();
 
-    assert_eq!(prepared.source.message_id.as_str(), source_call.message_id);
     assert_eq!(
-        prepared.source.tool_use_id.as_str(),
+        prepared.source.source().message_id.as_str(),
+        source_call.message_id
+    );
+    assert_eq!(
+        prepared.source.source().tool_use_id.as_str(),
         source_call.tool_use_id
     );
     assert_eq!(preparation_count(&db).await, 1);
@@ -323,6 +1212,7 @@ async fn goal_preparation_migration_follows_conversation_tool_migrations() {
             (152, "goal_preparation_inflight_source".into()),
             (153, "close_writer_observations".into()),
             (155, "ordinary_self_goal_admission".into()),
+            (156, "remote_coordinator_goals".into())
         ]
     );
 }
@@ -352,14 +1242,23 @@ async fn prepare_retains_exact_source_and_payload_without_mutating_or_dispatchin
     assert_eq!(action.owner, owner);
     assert_eq!(action.expected_version, GoalVersion::INITIAL);
     assert_eq!(action.observed_goal_id, None);
-    assert_eq!(action.source.product_conversation_id, source_product);
-    assert_eq!(action.source.transcript_id.as_str(), caller);
     assert_eq!(
-        action.source.execution.turn_id(),
+        action.source.source().product_conversation_id,
+        source_product
+    );
+    assert_eq!(action.source.source().transcript_id.as_str(), caller);
+    assert_eq!(
+        action.source.source().execution.turn_id(),
         i64::try_from(turn.0).unwrap()
     );
-    assert_eq!(action.source.message_id.as_str(), source_call.message_id);
-    assert_eq!(action.source.tool_use_id.as_str(), source_call.tool_use_id);
+    assert_eq!(
+        action.source.source().message_id.as_str(),
+        source_call.message_id
+    );
+    assert_eq!(
+        action.source.source().tool_use_id.as_str(),
+        source_call.tool_use_id
+    );
     assert_eq!(preparation_count(&db).await, 1);
     assert_eq!(counts(&db).await, before);
     assert_eq!(
@@ -560,7 +1459,7 @@ async fn prepared_command_observes_version_cas_and_replays_retained_refusal() {
     let receipt = db
         .apply_coordinator_goal_command(
             &caller,
-            &action.source,
+            action.source.source(),
             &command,
             &transcript,
             false,
@@ -582,7 +1481,7 @@ async fn prepared_command_observes_version_cas_and_replays_retained_refusal() {
     let retry = db
         .apply_coordinator_goal_command(
             &caller,
-            &action.source,
+            action.source.source(),
             &command,
             &transcript,
             false,
@@ -628,7 +1527,7 @@ async fn prepared_command_accepts_real_coordinator_source_and_replays_without_mu
     let receipt = db
         .apply_coordinator_goal_command(
             &caller,
-            &action.source,
+            action.source.source(),
             &command,
             &transcript,
             false,
@@ -646,12 +1545,12 @@ async fn prepared_command_accepts_real_coordinator_source_and_replays_without_mu
         .unwrap();
     assert_eq!(history.len(), 1);
     assert!(matches!(&history[0].mutation().attribution.requested_by,
-        phoenix_core::domain::conversation_goal::GoalActor::Coordinator(source) if source == &action.source));
+        phoenix_core::domain::conversation_goal::GoalActor::Coordinator(source) if source == action.source.source()));
     let before = counts(&db).await;
     let retry = db
         .apply_coordinator_goal_command(
             &caller,
-            &action.source,
+            action.source.source(),
             &command,
             &transcript,
             false,
@@ -753,7 +1652,7 @@ async fn coordinator_payload_and_source_are_checked_before_busy_and_receipt_repl
     assert!(matches!(
         db.apply_coordinator_goal_command(
             &caller,
-            &action.source,
+            action.source.source(),
             &poisoned,
             &transcript,
             true,
@@ -765,7 +1664,7 @@ async fn coordinator_payload_and_source_are_checked_before_busy_and_receipt_repl
         .unwrap(),
         Err(GoalDbError::RetryConflict)
     ));
-    let mut wrong_source = action.source.clone();
+    let mut wrong_source = action.source.source().clone();
     wrong_source.tool_use_id = GoalText::parse("other-tool-use").unwrap();
     assert!(matches!(
         db.apply_coordinator_goal_command(
@@ -793,7 +1692,7 @@ async fn coordinator_payload_and_source_are_checked_before_busy_and_receipt_repl
     let receipt = db
         .apply_coordinator_goal_command(
             &caller,
-            &action.source,
+            action.source.source(),
             &command,
             &transcript,
             false,
@@ -815,7 +1714,7 @@ async fn coordinator_payload_and_source_are_checked_before_busy_and_receipt_repl
     assert!(matches!(
         db.apply_coordinator_goal_command(
             &caller,
-            &action.source,
+            action.source.source(),
             &poisoned,
             &transcript,
             false,
@@ -894,7 +1793,7 @@ async fn preparation_retains_source_locators_after_message_deletion_and_owner_ca
     let command = prepared.command(Uuid::new_v4()).unwrap();
     db.apply_coordinator_goal_command(
         &caller,
-        &prepared.source,
+        prepared.source.source(),
         &command,
         &transcript,
         false,

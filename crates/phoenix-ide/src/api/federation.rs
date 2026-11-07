@@ -13,9 +13,10 @@ use phoenix_core::domain::instance_identity::{
 };
 use phoenix_core::domain::{
     close::TranscriptConversationId,
-    conversation_goal::{GoalHistoryEntry, GoalVersion},
+    conversation_goal::{GoalHistoryEntry, GoalSnapshot, GoalVersion},
     product_conversation::ProductConversationId,
 };
+use phoenix_db::conversation_goals::prepared::GoalPreparationIntent;
 use phoenix_db::conversation_goals::{
     CoordinatorGoalWaitRequest, CoordinatorGoalWaitStatus, GoalDbError,
 };
@@ -1143,6 +1144,444 @@ impl RemoteGoalWaitRequest {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictGoalExecutionFields {
+    workflow_id: i64,
+    turn_id: i64,
+}
+
+struct StrictGoalExecution(phoenix_core::domain::conversation_goal::GoalExecution);
+
+impl<'de> Deserialize<'de> for StrictGoalExecution {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let fields = StrictGoalExecutionFields::deserialize(deserializer)?;
+        phoenix_core::domain::conversation_goal::GoalExecution::parse(
+            fields.workflow_id,
+            fields.turn_id,
+        )
+        .map(Self)
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictGoalAgentSource {
+    product_conversation_id: ProductConversationId,
+    transcript_id: phoenix_core::domain::conversation_goal::GoalText,
+    execution: StrictGoalExecution,
+    message_id: phoenix_core::domain::conversation_goal::GoalText,
+    tool_use_id: phoenix_core::domain::conversation_goal::GoalText,
+}
+
+impl From<StrictGoalAgentSource> for phoenix_core::domain::conversation_goal::GoalAgentSource {
+    fn from(source: StrictGoalAgentSource) -> Self {
+        Self {
+            product_conversation_id: source.product_conversation_id,
+            transcript_id: source.transcript_id,
+            execution: source.execution.0,
+            message_id: source.message_id,
+            tool_use_id: source.tool_use_id,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictRemoteGoalAgentSource {
+    instance_id: InstanceId,
+    source: StrictGoalAgentSource,
+}
+
+impl From<StrictRemoteGoalAgentSource>
+    for phoenix_core::domain::conversation_goal::RemoteGoalAgentSource
+{
+    fn from(source: StrictRemoteGoalAgentSource) -> Self {
+        Self {
+            instance_id: source.instance_id,
+            source: source.source.into(),
+        }
+    }
+}
+
+fn deserialize_strict_goal_source<'de, D>(
+    deserializer: D,
+) -> Result<phoenix_core::domain::conversation_goal::GoalAgentSource, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    StrictGoalAgentSource::deserialize(deserializer).map(Into::into)
+}
+
+fn deserialize_strict_remote_goal_source<'de, D>(
+    deserializer: D,
+) -> Result<phoenix_core::domain::conversation_goal::RemoteGoalAgentSource, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    StrictRemoteGoalAgentSource::deserialize(deserializer).map(Into::into)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RemotePrepareGoalRequest {
+    pub caller_instance_id: InstanceId,
+    pub destination_instance_id: InstanceId,
+    pub target: ProductConversationId,
+    pub intent: GoalPreparationIntent,
+    #[serde(deserialize_with = "deserialize_strict_goal_source")]
+    pub source: phoenix_core::domain::conversation_goal::GoalAgentSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RemotePrepareGoalResponse {
+    pub caller_instance_id: InstanceId,
+    pub destination_instance_id: InstanceId,
+    pub target: ProductConversationId,
+    pub intent: GoalPreparationIntent,
+    #[serde(deserialize_with = "deserialize_strict_remote_goal_source")]
+    pub source: phoenix_core::domain::conversation_goal::RemoteGoalAgentSource,
+    pub action_reference: uuid::Uuid,
+    pub expected_version: GoalVersion,
+    pub observed_goal_id: Option<phoenix_core::domain::conversation_goal::GoalId>,
+    pub expires_at_us: phoenix_core::domain::conversation_goal::GoalTimestampUs,
+}
+
+impl RemotePrepareGoalResponse {
+    pub(crate) fn verify(&self, request: &RemotePrepareGoalRequest) -> Result<(), String> {
+        let observation_matches_intent = match &self.intent {
+            GoalPreparationIntent::Create { .. } => {
+                self.observed_goal_id.is_none() && self.expected_version == GoalVersion::INITIAL
+            }
+            GoalPreparationIntent::Replace { .. } | GoalPreparationIntent::State { .. } => {
+                self.observed_goal_id.is_some() && self.expected_version > GoalVersion::INITIAL
+            }
+        };
+        if self.caller_instance_id != request.caller_instance_id
+            || self.destination_instance_id != request.destination_instance_id
+            || self.target != request.target
+            || self.intent != request.intent
+            || self.source.instance_id != request.caller_instance_id
+            || self.source.source != request.source
+            || self.action_reference.is_nil()
+            || self.expires_at_us.get() <= 0
+            || !observation_matches_intent
+        {
+            return Err(
+                "remote goal preparation changed identity, target, payload or observation".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RemoteApplyGoalRequest {
+    pub caller_instance_id: InstanceId,
+    pub destination_instance_id: InstanceId,
+    pub action_reference: uuid::Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum RemoteGoalResult {
+    Accepted {
+        #[serde(deserialize_with = "deserialize_present_option")]
+        previous: Option<Box<GoalSnapshot>>,
+        entry: Box<GoalHistoryEntry>,
+    },
+    Rejected {
+        reason: String,
+        observed_version: GoalVersion,
+        recorded_at: phoenix_core::domain::conversation_goal::GoalTimestampUs,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RemoteApplyGoalResponse {
+    pub caller_instance_id: InstanceId,
+    pub destination_instance_id: InstanceId,
+    pub action_reference: uuid::Uuid,
+    pub target: ProductConversationId,
+    pub source: phoenix_core::domain::conversation_goal::RemoteGoalAgentSource,
+    pub intent: GoalPreparationIntent,
+    pub expected_version: GoalVersion,
+    pub observed_goal_id: Option<phoenix_core::domain::conversation_goal::GoalId>,
+    pub request_id: uuid::Uuid,
+    pub result: RemoteGoalResult,
+}
+
+impl RemoteApplyGoalResponse {
+    fn from_receipt(
+        caller: InstanceId,
+        destination: InstanceId,
+        reference: uuid::Uuid,
+        prepared: phoenix_db::conversation_goals::prepared::PreparedGoalAction,
+        previous: Option<GoalSnapshot>,
+        receipt: phoenix_db::conversation_goals::user_commands::GoalUserReceipt,
+    ) -> Result<Self, Response> {
+        use phoenix_core::domain::conversation_goal::GoalPreparationSource;
+        use phoenix_db::conversation_goals::user_commands::GoalUserResult;
+        let GoalPreparationSource::Remote(source) = prepared.source else {
+            return Err(federation_error(
+                StatusCode::CONFLICT,
+                "non-remote preparation",
+            ));
+        };
+        let result = match receipt.result {
+            GoalUserResult::Accepted { entry } => RemoteGoalResult::Accepted {
+                previous: previous.map(Box::new),
+                entry,
+            },
+            GoalUserResult::Rejected {
+                reason,
+                observed_version,
+                recorded_at,
+            } => RemoteGoalResult::Rejected {
+                reason: serde_json::to_value(reason)
+                    .expect("refusal serializes")
+                    .as_str()
+                    .expect("refusal is string")
+                    .to_owned(),
+                observed_version,
+                recorded_at,
+            },
+        };
+        Ok(Self {
+            caller_instance_id: caller,
+            destination_instance_id: destination,
+            action_reference: reference,
+            target: prepared.owner,
+            source,
+            intent: prepared.intent,
+            expected_version: prepared.expected_version,
+            observed_goal_id: prepared.observed_goal_id,
+            request_id: receipt.request_id,
+            result,
+        })
+    }
+
+    pub(crate) fn verify(&self, request: &RemoteApplyGoalRequest) -> Result<(), String> {
+        if self.caller_instance_id != request.caller_instance_id
+            || self.destination_instance_id != request.destination_instance_id
+            || self.action_reference != request.action_reference
+            || self.request_id != request.action_reference
+            || self.source.instance_id != request.caller_instance_id
+        {
+            return Err("remote goal apply identity/reference mismatch".into());
+        }
+        match &self.result {
+            RemoteGoalResult::Accepted { previous, entry } => {
+                let mutation = entry.mutation();
+                let transition_matches = mutation
+                    .advance(previous.as_deref())
+                    .is_ok_and(|current| &current == entry.snapshot());
+                if entry.snapshot().owner() != &self.target
+                    || previous
+                        .as_deref()
+                        .is_some_and(|snapshot| snapshot.owner() != &self.target)
+                    || mutation.owner != self.target
+                    || mutation.expected_version != self.expected_version
+                    || !transition_matches
+                    || mutation.attribution.requested_by
+                        != phoenix_core::domain::conversation_goal::GoalActor::RemoteCoordinator(
+                            self.source.clone(),
+                        )
+                    || mutation.attribution.applied_by
+                        != phoenix_core::domain::conversation_goal::GoalActor::RemoteCoordinator(
+                            self.source.clone(),
+                        )
+                    || !goal_intent_matches_change(
+                        &self.intent,
+                        self.observed_goal_id.as_ref(),
+                        &mutation.change,
+                    )
+                {
+                    return Err("remote goal apply target/payload mismatch".into());
+                }
+            }
+            RemoteGoalResult::Rejected { reason, .. }
+                if !matches!(reason.as_str(), "version" | "busy" | "transition") =>
+            {
+                return Err("remote goal apply refusal mismatch".into());
+            }
+            RemoteGoalResult::Rejected { .. } => {}
+        }
+        Ok(())
+    }
+}
+
+fn goal_intent_matches_change(
+    intent: &GoalPreparationIntent,
+    observed: Option<&phoenix_core::domain::conversation_goal::GoalId>,
+    change: &phoenix_core::domain::conversation_goal::GoalChange,
+) -> bool {
+    use phoenix_core::domain::conversation_goal::GoalChange;
+    match (intent, change) {
+        (
+            GoalPreparationIntent::Create { objective },
+            GoalChange::Create {
+                objective: actual, ..
+            },
+        ) => observed.is_none() && objective == actual,
+        (
+            GoalPreparationIntent::Replace { objective },
+            GoalChange::Create {
+                objective: actual, ..
+            },
+        ) => observed.is_some() && objective == actual,
+        (
+            GoalPreparationIntent::State { disposition },
+            GoalChange::SetDisposition {
+                goal_id,
+                disposition: actual,
+            },
+        ) => {
+            observed == Some(goal_id)
+                && &phoenix_core::domain::conversation_goal::GoalDisposition::from(
+                    disposition.clone(),
+                ) == actual
+        }
+        _ => false,
+    }
+}
+
+pub async fn prepare_goal(
+    peer: PeerAuthenticated,
+    State(state): State<AppState>,
+    Json(request): Json<RemotePrepareGoalRequest>,
+) -> Response {
+    if state.runtime.local_authority_is_closed() {
+        return std::future::pending().await;
+    }
+    let destination = match state.db.instance_id().await {
+        Ok(id) => id,
+        Err(error) => {
+            return peer_authority_response(
+                &state.runtime,
+                super::product_conversations::db_to_app(error).into_response(),
+            )
+            .await;
+        }
+    };
+    if request.destination_instance_id != destination
+        || request.caller_instance_id != peer.caller_instance_id
+    {
+        return peer_authority_response(
+            &state.runtime,
+            federation_error(StatusCode::CONFLICT, "peer goal identity mismatch"),
+        )
+        .await;
+    }
+    let source = phoenix_core::domain::conversation_goal::RemoteGoalAgentSource {
+        instance_id: peer.caller_instance_id,
+        source: request.source,
+    };
+    let runtime = state.runtime.clone();
+    let operation = tokio::spawn(async move {
+        let service = crate::api::goal_commands::GoalCommandService::new(runtime.clone());
+        let result = service
+            .prepare_remote(
+                &peer.send_authority,
+                &source,
+                &request.target,
+                request.intent.clone(),
+            )
+            .await;
+        peer_authority_response(
+            &runtime,
+            match result {
+                Ok(action) => match action
+                    .expires_at_us()
+                    .and_then(|value| {
+                        phoenix_core::domain::conversation_goal::GoalTimestampUs::parse(value).ok()
+                    })
+                    .filter(|value| value.get() > 0)
+                {
+                    Some(expires_at_us) => Json(RemotePrepareGoalResponse {
+                        caller_instance_id: peer.caller_instance_id,
+                        destination_instance_id: destination,
+                        target: action.owner,
+                        intent: action.intent,
+                        source,
+                        action_reference: action.reference,
+                        expected_version: action.expected_version,
+                        observed_goal_id: action.observed_goal_id,
+                        expires_at_us,
+                    })
+                    .into_response(),
+                    None => federation_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "remote Goal preparation missing expiry",
+                    ),
+                },
+                Err(error) => error.into_response(),
+            },
+        )
+        .await
+    });
+    peer_write_join_response(&state.runtime, operation.await).await
+}
+
+pub async fn apply_goal(
+    peer: PeerAuthenticated,
+    State(state): State<AppState>,
+    Json(request): Json<RemoteApplyGoalRequest>,
+) -> Response {
+    if state.runtime.local_authority_is_closed() {
+        return std::future::pending().await;
+    }
+    let destination = match state.db.instance_id().await {
+        Ok(id) => id,
+        Err(error) => {
+            return peer_authority_response(
+                &state.runtime,
+                super::product_conversations::db_to_app(error).into_response(),
+            )
+            .await;
+        }
+    };
+    if request.destination_instance_id != destination
+        || request.caller_instance_id != peer.caller_instance_id
+    {
+        return peer_authority_response(
+            &state.runtime,
+            federation_error(StatusCode::CONFLICT, "peer goal identity mismatch"),
+        )
+        .await;
+    }
+    let runtime = state.runtime.clone();
+    let operation = tokio::spawn(async move {
+        let service = crate::api::goal_commands::GoalCommandService::new(runtime.clone());
+        let result = service
+            .apply_remote(&peer.send_authority, request.action_reference)
+            .await;
+        peer_authority_response(
+            &runtime,
+            match result {
+                Ok((action, previous, receipt)) => match RemoteApplyGoalResponse::from_receipt(
+                    peer.caller_instance_id,
+                    destination,
+                    request.action_reference,
+                    action,
+                    previous,
+                    receipt,
+                ) {
+                    Ok(response) => Json(response).into_response(),
+                    Err(error) => error,
+                },
+                Err(error) => error.into_response(),
+            },
+        )
+        .await
+    });
+    peer_write_join_response(&state.runtime, operation.await).await
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteReadGoalRequest {
@@ -1155,7 +1594,7 @@ pub struct RemoteReadGoalRequest {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RemoteGoalWaitStatus {
     Immediate,
     Satisfied,
@@ -1420,11 +1859,11 @@ async fn peer_write_join_response(
     match result {
         Ok(response) => peer_authority_response(runtime, response).await,
         Err(error) if runtime.local_authority_is_closed() => {
-            tracing::debug!(%error, "federated automatic-continuation write ended after local authority closure");
+            tracing::debug!(%error, "federated peer write ended after local authority closure");
             std::future::pending().await
         }
         Err(error) => {
-            tracing::error!(%error, "federated automatic-continuation write task failed");
+            tracing::error!(%error, "federated peer write task failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1897,6 +2336,59 @@ fn validate_remote_goal_wait_status(
             Ok(())
         }
     }
+}
+
+pub(crate) async fn prepare_remote_goal(
+    db: &crate::db::Database,
+    peer: &ResolvedPeer,
+    target: ProductConversationId,
+    intent: GoalPreparationIntent,
+    source: phoenix_core::domain::conversation_goal::GoalAgentSource,
+) -> Result<RemotePrepareGoalResponse, FederationClientError> {
+    let request = RemotePrepareGoalRequest {
+        caller_instance_id: db.instance_id().await?,
+        destination_instance_id: peer.instance_id(),
+        target,
+        intent,
+        source,
+    };
+    let response: RemotePrepareGoalResponse = send_bounded_peer_request(
+        format!(
+            "{}api/federation/peer/prepare-goal",
+            peer.connection.base_url
+        ),
+        peer.connection.bearer_credential.expose(),
+        &peer.connection.tls_trust,
+        &request,
+    )
+    .await?;
+    response
+        .verify(&request)
+        .map_err(FederationClientError::ProvenanceMismatch)?;
+    Ok(response)
+}
+
+pub(crate) async fn apply_remote_goal(
+    db: &crate::db::Database,
+    peer: &ResolvedPeer,
+    reference: uuid::Uuid,
+) -> Result<RemoteApplyGoalResponse, FederationClientError> {
+    let request = RemoteApplyGoalRequest {
+        caller_instance_id: db.instance_id().await?,
+        destination_instance_id: peer.instance_id(),
+        action_reference: reference,
+    };
+    let response: RemoteApplyGoalResponse = send_bounded_peer_request(
+        format!("{}api/federation/peer/apply-goal", peer.connection.base_url),
+        peer.connection.bearer_credential.expose(),
+        &peer.connection.tls_trust,
+        &request,
+    )
+    .await?;
+    response
+        .verify(&request)
+        .map_err(FederationClientError::ProvenanceMismatch)?;
+    Ok(response)
 }
 
 pub async fn read_remote_goal(
@@ -2572,6 +3064,208 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    fn goal_source(
+        instance: ProductConversationId,
+    ) -> phoenix_core::domain::conversation_goal::GoalAgentSource {
+        phoenix_core::domain::conversation_goal::GoalAgentSource {
+            product_conversation_id: instance,
+            transcript_id: phoenix_core::domain::conversation_goal::GoalText::parse("transcript")
+                .unwrap(),
+            execution: phoenix_core::domain::conversation_goal::GoalExecution::parse(1, 1).unwrap(),
+            message_id: phoenix_core::domain::conversation_goal::GoalText::parse("message")
+                .unwrap(),
+            tool_use_id: phoenix_core::domain::conversation_goal::GoalText::parse("tool-call")
+                .unwrap(),
+        }
+    }
+
+    #[test]
+    fn remote_goal_prepare_rejects_unknown_fields_and_inconsistent_observation() {
+        use phoenix_core::domain::conversation_goal::{GoalId, GoalText};
+
+        let caller = InstanceId::new();
+        let destination = InstanceId::new();
+        let target = ProductConversationId::parse("target").unwrap();
+        let intent = GoalPreparationIntent::Create {
+            objective: GoalText::parse("objective").unwrap(),
+        };
+        let source = goal_source(ProductConversationId::parse("source-conversation").unwrap());
+        let request = RemotePrepareGoalRequest {
+            caller_instance_id: caller,
+            destination_instance_id: destination,
+            target: target.clone(),
+            intent: intent.clone(),
+            source: source.clone(),
+        };
+        let response = RemotePrepareGoalResponse {
+            caller_instance_id: caller,
+            destination_instance_id: destination,
+            target: target.clone(),
+            intent: intent.clone(),
+            source: phoenix_core::domain::conversation_goal::RemoteGoalAgentSource {
+                instance_id: caller,
+                source,
+            },
+            action_reference: uuid::Uuid::new_v4(),
+            expected_version: GoalVersion::INITIAL,
+            observed_goal_id: None,
+            expires_at_us: serde_json::from_value(serde_json::json!(1)).unwrap(),
+        };
+        assert!(response.verify(&request).is_ok());
+
+        let mut bad_observation = response.clone();
+        bad_observation.observed_goal_id = Some(GoalId::parse("goal").unwrap());
+        assert!(bad_observation.verify(&request).is_err());
+
+        let mut wrong_target = response.clone();
+        wrong_target.target = ProductConversationId::parse("other-target").unwrap();
+        assert!(wrong_target.verify(&request).is_err());
+
+        let mut nil_reference = response.clone();
+        nil_reference.action_reference = uuid::Uuid::nil();
+        assert!(nil_reference.verify(&request).is_err());
+
+        let mut nonpositive_expiry = response.clone();
+        nonpositive_expiry.expires_at_us = serde_json::from_value(serde_json::json!(0)).unwrap();
+        assert!(nonpositive_expiry.verify(&request).is_err());
+
+        let mut unknown = serde_json::to_value(&request).unwrap();
+        unknown["extra"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<RemotePrepareGoalRequest>(unknown).is_err());
+
+        let mut nested_unknown = serde_json::to_value(&request).unwrap();
+        nested_unknown["source"]["extra"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<RemotePrepareGoalRequest>(nested_unknown).is_err());
+
+        let mut execution_unknown = serde_json::to_value(&request).unwrap();
+        execution_unknown["source"]["execution"]["extra"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<RemotePrepareGoalRequest>(execution_unknown).is_err());
+    }
+
+    #[test]
+    fn remote_goal_apply_verifies_previous_snapshot_and_transition() {
+        use phoenix_core::domain::conversation_goal::{
+            GoalActor, GoalAttribution, GoalChange, GoalCommandDisposition, GoalDisposition,
+            GoalId, GoalMutation, GoalState, GoalText, GoalTimestampUs,
+        };
+
+        let caller = InstanceId::new();
+        let destination = InstanceId::new();
+        let target = ProductConversationId::parse("target").unwrap();
+        let goal_id = GoalId::parse("goal").unwrap();
+        let previous_version = GoalVersion::parse(1).unwrap();
+        let action_reference = uuid::Uuid::new_v4();
+        let source = phoenix_core::domain::conversation_goal::RemoteGoalAgentSource {
+            instance_id: caller,
+            source: goal_source(ProductConversationId::parse("source-conversation").unwrap()),
+        };
+        let previous = GoalSnapshot::new(
+            target.clone(),
+            goal_id.clone(),
+            previous_version,
+            GoalText::parse("objective").unwrap(),
+            GoalState::Underway,
+        )
+        .unwrap();
+        let intent = GoalPreparationIntent::State {
+            disposition: GoalCommandDisposition::Blocked(
+                GoalText::parse("waiting on dependency").unwrap(),
+            ),
+        };
+        let mutation = GoalMutation {
+            owner: target.clone(),
+            action_id: GoalText::parse(action_reference.to_string()).unwrap(),
+            expected_version: previous_version,
+            change: GoalChange::SetDisposition {
+                goal_id: goal_id.clone(),
+                disposition: GoalDisposition::Blocked(
+                    GoalText::parse("waiting on dependency").unwrap(),
+                ),
+            },
+            attribution: GoalAttribution {
+                requested_by: GoalActor::RemoteCoordinator(source.clone()),
+                applied_by: GoalActor::RemoteCoordinator(source.clone()),
+            },
+        };
+        let current = mutation.advance(Some(&previous)).unwrap();
+        let entry = GoalHistoryEntry::new(
+            current,
+            mutation.clone(),
+            GoalTimestampUs::parse(2).unwrap(),
+        )
+        .unwrap();
+        let request = RemoteApplyGoalRequest {
+            caller_instance_id: caller,
+            destination_instance_id: destination,
+            action_reference,
+        };
+        let response = RemoteApplyGoalResponse {
+            caller_instance_id: caller,
+            destination_instance_id: destination,
+            target: target.clone(),
+            intent: intent.clone(),
+            source: source.clone(),
+            action_reference,
+            expected_version: previous_version,
+            observed_goal_id: Some(goal_id.clone()),
+            request_id: action_reference,
+            result: RemoteGoalResult::Accepted {
+                previous: Some(Box::new(previous.clone())),
+                entry: Box::new(entry.clone()),
+            },
+        };
+        assert!(response.verify(&request).is_ok());
+
+        let wrong_owner = GoalSnapshot::new(
+            ProductConversationId::parse("other-target").unwrap(),
+            goal_id.clone(),
+            previous_version,
+            GoalText::parse("objective").unwrap(),
+            GoalState::Underway,
+        )
+        .unwrap();
+        let mut wrong_previous_owner = response.clone();
+        wrong_previous_owner.result = RemoteGoalResult::Accepted {
+            previous: Some(Box::new(wrong_owner)),
+            entry: Box::new(entry.clone()),
+        };
+        assert!(wrong_previous_owner.verify(&request).is_err());
+
+        let mut wrong_applier_mutation = mutation.clone();
+        let mut wrong_applier_source = source.clone();
+        wrong_applier_source.instance_id = InstanceId::new();
+        wrong_applier_mutation.attribution.applied_by =
+            GoalActor::RemoteCoordinator(wrong_applier_source);
+        let wrong_applier_current = wrong_applier_mutation.advance(Some(&previous)).unwrap();
+        let wrong_applier_entry = GoalHistoryEntry::new(
+            wrong_applier_current,
+            wrong_applier_mutation,
+            GoalTimestampUs::parse(2).unwrap(),
+        )
+        .unwrap();
+        let mut wrong_applier = response.clone();
+        wrong_applier.result = RemoteGoalResult::Accepted {
+            previous: Some(Box::new(previous.clone())),
+            entry: Box::new(wrong_applier_entry),
+        };
+        assert!(wrong_applier.verify(&request).is_err());
+
+        let inconsistent_previous = GoalSnapshot::new(
+            target,
+            goal_id,
+            previous_version,
+            GoalText::parse("different objective").unwrap(),
+            GoalState::Underway,
+        )
+        .unwrap();
+        let mut impossible_transition = response;
+        impossible_transition.result = RemoteGoalResult::Accepted {
+            previous: Some(Box::new(inconsistent_previous)),
+            entry: Box::new(entry),
+        };
+        assert!(impossible_transition.verify(&request).is_err());
     }
 
     #[test]

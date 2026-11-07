@@ -199,6 +199,27 @@ pub enum GoalUserCommandKind {
     State,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteGoalAgentSource {
+    pub instance_id: super::instance_identity::InstanceId,
+    pub source: GoalAgentSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoalPreparationSource {
+    Local(GoalAgentSource),
+    Remote(RemoteGoalAgentSource),
+}
+
+impl GoalPreparationSource {
+    pub fn source(&self) -> &GoalAgentSource {
+        match self {
+            Self::Local(source) => source,
+            Self::Remote(remote) => &remote.source,
+        }
+    }
+}
+
 /// `UserApi` denotes the trusted input channel, not proof of biological authorship.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GoalActor {
@@ -213,6 +234,7 @@ pub enum GoalActor {
     },
     OwningAgent(GoalAgentSource),
     Coordinator(GoalAgentSource),
+    RemoteCoordinator(RemoteGoalAgentSource),
     GeneratedHost {
         action_id: GoalText,
     },
@@ -526,6 +548,7 @@ impl GoalMutation {
                     | GoalActor::UserApi { .. }
                     | GoalActor::UserControl { .. }
                     | GoalActor::Coordinator(_)
+                    | GoalActor::RemoteCoordinator(_)
                     | GoalActor::GeneratedHost { .. } => {
                         return Err(GoalError::ReportBindingRequired);
                     }

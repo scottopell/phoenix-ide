@@ -16,6 +16,7 @@ Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance c
 | REQ-FED-017–018 | Defined | Complexity boundaries and non-goals are normative in `requirements.md`. |
 | REQ-FED-019 | Implemented | Enrollment and peer-connection writes require a validated `PeerDisplayName`; constructor/JSON and HTTP tests pass for blank names and case/whitespace variants of local, including rejection without replacing credentials or connections. |
 | REQ-FED-020 | Implemented; deployment pending | Separate closed remote read/set requests, source Coordinator dispatch gate, authenticated destination transaction, strict preference-only set and response verification passed focused regressions, exact-range review, full repository qualification, and merge-head CI. Production deployment and live cross-host acceptance are not established. No generic settings, trust/enrollment, or combined enable-and-create operation is included. |
+| REQ-FED-021 | In progress (specification) | Remote Coordinator Goal prepare/apply specifies source-boundary presence-aware selection, typed enrollment and source-tool-call provenance, destination Coordinator `ProductConversation` targeting and destination-derived expected version, reference-only federation apply with internal preparation lookup, and one retained enrollment-scoped terminal receipt replayed before expiry/version checks under current authority gates. Local Goal tooling exists; remote mutation is not claimed as implemented or runtime-verified. |
 
 ## Existing foundations
 
@@ -36,4 +37,4 @@ Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance c
 
 ## Delivery inventory
 
-Goal mutations (including creation), generic settings beyond the typed automatic-continuation preference, Continue, conversation creation, rename, reverse enrollment, live peer changes, and combined enable-and-create are not implemented in this status snapshot. This inventory reports delivered behavior; it does not narrow separately authorized scope.
+Local Goal tooling exists; remote Coordinator Goal mutation via prepare/apply is in progress at the specification stage, with no runtime qualification claimed. Goal routing selector presence belongs to the source tool boundary; the federation apply request itself contains only the opaque preparation reference, and lookup is destination-internal. Generic settings beyond the typed automatic-continuation preference, Continue, conversation creation, rename, reverse enrollment, live peer changes, and combined enable-and-create are not delivered under this federation contract. Conversation creation and rename remain excluded. This inventory reports delivered behavior; it does not narrow separately authorized scope.

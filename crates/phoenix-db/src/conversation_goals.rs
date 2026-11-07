@@ -191,7 +191,7 @@ async fn binding_tx(tx: &mut GoalTx<'_>, turn_id: i64) -> Result<Option<GoalExec
 }
 
 async fn read_actor(tx: &mut GoalTx<'_>, actor_id: i64) -> Result<GoalActor> {
-    let row = sqlx::query("SELECT actor_id,owner_id,kind,source_product_id,transcript_id,workflow_id,turn_id,message_id,tool_use_id,host_action_id FROM conversation_goal_actors WHERE actor_id=?")
+    let row = sqlx::query("SELECT actor_id,owner_id,kind,source_instance_id,source_product_id,transcript_id,workflow_id,turn_id,message_id,tool_use_id,host_action_id FROM conversation_goal_actors WHERE actor_id=?")
         .bind(actor_id)
         .fetch_one(&mut **tx)
         .await?;
@@ -223,7 +223,7 @@ async fn read_actor(tx: &mut GoalTx<'_>, actor_id: i64) -> Result<GoalActor> {
         "generated_host" => Ok(GoalActor::GeneratedHost {
             action_id: text(row.try_get("host_action_id")?)?,
         }),
-        "owning_agent" | "coordinator" => {
+        "owning_agent" | "coordinator" | "remote_coordinator" => {
             let source = GoalAgentSource {
                 product_conversation_id: product(row.try_get("source_product_id")?)?,
                 transcript_id: text(row.try_get("transcript_id")?)?,
@@ -234,10 +234,31 @@ async fn read_actor(tx: &mut GoalTx<'_>, actor_id: i64) -> Result<GoalActor> {
                 message_id: text(row.try_get("message_id")?)?,
                 tool_use_id: text(row.try_get("tool_use_id")?)?,
             };
-            Ok(if kind == "owning_agent" {
-                GoalActor::OwningAgent(source)
-            } else {
-                GoalActor::Coordinator(source)
+            Ok(match kind.as_str() {
+                "owning_agent"
+                    if row
+                        .try_get::<Option<String>, _>("source_instance_id")?
+                        .is_none() =>
+                {
+                    GoalActor::OwningAgent(source)
+                }
+                "coordinator"
+                    if row
+                        .try_get::<Option<String>, _>("source_instance_id")?
+                        .is_none() =>
+                {
+                    GoalActor::Coordinator(source)
+                }
+                "remote_coordinator" => GoalActor::RemoteCoordinator(
+                    phoenix_core::domain::conversation_goal::RemoteGoalAgentSource {
+                        instance_id: row
+                            .try_get::<String, _>("source_instance_id")?
+                            .parse()
+                            .map_err(|_| GoalDbError::Integrity("actor source instance"))?,
+                        source,
+                    },
+                ),
+                _ => return Err(GoalDbError::Integrity("actor source instance")),
             })
         }
         _ => Err(GoalDbError::Integrity("actor kind")),
@@ -314,68 +335,83 @@ async fn insert_actor(
             return Err(GoalDbError::Integrity("source tool call mismatch"));
         }
     }
-    let (kind, source_product, transcript, workflow, turn, message, tool, host) = match actor {
-        GoalActor::UserControl {
-            principal_id,
-            request_id,
-            command,
-        } => {
-            let command = match command {
-                GoalUserCommandKind::Create => "create",
-                GoalUserCommandKind::State => "state",
-            };
-            let existing: Option<i64> = sqlx::query_scalar("SELECT actor_id FROM conversation_goal_actors WHERE kind='user_control' AND owner_id=?1 AND control_principal_id=?2 AND control_request_id=?3 AND control_command=?4 AND control_result_version=?5")
+    let (kind, source_instance, source_product, transcript, workflow, turn, message, tool, host) =
+        match actor {
+            GoalActor::UserControl {
+                principal_id,
+                request_id,
+                command,
+            } => {
+                let command = match command {
+                    GoalUserCommandKind::Create => "create",
+                    GoalUserCommandKind::State => "state",
+                };
+                let existing: Option<i64> = sqlx::query_scalar("SELECT actor_id FROM conversation_goal_actors WHERE kind='user_control' AND owner_id=?1 AND control_principal_id=?2 AND control_request_id=?3 AND control_command=?4 AND control_result_version=?5")
                 .bind(owner.as_str()).bind(principal_id.as_bytes().as_slice())
                 .bind(request_id.as_bytes().as_slice()).bind(command).bind(result_version.get())
                 .fetch_optional(&mut **tx).await?;
-            if let Some(existing) = existing {
-                return Ok(existing);
-            }
-            return Ok(sqlx::query("INSERT INTO conversation_goal_actors (owner_id,kind,control_principal_id,control_request_id,control_command,control_result_version) VALUES (?1,'user_control',?2,?3,?4,?5)")
+                if let Some(existing) = existing {
+                    return Ok(existing);
+                }
+                return Ok(sqlx::query("INSERT INTO conversation_goal_actors (owner_id,kind,control_principal_id,control_request_id,control_command,control_result_version) VALUES (?1,'user_control',?2,?3,?4,?5)")
                 .bind(owner.as_str()).bind(principal_id.as_bytes().as_slice())
                 .bind(request_id.as_bytes().as_slice()).bind(command).bind(result_version.get())
                 .execute(&mut **tx).await?.last_insert_rowid());
-        }
-        GoalActor::UserApi {
-            transcript_id,
-            message_id,
-        } => (
-            "user_api",
-            None,
-            Some(transcript_id.as_str()),
-            None,
-            None,
-            Some(message_id.as_str()),
-            None,
-            None,
-        ),
-        GoalActor::GeneratedHost { action_id } => (
-            "generated_host",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(action_id.as_str()),
-        ),
-        GoalActor::OwningAgent(source) | GoalActor::Coordinator(source) => (
-            if matches!(actor, GoalActor::OwningAgent(_)) {
-                "owning_agent"
-            } else {
-                "coordinator"
-            },
-            Some(source.product_conversation_id.as_str()),
-            Some(source.transcript_id.as_str()),
-            Some(source.execution.workflow_id()),
-            Some(source.execution.turn_id()),
-            Some(source.message_id.as_str()),
-            Some(source.tool_use_id.as_str()),
-            None,
-        ),
-    };
-    Ok(sqlx::query("INSERT INTO conversation_goal_actors (owner_id,kind,source_product_id,transcript_id,workflow_id,turn_id,message_id,tool_use_id,host_action_id) VALUES (?,?,?,?,?,?,?,?,?)")
-        .bind(owner.as_str()).bind(kind).bind(source_product).bind(transcript)
+            }
+            GoalActor::UserApi {
+                transcript_id,
+                message_id,
+            } => (
+                "user_api",
+                None,
+                None,
+                Some(transcript_id.as_str()),
+                None,
+                None,
+                Some(message_id.as_str()),
+                None,
+                None,
+            ),
+            GoalActor::GeneratedHost { action_id } => (
+                "generated_host",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(action_id.as_str()),
+            ),
+            GoalActor::OwningAgent(source) | GoalActor::Coordinator(source) => (
+                if matches!(actor, GoalActor::OwningAgent(_)) {
+                    "owning_agent"
+                } else {
+                    "coordinator"
+                },
+                None,
+                Some(source.product_conversation_id.as_str()),
+                Some(source.transcript_id.as_str()),
+                Some(source.execution.workflow_id()),
+                Some(source.execution.turn_id()),
+                Some(source.message_id.as_str()),
+                Some(source.tool_use_id.as_str()),
+                None,
+            ),
+            GoalActor::RemoteCoordinator(remote) => (
+                "remote_coordinator",
+                Some(remote.instance_id.to_string()),
+                Some(remote.source.product_conversation_id.as_str()),
+                Some(remote.source.transcript_id.as_str()),
+                Some(remote.source.execution.workflow_id()),
+                Some(remote.source.execution.turn_id()),
+                Some(remote.source.message_id.as_str()),
+                Some(remote.source.tool_use_id.as_str()),
+                None,
+            ),
+        };
+    Ok(sqlx::query("INSERT INTO conversation_goal_actors (owner_id,kind,source_instance_id,source_product_id,transcript_id,workflow_id,turn_id,message_id,tool_use_id,host_action_id) VALUES (?,?,?,?,?,?,?,?,?,?)")
+        .bind(owner.as_str()).bind(kind).bind(source_instance).bind(source_product).bind(transcript)
         .bind(workflow).bind(turn).bind(message).bind(tool).bind(host)
         .execute(&mut **tx).await?.last_insert_rowid())
 }
@@ -399,6 +435,19 @@ async fn action_is_claimed_tx(tx: &mut GoalTx<'_>, mutation: &GoalMutation) -> R
         &mutation.attribution.requested_by,
         &mutation.attribution.applied_by,
     ] {
+        if let GoalActor::RemoteCoordinator(remote) = actor {
+            let source = &remote.source;
+            let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversation_goal_actors
+                WHERE kind='remote_coordinator' AND source_instance_id=? AND source_product_id=?
+                  AND transcript_id=? AND workflow_id=? AND turn_id=? AND message_id=? AND tool_use_id=?)")
+                .bind(remote.instance_id.to_string()).bind(source.product_conversation_id.as_str())
+                .bind(source.transcript_id.as_str()).bind(source.execution.workflow_id())
+                .bind(source.execution.turn_id()).bind(source.message_id.as_str())
+                .bind(source.tool_use_id.as_str()).fetch_one(&mut **tx).await?;
+            if exists {
+                return Ok(true);
+            }
+        }
         if let GoalActor::OwningAgent(source) | GoalActor::Coordinator(source) = actor {
             let exists: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM conversation_goal_actors
@@ -573,6 +622,17 @@ impl Database {
         &self,
         mutation: &GoalMutation,
     ) -> Result<Option<GoalHistoryEntry>> {
+        if matches!(
+            mutation.attribution.requested_by,
+            GoalActor::RemoteCoordinator(_)
+        ) || matches!(
+            mutation.attribution.applied_by,
+            GoalActor::RemoteCoordinator(_)
+        ) {
+            return Err(GoalDbError::Invalid(
+                "remote Goal mutations require a prepared federation authority",
+            ));
+        }
         let mut tx = self.pool().begin().await?;
         let accepted = retry_tx(&mut tx, mutation).await?;
         tx.commit().await?;
@@ -586,6 +646,17 @@ impl Database {
         expected_transcript: &str,
         at: GoalTimestampUs,
     ) -> Result<GoalHistoryEntry> {
+        if matches!(
+            mutation.attribution.requested_by,
+            GoalActor::RemoteCoordinator(_)
+        ) || matches!(
+            mutation.attribution.applied_by,
+            GoalActor::RemoteCoordinator(_)
+        ) {
+            return Err(GoalDbError::Invalid(
+                "remote Goal mutations require a prepared federation authority",
+            ));
+        }
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         if let Some(previous) = retry_tx(&mut tx, mutation).await? {
             tx.commit().await?;

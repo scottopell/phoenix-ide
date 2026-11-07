@@ -807,6 +807,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "ordinary_self_goal_admission",
         sql: include_str!("migrations/ordinary_self_goal_admission.sql"),
     },
+    Migration {
+        version: 156,
+        name: "remote_coordinator_goals",
+        sql: include_str!("migrations/remote_coordinator_goals.sql"),
+    },
 ];
 
 const MIGRATION_138: &str = concat!(
@@ -12294,6 +12299,75 @@ pub(crate) async fn run_unpublished_tools_d3_for_test(pool: &SqlitePool) -> DbRe
     run_migration_list(pool, &unpublished).await
 }
 
+struct GoalMigrationForeignKeysGuard {
+    connection: sqlx::pool::PoolConnection<Sqlite>,
+    armed: bool,
+}
+
+impl Drop for GoalMigrationForeignKeysGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.connection.close_on_drop();
+        }
+    }
+}
+
+async fn run_migration_156(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
+    let mut guard = GoalMigrationForeignKeysGuard {
+        connection: pool.acquire().await?,
+        armed: true,
+    };
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *guard.connection)
+        .await?;
+    let result = async {
+        let mut tx = guard.connection.begin_with("BEGIN IMMEDIATE").await?;
+        let result: DbResult<()> = async {
+            sqlx::raw_sql(migration.sql).execute(&mut *tx).await?;
+            let violation = sqlx::query(
+                "SELECT 1 FROM pragma_foreign_key_check WHERE \"table\" IN (
+                'conversation_goal_actors','conversation_goal_preparations',
+                'conversation_goal_coordinator_receipts','conversation_goal_history') LIMIT 1",
+            )
+            .fetch_optional(&mut *tx)
+            .await?;
+            if violation.is_some() {
+                return Err(DbError::Serialization(
+                    "migration 156 left invalid goal foreign keys".to_string(),
+                ));
+            }
+            sqlx::query("INSERT INTO _migrations (version, name) VALUES (?, ?)")
+                .bind(migration.version)
+                .bind(migration.name)
+                .execute(&mut *tx)
+                .await?;
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => tx.commit().await.map_err(DbError::from),
+            Err(error) => {
+                tx.rollback().await?;
+                Err(error)
+            }
+        }
+    }
+    .await;
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *guard.connection)
+        .await?;
+    let enabled: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+        .fetch_one(&mut *guard.connection)
+        .await?;
+    if enabled != 1 {
+        return Err(DbError::Serialization(
+            "migration 156 could not restore foreign keys".to_string(),
+        ));
+    }
+    guard.armed = false;
+    result
+}
+
 #[cfg(test)]
 pub(crate) async fn run_through_for_test(pool: &SqlitePool, version: u32) -> DbResult<u32> {
     let end = MIGRATIONS.partition_point(|migration| migration.version <= version);
@@ -12378,6 +12452,12 @@ async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbRe
 
         if migration.version == 133 {
             federated_subscriptions::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 156 {
+            run_migration_156(pool, migration).await?;
             applied += 1;
             continue;
         }
@@ -13253,6 +13333,149 @@ END;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn migration_156_preserves_populated_local_goal_ledger_and_schema() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        run_through_for_test(&pool, 155).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO product_conversations(id,kind,ordinary_lifecycle) VALUES('owner','ordinary','open');
+             INSERT INTO conversation_goal_ids(goal_id,objective,owner_id) VALUES('goal','objective','owner');
+             INSERT INTO conversation_goal_actors(actor_id,owner_id,kind,host_action_id)
+                 VALUES(1,'owner','generated_host','host-action');
+             INSERT INTO conversation_goal_history(owner_id,version,goal_id,state,action_id,change_kind,requested_actor_id,applied_actor_id,recorded_at_us)
+                 VALUES('owner',1,'goal','underway','goal-action','create',1,1,100);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // A local preparation's source is historical data; the fixture has no running coordinator.
+        let source_trigger: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema WHERE name='conversation_goal_preparations_source'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DROP TRIGGER conversation_goal_preparations_source")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO conversation_goal_preparations(reference,owner_id,caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,tool_use_id,operation,expected_version,objective)
+                 VALUES(zeroblob(16),'owner','local-transcript','local-product',1,1,'message','tool','create',0,'prepared objective');
+             INSERT INTO conversation_goal_coordinator_receipts(preparation_reference,owner_id,outcome,result_version,recorded_at_us)
+                 VALUES(zeroblob(16),'owner','rejected_busy',0,101);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(&source_trigger).execute(&pool).await.unwrap();
+        let before: Vec<(String, String)> = sqlx::query_as(
+            "SELECT type,name FROM sqlite_schema
+             WHERE name LIKE 'conversation_goal_%'
+               AND name NOT IN (
+                 'conversation_goal_local_preparations_source_call',
+                 'conversation_goal_remote_preparations_source_call',
+                 'conversation_goal_remote_receipts_require_claimed'
+               )
+             ORDER BY type,name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        run_through_for_test(&pool, 156).await.unwrap();
+        let after: Vec<(String, String)> = sqlx::query_as(
+            "SELECT type,name FROM sqlite_schema
+             WHERE name LIKE 'conversation_goal_%'
+               AND name NOT IN (
+                 'conversation_goal_local_preparations_source_call',
+                 'conversation_goal_remote_preparations_source_call',
+                 'conversation_goal_remote_receipts_require_claimed'
+               )
+             ORDER BY type,name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(before, after);
+        let source_call_indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_schema
+             WHERE type='index' AND name IN (
+               'conversation_goal_local_preparations_source_call',
+               'conversation_goal_remote_preparations_source_call'
+             ) ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            source_call_indexes,
+            vec![
+                "conversation_goal_local_preparations_source_call".to_owned(),
+                "conversation_goal_remote_preparations_source_call".to_owned(),
+            ]
+        );
+        let receipt_claim_trigger: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type='trigger' AND name='conversation_goal_remote_receipts_require_claimed'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(receipt_claim_trigger, 1);
+        let enrollment_fk: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT \"table\",\"from\",\"on_delete\" FROM pragma_foreign_key_list('conversation_goal_preparations') WHERE \"from\"='enrollment_id'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            enrollment_fk,
+            vec![(
+                "federation_enrollments".to_owned(),
+                "enrollment_id".to_owned(),
+                "NO ACTION".to_owned()
+            )]
+        );
+        let preparation_columns: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('conversation_goal_preparations')",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(!preparation_columns.contains(&"source_instance_id".to_owned()));
+        assert!(preparation_columns.contains(&"apply_state".to_owned()));
+        for (table, expected) in [
+            ("conversation_goal_ids", 1),
+            ("conversation_goal_actors", 1),
+            ("conversation_goal_history", 1),
+            ("conversation_goal_preparations", 1),
+            ("conversation_goal_coordinator_receipts", 1),
+        ] {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(count, expected, "{table}");
+        }
+        let local: (Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT enrollment_id,expires_at_us FROM conversation_goal_preparations WHERE source_kind='local'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(local, (None, None));
+        let violations: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(violations.is_empty(), "{violations:?}");
+    }
 
     #[tokio::test]
     async fn slack_final_schema_excludes_obsolete_prototype_storage() {
@@ -20022,6 +20245,7 @@ mod tests {
                 (152, "goal_preparation_inflight_source"),
                 (153, "close_writer_observations"),
                 (155, "ordinary_self_goal_admission"),
+                (156, "remote_coordinator_goals"),
             ]
         );
         let goal = MIGRATIONS
@@ -20035,7 +20259,7 @@ mod tests {
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 153);
+        assert_eq!(MIGRATIONS.len(), 154);
     }
 
     #[tokio::test]

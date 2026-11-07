@@ -4,7 +4,10 @@ use phoenix_core::domain::db_schema::SourceToolCall;
 use phoenix_db::conversation_goals::prepared::{GoalPreparationIntent, PreparedGoalAction};
 use phoenix_db::workflow::LocalAuthorityResult;
 
-use phoenix_core::domain::conversation_goal::{GoalHistoryEntry, GoalTimestampUs, GoalVersion};
+use phoenix_core::domain::conversation_goal::{
+    GoalAgentSource, GoalHistoryEntry, GoalPreparationSource, GoalSnapshot, GoalTimestampUs,
+    GoalVersion,
+};
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use phoenix_db::conversation_goals::user_commands::{
     GoalUserChange, GoalUserCommand, GoalUserReceipt,
@@ -48,6 +51,44 @@ impl Drop for CoordinatorGoalPreparationAuthorityPass {
     }
 }
 
+struct RemoteGoalApplyAuthorityPass {
+    owner: Option<AdmittedOperation>,
+}
+
+impl RemoteGoalApplyAuthorityPass {
+    fn new(owner: AdmittedOperation) -> Self {
+        Self { owner: Some(owner) }
+    }
+
+    fn complete<T>(
+        mut self,
+        result: LocalAuthorityResult<Result<T, phoenix_db::conversation_goals::GoalDbError>>,
+    ) -> Result<T, AppError> {
+        match result {
+            LocalAuthorityResult::DurableFactEstablished(result) => {
+                self.owner.take();
+                result.map_err(goal_error)
+            }
+            LocalAuthorityResult::DurableFactUnclassified => {
+                if let Some(owner) = self.owner.take() {
+                    owner.close("remote_coordinator_goal_command_result");
+                }
+                Err(AppError::Internal(
+                    "remote goal command durable result is unclassified".into(),
+                ))
+            }
+        }
+    }
+}
+
+impl Drop for RemoteGoalApplyAuthorityPass {
+    fn drop(&mut self) {
+        if let Some(owner) = &self.owner {
+            owner.close("remote_coordinator_goal_command_apply");
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct GoalCommandService {
     runtime: Arc<RuntimeManager>,
@@ -57,6 +98,8 @@ pub(crate) struct GoalCommandService {
     receipt_lookup_barrier: Option<Arc<tokio::sync::Barrier>>,
     #[cfg(test)]
     command_publication_barrier: Option<Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    remote_source_identity_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl GoalCommandService {
@@ -69,6 +112,8 @@ impl GoalCommandService {
             receipt_lookup_barrier: None,
             #[cfg(test)]
             command_publication_barrier: None,
+            #[cfg(test)]
+            remote_source_identity_barrier: None,
         }
     }
 
@@ -99,12 +144,239 @@ impl GoalCommandService {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_remote_source_identity_barrier(
+        mut self,
+        barrier: Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        self.remote_source_identity_barrier = Some(barrier);
+        self
+    }
+
     fn publication_result<T>(&self, result: Result<T, AppError>) -> Result<T, AppError> {
         let _publication = self
             .runtime
             .acquire_local_authority_pass()
             .map_err(|()| AppError::Internal("local authority is closed".into()))?;
         result
+    }
+
+    pub(crate) async fn admit_remote_source(
+        &self,
+        caller: &str,
+        call: &SourceToolCall,
+        turn: phoenix_core::domain::sm_event::DirectTurnTurnId,
+        tool: &str,
+    ) -> Result<(tokio::sync::OwnedMutexGuard<()>, GoalAgentSource), AppError> {
+        let product: String =
+            sqlx::query_scalar("SELECT product_conversation_id FROM conversations WHERE id=?")
+                .bind(caller)
+                .fetch_optional(self.runtime.db().pool())
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?
+                .ok_or_else(|| {
+                    AppError::BadRequest("Coordinator product identity unavailable".into())
+                })?;
+        let product = ProductConversationId::parse(product)
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        #[cfg(test)]
+        if let Some(barrier) = &self.remote_source_identity_barrier {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+        let admission = self
+            .runtime
+            .try_lock_product_message_admission(product.as_str())
+            .await
+            .ok_or_else(|| {
+                AppError::BadRequest("Coordinator message admission is closed".into())
+            })?;
+        let source = self
+            .remote_source(caller, &product, call, turn, tool)
+            .await?;
+        Ok((admission, source))
+    }
+
+    async fn remote_source(
+        &self,
+        caller: &str,
+        product: &ProductConversationId,
+        call: &SourceToolCall,
+        turn: phoenix_core::domain::sm_event::DirectTurnTurnId,
+        tool: &str,
+    ) -> Result<GoalAgentSource, AppError> {
+        use phoenix_core::domain::conversation_goal::{GoalExecution, GoalText};
+        use sqlx::Row as _;
+        let db = self.runtime.db();
+        db.require_current_coordinator(caller)
+            .await
+            .map_err(goal_error)?;
+        let turn = i64::try_from(turn.0)
+            .map_err(|_| AppError::BadRequest("durable turn ID out of range".into()))?;
+        let row = sqlx::query("SELECT t.workflow_id,t.turn_id FROM conversations c JOIN durable_turns t ON t.conversation_id=c.id JOIN workflows w ON w.workflow_id=t.workflow_id AND w.generation=t.generation WHERE c.id=? AND c.product_conversation_id=? AND t.turn_id=? AND t.disposition='Runtime' AND t.terminal_kind IS NULL AND t.owns_conversation=1 AND w.status='Active'")
+            .bind(caller).bind(product.as_str()).bind(turn).fetch_optional(db.pool()).await
+            .map_err(|error| AppError::Internal(error.to_string()))?
+            .ok_or_else(|| AppError::BadRequest("durable Coordinator turn provenance unavailable".into()))?;
+        let content: Option<String> = sqlx::query_scalar("SELECT content FROM messages WHERE conversation_id=? AND message_id=? AND message_type='agent'")
+            .bind(caller).bind(&call.message_id).fetch_optional(db.pool()).await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        let valid = if let Some(content) = content {
+            let blocks: Vec<phoenix_core::domain::llm_types::ContentBlock> =
+                serde_json::from_str(&content)
+                    .map_err(|error| AppError::Internal(error.to_string()))?;
+            blocks.iter().any(|block| matches!(block, phoenix_core::domain::llm_types::ContentBlock::ToolUse { id, name, .. } if id == &call.tool_use_id && name == tool))
+        } else {
+            let state: Option<String> =
+                sqlx::query_scalar("SELECT state FROM conversations WHERE id=?")
+                    .bind(caller)
+                    .fetch_optional(db.pool())
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?;
+            matches!(state.and_then(|s| serde_json::from_str::<phoenix_db::ConvState>(&s).ok()),
+                Some(phoenix_db::ConvState::ToolExecuting { current_tool, assistant_message, .. })
+                if current_tool.name() == tool && current_tool.id == call.tool_use_id
+                && assistant_message.message_id == call.message_id
+                && assistant_message.content.iter().any(|block| matches!(block, phoenix_core::domain::llm_types::ContentBlock::ToolUse { id, name, .. } if id == &call.tool_use_id && name == tool)))
+        };
+        if !valid {
+            return Err(AppError::BadRequest(
+                "exact source tool-call provenance unavailable".into(),
+            ));
+        }
+        Ok(GoalAgentSource {
+            product_conversation_id: product.clone(),
+            transcript_id: GoalText::parse(caller)
+                .map_err(|e| AppError::BadRequest(e.to_string()))?,
+            execution: GoalExecution::parse(
+                row.try_get("workflow_id")
+                    .map_err(|e| AppError::Internal(e.to_string()))?,
+                row.try_get("turn_id")
+                    .map_err(|e| AppError::Internal(e.to_string()))?,
+            )
+            .map_err(|e| AppError::BadRequest(e.to_string()))?,
+            message_id: GoalText::parse(call.message_id.clone())
+                .map_err(|e| AppError::BadRequest(e.to_string()))?,
+            tool_use_id: GoalText::parse(call.tool_use_id.clone())
+                .map_err(|e| AppError::BadRequest(e.to_string()))?,
+        })
+    }
+
+    pub(crate) async fn prepare_remote(
+        &self,
+        authority: &phoenix_db::FederationSendAuthority,
+        source: &phoenix_core::domain::conversation_goal::RemoteGoalAgentSource,
+        owner: &ProductConversationId,
+        intent: GoalPreparationIntent,
+    ) -> Result<PreparedGoalAction, AppError> {
+        let pass = CoordinatorGoalPreparationAuthorityPass::new(
+            self.runtime
+                .acquire_local_authority_pass()
+                .map_err(|()| AppError::Internal("local authority is closed".into()))?,
+        );
+        let outcome = self
+            .runtime
+            .db()
+            .prepare_remote_coordinator_goal_action(authority, source, owner, intent)
+            .await;
+        self.publication_result(pass.complete(outcome)?)
+    }
+
+    pub(crate) async fn apply_remote(
+        &self,
+        authority: &phoenix_db::FederationSendAuthority,
+        reference: uuid::Uuid,
+    ) -> Result<(PreparedGoalAction, Option<GoalSnapshot>, GoalUserReceipt), AppError> {
+        let admission = self
+            .runtime
+            .acquire_local_authority_pass()
+            .map_err(|()| AppError::Internal("local authority is closed".into()))?;
+        let db = self.runtime.db();
+        let action = db
+            .read_remote_coordinator_goal_preparation(authority, reference)
+            .await
+            .map_err(goal_error)?;
+        let previous = if action.expected_version == GoalVersion::INITIAL {
+            None
+        } else {
+            let after = GoalVersion::parse(action.expected_version.get() - 1)
+                .map_err(|error| AppError::Internal(error.to_string()))?;
+            let entry = db
+                .conversation_goal_history(&action.owner, after)
+                .await
+                .map_err(goal_error)?
+                .into_iter()
+                .next()
+                .filter(|entry| entry.snapshot().version() == action.expected_version)
+                .ok_or_else(|| {
+                    AppError::Internal(
+                        "remote goal preparation previous snapshot is unavailable".into(),
+                    )
+                })?;
+            Some(entry.snapshot().clone())
+        };
+        if let Some(receipt) = db
+            .retained_remote_coordinator_goal_command(authority, reference)
+            .await
+            .map_err(goal_error)?
+        {
+            return self.publication_result(Ok((action, previous, receipt)));
+        }
+        let clock = || {
+            GoalTimestampUs::parse(chrono::Utc::now().timestamp_micros())
+                .map_err(phoenix_db::conversation_goals::GoalDbError::from)
+        };
+        let lost = || {
+            self.runtime
+                .signal_fatal_local_authority("remote_coordinator_goal_command_write")
+        };
+        let Some(_product_guard) = self
+            .runtime
+            .try_lock_product_message_admission(action.owner.as_str())
+            .await
+        else {
+            let pass = RemoteGoalApplyAuthorityPass::new(admission);
+            let receipt = pass.complete(
+                db.apply_remote_coordinator_goal_command(authority, reference, true, clock, lost)
+                    .await,
+            )?;
+            return self.publication_result(Ok((action, previous, receipt)));
+        };
+        let transcript = db
+            .get_ordinary_product_conversation(&action.owner)
+            .await
+            .map_err(crate::api::product_conversations::db_to_app)?
+            .latest_transcript_row_id;
+        let acceptance = self.runtime.try_lock_message_acceptance(&transcript).await;
+        let pass = RemoteGoalApplyAuthorityPass::new(admission);
+        let receipt = pass.complete(
+            db.apply_remote_coordinator_goal_command(
+                authority,
+                reference,
+                acceptance.is_none(),
+                clock,
+                lost,
+            )
+            .await,
+        )?;
+        self.publication_result(Ok((action, previous, receipt)))
+    }
+
+    pub(crate) async fn remote_prepared(
+        &self,
+        authority: &phoenix_db::FederationSendAuthority,
+        reference: uuid::Uuid,
+    ) -> Result<PreparedGoalAction, AppError> {
+        let _pass = self
+            .runtime
+            .acquire_local_authority_pass()
+            .map_err(|()| AppError::Internal("local authority is closed".into()))?;
+        let result = self
+            .runtime
+            .db()
+            .read_remote_coordinator_goal_preparation(authority, reference)
+            .await
+            .map_err(goal_error);
+        self.publication_result(result)
     }
 
     pub(crate) async fn prepare_coordinator(
@@ -253,6 +525,11 @@ impl GoalCommandService {
         action: &PreparedGoalAction,
         command: &GoalUserCommand,
     ) -> Result<GoalUserReceipt, AppError> {
+        let GoalPreparationSource::Local(source) = &action.source else {
+            return Err(AppError::BadRequest(
+                "remote Goal preparation cannot enter local application".into(),
+            ));
+        };
         let db = self.runtime.db();
         if let Some(receipt) = db
             .retained_coordinator_goal_command(caller, command)
@@ -282,7 +559,7 @@ impl GoalCommandService {
             return self.established_receipt(
                 db.apply_coordinator_goal_command(
                     caller,
-                    &action.source,
+                    source,
                     command,
                     &transcript,
                     true,
@@ -302,7 +579,7 @@ impl GoalCommandService {
             return self.established_receipt(
                 db.apply_coordinator_goal_command(
                     caller,
-                    &action.source,
+                    source,
                     command,
                     &transcript,
                     true,
@@ -315,7 +592,7 @@ impl GoalCommandService {
         self.established_receipt(
             db.apply_coordinator_goal_command(
                 caller,
-                &action.source,
+                source,
                 command,
                 &transcript,
                 false,

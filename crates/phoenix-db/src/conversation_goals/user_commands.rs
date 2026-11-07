@@ -1,4 +1,6 @@
-use phoenix_core::domain::conversation_goal::GoalAgentSource;
+use phoenix_core::domain::conversation_goal::{
+    GoalAgentSource, GoalPreparationSource, RemoteGoalAgentSource,
+};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -139,7 +141,7 @@ pub struct GoalUserReceipt {
 }
 
 #[derive(Clone, Copy)]
-enum GoalReceiptStore {
+pub(super) enum GoalReceiptStore {
     Owner,
     Coordinator,
 }
@@ -148,12 +150,14 @@ impl GoalControlAuthority<'_> {
     fn receipts(self) -> GoalReceiptStore {
         match self {
             Self::Owner => GoalReceiptStore::Owner,
-            Self::Coordinator { .. } => GoalReceiptStore::Coordinator,
+            Self::Coordinator { .. } | Self::RemoteCoordinator { .. } => {
+                GoalReceiptStore::Coordinator
+            }
         }
     }
 }
 
-async fn retained_tx(
+pub(super) async fn retained_tx(
     tx: &mut GoalTx<'_>,
     input: &GoalUserCommand,
     store: GoalReceiptStore,
@@ -245,7 +249,7 @@ async fn reject_tx(
             .bind(input.request_id.as_bytes().as_slice()).bind(input.change.command().0).bind(input.expected_version.get())
             .bind(goal_id).bind(objective).bind(state).bind(reason_text).bind(outcome)
             .bind(observed_version.get()).bind(at.get()).execute(&mut **tx).await?,
-        GoalControlAuthority::Coordinator { .. } => sqlx::query("INSERT INTO conversation_goal_coordinator_receipts (preparation_reference,owner_id,outcome,result_version,recorded_at_us) VALUES (?,?,?,?,?)")
+        GoalControlAuthority::Coordinator { .. } | GoalControlAuthority::RemoteCoordinator { .. } => sqlx::query("INSERT INTO conversation_goal_coordinator_receipts (preparation_reference,owner_id,outcome,result_version,recorded_at_us) VALUES (?,?,?,?,?)")
             .bind(input.request_id.as_bytes().as_slice()).bind(input.owner.as_str()).bind(outcome)
             .bind(observed_version.get()).bind(at.get()).execute(&mut **tx).await?,
     };
@@ -266,12 +270,22 @@ pub(crate) enum GoalControlAuthority<'a> {
         caller: &'a str,
         source: &'a GoalAgentSource,
     },
+    RemoteCoordinator {
+        authority: &'a crate::federation_enrollment::FederationSendAuthority,
+        source: &'a RemoteGoalAgentSource,
+    },
 }
 
 impl GoalControlAuthority<'_> {
     async fn require(self, tx: &mut GoalTx<'_>) -> Result<()> {
-        if let Self::Coordinator { caller, .. } = self {
-            super::prepared::require_coordinator(tx, caller).await?;
+        match self {
+            Self::Coordinator { caller, .. } => {
+                super::prepared::require_coordinator(tx, caller).await?
+            }
+            Self::RemoteCoordinator { authority, source } => {
+                super::prepared::require_remote_peer(tx, authority, source.instance_id).await?;
+            }
+            Self::Owner => {}
         }
         Ok(())
     }
@@ -284,6 +298,7 @@ impl GoalControlAuthority<'_> {
                 command: input.change.command().1,
             },
             Self::Coordinator { source, .. } => GoalActor::Coordinator(source.clone()),
+            Self::RemoteCoordinator { source, .. } => GoalActor::RemoteCoordinator(source.clone()),
         }
     }
 }
@@ -310,6 +325,109 @@ impl Database {
         let result = retained_tx(&mut tx, input, GoalReceiptStore::Coordinator).await?;
         tx.rollback().await?;
         Ok(result)
+    }
+
+    /// Read an immutable remote receipt, scoped to the peer that prepared the reference.
+    pub async fn retained_remote_coordinator_goal_command(
+        &self,
+        authority: &crate::federation_enrollment::FederationSendAuthority,
+        reference: Uuid,
+    ) -> Result<Option<GoalUserReceipt>> {
+        let mut tx = self.pool().begin().await?;
+        let prepared =
+            super::prepared::remote_preparation_tx(&mut tx, authority, reference).await?;
+        let input = prepared.command(Uuid::nil())?;
+        let receipt = retained_tx(&mut tx, &input, GoalReceiptStore::Coordinator).await?;
+        tx.rollback().await?;
+        Ok(receipt)
+    }
+
+    /// Apply only the action retained under an authenticated peer and reference.
+    pub async fn apply_remote_coordinator_goal_command<F: FnOnce()>(
+        &self,
+        authority: &crate::federation_enrollment::FederationSendAuthority,
+        reference: Uuid,
+        host_gate_busy: bool,
+        clock: impl FnOnce() -> Result<GoalTimestampUs>,
+        on_authority_lost: F,
+    ) -> LocalAuthorityResult<Result<GoalUserReceipt>> {
+        self.apply_remote_coordinator_goal_command_with_claim_commit(
+            authority,
+            reference,
+            host_gate_busy,
+            clock,
+            on_authority_lost,
+            #[cfg(test)]
+            super::prepared::RemoteGoalClaimCommitCut::None,
+        )
+        .await
+    }
+
+    pub(super) async fn apply_remote_coordinator_goal_command_with_claim_commit<F: FnOnce()>(
+        &self,
+        authority: &crate::federation_enrollment::FederationSendAuthority,
+        reference: Uuid,
+        host_gate_busy: bool,
+        clock: impl FnOnce() -> Result<GoalTimestampUs>,
+        on_authority_lost: F,
+        #[cfg(test)] claim_commit: super::prepared::RemoteGoalClaimCommitCut,
+    ) -> LocalAuthorityResult<Result<GoalUserReceipt>> {
+        let mut claim_authority = super::control::ControlCommitAuthority::new(on_authority_lost);
+        match self
+            .claim_remote_coordinator_goal_preparation(
+                authority,
+                reference,
+                #[cfg(test)]
+                claim_commit,
+            )
+            .await
+        {
+            Ok(super::prepared::RemoteCoordinatorGoalClaim::Claimed) => {}
+            Ok(super::prepared::RemoteCoordinatorGoalClaim::Replay(receipt)) => {
+                claim_authority.classified();
+                return LocalAuthorityResult::DurableFactEstablished(Ok(receipt));
+            }
+            Ok(super::prepared::RemoteCoordinatorGoalClaim::Unclassified) => {
+                return LocalAuthorityResult::DurableFactUnclassified;
+            }
+            Err(error) => {
+                claim_authority.classified();
+                return LocalAuthorityResult::DurableFactEstablished(Err(error));
+            }
+        }
+        let prepared = match self
+            .read_remote_coordinator_goal_preparation(authority, reference)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(_) => return LocalAuthorityResult::DurableFactUnclassified,
+        };
+        let input = match prepared.command(Uuid::nil()) {
+            Ok(input) => input,
+            Err(_) => return LocalAuthorityResult::DurableFactUnclassified,
+        };
+        let phoenix_core::domain::conversation_goal::GoalPreparationSource::Remote(source) =
+            &prepared.source
+        else {
+            return LocalAuthorityResult::DurableFactUnclassified;
+        };
+        let result = self
+            .control_goal_command_with_notification(
+                &input,
+                "",
+                GoalControlAuthority::RemoteCoordinator { authority, source },
+                clock,
+                host_gate_busy,
+                || {},
+                #[cfg(test)]
+                UserCommitCut::None,
+            )
+            .await;
+        if matches!(&result, LocalAuthorityResult::DurableFactEstablished(_)) {
+            claim_authority.classified();
+        }
+        self.notify_goal_command_outcome(&result);
+        Self::without_goal_notification(result)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -423,8 +541,23 @@ impl Database {
     ) -> Result<GoalUserCommandOutcome> {
         requester.require(tx).await?;
         let live = Self::get_ordinary_product_conversation_on(tx, &input.owner).await?;
-        if let GoalControlAuthority::Coordinator { caller, source } = requester {
-            super::prepared::require_exact_preparation(tx, caller, source, input).await?;
+        match requester {
+            GoalControlAuthority::Coordinator { caller, source } => {
+                super::prepared::require_exact_preparation(tx, caller, source, input).await?;
+            }
+            GoalControlAuthority::RemoteCoordinator { authority, source } => {
+                let prepared =
+                    super::prepared::remote_preparation_tx(tx, authority, input.request_id).await?;
+                let expected = prepared.command(input.principal_id)?;
+                if prepared.source != GoalPreparationSource::Remote(source.clone())
+                    || prepared.owner != input.owner
+                    || expected.expected_version != input.expected_version
+                    || expected.change != input.change
+                {
+                    return Err(GoalDbError::RetryConflict);
+                }
+            }
+            GoalControlAuthority::Owner => {}
         }
         if let Some(retained) = retained_tx(tx, input, requester.receipts()).await? {
             return Ok(GoalUserCommandOutcome {
@@ -432,8 +565,22 @@ impl Database {
                 committed_goal: None,
             });
         }
-        let target = if host_gate_busy {
-            &live.latest_transcript_row_id
+        if matches!(requester, GoalControlAuthority::RemoteCoordinator { .. }) {
+            let apply_state: String = sqlx::query_scalar(
+                "SELECT apply_state FROM conversation_goal_preparations WHERE reference=?",
+            )
+            .bind(input.request_id.as_bytes().as_slice())
+            .fetch_one(&mut **tx)
+            .await?;
+            if apply_state != "claimed" {
+                return Err(GoalDbError::TargetChanged);
+            }
+        }
+
+        let target = if host_gate_busy
+            || matches!(requester, GoalControlAuthority::RemoteCoordinator { .. })
+        {
+            live.latest_transcript_row_id.as_str()
         } else {
             expected_transcript
         };
@@ -469,7 +616,7 @@ impl Database {
             },
             change: input.change.mutation_change()?,
         };
-        match admission::require_settled_tx(tx, &mutation, expected_transcript).await {
+        match admission::require_settled_tx(tx, &mutation, target).await {
             Ok(()) => {}
             Err(GoalDbError::Busy) => {
                 let receipt =
@@ -502,29 +649,46 @@ impl Database {
             }
             Err(error) => return Err(error.into()),
         };
+        if matches!(requester, GoalControlAuthority::RemoteCoordinator { .. })
+            && matches!(&mutation.change, GoalChange::Create { .. })
+        {
+            match super::require_auto_continue_tx(tx, &input.owner).await {
+                Ok(()) => {}
+                Err(GoalDbError::AutoContinueDisabled) => {
+                    let receipt = reject_tx(
+                        tx,
+                        input,
+                        requester,
+                        GoalUserRefusal::Transition,
+                        observed,
+                        at,
+                    )
+                    .await?;
+                    return Ok(GoalUserCommandOutcome {
+                        receipt,
+                        committed_goal: None,
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        }
         match requester {
             GoalControlAuthority::Owner => sqlx::query("INSERT INTO conversation_goal_user_requests (owner_id,principal_id,request_id,command,expected_version,goal_id,outcome,result_version,recorded_at_us) VALUES (?,?,?,?,?,?,'accepted',?,?)")
                 .bind(input.owner.as_str()).bind(input.principal_id.as_bytes().as_slice())
                 .bind(input.request_id.as_bytes().as_slice()).bind(input.change.command().0).bind(input.expected_version.get())
                 .bind(next.goal_id().as_str()).bind(next.version().get()).bind(at.get())
                 .execute(&mut **tx).await?,
-            GoalControlAuthority::Coordinator { .. } => sqlx::query("INSERT INTO conversation_goal_coordinator_receipts (preparation_reference,owner_id,outcome,result_version,recorded_at_us) VALUES (?,?,'accepted',?,?)")
+            GoalControlAuthority::Coordinator { .. } | GoalControlAuthority::RemoteCoordinator { .. } => sqlx::query("INSERT INTO conversation_goal_coordinator_receipts (preparation_reference,owner_id,outcome,result_version,recorded_at_us) VALUES (?,?,'accepted',?,?)")
                 .bind(input.request_id.as_bytes().as_slice()).bind(input.owner.as_str())
                 .bind(next.version().get()).bind(at.get()).execute(&mut **tx).await?,
         };
-        let entry = apply_goal_tx(
-            tx,
-            &mutation,
-            Some(expected_transcript),
-            at,
-            self.goal_write_policies(),
-        )
-        .await?;
+        let entry =
+            apply_goal_tx(tx, &mutation, Some(target), at, self.goal_write_policies()).await?;
         crate::coordinator_watches::goal_facts::settled_change_tx(
             tx,
             self.goal_control_installation(),
             &entry,
-            expected_transcript,
+            target,
         )
         .await
         .map_err(GoalDbError::from)?;
@@ -603,15 +767,40 @@ impl Database {
         on_authority_lost: F,
         #[cfg(test)] cut: UserCommitCut,
     ) -> LocalAuthorityResult<Result<GoalUserCommandOutcome>> {
+        let remote_claimed = matches!(requester, GoalControlAuthority::RemoteCoordinator { .. });
+        let mut on_authority_lost = Some(on_authority_lost);
+        let authority = remote_claimed.then(|| {
+            super::control::ControlCommitAuthority::new(
+                on_authority_lost
+                    .take()
+                    .expect("authority-loss callback is available"),
+            )
+        });
         let mut connection = match self.pool().acquire().await {
             Ok(connection) => connection,
-            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+            Err(_) if remote_claimed => {
+                return LocalAuthorityResult::DurableFactUnclassified;
+            }
+            Err(error) => {
+                return LocalAuthorityResult::DurableFactEstablished(Err(error.into()));
+            }
         };
         let mut tx = match sqlx::Connection::begin_with(&mut *connection, "BEGIN IMMEDIATE").await {
             Ok(tx) => tx,
-            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+            Err(_) if remote_claimed => {
+                return LocalAuthorityResult::DurableFactUnclassified;
+            }
+            Err(error) => {
+                return LocalAuthorityResult::DurableFactEstablished(Err(error.into()));
+            }
         };
-        let mut authority = super::control::ControlCommitAuthority::new(on_authority_lost);
+        let mut authority = authority.unwrap_or_else(|| {
+            super::control::ControlCommitAuthority::new(
+                on_authority_lost
+                    .take()
+                    .expect("authority-loss callback is available"),
+            )
+        });
         let result = self
             .user_goal_command_tx(
                 &mut tx,
@@ -663,7 +852,7 @@ impl Database {
                 #[cfg(test)]
                 let rolled_back =
                     rolled_back && !matches!(cut, UserCommitCut::LostRollbackAcknowledgement);
-                if rolled_back {
+                if rolled_back && !remote_claimed {
                     authority.classified();
                     return LocalAuthorityResult::DurableFactEstablished(Err(error));
                 }
@@ -700,11 +889,11 @@ impl Database {
                     committed_goal,
                 }))
             }
-            (Ok(None), Ok(())) => {
+            (Ok(None), Ok(())) if !remote_claimed => {
                 authority.classified();
                 LocalAuthorityResult::DurableFactEstablished(Err(attempted))
             }
-            (Err(GoalDbError::RetryConflict), Ok(())) => {
+            (Err(GoalDbError::RetryConflict), Ok(())) if !remote_claimed => {
                 authority.classified();
                 LocalAuthorityResult::DurableFactEstablished(Err(GoalDbError::RetryConflict))
             }
