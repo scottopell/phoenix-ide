@@ -13051,6 +13051,56 @@ mod tests {
         assert!(db.record_close_writer_observation(&gap).await.is_err());
     }
 
+    async fn accept_writer_failure_fixture(
+        db: &Database,
+        failure: &TerminalizeInitialCloseCleanupFailureRequest,
+    ) {
+        let coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        db.append_steering_entry(
+            &coordinator.id,
+            &phoenix_core::domain::sm_event::SteerEntry {
+                text: "Close failure".into(),
+                origin: phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent {
+                    event_id: failure.failure_occurrence_id.clone(),
+                },
+                llm_text: None,
+                images: vec![],
+                files: vec![],
+                message_id: "accepted-writer-failure".into(),
+                user_agent: None,
+                skill_invocation: None,
+            },
+            "writer-failure-receipt",
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    async fn writer_lifetime_counts(
+        db: &Database,
+        failure: &TerminalizeInitialCloseCleanupFailureRequest,
+    ) -> (i64, i64, i64) {
+        sqlx::query_as(
+            "SELECT
+                (SELECT COUNT(*) FROM close_attempt_scopes WHERE attempt_id = ?1),
+                (SELECT COUNT(*) FROM close_writer_observations WHERE attempt_id = ?1),
+                (SELECT COUNT(*) FROM product_conversations WHERE id = ?2)",
+        )
+        .bind(failure.attempt_id.as_str())
+        .bind(failure.source_product_conversation_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn permanent_delete_removes_writer_observations_only_after_history_aggregate_is_empty() {
         let db = Database::open_in_memory().await.unwrap();
@@ -13088,7 +13138,25 @@ mod tests {
                 .unwrap(),
             vec![request]
         );
+        // Mandatory failure delivery retains source custody until a canonical
+        // coordinator receipt accepts it. Permanent Delete cannot skip delivery.
+        let retained = writer_lifetime_counts(&db, &failure).await;
+        assert!(retained.0 > 0);
+        assert_eq!((retained.1, retained.2), (1, 1));
+        let error = db.delete_conversation("root").await.unwrap_err();
+        assert!(
+            error.to_string().contains("FOREIGN KEY constraint failed"),
+            "{error}"
+        );
+        assert_eq!(writer_lifetime_counts(&db, &failure).await, retained);
+        assert!(db.get_conversation("root").await.is_ok());
+        assert!(db.get_conversation("latest").await.is_ok());
+        accept_writer_failure_fixture(&db, &failure).await;
+        // Delete the predecessor first to preserve the live continuation FK.
         db.delete_conversation("root").await.unwrap();
+        assert!(db.get_conversation("root").await.is_err());
+        assert!(db.get_conversation("latest").await.is_ok());
+        assert_eq!(writer_lifetime_counts(&db, &failure).await, retained);
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_writer_observations")
                 .fetch_one(db.pool())
@@ -13104,6 +13172,7 @@ mod tests {
                 .unwrap(),
             0
         );
+        assert_eq!(writer_lifetime_counts(&db, &failure).await, (0, 0, 0));
         assert!(db.get_conversation("other-aggregate").await.is_ok());
     }
 
@@ -13132,7 +13201,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_members_and_writer_evidence_cannot_be_deleted_outside_product_teardown() {
+    async fn empty_history_product_cannot_delete_writer_evidence_before_product_teardown() {
         let db = Database::open_in_memory().await.unwrap();
         let (request, mut failure) = writer_observation_fixture(&db).await;
         failure.stop_certainty =
@@ -13141,6 +13210,7 @@ mod tests {
         db.terminalize_initial_close_cleanup_failure(&failure)
             .await
             .unwrap();
+        accept_writer_failure_fixture(&db, &failure).await;
         let mut tx = db.pool().begin().await.unwrap();
         let members_before = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM conversations WHERE product_conversation_id = ?1",
@@ -13150,21 +13220,13 @@ mod tests {
         .await
         .unwrap();
         assert!(members_before > 0);
-        // Raw member deletion would cascade through Close authority while its
-        // product still owns immutable writer evidence. That intermediate state
-        // is structurally forbidden; public permanent Delete orders teardown.
-        let error = sqlx::query("DELETE FROM conversations WHERE product_conversation_id = ?1")
+        // Stage an empty-but-live History product after canonical delivery.
+        // Emptiness alone must not authorize deleting immutable writer evidence.
+        sqlx::query("DELETE FROM conversations WHERE product_conversation_id = ?1")
             .bind(failure.source_product_conversation_id.as_str())
             .execute(&mut *tx)
             .await
-            .unwrap_err();
-        assert!(
-            error.as_database_error().is_some_and(|error| {
-                error.code().as_deref() == Some("1811")
-                    && error.message() == "FOREIGN KEY constraint failed"
-            }),
-            "{error}"
-        );
+            .unwrap();
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM conversations WHERE product_conversation_id = ?1"
@@ -13173,7 +13235,7 @@ mod tests {
             .fetch_one(&mut *tx)
             .await
             .unwrap(),
-            members_before
+            0
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
