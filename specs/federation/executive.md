@@ -16,6 +16,7 @@ Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance c
 | REQ-FED-017–018 | Defined | Complexity boundaries and non-goals are normative in `requirements.md`. |
 | REQ-FED-019 | Implemented | Enrollment and peer-connection writes require a validated `PeerDisplayName`; constructor/JSON and HTTP tests pass for blank names and case/whitespace variants of local, including rejection without replacing credentials or connections. |
 | REQ-FED-020 | Implemented; deployment pending | Separate closed remote read/set requests, source Coordinator dispatch gate, authenticated destination transaction, strict preference-only set and response verification passed focused regressions, exact-range review, full repository qualification, and merge-head CI. Production deployment and live cross-host acceptance are not established. No generic settings, trust/enrollment, or combined enable-and-create operation is included. |
+| REQ-FED-021–022 | Implementation in progress; verification pending | Continue specifies local parity for omitted instance, explicit JSON `null`, and exact `"local"`; explicit remote selection resolves one enrolled peer without fallback. A successful `Accepted` dispatch receipt may retain a `Pending` opening with the exact caller/source-derived request key; eventual `Accepted` opening identity is that key or `successor:key`. Source and destination authority, exact boundary/replay, and response-provenance validation require focused and two-instance tests before status can advance; no shipped behavior is asserted. |
 
 ## Existing foundations
 
@@ -31,9 +32,10 @@ Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance c
 
 ## Verification still required
 
+- Federated Continue requires focused three-way local parity (omitted/null/exact `"local"`), source/destination authority, caller/source-derived payload-bound retry and changed-boundary rejection, lost-ack replay, independent dispatch-receipt/opening-state response validation (`Accepted` receipt with `Pending` opening included), restart and two-instance qualification; no shipped behavior is asserted.
 - Production rollout and live cross-host acceptance of the automatic-continuation controls remain unverified. Repository qualification and merge-head CI do not establish deployed behavior.
 - Operational interoperability still requires compatible deployment on participating hosts; this does not reopen the implemented watch lifecycle.
 
 ## Delivery inventory
 
-Goal mutations (including creation), generic settings beyond the typed automatic-continuation preference, Continue, conversation creation, rename, reverse enrollment, live peer changes, and combined enable-and-create are not implemented in this status snapshot. This inventory reports delivered behavior; it does not narrow separately authorized scope.
+Goal mutations (including creation), conversation creation, and rename are not implemented in this status snapshot. Generic settings beyond the typed automatic-continuation preference are out of scope rather than unfinished Federation work. Reverse enrollment, live peer changes, and combined enable-and-create are excluded. Federated Continue remains in progress and unverified, not delivered. This inventory reports delivered behavior; it does not narrow separately authorized scope.

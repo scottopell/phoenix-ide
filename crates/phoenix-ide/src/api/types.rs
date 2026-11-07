@@ -1087,7 +1087,7 @@ pub struct ContinueConversationRequest {
     pub retry_failed_automatic: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContinueConversationStatus {
     Accepted,
@@ -1096,7 +1096,7 @@ pub enum ContinueConversationStatus {
 }
 
 /// Response for context-continuation creation and opening-message dispatch.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ContinueConversationResponse {
     pub conversation_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -239,7 +239,8 @@ async fn native_goal_discovery_prepare_apply_read_and_replay_without_dispatch() 
             (150, "federated_subscription_terminal_cancellation".into()),
             (151, "one_shot_conversation_reminders".into()),
             (152, "goal_preparation_inflight_source".into()),
-            (153, "close_writer_observations".into())
+            (153, "close_writer_observations".into()),
+            (154, "federated_continuation_receipts".into())
         ]
     );
     for name in [
@@ -1315,6 +1316,7 @@ async fn production_coordinator_registry_has_exact_instance_selector_contract() 
         "unwatch_conversation",
         "list_watched_conversations",
         "read_goal",
+        "continue_conversation",
     ];
 
     assert!(!definitions
