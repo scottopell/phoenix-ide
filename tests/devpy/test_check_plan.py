@@ -666,13 +666,15 @@ class CheckPlanTests(unittest.TestCase):
             with self.subTest(path=path):
                 cats = self.dev._categorize_changed_paths({path})
                 self.assertIn("ASTGREP", cats)
-                self.assertIn("SPECS", cats)
+                self.assertIn("DEVPY", cats)
+                self.assertNotIn("SPECS", cats)
                 with mock.patch.object(
                     self.dev, "_changed_paths_vs_base", return_value={path},
                 ):
                     active, _ = self.dev._gate_lanes()
                 self.assertIn("ast-grep", active)
-                self.assertIn("spec-shape", active)
+                self.assertIn("devpy", active)
+                self.assertNotIn("spec-shape", active)
 
     def test_check_profile_scripts_run_their_devpy_unit_tests(self):
         for path in (
@@ -682,12 +684,92 @@ class CheckPlanTests(unittest.TestCase):
         ):
             with self.subTest(path=path):
                 cats = self.dev._categorize_changed_paths({path})
-                self.assertIn("SPECS", cats)
+                self.assertIn("DEVPY", cats)
                 with mock.patch.object(
                     self.dev, "_changed_paths_vs_base", return_value={path},
                 ):
                     active, _ = self.dev._gate_lanes()
-                self.assertIn("spec-shape", active)
+                self.assertIn("devpy", active)
+                self.assertNotIn("spec-shape", active)
+
+    def test_spec_and_devpy_dependency_gates_are_independent(self):
+        for path, expected in (
+            ("specs/bash/executive.md", {"spec-shape"}),
+            ("tests/devpy/removed_test.py", {"devpy"}),
+            ("scripts/check_profile_report.py", {"devpy"}),
+            ("tests/integration/deleted_fixture.py", {"devpy"}),
+            ("specs/global-recall/requirements.md", {"spec-shape", "devpy"}),
+            ("crates/phoenix-ide/src/api/handlers.rs", {"devpy"}),
+            ("ui/src/api.ts", {"devpy"}),
+            (".agents/skills/phoenix-adversarial-review/SKILL.md", {"devpy"}),
+        ):
+            with self.subTest(path=path), mock.patch.dict(os.environ, GATED_CI_ENV, clear=False), \
+                 mock.patch.object(self.dev, "_changed_paths_vs_base", return_value={path}):
+                active, _ = self.dev._resolve_check_lanes()
+            for lane in ("spec-shape", "devpy"):
+                self.assertEqual(lane in expected, lane in active)
+
+    def test_split_lane_filters_and_fail_closed_full_plans(self):
+        paths = {"specs/bash/executive.md", "tests/devpy/removed_test.py"}
+        with mock.patch.dict(os.environ, GATED_CI_ENV, clear=False), \
+             mock.patch.object(self.dev, "_changed_paths_vs_base", return_value=paths):
+            shape, _ = self.dev._resolve_check_lanes(lanes="spec-shape")
+            devpy, _ = self.dev._resolve_check_lanes(lanes="devpy")
+        self.assertEqual({"spec-shape"}, shape)
+        self.assertEqual({"devpy"}, devpy)
+        active, skipped = self.dev._resolve_check_lanes(gate=False)
+        self.assertFalse(skipped)
+        self.assertIn("spec-shape", active)
+        self.assertIn("devpy", active)
+        with mock.patch.dict(os.environ, {"CI": "", "PHOENIX_CHECK_ALL": ""}, clear=False), \
+             mock.patch.object(self.dev, "_on_integration_base", return_value=False), \
+             mock.patch.object(self.dev, "_changed_paths_vs_base", return_value=None):
+            active, skipped = self.dev._resolve_check_lanes()
+        self.assertFalse(skipped)
+        self.assertIn("spec-shape", active)
+        self.assertIn("devpy", active)
+
+    def test_spec_shape_subprocess_boundary_excludes_discovery_and_compiler_setup(self):
+        shape = mock.Mock(errors=[], legacy_design_docs=[])
+        with mock.patch.dict(os.environ, GATED_CI_ENV, clear=False), mock.patch.object(
+            self.dev, "_changed_paths_vs_base", return_value={"specs/bash/executive.md"}
+        ), mock.patch.object(self.dev, "_make_reporter"), mock.patch.object(
+            self.dev, "_validate_spears_v2_shape", return_value=shape
+        ) as validate_shape, mock.patch.object(
+            self.dev, "_compiler_cache_subprocess_env",
+            side_effect=AssertionError("compiler setup crossed spec-shape boundary"),
+        ) as compiler_setup, mock.patch.object(
+            self.dev.subprocess, "Popen",
+            side_effect=AssertionError("subprocess crossed spec-shape boundary"),
+        ) as popen, mock.patch.object(
+            self.dev.subprocess, "run",
+            side_effect=AssertionError("subprocess crossed spec-shape boundary"),
+        ) as run, mock.patch("builtins.print"):
+            active, skipped = self.dev._resolve_check_lanes(gate=True, lanes="spec-shape")
+            self.assertEqual({"spec-shape"}, active)
+            self.assertEqual({}, skipped)
+            self.dev.cmd_check(gate=True, lanes="spec-shape")
+
+        validate_shape.assert_called_once_with(ROOT / "specs")
+        compiler_setup.assert_not_called()
+        popen.assert_not_called()
+        run.assert_not_called()
+
+    def test_devpy_lane_runs_only_the_unittest_subprocess(self):
+        process = mock.Mock()
+        process.stdout = io.StringIO("")
+        process.wait.return_value = 0
+        process.pid = 12345
+
+        with mock.patch.object(self.dev.subprocess, "Popen", return_value=process) as launch, \
+             mock.patch.dict(os.environ, {"PHOENIX_CHECK_DIAGNOSTIC_DIR": ""}, clear=False):
+            self.dev.cmd_check(gate=False, lanes="devpy", profile_work=False)
+
+        launch.assert_called_once()
+        self.assertEqual(
+            [self.dev.sys.executable, "-m", "unittest", "discover", "tests/devpy"],
+            launch.call_args.args[0],
+        )
 
     def test_pr_433_task_only_rename_activates_only_task_group(self):
         paths = {"tasks/45002-p1-done--deterministic-message-scroll-state-machine.md"}
@@ -701,7 +783,7 @@ class CheckPlanTests(unittest.TestCase):
         self.assertIn("e2e", skipped)
         self.assertIn("ui-lint", skipped)
         self.assertEqual(
-            {"clippy": False, "e2e": False, "fast": True, "rust": False, "ui": False},
+            {"clippy": False, "devpy": False, "e2e": False, "fast": True, "rust": False, "ui": False},
             self.dev._ci_groups_for_active_lanes(active),
         )
 
@@ -766,6 +848,22 @@ class CheckPlanTests(unittest.TestCase):
         self.assertFalse(any("musl" in step for step in graph_steps))
 
 
+    def test_devpy_hosted_job_and_aggregate_own_the_new_group(self):
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        job = workflow.split("  check-devpy:\n", 1)[1].split("\n  check-ui:", 1)[0]
+        self.assertIn("devpy: ${{ steps.plan.outputs.devpy }}", workflow)
+        self.assertIn("needs: plan_check", job)
+        self.assertIn("needs.plan_check.outputs.devpy == 'true'", job)
+        self.assertIn("uses: astral-sh/setup-uv@v7", job)
+        self.assertIn("run: ./dev.py check --lanes devpy", job)
+        self.assertNotIn("cargo ", job)
+        self.assertNotIn("pnpm ", job)
+        aggregate_needs = (
+            "needs: [plan_check, check-rust, check-clippy, check-e2e, check-ui, "
+            "check-devpy, check-finalization-geometry, check-fast]"
+        )
+        self.assertEqual(2, workflow.count(aggregate_needs))
+
     def test_workflow_check_plan_fails_closed(self):
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
         self.assertIn(
@@ -781,6 +879,7 @@ def workflow_order(group):
         "clippy": ["clippy"],
         "e2e": ["e2e"],
         "ui": ["tsc", "ui-lint", "vitest", "ast-grep", "allium", "spec-shape", "spec-anchors", "pkglock"],
+        "devpy": ["devpy"],
     }[group]
 
 

@@ -167,6 +167,27 @@ class CheckProfileReportTests(unittest.TestCase):
         self.assertEqual(50, item["shared_unattributed_cpu_ms"])
         self.assertTrue(item["children_may_overlap"])
 
+    def test_python_child_cpu_reconciles_with_devpy_parent_not_spec_shape(self):
+        report = load_report()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "processes").mkdir()
+            for lane, cpu in (("spec-shape", 7), ("devpy", 20)):
+                (root / "processes" / f"{lane}-dev.py-unit-tests.json").write_text(json.dumps({
+                    "identity": f"step:{lane}:dev.py unit tests",
+                    "provenance": "exact_waited_descendants",
+                    "total_cpu_ms": cpu, "wall_ms": 20,
+                }))
+            (root / "python-test-cpu.jsonl").write_text(json.dumps({
+                "identity": "test_check_plan", "provenance": "windowed_process",
+                "total_cpu_ms": 8, "wall_ms": 10,
+            }) + "\n")
+            summary = report.render(root, 20)
+        python = next(item for item in summary["reconciliation"] if item["parent"] == "python")
+        self.assertEqual(20, python["parent_cpu_ms"])
+        self.assertEqual(8, python["attributed_child_cpu_ms"])
+        self.assertEqual(12, python["shared_unattributed_cpu_ms"])
+
     def test_sequential_windowed_children_do_not_claim_overlap(self):
         report = load_report()
         rows = [
