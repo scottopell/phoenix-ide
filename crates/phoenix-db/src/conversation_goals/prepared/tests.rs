@@ -321,7 +321,8 @@ async fn goal_preparation_migration_follows_conversation_tool_migrations() {
             (150, "federated_subscription_terminal_cancellation".into()),
             (151, "one_shot_conversation_reminders".into()),
             (152, "goal_preparation_inflight_source".into()),
-            (153, "close_writer_observations".into())
+            (153, "close_writer_observations".into()),
+            (155, "ordinary_self_goal_admission".into()),
         ]
     );
 }

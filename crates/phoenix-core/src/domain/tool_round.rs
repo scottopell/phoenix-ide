@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::fmt;
 
+use super::conversation_goal::ToolRoundResult;
 use super::db_schema::{
     InputOrigin, Message, MessageContent, MessageType, ToolContent, ToolResult,
 };
@@ -14,7 +15,7 @@ use super::tool_result_identity::tool_result_message_id;
 #[derive(Debug, Clone)]
 pub struct ToolRoundAssembly {
     assistant_message: AssistantMessage,
-    tool_results: Vec<ToolResult>,
+    tool_results: Vec<ToolRoundResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,15 +133,13 @@ impl ToolRoundAssembly {
     /// Returns an error when call and result identities do not correspond one-to-one.
     pub fn new(
         assistant_message: AssistantMessage,
-        mut completed_results: Vec<ToolResult>,
-        remaining_results: impl IntoIterator<Item = ToolResult>,
+        mut completed_results: Vec<ToolRoundResult>,
+        remaining_results: impl IntoIterator<Item = impl Into<ToolRoundResult>>,
     ) -> Result<Self, ToolRoundError> {
-        completed_results.extend(remaining_results);
+        completed_results.extend(remaining_results.into_iter().map(Into::into));
         validate_tool_round_ids(
             phoenix_tool_ids(&assistant_message.content),
-            completed_results
-                .iter()
-                .map(|result| result.tool_use_id.as_str()),
+            completed_results.iter().map(ToolRoundResult::tool_use_id),
         )?;
         Ok(Self {
             assistant_message,
@@ -154,12 +153,12 @@ impl ToolRoundAssembly {
     }
 
     #[must_use]
-    pub fn results(&self) -> &[ToolResult] {
+    pub fn results(&self) -> &[ToolRoundResult] {
         &self.tool_results
     }
 
     #[must_use]
-    pub fn into_parts(self) -> (AssistantMessage, Vec<ToolResult>) {
+    pub fn into_parts(self) -> (AssistantMessage, Vec<ToolRoundResult>) {
         (self.assistant_message, self.tool_results)
     }
 }
@@ -234,15 +233,28 @@ mod tests {
         ];
         let round = ToolRoundAssembly::new(
             assistant.clone(),
-            results[..2].to_vec(),
+            results[..2].iter().cloned().map(Into::into).collect(),
             results[2..].iter().cloned(),
         )
         .unwrap();
         assert_eq!(round.assistant_message(), &assistant);
-        assert_eq!(round.results(), results);
+        assert_eq!(
+            round.results(),
+            results
+                .clone()
+                .into_iter()
+                .map(ToolRoundResult::from)
+                .collect::<Vec<_>>()
+        );
         let (actual_assistant, actual_results) = round.into_parts();
         assert_eq!(actual_assistant, assistant);
-        assert_eq!(actual_results, results);
+        assert_eq!(
+            actual_results,
+            results
+                .into_iter()
+                .map(ToolRoundResult::from)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -250,8 +262,8 @@ mod tests {
         let round = ToolRoundAssembly::new(
             assistant(&["a", "b", "c"]),
             vec![
-                ToolResult::success("a".into(), "completed".into()),
-                ToolResult::success("c".into(), "recovered".into()),
+                ToolResult::success("a".into(), "completed".into()).into(),
+                ToolResult::success("c".into(), "recovered".into()).into(),
             ],
             [ToolResult::error("b".into(), "interrupted".into())],
         )
@@ -260,13 +272,22 @@ mod tests {
             round
                 .results()
                 .iter()
-                .map(|result| result.tool_use_id.as_str())
+                .map(ToolRoundResult::tool_use_id)
                 .collect::<Vec<_>>(),
             ["a", "c", "b"]
         );
-        assert_eq!(round.results()[0].output(), "completed");
-        assert_eq!(round.results()[1].output(), "recovered");
-        assert_eq!(round.results()[2].output(), "interrupted");
+        assert_eq!(
+            round.results()[0].finalized().unwrap().output(),
+            "completed"
+        );
+        assert_eq!(
+            round.results()[1].finalized().unwrap().output(),
+            "recovered"
+        );
+        assert_eq!(
+            round.results()[2].finalized().unwrap().output(),
+            "interrupted"
+        );
     }
 
     #[test]
@@ -275,7 +296,8 @@ mod tests {
             let error = ToolRoundAssembly::new(
                 assistant(&["a"]),
                 vec![],
-                (0..count).map(|_| ToolResult::error("a".into(), "error".into())),
+                (0..count)
+                    .map(|_| ToolRoundResult::from(ToolResult::error("a".into(), "error".into()))),
             )
             .unwrap_err();
             assert_eq!(
@@ -303,9 +325,14 @@ mod tests {
                 assistant(&calls),
                 results
                     .into_iter()
-                    .map(|id| ToolResult::success(id.into(), "retained output".into()))
+                    .map(|id| {
+                        ToolRoundResult::from(ToolResult::success(
+                            id.into(),
+                            "retained output".into(),
+                        ))
+                    })
                     .collect(),
-                [],
+                std::iter::empty::<ToolRoundResult>(),
             )
             .is_err());
         }

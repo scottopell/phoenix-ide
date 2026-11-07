@@ -239,7 +239,8 @@ async fn native_goal_discovery_prepare_apply_read_and_replay_without_dispatch() 
             (150, "federated_subscription_terminal_cancellation".into()),
             (151, "one_shot_conversation_reminders".into()),
             (152, "goal_preparation_inflight_source".into()),
-            (153, "close_writer_observations".into())
+            (153, "close_writer_observations".into()),
+            (155, "ordinary_self_goal_admission".into()),
         ]
     );
     for name in [

@@ -802,6 +802,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "close_writer_observations",
         sql: include_str!("migrations/close_writer_observations.sql"),
     },
+    Migration {
+        version: 155,
+        name: "ordinary_self_goal_admission",
+        sql: include_str!("migrations/ordinary_self_goal_admission.sql"),
+    },
 ];
 
 const MIGRATION_138: &str = concat!(
@@ -1248,9 +1253,13 @@ mod migration_132_tests {
             ) {
                 for insert in [true, false] {
                     let statement = if insert {
-                        format!("INSERT INTO {table} (id, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id) VALUES ('candidate', ?1, ?2, ?3, ?4, ?5, ?6, ?7)")
+                        format!(
+                            "INSERT INTO {table} (id, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id) VALUES ('candidate', ?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                        )
                     } else {
-                        format!("UPDATE {table} SET origin_kind = ?1, origin_product_conversation_id = ?2, origin_transcript_id = ?3, origin_subscription_event_id = ?4, origin_source_instance_id = ?5, origin_source_message_id = ?6, origin_source_tool_use_id = ?7 WHERE id = 'historical'")
+                        format!(
+                            "UPDATE {table} SET origin_kind = ?1, origin_product_conversation_id = ?2, origin_transcript_id = ?3, origin_subscription_event_id = ?4, origin_source_instance_id = ?5, origin_source_message_id = ?6, origin_source_tool_use_id = ?7 WHERE id = 'historical'"
+                        )
                     };
                     let result = sqlx::query(sqlx::AssertSqlSafe(statement))
                         .bind(kind)
@@ -14106,15 +14115,14 @@ mod tests {
                 "UPDATE coordinator_event_feature_retirements SET reason = 'Cancelled'
                  WHERE event_id = 'wake-event-pending'",
             ] {
-                let error = sqlx::query(statement)
-                    .execute(db.pool())
-                    .await
-                    .unwrap_err();
-                assert!(error
-                    .as_database_error()
-                    .unwrap()
-                    .message()
-                    .contains("CHECK constraint failed"));
+                let error = sqlx::query(statement).execute(db.pool()).await.unwrap_err();
+                assert!(
+                    error
+                        .as_database_error()
+                        .unwrap()
+                        .message()
+                        .contains("CHECK constraint failed")
+                );
             }
             let error = sqlx::query(
                 "INSERT INTO wake_occurrence_feature_retirements (conversation_id, message_id, reason)
@@ -14344,30 +14352,94 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Historical topology cases share the same preservation checks.
     async fn historical_continuation_preserves_unproven_or_ambiguous_openings() {
         // Rows precede migration 100's consume trigger; malformed topology is negative preservation evidence.
         let cases = [
-            ("mismatched handoff", "UPDATE messages SET content = '{\"text\":\"different handoff\"}' WHERE message_id = 'successor:opening';"),
-            ("wrong raw identity", "UPDATE messages SET message_id = 'different-opening' WHERE message_id = 'successor:opening';"),
-            ("wrong canonical identity", "UPDATE messages SET message_id = 'successor:different-opening' WHERE message_id = 'successor:opening';"),
-            ("wrong opening kind", "UPDATE messages SET message_type = 'agent', content = '{\"text\":\"exact handoff\"}' WHERE message_id = 'successor:opening';"),
-            ("wrong successor message scope", "UPDATE messages SET conversation_id = 'parent' WHERE message_id = 'successor:opening';"),
-            ("different product scope", "INSERT INTO product_conversations VALUES ('other-product', 'ordinary', 'open'); UPDATE conversations SET product_conversation_id = 'other-product' WHERE id = 'successor';"),
-            ("missing successor link", "UPDATE conversations SET continued_in_conv_id = NULL WHERE id = 'parent';"),
-            ("wrong successor link", "UPDATE conversations SET continued_in_conv_id = 'parent' WHERE id = 'parent';"),
-            ("non-root predecessor", "INSERT INTO conversations VALUES ('ancestor', 'product', NULL, 'user', 'idle', NULL); UPDATE conversations SET parent_conversation_id = 'ancestor' WHERE id = 'parent';"),
-            ("non-root successor", "INSERT INTO conversations VALUES ('ancestor', 'product', NULL, 'user', 'idle', NULL); UPDATE conversations SET parent_conversation_id = 'ancestor' WHERE id = 'successor';"),
-            ("mismatched runtime role", "UPDATE conversations SET runtime_role = 'coordinator' WHERE id = 'successor';"),
-            ("non-user runtime roles", "UPDATE conversations SET runtime_role = 'sub_agent';"),
-            ("duplicate matching identities", "INSERT INTO messages VALUES ('opening', 'successor', 2, 'user', '{\"text\":\"exact handoff\"}');"),
-            ("conflicting identity with different kind", "INSERT INTO messages VALUES ('opening', 'successor', 2, 'agent', '[]');"),
-            ("malformed accepted payload", "UPDATE messages SET content = '{\"text\":42}' WHERE message_id = 'successor:opening';"),
-            ("meta message cannot prove user authority", "UPDATE messages SET content = '{\"text\":\"exact handoff\",\"is_meta\":true}' WHERE message_id = 'successor:opening';"),
-            ("expanded payload is not literal opening", "UPDATE messages SET content = '{\"text\":\"exact handoff\",\"llm_text\":\"different model input\"}' WHERE message_id = 'successor:opening';"),
-            ("malformed predecessor summary", "UPDATE messages SET content = '{\"summary\":42}' WHERE message_id = 'summary';"),
-            ("multiple predecessor summaries", "INSERT INTO messages VALUES ('summary-two', 'parent', 2, 'continuation', '{\"summary\":\"another summary\"}');"),
-            ("missing predecessor summary", "DELETE FROM messages WHERE message_id = 'summary';"),
-            ("wrong predecessor summary kind", "UPDATE messages SET message_type = 'user', content = '{\"text\":\"exact handoff\"}' WHERE message_id = 'summary';"),
+            (
+                "mismatched handoff",
+                "UPDATE messages SET content = '{\"text\":\"different handoff\"}' WHERE message_id = 'successor:opening';",
+            ),
+            (
+                "wrong raw identity",
+                "UPDATE messages SET message_id = 'different-opening' WHERE message_id = 'successor:opening';",
+            ),
+            (
+                "wrong canonical identity",
+                "UPDATE messages SET message_id = 'successor:different-opening' WHERE message_id = 'successor:opening';",
+            ),
+            (
+                "wrong opening kind",
+                "UPDATE messages SET message_type = 'agent', content = '{\"text\":\"exact handoff\"}' WHERE message_id = 'successor:opening';",
+            ),
+            (
+                "wrong successor message scope",
+                "UPDATE messages SET conversation_id = 'parent' WHERE message_id = 'successor:opening';",
+            ),
+            (
+                "different product scope",
+                "INSERT INTO product_conversations VALUES ('other-product', 'ordinary', 'open'); UPDATE conversations SET product_conversation_id = 'other-product' WHERE id = 'successor';",
+            ),
+            (
+                "missing successor link",
+                "UPDATE conversations SET continued_in_conv_id = NULL WHERE id = 'parent';",
+            ),
+            (
+                "wrong successor link",
+                "UPDATE conversations SET continued_in_conv_id = 'parent' WHERE id = 'parent';",
+            ),
+            (
+                "non-root predecessor",
+                "INSERT INTO conversations VALUES ('ancestor', 'product', NULL, 'user', 'idle', NULL); UPDATE conversations SET parent_conversation_id = 'ancestor' WHERE id = 'parent';",
+            ),
+            (
+                "non-root successor",
+                "INSERT INTO conversations VALUES ('ancestor', 'product', NULL, 'user', 'idle', NULL); UPDATE conversations SET parent_conversation_id = 'ancestor' WHERE id = 'successor';",
+            ),
+            (
+                "mismatched runtime role",
+                "UPDATE conversations SET runtime_role = 'coordinator' WHERE id = 'successor';",
+            ),
+            (
+                "non-user runtime roles",
+                "UPDATE conversations SET runtime_role = 'sub_agent';",
+            ),
+            (
+                "duplicate matching identities",
+                "INSERT INTO messages VALUES ('opening', 'successor', 2, 'user', '{\"text\":\"exact handoff\"}');",
+            ),
+            (
+                "conflicting identity with different kind",
+                "INSERT INTO messages VALUES ('opening', 'successor', 2, 'agent', '[]');",
+            ),
+            (
+                "malformed accepted payload",
+                "UPDATE messages SET content = '{\"text\":42}' WHERE message_id = 'successor:opening';",
+            ),
+            (
+                "meta message cannot prove user authority",
+                "UPDATE messages SET content = '{\"text\":\"exact handoff\",\"is_meta\":true}' WHERE message_id = 'successor:opening';",
+            ),
+            (
+                "expanded payload is not literal opening",
+                "UPDATE messages SET content = '{\"text\":\"exact handoff\",\"llm_text\":\"different model input\"}' WHERE message_id = 'successor:opening';",
+            ),
+            (
+                "malformed predecessor summary",
+                "UPDATE messages SET content = '{\"summary\":42}' WHERE message_id = 'summary';",
+            ),
+            (
+                "multiple predecessor summaries",
+                "INSERT INTO messages VALUES ('summary-two', 'parent', 2, 'continuation', '{\"summary\":\"another summary\"}');",
+            ),
+            (
+                "missing predecessor summary",
+                "DELETE FROM messages WHERE message_id = 'summary';",
+            ),
+            (
+                "wrong predecessor summary kind",
+                "UPDATE messages SET message_type = 'user', content = '{\"text\":\"exact handoff\"}' WHERE message_id = 'summary';",
+            ),
         ];
         for (name, historical_rows) in cases {
             let pool = historical_continuation_fixture(historical_rows).await;
@@ -15655,7 +15727,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(run_through_for_test(db.pool(), 152).await.unwrap(), 1);
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 2);
         assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
         let ledger: Vec<(i64, String)> = sqlx::query_as(
             "SELECT version, name FROM _migrations WHERE version >= 150 ORDER BY version",
@@ -15670,6 +15742,7 @@ mod tests {
                 (151, "one_shot_conversation_reminders".into()),
                 (152, "goal_preparation_inflight_source".into()),
                 (153, "close_writer_observations".into()),
+                (155, "ordinary_self_goal_admission".into()),
             ]
         );
     }
@@ -15679,6 +15752,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (155, "ordinary_self_goal_admission"),
             (153, "close_writer_observations"),
             (152, "goal_preparation_inflight_source"),
             (151, "one_shot_conversation_reminders"),
@@ -17402,7 +17476,10 @@ mod tests {
             "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES (NULL, 'common_dir', 'present', '/repo', 1735689600000000)",
             "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-1', NULL, 'present', '/repo', 1735689600000000)",
         ] {
-            assert!(sqlx::query(statement).execute(&pool).await.is_err(), "{statement}");
+            assert!(
+                sqlx::query(statement).execute(&pool).await.is_err(),
+                "{statement}"
+            );
         }
     }
 
@@ -17442,7 +17519,10 @@ mod tests {
             "INSERT INTO work_scope_git_repositories (work_scope_id, repository_id) VALUES ('scope-text', X'7265706f2d74657874')",
         ] {
             assert!(
-                sqlx::query(statement).execute(&mut *connection).await.is_err(),
+                sqlx::query(statement)
+                    .execute(&mut *connection)
+                    .await
+                    .is_err(),
                 "accepted non-text storage: {statement}"
             );
         }
@@ -17724,7 +17804,10 @@ mod tests {
             "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-2', 'management_root', 'present', '', 1735689600000000)",
             "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-2', 'management_root', 'unknown', '/repo/unknown', 1735689600000000)",
         ] {
-            assert!(sqlx::query(statement).execute(&pool).await.is_err(), "{statement}");
+            assert!(
+                sqlx::query(statement).execute(&pool).await.is_err(),
+                "{statement}"
+            );
         }
 
         sqlx::query(
@@ -19938,6 +20021,7 @@ mod tests {
                 (151, "one_shot_conversation_reminders"),
                 (152, "goal_preparation_inflight_source"),
                 (153, "close_writer_observations"),
+                (155, "ordinary_self_goal_admission"),
             ]
         );
         let goal = MIGRATIONS
@@ -19951,7 +20035,7 @@ mod tests {
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 152);
+        assert_eq!(MIGRATIONS.len(), 153);
     }
 
     #[tokio::test]
@@ -19967,7 +20051,7 @@ mod tests {
         }
         sqlx::query("UPDATE product_creation_jobs SET status = 'published', published_product_id = 'deleted-product', published_conversation_id = 'deleted-transcript' WHERE request_id = 'orphan-image'")
             .execute(&pool).await.unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 5);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 6);
         let identity: Vec<(String, String)> = sqlx::query_as(
             "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
         ).fetch_all(&pool).await.unwrap();
@@ -20021,7 +20105,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 5);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 6);
         let retained: (String, String, String) = sqlx::query_as(
             "SELECT status, published_product_id, published_conversation_id
              FROM product_creation_jobs WHERE request_id = 'orphan-text'",

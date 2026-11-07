@@ -65,6 +65,36 @@ impl CanonicalReceipt {
         })
     }
 
+    pub(crate) fn bind_self_goal_evidence(
+        &mut self,
+        input: crate::conversation_goals::round::ToolRoundWrite<'_>,
+        results: &[phoenix_core::domain::db_schema::Message],
+    ) -> DbResult<()> {
+        if let crate::conversation_goals::round::ToolRoundWrite::Pending {
+            execution,
+            results: intents,
+        } = input
+        {
+            if intents.iter().any(|result| {
+                matches!(
+                    result,
+                    phoenix_core::domain::conversation_goal::ToolRoundResult::PendingSelfGoal { .. }
+                )
+            }) {
+                self.bind_evidence(&(execution, intents, results))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn bind_evidence(&mut self, evidence: &impl Serialize) -> DbResult<()> {
+        self.checkpoint_hash = command_hash(
+            b"canonical-tool-round/selected-evidence/v1\0",
+            &(&self.checkpoint_hash, evidence),
+        )?;
+        Ok(())
+    }
+
     pub(crate) async fn verify(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
