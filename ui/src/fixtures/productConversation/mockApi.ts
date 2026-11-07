@@ -236,6 +236,9 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     const requestUrl = new URL(url, location.href);
     const reminderPath = `/api/conversations/${encodeURIComponent(conversation.id)}/reminders`;
     if (scenario.reminderFixture && requestUrl.pathname === reminderPath && (init?.method ?? 'GET') === 'GET') {
+      if (scenario.reminderFixture.reminders.some((row) => row.product_conversation_id !== scenario.snapshot?.product_conversation_id)) {
+        throw new Error('Reminders fixture owner differs from product conversation');
+      }
       reminderRequestCount += 1;
       record('ReminderRequests', reminderRequestCount);
       if (reminderFailuresRemaining > 0) {
@@ -255,11 +258,25 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     if (scenario.reminderFixture?.rejectMutation && requestUrl.pathname.startsWith(`${reminderPath}/`) && init?.method === 'POST') {
       reminderMutationCount += 1;
       record('ReminderMutations', reminderMutationCount);
-      conflictRows = scenario.reminderFixture.reminders.map((row) => row.id === 'upcoming-fixture'
-        ? { ...row, revision: row.revision + 1, text: 'Check the release candidate — revised on server' }
+      const expectedRevision = (JSON.parse(String(init.body)) as { expected_revision: number }).expected_revision;
+      const current = (conflictRows ?? scenario.reminderFixture.reminders).find((row) => row.id === 'upcoming-fixture');
+      if (!current || !requestUrl.pathname.endsWith('/upcoming-fixture/cancel')) throw new Error('Unexpected fixture reminder mutation');
+      record('LastReminderRevision', expectedRevision);
+      if (!conflictRows) {
+        conflictRows = scenario.reminderFixture.reminders.map((row) => row.id === current.id
+          ? { ...row, revision: row.revision + 1, text: 'Check the release candidate — revised on server' }
+          : row);
+      }
+      const latest = conflictRows.find((row) => row.id === current.id)!;
+      if (expectedRevision !== latest.revision) {
+        record('ReminderMutation', 'rejected');
+        return Response.json({ kind: 'revision_conflict', error: 'The reminder changed in this fixture.', current: latest }, { status: 409 });
+      }
+      conflictRows = conflictRows.map((row) => row.id === latest.id
+        ? { ...row, state: { kind: 'cancelled', cancelled_at_us: 1783000000000000 } }
         : row);
-      record('ReminderMutation', 'rejected');
-      return Response.json({ kind: 'revision_conflict', error: 'The reminder changed in this fixture.', current: conflictRows.find((row) => row.id === 'upcoming-fixture') }, { status: 409 });
+      record('ReminderMutation', 'accepted');
+      return Response.json({ reminder: conflictRows.find((row) => row.id === latest.id) });
     }
     if (url.endsWith('/api/telemetry/conversation-open') || url.endsWith('/api/telemetry/product-conversation-open')) {
       return new Response(null, { status: 204 });

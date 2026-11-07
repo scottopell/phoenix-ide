@@ -74,7 +74,16 @@ runSurfaceCapture({
       }));
       assert.ok(conflictEvidence.requests > beforeConflictRequests, '409 must refresh the changed server record');
       assert.equal(conflictEvidence.mutations, 1, '409 must not replay the rejected mutation');
-      journey.push('loaded → focus refresh failure → keyboard retry → 409 alert → server revision refetched, mutation not replayed');
+      await page.screenshot({ path: path.join(outDir, `${id}--${viewport.name}--mutation-conflict.png`), fullPage: false });
+      await page.getByRole('button', { name: 'Cancel reminder' }).click();
+      await page.getByText('Cancelled').waitFor({ state: 'visible' });
+      const retriedMutation = await page.evaluate(() => ({
+        revision: Number(document.documentElement.dataset['productConversationFixtureLastReminderRevision']),
+        mutations: Number(document.documentElement.dataset['productConversationFixtureReminderMutations']),
+        outcome: document.documentElement.dataset['productConversationFixtureReminderMutation'],
+      }));
+      assert.deepEqual(retriedMutation, { revision: 5, mutations: 2, outcome: 'accepted' }, 'explicit user retry must use the fresh revision');
+      journey.push('loaded → focus refresh failure → keyboard retry → 409 alert → server row refetched without replay → explicit retry at revision 5 succeeds');
     }
 
     const evidence = await page.evaluate(() => {
