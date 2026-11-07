@@ -23,10 +23,14 @@ runSurfaceCapture({
     const picker = page.locator(viewport.name === 'mobile' ? '.mobile-only .directory-picker' : '.desktop-only .directory-picker');
     const toggle = picker.getByRole('button', { name: 'Choose recent location (20)' });
     await page.screenshot({ path: file('collapsed'), fullPage: true });
+    const pathInput = picker.getByRole('textbox', { name: 'Directory' });
+    if (viewport.hasTouch) await pathInput.tap();
+    else await pathInput.click();
+    await picker.locator('.directory-list').waitFor();
     if (viewport.hasTouch) await toggle.tap();
-    else {
-      await toggle.focus();
-      await page.keyboard.press('Enter');
+    else await toggle.click();
+    if (await picker.locator('.directory-list').isVisible()) {
+      throw new Error('Recent chooser must dismiss the directory autocomplete');
     }
     const search = picker.getByRole('searchbox', { name: 'Search recent locations' });
     await search.waitFor();
@@ -34,6 +38,12 @@ runSurfaceCapture({
       throw new Error('Crowded fixture must expose every recent location');
     }
     await page.screenshot({ path: file('expanded'), fullPage: true });
+    if (!viewport.hasTouch) {
+      await page.keyboard.press('Escape');
+      await toggle.focus();
+      await page.keyboard.press('Enter');
+      await search.waitFor();
+    }
     if (viewport.hasTouch) {
       await search.tap();
       const toggleHeight = await toggle.evaluate(element => element.getBoundingClientRect().height);

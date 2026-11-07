@@ -110,6 +110,19 @@ describe('DirectoryPicker recent locations', () => {
     expect(screen.getByRole('textbox', { name: 'Directory path' })).toHaveValue('/outside/recent');
   });
 
+  it('switches between the path autocomplete and recent locations', () => {
+    const { container } = render(<RecentPicker recentPaths={['/selected', '/second']} />);
+    const path = screen.getByRole('textbox', { name: 'Directory path' });
+    fireEvent.focus(path);
+    expect(container.querySelector('.directory-list')).toBeInTheDocument();
+    const toggle = screen.getByRole('button', { name: 'Choose recent location (2)' });
+    fireEvent.click(toggle);
+    expect(container.querySelector('.directory-list')).not.toBeInTheDocument();
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    fireEvent.focus(path);
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  });
+
   it('keeps a short suggestion set collapsed until requested', () => {
     render(<RecentPicker recentPaths={['/selected', '/second']} />);
     expect(screen.queryByRole('button', { name: '/second' })).not.toBeInTheDocument();
