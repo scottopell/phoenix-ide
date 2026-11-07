@@ -186,7 +186,7 @@ fn decode(row: &SqliteRow) -> Result<PreparedGoalAction> {
 
 pub(super) async fn require_exact_preparation(
     tx: &mut GoalTx<'_>,
-    caller: &str,
+    _caller: &str,
     source: &GoalAgentSource,
     input: &super::user_commands::GoalUserCommand,
 ) -> Result<()> {
@@ -198,7 +198,6 @@ pub(super) async fn require_exact_preparation(
     let prepared = decode(&row)?;
     let expected = prepared.command(input.principal_id)?;
     if prepared.source != GoalPreparationSource::Local(source.clone())
-        || source.transcript_id.as_str() != caller
         || prepared.owner != input.owner
         || expected.expected_version != input.expected_version
         || expected.change != input.change
@@ -210,7 +209,7 @@ pub(super) async fn require_exact_preparation(
 
 pub(super) async fn require_retained_preparation(
     tx: &mut GoalTx<'_>,
-    caller: &str,
+    _caller: &str,
     input: &super::user_commands::GoalUserCommand,
 ) -> Result<()> {
     let row = sqlx::query("SELECT p.*,e.caller_instance_id AS source_instance_id FROM conversation_goal_preparations p LEFT JOIN federation_enrollments e ON e.id=p.enrollment_id WHERE p.reference=?")
@@ -220,7 +219,7 @@ pub(super) async fn require_retained_preparation(
         .ok_or(GoalDbError::TargetChanged)?;
     let prepared = decode(&row)?;
     let expected = prepared.command(input.principal_id)?;
-    if !matches!(&prepared.source, GoalPreparationSource::Local(source) if source.transcript_id.as_str() == caller)
+    if !matches!(&prepared.source, GoalPreparationSource::Local(_))
         || prepared.owner != input.owner
         || expected.expected_version != input.expected_version
         || expected.change != input.change
@@ -793,8 +792,7 @@ impl Database {
                 "Unknown Goal action reference; prepare an explicit new action",
             ))?;
         let result = decode(&row)?;
-        if !matches!(&result.source, GoalPreparationSource::Local(source) if source.transcript_id.as_str() == caller)
-        {
+        if !matches!(&result.source, GoalPreparationSource::Local(_)) {
             return Err(GoalDbError::TargetChanged);
         }
         tx.rollback().await?;

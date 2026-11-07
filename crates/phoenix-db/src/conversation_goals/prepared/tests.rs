@@ -609,7 +609,7 @@ async fn expired_remote_preparation_replays_retained_receipt() {
     sqlx::query(
         "INSERT INTO conversation_goal_coordinator_receipts(
            preparation_reference,owner_id,outcome,result_version,recorded_at_us)
-         VALUES (?,?,'rejected_version',0,?)",
+         VALUES (?,?,'rejected_busy',0,?)",
     )
     .bind(expired.as_bytes().as_slice())
     .bind(owner.as_str())
@@ -634,7 +634,7 @@ async fn expired_remote_preparation_replays_retained_receipt() {
     assert_eq!(
         replay.result,
         GoalUserResult::Rejected {
-            reason: GoalUserRefusal::Version,
+            reason: GoalUserRefusal::Busy,
             observed_version: GoalVersion::INITIAL,
             recorded_at,
         }
@@ -1544,10 +1544,11 @@ async fn preparation_lost_commit_ack_is_unclassified_and_source_retry_recovers_o
     ));
     assert_eq!(preparation_count(&db).await, 1);
     assert_eq!(counts(&db).await, before);
-    let retained_row = sqlx::query("SELECT * FROM conversation_goal_preparations")
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
+    let retained_row =
+        sqlx::query("SELECT p.*,NULL AS source_instance_id FROM conversation_goal_preparations p")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
     let retained = decode(&retained_row).unwrap();
 
     let recovered = db

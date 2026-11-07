@@ -1263,7 +1263,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE conversation_goal_actors (actor_id INTEGER, owner_id TEXT, kind TEXT, source_product_id TEXT, transcript_id TEXT, workflow_id INTEGER, turn_id INTEGER, message_id TEXT, tool_use_id TEXT, host_action_id TEXT, control_principal_id BLOB, control_request_id BLOB, control_command TEXT)")
+        sqlx::query("CREATE TABLE conversation_goal_actors (actor_id INTEGER, owner_id TEXT, kind TEXT, source_instance_id TEXT, source_product_id TEXT, transcript_id TEXT, workflow_id INTEGER, turn_id INTEGER, message_id TEXT, tool_use_id TEXT, host_action_id TEXT, control_principal_id BLOB, control_request_id BLOB, control_command TEXT)")
             .execute(&pool)
             .await
             .unwrap();
@@ -1280,7 +1280,7 @@ mod tests {
             .execute(&mut *tx)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO conversation_goal_actors VALUES (1, 'owner', 'generated_host', NULL, NULL, NULL, NULL, NULL, NULL, 'host-action', NULL, NULL, NULL)")
+        sqlx::query("INSERT INTO conversation_goal_actors VALUES (1, 'owner', 'generated_host', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'host-action', NULL, NULL, NULL)")
             .execute(&mut *tx)
             .await
             .unwrap();
@@ -1313,7 +1313,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE conversation_goal_actors (actor_id INTEGER, owner_id TEXT, kind TEXT, source_product_id TEXT, transcript_id TEXT, workflow_id INTEGER, turn_id INTEGER, message_id TEXT, tool_use_id TEXT, host_action_id TEXT, control_principal_id BLOB, control_request_id BLOB, control_command TEXT)")
+        sqlx::query("CREATE TABLE conversation_goal_actors (actor_id INTEGER, owner_id TEXT, kind TEXT, source_instance_id TEXT, source_product_id TEXT, transcript_id TEXT, workflow_id INTEGER, turn_id INTEGER, message_id TEXT, tool_use_id TEXT, host_action_id TEXT, control_principal_id BLOB, control_request_id BLOB, control_command TEXT)")
             .execute(&pool)
             .await
             .unwrap();
