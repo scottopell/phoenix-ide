@@ -207,14 +207,20 @@ pub struct RemoteGoalAgentSource {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnrolledRemoteGoalAgentSource {
+    pub instance_id: super::instance_identity::InstanceId,
     pub enrollment_id: uuid::Uuid,
     pub source: GoalAgentSource,
 }
 
 impl EnrolledRemoteGoalAgentSource {
     #[must_use]
-    pub const fn new(enrollment_id: uuid::Uuid, source: GoalAgentSource) -> Self {
+    pub const fn new(
+        instance_id: super::instance_identity::InstanceId,
+        enrollment_id: uuid::Uuid,
+        source: GoalAgentSource,
+    ) -> Self {
         Self {
+            instance_id,
             enrollment_id,
             source,
         }

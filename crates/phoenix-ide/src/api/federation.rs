@@ -676,11 +676,6 @@ pub(crate) async fn resolve_tool_peer(
     selector: &crate::coordinator_tools::instance::RemoteInstanceSelector,
     resolution: crate::coordinator_tools::instance::PeerResolution,
 ) -> Result<ResolvedPeer, FederationClientError> {
-    if let Ok(id) = InstanceId::from_str(selector.as_str()) {
-        if selector.as_str() == id.to_string() && id == db.instance_id().await? {
-            return Err(FederationClientError::SelfPeerSelector);
-        }
-    }
     if matches!(
         resolution,
         crate::coordinator_tools::instance::PeerResolution::WatchUuidIdentity
@@ -695,7 +690,20 @@ pub(crate) async fn resolve_tool_peer(
             }
         }
     }
-    let peer = resolve_saved_peer(db, selector.as_str()).await?;
+    resolve_saved_peer(db, selector.as_str()).await
+}
+
+pub(crate) async fn resolve_goal_mutation_peer(
+    db: &crate::db::Database,
+    selector: &crate::coordinator_tools::instance::RemoteInstanceSelector,
+    resolution: crate::coordinator_tools::instance::PeerResolution,
+) -> Result<ResolvedPeer, FederationClientError> {
+    if let Ok(id) = InstanceId::from_str(selector.as_str()) {
+        if selector.as_str() == id.to_string() && id == db.instance_id().await? {
+            return Err(FederationClientError::SelfPeerSelector);
+        }
+    }
+    let peer = resolve_tool_peer(db, selector, resolution).await?;
     if peer.instance_id() == db.instance_id().await? {
         return Err(FederationClientError::SelfPeerSelector);
     }
@@ -1238,7 +1246,7 @@ pub(crate) struct RemoteApplyGoalRequest {
     pub action_reference: uuid::Uuid,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum RemoteGoalApplyClassification {
     Accepted {},
@@ -1246,12 +1254,13 @@ pub(crate) enum RemoteGoalApplyClassification {
     Expired {},
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RemoteGoalApplyRefusal {
     Version,
     Busy,
     Transition,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1317,6 +1326,21 @@ impl RemoteApplyGoalResponse {
             action_reference: reference,
             result,
         })
+    }
+
+    fn unknown_reference(
+        caller_instance_id: InstanceId,
+        destination_instance_id: InstanceId,
+        action_reference: uuid::Uuid,
+    ) -> Self {
+        Self {
+            caller_instance_id,
+            destination_instance_id,
+            action_reference,
+            result: RemoteGoalApplyClassification::Rejected {
+                reason: RemoteGoalApplyRefusal::Unknown,
+            },
+        }
     }
 
     pub(crate) fn verify(
@@ -1447,10 +1471,12 @@ pub async fn apply_goal(
                 },
                 Ok(
                     crate::api::goal_commands::RemoteGoalApplyServiceResult::ReferenceUnavailable,
-                ) => federation_error(
-                    StatusCode::CONFLICT,
-                    "remote Goal action reference is unavailable",
-                ),
+                ) => Json(RemoteApplyGoalResponse::unknown_reference(
+                    peer.caller_instance_id,
+                    destination,
+                    request.action_reference,
+                ))
+                .into_response(),
                 Err(error) => error.into_response(),
             },
         )
@@ -3096,6 +3122,7 @@ mod tests {
             (RemoteGoalApplyRefusal::Version, "version"),
             (RemoteGoalApplyRefusal::Busy, "busy"),
             (RemoteGoalApplyRefusal::Transition, "transition"),
+            (RemoteGoalApplyRefusal::Unknown, "unknown"),
         ] {
             let rejected = RemoteApplyGoalResponse {
                 result: RemoteGoalApplyClassification::Rejected { reason },
@@ -3176,13 +3203,22 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), MAX_REMOTE_RESPONSE_BYTES)
             .await
             .unwrap();
+        let response: RemoteApplyGoalResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response.caller_instance_id, peer);
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
-            serde_json::json!({"error": "remote Goal action reference is unavailable"})
+            response.destination_instance_id,
+            state.db.instance_id().await.unwrap()
+        );
+        assert_eq!(response.action_reference, action_reference);
+        assert_eq!(
+            response.result,
+            RemoteGoalApplyClassification::Rejected {
+                reason: RemoteGoalApplyRefusal::Unknown,
+            }
         );
         let after: (i64, i64, i64, i64) = sqlx::query_as(
             "SELECT
@@ -3277,7 +3313,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_peer_resolution_rejects_local_identity_for_all_remote_selectors() {
+    async fn self_peer_rejection_is_specific_to_goal_mutations() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         let local_id = state.db.instance_id().await.unwrap();
         save_test_peer(&state, local_id, "self-alias", "https://self.example", "s").await;
@@ -3292,8 +3328,12 @@ mod tests {
                 crate::coordinator_tools::instance::PeerResolution::SavedUuidOrName,
                 crate::coordinator_tools::instance::PeerResolution::WatchUuidIdentity,
             ] {
+                let peer = resolve_tool_peer(&state.db, &selector, resolution)
+                    .await
+                    .unwrap();
+                assert_eq!(peer.instance_id(), local_id);
                 assert!(matches!(
-                    resolve_tool_peer(&state.db, &selector, resolution).await,
+                    resolve_goal_mutation_peer(&state.db, &selector, resolution).await,
                     Err(FederationClientError::SelfPeerSelector)
                 ));
             }

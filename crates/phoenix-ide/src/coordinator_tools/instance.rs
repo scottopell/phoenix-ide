@@ -53,6 +53,7 @@ pub(crate) enum Route<T> {
     Remote(T),
 }
 
+#[derive(Clone, Copy)]
 pub(crate) enum PeerResolution {
     SavedUuidOrName,
     WatchUuidIdentity,
@@ -76,6 +77,18 @@ pub(crate) trait RoutedTool: Send + Sync {
     }
     fn validate_before_peer_lookup(&self, _input: &Value) -> Result<(), String> {
         Ok(())
+    }
+    async fn resolve_remote_peer(
+        &self,
+        selector: &RemoteInstanceSelector,
+    ) -> Result<crate::api::federation::ResolvedPeer, crate::api::federation::FederationClientError>
+    {
+        crate::api::federation::resolve_tool_peer(
+            self.resolution_db(),
+            selector,
+            self.peer_resolution(),
+        )
+        .await
     }
     async fn run_routed(
         &self,
@@ -146,13 +159,7 @@ impl<T: RoutedTool + 'static> Tool for RouteTool<T> {
                 if let Err(error) = self.0.validate_before_peer_lookup(&input) {
                     return ToolOutput::error(error);
                 }
-                match crate::api::federation::resolve_tool_peer(
-                    self.0.resolution_db(),
-                    &selector,
-                    self.0.peer_resolution(),
-                )
-                .await
-                {
+                match self.0.resolve_remote_peer(&selector).await {
                     Ok(peer) => Route::Remote(peer),
                     Err(error) => return ToolOutput::error(error.to_string()),
                 }

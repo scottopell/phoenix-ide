@@ -306,23 +306,18 @@ pub(super) async fn remote_preparation_tx(
     authority: &crate::federation_enrollment::FederationSendAuthority,
     reference: Uuid,
 ) -> Result<PreparedGoalAction> {
-    let row = sqlx::query("SELECT p.*,e.caller_instance_id AS source_instance_id FROM conversation_goal_preparations p LEFT JOIN federation_enrollments e ON e.id=p.enrollment_id WHERE p.reference=?")
+    let enrollment_id =
+        crate::federation_enrollment::federation_send_enrollment_id_tx(tx, authority).await?;
+    let row = sqlx::query("SELECT p.*,e.caller_instance_id AS source_instance_id FROM conversation_goal_preparations p LEFT JOIN federation_enrollments e ON e.id=p.enrollment_id WHERE p.reference=? AND p.enrollment_id=?")
         .bind(reference.as_bytes().as_slice())
+        .bind(enrollment_id.to_string())
         .fetch_optional(&mut **tx)
         .await?
         .ok_or(GoalDbError::TargetChanged)?;
     let prepared = decode(&row)?;
-    let GoalPreparationSource::Remote(source) = &prepared.source else {
+    let GoalPreparationSource::Remote(_) = &prepared.source else {
         return Err(GoalDbError::TargetChanged);
     };
-    let enrollment_id = require_remote_peer(tx, authority, source.instance_id).await?;
-    if row
-        .try_get::<Option<String>, _>("enrollment_id")?
-        .as_deref()
-        != Some(enrollment_id.to_string().as_str())
-    {
-        return Err(GoalDbError::TargetChanged);
-    }
     Ok(prepared)
 }
 

@@ -94,7 +94,7 @@ struct ApplyInput {
 
 enum ApplyRecord {
     Receipt(Value),
-    Expired(Value),
+    Outcome(Value),
 }
 
 fn target(value: &str) -> Result<ProductConversationId, String> {
@@ -124,6 +124,18 @@ impl super::instance::RoutedTool for GoalTool {
     }
     fn resolution_db(&self) -> &crate::db::Database {
         self.runtime.db()
+    }
+    async fn resolve_remote_peer(
+        &self,
+        selector: &super::instance::RemoteInstanceSelector,
+    ) -> Result<crate::api::federation::ResolvedPeer, crate::api::federation::FederationClientError>
+    {
+        crate::api::federation::resolve_goal_mutation_peer(
+            self.resolution_db(),
+            selector,
+            self.peer_resolution(),
+        )
+        .await
     }
     async fn authorize(&self, ctx: &ToolContext) -> Result<(), String> {
         self.service
@@ -511,7 +523,18 @@ impl GoalTool {
                             true,
                             "No dispatch performed. Use read_goal to inspect history.",
                         ),
-                        crate::api::federation::RemoteGoalApplyClassification::Rejected { .. } => (
+                        crate::api::federation::RemoteGoalApplyClassification::Rejected {
+                            reason: crate::api::federation::RemoteGoalApplyRefusal::Unknown,
+                        } => (
+                            false,
+                            "Unknown action reference: no Goal or receipt changed. Prepare a new explicit action before applying.",
+                        ),
+                        crate::api::federation::RemoteGoalApplyClassification::Rejected {
+                            reason:
+                                crate::api::federation::RemoteGoalApplyRefusal::Version
+                                | crate::api::federation::RemoteGoalApplyRefusal::Busy
+                                | crate::api::federation::RemoteGoalApplyRefusal::Transition,
+                        } => (
                             false,
                             "Retained refusal: same reference will return the same refusal. Read current Goal/history and explicitly reconsider; do not automatically reprepare.",
                         ),
@@ -520,16 +543,19 @@ impl GoalTool {
                             "Preparation expired without changing the Goal or creating a receipt. Prepare a new explicit action before applying.",
                         ),
                     };
-                    let expired = matches!(
+                    let unretained = matches!(
                         &response.result,
                         crate::api::federation::RemoteGoalApplyClassification::Expired {}
+                            | crate::api::federation::RemoteGoalApplyClassification::Rejected {
+                                reason: crate::api::federation::RemoteGoalApplyRefusal::Unknown,
+                            }
                     );
                     let value = json!({
                         "action_reference":response.action_reference,
                         "result":response.result
                     });
-                    let record = if expired {
-                        ApplyRecord::Expired(value)
+                    let record = if unretained {
+                        ApplyRecord::Outcome(value)
                     } else {
                         ApplyRecord::Receipt(value)
                     };
@@ -545,7 +571,7 @@ impl GoalTool {
         });
         match record {
             ApplyRecord::Receipt(receipt) => value["receipt"] = receipt,
-            ApplyRecord::Expired(outcome) => value["outcome"] = outcome,
+            ApplyRecord::Outcome(outcome) => value["outcome"] = outcome,
         }
         let output = serde_json::to_string(&value).map_err(|error| error.to_string())?;
         Ok(if accepted {

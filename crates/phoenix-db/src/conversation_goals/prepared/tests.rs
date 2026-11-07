@@ -587,6 +587,31 @@ async fn remote_preparation_reference_is_scoped_to_current_enrollment_peer() {
 }
 
 #[tokio::test]
+async fn remote_preparation_lookup_checks_authority_before_classifying_unknown_reference() {
+    let db = fixture().await;
+    let (authority, source, _) = remote_source(&db, "remote-unknown-authority").await;
+    let unknown_reference = Uuid::new_v4();
+
+    assert!(matches!(
+        db.read_remote_coordinator_goal_preparation(&authority, unknown_reference)
+            .await,
+        Err(GoalDbError::TargetChanged)
+    ));
+
+    assert!(db
+        .revoke_federation_enrollment(source.instance_id)
+        .await
+        .unwrap());
+    assert!(matches!(
+        db.read_remote_coordinator_goal_preparation(&authority, unknown_reference)
+            .await,
+        Err(GoalDbError::Admission(
+            crate::DbError::FederationSendAuthorityInactive
+        ))
+    ));
+}
+
+#[tokio::test]
 async fn expired_remote_preparation_cannot_be_applied_before_a_receipt() {
     let db = fixture().await;
     let (authority, source, owner) = remote_source(&db, "remote-expiry").await;
@@ -1384,6 +1409,15 @@ async fn remote_disabled_auto_continue_is_a_terminal_replayable_rejection() {
 async fn remote_apply_retains_receipt_and_history_decodes_remote_coordinator() {
     let db = fixture().await;
     let (authority, source, owner) = remote_source(&db, "remote-apply-replay").await;
+    let enrollment_id: Uuid = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM federation_enrollments WHERE caller_instance_id=?",
+    )
+    .bind(source.instance_id.to_string())
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+    .parse()
+    .unwrap();
     let prepared = db
         .prepare_remote_coordinator_goal_action(
             &authority,
@@ -1456,14 +1490,18 @@ async fn remote_apply_retains_receipt_and_history_decodes_remote_coordinator() {
         .await
         .unwrap();
     assert_eq!(history.len(), 1);
-    assert!(matches!(
-        &history[0].mutation().attribution.requested_by,
-        phoenix_core::domain::conversation_goal::GoalActor::RemoteCoordinator(remote) if remote.source == source.source
-    ));
-    assert!(matches!(
-        &history[0].mutation().attribution.applied_by,
-        phoenix_core::domain::conversation_goal::GoalActor::RemoteCoordinator(remote) if remote.source == source.source
-    ));
+    let expected_actor = phoenix_core::domain::conversation_goal::GoalActor::RemoteCoordinator(
+        phoenix_core::domain::conversation_goal::EnrolledRemoteGoalAgentSource::new(
+            source.instance_id,
+            enrollment_id,
+            source.source.clone(),
+        ),
+    );
+    assert_eq!(
+        history[0].mutation().attribution.requested_by,
+        expected_actor
+    );
+    assert_eq!(history[0].mutation().attribution.applied_by, expected_actor);
     let replacement = FederationCredentialVerifier::from_bearer(b"receipt replacement credential");
     db.replace_federation_enrollment(
         source.instance_id,

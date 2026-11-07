@@ -54,6 +54,7 @@ async fn public_goal_writers_reject_remote_coordinator_attribution() {
     };
     let actor = GoalActor::RemoteCoordinator(
         phoenix_core::domain::conversation_goal::EnrolledRemoteGoalAgentSource::new(
+            phoenix_core::domain::instance_identity::InstanceId::new(),
             Uuid::new_v4(),
             source,
         ),

@@ -355,6 +355,7 @@ impl GoalControlAuthority<'_> {
                 source,
             } => GoalActor::RemoteCoordinator(
                 phoenix_core::domain::conversation_goal::EnrolledRemoteGoalAgentSource::new(
+                    source.instance_id,
                     *enrollment_id,
                     source.source.clone(),
                 ),

@@ -191,7 +191,7 @@ async fn binding_tx(tx: &mut GoalTx<'_>, turn_id: i64) -> Result<Option<GoalExec
 }
 
 async fn read_actor(tx: &mut GoalTx<'_>, actor_id: i64) -> Result<GoalActor> {
-    let row = sqlx::query("SELECT actor_id,owner_id,kind,enrollment_id,source_product_id,transcript_id,workflow_id,turn_id,message_id,tool_use_id,host_action_id FROM conversation_goal_actors WHERE actor_id=?")
+    let row = sqlx::query("SELECT a.actor_id,a.owner_id,a.kind,a.enrollment_id,a.source_product_id,a.transcript_id,a.workflow_id,a.turn_id,a.message_id,a.tool_use_id,a.host_action_id,e.caller_instance_id AS source_instance_id FROM conversation_goal_actors a LEFT JOIN federation_enrollments e ON e.id=a.enrollment_id WHERE a.actor_id=?")
         .bind(actor_id)
         .fetch_one(&mut **tx)
         .await?;
@@ -260,8 +260,14 @@ async fn read_actor(tx: &mut GoalTx<'_>, actor_id: i64) -> Result<GoalActor> {
                         .ok_or(GoalDbError::Integrity("actor enrollment"))?
                         .parse()
                         .map_err(|_| GoalDbError::Integrity("actor enrollment"))?;
+                    let instance_id = row
+                        .try_get::<Option<String>, _>("source_instance_id")?
+                        .ok_or(GoalDbError::Integrity("actor enrollment"))?
+                        .parse()
+                        .map_err(|_| GoalDbError::Integrity("actor source instance"))?;
                     GoalActor::RemoteCoordinator(
                         phoenix_core::domain::conversation_goal::EnrolledRemoteGoalAgentSource::new(
+                            instance_id,
                             enrollment_id,
                             source,
                         ),
@@ -804,6 +810,15 @@ mod tests {
             .expect("in-memory SQLite pool")
     }
 
+    async fn create_federation_enrollments_fixture(pool: &sqlx::SqlitePool) {
+        sqlx::query(
+            "CREATE TABLE federation_enrollments (id TEXT PRIMARY KEY, caller_instance_id TEXT)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     async fn migrated_db() -> Database {
         let db = Database::open_in_memory().await.unwrap();
         db
@@ -1067,6 +1082,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        create_federation_enrollments_fixture(&pool).await;
         sqlx::query("CREATE TABLE conversation_goal_actors (actor_id INTEGER, owner_id TEXT, kind TEXT, enrollment_id TEXT, host_action_id TEXT)")
             .execute(&pool)
             .await
@@ -1262,6 +1278,7 @@ mod tests {
     #[tokio::test]
     async fn actor_decoder_rejects_remote_actor_without_enrollment_identity() {
         let pool = test_pool().await;
+        create_federation_enrollments_fixture(&pool).await;
         sqlx::query("CREATE TABLE conversation_goal_actors (actor_id INTEGER, owner_id TEXT, kind TEXT, enrollment_id TEXT, source_product_id TEXT, transcript_id TEXT, workflow_id INTEGER, turn_id INTEGER, message_id TEXT, tool_use_id TEXT, host_action_id TEXT, control_principal_id BLOB, control_request_id BLOB, control_command TEXT, control_result_version INTEGER)")
             .execute(&pool)
             .await
@@ -1280,6 +1297,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn actor_decoder_hydrates_remote_instance_from_existing_enrollment_relation() {
+        let pool = test_pool().await;
+        create_federation_enrollments_fixture(&pool).await;
+        sqlx::query("CREATE TABLE conversation_goal_actors (actor_id INTEGER, owner_id TEXT, kind TEXT, enrollment_id TEXT, source_product_id TEXT, transcript_id TEXT, workflow_id INTEGER, turn_id INTEGER, message_id TEXT, tool_use_id TEXT, host_action_id TEXT, control_principal_id BLOB, control_request_id BLOB, control_command TEXT, control_result_version INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let instance_id = phoenix_core::domain::instance_identity::InstanceId::new();
+        let enrollment_id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO federation_enrollments VALUES (?, ?)")
+            .bind(enrollment_id.to_string())
+            .bind(instance_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO conversation_goal_actors VALUES (1, 'owner', 'remote_coordinator', ?, 'product', 'transcript', 7, 11, 'message', 'tool', NULL, NULL, NULL, NULL, NULL)")
+            .bind(enrollment_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        assert_eq!(
+            read_actor(&mut tx, 1).await.unwrap(),
+            GoalActor::RemoteCoordinator(
+                phoenix_core::domain::conversation_goal::EnrolledRemoteGoalAgentSource::new(
+                    instance_id,
+                    enrollment_id,
+                    GoalAgentSource {
+                        product_conversation_id: ProductConversationId::parse("product").unwrap(),
+                        transcript_id: GoalText::parse("transcript").unwrap(),
+                        execution: GoalExecution::parse(7, 11).unwrap(),
+                        message_id: GoalText::parse("message").unwrap(),
+                        tool_use_id: GoalText::parse("tool").unwrap(),
+                    },
+                ),
+            )
+        );
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn current_and_history_read_absent_and_persisted_facts() {
         let pool = test_pool().await;
         sqlx::query(
@@ -1292,6 +1351,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        create_federation_enrollments_fixture(&pool).await;
         sqlx::query("CREATE TABLE conversation_goal_actors (actor_id INTEGER, owner_id TEXT, kind TEXT, enrollment_id TEXT, source_product_id TEXT, transcript_id TEXT, workflow_id INTEGER, turn_id INTEGER, message_id TEXT, tool_use_id TEXT, host_action_id TEXT, control_principal_id BLOB, control_request_id BLOB, control_command TEXT)")
             .execute(&pool)
             .await
@@ -1342,6 +1402,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        create_federation_enrollments_fixture(&pool).await;
         sqlx::query("CREATE TABLE conversation_goal_actors (actor_id INTEGER, owner_id TEXT, kind TEXT, enrollment_id TEXT, source_product_id TEXT, transcript_id TEXT, workflow_id INTEGER, turn_id INTEGER, message_id TEXT, tool_use_id TEXT, host_action_id TEXT, control_principal_id BLOB, control_request_id BLOB, control_command TEXT)")
             .execute(&pool)
             .await
