@@ -83,6 +83,7 @@ impl SelfRound {
     async fn next(&mut self, db: &Database, name: &str, operations: Vec<SelfGoalOperation>) {
         self.assistant.message_id = format!("assistant-{name}");
         self.assistant.created_at = Utc::now();
+        self.assistant.sequence_id = db.next_sequence_id(&self.transcript).await.unwrap();
         self.timestamp = self.assistant.created_at;
         self.results.clear();
         let generation: i64 =
@@ -666,13 +667,20 @@ async fn stale_generation_stop_pause_close_and_continuation_refuse_without_effec
                 .unwrap();
             }
             "continuation" => {
-                let (next, _) = ordinary(&db, "continued-transcript").await;
-                sqlx::query("UPDATE conversations SET continued_in_conv_id=? WHERE id=?")
-                    .bind(next)
-                    .bind(&round.transcript)
-                    .execute(db.pool())
-                    .await
-                    .unwrap();
+                db.update_conversation_state_at(
+                    &round.transcript,
+                    &ConvState::ContextExhausted {
+                        summary: "continue approved work".into(),
+                    },
+                    round.timestamp,
+                )
+                .await
+                .unwrap();
+                assert!(matches!(
+                    db.continue_conversation(&round.transcript).await.unwrap(),
+                    crate::ContinueOutcome::Created(_)
+                ));
+                round.install_state(&db).await;
             }
             "runtime" => {
                 sqlx::query("UPDATE workflows SET status='Completed' WHERE workflow_id=?")
@@ -690,6 +698,12 @@ async fn stale_generation_stop_pause_close_and_continuation_refuse_without_effec
             "refused",
             "{mutation}"
         );
+        if mutation == "continuation" {
+            assert_eq!(
+                status(&committed.results[0])["reason"],
+                "current_runtime_transcript_required"
+            );
+        }
         assert!(db.conversation_goal(&round.owner).await.unwrap().is_none());
         let after = effect_counts(&db).await;
         assert_eq!((after.0, after.1, after.2), (before.0, before.1, before.2));
