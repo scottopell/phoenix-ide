@@ -1,3 +1,43 @@
+.reminders-announcement {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.reminders-fetch-status {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.5rem;
+  margin: 0.25rem 1rem;
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  flex-shrink: 0;
+  min-width: 0;
+  max-width: calc(100% - 2rem);
+}
+
+.reminders-fetch-status details {
+  display: inline-block;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.reminders-fetch-status details[open] span {
+  display: block;
+  max-width: min(16rem, calc(100vw - 2rem));
+  max-height: 4rem;
+  overflow: auto;
+  overflow-wrap: anywhere;
+}
+
+.reminders-fetch-status summary {
+  cursor: pointer;
+}
+
 .reminders-panel {
   margin: 0.5rem 1rem;
   padding: 0.75rem;
@@ -76,6 +116,7 @@
 }
 
 .reminders-panel button,
+.reminders-fetch-status button,
 .reminder-edit input {
   padding: 0.35rem 0.5rem;
   color: var(--text-primary);
@@ -85,7 +126,8 @@
   border-radius: 4px;
 }
 
-.reminders-panel button {
+.reminders-panel button,
+.reminders-fetch-status button {
   cursor: pointer;
 }
 
@@ -95,11 +137,14 @@
 }
 
 .reminders-panel button:focus-visible,
+.reminders-fetch-status button:focus-visible,
+.reminders-fetch-status summary:focus-visible,
 .reminder-edit input:focus-visible {
   outline: 2px solid var(--accent-blue);
   outline-offset: 2px;
 }
 
-.reminders-panel button:hover:not(:disabled) {
+.reminders-panel button:hover:not(:disabled),
+.reminders-fetch-status button:hover:not(:disabled) {
   background: var(--bg-tertiary);
 }

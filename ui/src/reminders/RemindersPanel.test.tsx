@@ -18,6 +18,123 @@ beforeEach(() => {
 afterEach(() => { vi.restoreAllMocks(); });
 
 describe('reminder visibility and management', () => {
+  it('uses a compact, accessible status for an unloaded list, not the card panel or an empty claim', async () => {
+    vi.mocked(api.listReminders).mockRejectedValueOnce(new Error('Load failed')).mockResolvedValue([]);
+    render(<RemindersPanel conversationId="owner" />);
+    await screen.findByText('Reminders not loaded');
+    const status = screen.getByRole('status');
+    expect(status).toHaveTextContent('Reminder list: Reminders not loaded');
+    expect(screen.queryByRole('region', { name: 'Reminders' })).not.toBeInTheDocument();
+    const details = screen.getByText('Details').closest('details');
+    expect(details).not.toHaveAttribute('open');
+    fireEvent.click(screen.getByText('Details'));
+    expect(details).toHaveAttribute('open');
+    expect(details).toHaveTextContent('Load failed');
+    fireEvent.click(screen.getByRole('button', { name: 'Retry reminders' }));
+    await waitFor(() => expect(screen.queryByText('Reminders not loaded')).not.toBeInTheDocument());
+    expect(screen.queryByRole('region', { name: 'Reminders' })).not.toBeInTheDocument();
+    expect(api.listReminders).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the live region mounted while the first request is pending and announces its failure', async () => {
+    let reject!: (error: Error) => void;
+    vi.mocked(api.listReminders).mockImplementationOnce(() => new Promise<Reminder[]>((_resolve, fail) => { reject = fail; }));
+    render(<RemindersPanel conversationId="owner" />);
+    const status = screen.getByRole('status');
+    expect(status).toBeEmptyDOMElement();
+    await act(async () => { reject(new Error('Load failed')); });
+    expect(status).toHaveTextContent('Reminder list: Reminders not loaded');
+  });
+
+  it('retains due cards as explicitly stale through repeated failures, then clears the status on reconnect', async () => {
+    vi.mocked(api.listReminders).mockResolvedValueOnce([reminder({ state: { kind: 'due', occurred_at_us: 2 } })])
+      .mockRejectedValueOnce(new Error('Load failed')).mockRejectedValueOnce(new Error('Load failed'))
+      .mockResolvedValue([reminder({ state: { kind: 'due', occurred_at_us: 2 } })]);
+    render(<RemindersPanel conversationId="owner" />);
+    expect(await screen.findByText('Reminder due')).toBeInTheDocument();
+    fireEvent.focus(window);
+    await screen.findByText('Reminders may be out of date');
+    const status = screen.getByRole('status');
+    expect(status).toHaveTextContent('Reminder list: Reminders may be out of date');
+    expect(screen.getByText('Inspect Safari')).toBeInTheDocument();
+    expect(screen.getAllByRole('status')).toHaveLength(1);
+    fireEvent.focus(window);
+    await waitFor(() => expect(api.listReminders).toHaveBeenCalledTimes(3));
+    expect(screen.getAllByRole('status')).toHaveLength(1);
+    window.dispatchEvent(new Event('online'));
+    await waitFor(() => expect(screen.queryByText('Reminders may be out of date')).not.toBeInTheDocument());
+    expect(screen.getByText('Reminder due')).toBeInTheDocument();
+    expect(api.listReminders).toHaveBeenCalledTimes(4);
+  });
+
+  it('distinguishes a previously loaded empty list from an unknown initial failure', async () => {
+    vi.mocked(api.listReminders).mockResolvedValueOnce([]).mockRejectedValueOnce(new Error('Load failed'));
+    render(<RemindersPanel conversationId="owner" />);
+    await waitFor(() => expect(api.listReminders).toHaveBeenCalledTimes(1));
+    fireEvent.focus(window);
+    await screen.findByText('Reminders may be out of date');
+    expect(screen.getByRole('status')).toHaveTextContent('Reminders may be out of date');
+    expect(screen.queryByRole('region', { name: 'Reminders' })).not.toBeInTheDocument();
+  });
+
+  it('keeps an uncertain cancellation actionable without silently replaying the mutation', async () => {
+    vi.mocked(api.listReminders).mockResolvedValueOnce([reminder()]).mockRejectedValueOnce(new Error('Load failed'));
+    vi.mocked(api.manageReminder).mockRejectedValue(new Error('Network error'));
+    render(<RemindersPanel conversationId="owner" />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel reminder' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not cancel reminder: Network error');
+    expect(screen.getByText('Upcoming')).toBeInTheDocument();
+    await screen.findByText('Reminders may be out of date');
+    expect(screen.getByRole('status')).toHaveTextContent('Reminders may be out of date');
+    expect(api.manageReminder).toHaveBeenCalledTimes(1);
+  });
+
+  it('retains a failed reschedule form and marks the list stale if its follow-up refresh fails', async () => {
+    vi.mocked(api.listReminders).mockResolvedValueOnce([reminder()]).mockRejectedValueOnce(new Error('Load failed'));
+    vi.mocked(api.manageReminder).mockRejectedValue(new ApiResponseError('Invalid local date', 400));
+    render(<RemindersPanel conversationId="owner" />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Reschedule' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save reminder time' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not reschedule reminder: Invalid local date');
+    expect(screen.getByRole('button', { name: 'Save reminder time' })).toBeInTheDocument();
+    await screen.findByText('Reminders may be out of date');
+    expect(screen.getByRole('status')).toHaveTextContent('Reminders may be out of date');
+    expect(api.manageReminder).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not present a confirmed cancellation as a refreshed list when the GET fails', async () => {
+    vi.mocked(api.listReminders).mockResolvedValueOnce([reminder()]).mockRejectedValueOnce(new Error('Load failed'));
+    render(<RemindersPanel conversationId="owner" />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel reminder' }));
+    await screen.findByText('Reminders may be out of date');
+    expect(screen.getByRole('status')).toHaveTextContent('Reminders may be out of date');
+    expect(screen.getByText('Cancellation saved — list not refreshed')).toBeInTheDocument();
+    expect(screen.queryByText('Upcoming')).not.toBeInTheDocument();
+    expect(screen.queryByText('Cancelled')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Cancel reminder' })).not.toBeInTheDocument();
+    expect(api.manageReminder).toHaveBeenCalledTimes(1);
+  });
+
+  it('aborts a stalled pre-mutation GET and starts a new one after a confirmed cancellation', async () => {
+    let oldSignal: AbortSignal | undefined;
+    vi.mocked(api.listReminders).mockResolvedValueOnce([reminder()])
+      .mockImplementationOnce((_id, signal) => {
+        oldSignal = signal;
+        return new Promise<Reminder[]>(() => {});
+      })
+      .mockRejectedValueOnce(new Error('Load failed'));
+    render(<RemindersPanel conversationId="owner" />);
+    await screen.findByRole('button', { name: 'Cancel reminder' });
+    fireEvent.focus(window);
+    await waitFor(() => expect(api.listReminders).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel reminder' }));
+    await screen.findByText('Cancellation saved — list not refreshed');
+    await waitFor(() => expect(api.listReminders).toHaveBeenCalledTimes(3));
+    expect(oldSignal?.aborted).toBe(true);
+    await screen.findByText('Reminders may be out of date');
+    expect(screen.queryByText('Upcoming')).not.toBeInTheDocument();
+  });
+
   it('shows upcoming and durable due cards independently of a model response', async () => {
     vi.mocked(api.listReminders).mockResolvedValue([reminder(), reminder({ id: 'due', text: 'Capture storage', state: { kind: 'due', occurred_at_us: 2 } })]);
     render(<RemindersPanel conversationId="owner" />);
