@@ -764,8 +764,8 @@ async fn remote_unclassified_claim_closes_receiptless_retry(
 }
 
 async fn remote_claimed_action_survives_enrollment_change(replace: bool) {
-    use crate::federation_enrollment::FederationCredentialVerifier;
     use crate::workflow::LocalAuthorityResult;
+    use phoenix_core::domain::instance_identity::FederationCredentialVerifier;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,

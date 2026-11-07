@@ -361,24 +361,6 @@ impl GoalCommandService {
         self.publication_result(Ok((action, previous, receipt)))
     }
 
-    pub(crate) async fn remote_prepared(
-        &self,
-        authority: &phoenix_db::FederationSendAuthority,
-        reference: uuid::Uuid,
-    ) -> Result<PreparedGoalAction, AppError> {
-        let _pass = self
-            .runtime
-            .acquire_local_authority_pass()
-            .map_err(|()| AppError::Internal("local authority is closed".into()))?;
-        let result = self
-            .runtime
-            .db()
-            .read_remote_coordinator_goal_preparation(authority, reference)
-            .await
-            .map_err(goal_error);
-        self.publication_result(result)
-    }
-
     pub(crate) async fn prepare_coordinator(
         &self,
         caller: &str,

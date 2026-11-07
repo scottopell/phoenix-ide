@@ -355,7 +355,7 @@ fn prepare_observation(
 }
 
 pub(super) enum RemoteCoordinatorGoalClaim {
-    Claimed(RemoteClaimedGoalAction),
+    Claimed(Box<RemoteClaimedGoalAction>),
     Replay(super::user_commands::GoalUserReceipt),
     Unclassified,
 }
@@ -366,7 +366,7 @@ pub(super) struct RemoteClaimedGoalAction {
 }
 
 enum RemoteCoordinatorGoalClaimState {
-    Prepared(RemoteClaimedGoalAction),
+    Prepared(Box<RemoteClaimedGoalAction>),
     Claimed,
     Replay(super::user_commands::GoalUserReceipt),
 }
@@ -397,12 +397,12 @@ async fn remote_claim_state_tx(
     .fetch_one(&mut **tx)
     .await?;
     match state.as_str() {
-        "prepared" => Ok(RemoteCoordinatorGoalClaimState::Prepared(
+        "prepared" => Ok(RemoteCoordinatorGoalClaimState::Prepared(Box::new(
             RemoteClaimedGoalAction {
                 command: input,
                 source,
             },
-        )),
+        ))),
         "claimed" => Ok(RemoteCoordinatorGoalClaimState::Claimed),
         _ => Err(GoalDbError::Integrity("remote Goal claim state")),
     }

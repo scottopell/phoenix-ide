@@ -278,8 +278,7 @@ impl GoalControlAuthority<'_> {
             Self::Coordinator { caller, .. } => {
                 super::prepared::require_coordinator(tx, caller).await?;
             }
-            Self::RemoteCoordinator { .. } => {}
-            Self::Owner => {}
+            Self::RemoteCoordinator { .. } | Self::Owner => {}
         }
         Ok(())
     }
@@ -389,7 +388,7 @@ impl Database {
                 if let Some(pause) = claim_pause {
                     pause.after_claim().await;
                 }
-                let super::prepared::RemoteClaimedGoalAction { command, source } = action;
+                let super::prepared::RemoteClaimedGoalAction { command, source } = *action;
                 let result = self
                     .control_goal_command_with_notification(
                         &command,
