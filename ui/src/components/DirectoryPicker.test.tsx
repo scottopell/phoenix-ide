@@ -143,7 +143,7 @@ describe('DirectoryPicker recent locations', () => {
     const search = screen.getByRole('searchbox', { name: 'Search recent locations' });
     expect(search).toHaveFocus();
     fireEvent.change(search, { target: { value: 'project-20' } });
-    expect(screen.queryByRole('button', { name: paths[0] })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: paths[0]! })).not.toBeInTheDocument();
     const lastPath = paths.at(-1)!;
     const selection = screen.getByRole('button', { name: lastPath });
     fireEvent.click(selection);
@@ -151,7 +151,7 @@ describe('DirectoryPicker recent locations', () => {
     expect(toggle).toHaveAttribute('aria-expanded', 'false');
     expect(toggle).toHaveFocus();
     fireEvent.click(toggle);
-    expect(screen.getByRole('button', { name: paths[0] })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: paths[0]! })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: lastPath })).toHaveAttribute('aria-current', 'true');
   });
 
