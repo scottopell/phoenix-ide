@@ -19,7 +19,7 @@ function OwnedRemindersPanel({ conversationId, readOnly }: { conversationId: str
   const [error, setError] = useState<string | null>(null);
   const [edit, setEdit] = useState<Edit | null>(null);
   const [saving, setSaving] = useState(false);
-  const [confirmedChange, setConfirmedChange] = useState<{ id: string; operation: 'cancel' | 'reschedule' } | null>(null);
+  const [confirmedChanges, setConfirmedChanges] = useState<Record<string, 'cancel' | 'reschedule'>>({});
   const changeEpoch = useRef(0);
   const [refreshVersion, setRefreshVersion] = useState(0);
   const load = useCallback(async (signal: AbortSignal) => {
@@ -31,7 +31,7 @@ function OwnedRemindersPanel({ conversationId, readOnly }: { conversationId: str
     if (epoch !== changeEpoch.current) return;
     setReminders(rows);
     setLoadError(null);
-    setConfirmedChange(null);
+    setConfirmedChanges({});
   }, []);
   const fail = useCallback((failure: unknown) => { setLoadError(failure instanceof Error ? failure.message : 'Failed to load reminders'); }, []);
   const refresh = useReminderRefresh(load, receive, fail);
@@ -49,7 +49,7 @@ function OwnedRemindersPanel({ conversationId, readOnly }: { conversationId: str
       setEdit(null);
       changeEpoch.current += 1;
       committed = true;
-      setConfirmedChange({ id: reminder.id, operation });
+      setConfirmedChanges((changes) => ({ ...changes, [reminder.id]: operation }));
       setRefreshVersion((version) => version + 1);
     } catch (failure) {
       setError(`Could not ${operation} reminder: ${failure instanceof Error ? failure.message : 'request failed'}`);
@@ -67,19 +67,19 @@ function OwnedRemindersPanel({ conversationId, readOnly }: { conversationId: str
     <h2>Reminders</h2>
     {error && <p role="alert">{error}</p>}
     <ul>{displayedReminders.map((reminder) => <li key={reminder.id} className={`reminder-card reminder-card--${reminder.state.kind}`}>
-      <span className="reminder-card__state">{confirmedChange?.id === reminder.id
-        ? `${confirmedChange.operation === 'cancel' ? 'Cancellation' : 'Reschedule'} saved — list not refreshed`
+      <span className="reminder-card__state">{confirmedChanges[reminder.id]
+        ? `${confirmedChanges[reminder.id] === 'cancel' ? 'Cancellation' : 'Reschedule'} saved — list not refreshed`
         : reminder.state.kind === 'due' ? 'Reminder due' : reminder.state.kind === 'cancelled' ? 'Cancelled' : 'Upcoming'}</span>
       <p>{reminder.text}</p>
-      {confirmedChange?.id !== reminder.id && <time dateTime={new Date(reminder.due_at_us / 1000).toISOString()}>{formatReminderTime(reminder)}</time>}
-      {!readOnly && !confirmedChange && reminder.state.kind === 'scheduled' && <div className="reminder-card__actions">
+      {!confirmedChanges[reminder.id] && <time dateTime={new Date(reminder.due_at_us / 1000).toISOString()}>{formatReminderTime(reminder)}</time>}
+      {!readOnly && !confirmedChanges[reminder.id] && reminder.state.kind === 'scheduled' && <div className="reminder-card__actions">
         <button type="button" disabled={saving} onClick={() => {
           setError(null);
           setEdit({ reminder, local: reminderLocalInput(reminder), timezone: reminder.timezone, offset: '' });
         }}>Reschedule</button>
         <button type="button" disabled={saving} onClick={() => { void manage(reminder, 'cancel'); }}>Cancel reminder</button>
       </div>}
-      {edit && edit.reminder.id === reminder.id && reminder.state.kind === 'scheduled' && !readOnly && !confirmedChange && <form className="reminder-edit" onSubmit={(event) => { event.preventDefault(); void manage(edit.reminder, 'reschedule'); }}>
+      {edit && edit.reminder.id === reminder.id && reminder.state.kind === 'scheduled' && !readOnly && !confirmedChanges[reminder.id] && <form className="reminder-edit" onSubmit={(event) => { event.preventDefault(); void manage(edit.reminder, 'reschedule'); }}>
       <label>Local date and time<input required type="datetime-local" step="1" value={edit.local} onChange={(event) => setEdit({ ...edit, local: event.target.value })} /></label>
       <label>IANA timezone<input required value={edit.timezone} onChange={(event) => setEdit({ ...edit, timezone: event.target.value })} /></label>
       <label>UTC offset (optional)<input placeholder="e.g. -04:00" value={edit.offset} onChange={(event) => setEdit({ ...edit, offset: event.target.value })} /></label>

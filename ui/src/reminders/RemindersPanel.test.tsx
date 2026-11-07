@@ -115,6 +115,21 @@ describe('reminder visibility and management', () => {
     expect(api.manageReminder).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps unrelated reminders manageable and both confirmed changes honest during failed refreshes', async () => {
+    vi.mocked(api.listReminders).mockResolvedValueOnce([reminder(), reminder({ id: 'rem-2', text: 'Second task' })])
+      .mockRejectedValue(new Error('Load failed'));
+    render(<RemindersPanel conversationId="owner" />);
+    expect(await screen.findByText('Second task')).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole('button', { name: 'Cancel reminder' })[0]);
+    await screen.findByText('Cancellation saved — list not refreshed');
+    expect(screen.getByRole('button', { name: 'Cancel reminder' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel reminder' }));
+    await waitFor(() => expect(screen.getAllByText('Cancellation saved — list not refreshed')).toHaveLength(2));
+    expect(screen.queryByRole('button', { name: 'Cancel reminder' })).not.toBeInTheDocument();
+    expect(api.manageReminder).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(api.manageReminder).mock.calls.map((call) => call[1])).toEqual(['rem-1', 'rem-2']);
+  });
+
   it('aborts a stalled pre-mutation GET and starts a new one after a confirmed cancellation', async () => {
     let oldSignal: AbortSignal | undefined;
     vi.mocked(api.listReminders).mockResolvedValueOnce([reminder()])
