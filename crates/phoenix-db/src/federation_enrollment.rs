@@ -13,6 +13,10 @@ pub struct FederationSendAuthority {
 }
 
 impl FederationSendAuthority {
+    pub(crate) fn caller_instance_id(&self) -> &InstanceId {
+        &self.caller_instance_id
+    }
+
     #[must_use]
     pub fn new(
         caller_instance_id: InstanceId,
@@ -27,6 +31,7 @@ impl FederationSendAuthority {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FederationSendIdentityJournal {
+    Continuation,
     DirectTurn,
     SteeringReceipt,
 }
@@ -65,7 +70,36 @@ pub(crate) async fn require_federation_send_identity_owner_tx(
     conversation_id: &str,
     journal: FederationSendIdentityJournal,
 ) -> DbResult<()> {
+    let continuation_conflict: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM continuation_dispatch_intents WHERE message_id = ?1
+             UNION ALL
+             SELECT 1 FROM federated_continuation_receipts WHERE first_message_id = ?1
+             UNION ALL
+             SELECT 1 FROM completed_continuation_handoffs
+             WHERE accepted_successor_message_id = ?1
+                OR accepted_successor_message_id = successor_conversation_id || ':' || ?1
+         )",
+    )
+    .bind(admitted_message_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if continuation_conflict {
+        return Err(DbError::FederationSendIdentityConflict);
+    }
     let identity_conflict: bool = match journal {
+        FederationSendIdentityJournal::Continuation => {
+            sqlx::query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1 FROM durable_turns WHERE client_turn_key = ?1
+                     UNION ALL
+                     SELECT 1 FROM steering_acceptance_receipts WHERE message_id = ?1
+                 )",
+            )
+            .bind(admitted_message_id)
+            .fetch_one(&mut **tx)
+            .await?
+        }
         FederationSendIdentityJournal::DirectTurn => {
             sqlx::query_scalar(
                 "SELECT EXISTS(

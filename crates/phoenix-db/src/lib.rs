@@ -59,6 +59,7 @@ pub use automatic_continuation_settings::{
 mod native_continuation;
 pub use native_continuation::{
     CoordinatorContinuationOpening, CurrentCoordinatorContinuationRequest,
+    FederatedContinuationSource, FederatedCoordinatorContinuationRequest,
 };
 mod product_conversation_rename;
 pub use product_conversation_rename::{
