@@ -52,7 +52,7 @@ function pageHasSettled(root: HTMLElement, scenario: ProductConversationScenario
   if (scenario.reminderFixture) {
     const settled = document.documentElement.dataset['productConversationFixtureReminderState'];
     if (settled !== 'loaded' && settled !== 'failed') return false;
-    if (settled === 'failed' && !root.textContent?.includes('Retry reminders')) return false;
+    if (settled === 'failed' && !root.querySelector('.reminders-fetch-status, .reminders-panel')) return false;
     if (settled === 'loaded' && scenario.reminderFixture.reminders.length > 0 && !root.querySelector('.reminders-panel')) return false;
   }
   const page = root.querySelector('[data-testid="product-conversation-page"]');

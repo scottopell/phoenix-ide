@@ -29,7 +29,19 @@ runSurfaceCapture({
       await retry.waitFor({ state: 'visible' });
       assert.equal(await page.getByRole('region', { name: 'Reminders' }).count(), 0, 'initial GET failure must not produce a bordered panel');
       assert.ok(await page.locator('.reminders-fetch-status').evaluate((node) => node.getBoundingClientRect().height < 60), 'initial fetch failure must stay compact');
-      await page.screenshot({ path: path.join(outDir, `${id}--${viewport.name}--initial-failure.png`), fullPage: false });
+      const initialFailure = await page.evaluate(() => {
+        const selectors = ['.reminders-fetch-status', '#input-area', '.product-conversation-page__composer', '.product-conversation-page__transcript'];
+        const geometry = Object.fromEntries(selectors.map((selector) => {
+          const rect = document.querySelector(selector)?.getBoundingClientRect();
+          return [selector, rect ? { x: rect.x, y: rect.y, width: rect.width, height: rect.height, bottom: rect.bottom } : null];
+        }));
+        return { geometry, document: { width: document.documentElement.clientWidth, scrollWidth: document.documentElement.scrollWidth } };
+      });
+      assert.ok(initialFailure.geometry['#input-area']?.height > 0, 'composer must remain visible on failed fetch');
+      assert.ok(initialFailure.document.scrollWidth <= initialFailure.document.width + 1, 'failed fetch must not overflow horizontally');
+      const initialStem = `${id}--${viewport.name}--initial-failure`;
+      await page.screenshot({ path: path.join(outDir, `${initialStem}.png`), fullPage: false });
+      await writeFile(path.join(outDir, `${initialStem}.json`), JSON.stringify({ id, viewport, ...initialFailure }, null, 2));
       await retry.click();
       await page.getByRole('region', { name: 'Reminders' }).waitFor({ state: 'visible' });
       journey.push('initial GET failure → retry → loaded reminders');
