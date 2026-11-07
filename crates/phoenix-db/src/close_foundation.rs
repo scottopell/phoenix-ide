@@ -1809,6 +1809,151 @@ fn encode_aggregate_snapshot_component<'a>(
     encoded
 }
 
+fn parse_close_writer_authority(
+    detector: CloseWriterDetector,
+    kind: &str,
+    access: &str,
+    authority: &str,
+) -> DbResult<CloseWriterAuthority> {
+    let invalid = || DbError::Serialization("malformed Close writer observation".into());
+    let authority = match (detector, kind, access, authority) {
+        (
+            CloseWriterDetector::LinuxDescriptor | CloseWriterDetector::MacDescriptor,
+            "directory",
+            access,
+            "namespace",
+        ) => CloseWriterAuthority::DirectoryDescriptor(match access {
+            "read_only" => CloseDescriptorAccess::ReadOnly,
+            "write_only" => CloseDescriptorAccess::WriteOnly,
+            "read_write" => CloseDescriptorAccess::ReadWrite,
+            _ => return Err(invalid()),
+        }),
+        (
+            CloseWriterDetector::LinuxDescriptor | CloseWriterDetector::MacDescriptor,
+            "regular_file",
+            access,
+            "content",
+        ) => CloseWriterAuthority::WritableFile(match access {
+            "write_only" => CloseFileWriteAccess::WriteOnly,
+            "read_write" => CloseFileWriteAccess::ReadWrite,
+            _ => return Err(invalid()),
+        }),
+        (
+            CloseWriterDetector::LinuxCwd | CloseWriterDetector::MacCwd,
+            "cwd",
+            "relative_lookup",
+            "namespace",
+        ) => CloseWriterAuthority::WorkingDirectory,
+        (
+            CloseWriterDetector::LinuxMapping | CloseWriterDetector::MacMapping,
+            "mapping",
+            "write_shared",
+            "content",
+        ) => CloseWriterAuthority::WritableSharedMapping,
+        _ => return Err(invalid()),
+    };
+    Ok(authority)
+}
+
+fn parse_close_writer_observation_row(
+    row: SqliteRow,
+    run: &CloseRunRef,
+    scope: &WorkScopeId,
+) -> DbResult<RecordCloseWriterObservationRequest> {
+    let invalid = || DbError::Serialization("malformed Close writer observation".into());
+    let detector = match row.try_get::<&str, _>("detector")? {
+        "linux_descriptor" => CloseWriterDetector::LinuxDescriptor,
+        "linux_cwd" => CloseWriterDetector::LinuxCwd,
+        "linux_mapping" => CloseWriterDetector::LinuxMapping,
+        "mac_descriptor" => CloseWriterDetector::MacDescriptor,
+        "mac_cwd" => CloseWriterDetector::MacCwd,
+        "mac_mapping" => CloseWriterDetector::MacMapping,
+        _ => return Err(invalid()),
+    };
+    let pid = row
+        .try_get::<Option<i64>, _>("pid")?
+        .map(|pid| {
+            u32::try_from(pid)
+                .ok()
+                .filter(|pid| *pid != 0)
+                .ok_or_else(invalid)
+        })
+        .transpose()?;
+    let incarnation: Option<String> = row.try_get("incarnation")?;
+    let executable: Option<Vec<u8>> = row.try_get("executable")?;
+    let matched_path: Option<Vec<u8>> = row.try_get("matched_path")?;
+    let kind: Option<&str> = row.try_get("matched_kind")?;
+    let access: Option<&str> = row.try_get("access")?;
+    let authority: Option<&str> = row.try_get("authority")?;
+    let gap: Option<&str> = row.try_get("gap")?;
+    let observation = match (
+        gap,
+        incarnation,
+        executable,
+        matched_path,
+        kind,
+        access,
+        authority,
+    ) {
+        (Some(gap), None, None, None, None, None, None) => {
+            let reason = match gap {
+                "unavailable" => CloseWriterGap::Unavailable,
+                "malformed" => CloseWriterGap::Malformed,
+                "process_changed" => CloseWriterGap::ProcessChanged,
+                "descriptor_changed" => CloseWriterGap::DescriptorChanged,
+                "unsupported" => CloseWriterGap::Unsupported,
+                _ => return Err(invalid()),
+            };
+            CloseWriterObservation::InspectionGap {
+                detector,
+                pid,
+                reason,
+            }
+        }
+        (
+            None,
+            Some(incarnation),
+            Some(executable),
+            Some(matched_path),
+            Some(kind),
+            Some(access),
+            Some(authority),
+        ) => {
+            let authority = parse_close_writer_authority(detector, kind, access, authority)?;
+            CloseWriterObservation::Authority {
+                detector,
+                process: CloseWriterProcess {
+                    pid: pid.ok_or_else(invalid)?,
+                    incarnation: OpaqueIdentity::parse(incarnation)
+                        .map_err(|error| DbError::Serialization(error.to_string()))?,
+                    executable: decode_close_writer_path(executable)?,
+                },
+                matched_path: decode_close_writer_path(matched_path)?,
+                authority,
+            }
+        }
+        _ => return Err(invalid()),
+    };
+    let resource = parse_cleanup_resource_identity(&row)?;
+    if resource.kind() != RetiredResourceKind::Worktree
+        || row.try_get::<&str, _>("identity_value")?
+            != row.try_get::<&str, _>("captured_worktree_identity")?
+    {
+        return Err(invalid());
+    }
+    Ok(RecordCloseWriterObservationRequest {
+        run: run.clone(),
+        scope: scope.clone(),
+        snapshot: CloseRetirementSnapshot::parse(
+            row.try_get::<String, _>("inspection_generation")?,
+            row.try_get::<String, _>("inspection_fingerprint")?,
+        )
+        .map_err(|error| DbError::Serialization(error.to_string()))?,
+        resource,
+        observation,
+    })
+}
+
 // The close-foundation database API intentionally exposes `DbResult` for
 // storage failures from sqlx, row decoding/serialization failures, and explicit
 // close-foundation precondition/not-found errors enforced by this module.
@@ -4938,92 +5083,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await?
         .into_iter()
-        .map(|row| {
-            let invalid = || DbError::Serialization("malformed Close writer observation".into());
-            let detector = match row.try_get::<&str, _>("detector")? {
-                "linux_descriptor" => CloseWriterDetector::LinuxDescriptor,
-                "linux_cwd" => CloseWriterDetector::LinuxCwd,
-                "linux_mapping" => CloseWriterDetector::LinuxMapping,
-                "mac_descriptor" => CloseWriterDetector::MacDescriptor,
-                "mac_cwd" => CloseWriterDetector::MacCwd,
-                "mac_mapping" => CloseWriterDetector::MacMapping,
-                _ => return Err(invalid()),
-            };
-            let pid = row.try_get::<Option<i64>, _>("pid")?
-                .map(|pid| u32::try_from(pid).ok().filter(|pid| *pid != 0).ok_or_else(invalid))
-                .transpose()?;
-            let incarnation: Option<String> = row.try_get("incarnation")?;
-            let executable: Option<Vec<u8>> = row.try_get("executable")?;
-            let matched_path: Option<Vec<u8>> = row.try_get("matched_path")?;
-            let kind: Option<&str> = row.try_get("matched_kind")?;
-            let access: Option<&str> = row.try_get("access")?;
-            let authority: Option<&str> = row.try_get("authority")?;
-            let gap: Option<&str> = row.try_get("gap")?;
-            let observation = match (gap, incarnation, executable, matched_path, kind, access, authority) {
-                (Some(gap), None, None, None, None, None, None) => {
-                    let reason = match gap {
-                        "unavailable" => CloseWriterGap::Unavailable,
-                        "malformed" => CloseWriterGap::Malformed,
-                        "process_changed" => CloseWriterGap::ProcessChanged,
-                        "descriptor_changed" => CloseWriterGap::DescriptorChanged,
-                        "unsupported" => CloseWriterGap::Unsupported,
-                        _ => return Err(invalid()),
-                    };
-                    CloseWriterObservation::InspectionGap { detector, pid, reason }
-                }
-                (None, Some(incarnation), Some(executable), Some(matched_path), Some(kind), Some(access), Some(authority)) => {
-                    let authority = match (detector, kind, access, authority) {
-                        (CloseWriterDetector::LinuxDescriptor | CloseWriterDetector::MacDescriptor, "directory", access, "namespace") => {
-                            CloseWriterAuthority::DirectoryDescriptor(match access {
-                                "read_only" => CloseDescriptorAccess::ReadOnly,
-                                "write_only" => CloseDescriptorAccess::WriteOnly,
-                                "read_write" => CloseDescriptorAccess::ReadWrite,
-                                _ => return Err(invalid()),
-                            })
-                        }
-                        (CloseWriterDetector::LinuxDescriptor | CloseWriterDetector::MacDescriptor, "regular_file", access, "content") => {
-                            CloseWriterAuthority::WritableFile(match access {
-                                "write_only" => CloseFileWriteAccess::WriteOnly,
-                                "read_write" => CloseFileWriteAccess::ReadWrite,
-                                _ => return Err(invalid()),
-                            })
-                        }
-                        (CloseWriterDetector::LinuxCwd | CloseWriterDetector::MacCwd, "cwd", "relative_lookup", "namespace") => CloseWriterAuthority::WorkingDirectory,
-                        (CloseWriterDetector::LinuxMapping | CloseWriterDetector::MacMapping, "mapping", "write_shared", "content") => CloseWriterAuthority::WritableSharedMapping,
-                        _ => return Err(invalid()),
-                    };
-                    CloseWriterObservation::Authority {
-                        detector,
-                        process: CloseWriterProcess {
-                            pid: pid.ok_or_else(invalid)?,
-                            incarnation: OpaqueIdentity::parse(incarnation)
-                                .map_err(|error| DbError::Serialization(error.to_string()))?,
-                            executable: decode_close_writer_path(executable)?,
-                        },
-                        matched_path: decode_close_writer_path(matched_path)?,
-                        authority,
-                    }
-                }
-                _ => return Err(invalid()),
-            };
-            let resource = parse_cleanup_resource_identity(&row)?;
-            if resource.kind() != RetiredResourceKind::Worktree
-                || row.try_get::<&str, _>("identity_value")?
-                    != row.try_get::<&str, _>("captured_worktree_identity")?
-            {
-                return Err(invalid());
-            }
-            Ok(RecordCloseWriterObservationRequest {
-                run: run.clone(),
-                scope: scope.clone(),
-                snapshot: CloseRetirementSnapshot::parse(
-                    row.try_get::<String, _>("inspection_generation")?,
-                    row.try_get::<String, _>("inspection_fingerprint")?,
-                ).map_err(|error| DbError::Serialization(error.to_string()))?,
-                resource,
-                observation,
-            })
-        })
+        .map(|row| parse_close_writer_observation_row(row, run, scope))
         .collect()
     }
 
@@ -12860,13 +12920,10 @@ mod tests {
         .await
         .unwrap();
         let run = db
-            .get_close_attempt_dto(&failure.attempt_id)
+            .get_close_run(&CloseRunRef::initial(failure.attempt_id.clone()))
             .await
             .unwrap()
-            .runs
-            .current()
-            .run
-            .clone();
+            .run;
         (
             RecordCloseWriterObservationRequest {
                 run,
@@ -13238,7 +13295,7 @@ mod tests {
         changed.run.attempt_id = CloseAttemptId::parse("other-attempt").unwrap();
         mutations.push(changed);
         let mut changed = request.clone();
-        changed.run.ordinal = phoenix_core::domain::CloseRunOrdinal::parse(2).unwrap();
+        changed.run.ordinal = CloseRunOrdinal::parse(2).unwrap();
         mutations.push(changed);
         let mut changed = request.clone();
         changed.resource =
