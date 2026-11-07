@@ -13337,11 +13337,10 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn migration_156_preserves_populated_local_goal_ledger_and_schema() {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("migration-156.db");
+        let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+        let pool = db.pool().clone();
         run_through_for_test(&pool, 155).await.unwrap();
         sqlx::raw_sql(
             "INSERT INTO product_conversations(id,kind,ordinary_lifecycle) VALUES('owner','ordinary','open');

@@ -1286,7 +1286,7 @@ pub(crate) struct RemoteApplyGoalRequest {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum RemoteGoalApplyClassification {
-    Accepted,
+    Accepted {},
     Rejected { reason: RemoteGoalApplyRefusal },
 }
 
@@ -1312,8 +1312,8 @@ impl RemoteApplyGoalResponse {
         caller: InstanceId,
         destination: InstanceId,
         reference: uuid::Uuid,
-        prepared: phoenix_db::conversation_goals::prepared::PreparedGoalAction,
-        receipt: phoenix_db::conversation_goals::user_commands::GoalUserReceipt,
+        prepared: &phoenix_db::conversation_goals::prepared::PreparedGoalAction,
+        receipt: &phoenix_db::conversation_goals::user_commands::GoalUserReceipt,
     ) -> Result<Self, Box<Response>> {
         use phoenix_core::domain::conversation_goal::GoalPreparationSource;
         use phoenix_db::conversation_goals::user_commands::GoalUserResult;
@@ -1328,8 +1328,8 @@ impl RemoteApplyGoalResponse {
                 "remote preparation receipt identity mismatch",
             )));
         }
-        let result = match receipt.result {
-            GoalUserResult::Accepted { .. } => RemoteGoalApplyClassification::Accepted,
+        let result = match &receipt.result {
+            GoalUserResult::Accepted { .. } => RemoteGoalApplyClassification::Accepted {},
             GoalUserResult::Rejected { reason, .. } => RemoteGoalApplyClassification::Rejected {
                 reason: match reason {
                     phoenix_db::conversation_goals::user_commands::GoalUserRefusal::Version => {
@@ -1476,8 +1476,8 @@ pub async fn apply_goal(
                     peer.caller_instance_id,
                     destination,
                     request.action_reference,
-                    action,
-                    receipt,
+                    &action,
+                    &receipt,
                 ) {
                     Ok(response) => Json(response).into_response(),
                     Err(error) => *error,
@@ -3084,7 +3084,7 @@ mod tests {
             caller_instance_id: caller,
             destination_instance_id: destination,
             action_reference,
-            result: RemoteGoalApplyClassification::Accepted,
+            result: RemoteGoalApplyClassification::Accepted {},
         };
         assert!(response.verify(&request, caller, destination).is_ok());
         assert!(response
@@ -3120,6 +3120,19 @@ mod tests {
             );
             assert!(serde_json::to_vec(&value).unwrap().len() < MAX_REMOTE_RESPONSE_BYTES);
         }
+
+        assert!(
+            serde_json::from_value::<RemoteApplyGoalResponse>(serde_json::json!({
+                "caller_instance_id": caller,
+                "destination_instance_id": destination,
+                "action_reference": action_reference,
+                "result": {
+                    "outcome": "accepted",
+                    "entry": {"objective": large_objective},
+                },
+            }))
+            .is_err()
+        );
 
         assert!(
             serde_json::from_value::<RemoteGoalApplyClassification>(serde_json::json!({

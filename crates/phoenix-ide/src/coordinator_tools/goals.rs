@@ -485,7 +485,7 @@ impl GoalTool {
                         .map_err(GoalTool::refusal_message)?;
                     let accepted = matches!(
                         response.result,
-                        crate::api::federation::RemoteGoalApplyClassification::Accepted
+                        crate::api::federation::RemoteGoalApplyClassification::Accepted {}
                     );
                     Ok::<_, String>((
                         accepted,

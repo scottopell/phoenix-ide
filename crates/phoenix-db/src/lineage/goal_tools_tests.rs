@@ -31,8 +31,27 @@ async fn seed_real_145_receipt(db: &Database, owner: &str) -> String {
     let source = coordinator.product_conversation_id.to_string();
     sqlx::query("INSERT INTO conversation_goal_actors(actor_id,owner_id,kind,source_product_id,transcript_id,workflow_id,turn_id,message_id,tool_use_id) VALUES (2,?,'coordinator',?,?,1,1,'migration-agent','migration-tool')")
         .bind(owner).bind(&source).bind(&coordinator.id).execute(db.pool()).await.unwrap();
-    sqlx::query("INSERT INTO conversation_goal_preparations(reference,owner_id,caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,tool_use_id,operation,expected_version,observed_goal_id,objective,disposition,reason) VALUES (zeroblob(16),?,?,?,1,1,'migration-agent','migration-tool','state',1,'legacy-goal',NULL,'blocked','waiting')")
-        .bind(owner).bind(&coordinator.id).bind(&source).execute(db.pool()).await.unwrap();
+    let has_source_kind: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM pragma_table_info('conversation_goal_preparations')
+             WHERE name='source_kind'
+         )",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let preparation_insert = if has_source_kind {
+        "INSERT INTO conversation_goal_preparations(reference,owner_id,source_kind,caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,tool_use_id,operation,expected_version,observed_goal_id,objective,disposition,reason) VALUES (zeroblob(16),?,'local',?,?,1,1,'migration-agent','migration-tool','state',1,'legacy-goal',NULL,'blocked','waiting')"
+    } else {
+        "INSERT INTO conversation_goal_preparations(reference,owner_id,caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,tool_use_id,operation,expected_version,observed_goal_id,objective,disposition,reason) VALUES (zeroblob(16),?,?,?,1,1,'migration-agent','migration-tool','state',1,'legacy-goal',NULL,'blocked','waiting')"
+    };
+    sqlx::query(preparation_insert)
+        .bind(owner)
+        .bind(&coordinator.id)
+        .bind(&source)
+        .execute(db.pool())
+        .await
+        .unwrap();
     let mut tx = db.pool().begin().await.unwrap();
     sqlx::query("INSERT INTO conversation_goal_coordinator_receipts(preparation_reference,owner_id,outcome,result_version,recorded_at_us) VALUES (zeroblob(16),?,'accepted',2,2)")
         .bind(owner).execute(&mut *tx).await.unwrap();

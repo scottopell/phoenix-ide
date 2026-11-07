@@ -443,6 +443,7 @@ async fn remote_preparation_replay_is_idempotent_and_changed_payload_conflicts()
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn remote_preparation_reference_is_scoped_to_current_enrollment_peer() {
     use phoenix_core::domain::instance_identity::{FederationCredentialVerifier, InstanceId};
 
