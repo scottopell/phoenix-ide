@@ -54,7 +54,7 @@ fn apply_self_goal_round_commit(
     }
 }
 
-impl<S: Storage + 'static, L: LlmClient + 'static, T: ToolExecutor + 'static>
+impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'static>
     ConversationRuntime<S, L, T>
 {
     pub(super) async fn prepare_self_goal(&self, tool: ToolCall) -> Result<Option<Event>, String> {

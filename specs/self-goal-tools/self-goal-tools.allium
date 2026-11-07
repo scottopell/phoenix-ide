@@ -41,14 +41,14 @@ entity Operation {
 }
 
 rule ExplicitDisable {
-    when: DisableRequested(owner: Owner)
+    when: DisableRequested(owner)
     ensures:
         owner.enabled = false
         owner.disable_epoch = owner.disable_epoch + 1
 }
 
 rule AdmitTurn {
-    when: TurnAdmitted(admission: Admission)
+    when: TurnAdmitted(admission)
     ensures:
         admission.disable_epoch = admission.owner.disable_epoch
 }

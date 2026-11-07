@@ -2418,7 +2418,7 @@ impl MessageStore for DatabaseStorage {
         operation: phoenix_core::domain::conversation_goal::SelfGoalOperation,
     ) -> Result<phoenix_core::domain::conversation_goal::PendingSelfGoal, String> {
         let turn_id = i64::try_from(turn.turn_id.0).map_err(|e| e.to_string())?;
-        let generation = i64::try_from(turn.generation.0).map_err(|e| e.to_string())?;
+        let generation = i64::try_from(turn.generation).map_err(|e| e.to_string())?;
         self.db
             .prepare_self_goal_tool(
                 transcript,

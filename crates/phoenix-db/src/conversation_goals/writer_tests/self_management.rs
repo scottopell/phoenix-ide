@@ -53,24 +53,8 @@ impl SelfRound {
         operations: Vec<SelfGoalOperation>,
     ) -> Self {
         release(db, &owner).await;
-        let accepted = db
-            .accept_direct_turn(
-                &transcript,
-                name,
-                name,
-                b"self-goal",
-                AdmissionDisposition::Runtime,
-                &runtime_input(),
-                None,
-            )
-            .await
-            .unwrap()
-            .0;
-        let execution = GoalExecution::parse(
-            i64::try_from(accepted.workflow_id.0).unwrap(),
-            i64::try_from(accepted.turn_id.0).unwrap(),
-        )
-        .unwrap();
+        let execution =
+            accept_execution(&db.workflow_repository(), &runtime_input(&transcript, name)).await;
         let mut round = Self {
             transcript: transcript.clone(),
             owner,
@@ -147,7 +131,18 @@ impl SelfRound {
                 id: id.clone(),
                 input: ToolInput::from_name_and_value(name, input.clone()),
             }),
-            _ => None,
+            ContentBlock::Text { .. }
+            | ContentBlock::Image { .. }
+            | ContentBlock::ToolResult { .. }
+            | ContentBlock::ServerToolUse { .. }
+            | ContentBlock::ToolSearchToolResult { .. }
+            | ContentBlock::WebSearchToolResult { .. }
+            | ContentBlock::WebFetchToolResult { .. }
+            | ContentBlock::CodeExecutionToolResult { .. }
+            | ContentBlock::BashCodeExecutionToolResult { .. }
+            | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+            | ContentBlock::McpToolUse { .. }
+            | ContentBlock::McpToolResult { .. } => None,
         });
         let state = ConvState::ToolExecuting {
             current_tool: calls.next().unwrap(),
@@ -278,7 +273,7 @@ async fn off_create_refuses_then_enable_then_create_in_separate_rounds_without_d
         let counts = effect_counts(&db).await;
         assert_eq!(
             status(&round.commit(&db, replay).await.unwrap().results[0])["reason"],
-            "automatic_continuation_disabled"
+            "auto_continuation_disabled"
         );
         assert!(db.conversation_goal(&round.owner).await.unwrap().is_none());
         round
@@ -484,6 +479,7 @@ async fn forged_pending_source_is_not_an_argument_error_or_a_finalized_success()
     }
 }
 
+#[allow(clippy::too_many_lines)] // Exercises all stale and stopped execution refusal paths together.
 #[tokio::test]
 async fn stale_generation_stop_pause_close_and_continuation_refuse_without_effects() {
     for mutation in [
@@ -589,7 +585,7 @@ async fn stale_generation_stop_pause_close_and_continuation_refuse_without_effec
 }
 
 #[tokio::test]
-async fn every_existing_goal_disposition_refuses_creation_and_enable_without_reactivation() {
+async fn every_existing_goal_disposition_refuses_creation_and_enable_does_not_reactivate() {
     for disposition in [
         GoalDisposition::Underway,
         GoalDisposition::Blocked(text("blocked")),
@@ -640,9 +636,14 @@ async fn every_existing_goal_disposition_refuses_creation_and_enable_without_rea
         let before = db.conversation_goal(&round.owner).await.unwrap();
         let counts = effect_counts(&db).await;
         let committed = round.commit(&db, true).await.unwrap();
-        for result in &committed.results {
-            assert_eq!(status(result)["reason"], "goal_already_exists");
-        }
+        assert_eq!(
+            status(&committed.results[0])["reason"],
+            "goal_already_exists"
+        );
+        assert_eq!(
+            status(&committed.results[1])["status"],
+            "auto_continuation_enabled"
+        );
         assert_eq!(db.conversation_goal(&round.owner).await.unwrap(), before);
         assert!(round.commit(&db, true).await.unwrap().replayed);
         let after = effect_counts(&db).await;

@@ -13,6 +13,11 @@ use crate::Database;
 
 impl Database {
     /// Resolve identity from the active server turn, never from tool arguments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transcript is not the active durable turn,
+    /// or when its persisted identity fields are invalid.
     pub async fn prepare_self_goal_tool(
         &self,
         transcript: &str,
@@ -94,7 +99,19 @@ pub(super) async fn verify_source(
             {
                 Some((name, input))
             }
-            _ => None,
+            ContentBlock::Text { .. }
+            | ContentBlock::Image { .. }
+            | ContentBlock::ToolUse { .. }
+            | ContentBlock::ToolResult { .. }
+            | ContentBlock::ServerToolUse { .. }
+            | ContentBlock::ToolSearchToolResult { .. }
+            | ContentBlock::WebSearchToolResult { .. }
+            | ContentBlock::WebFetchToolResult { .. }
+            | ContentBlock::CodeExecutionToolResult { .. }
+            | ContentBlock::BashCodeExecutionToolResult { .. }
+            | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+            | ContentBlock::McpToolUse { .. }
+            | ContentBlock::McpToolResult { .. } => None,
         })
         .collect();
     let [(name, input)] = calls.as_slice() else {
@@ -110,6 +127,7 @@ pub(super) async fn verify_source(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // One transaction validates admission and applies the operation atomically.
 pub(super) async fn finalize(
     tx: &mut GoalTx<'_>,
     pending: &PendingSelfGoal,
@@ -146,7 +164,7 @@ pub(super) async fn finalize(
             Ok(()) => true,
             Err(super::control::ControlError::AdmissionStopped) => false,
             Err(super::control::ControlError::Storage(error)) => {
-                return Err(GoalDbError::Sqlx(error))
+                return Err(GoalDbError::Sqlx(error));
             }
             Err(_) => return Err(GoalDbError::Integrity("self-goal control authority")),
         };

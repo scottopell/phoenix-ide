@@ -25,10 +25,14 @@ impl From<ToolResult> for ToolRoundResult {
 
 impl ToolRoundResult {
     /// A finalized-only sink must refuse, not omit, an unfinished entry.
+    /// # Errors
+    /// Returns the unchanged pending intent when this result has not been finalized.
     pub fn into_finalized(self) -> Result<ToolResult, Box<Self>> {
         match self {
             Self::Finalized(result) => Ok(result),
-            pending => Err(Box::new(pending)),
+            pending @ (Self::PendingSelfGoal { .. } | Self::PendingGoalReport { .. }) => {
+                Err(Box::new(pending))
+            }
         }
     }
 

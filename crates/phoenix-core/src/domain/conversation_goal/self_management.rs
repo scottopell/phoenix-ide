@@ -20,6 +20,8 @@ impl SelfGoalOperation {
     }
 
     /// Parse only model-controlled arguments. Identity is supplied separately by the runtime.
+    /// # Errors
+    /// Returns an error for an unknown tool name or arguments outside its strict schema.
     pub fn parse(name: &str, input: serde_json::Value) -> Result<Self, String> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
