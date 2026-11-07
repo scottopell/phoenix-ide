@@ -30,7 +30,8 @@ runSurfaceCapture({
     });
     assert.ok(evidence.geometry['.reminders-panel']?.height > 0, 'baseline must render the failure panel');
     assert.notEqual(evidence.geometry['.reminders-panel']?.border, '0px', 'baseline must have a border');
-    assert.ok(evidence.geometry['#input-area']?.height > 0, 'baseline composer must be present');
+    const composer = evidence.geometry['#input-area'];
+    assert.ok(composer?.height > 0 && composer.y >= 0 && composer.bottom <= viewport.height, 'baseline composer must remain in viewport');
     assert.ok(evidence.document.scrollWidth <= evidence.document.width + 1, 'baseline must not overflow horizontally');
     await mkdir(outDir, { recursive: true });
     const stem = `${id}--${viewport.name}--initial-failure`;

@@ -834,6 +834,7 @@ jobs:
           PHOENIX_LADLE: '1'
           BASE_SHA: 5f72f617869e001b534542c3c31d7628db6aeecc
         run: |
+          root="$PWD"
           mkdir -p ui/qa-artifacts/assistant-finalization
           git rev-parse HEAD > ui/qa-artifacts/assistant-finalization/source.txt
           server=''
@@ -869,8 +870,8 @@ jobs:
             cp ui/src/reminders/RemindersPanel.tsx "$baseline_backup/RemindersPanel.tsx"
             cp ui/src/reminders/RemindersPanel.css "$baseline_backup/RemindersPanel.css"
             restore_reminders() {
-              cp "$baseline_backup/RemindersPanel.tsx" ui/src/reminders/RemindersPanel.tsx
-              cp "$baseline_backup/RemindersPanel.css" ui/src/reminders/RemindersPanel.css
+              cp "$baseline_backup/RemindersPanel.tsx" "$root/ui/src/reminders/RemindersPanel.tsx"
+              cp "$baseline_backup/RemindersPanel.css" "$root/ui/src/reminders/RemindersPanel.css"
             }
             trap 'stop_server; restore_reminders' EXIT
             git show "FETCH_HEAD:ui/src/reminders/RemindersPanel.tsx" > ui/src/reminders/RemindersPanel.tsx

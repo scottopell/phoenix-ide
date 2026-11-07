@@ -17,7 +17,8 @@ for (const viewport of viewports) {
   assert.ok(oldPanel && newStatus && oldTranscript && newTranscript, `${viewport}: required bounds missing`);
   assert.ok(oldPanel.height - newStatus.height >= 15, `${viewport}: failed fetch did not save meaningful vertical space`);
   assert.ok(newTranscript.height >= oldTranscript.height + 15, `${viewport}: transcript did not regain space`);
-  assert.ok(after.geometry['#input-area']?.height > 0, `${viewport}: composer absent`);
+  const composer = after.geometry['#input-area'];
+  assert.ok(composer?.height > 0 && composer.y >= 0 && composer.bottom <= after.viewport.height, `${viewport}: composer displaced out of viewport`);
   comparisons.push({ viewport, oldPanelHeight: oldPanel.height, newStatusHeight: newStatus.height,
     oldTranscriptHeight: oldTranscript.height, newTranscriptHeight: newTranscript.height,
     beforeComposer: before.geometry['#input-area'], afterComposer: after.geometry['#input-area'],

@@ -37,7 +37,8 @@ runSurfaceCapture({
         }));
         return { geometry, document: { width: document.documentElement.clientWidth, scrollWidth: document.documentElement.scrollWidth } };
       });
-      assert.ok(initialFailure.geometry['#input-area']?.height > 0, 'composer must remain visible on failed fetch');
+      const composer = initialFailure.geometry['#input-area'];
+      assert.ok(composer?.height > 0 && composer.y >= 0 && composer.bottom <= viewport.height, 'composer must remain inside the viewport on failed fetch');
       assert.ok(initialFailure.document.scrollWidth <= initialFailure.document.width + 1, 'failed fetch must not overflow horizontally');
       const initialStem = `${id}--${viewport.name}--initial-failure`;
       await page.screenshot({ path: path.join(outDir, `${initialStem}.png`), fullPage: false });
