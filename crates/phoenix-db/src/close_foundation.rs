@@ -12905,12 +12905,15 @@ mod tests {
         else {
             panic!("expected exact worktree")
         };
-        set_close_phase(
-            db,
-            failure.attempt_id.as_str(),
-            ClosePhase::RetirementRequested,
-        )
-        .await;
+        // The no-loss public inspection already requested retirement; do not replay a
+        // phase update, since equal-phase writes are not lifecycle transitions.
+        assert_eq!(
+            db.get_close_obligation(failure.attempt_id.as_str())
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::RetirementRequested
+        );
         db.record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
             attempt_id: failure.attempt_id.clone(),
             scope: scope.clone(),
