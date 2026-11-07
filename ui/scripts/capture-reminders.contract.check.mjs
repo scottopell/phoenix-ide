@@ -14,6 +14,9 @@ test('Reminders capture contract has typed scenarios, conversation-scoped GETs a
     assert.ok(stories.includes(`withReminders('${id}'`), `Missing Reminders story scenario ${id}`);
   }
   assert.doesNotMatch(stories, /as ProductConversationScenarioId/);
+  for (const suffix of ['initial-failure', 'loaded-stale-upcoming', 'retry-mutation-rejection']) {
+    assert.ok(capture.includes(`'${suffix}'`), `Capture must use the suffix after product-conversation--reminders-: ${suffix}`);
+  }
   assert.match(capture, /readyAttribute: 'data-reminders-fixture-ready'/);
   assert.match(fixture, /'data-reminders-fixture-ready': scenario.id.slice\('reminders-'.length\)/);
   assert.match(mockApi, /`\/api\/conversations\/\$\{encodeURIComponent\(conversation\.id\)\}\/reminders`/);

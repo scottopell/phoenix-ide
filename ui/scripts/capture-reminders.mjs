@@ -4,9 +4,9 @@ import path from 'node:path';
 import { runSurfaceCapture } from './capture-ladle-surface.mjs';
 
 const storyIds = [
-  'reminders-initial-failure',
-  'reminders-loaded-stale-upcoming',
-  'reminders-retry-mutation-rejection',
+  'initial-failure',
+  'loaded-stale-upcoming',
+  'retry-mutation-rejection',
 ];
 const viewports = [
   { name: 'mobile-375x667', width: 375, height: 667, isMobile: true, hasTouch: true },
