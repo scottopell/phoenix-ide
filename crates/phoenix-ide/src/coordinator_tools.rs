@@ -3398,7 +3398,13 @@ mod tests {
             db: state.db.clone(),
         });
         let own_instance = state.db.instance_id().await.unwrap().to_string();
-        for instance in ["missing-peer".to_string(), own_instance] {
+        for (instance, expected_error) in [
+            ("missing-peer".to_string(), "peer connection not found"),
+            (
+                own_instance,
+                "peer selector resolves to this local instance",
+            ),
+        ] {
             let output = tool
                 .run(
                     json!({
@@ -3414,7 +3420,7 @@ mod tests {
                 !output.is_success(),
                 "unexpected local fallback: {output:?}"
             );
-            assert!(output.output().contains("peer connection not found"));
+            assert!(output.output().contains(expected_error));
             assert!(state
                 .db
                 .get_messages("local-target")

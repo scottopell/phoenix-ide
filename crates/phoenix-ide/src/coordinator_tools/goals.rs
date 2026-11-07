@@ -92,6 +92,11 @@ struct ApplyInput {
     action_reference: Uuid,
 }
 
+enum ApplyRecord {
+    Receipt(Value),
+    Expired(Value),
+}
+
 fn target(value: &str) -> Result<ProductConversationId, String> {
     let id = value.strip_prefix("@conv:").filter(|id| !id.is_empty() && !id.chars().any(char::is_whitespace) && !id.contains('#'))
         .ok_or_else(|| "Use a stable @conv:<product-conversation-id> target returned by conversation discovery; transcript IDs and bare IDs are refused".to_string())?;
@@ -450,11 +455,6 @@ impl GoalTool {
         ctx: &ToolContext,
         route: super::instance::Route<crate::api::federation::ResolvedPeer>,
     ) -> Result<ToolOutput, String> {
-        enum ApplyRecord {
-            Receipt(Value),
-            Expired(Value),
-        }
-
         let args: ApplyInput =
             serde_json::from_value(input).map_err(|error| self.bad_input(&error))?;
         let (accepted, record, next_action) = match route {

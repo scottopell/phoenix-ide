@@ -2,6 +2,7 @@ use super::*;
 use crate::runtime::{deny_gate::CheckedToolCall, ToolExecutor, ToolRegistryExecutor};
 use phoenix_core::domain::{
     db_schema::{InputOrigin, MessageContent},
+    instance_identity::{PeerBearerCredential, PeerTlsTrust},
     llm_types::ContentBlock,
     sm_event::{
         DirectTurnTurnId, PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
@@ -1575,7 +1576,6 @@ async fn goal_tools_omit_or_accept_exact_local_instance_and_reject_invalid_remot
         let output = f.invoke("prepare_goal", json!({"target":f.target(),"instance":selector,"action":{"operation":"create","objective":"no fallback"}})).await;
         assert!(!output.is_success());
     }
-    use phoenix_core::domain::instance_identity::{PeerBearerCredential, PeerTlsTrust};
     let local_id = f.db.instance_id().await.unwrap();
     f.db.save_federation_peer_connection(
         local_id,
