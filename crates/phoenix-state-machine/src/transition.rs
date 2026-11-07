@@ -4732,11 +4732,14 @@ mod tests {
         let terminal_round = aborted
             .effects
             .iter()
-            .find_map(|effect| match effect {
-                Effect::PersistCheckpoint {
+            .find_map(|effect| {
+                let Effect::PersistCheckpoint {
                     data: CheckpointData::ToolRound(round),
-                } => Some(round),
-                _ => None,
+                } = effect
+                else {
+                    return None;
+                };
+                Some(round)
             })
             .unwrap();
         assert_eq!(terminal_round.results()[0], pending);
@@ -4759,11 +4762,14 @@ mod tests {
         let round = second
             .effects
             .iter()
-            .find_map(|effect| match effect {
-                Effect::PersistCheckpoint {
+            .find_map(|effect| {
+                let Effect::PersistCheckpoint {
                     data: CheckpointData::ToolRound(round),
-                } => Some(round),
-                _ => None,
+                } = effect
+                else {
+                    return None;
+                };
+                Some(round)
             })
             .unwrap();
         assert_eq!(round.results()[0], pending);

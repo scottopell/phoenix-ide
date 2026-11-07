@@ -159,10 +159,7 @@ impl SelfRound {
             ),
             pending_sub_agents: vec![],
         };
-        sqlx::query("UPDATE conversations SET state=? WHERE id=?")
-            .bind(serde_json::to_string(&state).unwrap())
-            .bind(&self.transcript)
-            .execute(db.pool())
+        db.update_conversation_state_at(&self.transcript, &state, self.timestamp)
             .await
             .unwrap();
     }
@@ -264,15 +261,13 @@ async fn effect_counts(db: &Database) -> (i64, i64, i64, i64) {
 #[tokio::test]
 async fn no_policy_installers_allow_canonical_enable_then_create() {
     let db = Database::open_in_memory().await.unwrap();
-    let mut round = SelfRound::with_preference(&db, "uninstalled-policies", vec![], false).await;
-
-    round
-        .next(
-            &db,
-            "enable",
-            vec![SelfGoalOperation::EnableAutoContinuation],
-        )
-        .await;
+    let mut round = SelfRound::with_preference(
+        &db,
+        "uninstalled-policies",
+        vec![SelfGoalOperation::EnableAutoContinuation],
+        false,
+    )
+    .await;
     assert_eq!(
         status(&round.commit(&db, false).await.unwrap().results[0])["status"],
         "auto_continuation_enabled"
@@ -650,12 +645,13 @@ async fn stale_generation_stop_pause_close_and_continuation_refuse_without_effec
                 .unwrap();
             }
             "pause" => {
-                sqlx::query("UPDATE conversations SET state=? WHERE id=?")
-                    .bind(serde_json::to_string(&ConvState::Idle).unwrap())
-                    .bind(&round.transcript)
-                    .execute(db.pool())
-                    .await
-                    .unwrap();
+                db.update_conversation_state_at(
+                    &round.transcript,
+                    &ConvState::Idle,
+                    round.timestamp,
+                )
+                .await
+                .unwrap();
             }
             "close" => {
                 db.begin_close_foundation(
@@ -719,28 +715,30 @@ async fn every_existing_goal_disposition_refuses_creation_and_enable_does_not_re
             )
             .await
             .unwrap();
-        let actor = GoalActor::GeneratedHost {
-            action_id: text("existing-state"),
-        };
-        db.apply_conversation_goal(
-            &GoalMutation {
-                owner: owner.clone(),
-                expected_version: first.snapshot().version(),
+        if !matches!(disposition, GoalDisposition::Underway) {
+            let actor = GoalActor::GeneratedHost {
                 action_id: text("existing-state"),
-                attribution: GoalAttribution {
-                    requested_by: actor.clone(),
-                    applied_by: actor,
+            };
+            db.apply_conversation_goal(
+                &GoalMutation {
+                    owner: owner.clone(),
+                    expected_version: first.snapshot().version(),
+                    action_id: text("existing-state"),
+                    attribution: GoalAttribution {
+                        requested_by: actor.clone(),
+                        applied_by: actor,
+                    },
+                    change: GoalChange::SetDisposition {
+                        goal_id: first.snapshot().goal_id().clone(),
+                        disposition,
+                    },
                 },
-                change: GoalChange::SetDisposition {
-                    goal_id: first.snapshot().goal_id().clone(),
-                    disposition,
-                },
-            },
-            &transcript,
-            at(),
-        )
-        .await
-        .unwrap();
+                &transcript,
+                at(),
+            )
+            .await
+            .unwrap();
+        }
         let round = SelfRound::admit(
             &db,
             transcript,
@@ -784,16 +782,15 @@ async fn real_lost_acknowledgements_reopen_and_replay_without_duplicate_effects(
     ] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("self-goal.sqlite");
-        let db = Database::open(path.to_str().unwrap())
-            .await
-            .unwrap()
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::run_pending_migrations(db.pool()).await.unwrap();
+        let db = db
             .install_goal_controls_for_tests()
             .await
             .unwrap()
             .install_goal_execution_for_tests(GoalRequestLimit::parse(2).unwrap())
             .await
             .unwrap();
-        crate::run_pending_migrations(db.pool()).await.unwrap();
         let round = SelfRound::new(&db, "lost-ack", vec![create()]).await;
         let before = effect_counts(&db).await;
         assert!(round.cut(&db, cut).await.is_err());

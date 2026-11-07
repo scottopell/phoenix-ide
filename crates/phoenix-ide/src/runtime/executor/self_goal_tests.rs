@@ -282,7 +282,7 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
     db.set_auto_continue_on_context_exhaustion(&owner, AutoContinueOnContextExhaustion::Disabled)
         .await
         .unwrap();
-    let cancelled = terminal_self_tool(
+    let cancelled = Box::pin(terminal_self_tool(
         &db,
         transcript,
         cwd.path(),
@@ -290,7 +290,7 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
         "enable_auto_continuation",
         serde_json::json!({}),
         true,
-    )
+    ))
     .await;
     assert_eq!(cancelled["reason"], "conversation_stopped_or_paused");
     assert_eq!(
@@ -299,7 +299,7 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
             .unwrap(),
         AutoContinueOnContextExhaustion::Disabled
     );
-    let refused = terminal_self_tool(
+    let refused = Box::pin(terminal_self_tool(
         &db,
         transcript,
         cwd.path(),
@@ -307,11 +307,11 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
         "create_goal",
         serde_json::json!({"objective":"finish approved work"}),
         false,
-    )
+    ))
     .await;
     assert_eq!(refused["reason"], "auto_continuation_disabled");
     assert!(db.conversation_goal(&owner).await.unwrap().is_none());
-    let enabled = terminal_self_tool(
+    let enabled = Box::pin(terminal_self_tool(
         &db,
         transcript,
         cwd.path(),
@@ -319,11 +319,11 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
         "enable_auto_continuation",
         serde_json::json!({}),
         false,
-    )
+    ))
     .await;
     assert_eq!(enabled["status"], "auto_continuation_enabled");
     assert!(db.conversation_goal(&owner).await.unwrap().is_none());
-    let created = terminal_self_tool(
+    let created = Box::pin(terminal_self_tool(
         &db,
         transcript,
         cwd.path(),
@@ -331,7 +331,7 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
         "create_goal",
         serde_json::json!({"objective":"finish approved work"}),
         false,
-    )
+    ))
     .await;
     assert_eq!(created["status"], "goal_created");
     assert_eq!(

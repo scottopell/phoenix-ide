@@ -30304,7 +30304,7 @@ mod goal_report_cancellation_checkpoint_tests {
                 conversation_id,
                 row.sequence_id,
                 row.created_at,
-                &result,
+                result,
             );
             assert_eq!(
                 serde_json::to_value(result.row()).unwrap(),
