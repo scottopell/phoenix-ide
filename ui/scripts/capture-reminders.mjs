@@ -5,6 +5,7 @@ import { runSurfaceCapture } from './capture-ladle-surface.mjs';
 
 const storyIds = [
   'initial-failure',
+  'standalone-initial-failure',
   'loaded-stale-upcoming',
   'retry-mutation-rejection',
 ];
@@ -25,12 +26,12 @@ runSurfaceCapture({
     assert.ok(storyIds.includes(id), `Unexpected Reminders story: ${id}`);
     const journey = [];
     const retry = page.getByRole('button', { name: 'Retry reminders' });
-    if (id === storyIds[0]) {
+    if (id.endsWith('initial-failure')) {
       await retry.waitFor({ state: 'visible' });
       assert.equal(await page.getByRole('region', { name: 'Reminders' }).count(), 0, 'initial GET failure must not produce a bordered panel');
       assert.ok(await page.locator('.reminders-fetch-status').evaluate((node) => node.getBoundingClientRect().height < 60), 'initial fetch failure must stay compact');
       const initialFailure = await page.evaluate(() => {
-        const selectors = ['.reminders-fetch-status', '#input-area', '.product-conversation-page__composer', '.product-conversation-page__transcript'];
+        const selectors = ['.reminders-fetch-status', '#input-area', '.product-conversation-page__composer', '.product-conversation-page__transcript', '#app > .conversation-column #chat-view'];
         const geometry = Object.fromEntries(selectors.map((selector) => {
           const rect = document.querySelector(selector)?.getBoundingClientRect();
           return [selector, rect ? { x: rect.x, y: rect.y, width: rect.width, height: rect.height, bottom: rect.bottom } : null];
@@ -40,20 +41,27 @@ runSurfaceCapture({
       const composer = initialFailure.geometry['#input-area'];
       assert.ok(composer?.height > 0 && composer.y >= 0 && composer.bottom <= viewport.height, 'composer must remain inside the viewport on failed fetch');
       assert.ok(initialFailure.document.scrollWidth <= initialFailure.document.width + 1, 'failed fetch must not overflow horizontally');
+      const transcriptSelector = id === 'standalone-initial-failure' ? '#app > .conversation-column #chat-view' : '.product-conversation-page__transcript';
+      assert.ok(initialFailure.geometry[transcriptSelector]?.height > 0, 'failed fetch must render the route transcript');
       const initialStem = `${id}--${viewport.name}--initial-failure`;
       await page.screenshot({ path: path.join(outDir, `${initialStem}.png`), fullPage: false });
       await writeFile(path.join(outDir, `${initialStem}.json`), JSON.stringify({ id, viewport, ...initialFailure }, null, 2));
+      await retry.focus();
+      assert.equal(await retry.evaluate((button) => document.activeElement === button), true, 'Retry must be keyboard-focusable');
+      if (id === 'standalone-initial-failure') {
+        await page.screenshot({ path: path.join(outDir, `${id}--${viewport.name}--retry-focused.png`), fullPage: false });
+      }
       await retry.click();
       await page.getByRole('region', { name: 'Reminders' }).waitFor({ state: 'visible' });
       journey.push('initial GET failure → retry → loaded reminders');
-    } else if (id === storyIds[1]) {
+    } else if (id === 'loaded-stale-upcoming') {
       await page.getByRole('region', { name: 'Reminders' }).waitFor({ state: 'visible' });
       await page.evaluate(() => window.dispatchEvent(new Event('focus')));
       await retry.waitFor({ state: 'visible' });
       await page.getByText('Reminder due').waitFor({ state: 'visible' });
       await page.getByText('Check the release candidate').waitFor({ state: 'visible' });
       journey.push('loaded due/upcoming reminders → focus refresh failure retains both with stale warning');
-    } else if (id === storyIds[2]) {
+    } else if (id === 'retry-mutation-rejection') {
       await page.getByRole('region', { name: 'Reminders' }).waitFor({ state: 'visible' });
       await page.evaluate(() => window.dispatchEvent(new Event('focus')));
       await retry.waitFor({ state: 'visible' });

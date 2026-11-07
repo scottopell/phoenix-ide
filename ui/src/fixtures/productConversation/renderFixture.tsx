@@ -11,6 +11,7 @@ import { ViewerSlotProvider } from '../../contexts/ViewerSlotContext';
 import { ConversationProvider } from '../../conversation';
 import { useDraftActions } from '../../hooks/useDraft';
 import { ProductConversationPage } from '../../pages/ProductConversationPage';
+import { ConversationPage } from '../../pages/ConversationPage';
 import '../../index.css';
 import { installProductConversationFixtureApi } from './mockApi';
 import type { ProductConversationScenario } from './types';
@@ -54,6 +55,10 @@ function pageHasSettled(root: HTMLElement, scenario: ProductConversationScenario
     if (settled !== 'loaded' && settled !== 'failed') return false;
     if (settled === 'failed' && !root.querySelector('.reminders-fetch-status, .reminders-panel')) return false;
     if (settled === 'loaded' && scenario.reminderFixture.reminders.length > 0 && !root.querySelector('.reminders-panel')) return false;
+  }
+  if (scenario.renderStandaloneConversation) {
+    return root.querySelector('#app > .conversation-column #chat-view') !== null
+      && root.querySelector('#input-area') !== null;
   }
   const page = root.querySelector('[data-testid="product-conversation-page"]');
   if (!page) return false;
@@ -127,7 +132,7 @@ function ProductConversationFixtureBody({ scenario }: Props) {
                   <FileExplorerProvider>
                     <Routes>
                       <Route path="/" element={<Navigate replace to={new URLSearchParams(window.location.search).get('fixtureEntry') ?? (scenario.kind === 'coordinator' ? `/global/${scenario.snapshot.latest_transcript_row_id}${fixtureHash}` : `/product-conversations/fixture-product-conversation${fixtureHash}`)} />} />
-                      <Route path="/c/:slug" element={<FixtureAlias />} />
+                      <Route path="/c/:slug" element={scenario.renderStandaloneConversation ? <ConversationPage /> : <FixtureAlias />} />
                       <Route path="/global" element={<CoordinatorPage />} />
                       <Route path="/global/:slug" element={<CoordinatorPage />} />
                       <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage />} />
