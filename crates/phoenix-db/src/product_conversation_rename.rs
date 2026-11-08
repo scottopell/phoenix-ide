@@ -2,7 +2,8 @@ use phoenix_core::domain::product_conversation::ProductConversationId;
 use serde::Serialize;
 use sqlx::{Connection, Row};
 
-use crate::{Database, DbError, DbResult};
+use crate::{Database, DbError, DbResult, FederationConversationAuthority};
+use phoenix_core::domain::instance_identity::InstanceId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedConversationTitle(String);
@@ -26,6 +27,7 @@ impl NormalizedConversationTitle {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProductConversationRenameSource {
+    pub source_instance_id: InstanceId,
     pub product_conversation_id: ProductConversationId,
     pub transcript_id: String,
     pub message_id: String,
@@ -167,9 +169,38 @@ impl Database {
         .await
     }
 
+    /// # Errors
+    /// Returns an error for inactive enrollment, invalid commands, or database failure.
+    pub async fn rename_product_conversation_as_federation(
+        &self,
+        authority: &FederationConversationAuthority,
+        command: &ProductConversationRenameCommand,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<ProductConversationRenameResult>> {
+        self.rename_product_conversation_authorized(
+            RenameAuthority::Federated(authority),
+            command,
+            RenameCommit::Normal,
+        )
+        .await
+    }
+
     async fn rename_product_conversation_with_commit(
         &self,
         current_gc_transcript_id: &str,
+        command: &ProductConversationRenameCommand,
+        commit: RenameCommit,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<ProductConversationRenameResult>> {
+        self.rename_product_conversation_authorized(
+            RenameAuthority::Local(current_gc_transcript_id),
+            command,
+            commit,
+        )
+        .await
+    }
+
+    async fn rename_product_conversation_authorized(
+        &self,
+        authority: RenameAuthority<'_>,
         command: &ProductConversationRenameCommand,
         commit: RenameCommit,
     ) -> crate::workflow::LocalAuthorityResult<DbResult<ProductConversationRenameResult>> {
@@ -187,23 +218,38 @@ impl Database {
             Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
         };
         let result = async {
-            require_current_gc_tx(&mut tx, current_gc_transcript_id).await?;
-            if command.source.transcript_id != current_gc_transcript_id {
-                return Err(DbError::CurrentCoordinatorRequired);
-            }
-            let source_owner: Option<String> = sqlx::query_scalar(
-                "SELECT product_conversation_id FROM conversations WHERE id = ?1",
-            )
-            .bind(&command.source.transcript_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if source_owner.as_deref() != Some(command.source.product_conversation_id.as_str()) {
-                return Ok(ProductConversationRenameResult::Conflict);
+            let local_instance_id: String = sqlx::query_scalar("SELECT instance_id FROM instance_identity WHERE singleton_key = 1").fetch_one(&mut *tx).await?;
+            let local_instance_id: InstanceId = local_instance_id.parse().map_err(|e: phoenix_core::domain::instance_identity::InstanceIdParseError| DbError::Serialization(e.to_string()))?;
+            match authority {
+                RenameAuthority::Local(transcript_id) => {
+                    require_current_gc_tx(&mut tx, transcript_id).await?;
+                    if command.source.source_instance_id != local_instance_id { return Ok(ProductConversationRenameResult::Conflict); }
+                }
+                RenameAuthority::Federated(peer) => {
+                    peer.require_tx(&mut tx).await?;
+                    if command.source.source_instance_id != peer.caller_instance_id() || peer.caller_instance_id() == local_instance_id {
+                        return Ok(ProductConversationRenameResult::Conflict);
+                    }
+                }
             }
             if let Some(row) = sqlx::query("SELECT * FROM product_conversation_rename_receipts WHERE operation_id = ?1")
                 .bind(&command.operation_id).fetch_optional(&mut *tx).await? {
                 let receipt = decode_receipt(&row)?;
                 return Ok(if same_intent(&receipt, command) { ProductConversationRenameResult::Replayed(receipt) } else { ProductConversationRenameResult::Conflict });
+            }
+            if let RenameAuthority::Local(current_gc_transcript_id) = authority {
+                if command.source.transcript_id != current_gc_transcript_id {
+                    return Err(DbError::CurrentCoordinatorRequired);
+                }
+                let source_owner: Option<String> = sqlx::query_scalar(
+                    "SELECT product_conversation_id FROM conversations WHERE id = ?1",
+                )
+                .bind(&command.source.transcript_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if source_owner.as_deref() != Some(command.source.product_conversation_id.as_str()) {
+                    return Ok(ProductConversationRenameResult::Conflict);
+                }
             }
             let resolved = Self::resolve_ordinary_product_conversation_on(&mut tx, command.product_conversation_id.as_str()).await;
             let resolved = match resolved { Ok(value) => value, Err(DbError::ConversationNotFound(_)) => return Ok(ProductConversationRenameResult::NotFound), Err(DbError::ProductConversationUnavailable(_)) => return Ok(ProductConversationRenameResult::Unavailable), Err(error) => return Err(error) };
@@ -230,8 +276,8 @@ impl Database {
             .await?;
             let Some(slug) = slug else { return Ok(ProductConversationRenameResult::Stale); };
             let now = chrono::Utc::now().timestamp_micros();
-            sqlx::query("INSERT INTO product_conversation_rename_receipts (operation_id, product_conversation_id, name_revision_before, title, source_product_conversation_id, source_transcript_id, source_message_id, source_tool_use_id, naming_root_transcript_id, slug_at_commit, committed_at_unix_micros) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)")
-                .bind(&command.operation_id).bind(command.product_conversation_id.as_str()).bind(revision).bind(command.title.as_str()).bind(command.source.product_conversation_id.as_str()).bind(&command.source.transcript_id).bind(&command.source.message_id).bind(&command.source.tool_use_id).bind(&root_id).bind(&slug).bind(now).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO product_conversation_rename_receipts (operation_id, product_conversation_id, name_revision_before, title, source_product_conversation_id, source_transcript_id, source_message_id, source_tool_use_id, naming_root_transcript_id, slug_at_commit, committed_at_unix_micros, source_instance_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)")
+                .bind(&command.operation_id).bind(command.product_conversation_id.as_str()).bind(revision).bind(command.title.as_str()).bind(command.source.product_conversation_id.as_str()).bind(&command.source.transcript_id).bind(&command.source.message_id).bind(&command.source.tool_use_id).bind(&root_id).bind(&slug).bind(now).bind(command.source.source_instance_id.to_string()).execute(&mut *tx).await?;
             Ok(ProductConversationRenameResult::Applied(ProductConversationRenameReceipt { operation_id: command.operation_id.clone(), product_conversation_id: command.product_conversation_id.clone(), title: command.title.as_str().into(), slug_at_commit: slug, naming_root_transcript_id: root_id, name_revision_before: revision, committed_at_unix_micros: now, source: command.source.clone() }))
         }.await;
         match result {
@@ -245,6 +291,12 @@ impl Database {
             },
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum RenameAuthority<'a> {
+    Local(&'a str),
+    Federated(&'a FederationConversationAuthority),
 }
 
 enum RenameCommit {
@@ -345,8 +397,7 @@ fn same_intent(
         && receipt.naming_root_transcript_id == command.expected_root_transcript_id
         && receipt.name_revision_before == command.expected_name_revision
         && receipt.title == command.title.as_str()
-        && receipt.source.product_conversation_id == command.source.product_conversation_id
-        && receipt.source.transcript_id == command.source.transcript_id
+        && receipt.source == command.source
 }
 
 fn decode_receipt(row: &sqlx::sqlite::SqliteRow) -> DbResult<ProductConversationRenameReceipt> {
@@ -355,6 +406,17 @@ fn decode_receipt(row: &sqlx::sqlite::SqliteRow) -> DbResult<ProductConversation
             .parse::<ProductConversationId>()
             .map_err(|e| DbError::Serialization(e.to_string()))
     };
+    for key in [
+        "source_transcript_id",
+        "source_message_id",
+        "source_tool_use_id",
+    ] {
+        if row.try_get::<String, _>(key)?.trim().is_empty() {
+            return Err(DbError::Serialization(
+                "incomplete native rename source".into(),
+            ));
+        }
+    }
     Ok(ProductConversationRenameReceipt {
         operation_id: row.try_get("operation_id")?,
         product_conversation_id: product("product_conversation_id")?,
@@ -364,6 +426,14 @@ fn decode_receipt(row: &sqlx::sqlite::SqliteRow) -> DbResult<ProductConversation
         name_revision_before: row.try_get("name_revision_before")?,
         committed_at_unix_micros: row.try_get("committed_at_unix_micros")?,
         source: ProductConversationRenameSource {
+            source_instance_id: row
+                .try_get::<String, _>("source_instance_id")?
+                .parse()
+                .map_err(
+                    |e: phoenix_core::domain::instance_identity::InstanceIdParseError| {
+                        DbError::Serialization(e.to_string())
+                    },
+                )?,
             product_conversation_id: product("source_product_conversation_id")?,
             transcript_id: row.try_get("source_transcript_id")?,
             message_id: row.try_get("source_message_id")?,
@@ -392,6 +462,118 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn federated_rename_replays_before_live_lookup_and_preserves_first_foreign_source() {
+        use crate::federation_conversation_authority::enroll_test_peer;
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation("remote-rename-root", "before", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let caller = InstanceId::new();
+        let authority = enroll_test_peer(&db, caller, b"rename-peer").await;
+        let other_caller = InstanceId::new();
+        let other = enroll_test_peer(&db, other_caller, b"rename-other").await;
+        let mut command = test_command(root.id.clone(), 0);
+        command.product_conversation_id = root.product_conversation_id.clone();
+        command.expected_root_transcript_id = root.id.clone();
+        command.source.source_instance_id = caller;
+        command.source.transcript_id = "foreign-source-with-no-local-row".into();
+        command.source.message_id = "foreign-message".into();
+        command.source.tool_use_id = "foreign-tool".into();
+        let ProductConversationRenameResult::Applied(first) = db
+            .rename_product_conversation_as_federation(&authority, &command)
+            .await
+            .established()
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected rename")
+        };
+        assert_eq!(first.source, command.source);
+        assert_eq!(first.title, command.title.as_str());
+        let mut changed_locator = command.clone();
+        changed_locator.source.tool_use_id = "different-call".into();
+        assert_eq!(
+            db.rename_product_conversation_as_federation(&authority, &changed_locator)
+                .await
+                .established()
+                .unwrap()
+                .unwrap(),
+            ProductConversationRenameResult::Conflict
+        );
+        let mut different_owner = command.clone();
+        different_owner.source.source_instance_id = other_caller;
+        assert_eq!(
+            db.rename_product_conversation_as_federation(&other, &different_owner)
+                .await
+                .established()
+                .unwrap()
+                .unwrap(),
+            ProductConversationRenameResult::Conflict
+        );
+        let mut later = command.clone();
+        later.operation_id = uuid::Uuid::new_v4().to_string();
+        later.expected_name_revision = 1;
+        later.title = NormalizedConversationTitle::parse("Later title").unwrap();
+        assert!(matches!(
+            db.rename_product_conversation_as_federation(&authority, &later)
+                .await
+                .established()
+                .unwrap()
+                .unwrap(),
+            ProductConversationRenameResult::Applied(_)
+        ));
+        assert_eq!(
+            db.rename_product_conversation_as_federation(&authority, &command)
+                .await
+                .established()
+                .unwrap()
+                .unwrap(),
+            ProductConversationRenameResult::Replayed(first.clone())
+        );
+        sqlx::query("DELETE FROM conversations WHERE id = ?1")
+            .bind(&root.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.rename_product_conversation_as_federation(&authority, &command)
+                .await
+                .established()
+                .unwrap()
+                .unwrap(),
+            ProductConversationRenameResult::Replayed(first.clone())
+        );
+        let replacement = enroll_test_peer(&db, caller, b"rename-rotated").await;
+        assert!(matches!(
+            db.rename_product_conversation_as_federation(&authority, &command)
+                .await
+                .established()
+                .unwrap(),
+            Err(DbError::FederationSendAuthorityInactive)
+        ));
+        assert_eq!(
+            db.rename_product_conversation_as_federation(&replacement, &command)
+                .await
+                .established()
+                .unwrap()
+                .unwrap(),
+            ProductConversationRenameResult::Replayed(first)
+        );
+        let mut changed = command.clone();
+        changed.title = NormalizedConversationTitle::parse("Changed intent").unwrap();
+        assert_eq!(
+            db.rename_product_conversation_as_federation(&replacement, &changed)
+                .await
+                .established()
+                .unwrap()
+                .unwrap(),
+            ProductConversationRenameResult::Conflict
+        );
+    }
+
+    #[tokio::test]
     async fn committed_rename_with_lost_acknowledgement_is_not_an_ordinary_failure() {
         let db = Database::open_in_memory().await.unwrap();
         let root = db
@@ -405,6 +587,7 @@ mod tests {
         let mut command = test_command(uuid::Uuid::new_v4().to_string(), 0);
         command.product_conversation_id = root.product_conversation_id.clone();
         command.expected_root_transcript_id = root.id.clone();
+        command.source.source_instance_id = db.instance_id().await.unwrap();
         command.source.product_conversation_id = gc.product_conversation_id;
         command.source.transcript_id = gc.id.clone();
         let outcome = db
@@ -503,6 +686,7 @@ mod tests {
         command.product_conversation_id = root.product_conversation_id.clone();
         command.expected_root_transcript_id = root.id.clone();
         command.title = NormalizedConversationTitle::parse("A").unwrap();
+        command.source.source_instance_id = db.instance_id().await.unwrap();
         command.source.product_conversation_id = gc.product_conversation_id;
         command.source.transcript_id = gc.id.clone();
         let ProductConversationRenameResult::Applied(first) = db
@@ -545,8 +729,17 @@ mod tests {
                 .unwrap(),
             ProductConversationRenameResult::Stale
         );
-        command.source.message_id = "retry-message".into();
-        command.source.tool_use_id = "retry-call".into();
+        let mut changed_locator = command.clone();
+        changed_locator.source.message_id = "retry-message".into();
+        changed_locator.source.tool_use_id = "retry-call".into();
+        assert_eq!(
+            db.rename_product_conversation(&gc.id, &changed_locator)
+                .await
+                .established()
+                .unwrap()
+                .unwrap(),
+            ProductConversationRenameResult::Conflict
+        );
         assert_eq!(
             db.rename_product_conversation(&gc.id, &command)
                 .await
@@ -587,6 +780,7 @@ mod tests {
         let mut command = test_command(uuid::Uuid::new_v4().to_string(), detail.name_revision);
         command.product_conversation_id = root.product_conversation_id.clone();
         command.expected_root_transcript_id = root.id.clone();
+        command.source.source_instance_id = db.instance_id().await.unwrap();
         command.source.product_conversation_id = gc.product_conversation_id;
         command.source.transcript_id = gc.id.clone();
         sqlx::query("UPDATE conversations SET archived=1 WHERE id=?1")
@@ -647,6 +841,7 @@ mod tests {
         let mut command = test_command(uuid::Uuid::new_v4().to_string(), 0);
         command.product_conversation_id = root.product_conversation_id.clone();
         command.expected_root_transcript_id = root.id.clone();
+        command.source.source_instance_id = db.instance_id().await.unwrap();
         command.source.product_conversation_id = gc.product_conversation_id.clone();
         command.source.transcript_id = gc.id.clone();
         let ProductConversationRenameResult::Applied(receipt) = db
@@ -716,7 +911,30 @@ mod tests {
             db.read_product_conversation_rename_receipt(&gc.id, &command.operation_id)
                 .await
                 .unwrap(),
-            Some(receipt)
+            Some(receipt.clone())
+        );
+        sqlx::query("UPDATE conversations SET coordinator_head=0 WHERE id=?1")
+            .bind(&gc.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let new_gc = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        assert_ne!(new_gc.id, gc.id);
+        sqlx::query("DELETE FROM conversations WHERE id=?1")
+            .bind(&gc.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.rename_product_conversation(&new_gc.id, &command)
+                .await
+                .established()
+                .unwrap()
+                .unwrap(),
+            ProductConversationRenameResult::Replayed(receipt)
         );
     }
 
@@ -729,6 +947,7 @@ mod tests {
             expected_name_revision: revision,
             title: NormalizedConversationTitle::parse("title").unwrap(),
             source: ProductConversationRenameSource {
+                source_instance_id: InstanceId::new(),
                 product_conversation_id: owner,
                 transcript_id: "source".into(),
                 message_id: "message".into(),

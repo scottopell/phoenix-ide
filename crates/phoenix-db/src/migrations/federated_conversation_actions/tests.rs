@@ -1,0 +1,290 @@
+use super::*;
+use phoenix_core::domain::instance_identity::InstanceId;
+use sqlx::sqlite::SqlitePoolOptions;
+
+fn table_sql(script: &str, name: &str, destination: &str) -> String {
+    let start = script.find(&format!("CREATE TABLE {name} (")).unwrap();
+    let end = start + script[start..].find("\n);").unwrap() + 3;
+    script[start..end].replacen(name, destination, 1)
+}
+
+async fn fixture() -> (SqlitePool, InstanceId) {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::raw_sql("PRAGMA foreign_keys=ON;
+        CREATE TABLE _migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL);
+        CREATE TABLE instance_identity(singleton_key INTEGER PRIMARY KEY CHECK(singleton_key=1),instance_id TEXT NOT NULL);
+        CREATE TABLE products(id TEXT PRIMARY KEY);
+        CREATE TABLE conversations(id TEXT PRIMARY KEY);
+        CREATE TABLE slack_gateway_requests(request_id TEXT PRIMARY KEY);")
+        .execute(&pool).await.unwrap();
+    let local = InstanceId::new();
+    sqlx::query("INSERT INTO instance_identity VALUES(1,?1)")
+        .bind(local.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let create = table_sql(
+        include_str!("../retain_product_creation_receipts.sql"),
+        "product_creation_jobs_phase1",
+        "product_creation_jobs",
+    );
+    let rename = table_sql(
+        include_str!("../retain_product_conversation_rename_receipts.sql"),
+        "product_conversation_rename_receipts_retained",
+        "product_conversation_rename_receipts",
+    );
+    sqlx::raw_sql(sqlx::AssertSqlSafe(create))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(rename))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let retained = include_str!("../retain_product_creation_receipts.sql");
+    let start = retained
+        .find("CREATE TRIGGER creation_slack_origin_insert")
+        .unwrap();
+    let end = retained[start..]
+        .find("INSERT INTO product_creation_job_images")
+        .unwrap()
+        + start;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(&retained[start..end]))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql("CREATE INDEX custom_creation_index ON product_creation_jobs(objective);
+        CREATE INDEX custom_rename_index ON product_conversation_rename_receipts(title);
+        CREATE TABLE trigger_witness(value TEXT NOT NULL);
+        CREATE TRIGGER custom_creation_trigger AFTER INSERT ON product_creation_jobs BEGIN INSERT INTO trigger_witness VALUES(NEW.request_id); END;
+        CREATE TRIGGER custom_rename_trigger AFTER INSERT ON product_conversation_rename_receipts BEGIN INSERT INTO trigger_witness VALUES(NEW.operation_id); END;
+        CREATE TABLE child_witness(request_id TEXT REFERENCES product_creation_jobs(request_id) ON DELETE CASCADE, value TEXT NOT NULL);")
+        .execute(&pool).await.unwrap();
+    (pool, local)
+}
+
+async fn seed_creation(pool: &SqlitePool, request: &str, kind: &str) {
+    sqlx::query("INSERT INTO product_creation_jobs(request_id,product_conversation_id,cwd,objective,llm_language,status,accepted_at_unix_micros,updated_at_unix_micros,objective_origin,objective_source_product_conversation_id,objective_source_transcript_id,objective_source_message_id,objective_source_tool_use_id) VALUES(?1,?2,'/repo','objective','phoenix-native','accepted',1,1,?3,?4,?5,?6,?7)")
+        .bind(request).bind(format!("product-{request}")).bind(kind)
+        .bind((kind == "internal_conversation").then_some("historical-source-product"))
+        .bind((kind == "internal_conversation").then_some("historical-source-transcript"))
+        .bind((kind == "internal_conversation").then_some("historical-source-message"))
+        .bind((kind == "internal_conversation").then_some("historical-source-tool"))
+        .execute(pool).await.unwrap();
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn migration158_qualifies_only_complete_local_native_history_and_preserves_schema() {
+    let (pool, local) = fixture().await;
+    for (request, kind) in [
+        ("local", "internal_conversation"),
+        ("api", "user_api"),
+        ("absent", "unknown_historical"),
+    ] {
+        seed_creation(&pool, request, kind).await;
+    }
+    sqlx::raw_sql("INSERT INTO product_conversation_rename_receipts VALUES('operation','target',0,'title','source-product','deleted-source','message','tool','deleted-root','retained-slug',10);
+        INSERT INTO product_conversation_rename_receipts VALUES('incomplete','other-target',0,'title','source-product',' ','message','tool','deleted-root','retained-other',11);
+        INSERT INTO child_witness VALUES('local','preserved child');")
+        .execute(&pool).await.unwrap();
+    let before: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT type,name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let migration = Migration {
+        version: 158,
+        name: "federated_conversation_actions",
+        sql: "",
+    };
+    run(&pool, &migration).await.unwrap();
+    let qualifications: Vec<(String, Option<String>)> = sqlx::query_as("SELECT request_id,objective_source_instance_id FROM product_creation_jobs ORDER BY request_id").fetch_all(&pool).await.unwrap();
+    assert_eq!(
+        qualifications,
+        vec![
+            ("absent".into(), None),
+            ("api".into(), None),
+            ("local".into(), Some(local.to_string()))
+        ]
+    );
+    let receipt: (String, String, String) = sqlx::query_as("SELECT source_instance_id,source_transcript_id,slug_at_commit FROM product_conversation_rename_receipts WHERE operation_id='operation'").fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        receipt,
+        (
+            local.to_string(),
+            "deleted-source".into(),
+            "retained-slug".into()
+        )
+    );
+    assert!(sqlx::query_scalar::<_,Option<String>>("SELECT source_instance_id FROM product_conversation_rename_receipts WHERE operation_id='incomplete'").fetch_one(&pool).await.unwrap().is_none());
+    let after: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT type,name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    for (kind, name, sql) in &before {
+        let changed = after
+            .iter()
+            .find(|item| &item.0 == kind && &item.1 == name)
+            .unwrap();
+        if name != "product_creation_jobs" && name != "product_conversation_rename_receipts" {
+            assert_eq!(&changed.2, sql, "schema object {name} changed");
+        } else {
+            let mut conn = pool.acquire().await.unwrap();
+            let columns: Vec<(i64, String, String, i64, Option<String>, i64)> =
+                sqlx::query_as(sqlx::AssertSqlSafe(format!("PRAGMA table_info({name})")))
+                    .fetch_all(&mut *conn)
+                    .await
+                    .unwrap();
+            assert_eq!(columns.last().unwrap().2, "TEXT");
+        }
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM child_witness")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM trigger_witness")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("PRAGMA integrity_check")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "ok"
+    );
+    // New foreign provenance is valid without creating any destination-local source rows.
+    sqlx::query("UPDATE product_creation_jobs SET objective_origin='federated_conversation',objective_source_instance_id=?1 WHERE request_id='local'").bind(InstanceId::new().to_string()).execute(&pool).await.unwrap();
+    assert!(sqlx::query("UPDATE product_creation_jobs SET objective_source_instance_id=NULL WHERE request_id='local'").execute(&pool).await.is_err());
+    assert!(sqlx::query("UPDATE product_creation_jobs SET objective_source_instance_id='invalid' WHERE request_id='local'").execute(&pool).await.is_err());
+    assert!(sqlx::query(
+        "UPDATE product_creation_jobs SET objective_source_instance_id=?1 WHERE request_id='api'"
+    )
+    .bind(local.to_string())
+    .execute(&pool)
+    .await
+    .is_err());
+    assert!(
+        sqlx::query("UPDATE product_creation_jobs SET attempt_count=0 WHERE request_id='api'")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    assert!(sqlx::query(
+        "UPDATE product_creation_jobs SET published_product_id='missing' WHERE request_id='api'"
+    )
+    .execute(&pool)
+    .await
+    .is_err());
+    assert!(
+        sqlx::query("UPDATE product_conversation_rename_receipts SET source_instance_id=NULL WHERE operation_id='operation'")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE product_conversation_rename_receipts SET name_revision_before=-1")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _migrations WHERE version=158")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn migration158_preserves_original_constraint_bodies_and_does_not_add_source_fks() {
+    let original = table_sql(
+        include_str!("../retain_product_creation_receipts.sql"),
+        "product_creation_jobs_phase1",
+        "product_creation_jobs",
+    );
+    let expanded = qualify_schema(&original, true).unwrap();
+    let expected_original = original.replace(CREATE_KIND_CHECK,"objective_origin IN ('unknown_historical', 'user_api', 'slack_gateway', 'internal_conversation', 'federated_conversation')").replace(CREATE_NATIVE_CHECK,"objective_origin IN ('internal_conversation', 'federated_conversation')");
+    let end = expected_original.rfind(')').unwrap();
+    assert!(expanded.starts_with(&expected_original[..end]));
+    assert_eq!(
+        expanded.matches("REFERENCES").count(),
+        original.matches("REFERENCES").count()
+    );
+    let original = table_sql(
+        include_str!("../retain_product_conversation_rename_receipts.sql"),
+        "product_conversation_rename_receipts_retained",
+        "product_conversation_rename_receipts",
+    );
+    let expanded = qualify_schema(&original, false).unwrap();
+    assert!(expanded.starts_with(&original[..original.rfind(')').unwrap()]));
+    assert!(!expanded.contains("REFERENCES"));
+    assert!(qualify_schema("CREATE TABLE unexpected(x TEXT)", true).is_err());
+}
+
+#[tokio::test]
+async fn migration158_failure_rolls_back_columns_and_restores_schema_guard() {
+    let (pool, _) = fixture().await;
+    sqlx::query(
+        "ALTER TABLE product_creation_jobs RENAME COLUMN objective_origin TO unexpected_origin",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let migration = Migration {
+        version: 158,
+        name: "federated_conversation_actions",
+        sql: "",
+    };
+    assert!(run(&pool, &migration).await.is_err());
+    for table in [
+        "product_creation_jobs",
+        "product_conversation_rename_receipts",
+    ] {
+        let columns: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT name FROM pragma_table_info('{table}')"
+        )))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(!columns
+            .iter()
+            .any(|name| name == "objective_source_instance_id" || name == "source_instance_id"));
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA writable_schema")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _migrations")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+}

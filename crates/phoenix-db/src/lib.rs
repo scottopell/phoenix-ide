@@ -16,6 +16,8 @@ mod coordinator_authority;
 mod coordinator_query;
 mod coordinator_watches;
 mod coordinator_work_scope;
+mod federation_conversation_authority;
+pub use federation_conversation_authority::FederationConversationAuthority;
 mod federation_enrollment;
 pub use federation_enrollment::FederationSendAuthority;
 mod federation_peers;
@@ -406,6 +408,8 @@ pub enum DbError {
     ),
     #[error("federation send authority is no longer active")]
     FederationSendAuthorityInactive,
+    #[error("product creation request identity is owned by another acceptance source")]
+    ProductCreationRequestConflict,
     #[error("federation send identity is already owned by another conversation")]
     FederationSendIdentityConflict,
     #[error("saved federation peer not found")]

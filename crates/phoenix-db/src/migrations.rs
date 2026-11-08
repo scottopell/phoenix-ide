@@ -11,6 +11,7 @@ use phoenix_core::work_scope::WorkScopeId;
 
 use super::{DbError, DbResult, ProjectSeedId};
 
+mod federated_conversation_actions;
 mod federated_subscriptions;
 mod goal_execution;
 mod local_goal_watch;
@@ -806,6 +807,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 155,
         name: "ordinary_self_goal_admission",
         sql: include_str!("migrations/ordinary_self_goal_admission.sql"),
+    },
+    Migration {
+        version: 158,
+        name: "federated_conversation_actions",
+        sql: "-- Native conversation action source qualification (special migration runner).",
     },
 ];
 
@@ -12376,6 +12382,12 @@ async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbRe
             continue;
         }
 
+        if migration.version == 158 {
+            federated_conversation_actions::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
         if migration.version == 133 {
             federated_subscriptions::run(pool, migration).await?;
             applied += 1;
@@ -15743,6 +15755,7 @@ mod tests {
                 (152, "goal_preparation_inflight_source".into()),
                 (153, "close_writer_observations".into()),
                 (155, "ordinary_self_goal_admission".into()),
+                (158, "federated_conversation_actions".into()),
             ]
         );
     }
@@ -15752,6 +15765,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (158, "federated_conversation_actions"),
             (155, "ordinary_self_goal_admission"),
             (153, "close_writer_observations"),
             (152, "goal_preparation_inflight_source"),
@@ -20022,6 +20036,7 @@ mod tests {
                 (152, "goal_preparation_inflight_source"),
                 (153, "close_writer_observations"),
                 (155, "ordinary_self_goal_admission"),
+                (158, "federated_conversation_actions"),
             ]
         );
         let goal = MIGRATIONS
@@ -20035,7 +20050,7 @@ mod tests {
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 153);
+        assert_eq!(MIGRATIONS.len(), 154);
     }
 
     #[tokio::test]

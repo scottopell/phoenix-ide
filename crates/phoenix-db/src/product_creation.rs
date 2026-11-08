@@ -1,6 +1,8 @@
 #![allow(clippy::missing_errors_doc)]
 
 use super::*;
+use crate::FederationConversationAuthority;
+use phoenix_core::domain::instance_identity::InstanceId;
 use phoenix_core::domain::product_conversation::ProductConversationId;
 pub use phoenix_core::domain::product_creation::ProductCreationProvisioningStage;
 use phoenix_core::llm_language::LlmLanguage;
@@ -45,6 +47,13 @@ pub enum ProductCreationOrigin {
         request_id: String,
     },
     InternalConversation {
+        source_instance_id: InstanceId,
+        product_conversation_id: ProductConversationId,
+        transcript_id: String,
+        source_call: phoenix_core::domain::db_schema::SourceToolCall,
+    },
+    FederatedConversation {
+        source_instance_id: InstanceId,
         product_conversation_id: ProductConversationId,
         transcript_id: String,
         source_call: phoenix_core::domain::db_schema::SourceToolCall,
@@ -63,95 +72,74 @@ impl ProductCreationOrigin {
             Self::UserApi => "user_api",
             Self::SlackGateway { .. } => "slack_gateway",
             Self::InternalConversation { .. } => "internal_conversation",
+            Self::FederatedConversation { .. } => "federated_conversation",
         }
     }
+
     fn from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
-        use phoenix_core::domain::db_schema::InputOrigin;
         let kind: String = row.try_get("objective_origin")?;
-        let origin = match kind.as_str() {
-            "unknown_historical" => InputOrigin::UnknownHistorical,
-            "user_api" => InputOrigin::UserApi,
-            "slack_gateway" => InputOrigin::SlackGateway {
-                request_id: row.try_get("objective_slack_request_id")?,
-            },
-            "internal_conversation" => {
-                let product_id: Option<String> =
-                    row.try_get("objective_source_product_conversation_id")?;
-                let transcript_id: Option<String> =
-                    row.try_get("objective_source_transcript_id")?;
-                let product_id = product_id.ok_or_else(|| {
-                    sqlx::Error::Decode("missing internal creation product source".into())
-                })?;
-                let transcript_id = transcript_id.ok_or_else(|| {
-                    sqlx::Error::Decode("missing internal creation transcript source".into())
-                })?;
-                InputOrigin::InternalConversation {
-                    product_conversation_id: ProductConversationId::parse(&product_id)
-                        .map_err(|error| sqlx::Error::Decode(Box::new(error)))?,
-                    transcript_id,
-                    source_call: None,
+        let instance: Option<String> = row.try_get("objective_source_instance_id")?;
+        let product: Option<String> = row.try_get("objective_source_product_conversation_id")?;
+        let transcript: Option<String> = row.try_get("objective_source_transcript_id")?;
+        let message: Option<String> = row.try_get("objective_source_message_id")?;
+        let tool: Option<String> = row.try_get("objective_source_tool_use_id")?;
+        let slack: Option<String> = row.try_get("objective_slack_request_id")?;
+        let bad = || sqlx::Error::Decode("invalid peer-qualified creation provenance".into());
+        match kind.as_str() {
+            "internal_conversation" | "federated_conversation" => {
+                if slack.is_some() {
+                    return Err(bad());
+                }
+                let source_instance_id = instance
+                    .ok_or_else(bad)?
+                    .parse::<InstanceId>()
+                    .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+                let product_conversation_id =
+                    ProductConversationId::parse(product.ok_or_else(bad)?)
+                        .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+                let transcript_id = transcript
+                    .filter(|v| !v.trim().is_empty())
+                    .ok_or_else(bad)?;
+                let message_id = message.filter(|v| !v.trim().is_empty()).ok_or_else(bad)?;
+                let tool_use_id = tool.filter(|v| !v.trim().is_empty()).ok_or_else(bad)?;
+                let source_call = phoenix_core::domain::db_schema::SourceToolCall {
+                    message_id,
+                    tool_use_id,
+                };
+                if kind == "internal_conversation" {
+                    Ok(Self::InternalConversation {
+                        source_instance_id,
+                        product_conversation_id,
+                        transcript_id,
+                        source_call,
+                    })
+                } else {
+                    Ok(Self::FederatedConversation {
+                        source_instance_id,
+                        product_conversation_id,
+                        transcript_id,
+                        source_call,
+                    })
                 }
             }
-            value => {
-                return Err(sqlx::Error::Decode(
-                    format!("invalid creation origin: {value}").into(),
-                ));
-            }
-        };
-        let source_product_id: Option<String> =
-            row.try_get("objective_source_product_conversation_id")?;
-        let source_transcript_id: Option<String> = row.try_get("objective_source_transcript_id")?;
-        let source_message_id: Option<String> = row.try_get("objective_source_message_id")?;
-        let source_tool_use_id: Option<String> = row.try_get("objective_source_tool_use_id")?;
-        let origin = origin
-            .with_source_call_columns(source_message_id, source_tool_use_id)
-            .map_err(|error| sqlx::Error::Decode(error.into()))?;
-        match origin {
-            InputOrigin::UnknownHistorical
-                if source_product_id.is_none() && source_transcript_id.is_none() =>
-            {
-                Ok(Self::UnknownHistorical)
-            }
-            InputOrigin::UserApi
-                if source_product_id.is_none() && source_transcript_id.is_none() =>
-            {
-                Ok(Self::UserApi)
-            }
-            InputOrigin::SlackGateway { request_id }
-                if source_product_id.is_none() && source_transcript_id.is_none() =>
-            {
-                Ok(Self::SlackGateway { request_id })
-            }
-            InputOrigin::InternalConversation {
-                product_conversation_id,
-                transcript_id,
-                source_call: Some(source_call),
-            } => {
-                if source_product_id.as_deref() != Some(product_conversation_id.as_str())
-                    || source_transcript_id.as_deref() != Some(transcript_id.as_str())
+            _ => {
+                if instance.is_some()
+                    || product.is_some()
+                    || transcript.is_some()
+                    || message.is_some()
+                    || tool.is_some()
                 {
-                    return Err(sqlx::Error::Decode(
-                        "invalid internal creation source columns".into(),
-                    ));
+                    return Err(bad());
                 }
-                Ok(Self::InternalConversation {
-                    product_conversation_id,
-                    transcript_id,
-                    source_call: *source_call,
-                })
+                match (kind.as_str(), slack) {
+                    ("unknown_historical", None) => Ok(Self::UnknownHistorical),
+                    ("user_api", None) => Ok(Self::UserApi),
+                    ("slack_gateway", Some(request_id)) if !request_id.trim().is_empty() => {
+                        Ok(Self::SlackGateway { request_id })
+                    }
+                    _ => Err(bad()),
+                }
             }
-            InputOrigin::UnknownHistorical
-            | InputOrigin::UserApi
-            | InputOrigin::InternalConversation { .. }
-            | InputOrigin::SystemGenerated
-            | InputOrigin::SlackGateway { .. }
-            | InputOrigin::ScheduledReminder { .. }
-            | InputOrigin::SubscriptionEvent { .. }
-            | InputOrigin::RemoteApi { .. }
-            | InputOrigin::RemoteConversation { .. }
-            | InputOrigin::RemoteCoordinator { .. } => Err(sqlx::Error::Decode(
-                "internal creation origin requires a source-call locator".into(),
-            )),
         }
     }
     #[must_use]
@@ -167,7 +155,19 @@ impl ProductCreationOrigin {
                 product_conversation_id,
                 transcript_id,
                 source_call,
+                ..
             } => InputOrigin::InternalConversation {
+                product_conversation_id: product_conversation_id.clone(),
+                transcript_id: transcript_id.clone(),
+                source_call: Some(Box::new(source_call.clone())),
+            },
+            Self::FederatedConversation {
+                source_instance_id,
+                product_conversation_id,
+                transcript_id,
+                source_call,
+            } => InputOrigin::RemoteCoordinator {
+                instance_id: *source_instance_id,
                 product_conversation_id: product_conversation_id.clone(),
                 transcript_id: transcript_id.clone(),
                 source_call: Some(Box::new(source_call.clone())),
@@ -223,9 +223,14 @@ pub enum StoredProductCreationImages {
 
 impl ProductCreationIntent<StoredProductCreationImages> {
     fn matches_retry(&self, retry: &ProductCreationIntent) -> bool {
-        self.origin
-            .input_origin()
-            .accepts_retry_origin(&retry.origin.input_origin())
+        (self.origin == retry.origin
+            || matches!(
+                (&self.origin, &retry.origin),
+                (
+                    ProductCreationOrigin::UnknownHistorical,
+                    ProductCreationOrigin::UserApi
+                )
+            ))
             && self.cwd == retry.cwd
             && self.objective == retry.objective
             && self.model == retry.model
@@ -435,20 +440,80 @@ pub struct ProductCreationPublishInput {
     pub git_publication: Option<ProductCreationGitPublicationFacts>,
 }
 
+fn creation_source_instance_id(origin: &ProductCreationOrigin) -> Option<InstanceId> {
+    match origin {
+        ProductCreationOrigin::InternalConversation {
+            source_instance_id, ..
+        }
+        | ProductCreationOrigin::FederatedConversation {
+            source_instance_id, ..
+        } => Some(*source_instance_id),
+        ProductCreationOrigin::UnknownHistorical
+        | ProductCreationOrigin::UserApi
+        | ProductCreationOrigin::SlackGateway { .. } => None,
+    }
+}
+
+fn require_creation_read_owner(
+    origin: &ProductCreationOrigin,
+    authority: &FederationConversationAuthority,
+) -> DbResult<()> {
+    match origin {
+        ProductCreationOrigin::FederatedConversation {
+            source_instance_id, ..
+        } if *source_instance_id == authority.caller_instance_id() => Ok(()),
+        ProductCreationOrigin::UnknownHistorical
+        | ProductCreationOrigin::UserApi
+        | ProductCreationOrigin::SlackGateway { .. }
+        | ProductCreationOrigin::InternalConversation { .. }
+        | ProductCreationOrigin::FederatedConversation { .. } => {
+            Err(DbError::FederationSendAuthorityInactive)
+        }
+    }
+}
+
 async fn require_creation_origin_tx(
     conn: &mut SqliteConnection,
+    local_instance_id: InstanceId,
     current_gc_transcript_id: Option<&str>,
+    authority: Option<&FederationConversationAuthority>,
     origin: &ProductCreationOrigin,
 ) -> DbResult<()> {
+    if let Some(authority) = authority {
+        return match origin {
+            ProductCreationOrigin::FederatedConversation {
+                source_instance_id,
+                transcript_id,
+                source_call,
+                ..
+            } if *source_instance_id == authority.caller_instance_id()
+                && *source_instance_id != local_instance_id
+                && !transcript_id.trim().is_empty()
+                && !source_call.message_id.trim().is_empty()
+                && !source_call.tool_use_id.trim().is_empty() =>
+            {
+                Ok(())
+            }
+            ProductCreationOrigin::UnknownHistorical
+            | ProductCreationOrigin::UserApi
+            | ProductCreationOrigin::SlackGateway { .. }
+            | ProductCreationOrigin::InternalConversation { .. }
+            | ProductCreationOrigin::FederatedConversation { .. } => {
+                Err(DbError::CurrentCoordinatorRequired)
+            }
+        };
+    }
     match (current_gc_transcript_id, origin) {
         (
             Some(caller),
             ProductCreationOrigin::InternalConversation {
+                source_instance_id,
                 product_conversation_id,
                 transcript_id,
                 source_call,
             },
-        ) if caller == transcript_id
+        ) if *source_instance_id == local_instance_id
+            && caller == transcript_id
             && !source_call.message_id.is_empty()
             && !source_call.tool_use_id.is_empty() =>
         {
@@ -658,7 +723,7 @@ impl Database {
         intent: &ProductCreationIntent,
     ) -> DbResult<bool> {
         normalize_product_creation_intent(intent)?;
-        let Some(record) = self.get_product_creation_job(request_id).await? else {
+        let Some(record) = self.load_product_creation_job(request_id).await? else {
             return Ok(false);
         };
         let expected_fingerprint = format!("product-create:{request_id}");
@@ -675,6 +740,16 @@ impl Database {
         &self,
         request_id: &str,
     ) -> DbResult<Option<ProductCreationJobRecord>> {
+        Ok(self
+            .load_product_creation_job(request_id)
+            .await?
+            .filter(|job| creation_source_instance_id(&job.intent.origin).is_none()))
+    }
+
+    async fn load_product_creation_job(
+        &self,
+        request_id: &str,
+    ) -> DbResult<Option<ProductCreationJobRecord>> {
         let mut connection = self.pool.acquire().await?;
         Self::get_product_creation_job_on(&mut connection, request_id).await
     }
@@ -684,7 +759,7 @@ impl Database {
         request_id: &str,
     ) -> DbResult<Option<ProductCreationJobRecord>> {
         sqlx::query(
-            "SELECT j.request_id, j.product_conversation_id, j.cwd, j.objective, j.objective_origin, j.objective_slack_request_id, j.objective_source_product_conversation_id, j.objective_source_transcript_id, j.objective_source_message_id, j.objective_source_tool_use_id, j.model, j.effort, j.llm_language, j.status,
+            "SELECT j.request_id, j.product_conversation_id, j.cwd, j.objective, j.objective_origin, j.objective_slack_request_id, j.objective_source_instance_id, j.objective_source_product_conversation_id, j.objective_source_transcript_id, j.objective_source_message_id, j.objective_source_tool_use_id, j.model, j.effort, j.llm_language, j.status,
                     j.provisioning_stage, j.stage_updated_at_unix_micros,
                     j.accepted_at_unix_micros, j.updated_at_unix_micros, j.attempt_count,
                     j.claim_generation, j.claim_worker_id, j.claim_token,
@@ -753,6 +828,36 @@ impl Database {
         Ok(projects)
     }
 
+    pub async fn get_product_creation_job_as_federation(
+        &self,
+        authority: &FederationConversationAuthority,
+        request_id: &str,
+    ) -> DbResult<Option<ProductCreationJobRecord>> {
+        let mut tx = self.pool.begin().await?;
+        authority.require_tx(&mut tx).await?;
+        let job = Self::get_product_creation_job_on(&mut tx, request_id).await?;
+        if let Some(job) = &job {
+            require_creation_read_owner(&job.intent.origin, authority)?;
+        }
+        tx.rollback().await?;
+        Ok(job)
+    }
+
+    pub async fn read_product_creation_status_as_federation(
+        &self,
+        authority: &FederationConversationAuthority,
+        request_id: &str,
+    ) -> DbResult<Option<ProductCreationStatusRead>> {
+        self.read_product_creation_status_authorized(
+            "",
+            request_id,
+            Some(authority),
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
     pub async fn get_product_creation_job_as_coordinator(
         &self,
         transcript_id: &str,
@@ -761,6 +866,14 @@ impl Database {
         let mut tx = self.pool.begin().await?;
         crate::product_conversation_rename::require_current_gc_tx(&mut tx, transcript_id).await?;
         let job = Self::get_product_creation_job_on(&mut tx, request_id).await?;
+        if job.as_ref().is_some_and(|job| {
+            matches!(
+                job.intent.origin,
+                ProductCreationOrigin::FederatedConversation { .. }
+            )
+        }) {
+            return Err(DbError::CurrentCoordinatorRequired);
+        }
         tx.commit().await?;
         Ok(job)
     }
@@ -791,6 +904,10 @@ impl Database {
             tx.rollback().await?;
             return Ok(None);
         };
+        if creation_source_instance_id(&job.intent.origin).is_some() {
+            tx.rollback().await?;
+            return Ok(None);
+        }
         let publication = Self::product_creation_publication_on(&mut tx, &job).await?;
         tx.rollback().await?;
         Ok(Some(PublicProductCreationStatusRead { job, publication }))
@@ -840,12 +957,44 @@ impl Database {
             std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>,
         >,
     ) -> DbResult<Option<ProductCreationStatusRead>> {
+        self.read_product_creation_status_authorized(
+            transcript_id,
+            request_id,
+            None,
+            #[cfg(test)]
+            after_job,
+        )
+        .await
+    }
+
+    async fn read_product_creation_status_authorized(
+        &self,
+        transcript_id: &str,
+        request_id: &str,
+        authority: Option<&FederationConversationAuthority>,
+        #[cfg(test)] after_job: Option<
+            std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>,
+        >,
+    ) -> DbResult<Option<ProductCreationStatusRead>> {
         let mut tx = self.pool.begin().await?;
-        crate::product_conversation_rename::require_current_gc_tx(&mut tx, transcript_id).await?;
+        if let Some(authority) = authority {
+            authority.require_tx(&mut tx).await?;
+        } else {
+            crate::product_conversation_rename::require_current_gc_tx(&mut tx, transcript_id)
+                .await?;
+        }
         let Some(job) = Self::get_product_creation_job_on(&mut tx, request_id).await? else {
             tx.rollback().await?;
             return Ok(None);
         };
+        if let Some(authority) = authority {
+            require_creation_read_owner(&job.intent.origin, authority)?;
+        } else if matches!(
+            job.intent.origin,
+            ProductCreationOrigin::FederatedConversation { .. }
+        ) {
+            return Err(DbError::CurrentCoordinatorRequired);
+        }
         #[cfg(test)]
         if let Some(after_job) = after_job {
             after_job.await;
@@ -891,6 +1040,34 @@ impl Database {
     where
         F: FnOnce(ProductCreationResolution<'_>) -> DbResult<ProductCreationIntent>,
     {
+        self.accept_product_creation_authorized(request_id, current_gc_transcript_id, None, resolve)
+            .await
+    }
+
+    pub async fn accept_product_creation_as_federation<F>(
+        &self,
+        authority: &FederationConversationAuthority,
+        request_id: &str,
+        resolve: F,
+    ) -> DbResult<ProductCreationAcceptOutcome>
+    where
+        F: FnOnce(ProductCreationResolution<'_>) -> DbResult<ProductCreationIntent>,
+    {
+        self.accept_product_creation_authorized(request_id, None, Some(authority), resolve)
+            .await
+    }
+
+    async fn accept_product_creation_authorized<F>(
+        &self,
+        request_id: &str,
+        current_gc_transcript_id: Option<&str>,
+        authority: Option<&FederationConversationAuthority>,
+        resolve: F,
+    ) -> DbResult<ProductCreationAcceptOutcome>
+    where
+        F: FnOnce(ProductCreationResolution<'_>) -> DbResult<ProductCreationIntent>,
+    {
+        let local_instance_id = self.instance_id().await?;
         let accepted_product_conversation_id = ProductConversationId::new();
         let now = unix_micros_now();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -898,8 +1075,11 @@ impl Database {
             super::product_conversation_rename::require_current_gc_tx(&mut tx, transcript_id)
                 .await?;
         }
+        if let Some(authority) = authority {
+            authority.require_tx(&mut tx).await?;
+        }
         let existing = sqlx::query(
-            "SELECT request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, objective_source_product_conversation_id, objective_source_transcript_id, objective_source_message_id, objective_source_tool_use_id, model, effort, llm_language, status,
+            "SELECT request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, objective_source_instance_id, objective_source_product_conversation_id, objective_source_transcript_id, objective_source_message_id, objective_source_tool_use_id, model, effort, llm_language, status,
                     provisioning_stage, stage_updated_at_unix_micros,
                     accepted_at_unix_micros, updated_at_unix_micros, attempt_count,
                     claim_generation, claim_worker_id, claim_token,
@@ -929,9 +1109,29 @@ impl Database {
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(existing) = existing {
+            if let Some(authority) = authority {
+                if require_creation_read_owner(&existing.intent.origin, authority).is_err() {
+                    return Err(DbError::ProductCreationRequestConflict);
+                }
+            } else {
+                match &existing.intent.origin {
+                    ProductCreationOrigin::FederatedConversation { .. } => {
+                        return Err(DbError::ProductCreationRequestConflict)
+                    }
+                    ProductCreationOrigin::InternalConversation {
+                        source_instance_id, ..
+                    } if current_gc_transcript_id.is_none()
+                        || *source_instance_id != local_instance_id =>
+                    {
+                        return Err(DbError::CurrentCoordinatorRequired)
+                    }
+                    ProductCreationOrigin::InternalConversation { .. }
+                    | ProductCreationOrigin::UnknownHistorical
+                    | ProductCreationOrigin::UserApi
+                    | ProductCreationOrigin::SlackGateway { .. } => {}
+                }
+            }
             let candidate = resolve(ProductCreationResolution::Existing(&existing))?;
-            require_creation_origin_tx(&mut tx, current_gc_transcript_id, &candidate.origin)
-                .await?;
             tx.rollback().await?;
             return Ok(if existing.intent.matches_retry(&candidate) {
                 ProductCreationAcceptOutcome::Replayed(existing)
@@ -949,16 +1149,23 @@ impl Database {
                 .map(LlmLanguage::parse_or_default)
                 .unwrap_or_default(),
         })?;
-        require_creation_origin_tx(&mut tx, current_gc_transcript_id, &intent.origin).await?;
+        require_creation_origin_tx(
+            &mut tx,
+            local_instance_id,
+            current_gc_transcript_id,
+            authority,
+            &intent.origin,
+        )
+        .await?;
         normalize_product_creation_intent(&intent)?;
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO product_creation_jobs (
                 request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id,
                 objective_source_product_conversation_id, objective_source_transcript_id,
-                objective_source_message_id, objective_source_tool_use_id,
+                objective_source_message_id, objective_source_tool_use_id, objective_source_instance_id,
                 model, effort, llm_language, status,
                 accepted_at_unix_micros, updated_at_unix_micros, stage_updated_at_unix_micros
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?14, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'accepted', ?13, ?13, ?13)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?14, ?6, ?7, ?8, ?9, ?15, ?10, ?11, ?12, 'accepted', ?13, ?13, ?13)",
         )
         .bind(request_id)
         .bind(accepted_product_conversation_id.as_str())
@@ -966,19 +1173,19 @@ impl Database {
         .bind(&intent.objective)
         .bind(intent.origin.as_str())
         .bind(match &intent.origin {
-            ProductCreationOrigin::InternalConversation { product_conversation_id, .. } => Some(product_conversation_id.as_str()),
+            ProductCreationOrigin::InternalConversation { product_conversation_id, .. } | ProductCreationOrigin::FederatedConversation { product_conversation_id, .. } => Some(product_conversation_id.as_str()),
             ProductCreationOrigin::UnknownHistorical | ProductCreationOrigin::UserApi | ProductCreationOrigin::SlackGateway { .. } => None,
         })
         .bind(match &intent.origin {
-            ProductCreationOrigin::InternalConversation { transcript_id, .. } => Some(transcript_id.as_str()),
+            ProductCreationOrigin::InternalConversation { transcript_id, .. } | ProductCreationOrigin::FederatedConversation { transcript_id, .. } => Some(transcript_id.as_str()),
             ProductCreationOrigin::UnknownHistorical | ProductCreationOrigin::UserApi | ProductCreationOrigin::SlackGateway { .. } => None,
         })
         .bind(match &intent.origin {
-            ProductCreationOrigin::InternalConversation { source_call, .. } => Some(source_call.message_id.as_str()),
+            ProductCreationOrigin::InternalConversation { source_call, .. } | ProductCreationOrigin::FederatedConversation { source_call, .. } => Some(source_call.message_id.as_str()),
             ProductCreationOrigin::UnknownHistorical | ProductCreationOrigin::UserApi | ProductCreationOrigin::SlackGateway { .. } => None,
         })
         .bind(match &intent.origin {
-            ProductCreationOrigin::InternalConversation { source_call, .. } => Some(source_call.tool_use_id.as_str()),
+            ProductCreationOrigin::InternalConversation { source_call, .. } | ProductCreationOrigin::FederatedConversation { source_call, .. } => Some(source_call.tool_use_id.as_str()),
             ProductCreationOrigin::UnknownHistorical | ProductCreationOrigin::UserApi | ProductCreationOrigin::SlackGateway { .. } => None,
         })
         .bind(&intent.model)
@@ -986,12 +1193,13 @@ impl Database {
         .bind(intent.llm_language.as_str())
         .bind(now)
         .bind(intent.origin.input_origin().slack_request_id())
+        .bind(creation_source_instance_id(&intent.origin).map(|id| id.to_string()))
         .execute(&mut *tx)
         .await?;
         if inserted.rows_affected() == 0 {
             tx.rollback().await?;
             let existing = self
-                .get_product_creation_job(request_id)
+                .load_product_creation_job(request_id)
                 .await?
                 .ok_or_else(|| {
                     DbError::Serialization("raced product creation disappeared".to_string())
@@ -1035,7 +1243,7 @@ impl Database {
         }
         tx.commit().await?;
         let record = self
-            .get_product_creation_job(request_id)
+            .load_product_creation_job(request_id)
             .await?
             .ok_or_else(|| {
                 DbError::Serialization("accepted product creation job missing".to_string())
@@ -1064,7 +1272,7 @@ impl Database {
                  OR (status = 'claimed' AND claim_lease_until_unix_micros <= ?1)
              ) AND (published_conversation_id IS NULL OR EXISTS (
                  SELECT 1 FROM conversations c WHERE c.id = product_creation_jobs.published_conversation_id
-             )) RETURNING request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, objective_source_product_conversation_id, objective_source_transcript_id, objective_source_message_id, objective_source_tool_use_id, model, effort,
+             )) RETURNING request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, objective_source_instance_id, objective_source_product_conversation_id, objective_source_transcript_id, objective_source_message_id, objective_source_tool_use_id, model, effort,
                  llm_language, status, provisioning_stage, stage_updated_at_unix_micros,
                  accepted_at_unix_micros, updated_at_unix_micros,
                  attempt_count, claim_generation, claim_worker_id, claim_token,
@@ -1138,7 +1346,7 @@ impl Database {
                           accepted_at_unix_micros ASC, request_id ASC
                  LIMIT 1
              )
-             RETURNING request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, objective_source_product_conversation_id, objective_source_transcript_id, objective_source_message_id, objective_source_tool_use_id, model, effort,
+             RETURNING request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, objective_source_instance_id, objective_source_product_conversation_id, objective_source_transcript_id, objective_source_message_id, objective_source_tool_use_id, model, effort,
                  llm_language, status, provisioning_stage, stage_updated_at_unix_micros,
                  accepted_at_unix_micros, updated_at_unix_micros,
                  attempt_count, claim_generation, claim_worker_id, claim_token,
@@ -1189,7 +1397,7 @@ impl Database {
         freshness: &str,
     ) -> DbResult<ProductCreationPinOutcome> {
         let existing = self
-            .get_product_creation_job(request_id)
+            .load_product_creation_job(request_id)
             .await?
             .ok_or_else(|| DbError::Sqlx(sqlx::Error::RowNotFound))?;
         if existing.pin_exact_checkout_oid.is_some()
@@ -1232,7 +1440,7 @@ impl Database {
         .execute(&self.pool)
         .await?;
         let current = self
-            .get_product_creation_job(request_id)
+            .load_product_creation_job(request_id)
             .await?
             .ok_or_else(|| {
                 DbError::Serialization("pinned product creation job missing".to_string())
@@ -1450,7 +1658,7 @@ impl Database {
         delivery_error: &str,
         now: DateTime<Utc>,
     ) -> DbResult<bool> {
-        let Some(record) = self.get_product_creation_job(request_id).await? else {
+        let Some(record) = self.load_product_creation_job(request_id).await? else {
             return Ok(false);
         };
         if record.status != "delivery_pending" {
@@ -1746,7 +1954,7 @@ impl Database {
         }
         tx.commit().await?;
         let job = self
-            .get_product_creation_job(&request_id)
+            .load_product_creation_job(&request_id)
             .await?
             .ok_or_else(|| {
                 DbError::Serialization("claimed product creation delivery job missing".to_string())
@@ -1817,7 +2025,7 @@ impl Database {
         cursor: Option<(i64, String)>,
     ) -> DbResult<Vec<ProductCreationRecoveryJobRecord>> {
         sqlx::query(
-            "SELECT request_id, cwd, objective, objective_origin, objective_slack_request_id, objective_source_product_conversation_id, objective_source_transcript_id, objective_source_message_id, objective_source_tool_use_id, model, effort, llm_language, status,
+            "SELECT request_id, cwd, objective, objective_origin, objective_slack_request_id, objective_source_instance_id, objective_source_product_conversation_id, objective_source_transcript_id, objective_source_message_id, objective_source_tool_use_id, model, effort, llm_language, status,
                     published_product_id, updated_at_unix_micros, last_error,
                     CASE WHEN j.status = 'delivery_failed' AND EXISTS (
                       SELECT 1 FROM product_conversations product
@@ -2295,7 +2503,7 @@ impl Database {
         let lease_until = now + lease_duration;
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, objective_source_product_conversation_id, objective_source_transcript_id, objective_source_message_id, objective_source_tool_use_id, model, effort, llm_language, status,
+            "SELECT request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, objective_source_instance_id, objective_source_product_conversation_id, objective_source_transcript_id, objective_source_message_id, objective_source_tool_use_id, model, effort, llm_language, status,
                     provisioning_stage, stage_updated_at_unix_micros,
                     accepted_at_unix_micros, updated_at_unix_micros, attempt_count,
                     claim_generation, claim_worker_id, claim_token, claim_lease_until_unix_micros,
@@ -2348,7 +2556,7 @@ impl Database {
         }
         tx.commit().await?;
         let mut job = self
-            .get_product_creation_job(&request_id)
+            .load_product_creation_job(&request_id)
             .await?
             .ok_or_else(|| {
                 DbError::Serialization("claimed product cleanup job missing".to_string())
@@ -2695,6 +2903,202 @@ mod product_creation_tests {
     use phoenix_core::domain::sm_state::ConvState;
     use phoenix_core::llm_language::LlmLanguage;
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn federated_creation_is_peer_owned_accepted_only_and_never_resolves_foreign_sources() {
+        use crate::federation_conversation_authority::enroll_test_peer;
+        use phoenix_core::domain::db_schema::{InputOrigin, SourceToolCall};
+        let db = Database::open_in_memory().await.unwrap();
+        let caller = InstanceId::new();
+        let authority = enroll_test_peer(&db, caller, b"create-peer").await;
+        let other = enroll_test_peer(&db, InstanceId::new(), b"other-peer").await;
+        let mut native = intent("/repo/native", "foreign objective");
+        native.origin = ProductCreationOrigin::FederatedConversation {
+            source_instance_id: caller,
+            product_conversation_id: ProductConversationId::new(),
+            transcript_id: "foreign-transcript-not-in-destination".into(),
+            source_call: SourceToolCall {
+                message_id: "foreign-message".into(),
+                tool_use_id: "foreign-tool".into(),
+            },
+        };
+        let request = uuid::Uuid::new_v4().to_string();
+        let ProductCreationAcceptOutcome::Accepted(first) = db
+            .accept_product_creation_as_federation(&authority, &request, |_| Ok(native.clone()))
+            .await
+            .unwrap()
+        else {
+            panic!("expected accepted")
+        };
+        assert_eq!(first.status, "accepted");
+        assert!(first.published_conversation_id.is_none());
+        assert_eq!(first.intent.origin, native.origin);
+        assert!(
+            matches!(native.origin.input_origin(), InputOrigin::RemoteCoordinator { instance_id, .. } if instance_id == caller)
+        );
+        assert!(db
+            .read_public_product_creation_status(&request)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db
+            .get_product_creation_job(&request)
+            .await
+            .unwrap()
+            .is_none());
+        let gc = db
+            .get_or_create_coordinator(None, LlmLanguage::default())
+            .await
+            .unwrap();
+        assert!(db
+            .get_product_creation_job_as_coordinator(&gc.id, &request)
+            .await
+            .is_err());
+        assert!(db
+            .read_product_creation_status_as_coordinator(&gc.id, &request)
+            .await
+            .is_err());
+        assert!(matches!(
+            db.accept_product_creation_as_federation(&authority, &request, |_| Ok(native.clone()))
+                .await
+                .unwrap(),
+            ProductCreationAcceptOutcome::Replayed(_)
+        ));
+        let mut changed = native.clone();
+        if let ProductCreationOrigin::FederatedConversation { source_call, .. } =
+            &mut changed.origin
+        {
+            source_call.tool_use_id = "changed".into();
+        }
+        assert!(matches!(
+            db.accept_product_creation_as_federation(&authority, &request, |_| Ok(changed))
+                .await
+                .unwrap(),
+            ProductCreationAcceptOutcome::Conflict(_)
+        ));
+        let mut changed_intent = native.clone();
+        changed_intent.objective = "different objective".into();
+        assert!(matches!(
+            db.accept_product_creation_as_federation(&authority, &request, |_| Ok(changed_intent))
+                .await
+                .unwrap(),
+            ProductCreationAcceptOutcome::Conflict(_)
+        ));
+        assert!(db
+            .get_product_creation_job_as_federation(&other, &request)
+            .await
+            .is_err());
+        assert!(db
+            .read_product_creation_status_as_federation(&other, &request)
+            .await
+            .is_err());
+        assert!(db
+            .accept_product_creation_as_federation(&other, &request, |_| panic!(
+                "must not expose another owner's receipt"
+            ))
+            .await
+            .is_err());
+        assert_eq!(
+            db.get_product_creation_job_as_federation(&authority, &request)
+                .await
+                .unwrap()
+                .unwrap()
+                .intent
+                .origin,
+            native.origin
+        );
+        assert_eq!(
+            db.read_product_creation_status_as_federation(&authority, &request)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "accepted"
+        );
+        assert!(db
+            .accept_product_creation(&uuid::Uuid::new_v4().to_string(), &native)
+            .await
+            .is_err());
+        let replacement = enroll_test_peer(&db, caller, b"rotated-create-peer").await;
+        assert!(db
+            .get_product_creation_job_as_federation(&authority, &request)
+            .await
+            .is_err());
+        assert!(db
+            .read_product_creation_status_as_federation(&authority, &request)
+            .await
+            .is_err());
+        assert!(db
+            .accept_product_creation_as_federation(&authority, &request, |_| Ok(native.clone()))
+            .await
+            .is_err());
+        assert!(matches!(
+            db.accept_product_creation_as_federation(
+                &replacement,
+                &request,
+                |_| Ok(native.clone())
+            )
+            .await
+            .unwrap(),
+            ProductCreationAcceptOutcome::Replayed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_creation_rejects_foreign_instance_even_for_current_coordinator() {
+        use phoenix_core::domain::db_schema::SourceToolCall;
+        let db = Database::open_in_memory().await.unwrap();
+        let gc = db
+            .get_or_create_coordinator(None, LlmLanguage::default())
+            .await
+            .unwrap();
+        let mut local = intent("/repo/local", "objective");
+        local.origin = ProductCreationOrigin::InternalConversation {
+            source_instance_id: InstanceId::new(),
+            product_conversation_id: gc.product_conversation_id.clone(),
+            transcript_id: gc.id.clone(),
+            source_call: SourceToolCall {
+                message_id: "message".into(),
+                tool_use_id: "tool".into(),
+            },
+        };
+        assert!(matches!(
+            db.accept_product_creation_resolved("wrong-instance", Some(&gc.id), |_| Ok(local))
+                .await,
+            Err(DbError::CurrentCoordinatorRequired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn native_creation_decode_requires_complete_peer_qualified_provenance() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let local = InstanceId::new().to_string();
+        for kind in ["internal_conversation", "federated_conversation"] {
+            let complete = [
+                Some(local.clone()),
+                Some("pc_native".to_owned()),
+                Some("transcript".to_owned()),
+                Some("message".to_owned()),
+                Some("tool".to_owned()),
+            ];
+            for missing in 0..=5 {
+                let mut fields = complete.clone();
+                if missing < 5 {
+                    fields[missing] = None;
+                }
+                let row = sqlx::query("SELECT ?1 AS objective_origin, ?2 AS objective_source_instance_id, ?3 AS objective_source_product_conversation_id, ?4 AS objective_source_transcript_id, ?5 AS objective_source_message_id, ?6 AS objective_source_tool_use_id, NULL AS objective_slack_request_id")
+                    .bind(kind).bind(&fields[0]).bind(&fields[1]).bind(&fields[2]).bind(&fields[3]).bind(&fields[4]).fetch_one(&pool).await.unwrap();
+                assert_eq!(ProductCreationOrigin::from_row(&row).is_ok(), missing == 5);
+            }
+        }
+        let row = sqlx::query("SELECT 'unknown-origin' AS objective_origin, NULL AS objective_source_instance_id, NULL AS objective_source_product_conversation_id, NULL AS objective_source_transcript_id, NULL AS objective_source_message_id, NULL AS objective_source_tool_use_id, NULL AS objective_slack_request_id").fetch_one(&pool).await.unwrap();
+        assert!(ProductCreationOrigin::from_row(&row).is_err());
+    }
+
     async fn advance_to_metadata(db: &Database, request_id: &str, claim: &ProductCreationClaim) {
         use ProductCreationProvisioningStage as Stage;
         for stage in [
@@ -2727,6 +3131,7 @@ mod product_creation_tests {
         let request_id = uuid::Uuid::new_v4().to_string();
         let mut accepted_intent = intent("/repo/history", "historical objective");
         accepted_intent.origin = ProductCreationOrigin::InternalConversation {
+            source_instance_id: db.instance_id().await.unwrap(),
             product_conversation_id: coordinator.product_conversation_id.clone(),
             transcript_id: coordinator.id.clone(),
             source_call: SourceToolCall {
@@ -5824,7 +6229,7 @@ mod product_creation_tests {
     }
 
     #[tokio::test]
-    async fn internal_creation_replay_accepts_new_locator_and_retains_first_source() {
+    async fn internal_creation_replay_conflicts_on_new_locator_and_retains_first_source() {
         use phoenix_core::domain::db_schema::SourceToolCall;
         let db = Database::open_in_memory().await.unwrap();
         let coordinator = db
@@ -5834,6 +6239,7 @@ mod product_creation_tests {
         let product_conversation_id = coordinator.product_conversation_id;
         let mut accepted_intent = intent("/repo/origin", "objective");
         accepted_intent.origin = ProductCreationOrigin::InternalConversation {
+            source_instance_id: db.instance_id().await.unwrap(),
             product_conversation_id: product_conversation_id.clone(),
             transcript_id: coordinator.id.clone(),
             source_call: SourceToolCall {
@@ -5849,6 +6255,7 @@ mod product_creation_tests {
 
         let mut replay_intent = accepted_intent.clone();
         replay_intent.origin = ProductCreationOrigin::InternalConversation {
+            source_instance_id: db.instance_id().await.unwrap(),
             product_conversation_id,
             transcript_id: coordinator.id.clone(),
             source_call: SourceToolCall {
@@ -5856,14 +6263,14 @@ mod product_creation_tests {
                 tool_use_id: "call-b".to_string(),
             },
         };
-        let ProductCreationAcceptOutcome::Replayed(job) = db
+        let ProductCreationAcceptOutcome::Conflict(job) = db
             .accept_product_creation_resolved("internal-origin", Some(&coordinator.id), |_| {
                 Ok(replay_intent.clone())
             })
             .await
             .unwrap()
         else {
-            panic!("expected same-owner replay")
+            panic!("expected changed-locator conflict")
         };
         assert_eq!(job.intent.origin, accepted_intent.origin);
     }
@@ -5878,6 +6285,7 @@ mod product_creation_tests {
             .unwrap();
         let mut candidate = intent("/repo/origin", "objective");
         candidate.origin = ProductCreationOrigin::InternalConversation {
+            source_instance_id: db.instance_id().await.unwrap(),
             product_conversation_id: coordinator.product_conversation_id,
             transcript_id: coordinator.id.clone(),
             source_call: SourceToolCall {
