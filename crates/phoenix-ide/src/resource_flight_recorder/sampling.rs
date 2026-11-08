@@ -241,6 +241,12 @@ mod tests {
         let value = serde_json::to_value(&sample).unwrap();
         assert_eq!(value["b"], serde_json::json!([100, 0, null, null]));
 
+        host.available_memory_bytes = None;
+        host.used_memory_bytes = None;
+        sample.host_bytes = host_bytes(&host, [None; 2]);
+        let value = serde_json::to_value(&sample).unwrap();
+        assert_eq!(value["b"], serde_json::json!([100, null, null, null]));
+
         host.total_memory_bytes = None;
         host.available_memory_bytes = None;
         host.used_memory_bytes = None;

@@ -1654,21 +1654,111 @@ fn totals_from_rows(processes: &[ManagedProcessRow]) -> ManagedResourceTotals {
     }
 }
 
-fn host_memory_bytes(supported: bool, total: u64, available: u64) -> [Option<u64>; 3] {
+fn host_memory_bytes(supported: bool, total: u64, available: Option<u64>) -> [Option<u64>; 3] {
     // sysinfo's zero total also encodes a failed native read on a fresh System.
     if !supported || total == 0 {
         tracing::debug!(
             metric = "host_memory",
             "resource metric unavailable or ambiguous"
         );
-        [None; 3]
-    } else {
-        [
-            Some(total),
-            Some(available),
-            Some(total.saturating_sub(available)),
-        ]
+        return [None; 3];
     }
+    let available = available.filter(|available| *available <= total);
+    if available.is_none() {
+        tracing::debug!(
+            metric = "host_memory_available",
+            "resource metric unavailable"
+        );
+    }
+    [
+        Some(total),
+        available,
+        available.map(|available| total - available),
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn native_available_memory() -> Option<u64> {
+    unsafe extern "C" {
+        fn mach_port_deallocate(
+            task: libc::mach_port_t,
+            name: libc::mach_port_t,
+        ) -> libc::kern_return_t;
+    }
+
+    // SAFETY: sysconf and mach_host_self take no pointers.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let host = unsafe { libc::mach_host_self() };
+    if host == libc::MACH_PORT_NULL as libc::mach_port_t {
+        return None;
+    }
+    let available = macos_available_memory_with(page_size, |stat, count| {
+        // SAFETY: stat and count are writable, correctly sized native outputs.
+        unsafe {
+            libc::host_statistics64(
+                host,
+                libc::HOST_VM_INFO64,
+                std::ptr::from_mut(stat).cast(),
+                count,
+            )
+        }
+    });
+    // SAFETY: release the send right returned by mach_host_self in this task.
+    #[allow(deprecated)] // libc exposes mach_task_self but recommends a separate mach2 dependency.
+    let released = unsafe { mach_port_deallocate(libc::mach_task_self(), host) };
+    if released != libc::KERN_SUCCESS {
+        tracing::debug!(metric = "host_memory_available", "host port release failed");
+    }
+    available
+}
+
+#[cfg(target_os = "macos")]
+fn macos_available_memory_with(
+    page_size: libc::c_long,
+    query: impl FnOnce(
+        &mut libc::vm_statistics64,
+        &mut libc::mach_msg_type_number_t,
+    ) -> libc::kern_return_t,
+) -> Option<u64> {
+    let page_size = u64::try_from(page_size).ok().filter(|size| *size > 0)?;
+    // SAFETY: vm_statistics64 consists solely of integer counters.
+    let mut stat: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    if query(&mut stat, &mut count) != libc::KERN_SUCCESS || count < libc::HOST_VM_INFO64_COUNT {
+        return None;
+    }
+    // sysinfo 0.33's available-memory formula; speculative pages are already in free_count.
+    Some(
+        u64::from(stat.free_count)
+            .saturating_add(u64::from(stat.inactive_count))
+            .saturating_add(u64::from(stat.purgeable_count))
+            .saturating_sub(u64::from(stat.compressor_page_count))
+            .saturating_mul(page_size),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn native_available_memory() -> Option<u64> {
+    linux_available_memory_with(|| std::fs::read_to_string("/proc/meminfo"))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_available_memory_with(read: impl FnOnce() -> std::io::Result<String>) -> Option<u64> {
+    let contents = read().ok()?;
+    let value = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))?;
+    let mut fields = value.split_ascii_whitespace();
+    let kib = fields.next()?.parse::<u64>().ok()?;
+    if fields.next()? != "kB" || fields.next().is_some() {
+        return None;
+    }
+    kib.checked_mul(1024)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn native_available_memory() -> Option<u64> {
+    None
 }
 
 fn host_swap_bytes(supported: bool, total: u64, used: u64) -> [Option<u64>; 2] {
@@ -1694,7 +1784,7 @@ pub(crate) async fn sample_host_resources() -> (HostResources, [Option<u64>; 2])
     let [total_memory_bytes, available_memory_bytes, used_memory_bytes] = host_memory_bytes(
         sysinfo::IS_SUPPORTED_SYSTEM,
         sys.total_memory(),
-        sys.available_memory(),
+        native_available_memory(),
     );
     let load = System::load_average();
     let swap = host_swap_bytes(
@@ -2384,20 +2474,118 @@ mod tests {
     #[test]
     fn host_memory_preserves_zero_available_as_full_usage() {
         assert_eq!(
-            host_memory_bytes(true, 100, 0),
+            host_memory_bytes(true, 100, Some(0)),
             [Some(100), Some(0), Some(100)]
         );
         assert_eq!(
-            host_memory_bytes(true, 100, 25),
+            host_memory_bytes(true, 100, Some(25)),
             [Some(100), Some(25), Some(75)]
         );
     }
 
     #[test]
     fn host_memory_keeps_unsupported_and_ambiguous_zero_total_unavailable() {
-        assert_eq!(host_memory_bytes(false, 100, 0), [None; 3]);
-        assert_eq!(host_memory_bytes(false, 100, 25), [None; 3]);
-        assert_eq!(host_memory_bytes(true, 0, 0), [None; 3]);
+        assert_eq!(host_memory_bytes(false, 100, Some(0)), [None; 3]);
+        assert_eq!(host_memory_bytes(false, 100, Some(25)), [None; 3]);
+        assert_eq!(host_memory_bytes(true, 0, Some(0)), [None; 3]);
+    }
+
+    #[test]
+    fn host_memory_keeps_independently_read_total_on_missing_or_invalid_availability() {
+        assert_eq!(host_memory_bytes(true, 100, None), [Some(100), None, None]);
+        assert_eq!(
+            host_memory_bytes(true, 100, Some(101)),
+            [Some(100), None, None]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_memory_query_distinguishes_native_failure_from_successful_zero() {
+        let zero = macos_available_memory_with(4096, |_, _| libc::KERN_SUCCESS);
+        let failed = macos_available_memory_with(4096, |stat, _| {
+            stat.free_count = 10;
+            libc::KERN_FAILURE
+        });
+        assert_eq!(zero, Some(0));
+        assert_eq!(failed, None);
+        assert_eq!(
+            host_memory_bytes(true, 100, zero),
+            [Some(100), Some(0), Some(100)]
+        );
+        assert_eq!(
+            host_memory_bytes(true, 100, failed),
+            [Some(100), None, None]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_memory_query_uses_sysinfo_formula_and_requires_complete_native_output() {
+        assert_eq!(
+            macos_available_memory_with(4096, |stat, _| {
+                stat.free_count = 3;
+                stat.inactive_count = 4;
+                stat.purgeable_count = 2;
+                stat.compressor_page_count = 1;
+                stat.speculative_count = 100;
+                libc::KERN_SUCCESS
+            }),
+            Some(8 * 4096)
+        );
+        assert_eq!(
+            macos_available_memory_with(4096, |stat, _| {
+                stat.compressor_page_count = 1;
+                libc::KERN_SUCCESS
+            }),
+            Some(0)
+        );
+        assert_eq!(
+            macos_available_memory_with(4096, |_, count| {
+                *count -= 1;
+                libc::KERN_SUCCESS
+            }),
+            None
+        );
+        for page_size in [-1, 0] {
+            assert_eq!(
+                macos_available_memory_with(page_size, |_, _| {
+                    panic!("invalid page size must not query native statistics")
+                }),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn linux_memory_read_distinguishes_failure_missing_malformed_and_zero() {
+        let zero = linux_available_memory_with(|| Ok("MemAvailable: 0 kB\n".into()));
+        let failed =
+            linux_available_memory_with(|| Err(std::io::ErrorKind::PermissionDenied.into()));
+        assert_eq!(zero, Some(0));
+        assert_eq!(failed, None);
+        assert_eq!(
+            host_memory_bytes(true, 100, zero),
+            [Some(100), Some(0), Some(100)]
+        );
+        assert_eq!(
+            host_memory_bytes(true, 100, failed),
+            [Some(100), None, None]
+        );
+        assert_eq!(
+            linux_available_memory_with(|| Ok("MemTotal: 100 kB\nMemAvailable: 25 kB\n".into())),
+            Some(25 * 1024)
+        );
+        for contents in [
+            "MemFree: 0 kB\n",
+            "MemAvailable: bad kB\n",
+            "MemAvailable: 1 MB\n",
+            "MemAvailable: 1 kB extra\n",
+            "MemAvailable: -1 kB\n",
+            "MemAvailable: 18446744073709551615 kB\n",
+        ] {
+            assert_eq!(linux_available_memory_with(|| Ok(contents.into())), None);
+        }
     }
 
     #[test]
