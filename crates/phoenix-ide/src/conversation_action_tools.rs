@@ -10,51 +10,14 @@ use serde_json::{json, Value};
 
 use crate::api::CreateProductConversationRequest;
 use crate::conversation_actions::{
-    accept_create, normalize_product_conversation_title, CreateSource,
+    self, accept_create, CoordinatorRenameIntent, CreateSource, LocalCoordinatorSource,
+    RenameAction, RenameOutcome,
 };
-use crate::db::{
-    NormalizedConversationTitle, ProductConversationRenameCommand, ProductConversationRenameResult,
-    ProductConversationRenameSource,
-};
-use crate::runtime::{AdmittedOperation, RuntimeManager};
+use crate::db::ProductConversationRenameResult;
+use crate::runtime::RuntimeManager;
 
 mod automatic_continuation;
 mod continuation;
-
-struct RenameAuthorityPass {
-    owner: Option<AdmittedOperation>,
-}
-
-impl RenameAuthorityPass {
-    fn new(owner: AdmittedOperation) -> Self {
-        Self { owner: Some(owner) }
-    }
-
-    fn complete(
-        mut self,
-        result: phoenix_db::workflow::LocalAuthorityResult<
-            crate::db::DbResult<ProductConversationRenameResult>,
-        >,
-    ) -> Result<ProductConversationRenameResult, String> {
-        match result {
-            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
-                self.owner.take();
-                result.map_err(|error| error.to_string())
-            }
-            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
-                Err("local authority is unclassified; process admission closed".into())
-            }
-        }
-    }
-}
-
-impl Drop for RenameAuthorityPass {
-    fn drop(&mut self) {
-        if let Some(owner) = &self.owner {
-            owner.close("product_conversation_rename");
-        }
-    }
-}
 
 pub(crate) async fn tools(
     runtime: Arc<RuntimeManager>,
@@ -154,7 +117,7 @@ fn output(result: Result<Value, String>) -> ToolOutput {
 async fn mutation_source(
     runtime: &RuntimeManager,
     ctx: &ToolContext,
-) -> Result<ProductConversationRenameSource, String> {
+) -> Result<LocalCoordinatorSource, String> {
     runtime
         .db()
         .require_current_coordinator_transcript(&ctx.conversation_id)
@@ -168,11 +131,10 @@ async fn mutation_source(
         .get_conversation(&ctx.conversation_id)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(ProductConversationRenameSource {
+    Ok(LocalCoordinatorSource {
         product_conversation_id: source.product_conversation_id,
         transcript_id: source.id,
-        message_id: call.message_id,
-        tool_use_id: call.tool_use_id,
+        source_call: call,
     })
 }
 
@@ -251,27 +213,24 @@ impl RenameConversation {
                 title,
             } => {
                 let source = mutation_source(&self.0, &ctx).await?;
-                let title =
-                    normalize_product_conversation_title(&title).map_err(|e| e.to_string())?;
-                let command = ProductConversationRenameCommand {
-                    operation_id: operation_id.0,
-                    product_conversation_id,
-                    expected_root_transcript_id,
-                    expected_name_revision,
-                    title: NormalizedConversationTitle::parse(&title).map_err(|e| e.to_string())?,
-                    source,
+                let outcome = conversation_actions::rename(
+                    &self.0,
+                    RenameAction::CurrentCoordinator {
+                        source,
+                        intent: CoordinatorRenameIntent {
+                            operation_id: operation_id.0,
+                            product_conversation_id,
+                            expected_root_transcript_id,
+                            expected_name_revision,
+                            title,
+                        },
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                let RenameOutcome::CurrentCoordinator(result) = outcome else {
+                    return Err("unexpected user API rename result".into());
                 };
-                let owner = self
-                    .0
-                    .acquire_local_authority_pass()
-                    .map_err(|()| "local authority is closed")?;
-                let authority = RenameAuthorityPass::new(owner);
-                let classified = self
-                    .0
-                    .db()
-                    .rename_product_conversation(&ctx.conversation_id, &command)
-                    .await;
-                let result = authority.complete(classified)?;
                 Ok(match result {
                     ProductConversationRenameResult::Applied(receipt) => {
                         json!({"status":"applied", "receipt":receipt})
@@ -494,9 +453,6 @@ impl CreateConversation {
                 llm_language,
             } => {
                 let source = mutation_source(&self.0, &ctx).await?;
-                let source_call = ctx
-                    .source_tool_call()
-                    .ok_or("Trusted source tool-call identity unavailable")?;
                 let accepted = accept_create(
                     &self.0,
                     CreateProductConversationRequest {
@@ -511,7 +467,7 @@ impl CreateConversation {
                     CreateSource::CurrentCoordinator {
                         product_conversation_id: source.product_conversation_id,
                         transcript_id: source.transcript_id,
-                        source_call,
+                        source_call: source.source_call,
                     },
                 )
                 .await

@@ -330,76 +330,6 @@ async fn native_creation_read_and_submit_receipt_require_current_snapshot_author
 }
 
 #[tokio::test]
-async fn rename_unclassified_result_closes_fence_before_releasing_owner() {
-    let (runtime, _, _) = native_runtime().await;
-    let authority = RenameAuthorityPass::new(runtime.acquire_local_authority_pass().unwrap());
-    let result =
-        authority.complete(phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified);
-    assert!(result.is_err());
-    assert!(runtime.local_authority_is_closed());
-    assert_eq!(runtime.fatal_authority_owners_at_first_close(), Some(1));
-    assert!(runtime.acquire_local_authority_pass().is_err());
-}
-
-#[tokio::test]
-async fn rename_established_rejection_and_stale_result_keep_admission_open() {
-    let (runtime, _, _) = native_runtime().await;
-    let authority = RenameAuthorityPass::new(runtime.acquire_local_authority_pass().unwrap());
-    assert!(authority
-        .complete(
-            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err(
-                crate::db::DbError::CurrentCoordinatorRequired
-            ),)
-        )
-        .is_err());
-    assert!(!runtime.local_authority_is_closed());
-    let authority = RenameAuthorityPass::new(runtime.acquire_local_authority_pass().unwrap());
-    assert_eq!(
-        authority
-            .complete(
-                phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(
-                    ProductConversationRenameResult::Stale
-                ),)
-            )
-            .unwrap(),
-        ProductConversationRenameResult::Stale
-    );
-    assert!(!runtime.local_authority_is_closed());
-    assert_eq!(runtime.fatal_authority_owners_at_first_close(), None);
-}
-
-#[tokio::test]
-async fn cancelled_rename_authority_closes_fence_before_releasing_owner() {
-    let (runtime, _, _) = native_runtime().await;
-    let owner = runtime.acquire_local_authority_pass().unwrap();
-    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-    let task = tokio::spawn(async move {
-        let authority = RenameAuthorityPass::new(owner);
-        entered_tx.send(()).unwrap();
-        std::future::pending::<()>().await;
-        authority.complete(phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified)
-    });
-    entered_rx.await.unwrap();
-    task.abort();
-    assert!(task.await.unwrap_err().is_cancelled());
-    assert!(runtime.local_authority_is_closed());
-    assert_eq!(runtime.fatal_authority_owners_at_first_close(), Some(1));
-}
-
-#[tokio::test]
-async fn panicked_rename_authority_closes_fence_before_releasing_owner() {
-    let (runtime, _, _) = native_runtime().await;
-    let owner = runtime.acquire_local_authority_pass().unwrap();
-    let task = tokio::spawn(async move {
-        let _authority = RenameAuthorityPass::new(owner);
-        panic!("injected rename boundary panic");
-    });
-    assert!(task.await.unwrap_err().is_panic());
-    assert!(runtime.local_authority_is_closed());
-    assert_eq!(runtime.fatal_authority_owners_at_first_close(), Some(1));
-}
-
-#[tokio::test]
 async fn native_registered_rename_is_guarded_replayable_and_revision_checked() {
     let (runtime, db, gc) = native_runtime().await;
     let root = db
@@ -428,10 +358,62 @@ async fn native_registered_rename_is_guarded_replayable_and_revision_checked() {
     let applied = rename.run(request.clone(), native_context(&gc)).await;
     let applied: Value = serde_json::from_str(applied.output()).unwrap();
     assert_eq!(applied["status"], "applied", "{applied}");
-    let replay = rename.run(request.clone(), native_context(&gc)).await;
+    let durable = db
+        .read_product_conversation_rename_receipt(&gc, &operation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.operation_id, operation);
+    assert_eq!(
+        durable.product_conversation_id,
+        root.product_conversation_id
+    );
+    assert_eq!(durable.naming_root_transcript_id, root.id);
+    assert_eq!(
+        durable.name_revision_before,
+        detail["detail"]["name_revision"].as_i64().unwrap()
+    );
+    assert_eq!(durable.title, "Native 東京");
+    assert_eq!(
+        durable.source.source_instance_id,
+        db.instance_id().await.unwrap()
+    );
+    assert_eq!(
+        durable.source.product_conversation_id,
+        db.get_conversation(&gc)
+            .await
+            .unwrap()
+            .product_conversation_id
+    );
+    assert_eq!(durable.source.transcript_id, gc);
+    assert_eq!(durable.source.message_id, "native-message");
+    assert_eq!(durable.source.tool_use_id, "native-call");
+    assert_eq!(serde_json::to_value(&durable).unwrap(), applied["receipt"]);
+    let replay = rename
+        .run(
+            request.clone(),
+            native_context(&gc)
+                .with_svg_assistant_message_id("rename-retry-message")
+                .with_tool_use_id("rename-retry-call"),
+        )
+        .await;
     let replay: Value = serde_json::from_str(replay.output()).unwrap();
     assert_eq!(replay["status"], "replayed");
     assert_eq!(replay["receipt"], applied["receipt"]);
+    assert_eq!(
+        db.read_product_conversation_rename_receipt(&gc, &operation)
+            .await
+            .unwrap()
+            .unwrap(),
+        durable
+    );
+    let mut changed = request.clone();
+    changed["title"] = json!("Different immutable intent");
+    let conflict = rename.run(changed, native_context(&gc)).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(conflict.output()).unwrap()["status"],
+        "conflict"
+    );
     request["operation_id"] = json!(uuid::Uuid::new_v4().to_string());
     let stale = rename.run(request.clone(), native_context(&gc)).await;
     assert_eq!(
@@ -498,10 +480,26 @@ async fn native_registered_create_freezes_literal_intent_and_reconciles_same_req
         .unwrap()
         .unwrap();
     assert_eq!(job.intent.objective, "/literal @not-a-user-file 東京");
-    assert!(matches!(
-        job.intent.origin,
-        crate::db::ProductCreationOrigin::InternalConversation { .. }
-    ));
+    let crate::db::ProductCreationOrigin::InternalConversation {
+        source_instance_id,
+        product_conversation_id,
+        transcript_id,
+        source_call,
+    } = &job.intent.origin
+    else {
+        panic!("expected local native origin")
+    };
+    assert_eq!(*source_instance_id, db.instance_id().await.unwrap());
+    assert_eq!(
+        *product_conversation_id,
+        db.get_conversation(&gc)
+            .await
+            .unwrap()
+            .product_conversation_id
+    );
+    assert_eq!(transcript_id, &gc);
+    assert_eq!(source_call.message_id, "native-message");
+    assert_eq!(source_call.tool_use_id, "native-call");
     let replay = create
         .run(
             request.clone(),

@@ -470,7 +470,8 @@ async fn expand_product_creation_objective(
         | crate::db::ProductCreationOrigin::SlackGateway { .. } => {
             crate::send_chat_service::MessageExpansionPolicy::ExpandReferences
         }
-        crate::db::ProductCreationOrigin::InternalConversation { .. } => {
+        crate::db::ProductCreationOrigin::InternalConversation { .. }
+        | crate::db::ProductCreationOrigin::FederatedConversation { .. } => {
             crate::send_chat_service::MessageExpansionPolicy::LiteralText
         }
     };
@@ -4372,8 +4373,10 @@ mod product_creation_delivery_replay_tests {
         )
         .await
         .unwrap();
+        let source_instance_id = db.instance_id().await.unwrap();
         let manager = test_runtime_manager(db);
         let origin = crate::db::ProductCreationOrigin::InternalConversation {
+            source_instance_id,
             product_conversation_id: "coordinator-product".parse().unwrap(),
             transcript_id: "coordinator-source".into(),
             source_call: phoenix_core::domain::db_schema::SourceToolCall {
