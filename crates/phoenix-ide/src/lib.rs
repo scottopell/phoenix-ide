@@ -31,6 +31,7 @@ mod reminder_delivery;
 mod reminder_service;
 mod resolution_root;
 mod resource_authority;
+mod resource_flight_recorder;
 mod runtime;
 mod send_chat_service;
 mod slack_gateway;
