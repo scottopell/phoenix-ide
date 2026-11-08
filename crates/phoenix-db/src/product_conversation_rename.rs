@@ -397,7 +397,9 @@ fn same_intent(
         && receipt.naming_root_transcript_id == command.expected_root_transcript_id
         && receipt.name_revision_before == command.expected_name_revision
         && receipt.title == command.title.as_str()
-        && receipt.source == command.source
+        && receipt.source.source_instance_id == command.source.source_instance_id
+        && receipt.source.product_conversation_id == command.source.product_conversation_id
+        && receipt.source.transcript_id == command.source.transcript_id
 }
 
 fn decode_receipt(row: &sqlx::sqlite::SqliteRow) -> DbResult<ProductConversationRenameReceipt> {
@@ -493,9 +495,20 @@ mod tests {
         assert_eq!(first.source, command.source);
         assert_eq!(first.title, command.title.as_str());
         let mut changed_locator = command.clone();
+        changed_locator.source.message_id = "different-message".into();
         changed_locator.source.tool_use_id = "different-call".into();
         assert_eq!(
             db.rename_product_conversation_as_federation(&authority, &changed_locator)
+                .await
+                .established()
+                .unwrap()
+                .unwrap(),
+            ProductConversationRenameResult::Replayed(first.clone())
+        );
+        let mut different_transcript_owner = command.clone();
+        different_transcript_owner.source.transcript_id = "another-source-transcript".into();
+        assert_eq!(
+            db.rename_product_conversation_as_federation(&authority, &different_transcript_owner)
                 .await
                 .established()
                 .unwrap()
@@ -525,7 +538,7 @@ mod tests {
             ProductConversationRenameResult::Applied(_)
         ));
         assert_eq!(
-            db.rename_product_conversation_as_federation(&authority, &command)
+            db.rename_product_conversation_as_federation(&authority, &changed_locator)
                 .await
                 .established()
                 .unwrap()
@@ -538,7 +551,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            db.rename_product_conversation_as_federation(&authority, &command)
+            db.rename_product_conversation_as_federation(&authority, &changed_locator)
                 .await
                 .established()
                 .unwrap()
@@ -734,6 +747,16 @@ mod tests {
         changed_locator.source.tool_use_id = "retry-call".into();
         assert_eq!(
             db.rename_product_conversation(&gc.id, &changed_locator)
+                .await
+                .established()
+                .unwrap()
+                .unwrap(),
+            ProductConversationRenameResult::Replayed(first.clone())
+        );
+        let mut changed_source_owner = command.clone();
+        changed_source_owner.source.product_conversation_id = root.product_conversation_id.clone();
+        assert_eq!(
+            db.rename_product_conversation(&gc.id, &changed_source_owner)
                 .await
                 .established()
                 .unwrap()
