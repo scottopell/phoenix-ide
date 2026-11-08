@@ -227,8 +227,10 @@ async fn migration158_qualifies_only_complete_local_native_history_and_preserves
             .await
             .is_err()
     );
-    assert!(sqlx::query("UPDATE product_conversation_rename_receipts SET source_tool_use_id='  ' WHERE operation_id='operation'")
+    assert!(sqlx::query("UPDATE product_conversation_rename_receipts SET source_tool_use_id='' WHERE operation_id='operation'")
         .execute(&pool).await.is_err());
+    sqlx::query("UPDATE product_conversation_rename_receipts SET source_tool_use_id='  ' WHERE operation_id='operation'")
+        .execute(&pool).await.unwrap();
     assert!(sqlx::query("UPDATE product_creation_jobs SET objective_source_message_id='  ' WHERE request_id='local'")
         .execute(&pool).await.is_err());
     assert_eq!(
@@ -314,71 +316,96 @@ async fn migration158_failure_rolls_back_columns_and_restores_schema_guard() {
 
 #[tokio::test]
 async fn migration158_rejects_incomplete_historical_locators_transactionally() {
-    for incomplete_creation in [true, false] {
-        let (pool, _) = fixture().await;
-        if incomplete_creation {
-            seed_creation(&pool, "incomplete", "internal_conversation").await;
-            sqlx::query("PRAGMA ignore_check_constraints=ON")
-                .execute(&pool)
-                .await
-                .unwrap();
-            sqlx::query("UPDATE product_creation_jobs SET objective_source_message_id='  ' WHERE request_id='incomplete'")
-                .execute(&pool).await.unwrap();
-            sqlx::query("PRAGMA ignore_check_constraints=OFF")
-                .execute(&pool)
-                .await
-                .unwrap();
-        } else {
-            sqlx::query("INSERT INTO product_conversation_rename_receipts VALUES('incomplete','target',0,'title','source-product','source-transcript','message','tool','root','slug',10)")
-                .execute(&pool).await.unwrap();
-            sqlx::query("UPDATE product_conversation_rename_receipts SET source_tool_use_id='  ' WHERE operation_id='incomplete'")
-                .execute(&pool).await.unwrap();
-        }
-        let migration = Migration {
+    let (pool, _) = fixture().await;
+    seed_creation(&pool, "incomplete", "internal_conversation").await;
+    sqlx::query("PRAGMA ignore_check_constraints=ON")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE product_creation_jobs SET objective_source_message_id='  ' WHERE request_id='incomplete'")
+        .execute(&pool).await.unwrap();
+    sqlx::query("PRAGMA ignore_check_constraints=OFF")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let migration = Migration {
+        version: 158,
+        name: "federated_conversation_actions",
+        sql: "",
+    };
+    assert!(run(&pool, &migration).await.is_err());
+    let creation_columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('product_creation_jobs')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let rename_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM pragma_table_info('product_conversation_rename_receipts')",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(!creation_columns
+        .iter()
+        .any(|name| name == "objective_source_instance_id"));
+    assert!(!rename_columns
+        .iter()
+        .any(|name| name == "source_instance_id"));
+    let source_message: String = sqlx::query_scalar("SELECT objective_source_message_id FROM product_creation_jobs WHERE request_id='incomplete'")
+            .fetch_one(&pool).await.unwrap();
+    assert_eq!(source_message, "  ");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _migrations")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA writable_schema")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn migration158_preserves_legacy_whitespace_rename_locators() {
+    let (pool, local) = fixture().await;
+    let locators = (" \t ", "  ", "\t", "  \t");
+    sqlx::query("INSERT INTO product_conversation_rename_receipts VALUES('legacy','target',0,'title',?1,?2,?3,?4,'root','slug',10)")
+        .bind(locators.0).bind(locators.1).bind(locators.2).bind(locators.3)
+        .execute(&pool).await.unwrap();
+    run(
+        &pool,
+        &Migration {
             version: 158,
             name: "federated_conversation_actions",
             sql: "",
-        };
-        assert!(run(&pool, &migration).await.is_err());
-        let creation_columns: Vec<String> =
-            sqlx::query_scalar("SELECT name FROM pragma_table_info('product_creation_jobs')")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
-        let rename_columns: Vec<String> = sqlx::query_scalar(
-            "SELECT name FROM pragma_table_info('product_conversation_rename_receipts')",
+        },
+    )
+    .await
+    .unwrap();
+    let retained: (String, String, String, String, String) = sqlx::query_as(
+        "SELECT source_product_conversation_id,source_transcript_id,source_message_id,source_tool_use_id,source_instance_id FROM product_conversation_rename_receipts WHERE operation_id='legacy'"
+    ).fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        retained,
+        (
+            locators.0.into(),
+            locators.1.into(),
+            locators.2.into(),
+            locators.3.into(),
+            local.to_string()
         )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert!(!creation_columns
-            .iter()
-            .any(|name| name == "objective_source_instance_id"));
-        assert!(!rename_columns
-            .iter()
-            .any(|name| name == "source_instance_id"));
-        if incomplete_creation {
-            let source_message: String = sqlx::query_scalar("SELECT objective_source_message_id FROM product_creation_jobs WHERE request_id='incomplete'")
-                .fetch_one(&pool).await.unwrap();
-            assert_eq!(source_message, "  ");
-        } else {
-            let source_tool: String = sqlx::query_scalar("SELECT source_tool_use_id FROM product_conversation_rename_receipts WHERE operation_id='incomplete'")
-                .fetch_one(&pool).await.unwrap();
-            assert_eq!(source_tool, "  ");
-        }
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _migrations")
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("PRAGMA writable_schema")
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
-            0
-        );
-    }
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("PRAGMA integrity_check")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "ok"
+    );
+    assert!(sqlx::query("UPDATE product_conversation_rename_receipts SET source_message_id='' WHERE operation_id='legacy'").execute(&pool).await.is_err());
 }

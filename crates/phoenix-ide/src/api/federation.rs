@@ -2959,14 +2959,17 @@ fn supported_efforts(
 }
 
 fn native_action_source(
-    source: &phoenix_db::ProductConversationRenameSource,
-) -> NativeActionSourceCall {
-    NativeActionSourceCall {
-        source_product_conversation_id: source.product_conversation_id.clone(),
+    source: &phoenix_db::ProductConversationRenameReceiptSource,
+) -> Result<NativeActionSourceCall, NativeActionFailure> {
+    Ok(NativeActionSourceCall {
+        source_product_conversation_id: ProductConversationId::parse(
+            source.product_conversation_id.clone(),
+        )
+        .map_err(native_error)?,
         source_transcript_id: source.transcript_id.clone(),
         source_assistant_message_id: source.message_id.clone(),
         source_tool_use_id: source.tool_use_id.clone(),
-    }
+    })
 }
 
 fn native_initial_execution(
@@ -3447,7 +3450,7 @@ pub(crate) async fn native_create_status(
     )
     .await
     .map_err(native_app_error)?;
-    let response = match status {
+    let mut response = match status {
         None => NativeCreateStatusResponse::Unknown {
             caller_instance_id: request.caller_instance_id,
             destination_instance_id: local,
@@ -3487,7 +3490,57 @@ pub(crate) async fn native_create_status(
             }
         }
     };
+    native_bound_status_diagnostics(&mut response)?;
     native_json(&response, NATIVE_CREATE_STATUS_RESPONSE_BYTES)
+}
+
+fn native_bound_status_diagnostics(
+    response: &mut NativeCreateStatusResponse,
+) -> Result<(), NativeActionFailure> {
+    let fits = |response: &NativeCreateStatusResponse| {
+        serde_json::to_vec(response)
+            .map(|bytes| bytes.len() <= NATIVE_CREATE_STATUS_RESPONSE_BYTES)
+            .map_err(native_error)
+    };
+    if fits(response)? {
+        return Ok(());
+    }
+    const OMITTED: &str = "diagnostic omitted: response size limit";
+    if let NativeCreateStatusResponse::Known {
+        error,
+        initial_execution,
+        ..
+    } = response
+    {
+        if let Some(error) = error {
+            if error.len() > NATIVE_CREATE_STATUS_RESPONSE_BYTES / 2 {
+                *error = OMITTED.to_string();
+            }
+        }
+        if let NativeCreateInitialExecution::Failed { reason } = initial_execution {
+            if reason.len() > NATIVE_CREATE_STATUS_RESPONSE_BYTES / 2 {
+                *reason = OMITTED.to_string();
+            }
+        }
+    }
+    if !fits(response)? {
+        if let NativeCreateStatusResponse::Known {
+            error: Some(error), ..
+        } = response
+        {
+            *error = OMITTED.to_string();
+        }
+    }
+    if !fits(response)? {
+        if let NativeCreateStatusResponse::Known {
+            initial_execution: NativeCreateInitialExecution::Failed { reason },
+            ..
+        } = response
+        {
+            *reason = OMITTED.to_string();
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn native_rename(
@@ -3543,7 +3596,7 @@ pub(crate) async fn native_rename(
                 receipt_name_revision_before: receipt.name_revision_before,
                 receipt_committed_at_unix_micros: receipt.committed_at_unix_micros,
                 receipt_source_instance_id: receipt.source.source_instance_id.clone(),
-                receipt_source: native_action_source(&receipt.source),
+                receipt_source: native_action_source(&receipt.source)?,
             }
         }
         phoenix_db::ProductConversationRenameResult::Replayed(receipt) => {
@@ -3558,7 +3611,7 @@ pub(crate) async fn native_rename(
                 receipt_name_revision_before: receipt.name_revision_before,
                 receipt_committed_at_unix_micros: receipt.committed_at_unix_micros,
                 receipt_source_instance_id: receipt.source.source_instance_id.clone(),
-                receipt_source: native_action_source(&receipt.source),
+                receipt_source: native_action_source(&receipt.source)?,
             }
         }
         phoenix_db::ProductConversationRenameResult::Stale => NativeRenameResponse::Stale {
@@ -3805,7 +3858,7 @@ fn native_verify_create_options(
         || response.projects.len() > NATIVE_CREATE_PROJECT_LIMIT
         || (response.projects_truncated && response.projects.len() != NATIVE_CREATE_PROJECT_LIMIT)
         || response.projects.iter().any(|project| {
-            !native_uuid_is_canonical(&project.project_id)
+            !native_domain_identity_valid(&project.project_id)
                 || !projects.insert(&project.project_id)
                 || !native_absolute_path(&project.cwd)
         })
@@ -3904,7 +3957,12 @@ fn native_verify_rename_options(
     } else {
         vec![NativeRenameDetailAction::Detail]
     };
-    if detail.name_revision < 0
+    if !native_domain_identity_valid(detail.product_conversation_id.as_str())
+        || !native_domain_identity_valid(&detail.root_transcript_id)
+        || (request.reference.starts_with("@conv:")
+            && conversation_lookup_identity(&request.reference)?
+                != detail.product_conversation_id.as_str())
+        || detail.name_revision < 0
         || (detail.can_rename && detail.name_revision == i64::MAX)
         || response.canonical_route
             != crate::api::product_conversations::product_route(
@@ -3941,7 +3999,7 @@ pub(crate) async fn remote_native_rename_options(
         request.destination_instance_id,
     )
     .await?;
-    validate_remote_resolve_reference(&request.reference)?;
+    conversation_lookup_identity(&request.reference)?;
     let response = native_post(
         peer,
         "/api/federation/peer/native-rename-options",
@@ -4020,8 +4078,10 @@ fn native_verify_status(
         {
             return Err(native_protocol("creation status metadata is inconsistent"));
         }
-        if (matches!(publication, NativeCreatePublication::Available { .. })
-            && *creation_status != S::Published)
+        if (matches!(publication, NativeCreatePublication::Available { conversation_id, .. }
+            | NativeCreatePublication::Historical { conversation_id } if !native_domain_identity_valid(conversation_id)))
+            || (matches!(publication, NativeCreatePublication::Available { .. })
+                && *creation_status != S::Published)
             || (*creation_status == S::Published
                 && matches!(publication, NativeCreatePublication::None))
             || (matches!(publication, NativeCreatePublication::Historical { .. })

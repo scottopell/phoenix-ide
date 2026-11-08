@@ -232,7 +232,8 @@ fn native_rename_receipt_preflight_covers_both_variants_at_field_bounds() {
         ProductConversationId::parse("p".repeat(NATIVE_DOMAIN_ID_MAX_BYTES)).unwrap();
     rename.expected_root_transcript_id = "r".repeat(NATIVE_DOMAIN_ID_MAX_BYTES);
     rename.title = "İ".repeat(200);
-    rename.source.source_product_conversation_id = "p".repeat(NATIVE_DOMAIN_ID_MAX_BYTES);
+    rename.source.source_product_conversation_id =
+        ProductConversationId::parse("p".repeat(NATIVE_DOMAIN_ID_MAX_BYTES)).unwrap();
     rename.source.source_transcript_id = "t".repeat(NATIVE_DOMAIN_ID_MAX_BYTES);
     rename.source.source_assistant_message_id = "m".repeat(NATIVE_DOMAIN_ID_MAX_BYTES);
     rename.source.source_tool_use_id = "u".repeat(NATIVE_DOMAIN_ID_MAX_BYTES);
@@ -289,6 +290,45 @@ fn create_options_verifies_the_servers_fifty_project_limit_even_with_cwd() {
 }
 
 #[test]
+fn create_options_accepts_opaque_project_ids_and_rejects_malformed_ids() {
+    let caller = InstanceId::new();
+    let destination = InstanceId::new();
+    let correlation = uuid::Uuid::new_v4().to_string();
+    let request = NativeCreateOptionsRequest::WithoutCwd {
+        caller_instance_id: caller,
+        destination_instance_id: destination,
+        correlation_id: correlation.clone(),
+    };
+    let mut response = NativeCreateOptionsResponse {
+        caller_instance_id: caller,
+        destination_instance_id: destination,
+        correlation_id: correlation,
+        cwd: None,
+        projects: vec![NativeCreateProjectOption {
+            project_id: "project-000".into(),
+            cwd: "/destination/project".into(),
+        }],
+        projects_truncated: false,
+        models: vec![NativeCreateModelOption {
+            model: "destination-model".into(),
+            supported_efforts: vec![],
+        }],
+        default_model: "destination-model".into(),
+        default_llm_language: "phoenix-native".into(),
+    };
+    assert!(native_verify_create_options(&request, &response).is_ok());
+    for invalid in ["", "   ", "project\n000"] {
+        response.projects[0].project_id = invalid.into();
+        assert!(
+            native_verify_create_options(&request, &response).is_err(),
+            "{invalid:?}"
+        );
+    }
+    response.projects[0].project_id = "x".repeat(NATIVE_DOMAIN_ID_MAX_BYTES + 1);
+    assert!(native_verify_create_options(&request, &response).is_err());
+}
+
+#[test]
 fn rename_options_binds_correlation_not_raw_destination_lookup_reference() {
     let request = NativeRenameOptionsRequest {
         caller_instance_id: InstanceId::new(),
@@ -327,6 +367,68 @@ fn rename_options_binds_correlation_not_raw_destination_lookup_reference() {
     response.detail.can_rename = false;
     assert!(native_verify_rename_options(&request, &response).is_ok());
     response.correlation_id = uuid::Uuid::new_v4().to_string();
+    assert!(native_verify_rename_options(&request, &response).is_err());
+}
+
+#[test]
+fn rename_options_closes_direct_product_reference_and_validates_target_ids() {
+    let product = ProductConversationId::parse("opaque-product").unwrap();
+    let mut request = NativeRenameOptionsRequest {
+        caller_instance_id: InstanceId::new(),
+        destination_instance_id: InstanceId::new(),
+        correlation_id: uuid::Uuid::new_v4().to_string(),
+        reference: "@conv:opaque-product".into(),
+    };
+    let mut response = NativeRenameOptionsResponse {
+        caller_instance_id: request.caller_instance_id,
+        destination_instance_id: request.destination_instance_id,
+        correlation_id: request.correlation_id.clone(),
+        canonical_route: "/c/destination-slug".into(),
+        detail: NativeRenameDetail {
+            can_rename: true,
+            product_conversation_id: product,
+            root_transcript_id: "opaque-root".into(),
+            name_revision: 1,
+            title: Some("Title".into()),
+            slug: Some("destination-slug".into()),
+        },
+        allowed_actions: vec![
+            NativeRenameDetailAction::Detail,
+            NativeRenameDetailAction::Rename,
+        ],
+    };
+    assert!(native_verify_rename_options(&request, &response).is_ok());
+    request.reference = "@conv:other-product".into();
+    assert!(native_verify_rename_options(&request, &response).is_err());
+    for reference in [
+        "@transcript:opaque-root",
+        "opaque-product",
+        "destination-slug",
+    ] {
+        request.reference = reference.into();
+        assert!(
+            native_verify_rename_options(&request, &response).is_ok(),
+            "{reference}"
+        );
+    }
+    for invalid in ["", " ", "root\ninvalid"] {
+        response.detail.root_transcript_id = invalid.into();
+        assert!(
+            native_verify_rename_options(&request, &response).is_err(),
+            "{invalid:?}"
+        );
+    }
+    response.detail.root_transcript_id = "r".repeat(NATIVE_DOMAIN_ID_MAX_BYTES + 1);
+    assert!(native_verify_rename_options(&request, &response).is_err());
+    response.detail.root_transcript_id = "opaque-root".into();
+    let invalid = "product\ninvalid";
+    response.detail.product_conversation_id = ProductConversationId::parse(invalid).unwrap();
+    assert!(
+        native_verify_rename_options(&request, &response).is_err(),
+        "{invalid:?}"
+    );
+    response.detail.product_conversation_id =
+        ProductConversationId::parse("p".repeat(NATIVE_DOMAIN_ID_MAX_BYTES + 1)).unwrap();
     assert!(native_verify_rename_options(&request, &response).is_err());
 }
 
@@ -521,6 +623,88 @@ fn create_status_validates_timestamps_stages_and_independent_execution_evidence(
 }
 
 #[test]
+fn create_status_rejects_malformed_available_and_historical_publication_ids() {
+    let (request, mut status) = status_fixture();
+    status["creation_status"] = "published".into();
+    status["provisioning_stage"] = "finalize_publication".into();
+    for publication in ["available", "historical"] {
+        for invalid in ["", "  ", "root\ninvalid"] {
+            status["publication"] = if publication == "available" {
+                serde_json::json!({"kind": publication, "conversation_id": invalid, "canonical_route": "/c/slug"})
+            } else {
+                serde_json::json!({"kind": publication, "conversation_id": invalid})
+            };
+            let typed = serde_json::from_value(status.clone()).unwrap();
+            assert!(
+                native_verify_status(&request, &typed).is_err(),
+                "{publication}/{invalid:?}"
+            );
+        }
+        status["publication"]["conversation_id"] =
+            "x".repeat(NATIVE_DOMAIN_ID_MAX_BYTES + 1).into();
+        let typed = serde_json::from_value(status.clone()).unwrap();
+        assert!(
+            native_verify_status(&request, &typed).is_err(),
+            "{publication}/oversized"
+        );
+        status["publication"]["conversation_id"] = "opaque-conversation".into();
+        let typed = serde_json::from_value(status.clone()).unwrap();
+        assert!(
+            native_verify_status(&request, &typed).is_ok(),
+            "{publication}/opaque"
+        );
+    }
+}
+
+#[test]
+fn create_status_bounds_retained_diagnostics_without_losing_snapshot() {
+    let (request, mut status) = status_fixture();
+    status["creation_status"] = "published".into();
+    status["provisioning_stage"] = "finalize_publication".into();
+    status["publication"] = serde_json::json!({
+        "kind": "available", "conversation_id": "opaque-conversation", "canonical_route": "/c/slug"
+    });
+    status["initial_execution"] = serde_json::json!({"kind":"failed", "reason":"short reason"});
+    status["error"] = "short error".into();
+    let mut known: NativeCreateStatusResponse = serde_json::from_value(status.clone()).unwrap();
+    native_bound_status_diagnostics(&mut known).unwrap();
+    assert_eq!(serde_json::to_value(&known).unwrap(), status);
+
+    for (error_size, reason_size) in [(100_000, 12), (12, 100_000), (100_000, 100_000)] {
+        status["error"] = "e".repeat(error_size).into();
+        status["initial_execution"]["reason"] = "r".repeat(reason_size).into();
+        let mut known: NativeCreateStatusResponse = serde_json::from_value(status.clone()).unwrap();
+        native_bound_status_diagnostics(&mut known).unwrap();
+        let encoded = serde_json::to_vec(&known).unwrap();
+        assert!(encoded.len() <= NATIVE_CREATE_STATUS_RESPONSE_BYTES);
+        assert!(native_json(&known, NATIVE_CREATE_STATUS_RESPONSE_BYTES).is_ok());
+        assert!(native_verify_status(&request, &known).is_ok());
+        let value = serde_json::to_value(&known).unwrap();
+        assert_eq!(value["publication"], status["publication"]);
+        assert_eq!(value["creation_status"], "published");
+        assert_eq!(
+            value["product_conversation_id"],
+            status["product_conversation_id"]
+        );
+        let expected_error = if error_size == 100_000 {
+            "diagnostic omitted: response size limit".to_owned()
+        } else {
+            "e".repeat(error_size)
+        };
+        assert_eq!(value["error"].as_str(), Some(expected_error.as_str()));
+        let expected_reason = if reason_size == 100_000 {
+            "diagnostic omitted: response size limit".to_owned()
+        } else {
+            "r".repeat(reason_size)
+        };
+        assert_eq!(
+            value["initial_execution"]["reason"].as_str(),
+            Some(expected_reason.as_str())
+        );
+    }
+}
+
+#[test]
 fn rename_replay_preserves_historical_tool_locator_but_not_foreign_provenance() {
     let mut too_long = NativeRenameRequest {
         caller_instance_id: InstanceId::new(),
@@ -547,7 +731,7 @@ fn rename_replay_preserves_historical_tool_locator_but_not_foreign_provenance() 
         source: source_call(),
     };
     let mut receipt = serde_json::json!({
-        "kind": "applied",
+        "status": "applied",
         "caller_instance_id": request.caller_instance_id,
         "destination_instance_id": request.destination_instance_id,
         "operation_id": request.operation_id,
@@ -558,8 +742,7 @@ fn rename_replay_preserves_historical_tool_locator_but_not_foreign_provenance() 
         "receipt_name_revision_before": request.expected_name_revision,
         "receipt_committed_at_unix_micros": 1,
         "receipt_source_instance_id": request.caller_instance_id,
-        "receipt_source": request.source,
-        "canonical_route": "/c/fixed-slug"
+        "receipt_source": request.source
     });
     let applied = serde_json::from_value(receipt.clone()).unwrap();
     assert!(native_verify_rename(&request, &applied).is_ok());
@@ -568,7 +751,7 @@ fn rename_replay_preserves_historical_tool_locator_but_not_foreign_provenance() 
     receipt["receipt_source"]["source_tool_use_id"] = "historical-tool-call".into();
     let applied = serde_json::from_value(receipt.clone()).unwrap();
     assert!(native_verify_rename(&request, &applied).is_err());
-    receipt["kind"] = "replayed".into();
+    receipt["status"] = "replayed".into();
     let replayed = serde_json::from_value(receipt.clone()).unwrap();
     assert!(native_verify_rename(&request, &replayed).is_ok());
     for (pointer, value) in [
