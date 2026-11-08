@@ -20,7 +20,9 @@ use phoenix_db::conversation_goals::{
     CoordinatorGoalWaitRequest, CoordinatorGoalWaitStatus, GoalDbError,
 };
 use rand::Rng;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+
+use crate::db::Database;
 use std::future::Future;
 use std::str::FromStr as _;
 
@@ -874,8 +876,28 @@ pub enum FederationClientError {
     Sql(#[from] sqlx::Error),
     #[error("federation request failed: {0}")]
     Request(#[from] reqwest::Error),
+    #[error("native federation request exceeded {0} bytes")]
+    NativeRequestTooLarge(usize),
+    #[error("native federation endpoint is unsupported")]
+    NativeEndpointUnsupported,
+    #[error("native federation authentication, authorization, or identity was rejected: {0}")]
+    NativeIdentityRejected(String),
+    #[error("native federation protocol was rejected: {0}")]
+    NativeProtocolRejected(String),
+    #[error("native federation operation was rejected: {0}")]
+    NativeDomainRejected(String),
+    #[error("native federation destination failed: {0}")]
+    NativeRemoteFailure(String),
     #[error("remote response exceeded {0} bytes")]
     ResponseTooLarge(usize),
+    #[error(
+        "create outcome uncertain at {destination_instance_id} for request {request_id}: {message}"
+    )]
+    NativeCreateUncertain {
+        destination_instance_id: InstanceId,
+        request_id: String,
+        message: String,
+    },
     #[error("remote query rejected: {0}")]
     RemoteRejected(String),
     #[error("invalid federation response: {0}")]
@@ -2527,11 +2549,1718 @@ pub async fn revoke_enrollment(
     }
 }
 
+fn native_canonical_uuid<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    let value = String::deserialize(deserializer)?;
+    if !native_uuid_is_canonical(&value) {
+        return Err(serde::de::Error::custom(
+            "expected canonical lowercase hyphenated UUID",
+        ));
+    }
+    value.parse().map_err(serde::de::Error::custom)
+}
+
+fn native_uuid_is_canonical(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|id| id.hyphenated().to_string() == value)
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeCreationState {
+    Accepted,
+    Claimed,
+    RetryScheduled,
+    Cancelling,
+    Cancelled,
+    DeletionPending,
+    DeliveryPending,
+    DeliveryFailed,
+    Published,
+    Failed,
+    CleanupAmbiguous,
+}
+
+pub(crate) const NATIVE_CREATE_OPTIONS_REQUEST_BYTES: usize = 4096;
+pub(crate) const NATIVE_CREATE_OPTIONS_RESPONSE_BYTES: usize = 262_144;
+pub(crate) const NATIVE_CREATE_REQUEST_BYTES: usize = 65_536;
+pub(crate) const NATIVE_CREATE_RESPONSE_BYTES: usize = 4096;
+pub(crate) const NATIVE_CREATE_STATUS_REQUEST_BYTES: usize = 4096;
+pub(crate) const NATIVE_CREATE_STATUS_RESPONSE_BYTES: usize = 16_384;
+pub(crate) const NATIVE_RENAME_OPTIONS_REQUEST_BYTES: usize = 4096;
+pub(crate) const NATIVE_RENAME_OPTIONS_RESPONSE_BYTES: usize = 262_144;
+pub(crate) const NATIVE_RENAME_REQUEST_BYTES: usize = 16_384;
+pub(crate) const NATIVE_RENAME_RESPONSE_BYTES: usize = 16_384;
+const NATIVE_CREATE_PROJECT_LIMIT: usize = 50;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum NativeCreateOptionsRequest {
+    WithoutCwd {
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        caller_instance_id: InstanceId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        destination_instance_id: InstanceId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        correlation_id: String,
+    },
+    WithCwd {
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        caller_instance_id: InstanceId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        destination_instance_id: InstanceId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        correlation_id: String,
+        cwd: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeRenameOptionsRequest {
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) caller_instance_id: InstanceId,
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) destination_instance_id: InstanceId,
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) correlation_id: String,
+    pub(crate) reference: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeActionSourceCall {
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) source_product_conversation_id: ProductConversationId,
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) source_transcript_id: String,
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) source_assistant_message_id: String,
+    pub(crate) source_tool_use_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeCreateRequest {
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) caller_instance_id: InstanceId,
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) destination_instance_id: InstanceId,
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) request_id: String,
+    pub(crate) cwd: String,
+    pub(crate) objective: String,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub(crate) model: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub(crate) effort: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub(crate) language: Option<String>,
+    pub(crate) start: NativeCreateStart,
+    pub(crate) source: NativeActionSourceCall,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeCreateStart {
+    SubmitObjective,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeCreateStatusRequest {
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) caller_instance_id: InstanceId,
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) destination_instance_id: InstanceId,
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeRenameRequest {
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) caller_instance_id: InstanceId,
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) destination_instance_id: InstanceId,
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) operation_id: String,
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) product_conversation_id: ProductConversationId,
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) expected_root_transcript_id: String,
+    pub(crate) expected_name_revision: i64,
+    pub(crate) title: String,
+    pub(crate) source: NativeActionSourceCall,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeCreateProjectOption {
+    pub(crate) project_id: String,
+    pub(crate) cwd: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeCreateModelOption {
+    pub(crate) model: String,
+    pub(crate) supported_efforts: Vec<phoenix_core::domain::llm_types::ModelEffort>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeCreateOptionsResponse {
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) caller_instance_id: InstanceId,
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) destination_instance_id: InstanceId,
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) correlation_id: String,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub(crate) cwd: Option<String>,
+    pub(crate) projects: Vec<NativeCreateProjectOption>,
+    pub(crate) projects_truncated: bool,
+    pub(crate) models: Vec<NativeCreateModelOption>,
+    pub(crate) default_model: String,
+    pub(crate) default_llm_language: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeRenameDetail {
+    pub(crate) can_rename: bool,
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) product_conversation_id: ProductConversationId,
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) root_transcript_id: String,
+    pub(crate) name_revision: i64,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub(crate) title: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub(crate) slug: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeRenameDetailAction {
+    Detail,
+    Read,
+    Rename,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeRenameOptionsResponse {
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) caller_instance_id: InstanceId,
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) destination_instance_id: InstanceId,
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) correlation_id: String,
+    pub(crate) canonical_route: String,
+    pub(crate) detail: NativeRenameDetail,
+    pub(crate) allowed_actions: Vec<NativeRenameDetailAction>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeCreateAcceptanceStatus {
+    Accepted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeCreateResponse {
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) caller_instance_id: InstanceId,
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) destination_instance_id: InstanceId,
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) request_id: String,
+    #[serde(deserialize_with = "native_canonical_uuid")]
+    pub(crate) product_conversation_id: ProductConversationId,
+    pub(crate) status: NativeCreateAcceptanceStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum NativeCreatePublication {
+    None,
+    Available {
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        conversation_id: String,
+        canonical_route: String,
+    },
+    Historical {
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        conversation_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum NativeCreateInitialExecution {
+    Queued,
+    Running,
+    Completed,
+    Failed { reason: String },
+    Cancelled,
+    AwaitingUserResponse,
+    AwaitingTaskApproval,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum NativeCreateStatusResponse {
+    Unknown {
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        caller_instance_id: InstanceId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        destination_instance_id: InstanceId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        request_id: String,
+    },
+    Known {
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        caller_instance_id: InstanceId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        destination_instance_id: InstanceId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        request_id: String,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        product_conversation_id: ProductConversationId,
+        creation_status: NativeCreationState,
+        provisioning_stage: phoenix_db::ProductCreationProvisioningStage,
+        provisioning_stage_updated_at_unix_micros: i64,
+        #[serde(deserialize_with = "deserialize_present_option")]
+        retry_at_unix_micros: Option<i64>,
+        #[serde(deserialize_with = "deserialize_present_option")]
+        error: Option<String>,
+        publication: NativeCreatePublication,
+        initial_execution: NativeCreateInitialExecution,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum NativeRenameResponse {
+    Applied {
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        caller_instance_id: InstanceId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        destination_instance_id: InstanceId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        operation_id: String,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        product_conversation_id: ProductConversationId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        root_transcript_id: String,
+        receipt_title: String,
+        receipt_slug_at_commit: String,
+        receipt_name_revision_before: i64,
+        receipt_committed_at_unix_micros: i64,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        receipt_source_instance_id: InstanceId,
+        receipt_source: NativeActionSourceCall,
+    },
+    Replayed {
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        caller_instance_id: InstanceId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        destination_instance_id: InstanceId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        operation_id: String,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        product_conversation_id: ProductConversationId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        root_transcript_id: String,
+        receipt_title: String,
+        receipt_slug_at_commit: String,
+        receipt_name_revision_before: i64,
+        receipt_committed_at_unix_micros: i64,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        receipt_source_instance_id: InstanceId,
+        receipt_source: NativeActionSourceCall,
+    },
+    Stale {
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        caller_instance_id: InstanceId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        destination_instance_id: InstanceId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        operation_id: String,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        product_conversation_id: ProductConversationId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        root_transcript_id: String,
+    },
+    Conflict {
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        caller_instance_id: InstanceId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        destination_instance_id: InstanceId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        operation_id: String,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        product_conversation_id: ProductConversationId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        root_transcript_id: String,
+    },
+    NotFound {
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        caller_instance_id: InstanceId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        destination_instance_id: InstanceId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        operation_id: String,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        product_conversation_id: ProductConversationId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        root_transcript_id: String,
+    },
+    Unavailable {
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        caller_instance_id: InstanceId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        destination_instance_id: InstanceId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        operation_id: String,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        product_conversation_id: ProductConversationId,
+        #[serde(deserialize_with = "native_canonical_uuid")]
+        root_transcript_id: String,
+    },
+}
+
+fn supported_efforts(
+    capabilities: &phoenix_llm::EffortCapabilities,
+) -> Vec<phoenix_core::domain::llm_types::ModelEffort> {
+    match capabilities {
+        phoenix_llm::EffortCapabilities::Supported(supported) => supported.levels().to_vec(),
+        phoenix_llm::EffortCapabilities::Unsupported | phoenix_llm::EffortCapabilities::Unknown => {
+            Vec::new()
+        }
+    }
+}
+
+fn native_action_source(
+    source: &phoenix_db::ProductConversationRenameSource,
+) -> NativeActionSourceCall {
+    NativeActionSourceCall {
+        source_product_conversation_id: source.product_conversation_id.clone(),
+        source_transcript_id: source.transcript_id.clone(),
+        source_assistant_message_id: source.message_id.clone(),
+        source_tool_use_id: source.tool_use_id.clone(),
+    }
+}
+
+fn native_initial_execution(
+    execution: &crate::db::ProductCreationInitialExecution,
+) -> NativeCreateInitialExecution {
+    use crate::db::ProductCreationInitialExecution as Execution;
+    match execution {
+        Execution::Queued => NativeCreateInitialExecution::Queued,
+        Execution::Running => NativeCreateInitialExecution::Running,
+        Execution::Completed => NativeCreateInitialExecution::Completed,
+        Execution::Failed { reason } => NativeCreateInitialExecution::Failed {
+            reason: reason.clone(),
+        },
+        Execution::Cancelled => NativeCreateInitialExecution::Cancelled,
+        Execution::AwaitingUserResponse => NativeCreateInitialExecution::AwaitingUserResponse,
+        Execution::AwaitingTaskApproval => NativeCreateInitialExecution::AwaitingTaskApproval,
+        Execution::Unavailable => NativeCreateInitialExecution::Unavailable,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeActionErrorCode {
+    InvalidRequest,
+    Unauthorized,
+    Forbidden,
+    NotFound,
+    Conflict,
+    TooLarge,
+    Unavailable,
+    Internal,
+    UnsupportedEndpoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeActionErrorBody {
+    pub(crate) error_type: NativeActionErrorCode,
+    pub(crate) error: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct NativeActionFailure {
+    status: StatusCode,
+    body: NativeActionErrorBody,
+}
+
+impl NativeActionFailure {
+    fn new(status: StatusCode, code: NativeActionErrorCode, message: &str) -> Self {
+        Self {
+            status,
+            body: NativeActionErrorBody {
+                error_type: code,
+                error: message.into(),
+            },
+        }
+    }
+}
+
+impl From<StatusCode> for NativeActionFailure {
+    fn from(status: StatusCode) -> Self {
+        let code = match status {
+            StatusCode::BAD_REQUEST
+            | StatusCode::UNPROCESSABLE_ENTITY
+            | StatusCode::UNSUPPORTED_MEDIA_TYPE => NativeActionErrorCode::InvalidRequest,
+            StatusCode::UNAUTHORIZED => NativeActionErrorCode::Unauthorized,
+            StatusCode::FORBIDDEN => NativeActionErrorCode::Forbidden,
+            StatusCode::NOT_FOUND => NativeActionErrorCode::NotFound,
+            StatusCode::CONFLICT => NativeActionErrorCode::Conflict,
+            StatusCode::PAYLOAD_TOO_LARGE => NativeActionErrorCode::TooLarge,
+            StatusCode::SERVICE_UNAVAILABLE => NativeActionErrorCode::Unavailable,
+            _ => NativeActionErrorCode::Internal,
+        };
+        Self::new(
+            status,
+            code,
+            status.canonical_reason().unwrap_or("native action failed"),
+        )
+    }
+}
+
+impl IntoResponse for NativeActionFailure {
+    fn into_response(self) -> Response {
+        (self.status, Json(self.body)).into_response()
+    }
+}
+
+fn native_json_rejection(error: axum::extract::rejection::JsonRejection) -> NativeActionFailure {
+    NativeActionFailure::from(error.status())
+}
+
+fn native_source_valid(source: &NativeActionSourceCall) -> bool {
+    native_uuid_is_canonical(source.source_product_conversation_id.as_str())
+        && native_uuid_is_canonical(&source.source_transcript_id)
+        && native_uuid_is_canonical(&source.source_assistant_message_id)
+        && !source.source_tool_use_id.trim().is_empty()
+        && !source.source_tool_use_id.chars().any(char::is_control)
+}
+
+fn native_create_intent_valid(request: &NativeCreateRequest) -> bool {
+    native_uuid_is_canonical(&request.request_id)
+        && !request.cwd.trim().is_empty()
+        && !request.cwd.chars().any(char::is_control)
+        && !request.objective.trim().is_empty()
+        && native_source_valid(&request.source)
+        && [&request.model, &request.effort, &request.language]
+            .iter()
+            .all(|value| {
+                value
+                    .as_ref()
+                    .is_none_or(|v| !v.trim().is_empty() && !v.chars().any(char::is_control))
+            })
+}
+
+fn native_rename_intent_valid(request: &NativeRenameRequest) -> bool {
+    native_uuid_is_canonical(&request.operation_id)
+        && native_uuid_is_canonical(request.product_conversation_id.as_str())
+        && native_uuid_is_canonical(&request.expected_root_transcript_id)
+        && (0..i64::MAX).contains(&request.expected_name_revision)
+        && native_source_valid(&request.source)
+        && crate::conversation_actions::normalize_product_conversation_title(&request.title).is_ok()
+}
+
+fn native_peer_authority(
+    peer: PeerAuthenticated,
+    caller: InstanceId,
+    destination: InstanceId,
+    local: InstanceId,
+) -> Result<phoenix_db::FederationConversationAuthority, NativeActionFailure> {
+    if peer.caller_instance_id != caller {
+        return Err(StatusCode::UNAUTHORIZED.into());
+    }
+    if destination != local {
+        return Err(StatusCode::CONFLICT.into());
+    }
+    Ok(peer.send_authority.into())
+}
+
+fn native_json<T: Serialize>(body: &T, max_bytes: usize) -> Result<Response, NativeActionFailure> {
+    let bytes = serde_json::to_vec(body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if bytes.is_empty() || bytes.len() > max_bytes {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR.into());
+    }
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        bytes,
+    )
+        .into_response())
+}
+
+fn native_error(error: impl std::fmt::Display) -> NativeActionFailure {
+    tracing::warn!(%error, "native federation action failed");
+    NativeActionFailure::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        NativeActionErrorCode::Internal,
+        "native action failed",
+    )
+}
+
+fn native_app_error(error: super::handlers::AppError) -> NativeActionFailure {
+    let message = error.to_string();
+    let status = error.into_response().status();
+    let mut failure = NativeActionFailure::from(status);
+    failure.body.error = message;
+    failure
+}
+
+fn normalized_native_cwd(cwd: &str, home: &std::path::Path) -> Result<String, NativeActionFailure> {
+    let path = if cwd == "~" {
+        home.to_path_buf()
+    } else if let Some(suffix) = cwd.strip_prefix("~/") {
+        home.join(suffix)
+    } else {
+        std::path::PathBuf::from(cwd)
+    };
+    if cwd.trim().is_empty() || !path.is_dir() {
+        return Err(StatusCode::BAD_REQUEST.into());
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|_| StatusCode::BAD_REQUEST)?;
+    crate::conversation_cwd::validate_conversation_cwd(canonical.to_string_lossy())
+        .map(crate::conversation_cwd::ValidConversationCwd::into_raw)
+        .map_err(|_| StatusCode::BAD_REQUEST.into())
+}
+
+pub(crate) async fn native_create_options(
+    State(state): State<AppState>,
+    peer: PeerAuthenticated,
+    request: Result<Json<NativeCreateOptionsRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Response, NativeActionFailure> {
+    let Json(request) = request.map_err(native_json_rejection)?;
+    let (caller, destination, correlation_id, cwd) = match request {
+        NativeCreateOptionsRequest::WithoutCwd {
+            caller_instance_id,
+            destination_instance_id,
+            correlation_id,
+        } => (
+            caller_instance_id,
+            destination_instance_id,
+            correlation_id,
+            None,
+        ),
+        NativeCreateOptionsRequest::WithCwd {
+            caller_instance_id,
+            destination_instance_id,
+            correlation_id,
+            cwd,
+        } => (
+            caller_instance_id,
+            destination_instance_id,
+            correlation_id,
+            Some(cwd),
+        ),
+    };
+    let local = state.db.instance_id().await.map_err(native_error)?;
+    let authority = native_peer_authority(peer, caller, destination, local)?;
+    let cwd = match cwd {
+        Some(cwd) => {
+            let home = state.runtime.runtime_home().to_path_buf();
+            Some(
+                tokio::task::spawn_blocking(move || normalized_native_cwd(&cwd, &home))
+                    .await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??,
+            )
+        }
+        None => None,
+    };
+    let mut projects = Vec::new();
+    let mut cursor = None::<String>;
+    while projects.len() <= NATIVE_CREATE_PROJECT_LIMIT {
+        let rows = state
+            .db
+            .product_creation_project_options_as_federation(&authority, cursor.as_deref())
+            .await
+            .map_err(native_error)?;
+        let Some((last, _)) = rows.last() else {
+            break;
+        };
+        cursor = Some(last.clone());
+        let home = state.runtime.runtime_home().to_path_buf();
+        let usable = tokio::task::spawn_blocking(move || {
+            rows.into_iter()
+                .filter_map(
+                    |(project_id, path)| match normalized_native_cwd(&path, &home) {
+                        Ok(cwd) => Some(NativeCreateProjectOption { project_id, cwd }),
+                        Err(_) => {
+                            tracing::debug!(
+                                %project_id,
+                                %path,
+                                "omitting unusable creation project option"
+                            );
+                            None
+                        }
+                    },
+                )
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        projects.extend(
+            usable
+                .into_iter()
+                .take(NATIVE_CREATE_PROJECT_LIMIT + 1 - projects.len()),
+        );
+    }
+    let truncated = projects.len() > NATIVE_CREATE_PROJECT_LIMIT;
+    projects.truncate(NATIVE_CREATE_PROJECT_LIMIT);
+    let registry = state.runtime.model_registry();
+    let models = registry
+        .available_execution_routes()
+        .into_iter()
+        .map(|route| NativeCreateModelOption {
+            model: route.model,
+            supported_efforts: supported_efforts(&route.supported_efforts),
+        })
+        .collect();
+    let default_llm_language = state
+        .db
+        .get_default_llm_language()
+        .await
+        .map_err(native_error)?;
+    native_json(
+        &NativeCreateOptionsResponse {
+            caller_instance_id: caller,
+            destination_instance_id: destination,
+            correlation_id,
+            cwd,
+            projects,
+            projects_truncated: truncated,
+            models,
+            default_model: registry.default_model_id().to_string(),
+            default_llm_language: default_llm_language.as_str().to_string(),
+        },
+        NATIVE_CREATE_OPTIONS_RESPONSE_BYTES,
+    )
+}
+
+pub(crate) async fn native_rename_options(
+    State(state): State<AppState>,
+    peer: PeerAuthenticated,
+    request: Result<Json<NativeRenameOptionsRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Response, NativeActionFailure> {
+    let Json(request) = request.map_err(native_json_rejection)?;
+    validate_remote_resolve_reference(&request.reference)
+        .map_err(|_| NativeActionFailure::from(StatusCode::BAD_REQUEST))?;
+    let local = state.db.instance_id().await.map_err(native_error)?;
+    let authority = native_peer_authority(
+        peer,
+        request.caller_instance_id,
+        request.destination_instance_id,
+        local,
+    )?;
+    let detail = state
+        .db
+        .read_product_conversation_rename_detail_as_federation(&authority, &request.reference)
+        .await
+        .map_err(native_error)?;
+    let route = crate::api::product_conversations::product_route(
+        detail.slug.as_deref(),
+        detail.product_conversation_id.as_str(),
+    );
+    let allowed_actions = if detail.can_rename {
+        vec![
+            NativeRenameDetailAction::Detail,
+            NativeRenameDetailAction::Rename,
+        ]
+    } else {
+        vec![NativeRenameDetailAction::Detail]
+    };
+    native_json(
+        &NativeRenameOptionsResponse {
+            caller_instance_id: request.caller_instance_id,
+            destination_instance_id: local,
+            correlation_id: request.correlation_id,
+            canonical_route: route,
+            detail: NativeRenameDetail {
+                can_rename: detail.can_rename,
+                product_conversation_id: detail.product_conversation_id,
+                root_transcript_id: detail.root_transcript_id,
+                name_revision: detail.name_revision,
+                title: detail.title,
+                slug: detail.slug,
+            },
+            allowed_actions,
+        },
+        NATIVE_RENAME_OPTIONS_RESPONSE_BYTES,
+    )
+}
+
+pub(crate) async fn native_create(
+    State(state): State<AppState>,
+    peer: PeerAuthenticated,
+    request: Result<Json<NativeCreateRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Response, NativeActionFailure> {
+    let Json(request) = request.map_err(native_json_rejection)?;
+    if !native_create_intent_valid(&request) {
+        return Err(StatusCode::BAD_REQUEST.into());
+    }
+    let local = state.db.instance_id().await.map_err(native_error)?;
+    let authority = native_peer_authority(
+        peer,
+        request.caller_instance_id,
+        request.destination_instance_id,
+        local,
+    )?;
+    let effort = request
+        .effort
+        .map(|value| value.parse().map_err(|_| StatusCode::BAD_REQUEST))
+        .transpose()?;
+    let language = request
+        .language
+        .map(|value| {
+            serde_json::from_value(serde_json::Value::String(value))
+                .map_err(|_| StatusCode::BAD_REQUEST)
+        })
+        .transpose()?;
+    let NativeCreateStart::SubmitObjective = request.start;
+    let accepted = crate::conversation_actions::accept_create_from_federation(
+        &state.runtime,
+        authority,
+        super::types::CreateProductConversationRequest {
+            request_id: request.request_id,
+            cwd: request.cwd,
+            objective: request.objective,
+            model: request.model,
+            effort,
+            llm_language: language,
+            images: Vec::new(),
+        },
+        request.source.source_product_conversation_id,
+        request.source.source_transcript_id,
+        phoenix_core::domain::db_schema::SourceToolCall {
+            message_id: request.source.source_assistant_message_id,
+            tool_use_id: request.source.source_tool_use_id,
+        },
+    )
+    .await
+    .map_err(native_app_error)?;
+    native_json(
+        &NativeCreateResponse {
+            caller_instance_id: request.caller_instance_id,
+            destination_instance_id: local,
+            request_id: accepted.request_id,
+            product_conversation_id: accepted.product_conversation_id,
+            status: NativeCreateAcceptanceStatus::Accepted,
+        },
+        NATIVE_CREATE_RESPONSE_BYTES,
+    )
+}
+
+pub(crate) async fn native_create_status(
+    State(state): State<AppState>,
+    peer: PeerAuthenticated,
+    request: Result<Json<NativeCreateStatusRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Response, NativeActionFailure> {
+    let Json(request) = request.map_err(native_json_rejection)?;
+    let local = state.db.instance_id().await.map_err(native_error)?;
+    let authority = native_peer_authority(
+        peer,
+        request.caller_instance_id,
+        request.destination_instance_id,
+        local,
+    )?;
+    let status = crate::conversation_actions::read_create_status_from_federation(
+        &state.runtime,
+        &authority,
+        &request.request_id,
+    )
+    .await
+    .map_err(native_app_error)?;
+    let response = match status {
+        None => NativeCreateStatusResponse::Unknown {
+            caller_instance_id: request.caller_instance_id,
+            destination_instance_id: local,
+            request_id: request.request_id,
+        },
+        Some(status) => {
+            let publication = match status.publication {
+                None => NativeCreatePublication::None,
+                Some(phoenix_db::ProductCreationPublicationRead::Available {
+                    conversation_id,
+                    aggregate,
+                }) => NativeCreatePublication::Available {
+                    conversation_id,
+                    canonical_route: crate::api::product_conversations::canonical_route(&aggregate),
+                },
+                Some(phoenix_db::ProductCreationPublicationRead::Historical {
+                    conversation_id,
+                }) => NativeCreatePublication::Historical { conversation_id },
+            };
+            let initial_execution = native_initial_execution(&status.initial_objective_execution);
+            let creation_status = serde_json::from_value(serde_json::Value::String(status.status))
+                .map_err(native_error)?;
+            NativeCreateStatusResponse::Known {
+                caller_instance_id: request.caller_instance_id,
+                destination_instance_id: local,
+                request_id: request.request_id,
+                product_conversation_id: status.product_conversation_id,
+                creation_status,
+                provisioning_stage: status.provisioning_stage,
+                provisioning_stage_updated_at_unix_micros: status
+                    .stage_updated_at
+                    .timestamp_micros(),
+                retry_at_unix_micros: status.retry_at.map(|at| at.timestamp_micros()),
+                error: status.error,
+                publication,
+                initial_execution,
+            }
+        }
+    };
+    native_json(&response, NATIVE_CREATE_STATUS_RESPONSE_BYTES)
+}
+
+pub(crate) async fn native_rename(
+    State(state): State<AppState>,
+    peer: PeerAuthenticated,
+    request: Result<Json<NativeRenameRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Response, NativeActionFailure> {
+    let Json(request) = request.map_err(native_json_rejection)?;
+    if !native_rename_intent_valid(&request) {
+        return Err(StatusCode::BAD_REQUEST.into());
+    }
+    let local = state.db.instance_id().await.map_err(native_error)?;
+    let authority = native_peer_authority(
+        peer,
+        request.caller_instance_id,
+        request.destination_instance_id,
+        local,
+    )?;
+    let source = phoenix_db::ProductConversationRenameSource {
+        source_instance_id: authority.caller_instance_id(),
+        product_conversation_id: request.source.source_product_conversation_id,
+        transcript_id: request.source.source_transcript_id,
+        message_id: request.source.source_assistant_message_id,
+        tool_use_id: request.source.source_tool_use_id,
+    };
+    let result = crate::conversation_actions::rename_from_federation(
+        &state.runtime,
+        &authority,
+        source,
+        crate::conversation_actions::CoordinatorRenameIntent {
+            operation_id: request.operation_id.clone(),
+            product_conversation_id: request.product_conversation_id.clone(),
+            expected_root_transcript_id: request.expected_root_transcript_id.clone(),
+            expected_name_revision: request.expected_name_revision,
+            title: request.title,
+        },
+    )
+    .await
+    .map_err(native_app_error)?;
+    let response = match result {
+        phoenix_db::ProductConversationRenameResult::Applied(receipt) => {
+            NativeRenameResponse::Applied {
+                caller_instance_id: request.caller_instance_id,
+                destination_instance_id: local,
+                operation_id: request.operation_id,
+                product_conversation_id: request.product_conversation_id,
+                root_transcript_id: request.expected_root_transcript_id,
+                receipt_title: receipt.title,
+                receipt_slug_at_commit: receipt.slug_at_commit,
+                receipt_name_revision_before: receipt.name_revision_before,
+                receipt_committed_at_unix_micros: receipt.committed_at_unix_micros,
+                receipt_source_instance_id: receipt.source.source_instance_id.clone(),
+                receipt_source: native_action_source(&receipt.source),
+            }
+        }
+        phoenix_db::ProductConversationRenameResult::Replayed(receipt) => {
+            NativeRenameResponse::Replayed {
+                caller_instance_id: request.caller_instance_id,
+                destination_instance_id: local,
+                operation_id: request.operation_id,
+                product_conversation_id: request.product_conversation_id,
+                root_transcript_id: request.expected_root_transcript_id,
+                receipt_title: receipt.title,
+                receipt_slug_at_commit: receipt.slug_at_commit,
+                receipt_name_revision_before: receipt.name_revision_before,
+                receipt_committed_at_unix_micros: receipt.committed_at_unix_micros,
+                receipt_source_instance_id: receipt.source.source_instance_id.clone(),
+                receipt_source: native_action_source(&receipt.source),
+            }
+        }
+        phoenix_db::ProductConversationRenameResult::Stale => NativeRenameResponse::Stale {
+            caller_instance_id: request.caller_instance_id,
+            destination_instance_id: local,
+            operation_id: request.operation_id,
+            product_conversation_id: request.product_conversation_id,
+            root_transcript_id: request.expected_root_transcript_id,
+        },
+        phoenix_db::ProductConversationRenameResult::Conflict => NativeRenameResponse::Conflict {
+            caller_instance_id: request.caller_instance_id,
+            destination_instance_id: local,
+            operation_id: request.operation_id,
+            product_conversation_id: request.product_conversation_id,
+            root_transcript_id: request.expected_root_transcript_id,
+        },
+        phoenix_db::ProductConversationRenameResult::NotFound => NativeRenameResponse::NotFound {
+            caller_instance_id: request.caller_instance_id,
+            destination_instance_id: local,
+            operation_id: request.operation_id,
+            product_conversation_id: request.product_conversation_id,
+            root_transcript_id: request.expected_root_transcript_id,
+        },
+        phoenix_db::ProductConversationRenameResult::Unavailable => {
+            NativeRenameResponse::Unavailable {
+                caller_instance_id: request.caller_instance_id,
+                destination_instance_id: local,
+                operation_id: request.operation_id,
+                product_conversation_id: request.product_conversation_id,
+                root_transcript_id: request.expected_root_transcript_id,
+            }
+        }
+    };
+    native_json(&response, NATIVE_RENAME_RESPONSE_BYTES)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum NativeCreateOutcome {
+    Accepted { acceptance: NativeCreateResponse },
+    Reconciled { status: NativeCreateStatusResponse },
+}
+
+fn native_protocol(message: &str) -> FederationClientError {
+    FederationClientError::NativeProtocolRejected(message.to_string())
+}
+
+async fn native_client_identity(
+    db: &Database,
+    peer: &ResolvedPeer,
+    caller: InstanceId,
+    destination: InstanceId,
+) -> Result<(), FederationClientError> {
+    if caller != db.instance_id().await?
+        || destination != peer.instance_id()
+        || caller == destination
+    {
+        return Err(FederationClientError::NativeIdentityRejected(
+            "request identity does not match selected peer/local instance".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn native_prepare_post<Q: Serialize + DeserializeOwned>(
+    peer: &ResolvedPeer,
+    route: &str,
+    request: &Q,
+    request_limit: usize,
+) -> Result<reqwest::RequestBuilder, FederationClientError> {
+    let bytes =
+        serde_json::to_vec(request).map_err(|_| native_protocol("request encoding failed"))?;
+    if bytes.len() > request_limit {
+        return Err(FederationClientError::NativeRequestTooLarge(request_limit));
+    }
+    // Constructed Rust requests must satisfy the same strict wire checks as ingress.
+    serde_json::from_slice::<Q>(&bytes)
+        .map_err(|_| native_protocol("request witnesses are malformed"))?;
+    let client = remote_query_client(&peer.connection.tls_trust)?;
+    Ok(client
+        .post(format!(
+            "{}{}",
+            peer.connection.base_url,
+            route.trim_start_matches('/')
+        ))
+        .bearer_auth(peer.connection.bearer_credential.expose())
+        .timeout(std::time::Duration::from_secs(15))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(bytes))
+}
+
+async fn native_post<Q, R>(
+    peer: &ResolvedPeer,
+    route: &str,
+    request: &Q,
+    request_limit: usize,
+    response_limit: usize,
+) -> Result<R, FederationClientError>
+where
+    Q: Serialize + DeserializeOwned,
+    R: DeserializeOwned,
+{
+    let post = native_prepare_post(peer, route, request, request_limit)?;
+    native_send_post(post, response_limit).await
+}
+
+async fn native_send_post<R: DeserializeOwned>(
+    post: reqwest::RequestBuilder,
+    response_limit: usize,
+) -> Result<R, FederationClientError> {
+    let mut response = post.send().await?;
+    let status = response.status();
+    if response
+        .content_length()
+        .is_some_and(|length| length > response_limit as u64)
+    {
+        return Err(FederationClientError::ResponseTooLarge(response_limit));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        append_bounded_response_chunk(&mut body, &chunk, response_limit)?;
+    }
+    if status != reqwest::StatusCode::OK {
+        return Err(native_response_error(status, &body));
+    }
+    serde_json::from_slice(&body)
+        .map_err(|_| native_protocol("response schema or canonical witnesses are invalid"))
+}
+
+fn native_response_error(status: reqwest::StatusCode, body: &[u8]) -> FederationClientError {
+    if let Ok(error) = serde_json::from_slice::<NativeActionErrorBody>(body) {
+        if !native_error_status_matches(status, error.error_type) || error.error.trim().is_empty() {
+            return native_protocol("error classification disagrees with HTTP status");
+        }
+        return match error.error_type {
+            NativeActionErrorCode::Unauthorized | NativeActionErrorCode::Forbidden => {
+                FederationClientError::NativeIdentityRejected(error.error)
+            }
+            NativeActionErrorCode::UnsupportedEndpoint => {
+                FederationClientError::NativeEndpointUnsupported
+            }
+            NativeActionErrorCode::Unavailable | NativeActionErrorCode::Internal => {
+                FederationClientError::NativeRemoteFailure(error.error)
+            }
+            _ => FederationClientError::NativeDomainRejected(error.error),
+        };
+    }
+    match status {
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED => {
+            FederationClientError::NativeEndpointUnsupported
+        }
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+            FederationClientError::NativeIdentityRejected(format!("HTTP {status}"))
+        }
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE => FederationClientError::NativeDomainRejected(
+            "raw request body exceeded destination limit".into(),
+        ),
+        _ if status.is_server_error() => {
+            FederationClientError::NativeRemoteFailure(format!("HTTP {status}"))
+        }
+        _ => native_protocol("unclassified native endpoint rejection"),
+    }
+}
+
+fn native_error_status_matches(status: reqwest::StatusCode, code: NativeActionErrorCode) -> bool {
+    match code {
+        NativeActionErrorCode::InvalidRequest => matches!(status.as_u16(), 400 | 415 | 422),
+        NativeActionErrorCode::Unauthorized => status.as_u16() == 401,
+        NativeActionErrorCode::Forbidden => status.as_u16() == 403,
+        NativeActionErrorCode::NotFound => status.as_u16() == 404,
+        NativeActionErrorCode::Conflict => status.as_u16() == 409,
+        NativeActionErrorCode::TooLarge => status.as_u16() == 413,
+        NativeActionErrorCode::Unavailable => status.as_u16() == 503,
+        NativeActionErrorCode::Internal => status.as_u16() == 500,
+        NativeActionErrorCode::UnsupportedEndpoint => matches!(status.as_u16(), 404 | 405),
+    }
+}
+
+fn native_echo_matches(
+    caller: InstanceId,
+    destination: InstanceId,
+    received_caller: InstanceId,
+    received_destination: InstanceId,
+    witness: &str,
+    received_witness: &str,
+) -> Result<(), FederationClientError> {
+    if caller != received_caller
+        || destination != received_destination
+        || witness != received_witness
+    {
+        return Err(native_protocol(
+            "response identities/correlation witness do not match request",
+        ));
+    }
+    Ok(())
+}
+
+fn native_option_string(value: &str) -> bool {
+    !value.trim().is_empty() && value.trim() == value && !value.chars().any(char::is_control)
+}
+
+fn native_verify_create_options(
+    request: &NativeCreateOptionsRequest,
+    response: &NativeCreateOptionsResponse,
+) -> Result<(), FederationClientError> {
+    let (caller, destination, correlation, with_cwd) = match request {
+        NativeCreateOptionsRequest::WithoutCwd {
+            caller_instance_id,
+            destination_instance_id,
+            correlation_id,
+        } => (
+            *caller_instance_id,
+            *destination_instance_id,
+            correlation_id,
+            false,
+        ),
+        NativeCreateOptionsRequest::WithCwd {
+            caller_instance_id,
+            destination_instance_id,
+            correlation_id,
+            ..
+        } => (
+            *caller_instance_id,
+            *destination_instance_id,
+            correlation_id,
+            true,
+        ),
+    };
+    native_echo_matches(
+        caller,
+        destination,
+        response.caller_instance_id,
+        response.destination_instance_id,
+        correlation,
+        &response.correlation_id,
+    )?;
+    let mut names = std::collections::HashSet::new();
+    let mut projects = std::collections::HashSet::new();
+    if response.cwd.is_some() != with_cwd
+        || response
+            .cwd
+            .as_ref()
+            .is_some_and(|cwd| !native_absolute_path(cwd))
+        || response.projects.len() > NATIVE_CREATE_PROJECT_LIMIT
+        || (response.projects_truncated && response.projects.len() != NATIVE_CREATE_PROJECT_LIMIT)
+        || response.projects.iter().any(|project| {
+            !native_uuid_is_canonical(&project.project_id)
+                || !projects.insert(&project.project_id)
+                || !native_absolute_path(&project.cwd)
+        })
+        || !native_option_string(&response.default_model)
+        || serde_json::from_value::<phoenix_core::llm_language::LlmLanguage>(
+            serde_json::Value::String(response.default_llm_language.clone()),
+        )
+        .is_err()
+    {
+        return Err(native_protocol(
+            "destination options defaults/cwd/project choices are invalid",
+        ));
+    }
+    for model in &response.models {
+        let mut efforts = std::collections::HashSet::new();
+        if !native_option_string(&model.model)
+            || !names.insert(&model.model)
+            || model
+                .supported_efforts
+                .iter()
+                .any(|effort| !efforts.insert(effort.as_wire_name()))
+        {
+            return Err(native_protocol(
+                "destination model/effort choices are invalid",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn native_absolute_path(path: &str) -> bool {
+    // Remote paths may be Windows or Unix; never resolve them on the source host.
+    native_option_string(path)
+        && (path.starts_with('/')
+            || path.starts_with("\\\\")
+            || (path.as_bytes().get(1) == Some(&b':')
+                && path
+                    .as_bytes()
+                    .get(2)
+                    .is_some_and(|c| matches!(c, b'/' | b'\\'))
+                && path.as_bytes()[0].is_ascii_alphabetic()))
+}
+
+pub(crate) async fn remote_native_create_options(
+    db: &Database,
+    peer: &ResolvedPeer,
+    request: &NativeCreateOptionsRequest,
+) -> Result<NativeCreateOptionsResponse, FederationClientError> {
+    let (caller, destination) = match request {
+        NativeCreateOptionsRequest::WithoutCwd {
+            caller_instance_id,
+            destination_instance_id,
+            ..
+        }
+        | NativeCreateOptionsRequest::WithCwd {
+            caller_instance_id,
+            destination_instance_id,
+            ..
+        } => (*caller_instance_id, *destination_instance_id),
+    };
+    native_client_identity(db, peer, caller, destination).await?;
+    if matches!(request, NativeCreateOptionsRequest::WithCwd { cwd, .. } if !native_option_string(cwd))
+    {
+        return Err(native_protocol("invalid cwd"));
+    }
+    let response = native_post(
+        peer,
+        "/api/federation/peer/native-create-options",
+        request,
+        NATIVE_CREATE_OPTIONS_REQUEST_BYTES,
+        NATIVE_CREATE_OPTIONS_RESPONSE_BYTES,
+    )
+    .await?;
+    native_verify_create_options(request, &response)?;
+    Ok(response)
+}
+
+fn native_verify_rename_options(
+    request: &NativeRenameOptionsRequest,
+    response: &NativeRenameOptionsResponse,
+) -> Result<(), FederationClientError> {
+    native_echo_matches(
+        request.caller_instance_id,
+        request.destination_instance_id,
+        response.caller_instance_id,
+        response.destination_instance_id,
+        &request.correlation_id,
+        &response.correlation_id,
+    )?;
+    let detail = &response.detail;
+    let expected_actions = if detail.can_rename {
+        vec![
+            NativeRenameDetailAction::Detail,
+            NativeRenameDetailAction::Rename,
+        ]
+    } else {
+        vec![NativeRenameDetailAction::Detail]
+    };
+    if detail.name_revision < 0
+        || (detail.can_rename && detail.name_revision == i64::MAX)
+        || response.canonical_route
+            != crate::api::product_conversations::product_route(
+                detail.slug.as_deref(),
+                detail.product_conversation_id.as_str(),
+            )
+        || response.allowed_actions.len() != expected_actions.len()
+        || expected_actions
+            .iter()
+            .any(|action| !response.allowed_actions.contains(action))
+        || detail.slug.as_ref().is_some_and(|slug| {
+            !native_option_string(slug)
+                || slug.contains('/')
+                || slug.contains('?')
+                || slug.contains('#')
+        })
+    {
+        return Err(native_protocol(
+            "rename-options detail/route/actions are inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn remote_native_rename_options(
+    db: &Database,
+    peer: &ResolvedPeer,
+    request: &NativeRenameOptionsRequest,
+) -> Result<NativeRenameOptionsResponse, FederationClientError> {
+    native_client_identity(
+        db,
+        peer,
+        request.caller_instance_id,
+        request.destination_instance_id,
+    )
+    .await?;
+    validate_remote_resolve_reference(&request.reference)?;
+    let response = native_post(
+        peer,
+        "/api/federation/peer/native-rename-options",
+        request,
+        NATIVE_RENAME_OPTIONS_REQUEST_BYTES,
+        NATIVE_RENAME_OPTIONS_RESPONSE_BYTES,
+    )
+    .await?;
+    native_verify_rename_options(request, &response)?;
+    Ok(response)
+}
+
+fn native_verify_status(
+    request: &NativeCreateStatusRequest,
+    response: &NativeCreateStatusResponse,
+) -> Result<(), FederationClientError> {
+    let (caller, destination, witness) = match response {
+        NativeCreateStatusResponse::Unknown {
+            caller_instance_id,
+            destination_instance_id,
+            request_id,
+        }
+        | NativeCreateStatusResponse::Known {
+            caller_instance_id,
+            destination_instance_id,
+            request_id,
+            ..
+        } => (*caller_instance_id, *destination_instance_id, request_id),
+    };
+    native_echo_matches(
+        request.caller_instance_id,
+        request.destination_instance_id,
+        caller,
+        destination,
+        &request.request_id,
+        witness,
+    )?;
+    if let NativeCreateStatusResponse::Known {
+        creation_status,
+        provisioning_stage,
+        provisioning_stage_updated_at_unix_micros,
+        retry_at_unix_micros,
+        publication,
+        initial_execution,
+        ..
+    } = response
+    {
+        use phoenix_db::ProductCreationProvisioningStage as Stage;
+        use NativeCreationState as S;
+        if *provisioning_stage_updated_at_unix_micros < 0
+            || chrono::DateTime::from_timestamp_micros(*provisioning_stage_updated_at_unix_micros)
+                .is_none()
+        {
+            return Err(native_protocol("creation stage timestamp is invalid"));
+        }
+        if matches!(initial_execution, NativeCreateInitialExecution::Failed { reason } if reason.trim().is_empty())
+        {
+            return Err(native_protocol(
+                "failed initial execution has no failure reason",
+            ));
+        }
+        if (*creation_status == S::RetryScheduled && retry_at_unix_micros.is_none())
+            || (retry_at_unix_micros.is_some()
+                && !matches!(
+                    creation_status,
+                    S::RetryScheduled
+                        | S::DeliveryPending
+                        | S::Cancelling
+                        | S::Cancelled
+                        | S::DeletionPending
+                        | S::CleanupAmbiguous
+                ))
+            || retry_at_unix_micros.is_some_and(|timestamp| {
+                timestamp < 0 || chrono::DateTime::from_timestamp_micros(timestamp).is_none()
+            })
+        {
+            return Err(native_protocol("creation status metadata is inconsistent"));
+        }
+        if (matches!(publication, NativeCreatePublication::Available { .. })
+            && *creation_status != S::Published)
+            || (*creation_status == S::Published
+                && matches!(publication, NativeCreatePublication::None))
+            || (matches!(publication, NativeCreatePublication::Historical { .. })
+                && !matches!(
+                    creation_status,
+                    S::Published | S::DeliveryPending | S::DeliveryFailed
+                ))
+            || (*creation_status == S::Published
+                && *provisioning_stage != Stage::FinalizePublication)
+            || (matches!(creation_status, S::DeliveryPending | S::DeliveryFailed)
+                && *provisioning_stage != Stage::BootstrapInitialTurn)
+            || (*creation_status == S::Accepted && *provisioning_stage != Stage::ValidateIntent)
+            || (matches!(creation_status, S::Claimed | S::RetryScheduled | S::Failed)
+                && matches!(
+                    provisioning_stage,
+                    Stage::BootstrapInitialTurn | Stage::FinalizePublication
+                ))
+            || (!matches!(
+                creation_status,
+                S::Published | S::DeliveryPending | S::DeliveryFailed | S::DeletionPending
+            ) && !matches!(initial_execution, NativeCreateInitialExecution::Unavailable))
+        {
+            return Err(native_protocol(
+                "publication/initial execution does not match creation state",
+            ));
+        }
+        if let NativeCreatePublication::Available {
+            canonical_route, ..
+        } = publication
+        {
+            // Slugs are destination-owned, but the route must remain a single canonical product route.
+            if !native_product_route_shape(canonical_route) {
+                return Err(native_protocol("published route is not canonical"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn native_product_route_shape(route: &str) -> bool {
+    let Some(segment) = route.strip_prefix("/c/") else {
+        return false;
+    };
+    if segment.is_empty() || segment.contains('/') || segment.contains('?') || segment.contains('#')
+    {
+        return false;
+    }
+    let Ok(decoded) = percent_encoding::percent_decode_str(segment).decode_utf8() else {
+        return false;
+    };
+    native_option_string(&decoded)
+        && !decoded.contains('/')
+        && !decoded.contains('?')
+        && !decoded.contains('#')
+        && crate::api::product_conversations::product_route(Some(&decoded), "") == route
+}
+
+pub(crate) async fn remote_native_create_status(
+    db: &Database,
+    peer: &ResolvedPeer,
+    request: &NativeCreateStatusRequest,
+) -> Result<NativeCreateStatusResponse, FederationClientError> {
+    native_client_identity(
+        db,
+        peer,
+        request.caller_instance_id,
+        request.destination_instance_id,
+    )
+    .await?;
+    let response = native_post(
+        peer,
+        "/api/federation/peer/native-create-status",
+        request,
+        NATIVE_CREATE_STATUS_REQUEST_BYTES,
+        NATIVE_CREATE_STATUS_RESPONSE_BYTES,
+    )
+    .await?;
+    native_verify_status(request, &response)?;
+    Ok(response)
+}
+
+pub(crate) async fn remote_native_create(
+    db: &Database,
+    peer: &ResolvedPeer,
+    request: &NativeCreateRequest,
+) -> Result<NativeCreateOutcome, FederationClientError> {
+    native_client_identity(
+        db,
+        peer,
+        request.caller_instance_id,
+        request.destination_instance_id,
+    )
+    .await?;
+    if !native_create_intent_valid(request) {
+        return Err(native_protocol("invalid create intent"));
+    }
+    let post = native_prepare_post(
+        peer,
+        "/api/federation/peer/native-create",
+        request,
+        NATIVE_CREATE_REQUEST_BYTES,
+    )?;
+    let result = native_send_post::<NativeCreateResponse>(post, NATIVE_CREATE_RESPONSE_BYTES)
+        .await
+        .and_then(|acceptance| {
+            native_echo_matches(
+                request.caller_instance_id,
+                request.destination_instance_id,
+                acceptance.caller_instance_id,
+                acceptance.destination_instance_id,
+                &request.request_id,
+                &acceptance.request_id,
+            )?;
+            Ok(acceptance)
+        });
+    match result {
+        Ok(acceptance) => Ok(NativeCreateOutcome::Accepted { acceptance }),
+        Err(
+            error @ (FederationClientError::NativeEndpointUnsupported
+            | FederationClientError::NativeIdentityRejected(_)
+            | FederationClientError::NativeDomainRejected(_)
+            | FederationClientError::NativeRejected { .. }),
+        ) => Err(error),
+        Err(error) => {
+            let status_request = NativeCreateStatusRequest {
+                caller_instance_id: request.caller_instance_id,
+                destination_instance_id: request.destination_instance_id,
+                request_id: request.request_id.clone(),
+            };
+            match remote_native_create_status(db, peer, &status_request).await {
+                Ok(status) => Ok(NativeCreateOutcome::Reconciled { status }),
+                Err(status_error) => Err(FederationClientError::NativeCreateUncertain {
+                    destination_instance_id: request.destination_instance_id,
+                    request_id: request.request_id.clone(),
+                    message: format!(
+                        "{error}; original-destination status lookup failed: {status_error}"
+                    ),
+                }),
+            }
+        }
+    }
+}
+
+fn native_verify_rename(
+    request: &NativeRenameRequest,
+    response: &NativeRenameResponse,
+) -> Result<(), FederationClientError> {
+    let (caller, destination, operation, product, root) = match response {
+        NativeRenameResponse::Applied {
+            caller_instance_id,
+            destination_instance_id,
+            operation_id,
+            product_conversation_id,
+            root_transcript_id,
+            ..
+        }
+        | NativeRenameResponse::Replayed {
+            caller_instance_id,
+            destination_instance_id,
+            operation_id,
+            product_conversation_id,
+            root_transcript_id,
+            ..
+        }
+        | NativeRenameResponse::Stale {
+            caller_instance_id,
+            destination_instance_id,
+            operation_id,
+            product_conversation_id,
+            root_transcript_id,
+        }
+        | NativeRenameResponse::Conflict {
+            caller_instance_id,
+            destination_instance_id,
+            operation_id,
+            product_conversation_id,
+            root_transcript_id,
+        }
+        | NativeRenameResponse::NotFound {
+            caller_instance_id,
+            destination_instance_id,
+            operation_id,
+            product_conversation_id,
+            root_transcript_id,
+        }
+        | NativeRenameResponse::Unavailable {
+            caller_instance_id,
+            destination_instance_id,
+            operation_id,
+            product_conversation_id,
+            root_transcript_id,
+        } => (
+            *caller_instance_id,
+            *destination_instance_id,
+            operation_id,
+            product_conversation_id,
+            root_transcript_id,
+        ),
+    };
+    native_echo_matches(
+        request.caller_instance_id,
+        request.destination_instance_id,
+        caller,
+        destination,
+        &request.operation_id,
+        operation,
+    )?;
+    if product != &request.product_conversation_id || root != &request.expected_root_transcript_id {
+        return Err(native_protocol(
+            "rename target witnesses do not match request",
+        ));
+    }
+    match response {
+        NativeRenameResponse::Applied {
+            receipt_title,
+            receipt_slug_at_commit,
+            receipt_name_revision_before,
+            receipt_committed_at_unix_micros,
+            receipt_source_instance_id,
+            receipt_source,
+            ..
+        }
+        | NativeRenameResponse::Replayed {
+            receipt_title,
+            receipt_slug_at_commit,
+            receipt_name_revision_before,
+            receipt_committed_at_unix_micros,
+            receipt_source_instance_id,
+            receipt_source,
+            ..
+        } => {
+            let title =
+                crate::conversation_actions::normalize_product_conversation_title(&request.title)
+                    .map_err(|_| native_protocol("invalid rename title"))?;
+            let source_matches = match response {
+                NativeRenameResponse::Applied { .. } => receipt_source == &request.source,
+                NativeRenameResponse::Replayed { .. } => {
+                    receipt_source.source_product_conversation_id
+                        == request.source.source_product_conversation_id
+                        && receipt_source.source_transcript_id
+                            == request.source.source_transcript_id
+                }
+                _ => unreachable!(),
+            };
+            if receipt_source_instance_id != &request.caller_instance_id
+                || !native_source_valid(receipt_source)
+                || !source_matches
+                || receipt_title != &title
+                || receipt_name_revision_before != &request.expected_name_revision
+                || *receipt_name_revision_before < 0
+                || *receipt_name_revision_before == i64::MAX
+                || chrono::DateTime::from_timestamp_micros(*receipt_committed_at_unix_micros)
+                    .is_none()
+                || !native_product_route_shape(&crate::api::product_conversations::product_route(
+                    Some(receipt_slug_at_commit),
+                    product.as_str(),
+                ))
+            {
+                return Err(native_protocol(
+                    "rename receipt does not witness the requested mutation",
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+pub(crate) async fn remote_native_rename(
+    db: &Database,
+    peer: &ResolvedPeer,
+    request: &NativeRenameRequest,
+) -> Result<NativeRenameResponse, FederationClientError> {
+    native_client_identity(
+        db,
+        peer,
+        request.caller_instance_id,
+        request.destination_instance_id,
+    )
+    .await?;
+    if !native_rename_intent_valid(request) {
+        return Err(native_protocol("invalid rename intent"));
+    }
+    let response = native_post(
+        peer,
+        "/api/federation/peer/native-rename",
+        request,
+        NATIVE_RENAME_REQUEST_BYTES,
+        NATIVE_RENAME_RESPONSE_BYTES,
+    )
+    .await?;
+    native_verify_rename(request, &response)?;
+    Ok(response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     mod goal_read;
+    #[path = "../native_actions.rs"]
+    mod native_actions;
     mod send;
 
     fn resolution(

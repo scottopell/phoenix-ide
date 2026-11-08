@@ -8,10 +8,11 @@ use phoenix_tools::{Tool, ToolContext, ToolOutput};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
-use crate::api::CreateProductConversationRequest;
+use crate::api::{federation, CreateProductConversationRequest};
 use crate::conversation_actions::{
     self, accept_create, CoordinatorRenameIntent, CreateSource, LocalCoordinatorSource,
 };
+use crate::coordinator_tools::instance::{Route, RouteTool, RoutedTool};
 use crate::db::ProductConversationRenameResult;
 use crate::runtime::RuntimeManager;
 
@@ -28,8 +29,8 @@ pub(crate) async fn tools(
         .await
     {
         Ok(()) => Ok(vec![
-            Arc::new(RenameConversation(runtime.clone())),
-            Arc::new(CreateConversation(runtime.clone())),
+            RouteTool::boxed(RenameConversation(runtime.clone())),
+            RouteTool::boxed(CreateConversation(runtime.clone())),
             Arc::new(continuation::ContinueConversation(runtime.clone())),
             Arc::new(automatic_continuation::AutomaticContinuationTool::read(
                 runtime.clone(),
@@ -142,14 +143,22 @@ fn operation_schema() -> Value {
 }
 
 #[async_trait]
-impl Tool for RenameConversation {
+impl RoutedTool for RenameConversation {
+    fn validate_before_peer_lookup(&self, input: &Value) -> Result<(), String> {
+        let request: RenameRequest =
+            serde_json::from_value(input.clone()).map_err(|error| error.to_string())?;
+        if matches!(request, RenameRequest::Read { .. }) {
+            return Err("Remote rename read cannot prove immutable intent from operation_id alone. Recovery requires the exact original rename request, including its original trusted source locator; a new tool call is not such a replay. Do not mint a replacement operation for recovery.".into());
+        }
+        Ok(())
+    }
     fn name(&self) -> &'static str {
         "rename_conversation"
     }
     fn description(&self) -> String {
-        "Current Global Coordinator only. Detail resolves a reference to immutable product/root identity and naming revision; use those exact values for rename. A rename updates the title (1-200 characters) and allocated slug, never the immutable product/work identity. Choose a new operation UUID for each intentional rename; read/retry the same operation UUID after an uncertain result. Durable replay reports the historical receipt, not current title/lifecycle.".into()
+        "Current Global Coordinator only. Detail resolves a reference to immutable product/root identity and naming revision; use those exact values for rename. A rename updates the title (1-200 characters) and allocated slug, never the immutable product/work identity. Choose a new operation UUID for each intentional rename; read/retry the same operation UUID after an uncertain result. Remote uncertainty requires the exact original request and original trusted source locator; a fresh tool call cannot recreate that locator. Read by operation_id alone is local-only; never mint a replacement operation to recover uncertainty. Durable replay reports the historical receipt, not current title/lifecycle.".into()
     }
-    fn input_schema(&self) -> Value {
+    fn schema_without_instance(&self) -> Value {
         json!({"type":"object", "additionalProperties":false, "required":["op"], "properties":{
             "op":{"type":"string","enum":["detail","read","rename"]},
             "reference":{"type":"string","description":"Required for detail; product id or slug.","minLength":1},
@@ -160,8 +169,29 @@ impl Tool for RenameConversation {
             "title":{"type":"string","description":"Required for rename.","minLength":1,"maxLength":200}
         }})
     }
-    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
-        output(self.run_inner(input, ctx).await)
+    fn clearable(&self) -> bool {
+        false
+    }
+    fn resolution_db(&self) -> &crate::db::Database {
+        self.0.db()
+    }
+    async fn authorize(&self, ctx: &ToolContext) -> Result<(), String> {
+        self.0
+            .db()
+            .require_current_coordinator_transcript(&ctx.conversation_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn run_routed(
+        &self,
+        input: Value,
+        route: Route<federation::ResolvedPeer>,
+        ctx: ToolContext,
+    ) -> ToolOutput {
+        output(match route {
+            Route::Local => self.run_inner(input, ctx).await,
+            Route::Remote(peer) => self.run_remote(input, &peer, ctx).await,
+        })
     }
 }
 
@@ -174,7 +204,90 @@ fn rename_detail_response(detail: &crate::db::ProductConversationRenameDetail) -
         "allowed_actions": if detail.can_rename { vec!["detail", "read", "rename"] } else { vec!["detail", "read"] }})
 }
 
+fn remote_rename_detail_response(
+    mut response: federation::NativeRenameOptionsResponse,
+) -> Result<Value, String> {
+    response.allowed_actions.retain(|action| {
+        if matches!(action, federation::NativeRenameDetailAction::Read) {
+            tracing::debug!("omitting remote rename read action: operation_id alone cannot prove immutable intent");
+            false
+        } else {
+            true
+        }
+    });
+    let mut result = serde_json::to_value(response).map_err(|error| error.to_string())?;
+    result["status"] = json!("detail");
+    result["next"] = json!("Use these exact product/root/revision values and this same instance for rename. Remote read by operation_id alone is unsupported. Uncertain rename recovery requires the original request including its original trusted source locator, not a fresh tool call or replacement operation.");
+    Ok(result)
+}
+
+async fn remote_source(
+    runtime: &RuntimeManager,
+    ctx: &ToolContext,
+) -> Result<federation::NativeActionSourceCall, String> {
+    let source = mutation_source(runtime, ctx).await?;
+    Ok(federation::NativeActionSourceCall {
+        source_product_conversation_id: source.product_conversation_id,
+        source_transcript_id: source.transcript_id,
+        source_assistant_message_id: source.source_call.message_id,
+        source_tool_use_id: source.source_call.tool_use_id,
+    })
+}
+
 impl RenameConversation {
+    async fn run_remote(
+        &self,
+        input: Value,
+        peer: &federation::ResolvedPeer,
+        ctx: ToolContext,
+    ) -> Result<Value, String> {
+        let request: RenameRequest =
+            serde_json::from_value(input).map_err(|error| error.to_string())?;
+        self.authorize(&ctx).await?;
+        let caller_instance_id = self
+            .0
+            .db()
+            .instance_id()
+            .await
+            .map_err(|error| error.to_string())?;
+        let destination_instance_id = peer.instance_id();
+        match request {
+            RenameRequest::Detail { reference } => {
+                let request = federation::NativeRenameOptionsRequest {
+                    caller_instance_id,
+                    destination_instance_id,
+                    correlation_id: uuid::Uuid::new_v4().to_string(),
+                    reference,
+                };
+                let response = federation::remote_native_rename_options(self.0.db(), peer, &request)
+                    .await.map_err(|error| error.to_string())?;
+                remote_rename_detail_response(response)
+            }
+            RenameRequest::Read { .. } => Err("Remote rename read is unsupported without the exact original request and original trusted source locator".into()),
+            RenameRequest::Rename {
+                operation_id,
+                product_conversation_id,
+                expected_root_transcript_id,
+                expected_name_revision,
+                title,
+            } => {
+                let request = federation::NativeRenameRequest {
+                    caller_instance_id,
+                    destination_instance_id,
+                    operation_id: operation_id.0,
+                    product_conversation_id,
+                    expected_root_transcript_id,
+                    expected_name_revision,
+                    title,
+                    source: remote_source(&self.0, &ctx).await?,
+                };
+                let response = federation::remote_native_rename(self.0.db(), peer, &request)
+                    .await.map_err(|error| error.to_string())?;
+                serde_json::to_value(response).map_err(|error| error.to_string())
+            }
+        }
+    }
+
     async fn run_inner(&self, input: Value, ctx: ToolContext) -> Result<Value, String> {
         self.0
             .db()
@@ -245,14 +358,19 @@ impl RenameConversation {
 }
 
 #[async_trait]
-impl Tool for CreateConversation {
+impl RoutedTool for CreateConversation {
+    fn validate_before_peer_lookup(&self, input: &Value) -> Result<(), String> {
+        serde_json::from_value::<CreateRequest>(input.clone())
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
     fn name(&self) -> &'static str {
         "create_conversation"
     }
     fn description(&self) -> String {
-        "Current Global Coordinator only. Explicitly create AND submit a nonblank text objective using start=submit_objective via the durable creation pipeline; dormant create is unsupported. Options discovers bounded project paths, normalized cwd, and available model/effort choices. Submit only an exact normalized absolute cwd. Objective text is literal agent content, never a user commission or slash command. Omit model/language to freeze current defaults on first acceptance; retry omission reuses those choices, while explicit different choices conflict. Omitted effort means native execution semantics, distinct from an explicit level. Choose a caller-owned request UUID before submission; read/retry that UUID after uncertainty (no duplicate or changed-intent retry). Accepted is not ready: read request_id for canonical pending/ready/failure status. No WorkScope attachment, artifact reference, cancellation, or retry-delivery operation is offered.".into()
+        "Current Global Coordinator only. Explicitly create AND submit a nonblank text objective using start=submit_objective via the durable creation pipeline; dormant create is unsupported. Options discovers bounded project paths, normalized cwd, and available model/effort choices. Submit only an exact normalized absolute cwd. Objective text is literal agent content, never a user commission or slash command. Omit model/language to freeze current defaults on first acceptance; retry omission reuses those choices, while explicit different choices conflict. Omitted effort means native execution semantics, distinct from an explicit level. Choose a caller-owned request UUID before submission; read/retry that UUID after uncertainty (no duplicate or changed-intent retry). Accepted is not ready: read request_id on the same instance for canonical pending/ready/failure status. Remote options and cwd are destination-scoped; never substitute source-local paths or defaults. No WorkScope attachment, artifact reference, cancellation, or retry-delivery operation is offered.".into()
     }
-    fn input_schema(&self) -> Value {
+    fn schema_without_instance(&self) -> Value {
         json!({"type":"object", "additionalProperties":false,"required":["op"],"properties":{
             "op":{"type":"string","enum":["options","read","create"]},"request_id":operation_schema(),
             "cwd":{"type":"string","description":"Optional path for options to normalize; required exact normalized absolute cwd for create.","minLength":1},
@@ -262,8 +380,29 @@ impl Tool for CreateConversation {
             "llm_language":{"type":"string","enum":["phoenix-native","caveman"]}
         }})
     }
-    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
-        output(self.run_inner(input, ctx).await)
+    fn clearable(&self) -> bool {
+        false
+    }
+    fn resolution_db(&self) -> &crate::db::Database {
+        self.0.db()
+    }
+    async fn authorize(&self, ctx: &ToolContext) -> Result<(), String> {
+        self.0
+            .db()
+            .require_current_coordinator_transcript(&ctx.conversation_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn run_routed(
+        &self,
+        input: Value,
+        route: Route<federation::ResolvedPeer>,
+        ctx: ToolContext,
+    ) -> ToolOutput {
+        output(match route {
+            Route::Local => self.run_inner(input, ctx).await,
+            Route::Remote(peer) => self.run_remote(input, &peer, ctx).await,
+        })
     }
 }
 
@@ -366,6 +505,100 @@ async fn native_creation_acceptance_receipt(
 }
 
 impl CreateConversation {
+    async fn run_remote(
+        &self,
+        input: Value,
+        peer: &federation::ResolvedPeer,
+        ctx: ToolContext,
+    ) -> Result<Value, String> {
+        let request: CreateRequest =
+            serde_json::from_value(input).map_err(|error| error.to_string())?;
+        self.authorize(&ctx).await?;
+        let caller_instance_id = self
+            .0
+            .db()
+            .instance_id()
+            .await
+            .map_err(|error| error.to_string())?;
+        let destination_instance_id = peer.instance_id();
+        match request {
+            CreateRequest::Options { cwd } => {
+                let correlation_id = uuid::Uuid::new_v4().to_string();
+                let request = match cwd {
+                    None => federation::NativeCreateOptionsRequest::WithoutCwd {
+                        caller_instance_id,
+                        destination_instance_id,
+                        correlation_id,
+                    },
+                    Some(cwd) => federation::NativeCreateOptionsRequest::WithCwd {
+                        caller_instance_id,
+                        destination_instance_id,
+                        correlation_id,
+                        cwd,
+                    },
+                };
+                let response =
+                    federation::remote_native_create_options(self.0.db(), peer, &request)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                let mut result =
+                    serde_json::to_value(response).map_err(|error| error.to_string())?;
+                result["status"] = json!("options");
+                result["supported_languages"] = json!(["phoenix-native", "caveman"]);
+                Ok(result)
+            }
+            CreateRequest::Read { request_id } => {
+                let request = federation::NativeCreateStatusRequest {
+                    caller_instance_id,
+                    destination_instance_id,
+                    request_id: request_id.0,
+                };
+                let response = federation::remote_native_create_status(self.0.db(), peer, &request)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                serde_json::to_value(response).map_err(|error| error.to_string())
+            }
+            CreateRequest::Create {
+                request_id,
+                cwd,
+                objective,
+                start: CreateStart::SubmitObjective,
+                model,
+                effort,
+                llm_language,
+            } => {
+                let request = federation::NativeCreateRequest {
+                    caller_instance_id,
+                    destination_instance_id,
+                    request_id: request_id.0,
+                    cwd,
+                    objective,
+                    model,
+                    effort: effort.map(|effort| effort.to_string()),
+                    language: llm_language.map(|language| language.as_str().to_string()),
+                    start: federation::NativeCreateStart::SubmitObjective,
+                    source: remote_source(&self.0, &ctx).await?,
+                };
+                match federation::remote_native_create(self.0.db(), peer, &request)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    federation::NativeCreateOutcome::Accepted {
+                        acceptance: response,
+                    } => {
+                        let mut result =
+                            serde_json::to_value(response).map_err(|error| error.to_string())?;
+                        result["next"] = json!("Accepted is not ready. Read the same request_id on the same instance for creation and initial execution status.");
+                        Ok(result)
+                    }
+                    federation::NativeCreateOutcome::Reconciled { status: response } => {
+                        serde_json::to_value(response).map_err(|error| error.to_string())
+                    }
+                }
+            }
+        }
+    }
+
     async fn project_options(&self, transcript_id: &str) -> Result<(Vec<Value>, bool), String> {
         let mut projects = Vec::new();
         let mut after_id = None::<String>;

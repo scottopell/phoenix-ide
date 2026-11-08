@@ -109,6 +109,53 @@ fn rename_detail_uses_shared_encoded_canonical_route_with_stable_id_fallback() {
     );
 }
 
+#[test]
+fn native_federated_rename_detail_omits_remote_receipt_read_only() {
+    use federation::NativeRenameDetailAction::{Detail, Read, Rename};
+    use phoenix_core::domain::instance_identity::InstanceId;
+
+    for can_rename in [true, false] {
+        let response = federation::NativeRenameOptionsResponse {
+            caller_instance_id: InstanceId::new(),
+            destination_instance_id: InstanceId::new(),
+            correlation_id: uuid::Uuid::new_v4().to_string(),
+            canonical_route: "/c/remote-title".into(),
+            detail: federation::NativeRenameDetail {
+                can_rename,
+                product_conversation_id: ProductConversationId::new(),
+                root_transcript_id: uuid::Uuid::new_v4().to_string(),
+                name_revision: 7,
+                title: Some("Remote title".into()),
+                slug: Some("remote-title".into()),
+            },
+            allowed_actions: if can_rename {
+                vec![Detail, Read, Rename]
+            } else {
+                vec![Detail, Read]
+            },
+        };
+        let original = serde_json::to_value(&response).unwrap();
+        let result = remote_rename_detail_response(response).unwrap();
+        assert_eq!(result["status"], "detail");
+        assert_eq!(result["detail"], original["detail"]);
+        assert_eq!(result["canonical_route"], original["canonical_route"]);
+        assert_eq!(result["caller_instance_id"], original["caller_instance_id"]);
+        assert_eq!(
+            result["destination_instance_id"],
+            original["destination_instance_id"]
+        );
+        assert_eq!(result["correlation_id"], original["correlation_id"]);
+        assert_eq!(
+            result["allowed_actions"],
+            if can_rename {
+                json!(["detail", "rename"])
+            } else {
+                json!(["detail"])
+            }
+        );
+    }
+}
+
 pub(super) fn native_context(transcript: &str) -> ToolContext {
     struct Offline;
     impl phoenix_core::llm_service::LlmSelector for Offline {
@@ -979,7 +1026,7 @@ async fn insert_project_option(db: &crate::db::Database, id: &str, path: &std::p
 #[tokio::test]
 async fn native_options_skips_stale_prefix_and_canonicalizes_usable_projects() {
     let (runtime, db, gc) = native_runtime().await;
-    let tool = CreateConversation(runtime);
+    let tool = RouteTool::boxed(CreateConversation(runtime));
     let temp = tempfile::tempdir().unwrap();
     for index in 0..70 {
         insert_project_option(
@@ -1013,7 +1060,7 @@ async fn native_options_skips_stale_prefix_and_canonicalizes_usable_projects() {
 #[tokio::test]
 async fn native_options_truncates_only_after_fifty_usable_projects() {
     let (runtime, db, gc) = native_runtime().await;
-    let tool = CreateConversation(runtime);
+    let tool = RouteTool::boxed(CreateConversation(runtime));
     let temp = tempfile::tempdir().unwrap();
     for index in 0..70 {
         insert_project_option(
@@ -1048,7 +1095,7 @@ async fn native_rename_rechecks_archive_but_retains_authorized_replay() {
         .create_conversation("archive-native", "archive-native", "/tmp", true, None, None)
         .await
         .unwrap();
-    let tool = RenameConversation(runtime);
+    let tool = RouteTool::boxed(RenameConversation(runtime));
     let detail = tool
         .run(
             json!({"op":"detail", "reference":root.product_conversation_id}),
@@ -1095,7 +1142,7 @@ async fn native_rename_rechecks_archive_but_retains_authorized_replay() {
 #[tokio::test]
 async fn native_options_rejects_missing_and_file_cwd_and_returns_usable_directory() {
     let (runtime, db, gc) = native_runtime().await;
-    let tool = CreateConversation(runtime.clone());
+    let tool = RouteTool::boxed(CreateConversation(runtime.clone()));
     let temp = tempfile::tempdir().unwrap();
     let file = temp.path().join("not-a-directory");
     std::fs::write(&file, "fixture").unwrap();
@@ -1182,7 +1229,7 @@ async fn native_archived_detail_does_not_advertise_rename() {
         .create_conversation("archive-detail", "archive-detail", "/tmp", true, None, None)
         .await
         .unwrap();
-    let tool = RenameConversation(runtime);
+    let tool = RouteTool::boxed(RenameConversation(runtime));
     let input = json!({"op":"detail", "reference":root.product_conversation_id});
     let open = tool.run(input.clone(), native_context(&gc)).await;
     let open: Value = serde_json::from_str(open.output()).unwrap();
@@ -1200,4 +1247,329 @@ async fn native_archived_detail_does_not_advertise_rename() {
     let closed = tool.run(input, native_context(&gc)).await;
     let closed: Value = serde_json::from_str(closed.output()).unwrap();
     assert_eq!(closed["allowed_actions"], json!(["detail", "read"]));
+}
+
+#[tokio::test]
+async fn native_federated_schema_registers_each_public_tool_once_without_nullable_instance() {
+    let (runtime, _, gc) = native_runtime().await;
+    let registry = tools(runtime, &gc).await.unwrap();
+    for name in ["create_conversation", "rename_conversation"] {
+        let matching = registry
+            .iter()
+            .filter(|tool| tool.name() == name)
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1);
+        let schema = matching[0].input_schema();
+        assert_eq!(schema["properties"]["instance"]["type"], "string");
+        assert!(schema["properties"]["instance"].get("oneOf").is_none());
+        assert_eq!(schema["required"], json!(["op"]));
+        assert_eq!(schema["additionalProperties"], false);
+        for field in [
+            "source",
+            "caller_instance_id",
+            "destination_instance_id",
+            "source_transcript_id",
+        ] {
+            assert!(schema["properties"].get(field).is_none(), "{name}: {field}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_federated_exact_local_preserves_options_detail_and_receipt_reads() {
+    let (runtime, db, gc) = native_runtime().await;
+    let root = db
+        .create_conversation(
+            "federated-local",
+            "federated-local",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let create = RouteTool::boxed(CreateConversation(runtime.clone()));
+    let rename = RouteTool::boxed(RenameConversation(runtime));
+    for (tool, input) in [
+        (create, json!({"op":"options"})),
+        (
+            rename.clone(),
+            json!({"op":"detail", "reference":root.product_conversation_id}),
+        ),
+        (
+            rename,
+            json!({"op":"read", "operation_id":uuid::Uuid::new_v4().to_string()}),
+        ),
+    ] {
+        let omitted = tool.run(input.clone(), native_context(&gc)).await;
+        assert!(
+            !matches!(omitted, ToolOutput::Error { .. }),
+            "{}",
+            omitted.output()
+        );
+        let mut local_input = input;
+        local_input["instance"] = json!("local");
+        let local = tool.run(local_input, native_context(&gc)).await;
+        assert_eq!(local.output(), omitted.output());
+        for invalid in [Value::Null, json!(false), json!(42)] {
+            let refused = tool
+                .run(
+                    json!({"op":"options", "instance":invalid}),
+                    native_context(&gc),
+                )
+                .await;
+            assert!(
+                matches!(refused, ToolOutput::Error { .. }),
+                "{}",
+                refused.output()
+            );
+            assert!(
+                refused.output().contains("invalid instance selector"),
+                "{}",
+                refused.output()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_federated_authority_precedes_peer_lookup_and_argument_provenance_is_closed() {
+    let (runtime, db, gc) = native_runtime().await;
+    let ordinary = db
+        .create_conversation(
+            "federated-ordinary",
+            "federated-ordinary",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    for (tool, op) in [
+        (
+            RouteTool::boxed(CreateConversation(runtime.clone())),
+            json!({"op":"options"}),
+        ),
+        (
+            RouteTool::boxed(RenameConversation(runtime.clone())),
+            json!({"op":"detail", "reference":"missing"}),
+        ),
+    ] {
+        let authority_error = tool.run(op.clone(), native_context(&ordinary.id)).await;
+        let mut remote = op;
+        remote["instance"] = json!("unknown-peer");
+        let remote_error = tool.run(remote.clone(), native_context(&ordinary.id)).await;
+        assert!(matches!(remote_error, ToolOutput::Error { .. }));
+        assert_eq!(remote_error.output(), authority_error.output());
+        let unknown = tool.run(remote.clone(), native_context(&gc)).await;
+        assert!(
+            unknown.output().contains("peer connection not found"),
+            "{}",
+            unknown.output()
+        );
+        for field in [
+            "source",
+            "source_product_conversation_id",
+            "source_transcript_id",
+            "source_assistant_message_id",
+            "source_tool_use_id",
+            "caller_instance_id",
+            "destination_instance_id",
+        ] {
+            let mut spoof = remote.clone();
+            spoof[field] = json!(uuid::Uuid::new_v4().to_string());
+            let refused = tool.run(spoof, native_context(&gc)).await;
+            assert!(matches!(refused, ToolOutput::Error { .. }));
+            assert!(
+                refused.output().contains("unknown field"),
+                "{}",
+                refused.output()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_federated_source_comes_only_from_trusted_context() {
+    let (runtime, db, gc) = native_runtime().await;
+    let context = native_context(&gc);
+    let source = remote_source(&runtime, &context).await.unwrap();
+    let row = db.get_conversation(&gc).await.unwrap();
+    assert_eq!(
+        source.source_product_conversation_id,
+        row.product_conversation_id
+    );
+    assert_eq!(source.source_transcript_id, gc);
+    assert_eq!(source.source_assistant_message_id, "native-message");
+    assert_eq!(source.source_tool_use_id, "native-call");
+    assert!(
+        remote_source(&runtime, &native_context_without_source_identity(&gc))
+            .await
+            .is_err()
+    );
+    sqlx::query("UPDATE conversations SET coordinator_head=0 WHERE id=?1")
+        .bind(&gc)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(remote_source(&runtime, &context).await.is_err());
+}
+
+async fn native_save_routing_peer(
+    db: &crate::db::Database,
+    id: phoenix_core::domain::instance_identity::InstanceId,
+    name: &str,
+) {
+    use phoenix_core::domain::instance_identity::{PeerBearerCredential, PeerTlsTrust};
+    let credential = PeerBearerCredential::parse(format!("phx_peer_{}", "1".repeat(43))).unwrap();
+    db.save_federation_peer_connection(
+        id,
+        &name.parse().unwrap(),
+        &"https://127.0.0.1:1".parse().unwrap(),
+        &credential,
+        &PeerTlsTrust::PlatformRoots,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn native_federated_selection_rejects_self_ambiguity_and_never_falls_back() {
+    use phoenix_core::domain::instance_identity::InstanceId;
+    let (runtime, db, gc) = native_runtime().await;
+    let first = InstanceId::new();
+    let second = InstanceId::new();
+    native_save_routing_peer(&db, first, "same-name").await;
+    native_save_routing_peer(&db, second, "same-name").await;
+    let local = db.instance_id().await.unwrap();
+    native_save_routing_peer(&db, local, "self-peer").await;
+    for (tool, op) in [
+        (
+            RouteTool::boxed(CreateConversation(runtime.clone())),
+            json!({"op":"options"}),
+        ),
+        (
+            RouteTool::boxed(RenameConversation(runtime.clone())),
+            json!({"op":"detail", "reference":gc}),
+        ),
+        (
+            RouteTool::boxed(CreateConversation(runtime.clone())),
+            json!({"op":"read", "request_id":uuid::Uuid::new_v4().to_string()}),
+        ),
+    ] {
+        for selector in [
+            "same-name".to_string(),
+            "self-peer".to_string(),
+            local.to_string(),
+            "LOCAL".to_string(),
+            " local ".to_string(),
+            "unknown".to_string(),
+        ] {
+            let mut input = op.clone();
+            input["instance"] = json!(selector);
+            let refused = tool.run(input, native_context(&gc)).await;
+            assert!(
+                matches!(refused, ToolOutput::Error { .. }),
+                "{selector}: {}",
+                refused.output()
+            );
+            let expected = if selector == "same-name" {
+                "ambiguous"
+            } else if selector == "self-peer" || selector == local.to_string() {
+                "request identity does not match selected peer/local instance"
+            } else {
+                "peer connection not found"
+            };
+            assert!(
+                refused.output().contains(expected),
+                "{selector}: {}",
+                refused.output()
+            );
+        }
+        let mut input = op;
+        input["instance"] = json!(first.to_string());
+        let exact = tool.run(input, native_context(&gc)).await;
+        assert!(matches!(exact, ToolOutput::Error { .. }));
+        assert!(
+            exact.output().contains("federation request failed"),
+            "{}",
+            exact.output()
+        );
+    }
+    native_save_routing_peer(&db, second, "unique-peer").await;
+    let create = RouteTool::boxed(CreateConversation(runtime.clone()));
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let cwd = tempfile::tempdir().unwrap();
+    let normalized = std::fs::canonicalize(cwd.path()).unwrap();
+    let failed = create
+        .run(
+            json!({"op":"create", "instance":"unique-peer", "request_id":request_id,
+        "cwd":normalized, "objective":"literal remote objective", "start":"submit_objective"}),
+            native_context(&gc)
+                .with_svg_assistant_message_id(uuid::Uuid::new_v4().to_string())
+                .with_tool_use_id("native-call"),
+        )
+        .await;
+    assert!(
+        matches!(failed, ToolOutput::Error { .. }),
+        "{}",
+        failed.output()
+    );
+    assert!(failed.output().contains("uncertain"), "{}", failed.output());
+    assert!(db
+        .get_product_creation_job(&request_id)
+        .await
+        .unwrap()
+        .is_none());
+    let rename = RouteTool::boxed(RenameConversation(runtime));
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let root = db
+        .create_conversation("no-fallback", "no-fallback", "/tmp", true, None, None)
+        .await
+        .unwrap();
+    let failed = rename.run(json!({"op":"rename", "instance":"unique-peer", "operation_id":operation_id,
+        "product_conversation_id":root.product_conversation_id, "expected_root_transcript_id":root.id,
+        "expected_name_revision":0, "title":"must not apply locally"}),
+        native_context(&gc)
+            .with_svg_assistant_message_id(uuid::Uuid::new_v4().to_string())
+            .with_tool_use_id("native-call")).await;
+    assert!(
+        matches!(failed, ToolOutput::Error { .. }),
+        "{}",
+        failed.output()
+    );
+    assert!(
+        failed.output().contains("federation request failed"),
+        "{}",
+        failed.output()
+    );
+    assert!(db
+        .read_product_conversation_rename_receipt(&gc, &operation_id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        db.get_conversation(&root.id).await.unwrap().title,
+        root.title
+    );
+}
+
+#[tokio::test]
+async fn native_federated_rename_read_requires_immutable_intent_replay() {
+    let (runtime, _, gc) = native_runtime().await;
+    let tool = RouteTool::boxed(RenameConversation(runtime));
+    let failed = tool.run(json!({"op":"read", "instance":"unknown-peer", "operation_id":uuid::Uuid::new_v4().to_string()}), native_context(&gc)).await;
+    assert!(matches!(failed, ToolOutput::Error { .. }));
+    assert!(
+        failed.output().contains("immutable intent"),
+        "{}",
+        failed.output()
+    );
+    assert!(
+        failed.output().contains("original trusted source locator"),
+        "{}",
+        failed.output()
+    );
 }

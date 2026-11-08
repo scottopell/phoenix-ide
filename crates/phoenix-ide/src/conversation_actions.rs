@@ -84,6 +84,65 @@ pub(crate) async fn rename_from_current_coordinator(
     authority.complete(classified)
 }
 
+pub(crate) async fn rename_from_federation(
+    runtime: &RuntimeManager,
+    authority: &phoenix_db::FederationConversationAuthority,
+    source: ProductConversationRenameSource,
+    intent: CoordinatorRenameIntent,
+) -> Result<ProductConversationRenameResult, AppError> {
+    let command = ProductConversationRenameCommand {
+        operation_id: intent.operation_id,
+        product_conversation_id: intent.product_conversation_id,
+        expected_root_transcript_id: intent.expected_root_transcript_id,
+        expected_name_revision: intent.expected_name_revision,
+        title: normalized_product_conversation_title(&intent.title)?,
+        source,
+    };
+    let owner = runtime
+        .acquire_local_authority_pass()
+        .map_err(|()| AppError::Internal("local authority is closed".into()))?;
+    RenameAuthorityPass::new(owner).complete(
+        runtime
+            .db()
+            .rename_product_conversation_as_federation(authority, &command)
+            .await,
+    )
+}
+
+pub(crate) async fn accept_create_from_federation(
+    runtime: &RuntimeManager,
+    authority: phoenix_db::FederationConversationAuthority,
+    req: CreateProductConversationRequest,
+    product_conversation_id: ProductConversationId,
+    transcript_id: String,
+    source_call: SourceToolCall,
+) -> Result<CreateAccepted, AppError> {
+    accept_create_with_cwd_validator(
+        runtime,
+        req,
+        CreateSource::FederatedConversation {
+            authority,
+            product_conversation_id,
+            transcript_id,
+            source_call,
+        },
+        validate_new_creation_cwd,
+    )
+    .await
+}
+
+pub(crate) async fn read_create_status_from_federation(
+    runtime: &RuntimeManager,
+    authority: &phoenix_db::FederationConversationAuthority,
+    request_id: &str,
+) -> Result<Option<phoenix_db::ProductCreationStatusRead>, AppError> {
+    runtime
+        .db()
+        .read_product_creation_status_as_federation(authority, request_id)
+        .await
+        .map_err(db_to_app)
+}
+
 struct RenameAuthorityPass {
     owner: Option<AdmittedOperation>,
 }
@@ -128,12 +187,29 @@ pub(crate) enum CreateSource {
         transcript_id: String,
         source_call: SourceToolCall,
     },
+    FederatedConversation {
+        authority: phoenix_db::FederationConversationAuthority,
+        product_conversation_id: ProductConversationId,
+        transcript_id: String,
+        source_call: SourceToolCall,
+    },
 }
 
 impl CreateSource {
     fn origin(&self, local_instance_id: InstanceId) -> ProductCreationOrigin {
         match self {
             Self::UserApi => ProductCreationOrigin::UserApi,
+            Self::FederatedConversation {
+                authority,
+                product_conversation_id,
+                transcript_id,
+                source_call,
+            } => ProductCreationOrigin::FederatedConversation {
+                source_instance_id: authority.caller_instance_id(),
+                product_conversation_id: product_conversation_id.clone(),
+                transcript_id: transcript_id.clone(),
+                source_call: source_call.clone(),
+            },
             Self::CurrentCoordinator {
                 product_conversation_id,
                 transcript_id,
@@ -149,7 +225,7 @@ impl CreateSource {
 
     fn coordinator_transcript_id(&self) -> Option<&str> {
         match self {
-            Self::UserApi => None,
+            Self::UserApi | Self::FederatedConversation { .. } => None,
             Self::CurrentCoordinator { transcript_id, .. } => Some(transcript_id),
         }
     }
@@ -212,7 +288,7 @@ fn resolve_intent(
     else {
         unreachable!("existing creation returned above")
     };
-    let internal = matches!(source, CreateSource::CurrentCoordinator { .. });
+    let internal = !matches!(source, CreateSource::UserApi);
     if req.objective.trim().is_empty() && (internal || req.images.is_empty()) {
         return Err(invalid(
             "Product creation requires nonblank objective text (or an image for user API input)",
@@ -320,12 +396,17 @@ where
     })?;
     uuid::Uuid::parse_str(&req.request_id)
         .map_err(|_| AppError::BadRequest("request_id must be a UUID".to_owned()))?;
-    let existing = runtime
-        .db()
-        .get_product_creation_job(&req.request_id)
-        .await
-        .map_err(db_to_app)?;
-    let internal = matches!(&source, CreateSource::CurrentCoordinator { .. });
+    let existing = match &source {
+        CreateSource::FederatedConversation { authority, .. } => {
+            runtime
+                .db()
+                .get_product_creation_job_as_federation(authority, &req.request_id)
+                .await
+        }
+        _ => runtime.db().get_product_creation_job(&req.request_id).await,
+    }
+    .map_err(db_to_app)?;
+    let internal = !matches!(&source, CreateSource::UserApi);
     let cwd_preparation = if existing
         .as_ref()
         .is_some_and(|job| internal || job.intent.cwd == req.cwd)
@@ -354,24 +435,35 @@ where
         }
     };
     let local_instance_id = runtime.db().instance_id().await.map_err(db_to_app)?;
-    let outcome = runtime
-        .db()
-        .accept_product_creation_resolved(
-            &req.request_id,
-            source.coordinator_transcript_id(),
-            |resolution| {
-                resolve_intent(
-                    runtime,
-                    &req,
-                    &source,
-                    local_instance_id,
-                    resolution,
-                    &cwd_preparation,
-                )
-            },
+    let resolve = |resolution| {
+        resolve_intent(
+            runtime,
+            &req,
+            &source,
+            local_instance_id,
+            resolution,
+            &cwd_preparation,
         )
-        .await
-        .map_err(db_to_app)?;
+    };
+    let outcome = match &source {
+        CreateSource::FederatedConversation { authority, .. } => {
+            runtime
+                .db()
+                .accept_product_creation_as_federation(authority, &req.request_id, resolve)
+                .await
+        }
+        _ => {
+            runtime
+                .db()
+                .accept_product_creation_resolved(
+                    &req.request_id,
+                    source.coordinator_transcript_id(),
+                    resolve,
+                )
+                .await
+        }
+    }
+    .map_err(db_to_app)?;
     let (job, newly_accepted): (ProductCreationJobRecord, bool) = match outcome {
         ProductCreationAcceptOutcome::Accepted(job) => (job, true),
         ProductCreationAcceptOutcome::Replayed(job) => (job, false),
@@ -525,7 +617,7 @@ mod tests {
         source: &CreateSource,
         resolution: ProductCreationResolution<'_>,
     ) -> Result<ProductCreationIntent, DbError> {
-        let internal = matches!(source, CreateSource::CurrentCoordinator { .. });
+        let internal = !matches!(source, CreateSource::UserApi);
         let prepared = validate_new_creation_cwd(&req.cwd, runtime.runtime_home(), internal);
         let preparation = CreationCwdPreparation {
             new: prepared.clone(),
@@ -635,6 +727,77 @@ mod tests {
         .unwrap();
         assert_eq!(api_intent.cwd, req.cwd);
         assert!(!missing.exists());
+    }
+
+    #[tokio::test]
+    async fn federated_native_creation_rejects_invalid_cwd_without_durable_acceptance() {
+        use phoenix_core::domain::instance_identity::FederationCredentialVerifier;
+
+        let db = Database::open_in_memory().await.unwrap();
+        let caller = InstanceId::new();
+        let verifier = FederationCredentialVerifier::from_bearer(b"native-create-peer");
+        db.replace_federation_enrollment(caller, &"native peer".parse().unwrap(), &verifier)
+            .await
+            .unwrap();
+        let authority: phoenix_db::FederationConversationAuthority =
+            phoenix_db::FederationSendAuthority::new(caller, verifier).into();
+        let manager = runtime(
+            db.clone(),
+            ModelRegistry::new(&LlmConfig {
+                openai_api_key: Some("test-never-dispatched".into()),
+                ..LlmConfig::default()
+            }),
+        );
+        let dir = tempfile::tempdir_in(manager.runtime_home()).unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let cwd = cwd.to_str().unwrap();
+        let missing = format!("{cwd}/not-created");
+        let product = ProductConversationId::new();
+        for invalid_cwd in [
+            ".".to_owned(),
+            "~".to_owned(),
+            "~/project".to_owned(),
+            format!(" {cwd}"),
+            format!("{cwd} "),
+            format!("{cwd}\n"),
+            format!("{cwd}/."),
+            missing.clone(),
+        ] {
+            let req = request(&invalid_cwd);
+            let request_id = req.request_id.clone();
+            let result = accept_create_from_federation(
+                &manager,
+                authority.clone(),
+                req,
+                product.clone(),
+                "foreign-transcript".into(),
+                SourceToolCall {
+                    message_id: "foreign-message".into(),
+                    tool_use_id: "foreign-call".into(),
+                },
+            )
+            .await;
+            assert!(
+                matches!(result, Err(AppError::BadRequest(_))),
+                "{invalid_cwd:?}"
+            );
+            assert!(db
+                .get_product_creation_job(&request_id)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(db
+                .read_product_creation_status_as_federation(&authority, &request_id)
+                .await
+                .unwrap()
+                .is_none());
+        }
+        assert!(!Path::new(&missing).exists());
+        let job_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_jobs")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(job_count, 0);
     }
 
     #[tokio::test]

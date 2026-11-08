@@ -71,6 +71,44 @@ pub enum ProductCreationResolution<'a> {
 }
 
 impl ProductCreationOrigin {
+    fn matches_retry_owner(&self, retry: &Self) -> bool {
+        match (self, retry) {
+            (
+                Self::InternalConversation {
+                    source_instance_id,
+                    product_conversation_id,
+                    transcript_id,
+                    ..
+                },
+                Self::InternalConversation {
+                    source_instance_id: retry_instance,
+                    product_conversation_id: retry_product,
+                    transcript_id: retry_transcript,
+                    ..
+                },
+            )
+            | (
+                Self::FederatedConversation {
+                    source_instance_id,
+                    product_conversation_id,
+                    transcript_id,
+                    ..
+                },
+                Self::FederatedConversation {
+                    source_instance_id: retry_instance,
+                    product_conversation_id: retry_product,
+                    transcript_id: retry_transcript,
+                    ..
+                },
+            ) => {
+                source_instance_id == retry_instance
+                    && product_conversation_id == retry_product
+                    && transcript_id == retry_transcript
+            }
+            _ => self == retry,
+        }
+    }
+
     fn as_str(&self) -> &'static str {
         match self {
             Self::UnknownHistorical => "unknown_historical",
@@ -228,7 +266,7 @@ pub enum StoredProductCreationImages {
 
 impl ProductCreationIntent<StoredProductCreationImages> {
     fn matches_retry(&self, retry: &ProductCreationIntent) -> bool {
-        (self.origin == retry.origin
+        (self.origin.matches_retry_owner(&retry.origin)
             || matches!(
                 (&self.origin, &retry.origin),
                 (
@@ -3103,14 +3141,54 @@ mod product_creation_tests {
         if let ProductCreationOrigin::FederatedConversation { source_call, .. } =
             &mut changed.origin
         {
-            source_call.tool_use_id = "changed".into();
+            source_call.message_id = "retry-message".into();
+            source_call.tool_use_id = "retry-tool".into();
         }
-        assert!(matches!(
-            db.accept_product_creation_as_federation(&authority, &request, |_| Ok(changed))
-                .await
-                .unwrap(),
-            ProductCreationAcceptOutcome::Conflict(_)
-        ));
+        let ProductCreationAcceptOutcome::Replayed(replayed) = db
+            .accept_product_creation_as_federation(&authority, &request, |_| Ok(changed))
+            .await
+            .unwrap()
+        else {
+            panic!("same-owner retry with a new call locator must replay")
+        };
+        assert_eq!(
+            replayed.product_conversation_id,
+            first.product_conversation_id
+        );
+        assert_eq!(replayed.intent, native);
+        assert_eq!(
+            replayed.intent.origin.input_origin(),
+            native.origin.input_origin()
+        );
+        for field in ["instance", "product", "transcript"] {
+            let mut changed_owner = native.clone();
+            let ProductCreationOrigin::FederatedConversation {
+                source_instance_id,
+                product_conversation_id,
+                transcript_id,
+                ..
+            } = &mut changed_owner.origin
+            else {
+                unreachable!()
+            };
+            match field {
+                "instance" => *source_instance_id = InstanceId::new(),
+                "product" => *product_conversation_id = ProductConversationId::new(),
+                "transcript" => *transcript_id = "different-transcript".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    db.accept_product_creation_as_federation(&authority, &request, |_| Ok(
+                        changed_owner
+                    ))
+                    .await
+                    .unwrap(),
+                    ProductCreationAcceptOutcome::Conflict(_)
+                ),
+                "changed {field} must conflict"
+            );
+        }
         let mut changed_intent = native.clone();
         changed_intent.objective = "different objective".into();
         assert!(matches!(
@@ -6364,7 +6442,7 @@ mod product_creation_tests {
     }
 
     #[tokio::test]
-    async fn internal_creation_replay_conflicts_on_new_locator_and_retains_first_source() {
+    async fn internal_creation_replays_new_locator_and_retains_first_source() {
         use phoenix_core::domain::db_schema::SourceToolCall;
         let db = Database::open_in_memory().await.unwrap();
         let coordinator = db
@@ -6388,16 +6466,6 @@ mod product_creation_tests {
         .await
         .unwrap();
 
-        assert_eq!(
-            db.get_product_creation_job("internal-origin")
-                .await
-                .unwrap()
-                .unwrap()
-                .intent
-                .origin,
-            accepted_intent.origin
-        );
-
         let mut replay_intent = accepted_intent.clone();
         replay_intent.origin = ProductCreationOrigin::InternalConversation {
             source_instance_id: db.instance_id().await.unwrap(),
@@ -6408,16 +6476,58 @@ mod product_creation_tests {
                 tool_use_id: "call-b".to_string(),
             },
         };
-        let ProductCreationAcceptOutcome::Conflict(job) = db
+        let ProductCreationAcceptOutcome::Replayed(job) = db
             .accept_product_creation_resolved("internal-origin", Some(&coordinator.id), |_| {
                 Ok(replay_intent.clone())
             })
             .await
             .unwrap()
         else {
-            panic!("expected changed-locator conflict")
+            panic!("same-owner retry with a new call locator must replay")
         };
-        assert_eq!(job.intent.origin, accepted_intent.origin);
+        assert_eq!(job.intent, accepted_intent);
+        assert_eq!(
+            job.intent.origin.input_origin(),
+            accepted_intent.origin.input_origin()
+        );
+        for field in ["instance", "product", "transcript"] {
+            let mut changed_owner = replay_intent.clone();
+            let ProductCreationOrigin::InternalConversation {
+                source_instance_id,
+                product_conversation_id,
+                transcript_id,
+                ..
+            } = &mut changed_owner.origin
+            else {
+                unreachable!()
+            };
+            match field {
+                "instance" => *source_instance_id = InstanceId::new(),
+                "product" => *product_conversation_id = ProductConversationId::new(),
+                "transcript" => *transcript_id = "different-transcript".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    db.accept_product_creation_resolved(
+                        "internal-origin",
+                        Some(&coordinator.id),
+                        |_| { Ok(changed_owner) }
+                    )
+                    .await
+                    .unwrap(),
+                    ProductCreationAcceptOutcome::Conflict(_)
+                ),
+                "changed {field} must conflict"
+            );
+        }
+        let stored = db
+            .get_product_creation_job("internal-origin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.product_conversation_id, job.product_conversation_id);
+        assert_eq!(stored.intent, accepted_intent);
     }
 
     #[tokio::test]
