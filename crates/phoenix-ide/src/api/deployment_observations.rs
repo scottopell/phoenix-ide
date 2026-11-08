@@ -100,7 +100,7 @@ pub(crate) async fn recorder_space(
     environment: &phoenix_core::runtime_env::PhoenixRuntimeEnvironment,
 ) -> [Option<u64>; 3] {
     let targets = vec![
-        ("database".into(), environment.db_path().to_path_buf()),
+        ("database".into(), environment.db_path().clone()),
         ("data".into(), environment.data_dir().to_path_buf()),
         ("temporary".into(), environment.tmp_root().to_path_buf()),
     ];
@@ -260,7 +260,7 @@ mod tests {
                 if path.ends_with("temporary") {
                     Err(io::Error::new(io::ErrorKind::PermissionDenied, "SECRET"))
                 } else {
-                    Ok((123456789, PathBuf::from("/private/SECRET")))
+                    Ok((123_456_789, PathBuf::from("/private/SECRET")))
                 }
             },
             |_| Ok(42),

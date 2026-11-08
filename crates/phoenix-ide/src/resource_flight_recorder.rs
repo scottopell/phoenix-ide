@@ -1,4 +1,4 @@
-//! Bounded resource history, independent of SQLite and structured-log storage.
+//! Bounded resource history, independent of `SQLite` and structured-log storage.
 //! The first segment carries an exclusive advisory lock for the writer's lifetime.
 //! A complete frame is not a durability claim: only successful `sync_data`
 //! advances `committed`. After a crash, even a valid unsynced tail may be lost.
@@ -169,9 +169,9 @@ pub(crate) struct Handle {
 impl Handle {
     /// Never waits for disk or channel capacity. One record may be pending in
     /// addition to the writer's in-flight record. Drop only disconnects, not joins.
-    pub(crate) fn try_record(&self, sample: Observation) {
+    pub(crate) fn try_record(&self, sample: &Observation) {
         self.counters.sampled.fetch_add(1, Relaxed);
-        match self.sender.try_send(sample) {
+        match self.sender.try_send(*sample) {
             Ok(()) => {
                 self.counters.queued.fetch_add(1, Relaxed);
             }
@@ -237,8 +237,8 @@ pub(crate) fn start(data_directory: &Path, process: &ProcessIdentity) -> io::Res
 
 // FNV-1a detects accidental corruption, not malicious modifications.
 fn checksum(bytes: &[u8]) -> u32 {
-    bytes.iter().fold(0x811c9dc5u32, |h, b| {
-        (h ^ u32::from(*b)).wrapping_mul(0x01000193)
+    bytes.iter().fold(0x811c_9dc5_u32, |h, b| {
+        (h ^ u32::from(*b)).wrapping_mul(0x0100_0193)
     })
 }
 
@@ -266,7 +266,8 @@ fn frame(record: &Record) -> Result<Vec<u8>, FailureCode> {
         });
     }
     let mut bytes = Vec::with_capacity(HEADER_BYTES + json.0.len());
-    bytes.extend_from_slice(&(json.0.len() as u16).to_le_bytes());
+    let length = u16::try_from(json.0.len()).map_err(|_| FailureCode::Oversized)?;
+    bytes.extend_from_slice(&length.to_le_bytes());
     bytes.extend_from_slice(&checksum(&json.0).to_le_bytes());
     bytes.extend_from_slice(&json.0);
     Ok(bytes)
@@ -493,7 +494,11 @@ fn run(
             Err(code) => {
                 match code {
                     FailureCode::Oversized => &counters.dropped_oversized,
-                    _ => &counters.dropped_encode,
+                    FailureCode::None
+                    | FailureCode::Encode
+                    | FailureCode::Io
+                    | FailureCode::SequenceExhausted
+                    | FailureCode::Disconnected => &counters.dropped_encode,
                 }
                 .fetch_add(1, Relaxed);
                 counters.failure.store(code as u64, Relaxed);
@@ -661,7 +666,7 @@ mod tests {
             counters: Arc::new(Counters::default()),
         };
         for _ in 0..100 {
-            handle.try_record(observation(1));
+            handle.try_record(&observation(1));
         }
         let snapshot = handle.snapshot();
         assert_eq!(snapshot.sampled, 100);
@@ -669,7 +674,7 @@ mod tests {
         assert_eq!(snapshot.dropped_full, 99);
         receiver.recv().unwrap();
         drop(receiver);
-        handle.try_record(observation(1));
+        handle.try_record(&observation(1));
         assert_eq!(handle.snapshot().dropped_disconnected, 1);
         drop(handle);
     }
@@ -790,11 +795,13 @@ mod tests {
         fn inspect(value: &serde_json::Value) {
             match value {
                 serde_json::Value::String(text) => {
-                    assert!(["s", "r", "p", "f", "u", "n", "w", "c"].contains(&text.as_str()))
+                    assert!(["s", "r", "p", "f", "u", "n", "w", "c"].contains(&text.as_str()));
                 }
                 serde_json::Value::Array(values) => values.iter().for_each(inspect),
                 serde_json::Value::Object(values) => values.values().for_each(inspect),
-                _ => {}
+                serde_json::Value::Null
+                | serde_json::Value::Bool(_)
+                | serde_json::Value::Number(_) => {}
             }
         }
         let value = serde_json::to_value(record(1)).unwrap();

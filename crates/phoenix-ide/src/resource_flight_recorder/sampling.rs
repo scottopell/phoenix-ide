@@ -58,23 +58,20 @@ pub(crate) fn initialize(environment: &PhoenixRuntimeEnvironment) -> Option<Hand
         code = "recorder_metric_gap",
         "lifetime maximum RSS, host pressure and SQLite codes have no supported recorder source"
     );
-    match super::start(environment.data_dir(), &process) {
-        Ok(handle) => {
-            let mut sample = unavailable(Phase::Startup);
-            let failure_counts = failures(&mut sample);
-            handle.try_record(Observation {
-                sample,
-                failure_counts,
-            });
-            Some(handle)
-        }
-        Err(_) => {
-            tracing::warn!(
-                code = "recorder_init",
-                "resource recorder unavailable; startup continues"
-            );
-            None
-        }
+    if let Ok(handle) = super::start(environment.data_dir(), &process) {
+        let mut sample = unavailable(Phase::Startup);
+        let failure_counts = failures(&mut sample);
+        handle.try_record(&Observation {
+            sample,
+            failure_counts,
+        });
+        Some(handle)
+    } else {
+        tracing::warn!(
+            code = "recorder_init",
+            "resource recorder unavailable; startup continues"
+        );
+        None
     }
 }
 
@@ -175,7 +172,7 @@ pub(crate) fn spawn_sampler(state: AppState, handle: Handle) {
             }
             sample.sampled_unix_ms = unix_ms();
             sample.process_uptime_ms = crate::hot_restart::uptime_secs().saturating_mul(1000);
-            handle.try_record(Observation {
+            handle.try_record(&Observation {
                 sample,
                 failure_counts,
             });
@@ -242,7 +239,7 @@ mod tests {
             tokio::select! {
                 biased;
                 _ = &mut next => panic!("sampling started before cadence"),
-                _ = tokio::time::sleep(Duration::from_secs(59)) => {}
+                () = tokio::time::sleep(Duration::from_secs(59)) => {}
             }
             tokio::time::advance(Duration::from_secs(1)).await;
             assert!(next.await);
