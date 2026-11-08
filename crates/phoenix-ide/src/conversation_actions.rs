@@ -140,7 +140,19 @@ pub(crate) async fn read_create_status_from_federation(
         .db()
         .read_product_creation_status_as_federation(authority, request_id)
         .await
-        .map_err(db_to_app)
+        .map_err(product_creation_db_to_app)
+}
+
+fn product_creation_db_to_app(error: DbError) -> AppError {
+    match error {
+        DbError::ProductCreationRequestConflict => {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "request_id conflicts with immutable creation intent",
+                "product_creation_request_conflict",
+            )))
+        }
+        error => db_to_app(error),
+    }
 }
 
 struct RenameAuthorityPass {
@@ -405,7 +417,7 @@ where
         }
         _ => runtime.db().get_product_creation_job(&req.request_id).await,
     }
-    .map_err(db_to_app)?;
+    .map_err(product_creation_db_to_app)?;
     let internal = !matches!(&source, CreateSource::UserApi);
     let cwd_preparation = if existing
         .as_ref()
@@ -471,11 +483,11 @@ where
                 .await
         }
     }
-    .map_err(db_to_app)?;
+    .map_err(product_creation_db_to_app)?;
     let (job, newly_accepted): (ProductCreationJobRecord, bool) = match outcome {
         ProductCreationAcceptOutcome::Accepted(job) => (job, true),
         ProductCreationAcceptOutcome::Replayed(job) => (job, false),
-        ProductCreationAcceptOutcome::Conflict(_) => {
+        ProductCreationAcceptOutcome::Conflict => {
             return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
                 "request_id conflicts with immutable creation intent",
                 "product_creation_request_conflict",
@@ -809,6 +821,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn federated_creation_request_uuid_is_private_to_its_accepting_peer() {
+        use phoenix_core::domain::instance_identity::FederationCredentialVerifier;
+
+        let db = Database::open_in_memory().await.unwrap();
+        let owner_id = InstanceId::new();
+        let other_id = InstanceId::new();
+        let owner_verifier = FederationCredentialVerifier::from_bearer(b"owner-create-peer");
+        let other_verifier = FederationCredentialVerifier::from_bearer(b"other-create-peer");
+        db.replace_federation_enrollment(owner_id, &"owner peer".parse().unwrap(), &owner_verifier)
+            .await
+            .unwrap();
+        db.replace_federation_enrollment(other_id, &"other peer".parse().unwrap(), &other_verifier)
+            .await
+            .unwrap();
+        let owner: phoenix_db::FederationConversationAuthority =
+            phoenix_db::FederationSendAuthority::new(owner_id, owner_verifier).into();
+        let other: phoenix_db::FederationConversationAuthority =
+            phoenix_db::FederationSendAuthority::new(other_id, other_verifier).into();
+        let manager = runtime(
+            db.clone(),
+            ModelRegistry::new(&LlmConfig {
+                openai_api_key: Some("test-never-dispatched".into()),
+                ..LlmConfig::default()
+            }),
+        );
+        let dir = tempfile::tempdir_in(manager.runtime_home()).unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let mut original = request(cwd.to_str().unwrap());
+        let request_id = original.request_id.clone();
+        let product = ProductConversationId::new();
+        let source_call = SourceToolCall {
+            message_id: "owner-message".into(),
+            tool_use_id: "owner-tool".into(),
+        };
+        let accepted = accept_create_from_federation(
+            &manager,
+            owner.clone(),
+            original.clone(),
+            product.clone(),
+            "owner-transcript".into(),
+            source_call.clone(),
+        )
+        .await
+        .unwrap();
+
+        for different_intent in [false, true] {
+            if different_intent {
+                original.objective = "different objective".into();
+            }
+            let result = accept_create_from_federation(
+                &manager,
+                other.clone(),
+                original.clone(),
+                ProductConversationId::new(),
+                "other-transcript".into(),
+                SourceToolCall {
+                    message_id: "other-message".into(),
+                    tool_use_id: "other-tool".into(),
+                },
+            )
+            .await;
+            assert!(matches!(result, Err(AppError::Conflict(_))));
+            assert!(
+                read_create_status_from_federation(&manager, &other, &request_id)
+                    .await
+                    .is_err()
+            );
+        }
+
+        let mut replay_request = request(cwd.to_str().unwrap());
+        replay_request.request_id = request_id.clone();
+        let replay = accept_create_from_federation(
+            &manager,
+            owner.clone(),
+            replay_request,
+            product,
+            "owner-transcript".into(),
+            source_call,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replay.product_conversation_id,
+            accepted.product_conversation_id
+        );
+        assert_eq!(
+            read_create_status_from_federation(&manager, &owner, &request_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .request_id,
+            request_id
+        );
+    }
+
+    #[tokio::test]
     async fn retry_preserves_omitted_effort_but_conflicts_when_explicit_effort_is_omitted() {
         use phoenix_core::domain::llm_types::ModelEffort;
 
@@ -896,7 +1004,7 @@ mod tests {
                 .await
                 .unwrap();
             if effort.is_some() {
-                assert!(matches!(outcome, ProductCreationAcceptOutcome::Conflict(_)));
+                assert!(matches!(outcome, ProductCreationAcceptOutcome::Conflict));
             } else {
                 let ProductCreationAcceptOutcome::Replayed(replayed) = outcome else {
                     panic!("originally omitted effort must replay after defaults change");
@@ -1003,7 +1111,7 @@ mod tests {
                         "{label}"
                     );
                 }
-                ProductCreationAcceptOutcome::Conflict(_) => {
+                ProductCreationAcceptOutcome::Conflict => {
                     assert!(!replay, "{label}: expected replay");
                 }
             }
@@ -1104,7 +1212,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            ProductCreationAcceptOutcome::Conflict(_)
+            ProductCreationAcceptOutcome::Conflict
         ));
         assert!(matches!(
             db.accept_product_creation_resolved(&req.request_id, None, |_| Ok(frozen.clone()))

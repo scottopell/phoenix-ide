@@ -80,7 +80,30 @@ fn rename_and_status_requests_reject_unknown_fields() {
 }
 
 #[test]
+fn rename_detail_targets_normalize_destination_lookup_identities() {
+    assert_eq!(
+        conversation_lookup_identity("@conv:opaque-product").unwrap(),
+        "opaque-product"
+    );
+    assert_eq!(
+        conversation_lookup_identity("@transcript:opaque-transcript#message-opaque-message")
+            .unwrap(),
+        "opaque-transcript"
+    );
+    assert_eq!(
+        conversation_lookup_identity("opaque-product-or-slug").unwrap(),
+        "opaque-product-or-slug"
+    );
+    assert!(conversation_lookup_identity(" @conv:opaque-product").is_err());
+    assert!(conversation_lookup_identity("@conv:opaque-product ").is_err());
+}
+
+#[test]
 fn responses_reject_payloads_beyond_route_bound() {
+    let failure = native_error(format!("secret detail: {}", "x".repeat(100_000)));
+    let body = serde_json::to_vec(&failure.body).unwrap();
+    assert!(body.len() < 256);
+    assert!(!String::from_utf8_lossy(&body).contains("secret detail"));
     assert_eq!(
         native_json(&"large payload", 4).unwrap_err().status,
         StatusCode::INTERNAL_SERVER_ERROR
@@ -104,7 +127,7 @@ fn source_call() -> NativeActionSourceCall {
 }
 
 #[test]
-fn uuid_witnesses_are_canonical_but_provider_tool_ids_are_opaque() {
+fn protocol_witnesses_are_canonical_but_persisted_identities_are_opaque() {
     let valid = serde_json::json!({
         "caller_instance_id": InstanceId::new(),
         "destination_instance_id": InstanceId::new(),
@@ -141,12 +164,21 @@ fn uuid_witnesses_are_canonical_but_provider_tool_ids_are_opaque() {
         assert!(!native_source_valid(&source));
     }
     let mut invalid_source = serde_json::to_value(source).unwrap();
-    invalid_source["source_transcript_id"] = "not-a-uuid".into();
-    assert!(serde_json::from_value::<NativeActionSourceCall>(invalid_source).is_err());
+    invalid_source["source_transcript_id"] = "transcript:root".into();
+    assert!(serde_json::from_value::<NativeActionSourceCall>(invalid_source).is_ok());
+    invalid_source["source_transcript_id"] = "   ".into();
+    let source: NativeActionSourceCall = serde_json::from_value(invalid_source).unwrap();
+    assert!(!native_source_valid(&source));
 }
 
 #[test]
 fn constructed_native_intents_are_validated_before_transport() {
+    let mut source = source_call();
+    source.source_transcript_id = "transcript:root".into();
+    source.source_assistant_message_id = "message:assistant".into();
+    assert!(native_source_valid(&source));
+    source.source_assistant_message_id = "x".repeat(NATIVE_DOMAIN_ID_MAX_BYTES + 1);
+    assert!(!native_source_valid(&source));
     let mut create = NativeCreateRequest {
         caller_instance_id: InstanceId::new(),
         destination_instance_id: InstanceId::new(),
@@ -167,7 +199,7 @@ fn constructed_native_intents_are_validated_before_transport() {
     assert!(!native_create_intent_valid(&create));
     create.model = None;
     create.source.source_assistant_message_id = "bad-message".into();
-    assert!(!native_create_intent_valid(&create));
+    assert!(native_create_intent_valid(&create));
 
     let mut rename = NativeRenameRequest {
         caller_instance_id: InstanceId::new(),
@@ -187,6 +219,22 @@ fn constructed_native_intents_are_validated_before_transport() {
     rename.expected_name_revision = 0;
     rename.title = "  ".into();
     assert!(!native_rename_intent_valid(&rename));
+}
+
+#[test]
+fn native_rename_receipt_preflight_covers_both_variants_at_field_bounds() {
+    let mut rename = native_rename_request();
+    rename.product_conversation_id =
+        ProductConversationId::parse("p".repeat(NATIVE_DOMAIN_ID_MAX_BYTES)).unwrap();
+    rename.expected_root_transcript_id = "r".repeat(NATIVE_DOMAIN_ID_MAX_BYTES);
+    rename.title = "İ".repeat(200);
+    rename.source.source_product_conversation_id = "p".repeat(NATIVE_DOMAIN_ID_MAX_BYTES);
+    rename.source.source_transcript_id = "t".repeat(NATIVE_DOMAIN_ID_MAX_BYTES);
+    rename.source.source_assistant_message_id = "m".repeat(NATIVE_DOMAIN_ID_MAX_BYTES);
+    rename.source.source_tool_use_id = "u".repeat(NATIVE_DOMAIN_ID_MAX_BYTES);
+
+    assert!(native_rename_intent_valid(&rename));
+    assert!(native_rename_receipt_responses_fit(&rename));
 }
 
 #[test]
@@ -470,6 +518,20 @@ fn create_status_validates_timestamps_stages_and_independent_execution_evidence(
 
 #[test]
 fn rename_replay_preserves_historical_tool_locator_but_not_foreign_provenance() {
+    let mut too_long = NativeRenameRequest {
+        caller_instance_id: InstanceId::new(),
+        destination_instance_id: InstanceId::new(),
+        operation_id: uuid::Uuid::new_v4().to_string(),
+        product_conversation_id: ProductConversationId::new(),
+        expected_root_transcript_id: "root:opaque".into(),
+        expected_name_revision: 0,
+        title: "x".repeat(NATIVE_DOMAIN_ID_MAX_BYTES + 1),
+        source: source_call(),
+    };
+    assert!(!native_rename_intent_valid(&too_long));
+    too_long.title = "bounded".into();
+    too_long.expected_root_transcript_id = "".into();
+    assert!(!native_rename_intent_valid(&too_long));
     let request = NativeRenameRequest {
         caller_instance_id: InstanceId::new(),
         destination_instance_id: InstanceId::new(),
@@ -532,8 +594,11 @@ fn rename_replay_preserves_historical_tool_locator_but_not_foreign_provenance() 
             "{pointer}"
         );
     }
-    receipt["receipt_source"]["source_assistant_message_id"] = "not-a-uuid".into();
-    assert!(serde_json::from_value::<NativeRenameResponse>(receipt).is_err());
+    receipt["receipt_source"]["source_assistant_message_id"] = "message:opaque".into();
+    assert!(serde_json::from_value::<NativeRenameResponse>(receipt.clone()).is_ok());
+    receipt["receipt_source"]["source_assistant_message_id"] = "".into();
+    let response: NativeRenameResponse = serde_json::from_value(receipt).unwrap();
+    assert!(native_verify_rename(&request, &response).is_err());
 }
 
 #[tokio::test]
@@ -570,7 +635,10 @@ async fn native_create_reconciles_only_uncertain_dispatch_failures_without_retry
         "unsupported",
         "disconnect",
     ] {
-        let should_reconcile = !matches!(case, "domain_rejection" | "unsupported");
+        let should_reconcile = matches!(
+            case,
+            "disconnect" | "status_malformed" | "status_witness_mismatch"
+        );
         let destination = InstanceId::new();
         let request = NativeCreateRequest {
             caller_instance_id: caller,
@@ -591,7 +659,7 @@ async fn native_create_reconciles_only_uncertain_dispatch_failures_without_retry
         });
         let mut status = "200 OK";
         let body = match case {
-            "malformed" | "status_malformed" | "status_witness_mismatch" => b"not json".to_vec(),
+            "malformed" => b"not json".to_vec(),
             "oversized" | "oversized_stream" => vec![b' '; NATIVE_CREATE_RESPONSE_BYTES + 1],
             "wrong_caller" => {
                 receipt["caller_instance_id"] = serde_json::json!(InstanceId::new());
@@ -620,10 +688,15 @@ async fn native_create_reconciles_only_uncertain_dispatch_failures_without_retry
                 status = "404 Not Found";
                 Vec::new()
             }
-            "disconnect" => Vec::new(),
+            "disconnect" | "status_malformed" | "status_witness_mismatch" => Vec::new(),
             _ => unreachable!(),
         };
-        let first_response = if case == "oversized_stream" {
+        let first_response = if case == "disconnect"
+            || case == "status_malformed"
+            || case == "status_witness_mismatch"
+        {
+            Vec::new()
+        } else if case == "oversized_stream" {
             format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n", body.len(), String::from_utf8(body).unwrap()).into_bytes()
         } else {
             format!(
@@ -740,6 +813,16 @@ async fn native_create_reconciles_only_uncertain_dispatch_failures_without_retry
         .await
         .unwrap();
         match case {
+            "disconnect" => assert!(
+                matches!(outcome, Ok(NativeCreateOutcome::Reconciled {
+                    status: NativeCreateStatusResponse::Known {
+                        request_id,
+                        destination_instance_id,
+                        ..
+                    }
+                }) if request_id == request.request_id && destination_instance_id == destination),
+                "{case}"
+            ),
             "status_malformed" | "status_witness_mismatch" => assert!(matches!(
                 outcome,
                 Err(FederationClientError::NativeCreateUncertain {
@@ -747,6 +830,12 @@ async fn native_create_reconciles_only_uncertain_dispatch_failures_without_retry
                     request_id,
                     ..
                 }) if destination_instance_id == destination && request_id == request.request_id
+            )),
+            "oversized" | "oversized_stream" => assert!(matches!(
+                outcome,
+                Err(FederationClientError::ResponseTooLarge(
+                    NATIVE_CREATE_RESPONSE_BYTES
+                ))
             )),
             "domain_rejection" => assert!(matches!(
                 outcome,
@@ -757,13 +846,10 @@ async fn native_create_reconciles_only_uncertain_dispatch_failures_without_retry
                 Err(FederationClientError::NativeEndpointUnsupported)
             )),
             _ => assert!(
-                matches!(outcome, Ok(NativeCreateOutcome::Reconciled {
-                    status: NativeCreateStatusResponse::Known {
-                        request_id,
-                        destination_instance_id,
-                        ..
-                    }
-                }) if request_id == request.request_id && destination_instance_id == destination),
+                matches!(
+                    outcome,
+                    Err(FederationClientError::NativeProtocolRejected(_))
+                ),
                 "{case}"
             ),
         }

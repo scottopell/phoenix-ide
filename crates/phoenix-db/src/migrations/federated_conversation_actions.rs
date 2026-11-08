@@ -28,9 +28,9 @@ fn qualify_schema(sql: &str, creation: bool) -> DbResult<String> {
     };
     let uuid_check = format!("typeof({column}) = 'text' AND length({column}) = 36 AND {column} = lower({column}) AND substr({column},9,1) = '-' AND substr({column},14,1) = '-' AND substr({column},15,1) = '4' AND substr({column},19,1) = '-' AND substr({column},20,1) IN ('8','9','a','b') AND substr({column},24,1) = '-' AND length(replace({column},'-','')) = 32 AND replace({column},'-','') NOT GLOB '*[^0-9a-f]*'");
     let check = if creation {
-        format!("CHECK ((objective_origin IN ('internal_conversation', 'federated_conversation') AND {column} IS NOT NULL AND {uuid_check} AND objective_slack_request_id IS NULL) OR (objective_origin IN ('unknown_historical', 'user_api', 'slack_gateway') AND {column} IS NULL))")
+        format!("CHECK ((objective_origin IN ('internal_conversation', 'federated_conversation') AND {column} IS NOT NULL AND {uuid_check} AND objective_slack_request_id IS NULL AND length(trim(objective_source_product_conversation_id)) > 0 AND length(trim(objective_source_transcript_id)) > 0 AND length(trim(objective_source_message_id)) > 0 AND length(trim(objective_source_tool_use_id)) > 0) OR (objective_origin IN ('unknown_historical', 'user_api', 'slack_gateway') AND {column} IS NULL))")
     } else {
-        format!("CHECK (length(source_product_conversation_id) > 0 AND length(source_transcript_id) > 0 AND length(source_message_id) > 0 AND length(source_tool_use_id) > 0 AND {column} IS NOT NULL AND {uuid_check})")
+        format!("CHECK (length(trim(source_product_conversation_id)) > 0 AND length(trim(source_transcript_id)) > 0 AND length(trim(source_message_id)) > 0 AND length(trim(source_tool_use_id)) > 0 AND {column} IS NOT NULL AND {uuid_check})")
     };
     let end = sql
         .rfind(')')
@@ -46,14 +46,17 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
         let local: String = sqlx::query_scalar("SELECT instance_id FROM instance_identity WHERE singleton_key = 1").fetch_one(&mut *tx).await?;
         local.parse::<phoenix_core::domain::instance_identity::InstanceId>()
             .map_err(|error| DbError::Serialization(format!("migration 158 invalid local instance identity: {error}")))?;
+        let incomplete_native_creations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_jobs WHERE objective_origin = 'internal_conversation' AND (length(trim(objective_source_product_conversation_id)) = 0 OR length(trim(objective_source_transcript_id)) = 0 OR length(trim(objective_source_message_id)) = 0 OR length(trim(objective_source_tool_use_id)) = 0)")
+            .fetch_one(&mut *tx).await?;
+        let incomplete_rename_receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM product_conversation_rename_receipts WHERE length(trim(source_product_conversation_id)) = 0 OR length(trim(source_transcript_id)) = 0 OR length(trim(source_message_id)) = 0 OR length(trim(source_tool_use_id)) = 0")
+            .fetch_one(&mut *tx).await?;
+        if incomplete_native_creations != 0 || incomplete_rename_receipts != 0 {
+            return Err(DbError::Serialization(format!("migration 158 cannot qualify incomplete historical native locators (creation jobs: {incomplete_native_creations}, rename receipts: {incomplete_rename_receipts})")));
+        }
         sqlx::raw_sql("ALTER TABLE product_creation_jobs ADD COLUMN objective_source_instance_id TEXT;
             ALTER TABLE product_conversation_rename_receipts ADD COLUMN source_instance_id TEXT;
             UPDATE product_creation_jobs SET objective_source_instance_id = (SELECT instance_id FROM instance_identity WHERE singleton_key = 1)
-            WHERE objective_origin = 'internal_conversation'
-              AND length(trim(objective_source_product_conversation_id)) > 0
-              AND length(trim(objective_source_transcript_id)) > 0
-              AND length(trim(objective_source_message_id)) > 0
-              AND length(trim(objective_source_tool_use_id)) > 0;
+            WHERE objective_origin = 'internal_conversation';
             UPDATE product_conversation_rename_receipts SET source_instance_id = (SELECT instance_id FROM instance_identity WHERE singleton_key = 1);")
             .execute(&mut *tx).await?;
         // Updating only these definitions retains every existing FK, index, and trigger in place.

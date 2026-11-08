@@ -148,7 +148,7 @@ impl RoutedTool for RenameConversation {
         let request: RenameRequest =
             serde_json::from_value(input.clone()).map_err(|error| error.to_string())?;
         if matches!(request, RenameRequest::Read { .. }) {
-            return Err("Remote rename read cannot prove immutable intent from operation_id alone. Recovery requires the exact original rename request, including its original trusted source locator; a new tool call is not such a replay. Do not mint a replacement operation for recovery.".into());
+            return Err("Remote rename receipt read by operation_id alone is unsupported. If the outcome is uncertain, retry op=rename with the same operation_id, destination instance, product_conversation_id, expected_root_transcript_id, expected_name_revision, title, and source ProductConversation/transcript. A later assistant-message/tool-use locator is allowed for that same source owner; the original receipt remains authoritative. Never mint a replacement operation.".into());
         }
         Ok(())
     }
@@ -156,7 +156,7 @@ impl RoutedTool for RenameConversation {
         "rename_conversation"
     }
     fn description(&self) -> String {
-        "Current Global Coordinator only. Detail resolves a reference to immutable product/root identity and naming revision; use those exact values for rename. A rename updates the title (1-200 characters) and allocated slug, never the immutable product/work identity. Choose a new operation UUID for each intentional rename; read/retry the same operation UUID after an uncertain result. Remote uncertainty requires the exact original request and original trusted source locator; a fresh tool call cannot recreate that locator. Read by operation_id alone is local-only; never mint a replacement operation to recover uncertainty. Durable replay reports the historical receipt, not current title/lifecycle.".into()
+        "Current Global Coordinator only. Detail resolves a reference to immutable product/root identity and naming revision; use those exact values for rename. A rename updates the title (1-200 characters) and allocated slug, never the immutable product/work identity. Choose a new operation UUID for each intentional rename. Remote read by operation_id alone is unsupported; if rename outcome is uncertain, retry op=rename with the same operation UUID, destination instance, product/root/revision/title, and source ProductConversation/transcript. A later assistant-message/tool-use locator is allowed for that same source owner, and the original receipt remains authoritative. Never mint a replacement operation to recover uncertainty. Durable replay reports the historical receipt, not current title/lifecycle.".into()
     }
     fn schema_without_instance(&self) -> Value {
         json!({"type":"object", "additionalProperties":false, "required":["op"], "properties":{
@@ -195,6 +195,10 @@ impl RoutedTool for RenameConversation {
     }
 }
 
+fn rename_detail_reference(reference: &str) -> Result<String, String> {
+    federation::conversation_lookup_identity(reference).map_err(|error| error.to_string())
+}
+
 fn rename_detail_response(detail: &crate::db::ProductConversationRenameDetail) -> Value {
     let route = crate::api::product_conversations::product_route(
         detail.slug.as_deref(),
@@ -217,7 +221,7 @@ fn remote_rename_detail_response(
     });
     let mut result = serde_json::to_value(response).map_err(|error| error.to_string())?;
     result["status"] = json!("detail");
-    result["next"] = json!("Use these exact product/root/revision values and this same instance for rename. Remote read by operation_id alone is unsupported. Uncertain rename recovery requires the original request including its original trusted source locator, not a fresh tool call or replacement operation.");
+    result["next"] = json!("Use these exact product/root/revision values and this same instance for rename. Remote read by operation_id alone is unsupported. If outcome is uncertain, retry op=rename with this same operation_id, destination, product/root/revision/title, and source ProductConversation/transcript. A later assistant-message/tool-use locator is allowed for that same source owner; the original receipt remains authoritative. Never mint a replacement operation.");
     Ok(result)
 }
 
@@ -263,7 +267,7 @@ impl RenameConversation {
                     .await.map_err(|error| error.to_string())?;
                 remote_rename_detail_response(response)
             }
-            RenameRequest::Read { .. } => Err("Remote rename read is unsupported without the exact original request and original trusted source locator".into()),
+            RenameRequest::Read { .. } => Err("Remote rename receipt read by operation_id alone is unsupported. If the outcome is uncertain, retry op=rename with the same operation_id, destination instance, product_conversation_id, expected_root_transcript_id, expected_name_revision, title, and source ProductConversation/transcript. A later assistant-message/tool-use locator is allowed for that same source owner; the original receipt remains authoritative. Never mint a replacement operation.".into()),
             RenameRequest::Rename {
                 operation_id,
                 product_conversation_id,
@@ -297,11 +301,11 @@ impl RenameConversation {
         let request: RenameRequest = serde_json::from_value(input).map_err(|e| e.to_string())?;
         match request {
             RenameRequest::Detail { reference } => {
-                let reference = reference.strip_prefix("@conv:").unwrap_or(&reference);
+                let reference = rename_detail_reference(&reference)?;
                 let detail = self
                     .0
                     .db()
-                    .read_product_conversation_rename_detail(&ctx.conversation_id, reference)
+                    .read_product_conversation_rename_detail(&ctx.conversation_id, &reference)
                     .await
                     .map_err(|e| e.to_string())?;
                 Ok(rename_detail_response(&detail))

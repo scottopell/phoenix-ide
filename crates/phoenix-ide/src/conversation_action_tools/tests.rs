@@ -78,6 +78,21 @@ fn rename_decoder_requires_cas_and_rejects_retargeting_extra_fields() {
 }
 
 #[test]
+fn rename_detail_normalizes_canonical_typed_references_to_raw_identity() {
+    assert_eq!(
+        rename_detail_reference("@conv:product-id").unwrap(),
+        "product-id"
+    );
+    assert_eq!(
+        rename_detail_reference("@transcript:root-id#message-message-id").unwrap(),
+        "root-id"
+    );
+    assert_eq!(rename_detail_reference("plain-id").unwrap(), "plain-id");
+    assert!(rename_detail_reference(" @conv:product-id").is_err());
+    assert!(rename_detail_reference("@transcript:root-id#invalid").is_err());
+}
+
+#[test]
 fn rename_detail_uses_shared_encoded_canonical_route_with_stable_id_fallback() {
     let mut detail = crate::db::ProductConversationRenameDetail {
         can_rename: true,
@@ -153,7 +168,29 @@ fn native_federated_rename_detail_omits_remote_receipt_read_only() {
                 json!(["detail"])
             }
         );
+        let guidance = result["next"].as_str().unwrap();
+        assert!(guidance.contains("retry op=rename with this same operation_id"));
+        assert!(guidance.contains("A later assistant-message/tool-use locator is allowed"));
+        assert!(guidance.contains("the original receipt remains authoritative"));
+        assert!(guidance.contains("Never mint a replacement operation"));
     }
+}
+
+#[tokio::test]
+async fn remote_rename_guidance_allows_new_locator_for_same_source_owner() {
+    let (runtime, _, _) = native_runtime().await;
+    let tool = RenameConversation(runtime);
+    let error = tool
+        .validate_before_peer_lookup(&json!({
+            "op": "read",
+            "operation_id": "01b22123-04de-4b01-88dd-83e74eb2ed51"
+        }))
+        .unwrap_err();
+    assert!(error.contains("Remote rename receipt read by operation_id alone is unsupported"));
+    assert!(error.contains("retry op=rename with the same operation_id"));
+    assert!(error.contains("A later assistant-message/tool-use locator is allowed"));
+    assert!(error.contains("the original receipt remains authoritative"));
+    assert!(error.contains("Never mint a replacement operation"));
 }
 
 pub(super) fn native_context(transcript: &str) -> ToolContext {
@@ -1562,14 +1599,16 @@ async fn native_federated_rename_read_requires_immutable_intent_replay() {
     let tool = RouteTool::boxed(RenameConversation(runtime));
     let failed = tool.run(json!({"op":"read", "instance":"unknown-peer", "operation_id":uuid::Uuid::new_v4().to_string()}), native_context(&gc)).await;
     assert!(matches!(failed, ToolOutput::Error { .. }));
-    assert!(
-        failed.output().contains("immutable intent"),
-        "{}",
-        failed.output()
-    );
-    assert!(
-        failed.output().contains("original trusted source locator"),
-        "{}",
-        failed.output()
-    );
+    for recovery_contract in [
+        "retry op=rename with the same operation_id, destination instance, product_conversation_id, expected_root_transcript_id, expected_name_revision, title, and source ProductConversation/transcript",
+        "A later assistant-message/tool-use locator is allowed for that same source owner",
+        "the original receipt remains authoritative",
+        "Never mint a replacement operation",
+    ] {
+        assert!(
+            failed.output().contains(recovery_contract),
+            "missing {recovery_contract:?} in {}",
+            failed.output()
+        );
+    }
 }

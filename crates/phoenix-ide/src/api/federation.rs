@@ -1008,8 +1008,10 @@ pub enum RemoteConversationTarget {
 
 impl RemoteConversationTarget {
     fn parse(reference: &str) -> Result<Self, FederationClientError> {
-        let reference = reference.trim();
-        if reference.len() > 1024 || reference.chars().any(char::is_whitespace) {
+        if reference.trim() != reference
+            || reference.len() > 1024
+            || reference.chars().any(char::is_whitespace)
+        {
             return Err(FederationClientError::ProvenanceMismatch(
                 "reference must be one bounded canonical token".to_string(),
             ));
@@ -1054,6 +1056,15 @@ impl RemoteConversationTarget {
         Err(FederationClientError::ProvenanceMismatch(
             "remote reference must be @conv: or @transcript:".to_string(),
         ))
+    }
+
+    fn lookup_identity(&self) -> &str {
+        match self {
+            Self::ProductConversation {
+                product_conversation_id,
+            } => product_conversation_id,
+            Self::ExactTranscript { transcript_id, .. } => transcript_id,
+        }
     }
 
     fn reference(&self) -> String {
@@ -1643,6 +1654,26 @@ pub(crate) fn validate_remote_resolve_reference(
     reference: &str,
 ) -> Result<RemoteConversationTarget, FederationClientError> {
     RemoteConversationTarget::parse(reference)
+}
+
+pub(crate) fn conversation_lookup_identity(
+    reference: &str,
+) -> Result<String, FederationClientError> {
+    if reference.starts_with('@') {
+        return validate_remote_resolve_reference(reference)
+            .map(|target| target.lookup_identity().to_owned());
+    }
+    if reference.trim().is_empty()
+        || reference.trim() != reference
+        || reference.len() > NATIVE_RENAME_REQUEST_BYTES
+        || reference.chars().any(char::is_control)
+    {
+        return Err(FederationClientError::ProvenanceMismatch(
+            "reference must be one bounded nonblank identity or canonical typed reference"
+                .to_string(),
+        ));
+    }
+    Ok(reference.to_owned())
 }
 
 pub async fn resolve_remote_reference(
@@ -2594,6 +2625,7 @@ pub(crate) const NATIVE_RENAME_OPTIONS_REQUEST_BYTES: usize = 4096;
 pub(crate) const NATIVE_RENAME_OPTIONS_RESPONSE_BYTES: usize = 262_144;
 pub(crate) const NATIVE_RENAME_REQUEST_BYTES: usize = 16_384;
 pub(crate) const NATIVE_RENAME_RESPONSE_BYTES: usize = 16_384;
+const NATIVE_DOMAIN_ID_MAX_BYTES: usize = 256;
 const NATIVE_CREATE_PROJECT_LIMIT: usize = 50;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2633,11 +2665,8 @@ pub(crate) struct NativeRenameOptionsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativeActionSourceCall {
-    #[serde(deserialize_with = "native_canonical_uuid")]
     pub(crate) source_product_conversation_id: ProductConversationId,
-    #[serde(deserialize_with = "native_canonical_uuid")]
     pub(crate) source_transcript_id: String,
-    #[serde(deserialize_with = "native_canonical_uuid")]
     pub(crate) source_assistant_message_id: String,
     pub(crate) source_tool_use_id: String,
 }
@@ -2689,9 +2718,7 @@ pub(crate) struct NativeRenameRequest {
     pub(crate) destination_instance_id: InstanceId,
     #[serde(deserialize_with = "native_canonical_uuid")]
     pub(crate) operation_id: String,
-    #[serde(deserialize_with = "native_canonical_uuid")]
     pub(crate) product_conversation_id: ProductConversationId,
-    #[serde(deserialize_with = "native_canonical_uuid")]
     pub(crate) expected_root_transcript_id: String,
     pub(crate) expected_name_revision: i64,
     pub(crate) title: String,
@@ -2734,9 +2761,7 @@ pub(crate) struct NativeCreateOptionsResponse {
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativeRenameDetail {
     pub(crate) can_rename: bool,
-    #[serde(deserialize_with = "native_canonical_uuid")]
     pub(crate) product_conversation_id: ProductConversationId,
-    #[serde(deserialize_with = "native_canonical_uuid")]
     pub(crate) root_transcript_id: String,
     pub(crate) name_revision: i64,
     #[serde(deserialize_with = "deserialize_present_option")]
@@ -2782,7 +2807,6 @@ pub(crate) struct NativeCreateResponse {
     pub(crate) destination_instance_id: InstanceId,
     #[serde(deserialize_with = "native_canonical_uuid")]
     pub(crate) request_id: String,
-    #[serde(deserialize_with = "native_canonical_uuid")]
     pub(crate) product_conversation_id: ProductConversationId,
     pub(crate) status: NativeCreateAcceptanceStatus,
 }
@@ -2792,12 +2816,10 @@ pub(crate) struct NativeCreateResponse {
 pub(crate) enum NativeCreatePublication {
     None,
     Available {
-        #[serde(deserialize_with = "native_canonical_uuid")]
         conversation_id: String,
         canonical_route: String,
     },
     Historical {
-        #[serde(deserialize_with = "native_canonical_uuid")]
         conversation_id: String,
     },
 }
@@ -2833,7 +2855,6 @@ pub(crate) enum NativeCreateStatusResponse {
         destination_instance_id: InstanceId,
         #[serde(deserialize_with = "native_canonical_uuid")]
         request_id: String,
-        #[serde(deserialize_with = "native_canonical_uuid")]
         product_conversation_id: ProductConversationId,
         creation_status: NativeCreationState,
         provisioning_stage: phoenix_db::ProductCreationProvisioningStage,
@@ -2857,9 +2878,7 @@ pub(crate) enum NativeRenameResponse {
         destination_instance_id: InstanceId,
         #[serde(deserialize_with = "native_canonical_uuid")]
         operation_id: String,
-        #[serde(deserialize_with = "native_canonical_uuid")]
         product_conversation_id: ProductConversationId,
-        #[serde(deserialize_with = "native_canonical_uuid")]
         root_transcript_id: String,
         receipt_title: String,
         receipt_slug_at_commit: String,
@@ -2876,9 +2895,7 @@ pub(crate) enum NativeRenameResponse {
         destination_instance_id: InstanceId,
         #[serde(deserialize_with = "native_canonical_uuid")]
         operation_id: String,
-        #[serde(deserialize_with = "native_canonical_uuid")]
         product_conversation_id: ProductConversationId,
-        #[serde(deserialize_with = "native_canonical_uuid")]
         root_transcript_id: String,
         receipt_title: String,
         receipt_slug_at_commit: String,
@@ -2895,9 +2912,7 @@ pub(crate) enum NativeRenameResponse {
         destination_instance_id: InstanceId,
         #[serde(deserialize_with = "native_canonical_uuid")]
         operation_id: String,
-        #[serde(deserialize_with = "native_canonical_uuid")]
         product_conversation_id: ProductConversationId,
-        #[serde(deserialize_with = "native_canonical_uuid")]
         root_transcript_id: String,
     },
     Conflict {
@@ -2907,9 +2922,7 @@ pub(crate) enum NativeRenameResponse {
         destination_instance_id: InstanceId,
         #[serde(deserialize_with = "native_canonical_uuid")]
         operation_id: String,
-        #[serde(deserialize_with = "native_canonical_uuid")]
         product_conversation_id: ProductConversationId,
-        #[serde(deserialize_with = "native_canonical_uuid")]
         root_transcript_id: String,
     },
     NotFound {
@@ -2919,9 +2932,7 @@ pub(crate) enum NativeRenameResponse {
         destination_instance_id: InstanceId,
         #[serde(deserialize_with = "native_canonical_uuid")]
         operation_id: String,
-        #[serde(deserialize_with = "native_canonical_uuid")]
         product_conversation_id: ProductConversationId,
-        #[serde(deserialize_with = "native_canonical_uuid")]
         root_transcript_id: String,
     },
     Unavailable {
@@ -2931,9 +2942,7 @@ pub(crate) enum NativeRenameResponse {
         destination_instance_id: InstanceId,
         #[serde(deserialize_with = "native_canonical_uuid")]
         operation_id: String,
-        #[serde(deserialize_with = "native_canonical_uuid")]
         product_conversation_id: ProductConversationId,
-        #[serde(deserialize_with = "native_canonical_uuid")]
         root_transcript_id: String,
     },
 }
@@ -3006,12 +3015,23 @@ pub(crate) struct NativeActionFailure {
 }
 
 impl NativeActionFailure {
-    fn new(status: StatusCode, code: NativeActionErrorCode, message: &str) -> Self {
+    fn new(status: StatusCode, code: NativeActionErrorCode) -> Self {
+        let error = match code {
+            NativeActionErrorCode::InvalidRequest => "invalid native action request",
+            NativeActionErrorCode::Unauthorized => "native action authentication required",
+            NativeActionErrorCode::Forbidden => "native action is not authorized",
+            NativeActionErrorCode::NotFound => "native action target was not found",
+            NativeActionErrorCode::Conflict => "native action conflicts with destination state",
+            NativeActionErrorCode::TooLarge => "native action payload is too large",
+            NativeActionErrorCode::Unavailable => "native action is unavailable",
+            NativeActionErrorCode::Internal => "native action failed",
+            NativeActionErrorCode::UnsupportedEndpoint => "native action endpoint is unsupported",
+        };
         Self {
             status,
             body: NativeActionErrorBody {
                 error_type: code,
-                error: message.into(),
+                error: error.into(),
             },
         }
     }
@@ -3031,11 +3051,7 @@ impl From<StatusCode> for NativeActionFailure {
             StatusCode::SERVICE_UNAVAILABLE => NativeActionErrorCode::Unavailable,
             _ => NativeActionErrorCode::Internal,
         };
-        Self::new(
-            status,
-            code,
-            status.canonical_reason().unwrap_or("native action failed"),
-        )
+        Self::new(status, code)
     }
 }
 
@@ -3050,11 +3066,16 @@ fn native_json_rejection(error: axum::extract::rejection::JsonRejection) -> Nati
 }
 
 fn native_source_valid(source: &NativeActionSourceCall) -> bool {
-    native_uuid_is_canonical(source.source_product_conversation_id.as_str())
-        && native_uuid_is_canonical(&source.source_transcript_id)
-        && native_uuid_is_canonical(&source.source_assistant_message_id)
-        && !source.source_tool_use_id.trim().is_empty()
-        && !source.source_tool_use_id.chars().any(char::is_control)
+    native_domain_identity_valid(source.source_product_conversation_id.as_str())
+        && native_domain_identity_valid(&source.source_transcript_id)
+        && native_domain_identity_valid(&source.source_assistant_message_id)
+        && native_domain_identity_valid(&source.source_tool_use_id)
+}
+
+fn native_domain_identity_valid(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= NATIVE_DOMAIN_ID_MAX_BYTES
+        && !value.chars().any(char::is_control)
 }
 
 fn native_create_intent_valid(request: &NativeCreateRequest) -> bool {
@@ -3074,11 +3095,55 @@ fn native_create_intent_valid(request: &NativeCreateRequest) -> bool {
 
 fn native_rename_intent_valid(request: &NativeRenameRequest) -> bool {
     native_uuid_is_canonical(&request.operation_id)
-        && native_uuid_is_canonical(request.product_conversation_id.as_str())
-        && native_uuid_is_canonical(&request.expected_root_transcript_id)
+        && native_domain_identity_valid(request.product_conversation_id.as_str())
+        && native_domain_identity_valid(&request.expected_root_transcript_id)
         && (0..i64::MAX).contains(&request.expected_name_revision)
         && native_source_valid(&request.source)
         && crate::conversation_actions::normalize_product_conversation_title(&request.title).is_ok()
+}
+
+fn native_rename_receipt_responses_fit(request: &NativeRenameRequest) -> bool {
+    const MAX_LOWERCASE_UTF8_BYTES_PER_INPUT_CHAR: usize = 12;
+    const MAX_COLLISION_SUFFIX_BYTES: usize = 21;
+
+    let max_slug = "x".repeat(
+        request
+            .title
+            .chars()
+            .count()
+            .saturating_mul(MAX_LOWERCASE_UTF8_BYTES_PER_INPUT_CHAR)
+            .saturating_add(MAX_COLLISION_SUFFIX_BYTES),
+    );
+    let applied = NativeRenameResponse::Applied {
+        caller_instance_id: request.caller_instance_id,
+        destination_instance_id: request.destination_instance_id,
+        operation_id: request.operation_id.clone(),
+        product_conversation_id: request.product_conversation_id.clone(),
+        root_transcript_id: request.expected_root_transcript_id.clone(),
+        receipt_title: request.title.clone(),
+        receipt_slug_at_commit: max_slug.clone(),
+        receipt_name_revision_before: request.expected_name_revision,
+        receipt_committed_at_unix_micros: i64::MIN,
+        receipt_source_instance_id: request.caller_instance_id,
+        receipt_source: request.source.clone(),
+    };
+    let replayed = NativeRenameResponse::Replayed {
+        caller_instance_id: request.caller_instance_id,
+        destination_instance_id: request.destination_instance_id,
+        operation_id: request.operation_id.clone(),
+        product_conversation_id: request.product_conversation_id.clone(),
+        root_transcript_id: request.expected_root_transcript_id.clone(),
+        receipt_title: request.title.clone(),
+        receipt_slug_at_commit: max_slug,
+        receipt_name_revision_before: request.expected_name_revision,
+        receipt_committed_at_unix_micros: i64::MIN,
+        receipt_source_instance_id: request.caller_instance_id,
+        receipt_source: request.source.clone(),
+    };
+    [applied, replayed].iter().all(|response| {
+        serde_json::to_vec(response)
+            .is_ok_and(|bytes| !bytes.is_empty() && bytes.len() <= NATIVE_RENAME_RESPONSE_BYTES)
+    })
 }
 
 fn native_peer_authority(
@@ -3113,16 +3178,11 @@ fn native_error(error: impl std::fmt::Display) -> NativeActionFailure {
     NativeActionFailure::new(
         StatusCode::INTERNAL_SERVER_ERROR,
         NativeActionErrorCode::Internal,
-        "native action failed",
     )
 }
 
 fn native_app_error(error: super::handlers::AppError) -> NativeActionFailure {
-    let message = error.to_string();
-    let status = error.into_response().status();
-    let mut failure = NativeActionFailure::from(status);
-    failure.body.error = message;
-    failure
+    NativeActionFailure::from(error.into_response().status())
 }
 
 fn normalized_native_cwd(cwd: &str, home: &std::path::Path) -> Result<String, NativeActionFailure> {
@@ -3260,7 +3320,7 @@ pub(crate) async fn native_rename_options(
     request: Result<Json<NativeRenameOptionsRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, NativeActionFailure> {
     let Json(request) = request.map_err(native_json_rejection)?;
-    validate_remote_resolve_reference(&request.reference)
+    let lookup_identity = conversation_lookup_identity(&request.reference)
         .map_err(|_| NativeActionFailure::from(StatusCode::BAD_REQUEST))?;
     let local = state.db.instance_id().await.map_err(native_error)?;
     let authority = native_peer_authority(
@@ -3271,7 +3331,7 @@ pub(crate) async fn native_rename_options(
     )?;
     let detail = state
         .db
-        .read_product_conversation_rename_detail_as_federation(&authority, &request.reference)
+        .read_product_conversation_rename_detail_as_federation(&authority, &lookup_identity)
         .await
         .map_err(native_error)?;
     let route = crate::api::product_conversations::product_route(
@@ -3438,6 +3498,9 @@ pub(crate) async fn native_rename(
     let Json(request) = request.map_err(native_json_rejection)?;
     if !native_rename_intent_valid(&request) {
         return Err(StatusCode::BAD_REQUEST.into());
+    }
+    if !native_rename_receipt_responses_fit(&request) {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE.into());
     }
     let local = state.db.instance_id().await.map_err(native_error)?;
     let authority = native_peer_authority(
@@ -4076,13 +4139,7 @@ pub(crate) async fn remote_native_create(
         });
     match result {
         Ok(acceptance) => Ok(NativeCreateOutcome::Accepted { acceptance }),
-        Err(
-            error @ (FederationClientError::NativeEndpointUnsupported
-            | FederationClientError::NativeIdentityRejected(_)
-            | FederationClientError::NativeProtocolRejected(_)
-            | FederationClientError::NativeDomainRejected(_)),
-        ) => Err(error),
-        Err(error) => {
+        Err(error @ FederationClientError::Request(_)) => {
             let status_request = NativeCreateStatusRequest {
                 caller_instance_id: request.caller_instance_id,
                 destination_instance_id: request.destination_instance_id,
@@ -4099,6 +4156,7 @@ pub(crate) async fn remote_native_create(
                 }),
             }
         }
+        Err(error) => Err(error),
     }
 }
 

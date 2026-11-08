@@ -286,7 +286,19 @@ impl Database {
             }
             let resolved = Self::resolve_ordinary_product_conversation_on(&mut tx, command.product_conversation_id.as_str()).await;
             let resolved = match resolved { Ok(value) => value, Err(DbError::ConversationNotFound(_)) => return Ok(ProductConversationRenameResult::NotFound), Err(DbError::ProductConversationUnavailable(_)) => return Ok(ProductConversationRenameResult::Unavailable), Err(error) => return Err(error) };
-            crate::close_foundation::require_product_conversation_admission_tx(&mut tx, &resolved.requested_transcript_row_id).await?;
+            match crate::close_foundation::require_product_conversation_admission_tx(
+                &mut tx,
+                &resolved.requested_transcript_row_id,
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(DbError::CloseAdmissionFenced(_))
+                | Err(DbError::ProductConversationUnavailable(_)) => {
+                    return Ok(ProductConversationRenameResult::Unavailable);
+                }
+                Err(error) => return Err(error),
+            }
             let root = sqlx::query("SELECT id, name_revision, archived FROM conversations WHERE product_conversation_id = ?1 AND runtime_role = 'user' AND user_initiated = 1 AND parent_conversation_id IS NULL AND NOT EXISTS (SELECT 1 FROM conversations p WHERE p.product_conversation_id = conversations.product_conversation_id AND p.continued_in_conv_id = conversations.id) ORDER BY id LIMIT 1")
                 .bind(command.product_conversation_id.as_str()).fetch_optional(&mut *tx).await?;
             let Some(root) = root else { return Ok(ProductConversationRenameResult::NotFound); };
@@ -362,10 +374,10 @@ fn validate_command(command: &ProductConversationRenameCommand) -> DbResult<()> 
     validate_operation_id(&command.operation_id)?;
     if command.expected_name_revision < 0
         || command.expected_name_revision == i64::MAX
-        || command.expected_root_transcript_id.is_empty()
-        || command.source.transcript_id.is_empty()
-        || command.source.message_id.is_empty()
-        || command.source.tool_use_id.is_empty()
+        || command.expected_root_transcript_id.trim().is_empty()
+        || command.source.transcript_id.trim().is_empty()
+        || command.source.message_id.trim().is_empty()
+        || command.source.tool_use_id.trim().is_empty()
     {
         return Err(DbError::ConversationTitleInvalid);
     }
@@ -442,6 +454,7 @@ fn decode_receipt(row: &sqlx::sqlite::SqliteRow) -> DbResult<ProductConversation
             .map_err(|e| DbError::Serialization(e.to_string()))
     };
     for key in [
+        "source_product_conversation_id",
         "source_transcript_id",
         "source_message_id",
         "source_tool_use_id",
@@ -946,6 +959,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_close_fence_classifies_new_rename_as_unavailable() {
+        use phoenix_core::domain::close::TranscriptConversationId;
+
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation(
+                "close-fenced-root",
+                "close-fenced-root",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let gc = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let mut command = test_command(uuid::Uuid::new_v4().to_string(), 0);
+        command.product_conversation_id = root.product_conversation_id.clone();
+        command.expected_root_transcript_id = root.id.clone();
+        command.source.source_instance_id = db.instance_id().await.unwrap();
+        command.source.product_conversation_id = gc.product_conversation_id;
+        command.source.transcript_id = gc.id.clone();
+        db.begin_close_foundation(
+            &root.product_conversation_id,
+            &TranscriptConversationId::parse(root.id.clone()).unwrap(),
+            "close-attempt",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.rename_product_conversation(&gc.id, &command)
+                .await
+                .established()
+                .expect("rename classification")
+                .unwrap(),
+            ProductConversationRenameResult::Unavailable,
+        );
+        assert!(db
+            .read_product_conversation_rename_receipt(&gc.id, &command.operation_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn archived_root_refuses_new_rename_without_changing_identity() {
         let db = Database::open_in_memory().await.unwrap();
         let root = db
@@ -1066,60 +1128,33 @@ mod tests {
         let mut changed = command.clone();
         changed.product_conversation_id = replacement.product_conversation_id;
         changed.expected_root_transcript_id = replacement.id;
-        assert!(matches!(
-            db.rename_product_conversation(&gc.id, &changed)
-                .await
-                .established()
-                .expect("rename classification"),
-            Ok(ProductConversationRenameResult::Conflict)
-        ));
+        assert_rename_conflict(&db, &gc.id, &changed).await;
         changed = command.clone();
         changed.title = NormalizedConversationTitle::parse("changed intent").unwrap();
-        assert!(matches!(
-            db.rename_product_conversation(&gc.id, &changed)
-                .await
-                .established()
-                .expect("rename classification"),
-            Ok(ProductConversationRenameResult::Conflict)
-        ));
+        assert_rename_conflict(&db, &gc.id, &changed).await;
         changed = command.clone();
         changed.source.product_conversation_id = command.product_conversation_id.clone();
-        assert!(matches!(
-            db.rename_product_conversation(&gc.id, &changed)
-                .await
-                .established()
-                .expect("rename classification"),
-            Ok(ProductConversationRenameResult::Conflict)
-        ));
+        assert_rename_conflict(&db, &gc.id, &changed).await;
         assert_eq!(
             db.read_product_conversation_rename_receipt(&gc.id, &command.operation_id)
                 .await
                 .unwrap(),
-            Some(receipt.clone())
+            Some(receipt)
         );
-        sqlx::query("UPDATE conversations SET coordinator_head=0 WHERE id=?1")
-            .bind(&gc.id)
-            .execute(db.pool())
-            .await
-            .unwrap();
-        let new_gc = db
-            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
-            .await
-            .unwrap();
-        assert_ne!(new_gc.id, gc.id);
-        sqlx::query("DELETE FROM conversations WHERE id=?1")
-            .bind(&gc.id)
-            .execute(db.pool())
-            .await
-            .unwrap();
-        assert_eq!(
-            db.rename_product_conversation(&new_gc.id, &command)
+    }
+
+    async fn assert_rename_conflict(
+        db: &Database,
+        transcript_id: &str,
+        command: &ProductConversationRenameCommand,
+    ) {
+        assert!(matches!(
+            db.rename_product_conversation(transcript_id, command)
                 .await
                 .established()
-                .unwrap()
-                .unwrap(),
-            ProductConversationRenameResult::Replayed(receipt)
-        );
+                .expect("rename classification"),
+            Ok(ProductConversationRenameResult::Conflict)
+        ));
     }
 
     fn test_command(operation_id: String, revision: i64) -> ProductConversationRenameCommand {
@@ -1138,6 +1173,16 @@ mod tests {
                 tool_use_id: "tool".into(),
             },
         }
+    }
+
+    #[test]
+    fn command_rejects_whitespace_only_native_locator_values() {
+        let mut command = test_command(uuid::Uuid::new_v4().to_string(), 0);
+        command.source.message_id = "  \t".into();
+        assert!(validate_command(&command).is_err());
+        command.source.message_id = "message".into();
+        command.expected_root_transcript_id = "  ".into();
+        assert!(validate_command(&command).is_err());
     }
 
     #[test]
