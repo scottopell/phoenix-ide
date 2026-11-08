@@ -4,7 +4,7 @@
 //! advances `committed`. After a crash, even a valid unsynced tail may be lost.
 
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -13,6 +13,7 @@ use std::sync::{mpsc, Arc};
 const SEGMENT_BYTES: u64 = 2 * 1024 * 1024;
 const FRAME_BYTES: usize = 1024;
 const HEADER_BYTES: usize = 6;
+const DIRECTORY: &str = "resource-flight-recorder";
 const NAMES: [&str; 2] = ["resources.0.frames", "resources.1.frames"];
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -179,10 +180,13 @@ impl Handle {
 }
 
 /// Optional startup: errors are returned, never logged or made process-fatal.
-/// Only the two fixed filenames are opened; the argument is directory config,
-/// not a payload-controlled filename. No environment variable enables this leaf.
-pub(crate) fn start(directory: &Path, process: ProcessIdentity) -> io::Result<Handle> {
-    let (storage, sequence) = Storage::open(directory)?;
+/// `data_directory` must already exist, be owned by the effective user, and not
+/// permit group/other writes. Its mode is never changed. Storage creates a fixed
+/// `resource-flight-recorder/` child (0700) holding the two fixed files (0600).
+/// Existing unsafe entries are rejected, not repaired. Unix only; no environment
+/// variable enables this leaf.
+pub(crate) fn start(data_directory: &Path, process: ProcessIdentity) -> io::Result<Handle> {
+    let (storage, sequence) = Storage::open(data_directory)?;
     let (sender, receiver) = mpsc::sync_channel(1);
     let counters = Arc::new(Counters::default());
     let worker_counters = counters.clone();
@@ -273,19 +277,55 @@ struct Storage {
 }
 
 impl Storage {
-    fn open(directory: &Path) -> io::Result<(Self, u64)> {
-        std::fs::create_dir_all(directory)?;
-        let open = |name| {
-            let mut options = OpenOptions::new();
-            options.read(true).write(true).create(true).truncate(false);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            options.open(directory.join(name))
+    #[cfg(not(unix))]
+    fn open(_: &Path) -> io::Result<(Self, u64)> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "resource recorder requires Unix no-follow storage",
+        ))
+    }
+
+    #[cfg(unix)]
+    fn open(data_directory: &Path) -> io::Result<(Self, u64)> {
+        use nix::fcntl::{open, openat, OFlag};
+        use nix::sys::stat::{mkdirat, Mode};
+        use std::os::unix::fs::MetadataExt;
+
+        let directory_flags =
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+        let parent = File::from(open(data_directory, directory_flags, Mode::empty())?);
+        let metadata = parent.metadata()?;
+        validate_owner(metadata.uid())?;
+        if !metadata.is_dir() || metadata.mode() & 0o7022 != 0 {
+            return Err(unsafe_storage("unsafe recorder data directory"));
+        }
+        match mkdirat(&parent, DIRECTORY, Mode::S_IRWXU) {
+            Ok(()) | Err(nix::errno::Errno::EEXIST) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let directory = File::from(openat(&parent, DIRECTORY, directory_flags, Mode::empty())?);
+        let metadata = directory.metadata()?;
+        validate_owner(metadata.uid())?;
+        if !metadata.is_dir() || metadata.mode() & 0o7777 != 0o700 {
+            return Err(unsafe_storage("recorder directory must be private (0700)"));
+        }
+        let open_segment = |name: &str| -> io::Result<File> {
+            // O_NONBLOCK prevents opening a pre-existing FIFO from stalling startup.
+            let flags = OFlag::O_RDWR | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK;
+            let descriptor = match openat(
+                &directory,
+                name,
+                flags | OFlag::O_CREAT | OFlag::O_EXCL,
+                Mode::S_IRUSR | Mode::S_IWUSR,
+            ) {
+                Ok(descriptor) => descriptor,
+                Err(nix::errno::Errno::EEXIST) => openat(&directory, name, flags, Mode::empty())?,
+                Err(error) => return Err(error.into()),
+            };
+            Ok(File::from(descriptor))
         };
-        let mut files = [open(NAMES[0])?, open(NAMES[1])?];
+        let mut files = [open_segment(NAMES[0])?, open_segment(NAMES[1])?];
+        validate_segments(&files)?;
         fs2::FileExt::try_lock_exclusive(&files[0])?;
         let prefixes = [scan(&mut files[0])?, scan(&mut files[1])?];
         let active = usize::from(prefixes[1].1 > prefixes[0].1);
@@ -303,6 +343,46 @@ impl Storage {
             prefixes[active].1,
         ))
     }
+}
+
+#[cfg(unix)]
+fn unsafe_storage(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, message)
+}
+
+#[cfg(unix)]
+fn validate_owner(uid: u32) -> io::Result<()> {
+    // SAFETY: geteuid has no arguments or memory safety preconditions.
+    if uid != unsafe { libc::geteuid() } {
+        return Err(unsafe_storage(
+            "recorder entry is not owned by the effective user",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_segments(files: &[File; 2]) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = [files[0].metadata()?, files[1].metadata()?];
+    for entry in &metadata {
+        validate_owner(entry.uid())?;
+        if !entry.is_file() || entry.nlink() != 1 || entry.mode() & 0o7777 != 0o600 {
+            return Err(unsafe_storage(
+                "recorder segment must be regular, single-link, private (0600)",
+            ));
+        }
+        if entry.len() > SEGMENT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recorder segment exceeds bound",
+            ));
+        }
+    }
+    if (metadata[0].dev(), metadata[0].ino()) == (metadata[1].dev(), metadata[1].ino()) {
+        return Err(unsafe_storage("recorder segments share an inode"));
+    }
+    Ok(())
 }
 
 fn append_bytes(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
@@ -558,6 +638,333 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    mod storage_safety {
+        use super::*;
+        use std::fs::{self, OpenOptions};
+        use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
+        use std::path::PathBuf;
+
+        // Deliberately torn tails reveal any premature truncation on refusal.
+        fn fixture() -> (tempfile::TempDir, [PathBuf; 2], Vec<u8>) {
+            let root = tempfile::tempdir().unwrap();
+            drop(Storage::open(root.path()).unwrap());
+            let paths = NAMES.map(|name| root.path().join(DIRECTORY).join(name));
+            let mut sentinel = frame(&record(1)).unwrap();
+            sentinel.extend_from_slice(b"torn sentinel");
+            for path in &paths {
+                fs::write(path, &sentinel).unwrap();
+            }
+            (root, paths, sentinel)
+        }
+
+        fn private_file(path: &Path, bytes: &[u8]) -> File {
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap();
+            file.write_all(bytes).unwrap();
+            file
+        }
+
+        #[test]
+        fn symlink_segments_never_touch_targets_or_other_segment() {
+            for slot in 0..2 {
+                let (root, paths, sentinel) = fixture();
+                let outside = tempfile::tempdir().unwrap();
+                let target = outside.path().join("target");
+                let file = private_file(&target, &sentinel);
+                let inode = file.metadata().unwrap().ino();
+                fs::remove_file(&paths[slot]).unwrap();
+                symlink(&target, &paths[slot]).unwrap();
+                assert!(Storage::open(root.path()).is_err());
+                assert_eq!(fs::read(&target).unwrap(), sentinel);
+                assert_eq!(file.metadata().unwrap().ino(), inode);
+                assert_eq!(fs::read(&paths[1 - slot]).unwrap(), sentinel);
+                assert!(fs::symlink_metadata(&paths[slot]).unwrap().is_symlink());
+            }
+        }
+
+        #[test]
+        fn hardlink_segments_never_touch_targets_or_other_segment() {
+            for slot in 0..2 {
+                let (root, paths, sentinel) = fixture();
+                let outside = tempfile::tempdir().unwrap();
+                let target = outside.path().join("target");
+                let file = private_file(&target, &sentinel);
+                fs::remove_file(&paths[slot]).unwrap();
+                fs::hard_link(&target, &paths[slot]).unwrap();
+                assert!(Storage::open(root.path()).is_err());
+                assert_eq!(fs::read(&target).unwrap(), sentinel);
+                assert_eq!(file.metadata().unwrap().nlink(), 2);
+                assert_eq!(fs::read(&paths[1 - slot]).unwrap(), sentinel);
+            }
+        }
+
+        #[test]
+        fn same_inode_is_rejected_even_without_multiple_links() {
+            let (root, paths, sentinel) = fixture();
+            fs::remove_file(&paths[1]).unwrap();
+            fs::hard_link(&paths[0], &paths[1]).unwrap();
+            assert!(Storage::open(root.path()).is_err());
+            assert_eq!(fs::read(&paths[0]).unwrap(), sentinel);
+            assert_eq!(fs::read(&paths[1]).unwrap(), sentinel);
+            fs::remove_file(&paths[1]).unwrap();
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&paths[0])
+                .unwrap();
+            assert_eq!(file.metadata().unwrap().nlink(), 1);
+            let alias = file.try_clone().unwrap();
+            assert!(validate_segments(&[file, alias]).is_err());
+            assert_eq!(fs::read(&paths[0]).unwrap(), sentinel);
+        }
+
+        #[test]
+        fn fifo_and_directory_are_refused_without_touching_other_segment() {
+            use nix::sys::stat::Mode;
+            use nix::unistd::mkfifo;
+
+            for slot in 0..2 {
+                for fifo in [false, true] {
+                    let (root, paths, sentinel) = fixture();
+                    fs::remove_file(&paths[slot]).unwrap();
+                    if fifo {
+                        mkfifo(&paths[slot], Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+                    } else {
+                        fs::create_dir(&paths[slot]).unwrap();
+                    }
+                    assert!(Storage::open(root.path()).is_err());
+                    assert_eq!(fs::read(&paths[1 - slot]).unwrap(), sentinel);
+                    let metadata = fs::symlink_metadata(&paths[slot]).unwrap();
+                    assert_eq!(metadata.is_dir(), !fifo);
+                }
+            }
+        }
+
+        #[test]
+        fn permissive_segment_is_refused_without_chmod_or_truncation() {
+            for slot in 0..2 {
+                for mode in [0o640, 0o606, 0o666, 0o4600] {
+                    let (root, paths, sentinel) = fixture();
+                    fs::set_permissions(&paths[slot], fs::Permissions::from_mode(mode)).unwrap();
+                    assert!(Storage::open(root.path()).is_err());
+                    assert_eq!(fs::metadata(&paths[slot]).unwrap().mode() & 0o7777, mode);
+                    for path in &paths {
+                        assert_eq!(fs::read(path).unwrap(), sentinel);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn unsafe_directories_are_refused_without_chmod_or_truncation() {
+            for recorder_child in [false, true] {
+                for mode in [0o755, 0o770, 0o777] {
+                    if !recorder_child && mode == 0o755 {
+                        continue; // A read/search-only public data parent is supported below.
+                    }
+                    let (root, paths, sentinel) = fixture();
+                    let directory = if recorder_child {
+                        root.path().join(DIRECTORY)
+                    } else {
+                        root.path().to_path_buf()
+                    };
+                    fs::set_permissions(&directory, fs::Permissions::from_mode(mode)).unwrap();
+                    assert!(Storage::open(root.path()).is_err());
+                    assert_eq!(fs::metadata(&directory).unwrap().mode() & 0o7777, mode);
+                    for path in &paths {
+                        assert_eq!(fs::read(path).unwrap(), sentinel);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn symlink_directories_are_refused_without_touching_targets() {
+            let (root, paths, sentinel) = fixture();
+            let links = tempfile::tempdir().unwrap();
+            let parent_link = links.path().join("data");
+            symlink(root.path(), &parent_link).unwrap();
+            assert!(Storage::open(&parent_link).is_err());
+            let child_parent = tempfile::tempdir().unwrap();
+            symlink(
+                root.path().join(DIRECTORY),
+                child_parent.path().join(DIRECTORY),
+            )
+            .unwrap();
+            assert!(Storage::open(child_parent.path()).is_err());
+            for path in &paths {
+                assert_eq!(fs::read(path).unwrap(), sentinel);
+            }
+        }
+
+        #[test]
+        fn non_directory_and_missing_parent_are_refused() {
+            let root = tempfile::tempdir().unwrap();
+            let parent_file = root.path().join("file");
+            private_file(&parent_file, b"unchanged");
+            assert!(Storage::open(&parent_file).is_err());
+            assert_eq!(fs::read(&parent_file).unwrap(), b"unchanged");
+            let missing = root.path().join("missing");
+            assert!(Storage::open(&missing).is_err());
+            assert!(!missing.exists());
+            let child = root.path().join(DIRECTORY);
+            private_file(&child, b"unchanged child");
+            assert!(Storage::open(root.path()).is_err());
+            assert_eq!(fs::read(child).unwrap(), b"unchanged child");
+        }
+
+        #[test]
+        fn public_read_only_data_parent_gets_private_child_without_chmod() {
+            let root = tempfile::tempdir().unwrap();
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+            let parent_file = root.path().join(NAMES[0]);
+            private_file(&parent_file, b"not a recorder file");
+            drop(Storage::open(root.path()).unwrap());
+            assert_eq!(fs::metadata(root.path()).unwrap().mode() & 0o7777, 0o755);
+            assert_eq!(
+                fs::metadata(root.path().join(DIRECTORY)).unwrap().mode() & 0o7777,
+                0o700
+            );
+            assert_eq!(fs::read(parent_file).unwrap(), b"not a recorder file");
+            for name in NAMES {
+                assert_eq!(
+                    fs::metadata(root.path().join(DIRECTORY).join(name))
+                        .unwrap()
+                        .mode()
+                        & 0o7777,
+                    0o600
+                );
+            }
+        }
+
+        #[test]
+        fn foreign_owner_is_refused_with_chown_fixture_when_privileged() {
+            // SAFETY: geteuid has no arguments or memory safety preconditions.
+            let uid = unsafe { libc::geteuid() };
+            assert!(validate_owner(uid).is_ok());
+            assert!(validate_owner(uid.wrapping_add(1)).is_err());
+            if uid != 0 {
+                // Foreign-owned temporary fixtures require privilege; the UID
+                // predicate above is still exercised on unprivileged test hosts.
+                return;
+            }
+            for entry in 0..4 {
+                let (root, paths, sentinel) = fixture();
+                let child = root.path().join(DIRECTORY);
+                let path: &Path = match entry {
+                    0 | 1 => &paths[entry],
+                    2 => &child,
+                    _ => root.path(),
+                };
+                std::os::unix::fs::chown(path, Some(1), None).unwrap();
+                assert!(Storage::open(root.path()).is_err());
+                assert_eq!(fs::metadata(path).unwrap().uid(), 1);
+                for segment in &paths {
+                    assert_eq!(fs::read(segment).unwrap(), sentinel);
+                }
+            }
+        }
+
+        #[test]
+        fn oversized_segments_are_refused_without_reading_or_truncating() {
+            for slot in 0..2 {
+                for length in [SEGMENT_BYTES + 1, 1 << 40] {
+                    let (root, paths, sentinel) = fixture();
+                    let mut file = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&paths[slot])
+                        .unwrap();
+                    file.set_len(length).unwrap(); // Sparse fixture, not disk exhaustion.
+                    file.seek(SeekFrom::Start(length - 4)).unwrap();
+                    file.write_all(b"tail").unwrap();
+                    let inode = file.metadata().unwrap().ino();
+                    assert!(Storage::open(root.path()).is_err());
+                    assert_eq!(file.metadata().unwrap().len(), length);
+                    assert_eq!(file.metadata().unwrap().ino(), inode);
+                    file.seek(SeekFrom::Start(0)).unwrap();
+                    let mut head = vec![0; sentinel.len()];
+                    file.read_exact(&mut head).unwrap();
+                    assert_eq!(head, sentinel);
+                    file.seek(SeekFrom::Start(length - 4)).unwrap();
+                    let mut tail = [0; 4];
+                    file.read_exact(&mut tail).unwrap();
+                    assert_eq!(&tail, b"tail");
+                    assert_eq!(fs::read(&paths[1 - slot]).unwrap(), sentinel);
+                }
+            }
+        }
+
+        #[test]
+        fn rotation_reopen_after_truncate_partial_and_complete_first_frame() {
+            use std::fs::FileTimes;
+            use std::time::{Duration, SystemTime};
+
+            for cut in 0..3 {
+                let (root, paths, _) = fixture();
+                fs::write(&paths[0], frame(&record(100)).unwrap()).unwrap();
+                fs::write(&paths[1], frame(&record(1)).unwrap()).unwrap();
+                let (mut storage, mut sequence) = Storage::open(root.path()).unwrap();
+                let next_frame = loop {
+                    let bytes = frame(&record(sequence + 1)).unwrap();
+                    if storage.length + bytes.len() as u64 > SEGMENT_BYTES {
+                        break bytes;
+                    }
+                    storage.append(&bytes).unwrap();
+                    sequence += 1;
+                };
+                storage.sync().unwrap();
+                assert_eq!(storage.active, 0);
+                let intact = fs::read(&paths[0]).unwrap();
+                // Exact rotation crash cuts, before any reopen; no fault framework.
+                storage.files[1].set_len(0).unwrap();
+                storage.files[1].seek(SeekFrom::Start(0)).unwrap();
+                let written = match cut {
+                    0 => 0,
+                    1 => next_frame.len() / 2,
+                    _ => next_frame.len(),
+                };
+                storage.files[1].write_all(&next_frame[..written]).unwrap();
+                // Make mtime point to the WRONG active segment at each cut.
+                let older = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+                let newer = older + Duration::from_secs(10);
+                for (index, file) in storage.files.iter().enumerate() {
+                    let is_newer = index == usize::from(cut != 2);
+                    file.set_times(FileTimes::new().set_modified(if is_newer {
+                        newer
+                    } else {
+                        older
+                    }))
+                    .unwrap();
+                }
+                drop(storage);
+                let (mut reopened, recovered) = Storage::open(root.path()).unwrap();
+                let complete = cut == 2;
+                assert_eq!(recovered, sequence + u64::from(complete));
+                assert_eq!(reopened.active, usize::from(complete));
+                assert_eq!(fs::read(&paths[0]).unwrap(), intact);
+                assert_eq!(
+                    fs::read(&paths[1]).unwrap(),
+                    if complete { next_frame } else { Vec::new() }
+                );
+                reopened
+                    .append(&frame(&record(recovered + 1)).unwrap())
+                    .unwrap();
+                reopened.sync().unwrap();
+                assert_eq!(fs::read(&paths[0]).unwrap(), intact);
+                drop(reopened);
+                assert_eq!(Storage::open(root.path()).unwrap().1, recovered + 1);
+            }
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn reopen_rotation_and_byte_bounds() {
         let directory = tempfile::tempdir().unwrap();
@@ -602,7 +1009,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             for name in NAMES {
                 assert_eq!(
-                    std::fs::metadata(directory.path().join(name))
+                    std::fs::metadata(directory.path().join(DIRECTORY).join(name))
                         .unwrap()
                         .permissions()
                         .mode()

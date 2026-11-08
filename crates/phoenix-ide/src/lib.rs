@@ -31,6 +31,10 @@ mod reminder_delivery;
 mod reminder_service;
 mod resolution_root;
 mod resource_authority;
+#[allow(
+    dead_code,
+    reason = "temporary storage leaf; remove when packet2 wires the recorder"
+)]
 mod resource_flight_recorder;
 mod runtime;
 mod send_chat_service;
