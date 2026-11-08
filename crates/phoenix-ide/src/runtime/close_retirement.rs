@@ -6550,126 +6550,138 @@ fn mac_writer_scan(
 }
 
 #[cfg(target_os = "macos")]
-fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence, String> {
-    use std::ffi::CStr;
-    use std::mem::{size_of, MaybeUninit};
-    use std::os::unix::ffi::OsStrExt as _;
+#[repr(C)]
+struct MacProcFileInfo {
+    open_flags: u32,
+    status: u32,
+    offset: i64,
+    file_type: i32,
+    guard_flags: u32,
+}
 
-    #[repr(C)]
-    struct ProcFileInfo {
-        open_flags: u32,
-        status: u32,
-        offset: i64,
-        file_type: i32,
-        guard_flags: u32,
-    }
-    #[repr(C)]
-    struct VnodeFdInfoWithPath {
-        file: ProcFileInfo,
-        vnode: libc::vnode_info_path,
-    }
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct MacVnodeFdInfoWithPath {
+    file: MacProcFileInfo,
+    vnode: libc::vnode_info_path,
+}
+
+#[cfg(target_os = "macos")]
+fn mac_vnode_fd_info(pid: libc::pid_t, fd: i32) -> Result<MacVnodeFdInfoWithPath, CloseWriterGap> {
+    use std::mem::{size_of, MaybeUninit};
 
     const PROC_PIDFDVNODEPATHINFO: i32 = 2;
-    let read_info = |pid, fd| {
-        let mut output = MaybeUninit::<VnodeFdInfoWithPath>::zeroed();
-        let length = i32::try_from(size_of::<VnodeFdInfoWithPath>()).expect("vnode info fits i32");
-        // SAFETY: output is valid writable storage of the requested C structure size.
-        let bytes = unsafe {
-            libc::proc_pidfdinfo(
+    let mut output = MaybeUninit::<MacVnodeFdInfoWithPath>::zeroed();
+    let length = i32::try_from(size_of::<MacVnodeFdInfoWithPath>()).expect("vnode info fits i32");
+    // SAFETY: output is valid writable storage of the requested C structure size.
+    let bytes = unsafe {
+        libc::proc_pidfdinfo(
+            pid,
+            fd,
+            PROC_PIDFDVNODEPATHINFO,
+            output.as_mut_ptr().cast(),
+            length,
+        )
+    };
+    if bytes != length {
+        return Err(CloseWriterGap::DescriptorChanged);
+    }
+    // SAFETY: the complete structure was initialized by the successful call.
+    Ok(unsafe { output.assume_init() })
+}
+
+#[cfg(target_os = "macos")]
+fn mac_vnode_descriptors(pid: libc::pid_t) -> Result<Vec<libc::proc_fdinfo>, CloseWriterGap> {
+    use std::mem::size_of;
+
+    let mut descriptor_capacity = 256_usize;
+    loop {
+        let mut descriptors = vec![
+            libc::proc_fdinfo {
+                proc_fd: 0,
+                proc_fdtype: 0
+            };
+            descriptor_capacity
+        ];
+        let capacity_bytes = descriptors.len() * size_of::<libc::proc_fdinfo>();
+        let capacity_bytes_i32 =
+            i32::try_from(capacity_bytes).map_err(|_| CloseWriterGap::Unavailable)?;
+        // SAFETY: the vector provides writable storage for exactly the byte count passed.
+        let descriptor_bytes = unsafe {
+            libc::proc_pidinfo(
                 pid,
-                fd,
-                PROC_PIDFDVNODEPATHINFO,
-                output.as_mut_ptr().cast(),
-                length,
+                libc::PROC_PIDLISTFDS,
+                0,
+                descriptors.as_mut_ptr().cast(),
+                capacity_bytes_i32,
             )
         };
-        if bytes != length {
+        if descriptor_bytes <= 0 {
+            return Err(CloseWriterGap::Unavailable);
+        }
+        let descriptor_bytes =
+            usize::try_from(descriptor_bytes).expect("positive descriptor byte count");
+        if descriptor_bytes % size_of::<libc::proc_fdinfo>() != 0 {
+            return Err(CloseWriterGap::Malformed);
+        }
+        if !descriptor_inventory_may_be_truncated(descriptor_bytes, capacity_bytes) {
+            descriptors.truncate(descriptor_bytes / size_of::<libc::proc_fdinfo>());
+            descriptors
+                .retain(|descriptor| descriptor.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32);
+            return Ok(descriptors);
+        }
+        descriptor_capacity = descriptor_capacity
+            .checked_mul(2)
+            .filter(|capacity| *capacity <= 1_048_576)
+            .ok_or(CloseWriterGap::Unavailable)?;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_inspect_open_descriptors(
+    pid: libc::pid_t,
+    canonical: &Path,
+) -> Result<Option<(PathBuf, CloseWriterAuthority)>, CloseWriterGap> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    for descriptor in mac_vnode_descriptors(pid)? {
+        let info = mac_vnode_fd_info(pid, descriptor.proc_fd)?;
+        let path_bytes = info.vnode.vip_path.as_flattened();
+        // SAFETY: path_bytes points to the initialized kernel path buffer; bounded below.
+        let path_bytes = unsafe {
+            std::slice::from_raw_parts(path_bytes.as_ptr().cast::<u8>(), path_bytes.len())
+        };
+        let candidate =
+            CStr::from_bytes_until_nul(path_bytes).map_err(|_| CloseWriterGap::Malformed)?;
+        let candidate = PathBuf::from(std::ffi::OsStr::from_bytes(candidate.to_bytes()));
+        if !path_is_within(&candidate, canonical) {
+            continue;
+        }
+        let repeated = mac_vnode_fd_info(pid, descriptor.proc_fd)?;
+        if info.file.open_flags != repeated.file.open_flags
+            || info.vnode.vip_vi.vi_stat.vst_dev != repeated.vnode.vip_vi.vi_stat.vst_dev
+            || info.vnode.vip_vi.vi_stat.vst_ino != repeated.vnode.vip_vi.vi_stat.vst_ino
+            || info.vnode.vip_vi.vi_stat.vst_mode != repeated.vnode.vip_vi.vi_stat.vst_mode
+            || info.vnode.vip_path != repeated.vnode.vip_path
+        {
             return Err(CloseWriterGap::DescriptorChanged);
         }
-        // SAFETY: the complete structure was initialized by the successful call.
-        Ok(unsafe { output.assume_init() })
-    };
+        if let Some(authority) =
+            mac_descriptor_authority(info.vnode.vip_vi.vi_stat.vst_mode, info.file.open_flags)?
+        {
+            return Ok(Some((candidate, authority)));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
+fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence, String> {
     mac_writer_scan(
         path,
         CloseWriterDetector::MacDescriptor,
-        |pid, canonical| {
-            let mut descriptor_capacity = 256_usize;
-            let descriptors = loop {
-                let mut descriptors = vec![
-                    libc::proc_fdinfo {
-                        proc_fd: 0,
-                        proc_fdtype: 0
-                    };
-                    descriptor_capacity
-                ];
-                let capacity_bytes = descriptors.len() * size_of::<libc::proc_fdinfo>();
-                let Ok(capacity_bytes_i32) = i32::try_from(capacity_bytes) else {
-                    return Err(CloseWriterGap::Unavailable);
-                };
-                // SAFETY: the vector provides writable storage for exactly the byte count passed.
-                let descriptor_bytes = unsafe {
-                    libc::proc_pidinfo(
-                        pid,
-                        libc::PROC_PIDLISTFDS,
-                        0,
-                        descriptors.as_mut_ptr().cast(),
-                        capacity_bytes_i32,
-                    )
-                };
-                if descriptor_bytes <= 0 {
-                    return Err(CloseWriterGap::Unavailable);
-                }
-                let descriptor_bytes =
-                    usize::try_from(descriptor_bytes).expect("positive descriptor byte count");
-                if descriptor_bytes % size_of::<libc::proc_fdinfo>() != 0 {
-                    return Err(CloseWriterGap::Malformed);
-                }
-                if !descriptor_inventory_may_be_truncated(descriptor_bytes, capacity_bytes) {
-                    descriptors.truncate(descriptor_bytes / size_of::<libc::proc_fdinfo>());
-                    break descriptors;
-                }
-                let Some(next_capacity) = descriptor_capacity.checked_mul(2) else {
-                    return Err(CloseWriterGap::Unavailable);
-                };
-                if next_capacity > 1_048_576 {
-                    return Err(CloseWriterGap::Unavailable);
-                }
-                descriptor_capacity = next_capacity;
-            };
-            for descriptor in descriptors
-                .into_iter()
-                .filter(|descriptor| descriptor.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32)
-            {
-                let info = read_info(pid, descriptor.proc_fd)?;
-                let path_bytes = info.vnode.vip_path.as_flattened();
-                // SAFETY: path_bytes points to the initialized kernel path buffer; bounded below.
-                let path_bytes = unsafe {
-                    std::slice::from_raw_parts(path_bytes.as_ptr().cast::<u8>(), path_bytes.len())
-                };
-                let candidate = CStr::from_bytes_until_nul(path_bytes)
-                    .map_err(|_| CloseWriterGap::Malformed)?;
-                let candidate = PathBuf::from(std::ffi::OsStr::from_bytes(candidate.to_bytes()));
-                if !path_is_within(&candidate, canonical) {
-                    continue;
-                }
-                let repeated = read_info(pid, descriptor.proc_fd)?;
-                if info.file.open_flags != repeated.file.open_flags
-                    || info.vnode.vip_vi.vi_stat.vst_dev != repeated.vnode.vip_vi.vi_stat.vst_dev
-                    || info.vnode.vip_vi.vi_stat.vst_ino != repeated.vnode.vip_vi.vi_stat.vst_ino
-                    || info.vnode.vip_vi.vi_stat.vst_mode != repeated.vnode.vip_vi.vi_stat.vst_mode
-                    || info.vnode.vip_path != repeated.vnode.vip_path
-                {
-                    return Err(CloseWriterGap::DescriptorChanged);
-                }
-                if let Some(authority) = mac_descriptor_authority(
-                    info.vnode.vip_vi.vi_stat.vst_mode,
-                    info.file.open_flags,
-                )? {
-                    return Ok(Some((candidate, authority)));
-                }
-            }
-            Ok(None)
-        },
+        mac_inspect_open_descriptors,
     )
 }
 
