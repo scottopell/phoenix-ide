@@ -127,6 +127,18 @@ async fn next_attempt(handle: &Handle) -> bool {
     !stopped(handle)
 }
 
+fn host_bytes(
+    host: &crate::api::deployment::HostResources,
+    swap: [Option<u64>; 2],
+) -> [Option<u64>; 4] {
+    [
+        host.total_memory_bytes,
+        host.available_memory_bytes,
+        swap[0],
+        swap[1],
+    ]
+}
+
 pub(crate) fn spawn_sampler(state: AppState, handle: Handle) {
     tokio::spawn(async move {
         while next_attempt(&handle).await {
@@ -140,12 +152,7 @@ pub(crate) fn spawn_sampler(state: AppState, handle: Handle) {
             sample.managed_proportional_bytes = summary.managed_total.memory_bytes;
             sample.managed_pid_count =
                 Some(u64::from(summary.managed_total.deduplicated_pid_count));
-            sample.host_bytes = [
-                generation.host.total_memory_bytes,
-                generation.host.available_memory_bytes,
-                generation.host_swap[0],
-                generation.host_swap[1],
-            ];
+            sample.host_bytes = host_bytes(&generation.host, generation.host_swap);
             sample.disk_available_bytes =
                 crate::api::deployment_observations::recorder_space(&state.runtime_env).await;
             sample.disk_unix_ms = unix_ms();
@@ -213,6 +220,33 @@ mod tests {
                     .find("open_database_with_migrations(&runtime_env).await?")
                     .unwrap()
         );
+    }
+
+    #[test]
+    fn host_projection_records_exhausted_memory_as_zero_not_unavailable() {
+        let mut host = crate::api::deployment::HostResources {
+            logical_cpu_count: None,
+            cpu_busy_percent: None,
+            cpu_system_percent: None,
+            cpu_idle_percent: None,
+            total_memory_bytes: Some(100),
+            available_memory_bytes: Some(0),
+            used_memory_bytes: Some(100),
+            load_average_one: None,
+            load_average_five: None,
+            load_average_fifteen: None,
+        };
+        let mut sample = unavailable(Phase::Running);
+        sample.host_bytes = host_bytes(&host, [None; 2]);
+        let value = serde_json::to_value(&sample).unwrap();
+        assert_eq!(value["b"], serde_json::json!([100, 0, null, null]));
+
+        host.total_memory_bytes = None;
+        host.available_memory_bytes = None;
+        host.used_memory_bytes = None;
+        sample.host_bytes = host_bytes(&host, [None; 2]);
+        let value = serde_json::to_value(&sample).unwrap();
+        assert_eq!(value["b"], serde_json::json!([null, null, null, null]));
     }
 
     #[test]

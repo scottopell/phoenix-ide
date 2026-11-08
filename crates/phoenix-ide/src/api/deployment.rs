@@ -1654,6 +1654,23 @@ fn totals_from_rows(processes: &[ManagedProcessRow]) -> ManagedResourceTotals {
     }
 }
 
+fn host_memory_bytes(supported: bool, total: u64, available: u64) -> [Option<u64>; 3] {
+    // sysinfo's zero total also encodes a failed native read on a fresh System.
+    if !supported || total == 0 {
+        tracing::debug!(
+            metric = "host_memory",
+            "resource metric unavailable or ambiguous"
+        );
+        [None; 3]
+    } else {
+        [
+            Some(total),
+            Some(available),
+            Some(total.saturating_sub(available)),
+        ]
+    }
+}
+
 fn host_swap_bytes(supported: bool, total: u64, used: u64) -> [Option<u64>; 2] {
     // sysinfo's zero total also encodes a failed native read on a fresh System.
     if !supported || total == 0 || used > total {
@@ -1674,13 +1691,11 @@ pub(crate) async fn sample_host_resources() -> (HostResources, [Option<u64>; 2])
     let mut sys = System::new();
     sys.refresh_memory();
 
-    let total_memory_bytes =
-        (sysinfo::IS_SUPPORTED_SYSTEM && sys.total_memory() != 0).then(|| sys.total_memory());
-    let available_memory_bytes = (sysinfo::IS_SUPPORTED_SYSTEM && sys.available_memory() != 0)
-        .then(|| sys.available_memory());
-    let used_memory_bytes = total_memory_bytes
-        .zip(available_memory_bytes)
-        .map(|(t, a)| t.saturating_sub(a));
+    let [total_memory_bytes, available_memory_bytes, used_memory_bytes] = host_memory_bytes(
+        sysinfo::IS_SUPPORTED_SYSTEM,
+        sys.total_memory(),
+        sys.available_memory(),
+    );
     let load = System::load_average();
     let swap = host_swap_bytes(
         sysinfo::IS_SUPPORTED_SYSTEM,
@@ -2364,6 +2379,25 @@ mod tests {
         assert_eq!(incomplete.memory_bytes, None);
         assert_eq!(incomplete.process_count, 2);
         assert_eq!(incomplete.deduplicated_pid_count, 2);
+    }
+
+    #[test]
+    fn host_memory_preserves_zero_available_as_full_usage() {
+        assert_eq!(
+            host_memory_bytes(true, 100, 0),
+            [Some(100), Some(0), Some(100)]
+        );
+        assert_eq!(
+            host_memory_bytes(true, 100, 25),
+            [Some(100), Some(25), Some(75)]
+        );
+    }
+
+    #[test]
+    fn host_memory_keeps_unsupported_and_ambiguous_zero_total_unavailable() {
+        assert_eq!(host_memory_bytes(false, 100, 0), [None; 3]);
+        assert_eq!(host_memory_bytes(false, 100, 25), [None; 3]);
+        assert_eq!(host_memory_bytes(true, 0, 0), [None; 3]);
     }
 
     #[test]
