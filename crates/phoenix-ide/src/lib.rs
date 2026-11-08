@@ -1960,6 +1960,20 @@ mod reconcile_worktrees_tests {
         assert!(status.success(), "git worktree add failed");
     }
 
+    fn branch_exists(repo_root: &std::path::Path, branch: &str) -> bool {
+        phoenix_core::git::command()
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ])
+            .current_dir(repo_root)
+            .status()
+            .unwrap()
+            .success()
+    }
+
     async fn set_state(db: &db::Database, id: &str, state: &ConvState) {
         db.update_conversation_state(id, state).await.unwrap();
     }
