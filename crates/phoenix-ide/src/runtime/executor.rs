@@ -3458,17 +3458,13 @@ where
         Box::pin(self.process_event_with_authority(event, authority)).await
     }
 
-    /// Broadcast `ConversationBecameTerminal` to all SSE subscribers, clean up
-    /// any lingering worktree, and retire this conversation's still-pending fork
-    /// proposals (REQ-PROJ-035).
+    /// Broadcast `ConversationBecameTerminal` and retire this conversation's
+    /// still-pending fork proposals (REQ-PROJ-035).
     ///
     /// Send errors (no active receivers) are intentionally ignored.
     async fn emit_terminal_lifecycle_event(&self) {
         emit_terminal_lifecycle_event(
             &self.context.conversation_id,
-            self.context.is_sub_agent,
-            &self.state,
-            self.context.work_scope_worktree.as_deref(),
             self.fork_cmd_tx.as_ref(),
             &self.broadcast_tx,
         )
@@ -14821,31 +14817,17 @@ fn llm_error_to_outcome(
 
 pub(crate) async fn complete_terminal_lifecycle_without_broadcast(
     conversation_id: &str,
-    is_sub_agent: bool,
-    state: &ConvState,
-    worktree_path: Option<&std::path::Path>,
     fork_cmd_tx: Option<&mpsc::Sender<super::fork_resolve::ForkCommand>>,
 ) {
-    cleanup_worktree_if_present(conversation_id, is_sub_agent, state, worktree_path);
     retire_fork_proposals_on_terminal(conversation_id, fork_cmd_tx).await;
 }
 
 pub(crate) async fn emit_terminal_lifecycle_event(
     conversation_id: &str,
-    is_sub_agent: bool,
-    state: &ConvState,
-    worktree_path: Option<&std::path::Path>,
     fork_cmd_tx: Option<&mpsc::Sender<super::fork_resolve::ForkCommand>>,
     broadcast_tx: &SseBroadcaster,
 ) {
-    complete_terminal_lifecycle_without_broadcast(
-        conversation_id,
-        is_sub_agent,
-        state,
-        worktree_path,
-        fork_cmd_tx,
-    )
-    .await;
+    complete_terminal_lifecycle_without_broadcast(conversation_id, fork_cmd_tx).await;
     let _ = broadcast_tx.send_seq(|seq| SseEvent::ConversationBecameTerminal { sequence_id: seq });
 }
 
@@ -14872,57 +14854,6 @@ async fn retire_fork_proposals_on_terminal(
         return;
     }
     let _ = reply_rx.await;
-}
-
-fn cleanup_worktree_if_present(
-    conversation_id: &str,
-    is_sub_agent: bool,
-    state: &ConvState,
-    worktree_path: Option<&std::path::Path>,
-) {
-    if is_sub_agent {
-        return;
-    }
-
-    if matches!(
-        state,
-        ConvState::ContextExhausted { .. } | ConvState::HandedOff { .. }
-    ) {
-        tracing::debug!(
-            conv_id = %conversation_id,
-            "skipping terminal worktree cleanup for preserved/transferred scope"
-        );
-        return;
-    }
-
-    let Some(worktree_path) = worktree_path else {
-        return;
-    };
-    if !worktree_path.exists() {
-        return;
-    }
-    let Some(repo_root) = crate::git_ops::repo_root_from_phoenix_worktree(worktree_path) else {
-        tracing::warn!(
-            conv_id = %conversation_id,
-            worktree = %worktree_path.display(),
-            "refusing terminal worktree cleanup for non-Phoenix WorkScope path"
-        );
-        return;
-    };
-
-    let worktree_str = worktree_path.to_string_lossy().into_owned();
-    tracing::info!(worktree = %worktree_str, "Cleaning up worktree on terminal");
-    if let Err(error) = crate::git_ops::run_git(
-        &repo_root,
-        &["worktree", "remove", &worktree_str, "--force"],
-    ) {
-        tracing::warn!(
-            conv_id = %conversation_id,
-            worktree = %worktree_str,
-            %error,
-            "terminal worktree cleanup failed; worktree may remain on disk"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -20864,6 +20795,15 @@ mod context_exhausted_preserves_worktree_tests {
     use std::time::Duration;
     use tokio::sync::{broadcast, mpsc};
 
+    fn run_git(cwd: impl AsRef<Path>, args: &[&str]) {
+        let status = phoenix_core::git::command()
+            .args(args)
+            .current_dir(cwd)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
     #[allow(clippy::type_complexity)]
     fn build_runtime(
         storage: Arc<InMemoryStorage>,
@@ -21020,19 +20960,8 @@ mod context_exhausted_preserves_worktree_tests {
         assert!(wait_for_context_exhausted_broadcast(&mut rx, Duration::from_secs(1)).await);
     }
 
-    /// REQ-BED-031 regression: the executor's terminal-exit lifecycle hook
-    /// (`emit_terminal_lifecycle_event` → `cleanup_worktree_if_present`) must
-    /// NOT remove the worktree when the terminal state is `ContextExhausted`.
-    ///
-    /// The `Effect::NotifyContextExhausted` tests above only exercise the
-    /// effect dispatcher; they do not drive the executor-loop exit path
-    /// where `cleanup_worktree_if_present` is called. The original Phase 3
-    /// commit (e82c1db) removed `cleanup_context_exhausted_worktree` but
-    /// missed this sibling cleanup added in 4a94509 for Explore-mode leaks.
-    /// As a result, every Work/Branch conversation that hit
-    /// `ContextExhausted` had its worktree force-removed on executor exit,
-    /// breaking the continuation handoff because the child inherits the
-    /// parent's now-missing `worktree_path`.
+    /// REQ-BED-031 regression: context exhaustion preserves the worktree for
+    /// continuation transfer.
     #[tokio::test]
     async fn terminal_exit_preserves_worktree_when_context_exhausted() {
         let (_tmp, repo_root) = init_repo();
@@ -21075,12 +21004,53 @@ mod context_exhausted_preserves_worktree_tests {
     }
 
     #[tokio::test]
-    async fn terminal_exit_cleans_inherited_worktree_scope_path() {
+    async fn terminal_exit_preserves_clean_worktree() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "terminal-clean";
+        let branch = "clean-work-branch";
+        let wt_path = add_worktree(&repo_root, conv_id, branch);
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let (rt, _rx) = build_runtime_with_state(
+            storage,
+            conv_id,
+            PathBuf::from(&wt_path),
+            ConvState::Terminal,
+        );
+
+        rt.emit_terminal_lifecycle_event().await;
+
+        assert!(Path::new(&wt_path).exists());
+        assert!(branch_exists(&repo_root, branch));
+    }
+
+    #[tokio::test]
+    async fn terminal_exit_preserves_inherited_worktree_and_unique_material() {
         let (_tmp, repo_root) = init_repo();
         let owner_id = "original-owner";
         let leaf_id = "continued-leaf";
         let branch = "continued-work-branch";
         let wt_path = add_worktree(&repo_root, owner_id, branch);
+        let tracked_path = Path::new(&wt_path).join("tracked.txt");
+        let untracked_path = Path::new(&wt_path).join("unique-untracked.txt");
+        std::fs::write(&tracked_path, "baseline owner work\n").unwrap();
+        run_git(&wt_path, &["add", "tracked.txt"]);
+        run_git(
+            &wt_path,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "track preservation fixture",
+            ],
+        );
+        std::fs::write(&tracked_path, "dirty material\n").unwrap();
+        std::fs::write(&untracked_path, "unique material\n").unwrap();
 
         let storage = Arc::new(InMemoryStorage::new());
         let (rt, _rx) = build_runtime_with_state(
@@ -21092,11 +21062,41 @@ mod context_exhausted_preserves_worktree_tests {
 
         rt.emit_terminal_lifecycle_event().await;
 
-        assert!(
-            !Path::new(&wt_path).exists(),
-            "terminal cleanup must remove the inherited WorkScope path rather than \
-             deriving a nonexistent path from the continuation id"
+        assert_eq!(
+            std::fs::read_to_string(tracked_path).unwrap(),
+            "dirty material\n"
         );
+        assert_eq!(
+            std::fs::read_to_string(untracked_path).unwrap(),
+            "unique material\n"
+        );
+        assert!(branch_exists(&repo_root, branch));
+    }
+
+    #[tokio::test]
+    async fn terminal_exit_preserves_nested_descendant_path() {
+        let (_tmp, repo_root) = init_repo();
+        let owner_id = "nested-owner";
+        let leaf_id = "nested-continuation";
+        let branch = "nested-work-branch";
+        let wt_path = add_worktree(&repo_root, owner_id, branch);
+        let nested_path = Path::new(&wt_path).join("nested/source");
+        std::fs::create_dir_all(&nested_path).unwrap();
+        let unique_path = nested_path.join("unique.txt");
+        std::fs::write(&unique_path, "nested unique material\n").unwrap();
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let (rt, _rx) =
+            build_runtime_with_state(storage, leaf_id, nested_path, ConvState::Terminal);
+
+        rt.emit_terminal_lifecycle_event().await;
+
+        assert_eq!(
+            std::fs::read_to_string(unique_path).unwrap(),
+            "nested unique material\n"
+        );
+        assert!(Path::new(&wt_path).exists());
+        assert!(branch_exists(&repo_root, branch));
     }
 
     #[tokio::test]

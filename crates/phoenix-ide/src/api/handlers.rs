@@ -7156,8 +7156,7 @@ pub(crate) async fn run_runtime_resource_cleanup_cascade(
 ///      registry entry.
 ///   4. `cascade_projects_on_delete` — worktree/branch removal for
 ///      Work / Branch / Explore-with-worktree conversations. Direct mode
-///      and conversations whose worktree was already cleaned at terminal
-///      transition: no-op.
+///      is a no-op.
 ///   5. `db.delete_conversation` — `SQLite` ON DELETE CASCADE removes
 ///      messages, tool calls, and other dependent rows. This is the only
 ///      step whose failure is surfaced to the user as a 5xx; the
@@ -7541,16 +7540,9 @@ struct CascadeProjectsReport {
 ///   - `ConvMode::Direct` — no worktree was ever created.
 ///   - `ConvMode::Explore { worktree_path: None }` — sub-agent Explore;
 ///     no worktree of its own (REQ-PROJ-008 sub-agents share the parent's).
-///   - Already-terminal Work/Branch conversations — abandon /
-///     mark-merged already removed the worktree at terminal transition.
-///     We still attempt removal (it's idempotent) so a partial-failure
-///     prior abandon gets a second chance.
 ///
-/// Explore-with-worktree (top-level managed): the worktree is normally torn
-/// down on terminal-state transition (`cleanup_worktree_if_present`). Hard-
-/// delete short-circuits that path — the row is removed before the executor
-/// reaches Terminal — so this cascade must remove the worktree itself, plus
-/// the temporary `task-pending-{id_prefix}` branch that
+/// Explore-with-worktree (top-level managed): this delete cascade removes the
+/// worktree plus the temporary `task-pending-{id_prefix}` branch that
 /// `create_managed_explore_worktree_blocking` created (REQ-PROJ-028). The
 /// branch was never promoted to a real task branch; it would otherwise
 /// linger as a dangling ref.

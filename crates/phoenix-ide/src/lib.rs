@@ -1449,10 +1449,7 @@ fn verify_registered_phoenix_worktree(
 /// Reclaim a clean Phoenix worktree whose persisted scope has no owner.
 /// Dirty or unreadable worktrees are retained so startup recovery cannot erase
 /// uncommitted evidence.
-fn reclaim_unowned_worktree(
-    worktree_path: &std::path::Path,
-    branch_to_delete: Option<&str>,
-) -> Result<bool, String> {
+fn reclaim_unowned_worktree(worktree_path: &std::path::Path) -> Result<bool, String> {
     let Some(repo_root) = crate::git_ops::repo_root_from_phoenix_worktree(worktree_path) else {
         return Err("path is not a canonical Phoenix worktree".to_string());
     };
@@ -1523,13 +1520,6 @@ fn reclaim_unowned_worktree(
     crate::git_ops::run_git(&repo_root, &["worktree", "remove", &path, "--force"])
         .map_err(|error| format!("git worktree remove refused: {error}"))?;
 
-    if let Some(branch) = branch_to_delete {
-        if crate::git_ops::find_branch_in_worktree_list(&repo_root, branch).is_none() {
-            if let Err(error) = crate::git_ops::run_git(&repo_root, &["branch", "-D", branch]) {
-                tracing::debug!(%error, branch, "startup worktree reconciliation: branch delete failed");
-            }
-        }
-    }
     Ok(true)
 }
 
@@ -1597,7 +1587,7 @@ where
         };
         let mut retained = false;
         for owner in &owners {
-            match crate::runtime::conversation_retains_work_scope(db, owner).await {
+            match crate::runtime::conversation_retains_work_scope_for_reclamation(db, owner).await {
                 Ok(true) => {
                     retained = true;
                     break;
@@ -1617,16 +1607,9 @@ where
         if !worktree.exists() {
             continue;
         }
-        let branch = if owners.is_empty() {
-            None
-        } else {
-            crate::runtime::cleanup_branch_for_unretained_work_scope(&worktree, &owners)
-        };
         let worktree_for_cleanup = worktree.clone();
-        match tokio::task::spawn_blocking(move || {
-            reclaim_unowned_worktree(&worktree_for_cleanup, branch.as_deref())
-        })
-        .await
+        match tokio::task::spawn_blocking(move || reclaim_unowned_worktree(&worktree_for_cleanup))
+            .await
         {
             Ok(Ok(true)) => {
                 reclaimed += 1;
@@ -1977,6 +1960,20 @@ mod reconcile_worktrees_tests {
         assert!(status.success(), "git worktree add failed");
     }
 
+    fn branch_exists(repo_root: &std::path::Path, branch: &str) -> bool {
+        phoenix_core::git::command()
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ])
+            .current_dir(repo_root)
+            .status()
+            .unwrap()
+            .success()
+    }
+
     async fn set_state(db: &db::Database, id: &str, state: &ConvState) {
         db.update_conversation_state(id, state).await.unwrap();
     }
@@ -2048,6 +2045,19 @@ mod reconcile_worktrees_tests {
         .await
         .unwrap();
         tx.commit().await.unwrap();
+    }
+
+    async fn move_product_conversation_to_history(db: &db::Database, conversation_id: &str) {
+        let conversation = db.get_conversation(conversation_id).await.unwrap();
+        sqlx::query(
+            "UPDATE product_conversations
+             SET ordinary_lifecycle = 'history'
+             WHERE id = ?1",
+        )
+        .bind(conversation.product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
     }
 
     /// Case (a): parent reached `ContextExhausted`. Worktree directory is
@@ -2234,7 +2244,74 @@ mod reconcile_worktrees_tests {
     }
 
     #[tokio::test]
-    async fn reclaims_clean_scope_after_handoff_chain_terminates() {
+    async fn preserves_clean_terminal_scope_while_product_conversation_is_open() {
+        let (_git_tmp, repo_root) = init_repo();
+        let db = fresh_db().await;
+        let project = db
+            .find_or_create_project(repo_root.to_str().unwrap())
+            .await
+            .unwrap();
+        let (wt_path, mode) = work_mode_at(&repo_root, "open-terminal", "task-open-terminal");
+        add_worktree(&repo_root, &wt_path, "task-open-terminal");
+        seed_work_conv(
+            &db,
+            "open-terminal",
+            "open-terminal",
+            &wt_path,
+            &mode,
+            &project.id,
+        )
+        .await;
+        set_state(&db, "open-terminal", &ConvState::Terminal).await;
+
+        reconcile_worktrees(&db).await;
+
+        assert!(std::path::Path::new(&wt_path).exists());
+        assert!(
+            crate::git_ops::find_branch_in_worktree_list(&repo_root, "task-open-terminal")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn preserves_history_scope_while_close_recovery_remains_active() {
+        let (_git_tmp, repo_root) = init_repo();
+        let db = fresh_db().await;
+        let project = db
+            .find_or_create_project(repo_root.to_str().unwrap())
+            .await
+            .unwrap();
+        let (wt_path, mode) = work_mode_at(&repo_root, "close-recovery", "task-close-recovery");
+        add_worktree(&repo_root, &wt_path, "task-close-recovery");
+        seed_work_conv(
+            &db,
+            "close-recovery",
+            "close-recovery",
+            &wt_path,
+            &mode,
+            &project.id,
+        )
+        .await;
+        set_state(&db, "close-recovery", &ConvState::Terminal).await;
+        let conversation = db.get_conversation("close-recovery").await.unwrap();
+        db.begin_close_foundation(
+            &conversation.product_conversation_id,
+            &phoenix_core::domain::close::TranscriptConversationId::parse("close-recovery")
+                .unwrap(),
+            "startup-close-recovery",
+        )
+        .await
+        .unwrap();
+        move_product_conversation_to_history(&db, "close-recovery").await;
+
+        reconcile_worktrees(&db).await;
+
+        assert!(std::path::Path::new(&wt_path).exists());
+        assert!(branch_exists(&repo_root, "task-close-recovery"));
+    }
+
+    #[tokio::test]
+    async fn reclaims_clean_history_scope_after_handoff_chain_terminates() {
         let (_git_tmp, repo_root) = init_repo();
         let db = fresh_db().await;
         let project = db
@@ -2254,23 +2331,21 @@ mod reconcile_worktrees_tests {
             },
         )
         .await;
-        set_state(&db, "leaf", &ConvState::Terminal).await;
         wire_continuation(&db, "owner", "leaf").await;
+        set_state(&db, "leaf", &ConvState::Terminal).await;
+        move_product_conversation_to_history(&db, "leaf").await;
 
         reconcile_worktrees(&db).await;
 
         assert!(!std::path::Path::new(&wt_path).exists());
-        assert!(
-            crate::git_ops::find_branch_in_worktree_list(&repo_root, "task-clean-reclaim")
-                .is_none()
-        );
+        assert!(branch_exists(&repo_root, "task-clean-reclaim"));
 
         reconcile_worktrees(&db).await;
         assert!(!std::path::Path::new(&wt_path).exists());
     }
 
     #[tokio::test]
-    async fn explore_continuation_reclaims_original_owner_temp_branch() {
+    async fn explore_history_continuation_reclaims_worktree_but_preserves_branch() {
         let (_git_tmp, repo_root) = init_repo();
         let db = fresh_db().await;
         let project = db
@@ -2300,8 +2375,9 @@ mod reconcile_worktrees_tests {
             },
         )
         .await;
-        set_state(&db, leaf_id, &ConvState::Terminal).await;
         wire_continuation(&db, owner_id, leaf_id).await;
+        set_state(&db, leaf_id, &ConvState::Terminal).await;
+        move_product_conversation_to_history(&db, leaf_id).await;
 
         reconcile_worktrees(&db).await;
 
@@ -2318,8 +2394,8 @@ mod reconcile_worktrees_tests {
             .unwrap()
             .success();
         assert!(
-            !branch_exists,
-            "the original owner's temp branch must be deleted"
+            branch_exists,
+            "startup reclamation must preserve the original owner's branch"
         );
     }
 
@@ -2373,7 +2449,7 @@ mod reconcile_worktrees_tests {
         std::fs::create_dir_all(link.parent().unwrap()).unwrap();
         symlink(external_root, &link).unwrap();
 
-        let result = reclaim_unowned_worktree(&link, None);
+        let result = reclaim_unowned_worktree(&link);
 
         assert!(result.is_err());
         assert_eq!(
@@ -2445,7 +2521,7 @@ mod reconcile_worktrees_tests {
     }
 
     #[tokio::test]
-    async fn reclaims_unowned_scope_with_ignored_build_artifacts() {
+    async fn reclaims_history_scope_with_ignored_build_artifacts() {
         let (_git_tmp, repo_root) = init_repo();
         let db = fresh_db().await;
         let project = db
@@ -2487,6 +2563,7 @@ mod reconcile_worktrees_tests {
         .unwrap();
         seed_work_conv(&db, "ignored", "ignored", &wt_path, &mode, &project.id).await;
         set_state(&db, "ignored", &ConvState::Terminal).await;
+        move_product_conversation_to_history(&db, "ignored").await;
 
         reconcile_worktrees(&db).await;
 
@@ -2539,6 +2616,7 @@ mod reconcile_worktrees_tests {
         )
         .await;
         set_state(&db, "ignored-user", &ConvState::Terminal).await;
+        move_product_conversation_to_history(&db, "ignored-user").await;
 
         reconcile_worktrees(&db).await;
 
@@ -2550,7 +2628,7 @@ mod reconcile_worktrees_tests {
     }
 
     #[tokio::test]
-    async fn reclaims_unowned_scope_with_clean_initialized_submodule() {
+    async fn reclaims_history_scope_with_clean_initialized_submodule() {
         let (_git_tmp, repo_root) = init_repo();
         let submodule_tmp = tempfile::tempdir().unwrap();
         let submodule_root = submodule_tmp.path();
@@ -2629,6 +2707,7 @@ mod reconcile_worktrees_tests {
         );
         seed_work_conv(&db, "clean-sub", "clean-sub", &wt_path, &mode, &project.id).await;
         set_state(&db, "clean-sub", &ConvState::Terminal).await;
+        move_product_conversation_to_history(&db, "clean-sub").await;
 
         reconcile_worktrees(&db).await;
 
@@ -2715,6 +2794,7 @@ mod reconcile_worktrees_tests {
         )
         .await;
         set_state(&db, "uninit-sub", &ConvState::Terminal).await;
+        move_product_conversation_to_history(&db, "uninit-sub").await;
 
         reconcile_worktrees(&db).await;
 
@@ -2810,6 +2890,7 @@ mod reconcile_worktrees_tests {
         .unwrap();
         seed_work_conv(&db, "dirty-sub", "dirty-sub", &wt_path, &mode, &project.id).await;
         set_state(&db, "dirty-sub", &ConvState::Terminal).await;
+        move_product_conversation_to_history(&db, "dirty-sub").await;
 
         reconcile_worktrees(&db).await;
 
@@ -2839,6 +2920,7 @@ mod reconcile_worktrees_tests {
 
         seed_work_conv(&db, "dirty", "dirty", &wt_path, &mode, &project.id).await;
         set_state(&db, "dirty", &ConvState::Terminal).await;
+        move_product_conversation_to_history(&db, "dirty").await;
 
         reconcile_worktrees(&db).await;
 
