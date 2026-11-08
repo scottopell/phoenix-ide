@@ -362,6 +362,7 @@ pub(super) async fn continue_manual(
             | DbError::CloseFoundationConflict(_)
             | DbError::SteeringQueueFull
             | DbError::ProductCreationClaimLost
+            | DbError::ProductCreationRequestConflict
             | DbError::CloseFoundationPrecondition(_)
             | DbError::CloseFoundationStaleLatest { .. }
             | DbError::CloseFoundationRepairRequired(_)

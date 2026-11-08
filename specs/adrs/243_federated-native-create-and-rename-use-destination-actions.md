@@ -1,8 +1,8 @@
 # ADR-243: Federated Native Create and Rename Use Destination Actions
 
-**Status:** Accepted
-
-**Date:** 2026-11-08
+- **Status:** Accepted
+- **Date:** 2026-11-08
+- **Affects:** REQ-FED-021–024
 **Successor to:** [ADR-191](191_native-create-and-rename-use-shared-application-actions.md)
 
 ## Context
@@ -26,6 +26,13 @@ Before remote dispatch, the source revalidates current-Coordinator authority and
 Peer qualification is stored atomically with the complete source-call locator. Internal-native creation jobs and rename receipts require every peer-qualified locator field; non-native and unknown-historical creation origins carry none. Foreign identities have no destination-local foreign keys. The rollout preserves every existing locator value and backfills the database's durable local instance identity only onto internal-native creation jobs and retained rename receipts that already have complete native locators; it does not manufacture provenance for provenance-absent creation rows.
 
 Create-option discovery, rename-option discovery, create, create-status, and rename use distinct strict bounded wire contracts. Each option-discovery request is limited to 4,096 bytes and each option-discovery response to 262,144 bytes. Native-create requests are limited to 65,536 bytes; create responses and create-status requests to 4,096 bytes; and create-status responses and rename requests and responses to 16,384 bytes. Requests and responses close over authenticated caller and destination identities plus the exact request or operation and target identities. A peer that does not implement a required endpoint fails explicitly. No compatibility alias, generic remote CRUD/settings surface, trust or enrollment authority, or lifecycle authority is introduced.
+
+## Options considered
+
+- Making native invocation an HTTP client would duplicate local policy and force local selection through an unnecessary network boundary.
+- Reusing inbound Federation route DTOs as application actions would couple local authority to transport concerns and permit malformed construction outside authenticated adapters.
+- Adding source-instance columns to a shared locator table would make peer qualification representable for non-native rows that must not carry it.
+- Treating transport uncertainty as a domain result would misstate durability and permit unsafe automatic retries.
 
 ## Consequences
 

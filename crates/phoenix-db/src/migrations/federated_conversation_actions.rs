@@ -41,7 +41,7 @@ fn qualify_schema(sql: &str, creation: bool) -> DbResult<String> {
 
 pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
     let mut guard = WritableSchemaGuard::enable(pool).await?;
-    let result = async {
+    let result: DbResult<()> = async {
         let mut tx = guard.connection().begin().await?;
         let local: String = sqlx::query_scalar("SELECT instance_id FROM instance_identity WHERE singleton_key = 1").fetch_one(&mut *tx).await?;
         local.parse::<phoenix_core::domain::instance_identity::InstanceId>()

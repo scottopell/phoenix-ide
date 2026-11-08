@@ -435,21 +435,20 @@ where
         }
     };
     let local_instance_id = runtime.db().instance_id().await.map_err(db_to_app)?;
-    let resolve = |resolution| {
-        resolve_intent(
-            runtime,
-            &req,
-            &source,
-            local_instance_id,
-            resolution,
-            &cwd_preparation,
-        )
-    };
     let outcome = match &source {
         CreateSource::FederatedConversation { authority, .. } => {
             runtime
                 .db()
-                .accept_product_creation_as_federation(authority, &req.request_id, resolve)
+                .accept_product_creation_as_federation(authority, &req.request_id, |resolution| {
+                    resolve_intent(
+                        runtime,
+                        &req,
+                        &source,
+                        local_instance_id,
+                        resolution,
+                        &cwd_preparation,
+                    )
+                })
                 .await
         }
         _ => {
@@ -458,7 +457,16 @@ where
                 .accept_product_creation_resolved(
                     &req.request_id,
                     source.coordinator_transcript_id(),
-                    resolve,
+                    |resolution| {
+                        resolve_intent(
+                            runtime,
+                            &req,
+                            &source,
+                            local_instance_id,
+                            resolution,
+                            &cwd_preparation,
+                        )
+                    },
                 )
                 .await
         }

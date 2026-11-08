@@ -550,10 +550,10 @@ async fn native_create_reconciles_only_uncertain_dispatch_failures_without_retry
     .unwrap();
     config.server.alpn_protocols = vec![b"http/1.1".to_vec()];
     let trust = PeerTlsTrust::PrivateCa {
-        certificate_pem: std::fs::read_to_string(config.ca_cert_path.unwrap())
-            .unwrap()
-            .parse()
-            .unwrap(),
+        certificate_pem: phoenix_core::domain::instance_identity::PeerCaCertificatePem::parse(
+            std::fs::read_to_string(config.ca_cert_path.unwrap()).unwrap(),
+        )
+        .unwrap(),
     };
     let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config.server));
     for case in [
@@ -636,7 +636,10 @@ async fn native_create_reconciles_only_uncertain_dispatch_failures_without_retry
             "https://localhost:{}",
             listener.local_addr().unwrap().port()
         );
-        let credential = format!("phx_peer_{}", "n".repeat(43)).parse().unwrap();
+        let credential = phoenix_core::domain::instance_identity::PeerBearerCredential::parse(
+            format!("phx_peer_{}", "n".repeat(43)),
+        )
+        .unwrap();
         state
             .db
             .save_federation_peer_connection(

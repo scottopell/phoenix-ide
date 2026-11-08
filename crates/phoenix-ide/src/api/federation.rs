@@ -4079,8 +4079,8 @@ pub(crate) async fn remote_native_create(
         Err(
             error @ (FederationClientError::NativeEndpointUnsupported
             | FederationClientError::NativeIdentityRejected(_)
-            | FederationClientError::NativeDomainRejected(_)
-            | FederationClientError::NativeRejected { .. }),
+            | FederationClientError::NativeProtocolRejected(_)
+            | FederationClientError::NativeDomainRejected(_)),
         ) => Err(error),
         Err(error) => {
             let status_request = NativeCreateStatusRequest {
