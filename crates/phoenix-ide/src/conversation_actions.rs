@@ -409,15 +409,13 @@ where
     uuid::Uuid::parse_str(&req.request_id)
         .map_err(|_| AppError::BadRequest("request_id must be a UUID".to_owned()))?;
     let existing = match &source {
-        CreateSource::FederatedConversation { authority, .. } => {
-            runtime
-                .db()
-                .get_product_creation_job_as_federation(authority, &req.request_id)
-                .await
-        }
-        _ => runtime.db().get_product_creation_job(&req.request_id).await,
-    }
-    .map_err(product_creation_db_to_app)?;
+        CreateSource::FederatedConversation { .. } => None,
+        _ => runtime
+            .db()
+            .get_product_creation_job(&req.request_id)
+            .await
+            .map_err(product_creation_db_to_app)?,
+    };
     let internal = !matches!(&source, CreateSource::UserApi);
     let cwd_preparation = if existing
         .as_ref()
