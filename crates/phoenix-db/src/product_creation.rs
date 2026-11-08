@@ -16,6 +16,11 @@ const PRODUCT_CREATION_MAX_ATTEMPTS: i64 = 4;
 const PRODUCT_CREATION_RETRY_DELAYS_SECONDS: [i64; 3] = [2, 10, 30];
 const PRODUCT_CREATION_MAX_DELIVERY_ATTEMPTS: i64 = 4;
 
+enum ProjectOptionAuthority<'a> {
+    Coordinator(&'a str),
+    Federation(&'a FederationConversationAuthority),
+}
+
 fn unix_micros_now() -> i64 {
     Utc::now().timestamp_micros()
 }
@@ -808,13 +813,43 @@ impl Database {
         .map_err(DbError::Sqlx)
     }
 
+    pub async fn product_creation_project_options_as_federation(
+        &self,
+        authority: &FederationConversationAuthority,
+        after_id: Option<&str>,
+    ) -> DbResult<Vec<(String, String)>> {
+        self.product_creation_project_options_authorized(
+            ProjectOptionAuthority::Federation(authority),
+            after_id,
+        )
+        .await
+    }
+
     pub async fn product_creation_project_options_as_coordinator(
         &self,
         transcript_id: &str,
         after_id: Option<&str>,
     ) -> DbResult<Vec<(String, String)>> {
+        self.product_creation_project_options_authorized(
+            ProjectOptionAuthority::Coordinator(transcript_id),
+            after_id,
+        )
+        .await
+    }
+
+    async fn product_creation_project_options_authorized(
+        &self,
+        authority: ProjectOptionAuthority<'_>,
+        after_id: Option<&str>,
+    ) -> DbResult<Vec<(String, String)>> {
         let mut tx = self.pool.begin().await?;
-        crate::product_conversation_rename::require_current_gc_tx(&mut tx, transcript_id).await?;
+        match authority {
+            ProjectOptionAuthority::Coordinator(transcript_id) => {
+                crate::product_conversation_rename::require_current_gc_tx(&mut tx, transcript_id)
+                    .await?;
+            }
+            ProjectOptionAuthority::Federation(peer) => peer.require_tx(&mut tx).await?,
+        }
         let projects = sqlx::query_as::<_, (String, String)>(
             "SELECT id, canonical_path FROM projects WHERE (?1 IS NULL OR id > ?1) ORDER BY id LIMIT 64",
         )
@@ -2899,6 +2934,105 @@ mod product_creation_tests {
     use phoenix_core::domain::db_schema::{Message, MessageContent, UserContent};
     use phoenix_core::domain::sm_state::ConvState;
     use phoenix_core::llm_language::LlmLanguage;
+
+    #[tokio::test]
+    async fn peer_project_options_match_coordinator_order_and_page_limit_without_a_transcript() {
+        use crate::federation_conversation_authority::enroll_test_peer;
+
+        let db = Database::open_in_memory().await.unwrap();
+        let gc = db
+            .get_or_create_coordinator(None, LlmLanguage::default())
+            .await
+            .unwrap();
+        let authority = enroll_test_peer(&db, InstanceId::new(), b"options-peer").await;
+        for index in (0..70).rev() {
+            sqlx::query(
+                "INSERT INTO projects (id, canonical_path, main_ref, created_at) VALUES (?1, ?2, 'main', '2026-01-01T00:00:00Z')",
+            )
+            .bind(format!("project-{index:03}"))
+            .bind(format!("/repo/{index:03}"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        let coordinator_first = db
+            .product_creation_project_options_as_coordinator(&gc.id, None)
+            .await
+            .unwrap();
+        let peer_first = db
+            .product_creation_project_options_as_federation(&authority, None)
+            .await
+            .unwrap();
+        assert_eq!(peer_first, coordinator_first);
+        assert_eq!(peer_first.len(), 64);
+        assert_eq!(
+            peer_first.first().unwrap(),
+            &("project-000".into(), "/repo/000".into())
+        );
+        assert_eq!(
+            peer_first.last().unwrap(),
+            &("project-063".into(), "/repo/063".into())
+        );
+
+        let cursor = peer_first.last().unwrap().0.as_str();
+        let coordinator_second = db
+            .product_creation_project_options_as_coordinator(&gc.id, Some(cursor))
+            .await
+            .unwrap();
+        let peer_second = db
+            .product_creation_project_options_as_federation(&authority, Some(cursor))
+            .await
+            .unwrap();
+        assert_eq!(peer_second, coordinator_second);
+        assert_eq!(peer_second.len(), 6);
+        assert_eq!(peer_second.first().unwrap().0, "project-064");
+        assert_eq!(peer_second.last().unwrap().0, "project-069");
+        assert!(db
+            .product_creation_project_options_as_federation(&authority, Some("project-999"))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn peer_project_options_reject_wrong_and_rotated_credentials_before_project_read() {
+        use crate::federation_conversation_authority::enroll_test_peer;
+        use phoenix_core::domain::instance_identity::FederationCredentialVerifier;
+
+        let db = Database::open_in_memory().await.unwrap();
+        let caller = InstanceId::new();
+        let original = enroll_test_peer(&db, caller, b"options-original").await;
+        let wrong: FederationConversationAuthority = FederationSendAuthority::new(
+            caller,
+            FederationCredentialVerifier::from_bearer(b"options-wrong"),
+        )
+        .into();
+        let replacement = enroll_test_peer(&db, caller, b"options-replacement").await;
+        assert!(db
+            .product_creation_project_options_as_federation(&replacement, None)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Missing projects would make an attempted read fail with SQLx rather than authority failure.
+        sqlx::query("DROP TABLE projects")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        for cursor in [None, Some("project-000"), Some("project-999")] {
+            assert!(matches!(
+                db.product_creation_project_options_as_federation(&wrong, cursor)
+                    .await,
+                Err(DbError::FederationSendAuthorityInactive)
+            ));
+            assert!(matches!(
+                db.product_creation_project_options_as_federation(&original, cursor)
+                    .await,
+                Err(DbError::FederationSendAuthorityInactive)
+            ));
+        }
+    }
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
