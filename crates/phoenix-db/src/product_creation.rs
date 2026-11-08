@@ -740,10 +740,7 @@ impl Database {
         &self,
         request_id: &str,
     ) -> DbResult<Option<ProductCreationJobRecord>> {
-        Ok(self
-            .load_product_creation_job(request_id)
-            .await?
-            .filter(|job| creation_source_instance_id(&job.intent.origin).is_none()))
+        self.load_product_creation_job(request_id).await
     }
 
     async fn load_product_creation_job(
@@ -2941,11 +2938,15 @@ mod product_creation_tests {
             .await
             .unwrap()
             .is_none());
-        assert!(db
-            .get_product_creation_job(&request)
-            .await
-            .unwrap()
-            .is_none());
+        assert_eq!(
+            db.get_product_creation_job(&request)
+                .await
+                .unwrap()
+                .unwrap()
+                .intent
+                .origin,
+            native.origin
+        );
         let gc = db
             .get_or_create_coordinator(None, LlmLanguage::default())
             .await

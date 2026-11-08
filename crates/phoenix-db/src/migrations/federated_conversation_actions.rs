@@ -30,7 +30,7 @@ fn qualify_schema(sql: &str, creation: bool) -> DbResult<String> {
     let check = if creation {
         format!("CHECK ((objective_origin IN ('internal_conversation', 'federated_conversation') AND {column} IS NOT NULL AND {uuid_check} AND objective_slack_request_id IS NULL) OR (objective_origin IN ('unknown_historical', 'user_api', 'slack_gateway') AND {column} IS NULL))")
     } else {
-        format!("CHECK ((length(trim(source_product_conversation_id)) > 0 AND length(trim(source_transcript_id)) > 0 AND length(trim(source_message_id)) > 0 AND length(trim(source_tool_use_id)) > 0 AND {column} IS NOT NULL AND {uuid_check}) OR ((length(trim(source_product_conversation_id)) = 0 OR length(trim(source_transcript_id)) = 0 OR length(trim(source_message_id)) = 0 OR length(trim(source_tool_use_id)) = 0) AND {column} IS NULL))")
+        format!("CHECK (length(source_product_conversation_id) > 0 AND length(source_transcript_id) > 0 AND length(source_message_id) > 0 AND length(source_tool_use_id) > 0 AND {column} IS NOT NULL AND {uuid_check})")
     };
     let end = sql
         .rfind(')')
@@ -54,9 +54,7 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
               AND length(trim(objective_source_transcript_id)) > 0
               AND length(trim(objective_source_message_id)) > 0
               AND length(trim(objective_source_tool_use_id)) > 0;
-            UPDATE product_conversation_rename_receipts SET source_instance_id = (SELECT instance_id FROM instance_identity WHERE singleton_key = 1)
-            WHERE length(trim(source_product_conversation_id)) > 0 AND length(trim(source_transcript_id)) > 0
-              AND length(trim(source_message_id)) > 0 AND length(trim(source_tool_use_id)) > 0;")
+            UPDATE product_conversation_rename_receipts SET source_instance_id = (SELECT instance_id FROM instance_identity WHERE singleton_key = 1);")
             .execute(&mut *tx).await?;
         // Updating only these definitions retains every existing FK, index, and trigger in place.
         for (table, creation) in [("product_creation_jobs", true), ("product_conversation_rename_receipts", false)] {

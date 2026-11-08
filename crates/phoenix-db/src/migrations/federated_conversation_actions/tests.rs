@@ -89,7 +89,7 @@ async fn migration158_qualifies_only_complete_local_native_history_and_preserves
         seed_creation(&pool, request, kind).await;
     }
     sqlx::raw_sql("INSERT INTO product_conversation_rename_receipts VALUES('operation','target',0,'title','source-product','deleted-source','message','tool','deleted-root','retained-slug',10);
-        INSERT INTO product_conversation_rename_receipts VALUES('incomplete','other-target',0,'title','source-product',' ','message','tool','deleted-root','retained-other',11);
+        INSERT INTO product_conversation_rename_receipts VALUES('whitespace','other-target',0,'title','source-product',' ','message','tool','deleted-root','retained-other',11);
         INSERT INTO child_witness VALUES('local','preserved child');")
         .execute(&pool).await.unwrap();
     let before: Vec<(String, String, Option<String>)> = sqlx::query_as(
@@ -122,7 +122,8 @@ async fn migration158_qualifies_only_complete_local_native_history_and_preserves
             "retained-slug".into()
         )
     );
-    assert!(sqlx::query_scalar::<_,Option<String>>("SELECT source_instance_id FROM product_conversation_rename_receipts WHERE operation_id='incomplete'").fetch_one(&pool).await.unwrap().is_none());
+    let whitespace_receipt: (String, String) = sqlx::query_as("SELECT source_instance_id,source_transcript_id FROM product_conversation_rename_receipts WHERE operation_id='whitespace'").fetch_one(&pool).await.unwrap();
+    assert_eq!(whitespace_receipt, (local.to_string(), " ".into()));
     let after: Vec<(String, String, Option<String>)> = sqlx::query_as(
         "SELECT type,name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name",
     )
