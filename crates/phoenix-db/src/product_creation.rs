@@ -6254,6 +6254,16 @@ mod product_creation_tests {
         .await
         .unwrap();
 
+        assert_eq!(
+            db.get_product_creation_job("internal-origin")
+                .await
+                .unwrap()
+                .unwrap()
+                .intent
+                .origin,
+            accepted_intent.origin
+        );
+
         let mut replay_intent = accepted_intent.clone();
         replay_intent.origin = ProductCreationOrigin::InternalConversation {
             source_instance_id: db.instance_id().await.unwrap(),
