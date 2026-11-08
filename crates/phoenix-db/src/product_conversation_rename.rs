@@ -84,8 +84,41 @@ impl Database {
         transcript_id: &str,
         reference: &str,
     ) -> DbResult<ProductConversationRenameDetail> {
+        self.read_product_conversation_rename_detail_authorized(
+            RenameAuthority::Local(transcript_id),
+            reference,
+        )
+        .await
+    }
+
+    /// # Errors
+    /// Returns an error if the peer enrollment is inactive, the ordinary target is missing, or database access fails.
+    pub async fn read_product_conversation_rename_detail_as_federation(
+        &self,
+        authority: &FederationConversationAuthority,
+        reference: &str,
+    ) -> DbResult<ProductConversationRenameDetail> {
+        self.read_product_conversation_rename_detail_authorized(
+            RenameAuthority::Federated(authority),
+            reference,
+        )
+        .await
+    }
+
+    async fn read_product_conversation_rename_detail_authorized(
+        &self,
+        authority: RenameAuthority<'_>,
+        reference: &str,
+    ) -> DbResult<ProductConversationRenameDetail> {
         let mut tx = self.pool.begin().await?;
-        require_current_gc_tx(&mut tx, transcript_id).await?;
+        match authority {
+            RenameAuthority::Local(transcript_id) => {
+                require_current_gc_tx(&mut tx, transcript_id).await?;
+            }
+            RenameAuthority::Federated(peer) => {
+                peer.require_tx(&mut tx).await?;
+            }
+        }
         let resolved = Self::resolve_ordinary_product_conversation_on(&mut tx, reference).await?;
         let row = sqlx::query("SELECT id, title, slug, name_revision, (archived = 0 AND name_revision < 9223372036854775807 AND EXISTS (SELECT 1 FROM product_conversations p WHERE p.id = root.product_conversation_id AND p.ordinary_lifecycle = 'open') AND NOT EXISTS (SELECT 1 FROM close_obligations o WHERE o.product_conversation_id = root.product_conversation_id AND (o.phase <> 'completed' OR o.close_outcome = 'close_incomplete'))) AS can_rename FROM conversations root WHERE product_conversation_id = ?1 AND runtime_role = 'user' AND user_initiated = 1 AND parent_conversation_id IS NULL AND NOT EXISTS (SELECT 1 FROM conversations predecessor WHERE predecessor.product_conversation_id = root.product_conversation_id AND predecessor.continued_in_conv_id = root.id) ORDER BY id LIMIT 1")
             .bind(resolved.product_conversation_id.as_str()).fetch_optional(&mut *tx).await?
@@ -461,6 +494,134 @@ mod tests {
         command.operation_id = id;
         command.expected_name_revision = i64::MAX;
         assert!(validate_command(&command).is_err());
+    }
+
+    #[tokio::test]
+    async fn federated_rename_detail_uses_peer_authority_for_stable_and_exact_references() {
+        use crate::federation_conversation_authority::enroll_test_peer;
+
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation("option-target", "Option target", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let caller = InstanceId::new();
+        let authority = enroll_test_peer(&db, caller, b"option-peer").await;
+
+        let stable = db
+            .read_product_conversation_rename_detail_as_federation(
+                &authority,
+                root.product_conversation_id.as_str(),
+            )
+            .await
+            .unwrap();
+        let exact = db
+            .read_product_conversation_rename_detail_as_federation(&authority, &root.id)
+            .await
+            .unwrap();
+        assert_eq!(stable.product_conversation_id, root.product_conversation_id);
+        assert_eq!(
+            exact.product_conversation_id,
+            stable.product_conversation_id
+        );
+        assert_eq!(stable.root_transcript_id, root.id);
+        assert_eq!(exact.root_transcript_id, stable.root_transcript_id);
+        assert_eq!(exact.name_revision, stable.name_revision);
+        assert_eq!(exact.title, stable.title);
+        assert_eq!(exact.slug, stable.slug);
+        assert!(stable.can_rename);
+
+        let gc = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.read_product_conversation_rename_detail(
+                &root.id,
+                root.product_conversation_id.as_str()
+            )
+            .await,
+            Err(DbError::CurrentCoordinatorRequired)
+        ));
+        assert_eq!(
+            db.read_product_conversation_rename_detail(
+                &gc.id,
+                root.product_conversation_id.as_str()
+            )
+            .await
+            .unwrap()
+            .root_transcript_id,
+            root.id
+        );
+    }
+
+    #[tokio::test]
+    async fn federated_rename_detail_rejects_inactive_peer_before_target_resolution() {
+        use crate::federation_conversation_authority::enroll_test_peer;
+        use phoenix_core::domain::instance_identity::FederationCredentialVerifier;
+
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation("option-guard", "Option guard", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let caller = InstanceId::new();
+        let authority = enroll_test_peer(&db, caller, b"first-credential").await;
+        let wrong: FederationConversationAuthority = crate::FederationSendAuthority::new(
+            caller,
+            FederationCredentialVerifier::from_bearer(b"wrong-credential"),
+        )
+        .into();
+        for reference in [root.product_conversation_id.as_str(), "missing-option"] {
+            assert!(matches!(
+                db.read_product_conversation_rename_detail_as_federation(&wrong, reference)
+                    .await,
+                Err(DbError::FederationSendAuthorityInactive)
+            ));
+        }
+        let replacement = enroll_test_peer(&db, caller, b"replacement-credential").await;
+        assert!(matches!(
+            db.read_product_conversation_rename_detail_as_federation(
+                &authority,
+                root.product_conversation_id.as_str()
+            )
+            .await,
+            Err(DbError::FederationSendAuthorityInactive)
+        ));
+        assert_eq!(
+            db.read_product_conversation_rename_detail_as_federation(&replacement, &root.id)
+                .await
+                .unwrap()
+                .product_conversation_id,
+            root.product_conversation_id
+        );
+    }
+
+    #[tokio::test]
+    async fn federated_rename_detail_rejects_non_ordinary_and_missing_targets() {
+        use crate::federation_conversation_authority::enroll_test_peer;
+
+        let db = Database::open_in_memory().await.unwrap();
+        let gc = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let authority = enroll_test_peer(&db, InstanceId::new(), b"kind-guard").await;
+        for reference in [
+            gc.product_conversation_id.as_str(),
+            gc.id.as_str(),
+            "missing-option",
+        ] {
+            assert!(matches!(
+                db.read_product_conversation_rename_detail_as_federation(&authority, reference)
+                    .await,
+                Err(DbError::ConversationNotFound(id)) if id == reference
+            ));
+            assert!(matches!(
+                db.read_product_conversation_rename_detail(&gc.id, reference).await,
+                Err(DbError::ConversationNotFound(id)) if id == reference
+            ));
+        }
     }
 
     #[tokio::test]
