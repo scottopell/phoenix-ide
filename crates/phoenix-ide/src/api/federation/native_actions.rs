@@ -126,6 +126,19 @@ fn source_call() -> NativeActionSourceCall {
     }
 }
 
+fn native_rename_request() -> NativeRenameRequest {
+    NativeRenameRequest {
+        caller_instance_id: InstanceId::new(),
+        destination_instance_id: InstanceId::new(),
+        operation_id: uuid::Uuid::new_v4().to_string(),
+        product_conversation_id: ProductConversationId::new(),
+        expected_root_transcript_id: uuid::Uuid::new_v4().to_string(),
+        expected_name_revision: 0,
+        title: "new title".into(),
+        source: source_call(),
+    }
+}
+
 #[test]
 fn protocol_witnesses_are_canonical_but_persisted_identities_are_opaque() {
     let valid = serde_json::json!({
@@ -165,7 +178,7 @@ fn protocol_witnesses_are_canonical_but_persisted_identities_are_opaque() {
     }
     let mut invalid_source = serde_json::to_value(source).unwrap();
     invalid_source["source_transcript_id"] = "transcript:root".into();
-    assert!(serde_json::from_value::<NativeActionSourceCall>(invalid_source).is_ok());
+    assert!(serde_json::from_value::<NativeActionSourceCall>(invalid_source.clone()).is_ok());
     invalid_source["source_transcript_id"] = "   ".into();
     let source: NativeActionSourceCall = serde_json::from_value(invalid_source).unwrap();
     assert!(!native_source_valid(&source));
@@ -201,16 +214,7 @@ fn constructed_native_intents_are_validated_before_transport() {
     create.source.source_assistant_message_id = "bad-message".into();
     assert!(native_create_intent_valid(&create));
 
-    let mut rename = NativeRenameRequest {
-        caller_instance_id: InstanceId::new(),
-        destination_instance_id: InstanceId::new(),
-        operation_id: uuid::Uuid::new_v4().to_string(),
-        product_conversation_id: ProductConversationId::new(),
-        expected_root_transcript_id: uuid::Uuid::new_v4().to_string(),
-        expected_name_revision: 0,
-        title: "new title".into(),
-        source: source_call(),
-    };
+    let mut rename = native_rename_request();
     assert!(native_rename_intent_valid(&rename));
     for revision in [-1, i64::MAX] {
         rename.expected_name_revision = revision;

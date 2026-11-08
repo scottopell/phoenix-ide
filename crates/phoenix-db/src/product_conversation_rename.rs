@@ -260,7 +260,10 @@ impl Database {
                 }
                 RenameAuthority::Federated(peer) => {
                     peer.require_tx(&mut tx).await?;
-                    if command.source.source_instance_id != peer.caller_instance_id() || peer.caller_instance_id() == local_instance_id {
+                    let caller_instance_id = peer.caller_instance_id();
+                    if command.source.source_instance_id != caller_instance_id
+                        || caller_instance_id == local_instance_id
+                    {
                         return Ok(ProductConversationRenameResult::Conflict);
                     }
                 }

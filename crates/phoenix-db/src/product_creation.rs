@@ -515,6 +515,32 @@ fn require_creation_read_owner(
     }
 }
 
+fn require_creation_retry_owner(
+    origin: &ProductCreationOrigin,
+    local_instance_id: InstanceId,
+    current_gc_transcript_id: Option<&str>,
+    authority: Option<&FederationConversationAuthority>,
+) -> DbResult<()> {
+    if let Some(authority) = authority {
+        return require_creation_read_owner(origin, authority)
+            .map_err(|_| DbError::ProductCreationRequestConflict);
+    }
+    match origin {
+        ProductCreationOrigin::FederatedConversation { .. } => {
+            Err(DbError::ProductCreationRequestConflict)
+        }
+        ProductCreationOrigin::InternalConversation {
+            source_instance_id, ..
+        } if current_gc_transcript_id.is_none() || *source_instance_id != local_instance_id => {
+            Err(DbError::CurrentCoordinatorRequired)
+        }
+        ProductCreationOrigin::InternalConversation { .. }
+        | ProductCreationOrigin::UnknownHistorical
+        | ProductCreationOrigin::UserApi
+        | ProductCreationOrigin::SlackGateway { .. } => Ok(()),
+    }
+}
+
 async fn require_creation_origin_tx(
     conn: &mut SqliteConnection,
     local_instance_id: InstanceId,
@@ -1233,28 +1259,12 @@ impl Database {
         }
         let existing = Self::get_product_creation_job_on(&mut tx, request_id).await?;
         if let Some(existing) = existing {
-            if let Some(authority) = authority {
-                if require_creation_read_owner(&existing.intent.origin, authority).is_err() {
-                    return Err(DbError::ProductCreationRequestConflict);
-                }
-            } else {
-                match &existing.intent.origin {
-                    ProductCreationOrigin::FederatedConversation { .. } => {
-                        return Err(DbError::ProductCreationRequestConflict)
-                    }
-                    ProductCreationOrigin::InternalConversation {
-                        source_instance_id, ..
-                    } if current_gc_transcript_id.is_none()
-                        || *source_instance_id != local_instance_id =>
-                    {
-                        return Err(DbError::CurrentCoordinatorRequired)
-                    }
-                    ProductCreationOrigin::InternalConversation { .. }
-                    | ProductCreationOrigin::UnknownHistorical
-                    | ProductCreationOrigin::UserApi
-                    | ProductCreationOrigin::SlackGateway { .. } => {}
-                }
-            }
+            require_creation_retry_owner(
+                &existing.intent.origin,
+                local_instance_id,
+                current_gc_transcript_id,
+                authority,
+            )?;
             let candidate = resolve(ProductCreationResolution::Existing(&existing))?;
             tx.rollback().await?;
             return Ok(if existing.intent.matches_retry(&candidate) {
@@ -1308,28 +1318,12 @@ impl Database {
                 .ok_or_else(|| {
                     DbError::Serialization("raced product creation disappeared".to_string())
                 })?;
-            if let Some(authority) = authority {
-                if require_creation_read_owner(&existing.intent.origin, authority).is_err() {
-                    return Err(DbError::ProductCreationRequestConflict);
-                }
-            } else {
-                match &existing.intent.origin {
-                    ProductCreationOrigin::FederatedConversation { .. } => {
-                        return Err(DbError::ProductCreationRequestConflict)
-                    }
-                    ProductCreationOrigin::InternalConversation {
-                        source_instance_id, ..
-                    } if current_gc_transcript_id.is_none()
-                        || *source_instance_id != local_instance_id =>
-                    {
-                        return Err(DbError::CurrentCoordinatorRequired)
-                    }
-                    ProductCreationOrigin::InternalConversation { .. }
-                    | ProductCreationOrigin::UnknownHistorical
-                    | ProductCreationOrigin::UserApi
-                    | ProductCreationOrigin::SlackGateway { .. } => {}
-                }
-            }
+            require_creation_retry_owner(
+                &existing.intent.origin,
+                local_instance_id,
+                current_gc_transcript_id,
+                authority,
+            )?;
             race_tx.rollback().await?;
             return Ok(if existing.intent.matches_retry(&intent) {
                 ProductCreationAcceptOutcome::Replayed(existing)

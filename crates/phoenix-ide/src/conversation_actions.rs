@@ -848,7 +848,7 @@ mod tests {
         );
         let dir = tempfile::tempdir_in(manager.runtime_home()).unwrap();
         let cwd = dir.path().canonicalize().unwrap();
-        let mut original = request(cwd.to_str().unwrap());
+        let original = request(cwd.to_str().unwrap());
         let request_id = original.request_id.clone();
         let product = ProductConversationId::new();
         let source_call = SourceToolCall {
@@ -858,7 +858,7 @@ mod tests {
         let accepted = accept_create_from_federation(
             &manager,
             owner.clone(),
-            original.clone(),
+            original,
             product.clone(),
             "owner-transcript".into(),
             source_call.clone(),
@@ -867,13 +867,15 @@ mod tests {
         .unwrap();
 
         for different_intent in [false, true] {
+            let mut other_request = request(cwd.to_str().unwrap());
+            other_request.request_id = request_id.clone();
             if different_intent {
-                original.objective = "different objective".into();
+                other_request.objective = "different objective".into();
             }
             let result = accept_create_from_federation(
                 &manager,
                 other.clone(),
-                original.clone(),
+                other_request,
                 ProductConversationId::new(),
                 "other-transcript".into(),
                 SourceToolCall {
