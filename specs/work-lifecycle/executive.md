@@ -52,6 +52,10 @@ These are acceptance obligations, **not tests reported as passing**:
 
 ## Validation Notes
 
+### Terminal lifecycle versus Close retirement
+
+Generic terminal lifecycle notification retires pending fork proposals and broadcasts terminal state; it carries no worktree-retirement authority. `terminal_exit_preserves_clean_worktree`, `terminal_exit_preserves_inherited_worktree_and_unique_material`, and `terminal_exit_preserves_nested_descendant_path` cover clean, tracked-dirty, untracked, and nested descendant-path preservation. Destructive retirement from a live `ProductConversation` remains under admitted Close or explicit hard-delete. Startup reconciliation likewise retains an attached worktree while the owning ordinary `ProductConversation` is Open or Close-fenced, even if its current transcript is terminal; `preserves_clean_terminal_scope_while_product_conversation_is_open` covers that boundary. Reclamation under `REQ-PROJ-015` remains available once the ordinary aggregate is History or no aggregate ownership record exists.
+
 ### Inventory preparation versus host cleanup
 
 `prepare_retirement_captures_and_seals_one_exact_shared_worktree` exercises the production first-pass inventory preparation boundary using retained SQLite identities, without a Git repository, watcher shutdown, or filesystem deletion. It replaces `archive_chain_captures_first_pass_close_inventory`, whose inventory assertion depended on full host cleanup succeeding. The regression checks one exact target for a three-member shared chain, retained snapshot, repeat preparation, admission fences, and no retirement evidence or lifecycle transition from capture alone.
