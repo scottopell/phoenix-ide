@@ -1,6 +1,7 @@
 # ADR-009: Native process metrics use shared demand-driven observation generations
 
 - **Status:** Accepted
+- **Related decision:** [ADR-243](243_bounded-resource-recorder-reuses-shared-observations.md) partially supersedes only the no-autonomous-consumer and no-retained-history conclusions for the bounded resource recorder.
 - **Date:** 2026-07-15
 - **Affects:** REQ-DEPLOY-007a, REQ-PINSP-004, REQ-PINSP-008, REQ-WSUI-006, REQ-WSUI-010
 

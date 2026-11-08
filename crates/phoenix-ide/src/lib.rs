@@ -31,10 +31,6 @@ mod reminder_delivery;
 mod reminder_service;
 mod resolution_root;
 mod resource_authority;
-#[allow(
-    dead_code,
-    reason = "temporary storage leaf; remove when packet2 wires the recorder"
-)]
 mod resource_flight_recorder;
 mod runtime;
 mod send_chat_service;
@@ -697,6 +693,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // and the Phoenix layout under them) once, behind a typed surface. Every
     // subsystem that needs an on-disk location reads it from here.
     let runtime_env = Arc::new(PhoenixRuntimeEnvironment::detect());
+    let resource_recorder = resource_flight_recorder::initialize(&runtime_env);
 
     // REQ-BASH-007: install the child subreaper so descendants whose
     // parent dies (double-forks, setsid daemons) reparent to Phoenix
@@ -1005,6 +1002,10 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         federation_tls_trust,
     )
     .await?;
+
+    if let Some(recorder) = resource_recorder {
+        resource_flight_recorder::spawn_sampler(state.clone(), recorder);
+    }
 
     let automatic_continuation_runtime = state.runtime.clone();
     let automatic_continuation_authority = state.runtime.clone();

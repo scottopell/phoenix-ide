@@ -1,4 +1,4 @@
-//! Bounded, opt-in storage leaf; no logging, SQLite, or startup integration.
+//! Bounded resource history, independent of SQLite and structured-log storage.
 //! The first segment carries an exclusive advisory lock for the writer's lifetime.
 //! A complete frame is not a durability claim: only successful `sync_data`
 //! advances `committed`. After a crash, even a valid unsynced tail may be lost.
@@ -10,6 +10,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{mpsc, Arc};
 
+mod sampling;
+pub(crate) use sampling::{initialize, spawn_sampler};
+
 const SEGMENT_BYTES: u64 = 2 * 1024 * 1024;
 const FRAME_BYTES: usize = 1024;
 const HEADER_BYTES: usize = 6;
@@ -18,67 +21,100 @@ const NAMES: [&str; 2] = ["resources.0.frames", "resources.1.frames"];
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
 pub(crate) struct ProcessIdentity {
+    #[serde(rename = "p")]
     pub pid: u32,
-    pub started_unix_ms: u64,
+    #[serde(rename = "t")]
+    pub started_unix_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
-pub(crate) enum MetricFailure {
-    Unsupported,
-    Permission,
-    Read,
-    Parse,
-}
-
-/// The observation timestamp permits consumers to compute age independently of
-/// the sample timestamp. Unavailable is not zero and does not reuse an old value.
-#[derive(Clone, Copy, Serialize, Deserialize)]
-pub(crate) enum ByteReading {
-    Available {
-        bytes: u64,
-        observed_unix_ms: u64,
-    },
-    Unavailable {
-        observed_unix_ms: u64,
-        code: MetricFailure,
-    },
-}
-
-#[derive(Clone, Copy, Serialize, Deserialize)]
-pub(crate) enum ProportionalSource {
-    LinuxSmapsRollupPss,
+pub(crate) enum MemorySource {
+    #[serde(rename = "p")]
+    LinuxPss,
+    #[serde(rename = "f")]
     MacPhysicalFootprint,
+    #[serde(rename = "u")]
+    Unavailable,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
-pub(crate) struct ProportionalReading {
-    pub source: ProportionalSource,
-    pub reading: ByteReading,
+pub(crate) enum HostPressure {
+    #[serde(rename = "n")]
+    Normal,
+    #[serde(rename = "w")]
+    Warning,
+    #[serde(rename = "c")]
+    Critical,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
-pub(crate) struct CheapCounts {
-    pub conversations: Option<u64>,
-    pub active_tools: Option<u64>,
-    pub child_processes: Option<u64>,
+pub(crate) enum Phase {
+    #[serde(rename = "s")]
+    Startup,
+    #[serde(rename = "r")]
+    Running,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
 pub(crate) struct Sample {
+    #[serde(rename = "k")]
+    pub phase: Phase,
+    #[serde(rename = "t")]
     pub sampled_unix_ms: u64,
+    #[serde(rename = "u")]
     pub process_uptime_ms: u64,
-    pub current_rss: ByteReading,
-    pub proportional: Option<ProportionalReading>,
-    pub high_water_rss: ByteReading,
-    pub counts: Option<CheapCounts>,
+    #[serde(rename = "h")]
+    pub host_uptime_secs: Option<u64>,
+    #[serde(rename = "g")]
+    pub generation_unix_ms: Option<u64>,
+    #[serde(rename = "d")]
+    pub disk_unix_ms: Option<u64>,
+    #[serde(rename = "m")]
+    pub memory_source: MemorySource,
+    #[serde(rename = "r")]
+    pub current_rss_bytes: Option<u64>,
+    #[serde(rename = "p")]
+    pub proportional_bytes: Option<u64>,
+    #[serde(rename = "l")]
+    pub lifetime_max_rss_bytes: Option<u64>,
+    #[serde(rename = "b")]
+    pub host_bytes: [Option<u64>; 4],
+    #[serde(rename = "v")]
+    pub host_pressure: Option<HostPressure>,
+    #[serde(rename = "s")]
+    pub disk_available_bytes: [Option<u64>; 3],
+    #[serde(rename = "a")]
+    pub managed_proportional_bytes: Option<u64>,
+    #[serde(rename = "n")]
+    pub managed_pid_count: Option<u64>,
+    #[serde(rename = "w")]
+    pub live_materialized_handles: Option<u64>,
+    #[serde(rename = "e")]
+    pub last_failure_unix_ms: Option<u64>,
+    #[serde(rename = "c")]
+    pub sqlite_extended_code: Option<i32>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Observation {
+    pub sample: Sample,
+    pub failure_counts: [Option<u64>; 11],
 }
 
 #[derive(Serialize, Deserialize)]
 struct Record {
+    #[serde(rename = "v")]
     version: u8,
+    #[serde(rename = "q")]
     sequence: u64,
+    #[serde(rename = "i")]
     process: ProcessIdentity,
+    #[serde(rename = "x")]
     sample: Sample,
+    #[serde(rename = "f")]
+    failure_deltas: [Option<u64>; 11],
+    #[serde(rename = "z")]
+    recorder_drop_deltas: [Option<u64>; 4],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,14 +162,14 @@ pub(crate) struct CounterSnapshot {
 }
 
 pub(crate) struct Handle {
-    sender: mpsc::SyncSender<Sample>,
+    sender: mpsc::SyncSender<Observation>,
     counters: Arc<Counters>,
 }
 
 impl Handle {
     /// Never waits for disk or channel capacity. One record may be pending in
     /// addition to the writer's in-flight record. Drop only disconnects, not joins.
-    pub(crate) fn try_record(&self, sample: Sample) {
+    pub(crate) fn try_record(&self, sample: Observation) {
         self.counters.sampled.fetch_add(1, Relaxed);
         match self.sender.try_send(sample) {
             Ok(()) => {
@@ -185,7 +221,8 @@ impl Handle {
 /// `resource-flight-recorder/` child (0700) holding the two fixed files (0600).
 /// Existing unsafe entries are rejected, not repaired. Unix only; no environment
 /// variable enables this leaf.
-pub(crate) fn start(data_directory: &Path, process: ProcessIdentity) -> io::Result<Handle> {
+pub(crate) fn start(data_directory: &Path, process: &ProcessIdentity) -> io::Result<Handle> {
+    let process = *process;
     let (storage, sequence) = Storage::open(data_directory)?;
     let (sender, receiver) = mpsc::sync_channel(1);
     let counters = Arc::new(Counters::default());
@@ -254,7 +291,7 @@ fn scan(reader: impl Read) -> io::Result<(u64, u64)> {
         let Ok(record) = serde_json::from_slice::<Record>(payload) else {
             break;
         };
-        if record.version != 1 || record.sequence <= sequence {
+        if record.version != 2 || record.sequence <= sequence {
             break;
         }
         sequence = record.sequence;
@@ -411,14 +448,33 @@ impl Sink for Storage {
     }
 }
 
+fn nonzero_deltas<const N: usize>(
+    current: [Option<u64>; N],
+    committed: [Option<u64>; N],
+) -> [Option<u64>; N] {
+    std::array::from_fn(|index| {
+        current[index]?
+            .checked_sub(committed[index].unwrap_or(0))
+            .filter(|delta| *delta != 0)
+    })
+}
+
 fn run(
     mut storage: impl Sink,
     mut sequence: u64,
     process: ProcessIdentity,
-    receiver: mpsc::Receiver<Sample>,
+    receiver: mpsc::Receiver<Observation>,
     counters: &Counters,
 ) {
-    for sample in receiver {
+    let mut failure_baseline = [Some(0); 11];
+    let mut drop_baseline = [Some(0); 4];
+    for observation in receiver {
+        let drop_counts = [
+            Some(counters.dropped_full.load(Relaxed)),
+            Some(counters.dropped_disconnected.load(Relaxed)),
+            Some(counters.dropped_encode.load(Relaxed)),
+            Some(counters.dropped_oversized.load(Relaxed)),
+        ];
         let Some(next) = sequence.checked_add(1) else {
             counters
                 .failure
@@ -426,10 +482,12 @@ fn run(
             return;
         };
         let bytes = match frame(&Record {
-            version: 1,
+            version: 2,
             sequence: next,
             process,
-            sample,
+            sample: observation.sample,
+            failure_deltas: nonzero_deltas(observation.failure_counts, failure_baseline),
+            recorder_drop_deltas: nonzero_deltas(drop_counts, drop_baseline),
         }) {
             Ok(bytes) => bytes,
             Err(code) => {
@@ -454,6 +512,10 @@ fn run(
             counters.failure.store(FailureCode::Io as u64, Relaxed);
             return;
         }
+        failure_baseline = std::array::from_fn(|index| {
+            observation.failure_counts[index].or(failure_baseline[index])
+        });
+        drop_baseline = drop_counts;
         sequence = next;
         counters.last_committed_sequence.store(sequence, Relaxed);
         counters.committed.fetch_add(1, Relaxed);
@@ -465,25 +527,42 @@ mod tests {
     use super::*;
 
     fn record(sequence: u64) -> Record {
-        let reading = ByteReading::Available {
-            bytes: 42,
-            observed_unix_ms: 10,
-        };
         Record {
-            version: 1,
+            version: 2,
             sequence,
             process: ProcessIdentity {
                 pid: 7,
-                started_unix_ms: 5,
+                started_unix_ms: Some(5),
             },
             sample: Sample {
+                phase: Phase::Running,
                 sampled_unix_ms: 11,
                 process_uptime_ms: 6,
-                current_rss: reading,
-                proportional: None,
-                high_water_rss: reading,
-                counts: None,
+                host_uptime_secs: None,
+                generation_unix_ms: None,
+                disk_unix_ms: None,
+                memory_source: MemorySource::Unavailable,
+                current_rss_bytes: None,
+                proportional_bytes: None,
+                lifetime_max_rss_bytes: None,
+                host_bytes: [None; 4],
+                host_pressure: None,
+                disk_available_bytes: [None; 3],
+                managed_proportional_bytes: None,
+                managed_pid_count: None,
+                live_materialized_handles: None,
+                last_failure_unix_ms: None,
+                sqlite_extended_code: None,
             },
+            failure_deltas: [None; 11],
+            recorder_drop_deltas: [None; 4],
+        }
+    }
+
+    fn observation(sequence: u64) -> Observation {
+        Observation {
+            sample: record(sequence).sample,
+            failure_counts: [Some(0); 11],
         }
     }
 
@@ -559,8 +638,8 @@ mod tests {
                 ..Fake::default()
             };
             let (tx, rx) = mpsc::sync_channel(2);
-            tx.send(record(1).sample).unwrap();
-            tx.send(record(2).sample).unwrap();
+            tx.send(observation(1)).unwrap();
+            tx.send(observation(2)).unwrap();
             drop(tx);
             let counters = Counters::default();
             run(&mut fake, 0, record(1).process, rx, &counters);
@@ -582,7 +661,7 @@ mod tests {
             counters: Arc::new(Counters::default()),
         };
         for _ in 0..100 {
-            handle.try_record(record(1).sample);
+            handle.try_record(observation(1));
         }
         let snapshot = handle.snapshot();
         assert_eq!(snapshot.sampled, 100);
@@ -590,7 +669,7 @@ mod tests {
         assert_eq!(snapshot.dropped_full, 99);
         receiver.recv().unwrap();
         drop(receiver);
-        handle.try_record(record(1).sample);
+        handle.try_record(observation(1));
         assert_eq!(handle.snapshot().dropped_disconnected, 1);
         drop(handle);
     }
@@ -598,22 +677,35 @@ mod tests {
     #[test]
     fn frame_and_serialization_bounds() {
         let mut r = record(u64::MAX);
-        let reading = ByteReading::Available {
-            bytes: u64::MAX,
-            observed_unix_ms: u64::MAX,
-        };
-        r.sample.current_rss = reading;
-        r.sample.high_water_rss = reading;
-        r.sample.proportional = Some(ProportionalReading {
-            source: ProportionalSource::LinuxSmapsRollupPss,
-            reading,
-        });
-        r.sample.counts = Some(CheapCounts {
-            conversations: Some(u64::MAX),
-            active_tools: Some(u64::MAX),
-            child_processes: Some(u64::MAX),
-        });
+        r.process.pid = u32::MAX;
+        r.process.started_unix_ms = Some(u64::MAX);
+        r.sample.sampled_unix_ms = u64::MAX;
+        r.sample.process_uptime_ms = u64::MAX;
+        r.sample.host_uptime_secs = Some(u64::MAX);
+        r.sample.generation_unix_ms = Some(u64::MAX);
+        r.sample.disk_unix_ms = Some(u64::MAX);
+        r.sample.memory_source = MemorySource::MacPhysicalFootprint;
+        r.sample.current_rss_bytes = Some(u64::MAX);
+        r.sample.proportional_bytes = Some(u64::MAX);
+        r.sample.lifetime_max_rss_bytes = Some(u64::MAX);
+        r.sample.host_bytes = [Some(u64::MAX); 4];
+        r.sample.host_pressure = Some(HostPressure::Critical);
+        r.sample.disk_available_bytes = [Some(u64::MAX); 3];
+        r.sample.managed_proportional_bytes = Some(u64::MAX);
+        r.sample.managed_pid_count = Some(u64::MAX);
+        r.sample.live_materialized_handles = Some(u64::MAX);
+        r.sample.last_failure_unix_ms = Some(u64::MAX);
+        r.sample.sqlite_extended_code = Some(i32::MIN);
+        r.failure_deltas = [Some(u64::MAX); 11];
+        r.recorder_drop_deltas = [Some(u64::MAX); 4];
         assert!(frame(&r).unwrap().len() <= FRAME_BYTES);
+        assert_eq!(serde_json::to_value(&r).unwrap()["i"]["t"], u64::MAX);
+        r.process.started_unix_ms = None;
+        assert!(frame(&r).unwrap().len() <= FRAME_BYTES);
+        let value = serde_json::to_value(&r).unwrap();
+        assert!(value["i"]["t"].is_null());
+        let decoded: Record = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.process.started_unix_ms, None);
         let mut bounded = BoundedJson(Vec::new());
         assert!(bounded.write_all(&[0; FRAME_BYTES]).is_err());
         assert!(bounded.0.is_empty());
@@ -621,9 +713,98 @@ mod tests {
     }
 
     #[test]
+    fn failure_and_drop_deltas_follow_only_synced_samples() {
+        let mut fake = Fake {
+            capacity: FRAME_BYTES * 3,
+            ..Fake::default()
+        };
+        let (tx, rx) = mpsc::sync_channel(3);
+        for count in [7, 7, 9] {
+            let mut value = observation(1);
+            value.failure_counts[0] = Some(count);
+            tx.send(value).unwrap();
+        }
+        drop(tx);
+        let counters = Counters::default();
+        counters.dropped_full.store(12, Relaxed);
+        run(&mut fake, 0, record(1).process, rx, &counters);
+        assert_eq!(counters.committed.load(Relaxed), 3);
+        let bytes = fake.bytes.lock().unwrap();
+        let mut offset = 0;
+        for (expected, drops) in [(Some(7), Some(12)), (None, None), (Some(2), None)] {
+            let length = usize::from(u16::from_le_bytes([bytes[offset], bytes[offset + 1]]));
+            let value: Record = serde_json::from_slice(
+                &bytes[offset + HEADER_BYTES..offset + HEADER_BYTES + length],
+            )
+            .unwrap();
+            assert_eq!(value.failure_deltas[0], expected);
+            assert_eq!(value.recorder_drop_deltas[0], drops);
+            assert!(value.failure_deltas[1..].iter().all(Option::is_none));
+            offset += HEADER_BYTES + length;
+        }
+        assert_eq!(offset, bytes.len());
+        assert_eq!(
+            nonzero_deltas([Some(0), None], [Some(9), Some(9)]),
+            [None, None]
+        );
+    }
+
+    #[test]
+    fn restart_and_reboot_evidence_does_not_invent_missing_samples() {
+        let mut first = record(1);
+        first.sample.host_uptime_secs = Some(1000);
+        let mut second = record(2);
+        second.process.pid = 8;
+        second.process.started_unix_ms = Some(5000);
+        second.sample.sampled_unix_ms = 5001;
+        second.sample.host_uptime_secs = Some(3);
+        second.sample.process_uptime_ms = 1;
+        second.sample.phase = Phase::Startup;
+        let mut bytes = frame(&first).unwrap();
+        bytes.extend(frame(&second).unwrap());
+        assert_eq!(scan(&bytes[..]).unwrap(), (bytes.len() as u64, 2));
+        let value = serde_json::to_value(second).unwrap();
+        assert_eq!(value["i"]["p"], 8);
+        assert_eq!(value["x"]["h"], 3);
+        assert_eq!(value["x"]["k"], "s");
+        assert!(value["x"]["g"].is_null());
+        assert!(value["x"]["l"].is_null());
+        assert!(value["x"].get("gap_duration").is_none());
+    }
+
+    #[test]
+    fn persisted_record_has_a_closed_primitive_and_fixed_enum_allowlist() {
+        fn inspect(value: &serde_json::Value) {
+            match value {
+                serde_json::Value::String(text) => {
+                    assert!(["s", "r", "p", "f", "u", "n", "w", "c"].contains(&text.as_str()))
+                }
+                serde_json::Value::Array(values) => values.iter().for_each(inspect),
+                serde_json::Value::Object(values) => values.values().for_each(inspect),
+                _ => {}
+            }
+        }
+        let value = serde_json::to_value(record(1)).unwrap();
+        inspect(&value);
+        let keys = value["x"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "k", "t", "u", "h", "g", "d", "m", "r", "p", "l", "b", "v", "s", "a", "n", "w",
+                "e", "c"
+            ])
+        );
+    }
+
+    #[test]
     fn sequence_exhaustion_never_wraps_or_writes() {
         let (tx, rx) = mpsc::sync_channel(1);
-        tx.send(record(1).sample).unwrap();
+        tx.send(observation(1)).unwrap();
         drop(tx);
         let counters = Counters::default();
         let mut fake = Fake {

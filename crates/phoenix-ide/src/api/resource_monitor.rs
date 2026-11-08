@@ -1,4 +1,4 @@
-//! Demand-driven, request-coalesced process resource observations.
+//! Coalesced process observations shared by requests and the bounded recorder.
 
 use super::deployment::HostResources;
 use super::process_sample::{
@@ -55,6 +55,7 @@ pub struct HandleObservationTarget {
 pub struct ResourceObservationGeneration {
     pub sampled_at: DateTime<Utc>,
     pub host: HostResources,
+    pub host_swap: [Option<u64>; 2],
     pub observations: BTreeMap<u32, ProcessObservation>,
     pub api_pids: BTreeSet<u32>,
     pub terminal_pids: Option<BTreeSet<u32>>,
@@ -320,7 +321,7 @@ async fn sample_generation(
         all_identities.extend(identities.clone());
     }
 
-    let (host, rows) = tokio::join!(
+    let ((host, host_swap), rows) = tokio::join!(
         super::deployment::sample_host_resources(),
         sample_process_observations(&all_identities)
     );
@@ -335,6 +336,7 @@ async fn sample_generation(
     ResourceObservationGeneration {
         sampled_at: Utc::now(),
         host,
+        host_swap,
         observations: rows.into_iter().map(|row| (row.pid, row)).collect(),
         api_pids: api_identities.keys().copied().collect(),
         terminal_pids: terminal_identities.map(|ids| ids.keys().copied().collect()),
@@ -351,6 +353,7 @@ mod tests {
     fn empty_generation() -> ResourceObservationGeneration {
         ResourceObservationGeneration {
             sampled_at: Utc::now(),
+            host_swap: [None; 2],
             host: HostResources {
                 logical_cpu_count: None,
                 cpu_busy_percent: None,
@@ -701,6 +704,7 @@ mod tests {
         generation.observations.insert(
             10,
             ProcessObservation {
+                current_rss_bytes: None,
                 pid: 10,
                 name: "shared".into(),
                 cpu_percent: Some(1.0),
@@ -721,6 +725,48 @@ mod tests {
             assert_eq!(health.memory_bytes, None);
             assert_eq!(health.process_count, None);
         }
+    }
+
+    #[test]
+    fn about_and_recorder_projection_share_generation_and_deduplicate_categories() {
+        let mut generation = empty_generation();
+        generation.observations.insert(
+            10,
+            ProcessObservation {
+                current_rss_bytes: Some(90),
+                pid: 10,
+                name: "/private/secret-process".into(),
+                cpu_percent: Some(1.0),
+                memory_bytes: Some(30),
+                thread_count: None,
+                cpu_time_seconds: None,
+            },
+        );
+        generation.api_pids = BTreeSet::from([10]);
+        generation.terminal_pids = Some(BTreeSet::from([10]));
+        let summary = super::super::deployment::resource_summary(&generation);
+        assert_eq!(summary.managed_total.memory_bytes, Some(30));
+        assert_eq!(summary.managed_total.deduplicated_pid_count, 1);
+        assert_eq!(summary.api_rss_bytes, Some(90));
+        assert_eq!(summary.api_proportional_bytes, Some(30));
+        generation.observations.get_mut(&10).unwrap().memory_bytes = None;
+        let summary = super::super::deployment::resource_summary(&generation);
+        assert_eq!(summary.api_proportional_bytes, None);
+        assert_eq!(summary.api_rss_bytes, Some(90));
+        assert_eq!(summary.managed_total.memory_bytes, None);
+        generation.api_pids.insert(11);
+        assert_eq!(
+            super::super::deployment::resource_summary(&generation).api_rss_bytes,
+            None
+        );
+        generation.api_pids = BTreeSet::from([10]);
+        generation.terminal_pids = None;
+        assert_eq!(
+            super::super::deployment::resource_summary(&generation)
+                .managed_total
+                .memory_bytes,
+            None
+        );
     }
 
     #[test]

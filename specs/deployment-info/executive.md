@@ -37,8 +37,9 @@ the machine is it using right now?"
 
 **Explicitly out of scope:**
 - Rendering log file contents (path/sink only)
-- Durable server-side time-series retention or a general-purpose monitoring
-  system
+- A general-purpose monitoring backend or server-history API/UI. The live monitor
+  keeps a small in-browser rolling window; the bounded resource flight recorder
+  retains separate private diagnostic frames without a query surface.
 - Attribution for Browser, tmux server, or MCP native processes until those
   subsystems surface process identity; shell-mode terminal process groups are attributed
 
@@ -52,6 +53,53 @@ TLS configuration, and its data layout, and can sample both its host environment
 and the native processes Phoenix manages. Surfacing those facts in one
 read-only page turns a multi-command investigation into a single glance, while
 staying safe to open because ordinary inspection changes nothing.
+
+## Bounded resource flight recorder
+
+`run_server` attempts initialization from `PhoenixRuntimeEnvironment::data_dir`
+before DB open. Existing startup/fatal ordering is unchanged; initialization failure
+emits a fixed code and does not fail startup. Initialization first prepares the typed
+data parent with ordinary directory creation, leaving existing permissions unchanged.
+The storage leaf requires an owned data parent without group/other writes and never
+repairs unsafe storage.
+`sampling::spawn_sampler` starts after AppState, sleeps at least 60 seconds after
+each attempt, and ends on storage failure without retry.
+
+The recorder shares `ResourceMonitor::observe` and `deployment::resource_summary`
+with About. Current RSS comes from the existing sysinfo process refresh, separately
+from Linux PSS/macOS physical footprint. Swap uses the existing host refresh; an
+ambiguous zero total is null because sysinfo cannot distinguish no swap from a failed
+read. Pressure, lifetime RSS maximum and SQLite code remain null. Runtime-map
+`try_read` reports only live materialized handles, not queued work. Disk bytes reuse
+the deployment space provider, retaining only database/data/temporary role values.
+
+Schema version 2 uses compact keys: `v` version, `q` sequence, `i` process identity
+(`p` PID, `t` Phoenix startup Unix milliseconds or null when unknown), `x` sample, `f` eleven fixed
+failure-delta slots, and `z` four recorder-drop slots. In `x`: `k` phase (`s` startup,
+`r` running), `t` sample Unix milliseconds, `u` process uptime milliseconds, `h` host
+uptime seconds, `g` generation Unix milliseconds, `d` disk Unix milliseconds, `m`
+proportional source (`p` Linux PSS, `f` macOS footprint, `u` unsupported), `r` current
+API RSS bytes, `p` API proportional bytes, `l` lifetime maximum RSS bytes, `b` host
+total/available/swap-used/swap-total bytes, `v` pressure, `s` disk available bytes by
+database/data/temporary role, `a` deduplicated managed proportional bytes, `n`
+observed managed PID count, `w` live materialized handles, `e` latest known boundary
+failure Unix milliseconds, and `c` SQLite extended code. Pressure reserves `n/w/c`
+enum values but has no supported sampler. Failure/drop slot order is specified by
+REQ-DEPLOY-007d; null means no reported positive delta, not proof of zero or coverage.
+
+Writer baselines advance only after append and sync. In-memory sampled, queued,
+appended and committed counters remain distinct; a surviving frame does not prove
+pre-crash sync. Startup phase, identity and host/process uptime offer restart evidence
+without inventing boot IDs, missing samples, gap durations or peaks. No DB scan,
+paths, process names, source identifiers, error strings or secrets are retained.
+
+Verification: native tests/builds remain **unrun** under the resource gate. Added
+source regressions cover first-launch parent preparation and pre-DB ordering, unknown
+startup timestamp serialization, unavailable samplers, shared About projection/dedup, metric
+separation, fixed disk roles, restart/reboot evidence, closed serialization allowlists,
+cadence/terminal writer failure, committed delta progression, and the full-width frame
+bound. Standalone rustfmt/diff and static source/serialization inspection are the
+only validation performed for this integration.
 
 ## Current Reality
 
@@ -74,6 +122,7 @@ staying safe to open because ordinary inspection changes nothing.
 | **REQ-DEPLOY-006:** Surface logging destinations, never their contents | Implemented | `LogInfo` reports stdout, process-rotated structured-file, and bounded fatal-diagnostic destinations from one immutable process configuration, and the page renders their facts only. Development, bare, and launchd launchers retain bounded output separately for failures that happen outside the running logger. |
 | **REQ-DEPLOY-006A:** Observe persistence-boundary and diagnostic-sink failures | Implemented with exporter capability limit | Fixed process-local atomic count/time observations cover the existing fatal authority boundary, underlying structured-file/stdout Write and flush errors, fatal diagnostic failures, and OTLP export results. Nonblocking queue drops remain separate. The fence supplies its existing exact static boundary without a second authority representation. Datadog's SDK exposes no exporter injection/callback, so its failure-observation capability is explicitly unavailable; its existing pipeline is preserved. Counters reset on process replacement and do not prove health or own runtime correctness. |
 | **REQ-DEPLOY-007:** Freshness of sampled values | Implemented | `DeploymentInfo`, `DeploymentDiskInfo`, and `AboutResourcesSnapshot` all carry `sampled_at`; the UI distinguishes deployment-facts refresh, disk refresh, and continuous resource sampling rather than serving one cached omnibus snapshot. |
+| **REQ-DEPLOY-007b–007d:** Bounded autonomous private resource evidence | Implemented; native validation pending | Nonfatal pre-DB initialization, shared monitor projection, fixed-role disks, nonblocking live handle count, fixed failure/drop deltas with post-sync baselines, and compact typed frames. Native tests are authored but unrun under the resource gate. |
 | **REQ-DEPLOY-008:** Safely clean up leftover managed worktrees | Implemented | `POST /api/deployment/disk/managed-worktrees/cleanup` revalidates DB ownership, Phoenix path shape, live-conversation ownership, and mode semantics before removal; the UI offers cleanup only for typed leftover rows whose disposition allows it. |
 
 ## Behavioural Specification

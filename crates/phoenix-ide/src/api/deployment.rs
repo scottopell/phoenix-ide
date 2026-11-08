@@ -1400,14 +1400,48 @@ pub fn absolutize(path: &Path) -> PathBuf {
     }
 }
 
+pub(crate) struct ResourceSummary {
+    pub managed_total: ManagedResourceTotals,
+    pub api_rss_bytes: Option<u64>,
+    pub api_proportional_bytes: Option<u64>,
+}
+
+pub(crate) fn resource_summary(
+    generation: &super::resource_monitor::ResourceObservationGeneration,
+) -> ResourceSummary {
+    let mut all_pids = generation.api_pids.clone();
+    all_pids.extend(generation.all_bash_pids());
+    if let Some(pids) = &generation.terminal_pids {
+        all_pids.extend(pids);
+    }
+    let api_sum = |reading: fn(&ProcessObservation) -> Option<u64>| {
+        if generation.api_pids.is_empty() {
+            return None;
+        }
+        generation.api_pids.iter().try_fold(0_u64, |total, pid| {
+            total.checked_add(reading(generation.observations.get(pid)?)?)
+        })
+    };
+    ResourceSummary {
+        managed_total: managed_totals_from_observations(
+            &all_pids,
+            &generation.observations,
+            generation.incomplete_bash_scopes.is_empty()
+                && generation.terminal_pids.is_some()
+                && !generation.api_pids.is_empty()
+                && all_pids
+                    .iter()
+                    .all(|pid| generation.observations.contains_key(pid)),
+        ),
+        api_rss_bytes: api_sum(|row| row.current_rss_bytes),
+        api_proportional_bytes: api_sum(|row| row.memory_bytes),
+    }
+}
+
 async fn sample_about_resources(state: &AppState) -> AboutResourcesSnapshot {
     let generation = state.resource_monitor.observe(state).await;
+    let summary = resource_summary(&generation);
     let bash_pids = generation.all_bash_pids();
-    let mut all_pids = generation.api_pids.clone();
-    all_pids.extend(bash_pids.iter().copied());
-    if let Some(terminal_pids) = &generation.terminal_pids {
-        all_pids.extend(terminal_pids.iter().copied());
-    }
 
     let api = if generation.api_pids.is_empty() {
         unavailable_category(
@@ -1464,11 +1498,7 @@ async fn sample_about_resources(state: &AppState) -> AboutResourcesSnapshot {
     AboutResourcesSnapshot {
         sampled_at: generation.sampled_at,
         host: generation.host.clone(),
-        managed_total: managed_totals_from_observations(
-            &all_pids,
-            &generation.observations,
-            generation.incomplete_bash_scopes.is_empty(),
-        ),
+        managed_total: summary.managed_total,
         categories: vec![
             api,
             bash,
@@ -1624,31 +1654,54 @@ fn totals_from_rows(processes: &[ManagedProcessRow]) -> ManagedResourceTotals {
     }
 }
 
-pub(crate) async fn sample_host_resources() -> HostResources {
+fn host_swap_bytes(supported: bool, total: u64, used: u64) -> [Option<u64>; 2] {
+    // sysinfo's zero total also encodes a failed native read on a fresh System.
+    if !supported || total == 0 || used > total {
+        tracing::debug!(
+            metric = "host_swap",
+            "resource metric unavailable or ambiguous"
+        );
+        [None; 2]
+    } else {
+        [Some(used), Some(total)]
+    }
+}
+
+pub(crate) async fn sample_host_resources() -> (HostResources, [Option<u64>; 2]) {
     use sysinfo::System;
 
     let cpu = sample_host_cpu_breakdown().await;
     let mut sys = System::new();
     sys.refresh_memory();
 
-    let total_memory_bytes = Some(sys.total_memory());
-    let available_memory_bytes = Some(sys.available_memory());
+    let total_memory_bytes =
+        (sysinfo::IS_SUPPORTED_SYSTEM && sys.total_memory() != 0).then(|| sys.total_memory());
+    let available_memory_bytes = (sysinfo::IS_SUPPORTED_SYSTEM && sys.available_memory() != 0)
+        .then(|| sys.available_memory());
     let used_memory_bytes = total_memory_bytes
         .zip(available_memory_bytes)
         .map(|(t, a)| t.saturating_sub(a));
     let load = System::load_average();
-    HostResources {
-        logical_cpu_count: cpu.logical_cpu_count,
-        cpu_busy_percent: cpu.busy_percent,
-        cpu_system_percent: cpu.system_percent,
-        cpu_idle_percent: cpu.idle_percent,
-        total_memory_bytes,
-        available_memory_bytes,
-        used_memory_bytes,
-        load_average_one: Some(load.one),
-        load_average_five: Some(load.five),
-        load_average_fifteen: Some(load.fifteen),
-    }
+    let swap = host_swap_bytes(
+        sysinfo::IS_SUPPORTED_SYSTEM,
+        sys.total_swap(),
+        sys.used_swap(),
+    );
+    (
+        HostResources {
+            logical_cpu_count: cpu.logical_cpu_count,
+            cpu_busy_percent: cpu.busy_percent,
+            cpu_system_percent: cpu.system_percent,
+            cpu_idle_percent: cpu.idle_percent,
+            total_memory_bytes,
+            available_memory_bytes,
+            used_memory_bytes,
+            load_average_one: Some(load.one),
+            load_average_five: Some(load.five),
+            load_average_fifteen: Some(load.fifteen),
+        },
+        swap,
+    )
 }
 
 /// Size a single configured location per its [`MeasureMode`].
@@ -2253,6 +2306,7 @@ mod tests {
             (
                 1,
                 ProcessObservation {
+                    current_rss_bytes: None,
                     pid: 1,
                     name: "api".to_string(),
                     cpu_percent: Some(1.0),
@@ -2264,6 +2318,7 @@ mod tests {
             (
                 2,
                 ProcessObservation {
+                    current_rss_bytes: None,
                     pid: 2,
                     name: "bash".to_string(),
                     cpu_percent: Some(2.0),
@@ -2290,6 +2345,7 @@ mod tests {
                 (
                     pid,
                     ProcessObservation {
+                        current_rss_bytes: None,
                         pid,
                         name: name.into(),
                         cpu_percent: Some(cpu),
@@ -2308,6 +2364,14 @@ mod tests {
         assert_eq!(incomplete.memory_bytes, None);
         assert_eq!(incomplete.process_count, 2);
         assert_eq!(incomplete.deduplicated_pid_count, 2);
+    }
+
+    #[test]
+    fn host_swap_keeps_zero_usage_but_not_ambiguous_zero_total_or_unsupported_sources() {
+        assert_eq!(host_swap_bytes(true, 100, 0), [Some(0), Some(100)]);
+        assert_eq!(host_swap_bytes(true, 0, 0), [None; 2]);
+        assert_eq!(host_swap_bytes(false, 100, 10), [None; 2]);
+        assert_eq!(host_swap_bytes(true, 100, 101), [None; 2]);
     }
 
     #[test]

@@ -3,13 +3,13 @@
 //!
 //! Samples the core trio — `cpu_pct`, `memory_bytes` (proportional /
 //! shared-aware, NOT RSS), `process_count` — over a bash handle's process
-//! *group* (the `pgid`), at request time only. There is no background
-//! sampler: the group is read exactly when an operator is watching it.
+//! *group* (the `pgid`). The shared resource monitor also uses these native
+//! readers for About and the bounded recorder (REQ-DEPLOY-007a–007d).
 //!
 //! Two platform concerns, each with a `#[cfg(target_os = …)]` arm and a
 //! null-returning fallback so every metric degrades to `null` (with a
 //! `debug` log) rather than a misleading `0` on an unsupported host — the
-//! same null-not-zero convention `api::deployment::sample_resources` uses:
+//! same null-not-zero convention `api::deployment::resource_summary` uses:
 //!
 //! 1. **Group membership** — which pids share the `pgid`:
 //!    - Linux: scan `/proc/<pid>/stat` for processes whose process-group id
@@ -35,6 +35,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ProcessObservation {
+    pub current_rss_bytes: Option<u64>,
     pub pid: u32,
     pub name: String,
     pub cpu_percent: Option<f32>,
@@ -145,6 +146,11 @@ pub(crate) async fn sample_process_observations(
                 .map(|tasks| u32::try_from(tasks.len()).unwrap_or(u32::MAX)),
         );
         rows.push(ProcessObservation {
+            current_rss_bytes: log_metric_gap(
+                pid,
+                "current RSS",
+                (sysinfo::IS_SUPPORTED_SYSTEM && process.memory() != 0).then(|| process.memory()),
+            ),
             pid,
             name: process.name().to_string_lossy().into_owned(),
             cpu_percent: Some(process.cpu_usage()),
