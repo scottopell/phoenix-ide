@@ -2445,7 +2445,7 @@ pub(crate) async fn conversation_retains_work_scope(
     ))
 }
 
-pub(crate) async fn conversation_retains_work_scope_during_startup_reconciliation(
+pub(crate) async fn conversation_retains_work_scope_for_reclamation(
     db: &crate::db::Database,
     conv: &crate::db::Conversation,
 ) -> Result<bool, crate::db::DbError> {
@@ -2455,8 +2455,11 @@ pub(crate) async fn conversation_retains_work_scope_during_startup_reconciliatio
             | crate::db::ProductConversationAdmission::Refused(_),
         ) => Ok(true),
         crate::db::MessageTargetAdmission::Aggregate(
-            crate::db::ProductConversationAdmission::History(_),
-        ) => Ok(false),
+            crate::db::ProductConversationAdmission::History(product_conversation_id),
+        ) => Ok(db
+            .get_active_close_projection_for_product(&product_conversation_id)
+            .await?
+            .is_some()),
         crate::db::MessageTargetAdmission::StandaloneAvailable
         | crate::db::MessageTargetAdmission::StandaloneArchived => {
             Ok(conversation_attachment_retains_work_scope(conv))
