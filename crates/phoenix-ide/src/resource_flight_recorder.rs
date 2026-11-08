@@ -742,7 +742,7 @@ mod tests {
         counters.dropped_full.store(12, Relaxed);
         run(&mut fake, 0, record(1).process, rx, &counters);
         assert_eq!(counters.committed.load(Relaxed), 3);
-        let bytes = fake.bytes.lock().unwrap();
+        let bytes = &fake.bytes;
         let mut offset = 0;
         for (expected, drops) in [(Some(7), Some(12)), (None, None), (Some(2), None)] {
             let length = usize::from(u16::from_le_bytes([bytes[offset], bytes[offset + 1]]));
