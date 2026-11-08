@@ -16,6 +16,7 @@ Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance c
 | REQ-FED-017–018 | Defined | Complexity boundaries and non-goals are normative in `requirements.md`. |
 | REQ-FED-019 | Implemented | Enrollment and peer-connection writes require a validated `PeerDisplayName`; constructor/JSON and HTTP tests pass for blank names and case/whitespace variants of local, including rejection without replacing credentials or connections. |
 | REQ-FED-020 | Implemented; deployment pending | Separate closed remote read/set requests, source Coordinator dispatch gate, authenticated destination transaction, strict preference-only set and response verification passed focused regressions, exact-range review, full repository qualification, and merge-head CI. Production deployment and live cross-host acceptance are not established. No generic settings, trust/enrollment, or combined enable-and-create operation is included. |
+| REQ-FED-021–024 | Planned; not implemented | Normative contracts for native federated ordinary-conversation creation and rename are defined in `requirements.md` and `federation.allium`, aligned with ADR-243 and creation/identity requirements. No runtime endpoints, action wiring, or implementation tests are claimed. |
 
 ## Existing foundations
 
@@ -36,4 +37,4 @@ Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance c
 
 ## Delivery inventory
 
-Goal mutations (including creation), generic settings beyond the typed automatic-continuation preference, Continue, conversation creation, rename, reverse enrollment, live peer changes, and combined enable-and-create are not implemented in this status snapshot. This inventory reports delivered behavior; it does not narrow separately authorized scope.
+Goal mutations (including creation), generic settings beyond the typed automatic-continuation preference, Continue, native federated ordinary-conversation creation and rename, reverse enrollment, live peer changes, and combined enable-and-create are not implemented in this status snapshot. REQ-FED-021–024 describe planned behavior only; this inventory reports delivered behavior and does not narrow separately authorized scope.
