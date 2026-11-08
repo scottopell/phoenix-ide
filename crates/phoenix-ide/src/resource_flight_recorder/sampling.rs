@@ -6,8 +6,8 @@ use std::time::Duration;
 
 const CADENCE: Duration = Duration::from_secs(60);
 
-fn unix_ms() -> u64 {
-    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0)
+fn unix_ms() -> Option<u64> {
+    u64::try_from(chrono::Utc::now().timestamp_millis()).ok()
 }
 
 fn unavailable(phase: Phase) -> Sample {
@@ -151,7 +151,7 @@ pub(crate) fn spawn_sampler(state: AppState, handle: Handle) {
             ];
             sample.disk_available_bytes =
                 crate::api::deployment_observations::recorder_space(&state.runtime_env).await;
-            sample.disk_unix_ms = Some(unix_ms());
+            sample.disk_unix_ms = unix_ms();
             sample.live_materialized_handles = state.runtime.live_materialized_handle_count();
             let mut failure_counts = failures(&mut sample);
             let sinks = crate::logging::observations::snapshot(&state.deployment.log);

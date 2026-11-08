@@ -60,7 +60,7 @@ pub(crate) struct Sample {
     #[serde(rename = "k")]
     pub phase: Phase,
     #[serde(rename = "t")]
-    pub sampled_unix_ms: u64,
+    pub sampled_unix_ms: Option<u64>,
     #[serde(rename = "u")]
     pub process_uptime_ms: u64,
     #[serde(rename = "h")]
@@ -536,7 +536,7 @@ mod tests {
             },
             sample: Sample {
                 phase: Phase::Running,
-                sampled_unix_ms: 11,
+                sampled_unix_ms: Some(11),
                 process_uptime_ms: 6,
                 host_uptime_secs: None,
                 generation_unix_ms: None,
@@ -679,7 +679,7 @@ mod tests {
         let mut r = record(u64::MAX);
         r.process.pid = u32::MAX;
         r.process.started_unix_ms = Some(u64::MAX);
-        r.sample.sampled_unix_ms = u64::MAX;
+        r.sample.sampled_unix_ms = Some(u64::MAX);
         r.sample.process_uptime_ms = u64::MAX;
         r.sample.host_uptime_secs = Some(u64::MAX);
         r.sample.generation_unix_ms = Some(u64::MAX);
@@ -699,13 +699,26 @@ mod tests {
         r.failure_deltas = [Some(u64::MAX); 11];
         r.recorder_drop_deltas = [Some(u64::MAX); 4];
         assert!(frame(&r).unwrap().len() <= FRAME_BYTES);
-        assert_eq!(serde_json::to_value(&r).unwrap()["i"]["t"], u64::MAX);
+        let value = serde_json::to_value(&r).unwrap();
+        assert_eq!(value["i"]["t"], u64::MAX);
+        for key in ["t", "g", "d"] {
+            assert_eq!(value["x"][key], u64::MAX);
+        }
         r.process.started_unix_ms = None;
+        r.sample.sampled_unix_ms = None;
+        r.sample.generation_unix_ms = None;
+        r.sample.disk_unix_ms = None;
         assert!(frame(&r).unwrap().len() <= FRAME_BYTES);
         let value = serde_json::to_value(&r).unwrap();
-        assert!(value["i"]["t"].is_null());
+        assert_eq!(value["i"].get("t"), Some(&serde_json::Value::Null));
+        for key in ["t", "g", "d"] {
+            assert_eq!(value["x"].get(key), Some(&serde_json::Value::Null));
+        }
         let decoded: Record = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.process.started_unix_ms, None);
+        assert_eq!(decoded.sample.sampled_unix_ms, None);
+        assert_eq!(decoded.sample.generation_unix_ms, None);
+        assert_eq!(decoded.sample.disk_unix_ms, None);
         let mut bounded = BoundedJson(Vec::new());
         assert!(bounded.write_all(&[0; FRAME_BYTES]).is_err());
         assert!(bounded.0.is_empty());
@@ -756,7 +769,7 @@ mod tests {
         let mut second = record(2);
         second.process.pid = 8;
         second.process.started_unix_ms = Some(5000);
-        second.sample.sampled_unix_ms = 5001;
+        second.sample.sampled_unix_ms = Some(5001);
         second.sample.host_uptime_secs = Some(3);
         second.sample.process_uptime_ms = 1;
         second.sample.phase = Phase::Startup;

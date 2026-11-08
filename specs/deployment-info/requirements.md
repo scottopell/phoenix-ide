@@ -575,7 +575,7 @@ The recorder SHALL NOT persist database or executable paths, filesystem identiti
 
 THE SYSTEM SHALL distinguish current RSS, Linux proportional set size, macOS physical footprint, and lifetime maximum RSS. Missing metrics SHALL be null, not zero, stale substitutes, or invented peaks. Host pressure, lifetime maximum RSS, and SQLite extended error code SHALL be null without a supported observation at their true boundary. SQLite codes SHALL NOT be inferred from error strings. Resource generation and disk times SHALL identify freshness separately from the final sample time.
 
-Startup records SHALL NOT assert that application state or resources were sampled. An unavailable Phoenix startup timestamp SHALL serialize as null, not an invented zero. Process identities, wall times, and host/process uptime SHALL provide limited evidence across restarts; absent intervals SHALL remain unknown, with no invented samples, boot identity, gap duration, or lifetime peak. A surviving valid frame SHALL NOT itself prove successful sync before a crash.
+Startup records SHALL NOT assert that application state or resources were sampled. Unavailable Phoenix startup, sample, resource-generation, and disk-observation timestamps SHALL serialize as null, not an invented zero. Process identities, wall times, and host/process uptime SHALL provide limited evidence across restarts; absent intervals SHALL remain unknown, with no invented samples, boot identity, gap duration, or lifetime peak. A surviving valid frame SHALL NOT itself prove successful sync before a crash.
 
 ### REQ-DEPLOY-007d: Failure deltas and persistence truth
 

@@ -76,8 +76,8 @@ the deployment space provider, retaining only database/data/temporary role value
 Schema version 2 uses compact keys: `v` version, `q` sequence, `i` process identity
 (`p` PID, `t` Phoenix startup Unix milliseconds or null when unknown), `x` sample, `f` eleven fixed
 failure-delta slots, and `z` four recorder-drop slots. In `x`: `k` phase (`s` startup,
-`r` running), `t` sample Unix milliseconds, `u` process uptime milliseconds, `h` host
-uptime seconds, `g` generation Unix milliseconds, `d` disk Unix milliseconds, `m`
+`r` running), `t` sample Unix milliseconds or null when unavailable, `u` process uptime milliseconds, `h` host
+uptime seconds, `g` generation Unix milliseconds or null, `d` disk Unix milliseconds or null, `m`
 proportional source (`p` Linux PSS, `f` macOS footprint, `u` unsupported), `r` current
 API RSS bytes, `p` API proportional bytes, `l` lifetime maximum RSS bytes, `b` host
 total/available/swap-used/swap-total bytes, `v` pressure, `s` disk available bytes by
@@ -95,7 +95,7 @@ paths, process names, source identifiers, error strings or secrets are retained.
 
 Verification: native tests/builds remain **unrun** under the resource gate. Added
 source regressions cover first-launch parent preparation and pre-DB ordering, unknown
-startup timestamp serialization, unavailable samplers, shared About projection/dedup, metric
+startup/sample/generation/disk timestamp null serialization, unavailable samplers, shared About projection/dedup, metric
 separation, fixed disk roles, restart/reboot evidence, closed serialization allowlists,
 cadence/terminal writer failure, committed delta progression, and the full-width frame
 bound. Standalone rustfmt/diff and static source/serialization inspection are the
