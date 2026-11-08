@@ -124,19 +124,8 @@ pub async fn rename_product_conversation(
     Path(reference): Path<String>,
     Json(req): Json<RenameProductConversationRequest>,
 ) -> Result<Json<ProductConversationListRow>, AppError> {
-    let outcome = conversation_actions::rename(
-        &state.runtime,
-        RenameAction::UserApi {
-            reference,
-            title: req.title,
-        },
-    )
-    .await?;
-    let RenameOutcome::UserApi(product_conversation_id) = outcome else {
-        return Err(AppError::Internal(
-            "unexpected Coordinator rename result".into(),
-        ));
-    };
+    let product_conversation_id =
+        conversation_actions::rename_from_user_api(&state.runtime, &reference, &req.title).await?;
     let projection = state
         .db
         .list_ordinary_product_conversation_projections()
@@ -241,9 +230,7 @@ pub async fn regenerate_product_conversation_name(
     Ok(Json(list_row(&projection)))
 }
 
-use crate::conversation_actions::{
-    self, normalize_product_conversation_title, RenameAction, RenameOutcome,
-};
+use crate::conversation_actions::{self, normalize_product_conversation_title};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct AggregateCursor {

@@ -17,10 +17,14 @@ use crate::db::{
 };
 use crate::runtime::{AdmittedOperation, RuntimeManager};
 
+fn normalized_product_conversation_title(
+    title: &str,
+) -> Result<NormalizedConversationTitle, AppError> {
+    NormalizedConversationTitle::parse(title).map_err(db_to_app)
+}
+
 pub(crate) fn normalize_product_conversation_title(title: &str) -> Result<String, AppError> {
-    NormalizedConversationTitle::parse(title)
-        .map(|title| title.as_str().to_owned())
-        .map_err(db_to_app)
+    normalized_product_conversation_title(title).map(|title| title.as_str().to_owned())
 }
 
 pub(crate) struct LocalCoordinatorSource {
@@ -37,64 +41,47 @@ pub(crate) struct CoordinatorRenameIntent {
     pub title: String,
 }
 
-pub(crate) enum RenameAction {
-    UserApi {
-        reference: String,
-        title: String,
-    },
-    CurrentCoordinator {
-        source: LocalCoordinatorSource,
-        intent: CoordinatorRenameIntent,
-    },
-}
-
-pub(crate) enum RenameOutcome {
-    UserApi(ProductConversationId),
-    CurrentCoordinator(ProductConversationRenameResult),
-}
-
-pub(crate) async fn rename(
+pub(crate) async fn rename_from_user_api(
     runtime: &RuntimeManager,
-    action: RenameAction,
-) -> Result<RenameOutcome, AppError> {
-    match action {
-        RenameAction::UserApi { reference, title } => {
-            let title = normalize_product_conversation_title(&title)?;
-            runtime
-                .db()
-                .set_ordinary_product_conversation_title(&reference, &title)
-                .await
-                .map(RenameOutcome::UserApi)
-                .map_err(db_to_app)
-        }
-        RenameAction::CurrentCoordinator { source, intent } => {
-            let command = ProductConversationRenameCommand {
-                operation_id: intent.operation_id,
-                product_conversation_id: intent.product_conversation_id,
-                expected_root_transcript_id: intent.expected_root_transcript_id,
-                expected_name_revision: intent.expected_name_revision,
-                title: NormalizedConversationTitle::parse(&intent.title).map_err(db_to_app)?,
-                source: ProductConversationRenameSource {
-                    source_instance_id: runtime.db().instance_id().await.map_err(db_to_app)?,
-                    product_conversation_id: source.product_conversation_id,
-                    transcript_id: source.transcript_id,
-                    message_id: source.source_call.message_id,
-                    tool_use_id: source.source_call.tool_use_id,
-                },
-            };
-            let owner = runtime
-                .acquire_local_authority_pass()
-                .map_err(|()| AppError::Internal("local authority is closed".into()))?;
-            let authority = RenameAuthorityPass::new(owner);
-            let classified = runtime
-                .db()
-                .rename_product_conversation(&command.source.transcript_id, &command)
-                .await;
-            authority
-                .complete(classified)
-                .map(RenameOutcome::CurrentCoordinator)
-        }
-    }
+    reference: &str,
+    title: &str,
+) -> Result<ProductConversationId, AppError> {
+    let title = normalized_product_conversation_title(title)?;
+    runtime
+        .db()
+        .set_ordinary_product_conversation_title(reference, title.as_str())
+        .await
+        .map_err(db_to_app)
+}
+
+pub(crate) async fn rename_from_current_coordinator(
+    runtime: &RuntimeManager,
+    source: LocalCoordinatorSource,
+    intent: CoordinatorRenameIntent,
+) -> Result<ProductConversationRenameResult, AppError> {
+    let command = ProductConversationRenameCommand {
+        operation_id: intent.operation_id,
+        product_conversation_id: intent.product_conversation_id,
+        expected_root_transcript_id: intent.expected_root_transcript_id,
+        expected_name_revision: intent.expected_name_revision,
+        title: normalized_product_conversation_title(&intent.title)?,
+        source: ProductConversationRenameSource {
+            source_instance_id: runtime.db().instance_id().await.map_err(db_to_app)?,
+            product_conversation_id: source.product_conversation_id,
+            transcript_id: source.transcript_id,
+            message_id: source.source_call.message_id,
+            tool_use_id: source.source_call.tool_use_id,
+        },
+    };
+    let owner = runtime
+        .acquire_local_authority_pass()
+        .map_err(|()| AppError::Internal("local authority is closed".into()))?;
+    let authority = RenameAuthorityPass::new(owner);
+    let classified = runtime
+        .db()
+        .rename_product_conversation(&command.source.transcript_id, &command)
+        .await;
+    authority.complete(classified)
 }
 
 struct RenameAuthorityPass {

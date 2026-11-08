@@ -11,7 +11,6 @@ use serde_json::{json, Value};
 use crate::api::CreateProductConversationRequest;
 use crate::conversation_actions::{
     self, accept_create, CoordinatorRenameIntent, CreateSource, LocalCoordinatorSource,
-    RenameAction, RenameOutcome,
 };
 use crate::db::ProductConversationRenameResult;
 use crate::runtime::RuntimeManager;
@@ -213,24 +212,19 @@ impl RenameConversation {
                 title,
             } => {
                 let source = mutation_source(&self.0, &ctx).await?;
-                let outcome = conversation_actions::rename(
+                let result = conversation_actions::rename_from_current_coordinator(
                     &self.0,
-                    RenameAction::CurrentCoordinator {
-                        source,
-                        intent: CoordinatorRenameIntent {
-                            operation_id: operation_id.0,
-                            product_conversation_id,
-                            expected_root_transcript_id,
-                            expected_name_revision,
-                            title,
-                        },
+                    source,
+                    CoordinatorRenameIntent {
+                        operation_id: operation_id.0,
+                        product_conversation_id,
+                        expected_root_transcript_id,
+                        expected_name_revision,
+                        title,
                     },
                 )
                 .await
                 .map_err(|e| e.to_string())?;
-                let RenameOutcome::CurrentCoordinator(result) = outcome else {
-                    return Err("unexpected user API rename result".into());
-                };
                 Ok(match result {
                     ProductConversationRenameResult::Applied(receipt) => {
                         json!({"status":"applied", "receipt":receipt})
