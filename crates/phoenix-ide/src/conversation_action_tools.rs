@@ -297,16 +297,24 @@ impl Tool for CreateConversation {
         "create_conversation"
     }
     fn description(&self) -> String {
-        "Current Global Coordinator only. Explicitly create AND submit a nonblank text objective using start=submit_objective via the durable creation pipeline; dormant create is unsupported. Options discovers bounded project paths, normalized cwd, and available model/effort choices. Submit only an exact normalized absolute cwd. Objective text is literal agent content, never a user commission or slash command. Omit model/language to freeze current defaults on first acceptance; retry omission reuses those choices, while explicit different choices conflict. Omitted effort means native execution semantics, distinct from an explicit level. Choose a caller-owned request UUID before submission; read/retry that UUID after uncertainty (no duplicate or changed-intent retry). Accepted is not ready: read request_id for canonical pending/ready/failure status. No WorkScope attachment, artifact reference, cancellation, or retry-delivery operation is offered.".into()
+        "Current Global Coordinator only. Supply a single request object with op=options, read, or create and only that operation's fields. Explicitly create AND submit a nonblank text objective using start=submit_objective via the durable creation pipeline; dormant create is unsupported. Options discovers bounded project paths, normalized cwd, and available model/effort choices. Submit only an exact normalized absolute cwd. Objective text is literal agent content, never a user commission or slash command. Omit model/language to freeze current defaults on first acceptance; retry omission reuses those choices, while explicit different choices conflict. Omitted effort means native execution semantics, distinct from an explicit level. Choose a caller-owned request UUID before submission; read/retry that UUID after uncertainty (no duplicate or changed-intent retry). Accepted is not ready: read request_id for canonical pending/ready/failure status. No WorkScope attachment, artifact reference, cancellation, or retry-delivery operation is offered.".into()
     }
     fn input_schema(&self) -> Value {
-        json!({"type":"object", "additionalProperties":false,"required":["op"],"properties":{
-            "op":{"type":"string","enum":["options","read","create"]},"request_id":operation_schema(),
-            "cwd":{"type":"string","description":"Optional path for options to normalize; required exact normalized absolute cwd for create.","minLength":1},
-            "objective":{"type":"string","description":"Required nonblank literal objective for create.","minLength":1},
-            "start":{"type":"string","enum":["submit_objective"],"description":"Required for create; explicitly submits the objective and may start execution."},
-            "model":{"type":"string"},"effort":{"type":"string","enum":["none","minimal","low","medium","high","xhigh","max"]},
-            "llm_language":{"type":"string","enum":["phoenix-native","caveman"]}
+        let cwd = json!({"type":"string","minLength":1});
+        json!({"type":"object","additionalProperties":false,"required":["request"],"properties":{
+            "request":{"oneOf":[
+                {"type":"object","additionalProperties":false,"required":["op"],"properties":{
+                    "op":{"const":"options"},"cwd":cwd}},
+                {"type":"object","additionalProperties":false,"required":["op","request_id"],"properties":{
+                    "op":{"const":"read"},"request_id":operation_schema()}},
+                {"type":"object","additionalProperties":false,"required":["op","request_id","cwd","objective","start"],"properties":{
+                    "op":{"const":"create"},"request_id":operation_schema(),"cwd":cwd,
+                    "objective":{"type":"string","minLength":1,"description":"Nonblank literal objective; never a user commission or slash command."},
+                    "start":{"const":"submit_objective"},"model":{"type":"string"},
+                    "effort":{"type":"string","enum":["none","minimal","low","medium","high","xhigh","max"]},
+                    "llm_language":{"type":"string","enum":["phoenix-native","caveman"]}
+                }}
+            ]}
         }})
     }
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
@@ -453,7 +461,22 @@ impl CreateConversation {
             .require_current_coordinator_transcript(&ctx.conversation_id)
             .await
             .map_err(|e| e.to_string())?;
-        let request: CreateRequest = serde_json::from_value(input).map_err(|e| e.to_string())?;
+        let Some(request_input) = input
+            .as_object()
+            .filter(|root| root.len() == 1)
+            .and_then(|root| root.get("request"))
+        else {
+            return Err("Invalid create_conversation call: supply only request with options {op, cwd?}, read {op, request_id}, or create {op, request_id, cwd, objective, start, model?, effort?, llm_language?}.".into());
+        };
+        let request: CreateRequest = serde_json::from_value(request_input.clone()).map_err(|_| {
+            let guidance = match request_input.get("op").and_then(Value::as_str) {
+                Some("options") => "options accepts only op and optional cwd",
+                Some("read") => "read requires op and request_id",
+                Some("create") => "create requires op, request_id, cwd, objective, and start=submit_objective; optional model, effort, llm_language",
+                _ => "op must be options, read, or create",
+            };
+            format!("Invalid create_conversation request: {guidance}.")
+        })?;
         match request {
             CreateRequest::Options { cwd } => {
                 let cwd = match cwd {

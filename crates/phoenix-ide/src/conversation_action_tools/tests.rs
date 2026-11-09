@@ -1,11 +1,83 @@
 use super::*;
 
+fn create_input(request: Value) -> Value {
+    json!({"request": request})
+}
+
 fn submit() -> Value {
     json!({
         "op": "create", "request_id": "01b22123-04de-4b01-88dd-83e74eb2ed51",
         "cwd": "/tmp/project", "objective": "/skill this stays literal",
         "start": "submit_objective"
     })
+}
+
+#[tokio::test]
+async fn create_schema_closes_the_envelope_and_each_operation_branch() {
+    let (runtime, _, gc) = native_runtime().await;
+    let registry = tools(runtime, &gc).await.unwrap();
+    let schema = registry
+        .iter()
+        .find(|tool| tool.name() == "create_conversation")
+        .unwrap()
+        .input_schema();
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["required"], json!(["request"]));
+    let branches = schema["properties"]["request"]["oneOf"].as_array().unwrap();
+    assert_eq!(branches.len(), 3);
+    for branch in branches {
+        assert_eq!(branch["additionalProperties"], false);
+        assert_eq!(branch["type"], "object");
+    }
+    assert_eq!(branches[0]["properties"]["op"]["const"], "options");
+    assert_eq!(branches[1]["properties"]["op"]["const"], "read");
+    assert_eq!(branches[2]["properties"]["op"]["const"], "create");
+    assert_eq!(
+        branches[2]["properties"]["start"]["const"],
+        "submit_objective"
+    );
+}
+
+#[tokio::test]
+async fn malformed_create_calls_are_non_durable_and_errors_are_operation_guided() {
+    let (runtime, db, gc) = native_runtime().await;
+    let tool = CreateConversation(runtime);
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let malformed = [
+        json!({"op":"options", "request_id":request_id}),
+        json!({"op":"read", "cwd":"/secret/path"}),
+        json!({"op":"create", "request_id":request_id, "cwd":"/secret/path", "objective":"private objective", "start":"submit_objective", "reference":"wrong operation"}),
+    ];
+    let expected = ["options", "read", "create"];
+    for (request, operation) in malformed.into_iter().zip(expected) {
+        let output = tool.run(create_input(request), native_context(&gc)).await;
+        let error: Value = serde_json::from_str(output.output()).unwrap();
+        assert_eq!(error["status"], "error");
+        let message = error["error"].as_str().unwrap();
+        assert!(message.contains(operation), "{message}");
+        assert!(!message.contains("/secret/path"), "{message}");
+        assert!(!message.contains("private objective"), "{message}");
+    }
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_jobs WHERE request_id=?1")
+            .bind(&request_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn create_registration_is_single_tool() {
+    let (runtime, _, gc) = native_runtime().await;
+    let registry = tools(runtime, &gc).await.unwrap();
+    assert_eq!(
+        registry
+            .iter()
+            .filter(|tool| tool.name() == "create_conversation")
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -242,11 +314,11 @@ async fn native_creation_read_and_submit_receipt_require_current_snapshot_author
         .unwrap();
     let accepted = create
         .run(
-            json!({
+            create_input(json!({
                 "op":"create", "request_id":request_id,
                 "cwd":cwd.to_string_lossy(), "objective":"snapshot objective",
                 "start":"submit_objective", "model":"gpt-5.6-sol"
-            }),
+            })),
             native_context(&gc),
         )
         .await;
@@ -256,11 +328,11 @@ async fn native_creation_read_and_submit_receipt_require_current_snapshot_author
     );
     let replay = create
         .run(
-            json!({
+            create_input(json!({
                 "op":"create", "request_id":request_id,
                 "cwd":cwd.to_string_lossy(), "objective":"snapshot objective",
                 "start":"submit_objective", "model":"gpt-5.6-sol"
-            }),
+            })),
             native_context(&gc),
         )
         .await;
@@ -269,11 +341,11 @@ async fn native_creation_read_and_submit_receipt_require_current_snapshot_author
     assert_eq!(replay["request_id"], request_id);
     let changed = create
         .run(
-            json!({
+            create_input(json!({
                 "op":"create", "request_id":request_id,
                 "cwd":cwd.to_string_lossy(), "objective":"changed objective",
                 "start":"submit_objective", "model":"gpt-5.6-sol"
-            }),
+            })),
             native_context(&gc),
         )
         .await;
@@ -482,14 +554,19 @@ async fn native_registered_create_freezes_literal_intent_and_reconciles_same_req
         .to_string_lossy()
         .to_string();
     let options = create
-        .run(json!({"op":"options", "cwd":cwd}), native_context(&gc))
+        .run(
+            create_input(json!({"op":"options", "cwd":cwd})),
+            native_context(&gc),
+        )
         .await;
     let options: Value = serde_json::from_str(options.output()).unwrap();
     assert_eq!(options["status"], "options", "{options}");
     let request_id = uuid::Uuid::new_v4().to_string();
     let mut request = json!({"op":"create", "request_id":request_id,
         "cwd":options["cwd"], "objective":"/literal @not-a-user-file 東京", "start":"submit_objective", "model":"gpt-5.6-sol"});
-    let accepted = create.run(request.clone(), native_context(&gc)).await;
+    let accepted = create
+        .run(create_input(request.clone()), native_context(&gc))
+        .await;
     let accepted: Value = serde_json::from_str(accepted.output()).unwrap();
     assert_eq!(accepted["status"], "accepted", "{accepted}");
     let job = db
@@ -504,14 +581,14 @@ async fn native_registered_create_freezes_literal_intent_and_reconciles_same_req
     ));
     let replay = create
         .run(
-            request.clone(),
+            create_input(request.clone()),
             native_context(&gc).with_tool_use_id("retry-call"),
         )
         .await;
     let replay: Value = serde_json::from_str(replay.output()).unwrap();
     assert_eq!(replay, accepted);
     request["objective"] = json!("different intent");
-    let conflict = create.run(request, native_context(&gc)).await;
+    let conflict = create.run(create_input(request), native_context(&gc)).await;
     assert!(matches!(conflict, ToolOutput::Error { .. }));
     let count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_jobs WHERE request_id=?1")
@@ -522,7 +599,7 @@ async fn native_registered_create_freezes_literal_intent_and_reconciles_same_req
     assert_eq!(count, 1);
     let read = create
         .run(
-            json!({"op":"read", "request_id":request_id}),
+            create_input(json!({"op":"read", "request_id":request_id})),
             native_context(&gc),
         )
         .await;
@@ -541,7 +618,7 @@ async fn native_registered_create_freezes_literal_intent_and_reconciles_same_req
     );
     let denied = create
         .run(
-            json!({"op":"options"}),
+            create_input(json!({"op":"options"})),
             native_context("ordinary-or-missing"),
         )
         .await;
@@ -569,7 +646,7 @@ async fn native_registered_creation_read_replays_historical_publication_after_ta
     let dir = tempfile::tempdir().unwrap();
     let options = create
         .run(
-            json!({"op":"options", "cwd":dir.path()}),
+            create_input(json!({"op":"options", "cwd":dir.path()})),
             native_context(&gc),
         )
         .await;
@@ -579,7 +656,9 @@ async fn native_registered_creation_read_replays_historical_publication_after_ta
     let request = json!({"op":"create", "request_id":request_id,
         "cwd":options["cwd"], "objective":"historical native objective",
         "start":"submit_objective", "model":"gpt-5.6-sol"});
-    let accepted = create.run(request.clone(), native_context(&gc)).await;
+    let accepted = create
+        .run(create_input(request.clone()), native_context(&gc))
+        .await;
     let accepted: Value = serde_json::from_str(accepted.output()).unwrap();
     assert_eq!(accepted["status"], "accepted", "{accepted}");
     assert_eq!(accepted["request_id"], request_id);
@@ -661,7 +740,9 @@ async fn native_registered_creation_read_replays_historical_publication_after_ta
         .await
         .unwrap());
     let read_request = json!({"op":"read", "request_id":request_id});
-    let staged = create.run(read_request.clone(), native_context(&gc)).await;
+    let staged = create
+        .run(create_input(read_request.clone()), native_context(&gc))
+        .await;
     let staged: Value = serde_json::from_str(staged.output()).unwrap();
     assert_eq!(staged["status"], "delivery_pending", "{staged}");
     assert!(staged["publication"].is_null());
@@ -727,7 +808,9 @@ async fn native_registered_creation_read_replays_historical_publication_after_ta
     )
     .await
     .unwrap();
-    let failed = create.run(read_request.clone(), native_context(&gc)).await;
+    let failed = create
+        .run(create_input(read_request.clone()), native_context(&gc))
+        .await;
     let failed: Value = serde_json::from_str(failed.output()).unwrap();
     assert_eq!(failed["status"], "published", "{failed}");
     assert_eq!(failed["error"], Value::Null, "{failed}");
@@ -741,7 +824,9 @@ async fn native_registered_creation_read_replays_historical_publication_after_ta
     assert!(failed["publication"]["canonical_route"].as_str().is_some());
 
     db.delete_conversation(&conversation_id).await.unwrap();
-    let historical = create.run(read_request.clone(), native_context(&gc)).await;
+    let historical = create
+        .run(create_input(read_request.clone()), native_context(&gc))
+        .await;
     let historical: Value = serde_json::from_str(historical.output()).unwrap();
     assert_eq!(historical["request_id"], request_id);
     assert_eq!(
@@ -793,16 +878,18 @@ async fn native_registered_creation_read_replays_historical_publication_after_ta
     assert_eq!(job_count, 1);
     let mut changed = request.clone();
     changed["objective"] = json!("changed historical intent");
-    let conflict = create.run(changed, native_context(&gc)).await;
+    let conflict = create.run(create_input(changed), native_context(&gc)).await;
     assert_immutable_creation_conflict(&conflict);
     sqlx::query("UPDATE conversations SET coordinator_head=0 WHERE id=?1")
         .bind(&gc)
         .execute(db.pool())
         .await
         .unwrap();
-    let revoked = create.run(read_request, native_context(&gc)).await;
+    let revoked = create
+        .run(create_input(read_request), native_context(&gc))
+        .await;
     assert!(matches!(revoked, ToolOutput::Error { .. }));
-    let revoked_replay = create.run(request, native_context(&gc)).await;
+    let revoked_replay = create.run(create_input(request), native_context(&gc)).await;
     assert!(matches!(revoked_replay, ToolOutput::Error { .. }));
 }
 
@@ -996,15 +1083,17 @@ async fn native_options_skips_stale_prefix_and_canonicalizes_usable_projects() {
     insert_project_option(&db, "b-file", &file).await;
     insert_project_option(&db, "b-root", std::path::Path::new("/")).await;
     insert_project_option(&db, "z-valid", &temp.path().join(".")).await;
-    let output = tool.run(json!({"op":"options"}), native_context(&gc)).await;
+    let output = tool
+        .run(create_input(json!({"op":"options"})), native_context(&gc))
+        .await;
     let options: Value = serde_json::from_str(output.output()).unwrap();
     assert_eq!(options["projects_truncated"], false);
     assert_eq!(
         options["projects"],
         json!([{"project_id":"z-valid", "cwd":temp.path().canonicalize().unwrap()}])
     );
-    let accepted = tool.run(json!({"op":"create", "request_id":uuid::Uuid::new_v4().to_string(),
-        "cwd":options["projects"][0]["cwd"], "objective":"/literal @original", "start":"submit_objective", "model":"gpt-5.6-sol"}), native_context(&gc)).await;
+    let accepted = tool.run(create_input(json!({"op":"create", "request_id":uuid::Uuid::new_v4().to_string(),
+        "cwd":options["projects"][0]["cwd"], "objective":"/literal @original", "start":"submit_objective", "model":"gpt-5.6-sol"})), native_context(&gc)).await;
     assert!(
         !matches!(accepted, ToolOutput::Error { .. }),
         "{}",
@@ -1030,14 +1119,18 @@ async fn native_options_truncates_only_after_fifty_usable_projects() {
         std::fs::create_dir(&path).unwrap();
         insert_project_option(&db, &format!("z-{index:03}"), &path).await;
     }
-    let output = tool.run(json!({"op":"options"}), native_context(&gc)).await;
+    let output = tool
+        .run(create_input(json!({"op":"options"})), native_context(&gc))
+        .await;
     let options: Value = serde_json::from_str(output.output()).unwrap();
     assert_eq!(options["projects"].as_array().unwrap().len(), 50);
     assert_eq!(options["projects_truncated"], false);
     let path = temp.path().join("last-valid");
     std::fs::create_dir(&path).unwrap();
     insert_project_option(&db, "z-050", &path).await;
-    let output = tool.run(json!({"op":"options"}), native_context(&gc)).await;
+    let output = tool
+        .run(create_input(json!({"op":"options"})), native_context(&gc))
+        .await;
     let options: Value = serde_json::from_str(output.output()).unwrap();
     assert_eq!(options["projects"].as_array().unwrap().len(), 50);
     assert_eq!(options["projects_truncated"], true);
@@ -1103,7 +1196,10 @@ async fn native_options_rejects_missing_and_file_cwd_and_returns_usable_director
     std::fs::write(&file, "fixture").unwrap();
     for path in [temp.path().join("missing"), file] {
         let output = tool
-            .run(json!({"op":"options", "cwd":path}), native_context(&gc))
+            .run(
+                create_input(json!({"op":"options", "cwd":path})),
+                native_context(&gc),
+            )
             .await;
         assert!(
             matches!(output, ToolOutput::Error { .. }),
@@ -1113,7 +1209,7 @@ async fn native_options_rejects_missing_and_file_cwd_and_returns_usable_director
     }
     let options = tool
         .run(
-            json!({"op":"options", "cwd":temp.path()}),
+            create_input(json!({"op":"options", "cwd":temp.path()})),
             native_context(&gc),
         )
         .await;
@@ -1121,9 +1217,9 @@ async fn native_options_rejects_missing_and_file_cwd_and_returns_usable_director
     let request_id = uuid::Uuid::new_v4().to_string();
     let accepted = tool
         .run(
-            json!({"op":"create", "request_id":request_id,
+            create_input(json!({"op":"create", "request_id":request_id,
         "cwd":options["cwd"], "objective":"offline acceptance", "start":"submit_objective",
-        "model":"gpt-5.6-sol"}),
+        "model":"gpt-5.6-sol"})),
             native_context(&gc),
         )
         .await;
@@ -1134,7 +1230,7 @@ async fn native_options_rejects_missing_and_file_cwd_and_returns_usable_director
     );
     let read = tool
         .run(
-            json!({"op":"read", "request_id":request_id}),
+            create_input(json!({"op":"read", "request_id":request_id})),
             native_context(&gc),
         )
         .await;
