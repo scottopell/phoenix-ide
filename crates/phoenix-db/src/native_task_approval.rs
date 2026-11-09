@@ -333,9 +333,7 @@ pub(super) async fn receipt_established(
             && row.get::<String, _>("approved_task_file") == approved.task_file
             && row.get::<String, _>("approved_artifact_body") == approved.artifact_body
             && row.get::<String, _>("content")
-                == approval_message
-                    .content
-                    .to_stored_json()
+                == serde_json::to_string(&approval_message.content.to_stored_json())
                     .map_err(|error| DbError::Serialization(error.to_string()))?,
     )
 }
