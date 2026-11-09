@@ -1737,6 +1737,10 @@ variant NativeEffortSupported : NativeEffortCapabilities {
     native_default: NativeEffortDefault
 }
 
+-- NativeEffortDefault uses an externally tagged strict JSON wire shape. Unknown
+-- is the string `"unknown"`; known is the one-key object
+-- `{"known": <NativeModelEffort>}`. `kind` is a model discriminant, not a wire
+-- field, and no alternate object fields are accepted.
 entity NativeEffortDefault {
     kind: NativeEffortDefaultUnknown | NativeEffortDefaultKnown
 }

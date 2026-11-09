@@ -118,28 +118,55 @@ fn responses_reject_payloads_beyond_route_bound() {
 }
 
 #[test]
-fn create_model_options_round_trip_closed_effort_capabilities() {
-    let capabilities = [
-        phoenix_llm::EffortCapabilities::supported_known(
-            &[
-                phoenix_core::domain::llm_types::ModelEffort::Low,
+fn create_model_options_round_trip_exact_closed_effort_capabilities() {
+    let cases = [
+        (
+            phoenix_llm::EffortCapabilities::supported_known(
+                &[
+                    phoenix_core::domain::llm_types::ModelEffort::Low,
+                    phoenix_core::domain::llm_types::ModelEffort::Medium,
+                ],
                 phoenix_core::domain::llm_types::ModelEffort::Medium,
-            ],
-            phoenix_core::domain::llm_types::ModelEffort::Medium,
+            ),
+            serde_json::json!({
+                "support": "supported",
+                "levels": ["low", "medium"],
+                "native_default": {"known": "medium"},
+            }),
         ),
-        phoenix_llm::EffortCapabilities::supported_unknown(&[
-            phoenix_core::domain::llm_types::ModelEffort::Low,
-            phoenix_core::domain::llm_types::ModelEffort::High,
-        ]),
-        phoenix_llm::EffortCapabilities::Unsupported,
-        phoenix_llm::EffortCapabilities::Unknown,
+        (
+            phoenix_llm::EffortCapabilities::supported_unknown(&[
+                phoenix_core::domain::llm_types::ModelEffort::Low,
+                phoenix_core::domain::llm_types::ModelEffort::High,
+            ]),
+            serde_json::json!({
+                "support": "supported",
+                "levels": ["low", "high"],
+                "native_default": "unknown",
+            }),
+        ),
+        (
+            phoenix_llm::EffortCapabilities::Unsupported,
+            serde_json::json!({"support": "unsupported"}),
+        ),
+        (
+            phoenix_llm::EffortCapabilities::Unknown,
+            serde_json::json!({"support": "unknown"}),
+        ),
     ];
-    for (index, supported_efforts) in capabilities.into_iter().enumerate() {
+    for (index, (supported_efforts, expected_wire)) in cases.into_iter().enumerate() {
         let option = NativeCreateModelOption {
             model: format!("destination-model-{index}"),
             supported_efforts,
         };
         let encoded = serde_json::to_value(&option).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "model": format!("destination-model-{index}"),
+                "supported_efforts": expected_wire,
+            })
+        );
         let decoded: NativeCreateModelOption = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, option);
     }
@@ -169,6 +196,16 @@ fn create_model_options_reject_malformed_effort_capabilities() {
             "native_default": "unknown",
         }),
         serde_json::Value::Null,
+        serde_json::json!({
+            "support": "supported",
+            "levels": ["low"],
+            "native_default": {"kind": "known", "level": "low"},
+        }),
+        serde_json::json!({
+            "support": "supported",
+            "levels": ["low"],
+            "native_default": {"unknown": {}},
+        }),
         serde_json::json!({
             "support": "supported",
             "levels": ["low"],
