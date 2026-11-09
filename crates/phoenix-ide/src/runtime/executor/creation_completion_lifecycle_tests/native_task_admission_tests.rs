@@ -620,10 +620,10 @@ enum InitialApprovalScenario {
 async fn production_initial_approval_provider_success_preserves_body_and_replays() {
     tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        assert_production_initial_approval(
+        Box::pin(assert_production_initial_approval(
             InitialApprovalScenario::ProviderSuccess,
             ReviewedTaskKind::PlainMarkdown,
-        ),
+        )),
     )
     .await
     .expect("real provider entry and durable terminal settlement before exact replay");
@@ -633,10 +633,10 @@ async fn production_initial_approval_provider_success_preserves_body_and_replays
 async fn production_initial_taskmd_approval_provider_success_preserves_body_and_replays() {
     tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        assert_production_initial_approval(
+        Box::pin(assert_production_initial_approval(
             InitialApprovalScenario::ProviderSuccess,
             ReviewedTaskKind::Taskmd,
-        ),
+        )),
     )
     .await
     .expect("real taskmd approval, provider entry and durable settlement before exact replay");
@@ -644,19 +644,19 @@ async fn production_initial_taskmd_approval_provider_success_preserves_body_and_
 
 #[tokio::test]
 async fn production_initial_approval_settles_immediate_context_pressure_and_replays() {
-    assert_production_initial_approval(
+    Box::pin(assert_production_initial_approval(
         InitialApprovalScenario::ContextPressure,
         ReviewedTaskKind::PlainMarkdown,
-    )
+    ))
     .await;
 }
 
 #[tokio::test]
 async fn production_initial_approval_settles_immediate_freeze_failure_and_replays() {
-    assert_production_initial_approval(
+    Box::pin(assert_production_initial_approval(
         InitialApprovalScenario::FreezeFailure,
         ReviewedTaskKind::PlainMarkdown,
-    )
+    ))
     .await;
 }
 
