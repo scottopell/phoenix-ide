@@ -390,6 +390,29 @@ fn validate_new_creation_cwd(cwd: &str, home: &Path, internal: bool) -> Result<S
     .map_err(|error| error.to_string())
 }
 
+fn finish_create_acceptance(
+    runtime: &RuntimeManager,
+    outcome: ProductCreationAcceptOutcome,
+) -> Result<CreateAccepted, AppError> {
+    let (job, newly_accepted): (ProductCreationJobRecord, bool) = match outcome {
+        ProductCreationAcceptOutcome::Accepted(job) => (job, true),
+        ProductCreationAcceptOutcome::Replayed(job) => (job, false),
+        ProductCreationAcceptOutcome::Conflict => {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "request_id conflicts with immutable creation intent",
+                "product_creation_request_conflict",
+            ))));
+        }
+    };
+    if newly_accepted {
+        runtime.kick_creation_worker();
+    }
+    Ok(CreateAccepted {
+        request_id: job.request_id,
+        product_conversation_id: job.product_conversation_id,
+    })
+}
+
 pub(crate) async fn accept_create(
     runtime: &RuntimeManager,
     req: CreateProductConversationRequest,
@@ -494,23 +517,7 @@ where
             )?
         }
     };
-    let (job, newly_accepted): (ProductCreationJobRecord, bool) = match outcome {
-        ProductCreationAcceptOutcome::Accepted(job) => (job, true),
-        ProductCreationAcceptOutcome::Replayed(job) => (job, false),
-        ProductCreationAcceptOutcome::Conflict => {
-            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                "request_id conflicts with immutable creation intent",
-                "product_creation_request_conflict",
-            ))));
-        }
-    };
-    if newly_accepted {
-        runtime.kick_creation_worker();
-    }
-    Ok(CreateAccepted {
-        request_id: job.request_id,
-        product_conversation_id: job.product_conversation_id,
-    })
+    finish_create_acceptance(runtime, outcome)
 }
 
 #[cfg(test)]
@@ -548,15 +555,14 @@ mod tests {
             ModelRegistry::new_empty(),
         );
         let authority = LocalAuthorityPass::new(runtime.acquire_local_authority_pass().unwrap());
-        assert!(authority
-            .complete(
-                phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err(
-                    crate::db::DbError::CurrentCoordinatorRequired
-                ),),
-                db_to_app,
-                local_authority_unclassified,
-            )
-            .is_err());
+        let result: Result<ProductConversationRenameResult, AppError> = authority.complete(
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err(
+                crate::db::DbError::CurrentCoordinatorRequired,
+            )),
+            db_to_app,
+            local_authority_unclassified,
+        );
+        assert!(result.is_err());
         assert!(!runtime.local_authority_is_closed());
         let authority = LocalAuthorityPass::new(runtime.acquire_local_authority_pass().unwrap());
         assert_eq!(
