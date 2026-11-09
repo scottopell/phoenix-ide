@@ -208,3 +208,19 @@ Part A (canonical pending-state capture) and Part B leaf 1 (executing-source pro
 2. Part A head `05dcca22` passed hosted clippy. Leaf head `5335c1ee` subsequently failed hosted compilation in its dynamic SQL test helper, while musl/UI setup also encountered hosted sccache HTTP 504 failures. The bounded witness fix corrects the two introduced compiler errors; exact-head hosted qualification remains pending. No local compiler, build, tests or codegen was run. Complete source actor/receipt/replay and owning Stop admission before enabling any native mutator. The private receipt foundation does not satisfy the remaining end-to-end native approval gates.
 
 The internal Initial execution leaf above is unqualified; no local build/tests/codegen, registration, RC2, release or production work is included. A draft PR triggers standard hosted CI; runtime behavior remains unverified pending those results. The README index labels ADR-244 Proposed; Stop/pause policy is resolved but its implementation is deferred.
+
+### Initial actor review corrections (pending hosted qualification)
+
+Independent static review of the Initial-only actor leaf identified two postcommit
+projection gaps: immediate `RequestLlm` events were discarded, and the ordinary
+state-change SSE notification was bypassed. The native committed path now publishes
+`NotifyStateChange` before dispatch and processes immediate dispatch outcomes through
+the existing reducer settlement path. Failure to settle still closes the authority
+fence without erasing the committed receipt. Runtime regression execution and positive
+manager/Git qualification remain gates, not claims established by this static fix.
+
+The same correction unit revokes the actual `coordinator_head` in the role-first replay
+fixture, uses the typed continuation receipt field, completes exhaustive source-content
+matching, and confines superseded readiness-only queue helpers to tests. Hosted failures
+at `beaac9e6a` included source compile/lint errors; they are not classified as infrastructure.
+No local native compilation or tests were run.

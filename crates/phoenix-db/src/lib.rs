@@ -9197,7 +9197,7 @@ impl Database {
             )),
         )
         .await
-        .map(native_task_approval::ApprovalFact::user_result)
+        .map(|result| native_task_approval::ApprovalFact::user_result(&result))
     }
 
     /// Settle native approval and return the immutable receipt proven inside the transaction.

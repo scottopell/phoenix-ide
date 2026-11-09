@@ -117,7 +117,7 @@ pub(super) enum ApprovalFact {
 
 impl ApprovalFact {
     pub(super) fn user_result(
-        result: crate::workflow::LocalAuthorityResult<Self>,
+        result: &crate::workflow::LocalAuthorityResult<Self>,
     ) -> crate::workflow::LocalAuthorityResult<()> {
         match result {
             crate::workflow::LocalAuthorityResult::DurableFactEstablished(_) => {
@@ -303,7 +303,19 @@ async fn require_committed_canonical_source_tx(
         ContentBlock::ToolUse { id, name, input } if id == &command.source.tool_use_id => {
             Some((name, input))
         }
-        _ => None,
+        ContentBlock::Text { .. }
+        | ContentBlock::Image { .. }
+        | ContentBlock::ToolUse { .. }
+        | ContentBlock::ToolResult { .. }
+        | ContentBlock::ServerToolUse { .. }
+        | ContentBlock::ToolSearchToolResult { .. }
+        | ContentBlock::WebSearchToolResult { .. }
+        | ContentBlock::WebFetchToolResult { .. }
+        | ContentBlock::CodeExecutionToolResult { .. }
+        | ContentBlock::BashCodeExecutionToolResult { .. }
+        | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+        | ContentBlock::McpToolUse { .. }
+        | ContentBlock::McpToolResult { .. } => None,
     });
     let Some((name, input)) = calls.next() else {
         return Err(conflict("native approval canonical source call is missing"));

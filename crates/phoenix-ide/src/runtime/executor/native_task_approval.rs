@@ -132,9 +132,23 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             if let Err(error) = result {
                 tracing::error!(%error, "native approval committed; live projection unavailable");
                 admitted.close("native_approval_postcommit_projection");
-            } else if let Err(error) = Box::pin(self.execute_effect(Effect::RequestLlm)).await {
-                tracing::error!(%error, "native approval committed; continuation dispatch unavailable");
-                admitted.close("native_approval_postcommit_dispatch");
+            } else {
+                let continuation = Box::pin(async {
+                    self.execute_effect(Effect::NotifyStateChange).await?;
+                    match self.execute_effect(Effect::RequestLlm).await {
+                        Ok(Some(event)) => self.process_startup_event(event).await,
+                        Ok(None) => Ok(()),
+                        Err(error) => {
+                            let failure = self.llm_dispatch_failure_event(error);
+                            self.process_startup_event(failure).await
+                        }
+                    }
+                })
+                .await;
+                if let Err(error) = continuation {
+                    tracing::error!(%error, "native approval committed; continuation settlement unavailable");
+                    admitted.close("native_approval_postcommit_dispatch");
+                }
             }
             return Committed(receipt);
         }

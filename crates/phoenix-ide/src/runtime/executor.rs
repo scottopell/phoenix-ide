@@ -3251,6 +3251,7 @@ where
                             }
                             continue;
                         }
+                        #[cfg(test)]
                         AcknowledgedRuntimeRequest::InspectNativeTaskApprovalAdmission { expected, response } => {
                             let result = self.check_native_task_approval_admission(&expected).await;
                             let _ = response.send(result);
@@ -3832,6 +3833,7 @@ where
         }
     }
 
+    #[cfg(test)]
     async fn check_native_task_approval_admission(
         &self,
         expected: &super::task_approval_admission::FrozenPendingTask,

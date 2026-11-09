@@ -611,7 +611,7 @@ async fn canonical_replay_requires_the_stored_source_to_still_be_current_coordin
     let mut f = Fixture::new(false).await;
     f.settle().await.unwrap();
     f.checkpoint_source().await;
-    sqlx::query("DELETE FROM product_conversation_transcripts WHERE transcript_row_id=?1")
+    sqlx::query("UPDATE conversations SET coordinator_head=0 WHERE id=?1")
         .bind(&f.command.source_transcript_id)
         .execute(f.db.pool())
         .await
@@ -619,11 +619,14 @@ async fn canonical_replay_requires_the_stored_source_to_still_be_current_coordin
     f.command.pending.title.push_str(" changed");
     let before = database_rows(&f.db).await;
     let error = f.inspect().await.unwrap_err();
-    assert!(
-        matches!(error, NativeTaskApprovalError::Database(DbError::MessageConflict(ref reason))
-        if reason.contains("current Coordinator"))
-    );
-    assert!(f.settle().await.is_err());
+    assert!(matches!(
+        error,
+        NativeTaskApprovalError::Database(DbError::CurrentCoordinatorRequired)
+    ));
+    assert!(matches!(
+        f.settle().await,
+        Err(DbError::CurrentCoordinatorRequired)
+    ));
     assert_eq!(database_rows(&f.db).await, before);
 }
 
@@ -1194,7 +1197,7 @@ async fn public_native_settlement_returns_transaction_receipt_and_replays_origin
         panic!("native receipt not established");
     };
     assert_eq!(first.approval_message_id, f.message.message_id);
-    assert!(first.continuation_requested);
+    assert_eq!(first.continuation, NativeApprovalContinuation::Requested);
     f.checkpoint_source().await;
     f.db.update_conversation_state(&f.command.current_transcript_id, &ConvState::Idle)
         .await

@@ -286,6 +286,7 @@ pub(crate) enum AcknowledgedRuntimeRequest {
         response: tokio::sync::oneshot::Sender<task_approval_admission::NativeTaskApprovalOutcome>,
         admission: tokio::sync::OwnedMutexGuard<()>,
     },
+    #[cfg(test)]
     InspectNativeTaskApprovalAdmission {
         expected: Box<task_approval_admission::FrozenPendingTask>,
         response: tokio::sync::oneshot::Sender<
@@ -301,7 +302,8 @@ impl AcknowledgedRuntimeRequest {
     fn into_event(self) -> AcknowledgedEventRequest {
         match self {
             Self::Event(event) => *event,
-            Self::InspectNativeTaskApprovalAdmission { .. } => panic!("expected event request"),
+            Self::InspectNativeTaskApprovalAdmission { .. }
+            | Self::ExecuteNativeTaskApproval { .. } => panic!("expected event request"),
         }
     }
 }
@@ -7059,6 +7061,7 @@ impl RuntimeManager {
             .unwrap_or(NativeTaskApprovalOutcome::Unavailable)
     }
 
+    #[cfg(test)]
     pub(crate) async fn check_native_task_approval_admission(
         self: &Arc<Self>,
         expected: task_approval_admission::FrozenPendingTask,
