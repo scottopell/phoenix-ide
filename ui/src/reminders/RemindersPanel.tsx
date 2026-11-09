@@ -8,6 +8,9 @@ import { formatReminderTime, normalizeReminderLocalInput, reminderLocalInput } f
 const STATE_ORDER = { due: 0, scheduled: 1, cancelled: 2 };
 
 type Edit = { reminder: Reminder; local: string; timezone: string; offset: string };
+type UnconfirmedMutation =
+  | { kind: 'cancel'; message: string }
+  | { kind: 'reschedule'; message: string; revision: number; local: string; timezone: string; offset: string };
 
 export function RemindersPanel({ conversationId, readOnly = false }: { conversationId: string; readOnly?: boolean }) {
   return <OwnedRemindersPanel key={conversationId} conversationId={conversationId} readOnly={readOnly} />;
@@ -16,7 +19,8 @@ export function RemindersPanel({ conversationId, readOnly = false }: { conversat
 function OwnedRemindersPanel({ conversationId, readOnly }: { conversationId: string; readOnly: boolean }) {
   const [reminders, setReminders] = useState<Reminder[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [unconfirmed, setUnconfirmed] = useState<Record<string, UnconfirmedMutation>>({});
   const [edit, setEdit] = useState<Edit | null>(null);
   const [saving, setSaving] = useState(false);
   const [confirmedChanges, setConfirmedChanges] = useState<Record<string, 'cancel' | 'reschedule'>>({});
@@ -32,14 +36,24 @@ function OwnedRemindersPanel({ conversationId, readOnly }: { conversationId: str
     setReminders(rows);
     setLoadError(null);
     setConfirmedChanges({});
+    setUnconfirmed((previous) => Object.fromEntries(Object.entries(previous).filter(([id, pending]) => {
+      const saved = rows.find((row) => row.id === id);
+      if (!saved) return true;
+      if (pending.kind === 'cancel') return saved.state.kind !== 'cancelled';
+      if (saved.revision <= pending.revision || saved.state.kind === 'cancelled'
+        || saved.timezone !== pending.timezone || reminderLocalInput(saved) !== normalizeReminderLocalInput(pending.local)) return true;
+      if (!pending.offset) return false;
+      return saved.due_at_us !== Date.parse(`${normalizeReminderLocalInput(pending.local)}${pending.offset}`) * 1000;
+    })));
   }, []);
   const fail = useCallback((failure: unknown) => { setLoadError(failure instanceof Error ? failure.message : 'Failed to load reminders'); }, []);
   const refresh = useReminderRefresh(load, receive, fail);
 
   const manage = async (reminder: Reminder, operation: 'cancel' | 'reschedule') => {
     setSaving(true);
-    setError(null);
-    let committed = false;
+    setErrors((previous) => Object.fromEntries(Object.entries(previous).filter(([id]) => id !== reminder.id)));
+    setUnconfirmed((previous) => Object.fromEntries(Object.entries(previous).filter(([id]) => id !== reminder.id)));
+    let freshReadRequired = false;
     try {
       await api.manageReminder(conversationId, reminder.id, operation, reminder.revision,
         operation === 'reschedule' && edit ? {
@@ -48,24 +62,37 @@ function OwnedRemindersPanel({ conversationId, readOnly }: { conversationId: str
         } : undefined);
       setEdit(null);
       changeEpoch.current += 1;
-      committed = true;
+      freshReadRequired = true;
       setConfirmedChanges((changes) => ({ ...changes, [reminder.id]: operation }));
       setRefreshVersion((version) => version + 1);
     } catch (failure) {
-      setError(`Could not ${operation} reminder: ${failure instanceof Error ? failure.message : 'request failed'}`);
-      if (failure instanceof ApiResponseError && failure.status === 409) setEdit(null);
+      const message = failure instanceof Error ? failure.message : 'request failed';
+      if (failure instanceof ApiResponseError && failure.status < 500 && failure.status !== 408) {
+        setErrors((previous) => ({ ...previous, [reminder.id]: `Could not ${operation} reminder: ${message}` }));
+        if (failure.status === 409) setEdit(null);
+      } else {
+        const pending: UnconfirmedMutation = operation === 'reschedule' && edit
+          ? { kind: 'reschedule', message: `Could not confirm ${operation} reminder: ${message}`,
+            revision: reminder.revision, local: edit.local, timezone: edit.timezone, offset: edit.offset.trim() }
+          : { kind: 'cancel', message: `Could not confirm ${operation} reminder: ${message}` };
+        setUnconfirmed((previous) => ({ ...previous, [reminder.id]: pending }));
+        changeEpoch.current += 1;
+        freshReadRequired = true;
+        setRefreshVersion((version) => version + 1);
+      }
     } finally {
       setSaving(false);
-      if (!committed) refresh();
+      if (!freshReadRequired) refresh();
     }
   };
 
   const displayedReminders = reminders?.toSorted((a, b) => STATE_ORDER[a.state.kind] - STATE_ORDER[b.state.kind]) ?? [];
   return <>
     <ReminderFetchStatus error={loadError} loaded={reminders !== null} retry={refresh} />
-    {(displayedReminders.length > 0 || error || edit) && <section className="reminders-panel" aria-label="Reminders">
+    {(displayedReminders.length > 0 || Object.keys(errors).length > 0 || edit || Object.keys(unconfirmed).length > 0) && <section className="reminders-panel" aria-label="Reminders">
     <h2>Reminders</h2>
-    {error && <p role="alert">{error}</p>}
+    {Object.entries(errors).map(([id, message]) => <p role="alert" key={id}>{message}</p>)}
+    {Object.entries(unconfirmed).map(([id, pending]) => <p role="alert" key={id}>{pending.message}</p>)}
     <ul>{displayedReminders.map((reminder) => <li key={reminder.id} className={`reminder-card reminder-card--${reminder.state.kind}`}>
       <span className="reminder-card__state">{confirmedChanges[reminder.id]
         ? `${confirmedChanges[reminder.id] === 'cancel' ? 'Cancellation' : 'Reschedule'} saved — list not refreshed`
@@ -74,7 +101,7 @@ function OwnedRemindersPanel({ conversationId, readOnly }: { conversationId: str
       {!confirmedChanges[reminder.id] && <time dateTime={new Date(reminder.due_at_us / 1000).toISOString()}>{formatReminderTime(reminder)}</time>}
       {!readOnly && !confirmedChanges[reminder.id] && reminder.state.kind === 'scheduled' && <div className="reminder-card__actions">
         <button type="button" disabled={saving} onClick={() => {
-          setError(null);
+          setErrors((previous) => Object.fromEntries(Object.entries(previous).filter(([id]) => id !== reminder.id)));
           setEdit({ reminder, local: reminderLocalInput(reminder), timezone: reminder.timezone, offset: '' });
         }}>Reschedule</button>
         <button type="button" disabled={saving} onClick={() => { void manage(reminder, 'cancel'); }}>Cancel reminder</button>
