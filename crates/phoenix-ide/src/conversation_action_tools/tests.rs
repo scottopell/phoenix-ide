@@ -47,8 +47,14 @@ async fn malformed_create_calls_are_non_durable_and_errors_are_operation_guided(
         json!({"op":"options", "request_id":request_id}),
         json!({"op":"read", "cwd":"/secret/path"}),
         json!({"op":"create", "request_id":request_id, "cwd":"/secret/path", "objective":"private objective", "start":"submit_objective", "reference":"wrong operation"}),
+        json!({"op":"options", "cwd":null}),
+        json!({"op":"create", "request_id":request_id, "cwd":"/secret/path", "objective":"private objective", "start":"submit_objective", "model":null}),
+        json!({"op":"create", "request_id":request_id, "cwd":"/secret/path", "objective":"private objective", "start":"submit_objective", "effort":null}),
+        json!({"op":"create", "request_id":request_id, "cwd":"/secret/path", "objective":"private objective", "start":"submit_objective", "llm_language":null}),
     ];
-    let expected = ["options", "read", "create"];
+    let expected = [
+        "options", "read", "create", "options", "create", "create", "create",
+    ];
     for (request, operation) in malformed.into_iter().zip(expected) {
         let output = tool.run(create_input(request), native_context(&gc)).await;
         let error: Value = serde_json::from_str(output.output()).unwrap();

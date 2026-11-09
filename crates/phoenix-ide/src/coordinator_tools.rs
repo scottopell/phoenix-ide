@@ -151,6 +151,14 @@ mod previous_transcripts_tool_tests {
                 "list accepts only",
             ),
             (
+                serde_json::json!({"request":{"op":"list","cursor":null}}),
+                "list accepts only",
+            ),
+            (
+                serde_json::json!({"request":{"op":"read","transcript_ref":"@transcript:test","cursor":null}}),
+                "read requires",
+            ),
+            (
                 serde_json::json!({"request":{"op":"search","query":"private-needle","cursor":"bad"}}),
                 "search requires",
             ),

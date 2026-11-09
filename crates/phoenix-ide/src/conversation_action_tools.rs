@@ -8,6 +8,7 @@ use phoenix_tools::{Tool, ToolContext, ToolOutput};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
+use crate::api::global_read::deserialize_present_non_null;
 use crate::api::CreateProductConversationRequest;
 use crate::conversation_actions::{
     accept_create, normalize_product_conversation_title, CreateSource,
@@ -125,6 +126,7 @@ enum CreateStart {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum CreateRequest {
     Options {
+        #[serde(default, deserialize_with = "deserialize_present_non_null")]
         cwd: Option<String>,
     },
     Read {
@@ -135,8 +137,11 @@ enum CreateRequest {
         cwd: String,
         objective: String,
         start: CreateStart,
+        #[serde(default, deserialize_with = "deserialize_present_non_null")]
         model: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_present_non_null")]
         effort: Option<ModelEffort>,
+        #[serde(default, deserialize_with = "deserialize_present_non_null")]
         llm_language: Option<LlmLanguage>,
     },
 }
