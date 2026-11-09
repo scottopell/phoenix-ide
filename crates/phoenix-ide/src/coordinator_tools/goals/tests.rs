@@ -1335,6 +1335,8 @@ async fn production_coordinator_registry_has_exact_instance_selector_contract() 
                 | "watch_conversation"
                 | "unwatch_conversation"
                 | "list_watched_conversations"
+                | "create_conversation"
+                | "rename_conversation"
         ) {
             crate::coordinator_tools::instance::InstanceSelector::schema()
         } else {
