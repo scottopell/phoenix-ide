@@ -862,6 +862,8 @@ mod tests {
         )
         .await
         .unwrap();
+        drop(dir);
+        assert!(!cwd.exists());
 
         for different_intent in [false, true] {
             let mut other_request = request(cwd.to_str().unwrap());

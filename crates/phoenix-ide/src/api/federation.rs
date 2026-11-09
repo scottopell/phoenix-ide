@@ -6421,7 +6421,7 @@ mod tests {
     }
 
     async fn assert_response_remains_pending_after_authority_closes(
-        runtime: &Arc<RuntimeManager>,
+        runtime: &crate::runtime::RuntimeManager,
         response: Response,
     ) {
         let owner = runtime.acquire_local_authority_pass().unwrap();
@@ -6476,13 +6476,11 @@ mod tests {
     async fn native_create_error_response_remains_pending_after_authority_closes() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         let caller = InstanceId::new();
-        let response = native_create_inner(
-            &state,
-            test_native_create_peer(caller),
-            test_native_create_request(caller, InstanceId::new(), "/tmp".to_string()),
-        )
-        .await
-        .into_response();
+        let peer = test_native_create_peer(caller);
+        let request = test_native_create_request(caller, InstanceId::new(), "/tmp".to_string());
+        let response = native_create_inner(state.clone(), &peer, &request)
+            .await
+            .into_response();
         assert_eq!(response.status(), StatusCode::CONFLICT);
 
         assert_response_remains_pending_after_authority_closes(&state.runtime, response).await;
@@ -6495,13 +6493,11 @@ mod tests {
         let local = state.db.instance_id().await.unwrap();
         let cwd = state.runtime.runtime_home().join("native-create-cwd");
         std::fs::create_dir(&cwd).unwrap();
-        let response = native_create_inner(
-            &state,
-            test_native_create_peer(caller),
-            test_native_create_request(caller, local, cwd.to_string_lossy().into_owned()),
-        )
-        .await
-        .into_response();
+        let peer = test_native_create_peer(caller);
+        let request = test_native_create_request(caller, local, cwd.to_string_lossy().into_owned());
+        let response = native_create_inner(state.clone(), &peer, &request)
+            .await
+            .into_response();
         assert_eq!(response.status(), StatusCode::OK);
 
         assert_response_remains_pending_after_authority_closes(&state.runtime, response).await;
