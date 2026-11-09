@@ -2942,6 +2942,7 @@ fn map_db_not_found(e: DbError) -> AppError {
         | DbError::ProductConversationUnavailable(_)
         | DbError::SteeringQueueFull
         | DbError::ProductCreationClaimLost
+        | DbError::ProductCreationRequestConflict
         | DbError::CloseFoundationPrecondition(_)
         | DbError::CloseFoundationStaleLatest { .. }
         | DbError::CloseFoundationRepairRequired(_)

@@ -402,6 +402,10 @@ AND SHALL distinguish acceptance from publication, objective delivery, runtime e
 AND SHALL derive the complete native readback, including publication identity, route, and execution evidence, from one persistence snapshot that also validates the current Coordinator's authority
 AND SHALL NOT implicitly cancel, restart, or repeat an intentional creation under a new identity.
 
+When the current Global Coordinator selects a remote instance for this capability under [Federation REQ-FED-021–024](../federation/requirements.md), option discovery and creation SHALL use that destination's directory and model capabilities. The request SHALL preserve the local native creation intent—request UUID, destination-scoped directory, literal objective, model, effort, language, and submit-objective start intent—while the remote destination revalidates every choice and runs the same shared durable creation acceptance and reconciliation path as its local native invocation. Remote success SHALL mean durable acceptance only; it SHALL NOT claim publication, objective delivery, execution, or completion. Omitted or exact `"local"` selection SHALL invoke the local shared application action directly. A selected remote failure SHALL NOT invoke a local or alternate destination path.
+
+The source SHALL derive the exact source product, transcript, assistant message, and tool-use identities from trusted execution context, and the authenticated peer SHALL supply source instance identity. The destination SHALL persist that peer-qualified provenance without treating foreign source identities as destination-local rows. Retries retain the durable request identity, destination, immutable accepted intent, and original accepted provenance; they SHALL NOT create a second ProductConversation or reattribute the acceptance.
+
 WHEN the published product or its original transcript is deleted
 THE SYSTEM SHALL retain the accepted request identity, immutable intent identity, first source provenance, reserved product identity, and original publication identity
 AND SHALL reconcile an identical retry to that historical acceptance rather than create another product or repeat work

@@ -82,6 +82,10 @@ AND SHALL distinguish a historical receipt from the current name, route, and lif
 
 THE SYSTEM SHALL retain the existing immutable identity and released-slug semantics without reserving former routes or granting lifecycle mutation authority.
 
+When the current Global Coordinator selects a remote instance for rename under [Federation REQ-FED-021–024](../federation/requirements.md), the operation SHALL use the destination's existing title-and-route naming action and its durable receipt authority. The request SHALL pin the exact ProductConversation, canonical root transcript, and nonnegative naming revision observed before dispatch, and SHALL carry the requested title and one operation UUID. The destination SHALL derive the source instance from authenticated peer identity, retain the source-attested tool-call locator as peer-qualified provenance, commit the rename and receipt atomically, and apply existing title normalization, slug allocation, lifecycle admission, and History/Close protections.
+
+The remote result SHALL preserve the local `applied`, `replayed`, `stale`, `conflict`, `not_found`, and `unavailable` classifications. An uncertain retry SHALL use the same operation UUID, destination, and immutable intent. An identical replay SHALL report historical receipt without overwriting a subsequent rename; changed reuse SHALL conflict. The response SHALL be accepted only when authenticated caller/destination identities and operation, product, and canonical-root identities match the request. A stale root/revision, deleted product, unsupported endpoint, transport failure, or malformed/mismatched response SHALL NOT be retried as a local rename or against another peer.
+
 ## Acceptance scenarios
 
 - Duplicate human names remain identical while projections allocate `base`, `base-2`, and `base-3` under concurrent rename and creation.

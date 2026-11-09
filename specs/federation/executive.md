@@ -2,7 +2,7 @@
 
 ## Summary
 
-Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance conversation read/resolve support, and optional-instance `send_conversation_message`, `read_goal`, Coordinator `query_database`, and Coordinator `read_automatic_continuation`/`set_automatic_continuation` routing through destination-owned admission. Omission and exact `"local"` use local services; the preference tools reject explicit `null` even on read, while other read tools treat it as local. Other strings select an exact saved peer without fallback. Ordinary non-Coordinator query registrations remain local-only. Durable remote watches provide destination-owned enrollment, continuation following, accepted-delivery deduplication, restart and bounded-gap recovery, ordered unsubscribe, and revocation-aware closure.
+Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance conversation read/resolve support, and optional-instance `send_conversation_message`, `read_goal`, Coordinator `query_database`, Coordinator `read_automatic_continuation`/`set_automatic_continuation`, and native ordinary-conversation create/rename routing through destination-owned admission. Omission and exact `"local"` use local services; the preference tools reject explicit `null` even on read, while other read tools treat it as local. Other strings select an exact saved peer without fallback. Ordinary non-Coordinator query registrations remain local-only. Durable remote watches provide destination-owned enrollment, continuation following, accepted-delivery deduplication, restart and bounded-gap recovery, ordered unsubscribe, and revocation-aware closure.
 
 ## Requirement status
 
@@ -16,6 +16,7 @@ Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance c
 | REQ-FED-017–018 | Defined | Complexity boundaries and non-goals are normative in `requirements.md`. |
 | REQ-FED-019 | Implemented | Enrollment and peer-connection writes require a validated `PeerDisplayName`; constructor/JSON and HTTP tests pass for blank names and case/whitespace variants of local, including rejection without replacing credentials or connections. |
 | REQ-FED-020 | Implemented; deployment pending | Separate closed remote read/set requests, source Coordinator dispatch gate, authenticated destination transaction, strict preference-only set and response verification passed focused regressions, exact-range review, full repository qualification, and merge-head CI. Production deployment and live cross-host acceptance are not established. No generic settings, trust/enrollment, or combined enable-and-create operation is included. |
+| REQ-FED-021–024 | Implemented; deployment pending | Closed authenticated create/options/status and rename/options requests use destination-owned application actions, durable request/operation identities, strict witness-bound responses, status-only reconciliation after ambiguous create outcomes, replay-safe qualified rename receipts, and local/remote tool-output parity. Historical TEXT locator bytes are preserved losslessly; only live-valid tuples receive source-instance authority, while unqualifiable creation and rename provenance remains explicitly historical and untrusted. Exact-head hosted validation covers the protocol, persistence, migration, replay, authority, UI/spec, and end-to-end lanes. Production deployment and live cross-host acceptance are not established. |
 
 ## Existing foundations
 
@@ -25,6 +26,7 @@ Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance c
 - Unified local or remote Coordinator database query, stable-reference resolution, and conversation read/pagination.
 - Local payload-bound message replay through `message_id`.
 - Optional-instance remote message routing with authenticated source attribution, stable and exact destination receipts, durable peer-scoped replay, and no local fallback.
+- Native optional-instance ordinary-conversation create and rename with destination-owned options, admission, status reconciliation, durable replay, closed effort-capability metadata, and no local fallback.
 - Local and optional-instance Goal reads with stable resolution, version waiting, timeout, typed wait outcomes, exact transcript provenance, and malformed-response rejection.
 - Durable Coordinator watches with destination-owned admission, source continuation following, accepted-delivery deduplication, restart and bounded-gap recovery, ordered unsubscribe, and revocation-aware closure.
 - Federation event, source-subscription, consumer-state, gap-evidence, and tombstone persistence.
@@ -32,8 +34,9 @@ Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance c
 ## Verification still required
 
 - Production rollout and live cross-host acceptance of the automatic-continuation controls remain unverified. Repository qualification and merge-head CI do not establish deployed behavior.
+- Production rollout and live cross-host acceptance of native federated conversation create and rename remain unverified. Repository qualification does not establish deployed behavior.
 - Operational interoperability still requires compatible deployment on participating hosts; this does not reopen the implemented watch lifecycle.
 
 ## Delivery inventory
 
-Goal mutations (including creation), generic settings beyond the typed automatic-continuation preference, Continue, conversation creation, rename, reverse enrollment, live peer changes, and combined enable-and-create are not implemented in this status snapshot. This inventory reports delivered behavior; it does not narrow separately authorized scope.
+Goal mutations (including creation), generic settings beyond the typed automatic-continuation preference, Continue, reverse enrollment, live peer changes, and combined enable-and-create are not implemented in this status snapshot. This inventory reports delivered behavior and does not narrow separately authorized scope.
