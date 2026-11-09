@@ -16,7 +16,7 @@ Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance c
 | REQ-FED-017–018 | Defined | Complexity boundaries and non-goals are normative in `requirements.md`. |
 | REQ-FED-019 | Implemented | Enrollment and peer-connection writes require a validated `PeerDisplayName`; constructor/JSON and HTTP tests pass for blank names and case/whitespace variants of local, including rejection without replacing credentials or connections. |
 | REQ-FED-020 | Implemented; deployment pending | Separate closed remote read/set requests, source Coordinator dispatch gate, authenticated destination transaction, strict preference-only set and response verification passed focused regressions, exact-range review, full repository qualification, and merge-head CI. Production deployment and live cross-host acceptance are not established. No generic settings, trust/enrollment, or combined enable-and-create operation is included. |
-| REQ-FED-021–024 | Implemented | Closed authenticated create/options/status and rename/options requests use destination-owned application actions, durable request/operation identities, strict witness-bound responses, status-only reconciliation after ambiguous create outcomes, replay-safe rename receipts, and local/remote tool-output parity. Focused endpoint, client-verifier, action, migration, routing, replay, malformed-wire, authority-close, and tool-adapter regressions cover the contracts. |
+| REQ-FED-021–024 | Native action paths implemented; historical malformed-UTF8 provenance qualification pending | Closed authenticated create/options/status and rename/options requests use destination-owned application actions, durable request/operation identities, strict witness-bound responses, status-only reconciliation after ambiguous create outcomes, replay-safe qualified rename receipts, and local/remote tool-output parity. Historical TEXT locator byte preservation, qualification, untrusted `historical_internal` creation and unqualified rename handling require focused regression and repository validation; hosted validation is not complete. |
 
 ## Existing foundations
 
@@ -35,6 +35,7 @@ Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance c
 
 - Production rollout and live cross-host acceptance of the automatic-continuation controls remain unverified. Repository qualification and merge-head CI do not establish deployed behavior.
 - Production rollout and live cross-host acceptance of native federated conversation create and rename remain unverified. Repository qualification does not establish deployed behavior.
+- Historical malformed-UTF8 locator migration and trusted-write validation under REQ-FED-021/023 remain to be qualified with focused tests and repository checks. No hosted validation of this slice is claimed here.
 - Operational interoperability still requires compatible deployment on participating hosts; this does not reopen the implemented watch lifecycle.
 
 ## Delivery inventory

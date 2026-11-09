@@ -45,8 +45,84 @@ pub struct ProductCreationImage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoricalSqliteText(Vec<u8>);
+
+impl HistoricalSqliteText {
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl From<Vec<u8>> for HistoricalSqliteText {
+    fn from(value: Vec<u8>) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for HistoricalSqliteText {
+    fn from(value: &str) -> Self {
+        Self(value.as_bytes().to_vec())
+    }
+}
+
+impl serde::Serialize for HistoricalSqliteText {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match std::str::from_utf8(&self.0) {
+            Ok(text) => serializer.serialize_str(text),
+            Err(_) => serde::Serialize::serialize(&self.0, serializer),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoricalInternalCreationOrigin {
+    product_conversation_id: HistoricalSqliteText,
+    transcript_id: HistoricalSqliteText,
+    message_id: HistoricalSqliteText,
+    tool_use_id: HistoricalSqliteText,
+}
+
+impl HistoricalInternalCreationOrigin {
+    fn decoded(
+        product_conversation_id: Vec<u8>,
+        transcript_id: Vec<u8>,
+        message_id: Vec<u8>,
+        tool_use_id: Vec<u8>,
+    ) -> Self {
+        Self {
+            product_conversation_id: product_conversation_id.into(),
+            transcript_id: transcript_id.into(),
+            message_id: message_id.into(),
+            tool_use_id: tool_use_id.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn product_conversation_id(&self) -> &[u8] {
+        self.product_conversation_id.as_bytes()
+    }
+
+    #[must_use]
+    pub fn transcript_id(&self) -> &[u8] {
+        self.transcript_id.as_bytes()
+    }
+
+    #[must_use]
+    pub fn message_id(&self) -> &[u8] {
+        self.message_id.as_bytes()
+    }
+
+    #[must_use]
+    pub fn tool_use_id(&self) -> &[u8] {
+        self.tool_use_id.as_bytes()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProductCreationOrigin {
     UnknownHistorical,
+    HistoricalInternal(HistoricalInternalCreationOrigin),
     UserApi,
     SlackGateway {
         request_id: String,
@@ -112,6 +188,7 @@ impl ProductCreationOrigin {
     fn as_str(&self) -> &'static str {
         match self {
             Self::UnknownHistorical => "unknown_historical",
+            Self::HistoricalInternal(_) => "historical_internal",
             Self::UserApi => "user_api",
             Self::SlackGateway { .. } => "slack_gateway",
             Self::InternalConversation { .. } => "internal_conversation",
@@ -122,15 +199,45 @@ impl ProductCreationOrigin {
     fn from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
         let kind: String = row.try_get("objective_origin")?;
         let instance: Option<String> = row.try_get("objective_source_instance_id")?;
+        let slack: Option<String> = row.try_get("objective_slack_request_id")?;
+        let bad = || sqlx::Error::Decode("invalid peer-qualified creation provenance".into());
+        if kind == "historical_internal" {
+            if instance.is_some() || slack.is_some() {
+                return Err(bad());
+            }
+            let product: Option<Vec<u8>> =
+                row.try_get("objective_source_product_conversation_id")?;
+            let transcript: Option<Vec<u8>> = row.try_get("objective_source_transcript_id")?;
+            let message: Option<Vec<u8>> = row.try_get("objective_source_message_id")?;
+            let tool: Option<Vec<u8>> = row.try_get("objective_source_tool_use_id")?;
+            let product = product.ok_or_else(bad)?;
+            let transcript = transcript.ok_or_else(bad)?;
+            let message = message.ok_or_else(bad)?;
+            let tool = tool.ok_or_else(bad)?;
+            let locators = [&product, &transcript, &message, &tool];
+            if locators
+                .iter()
+                .all(|value| std::str::from_utf8(value).is_ok_and(valid_creation_locator))
+                || !locators
+                    .iter()
+                    .all(|value| valid_legacy_creation_locator(value))
+            {
+                return Err(bad());
+            }
+            return Ok(Self::HistoricalInternal(
+                HistoricalInternalCreationOrigin::decoded(product, transcript, message, tool),
+            ));
+        }
         let product: Option<String> = row.try_get("objective_source_product_conversation_id")?;
         let transcript: Option<String> = row.try_get("objective_source_transcript_id")?;
         let message: Option<String> = row.try_get("objective_source_message_id")?;
         let tool: Option<String> = row.try_get("objective_source_tool_use_id")?;
-        let slack: Option<String> = row.try_get("objective_slack_request_id")?;
-        let bad = || sqlx::Error::Decode("invalid peer-qualified creation provenance".into());
+        let locators_complete = [&product, &transcript, &message, &tool]
+            .into_iter()
+            .all(|value| value.as_deref().is_some_and(valid_creation_locator));
         match kind.as_str() {
             "internal_conversation" | "federated_conversation" => {
-                if slack.is_some() {
+                if slack.is_some() || !locators_complete {
                     return Err(bad());
                 }
                 let source_instance_id = instance
@@ -140,11 +247,9 @@ impl ProductCreationOrigin {
                 let product_conversation_id =
                     ProductConversationId::parse(product.ok_or_else(bad)?)
                         .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
-                let transcript_id = transcript
-                    .filter(|v| !v.trim().is_empty())
-                    .ok_or_else(bad)?;
-                let message_id = message.filter(|v| !v.trim().is_empty()).ok_or_else(bad)?;
-                let tool_use_id = tool.filter(|v| !v.trim().is_empty()).ok_or_else(bad)?;
+                let transcript_id = transcript.ok_or_else(bad)?;
+                let message_id = message.ok_or_else(bad)?;
+                let tool_use_id = tool.ok_or_else(bad)?;
                 let source_call = phoenix_core::domain::db_schema::SourceToolCall {
                     message_id,
                     tool_use_id,
@@ -189,7 +294,7 @@ impl ProductCreationOrigin {
     pub fn input_origin(&self) -> phoenix_core::domain::db_schema::InputOrigin {
         use phoenix_core::domain::db_schema::InputOrigin;
         match self {
-            Self::UnknownHistorical => InputOrigin::UnknownHistorical,
+            Self::UnknownHistorical | Self::HistoricalInternal(_) => InputOrigin::UnknownHistorical,
             Self::UserApi => InputOrigin::UserApi,
             Self::SlackGateway { request_id } => InputOrigin::SlackGateway {
                 request_id: request_id.clone(),
@@ -492,6 +597,7 @@ fn creation_source_instance_id(origin: &ProductCreationOrigin) -> Option<Instanc
             source_instance_id, ..
         } => Some(*source_instance_id),
         ProductCreationOrigin::UnknownHistorical
+        | ProductCreationOrigin::HistoricalInternal(_)
         | ProductCreationOrigin::UserApi
         | ProductCreationOrigin::SlackGateway { .. } => None,
     }
@@ -506,6 +612,7 @@ fn require_creation_read_owner(
             source_instance_id, ..
         } if *source_instance_id == authority.caller_instance_id() => Ok(()),
         ProductCreationOrigin::UnknownHistorical
+        | ProductCreationOrigin::HistoricalInternal(_)
         | ProductCreationOrigin::UserApi
         | ProductCreationOrigin::SlackGateway { .. }
         | ProductCreationOrigin::InternalConversation { .. }
@@ -534,6 +641,9 @@ fn require_creation_retry_owner(
         } if current_gc_transcript_id.is_none() || *source_instance_id != local_instance_id => {
             Err(DbError::CurrentCoordinatorRequired)
         }
+        ProductCreationOrigin::HistoricalInternal(_) => {
+            Err(DbError::ProductCreationRequestConflict)
+        }
         ProductCreationOrigin::InternalConversation { .. }
         | ProductCreationOrigin::UnknownHistorical
         | ProductCreationOrigin::UserApi
@@ -543,6 +653,13 @@ fn require_creation_retry_owner(
 
 fn valid_creation_locator(value: &str) -> bool {
     !value.trim().is_empty() && !value.contains('\0')
+}
+
+fn valid_legacy_creation_locator(value: &[u8]) -> bool {
+    value
+        .iter()
+        .take_while(|byte| **byte != 0)
+        .any(|byte| *byte != b' ')
 }
 
 async fn require_creation_origin_tx(
@@ -569,6 +686,7 @@ async fn require_creation_origin_tx(
                 Ok(())
             }
             ProductCreationOrigin::UnknownHistorical
+            | ProductCreationOrigin::HistoricalInternal(_)
             | ProductCreationOrigin::UserApi
             | ProductCreationOrigin::SlackGateway { .. }
             | ProductCreationOrigin::InternalConversation { .. }
@@ -611,6 +729,11 @@ async fn require_creation_origin_tx(
             | ProductCreationOrigin::UnknownHistorical
             | ProductCreationOrigin::SlackGateway { .. },
         ) => Ok(()),
+        (None, ProductCreationOrigin::HistoricalInternal(_)) => {
+            Err(DbError::ProductCreationIntentInvalid(
+                "historical internal creation provenance cannot be used for a new request".into(),
+            ))
+        }
         _ => Err(DbError::CurrentCoordinatorRequired),
     }
 }
@@ -1167,6 +1290,11 @@ impl Database {
         intent: &ProductCreationIntent,
         now: i64,
     ) -> DbResult<u64> {
+        if matches!(&intent.origin, ProductCreationOrigin::HistoricalInternal(_)) {
+            return Err(DbError::ProductCreationIntentInvalid(
+                "historical internal creation provenance cannot be used for a new request".into(),
+            ));
+        }
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO product_creation_jobs (
                 request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id,
@@ -1183,18 +1311,22 @@ impl Database {
         .bind(intent.origin.as_str())
         .bind(match &intent.origin {
             ProductCreationOrigin::InternalConversation { product_conversation_id, .. } | ProductCreationOrigin::FederatedConversation { product_conversation_id, .. } => Some(product_conversation_id.as_str()),
+            ProductCreationOrigin::HistoricalInternal(_) => None,
             ProductCreationOrigin::UnknownHistorical | ProductCreationOrigin::UserApi | ProductCreationOrigin::SlackGateway { .. } => None,
         })
         .bind(match &intent.origin {
             ProductCreationOrigin::InternalConversation { transcript_id, .. } | ProductCreationOrigin::FederatedConversation { transcript_id, .. } => Some(transcript_id.as_str()),
+            ProductCreationOrigin::HistoricalInternal(_) => None,
             ProductCreationOrigin::UnknownHistorical | ProductCreationOrigin::UserApi | ProductCreationOrigin::SlackGateway { .. } => None,
         })
         .bind(match &intent.origin {
             ProductCreationOrigin::InternalConversation { source_call, .. } | ProductCreationOrigin::FederatedConversation { source_call, .. } => Some(source_call.message_id.as_str()),
+            ProductCreationOrigin::HistoricalInternal(_) => None,
             ProductCreationOrigin::UnknownHistorical | ProductCreationOrigin::UserApi | ProductCreationOrigin::SlackGateway { .. } => None,
         })
         .bind(match &intent.origin {
             ProductCreationOrigin::InternalConversation { source_call, .. } | ProductCreationOrigin::FederatedConversation { source_call, .. } => Some(source_call.tool_use_id.as_str()),
+            ProductCreationOrigin::HistoricalInternal(_) => None,
             ProductCreationOrigin::UnknownHistorical | ProductCreationOrigin::UserApi | ProductCreationOrigin::SlackGateway { .. } => None,
         })
         .bind(&intent.model)
@@ -3325,33 +3457,235 @@ mod product_creation_tests {
     }
 
     #[tokio::test]
-    async fn native_creation_decode_requires_complete_peer_qualified_provenance() {
+    async fn product_creation_origin_decode_requires_an_exact_discriminator_and_shape() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
         let local = InstanceId::new().to_string();
+        let complete = [
+            Some(local.clone()),
+            Some("pc_native".to_owned()),
+            Some("transcript".to_owned()),
+            Some("message".to_owned()),
+            Some("tool".to_owned()),
+        ];
+
         for kind in ["internal_conversation", "federated_conversation"] {
-            let complete = [
-                Some(local.clone()),
-                Some("pc_native".to_owned()),
-                Some("transcript".to_owned()),
-                Some("message".to_owned()),
-                Some("tool".to_owned()),
-            ];
-            for missing in 0..=5 {
-                let mut fields = complete.clone();
-                if missing < 5 {
-                    fields[missing] = None;
-                }
+            let row = sqlx::query("SELECT ?1 AS objective_origin, ?2 AS objective_source_instance_id, ?3 AS objective_source_product_conversation_id, ?4 AS objective_source_transcript_id, ?5 AS objective_source_message_id, ?6 AS objective_source_tool_use_id, NULL AS objective_slack_request_id")
+                .bind(kind).bind(&complete[0]).bind(&complete[1]).bind(&complete[2]).bind(&complete[3]).bind(&complete[4]).fetch_one(&pool).await.unwrap();
+            assert!(matches!(
+                (kind, ProductCreationOrigin::from_row(&row).unwrap()),
+                (
+                    "internal_conversation",
+                    ProductCreationOrigin::InternalConversation { .. }
+                ) | (
+                    "federated_conversation",
+                    ProductCreationOrigin::FederatedConversation { .. }
+                )
+            ));
+
+            for malformed in [
+                [
+                    None,
+                    complete[1].clone(),
+                    complete[2].clone(),
+                    complete[3].clone(),
+                    complete[4].clone(),
+                ],
+                [
+                    complete[0].clone(),
+                    None,
+                    complete[2].clone(),
+                    complete[3].clone(),
+                    complete[4].clone(),
+                ],
+                [
+                    complete[0].clone(),
+                    complete[1].clone(),
+                    Some(" \t ".into()),
+                    complete[3].clone(),
+                    complete[4].clone(),
+                ],
+                [
+                    complete[0].clone(),
+                    complete[1].clone(),
+                    complete[2].clone(),
+                    Some("message\0id".into()),
+                    complete[4].clone(),
+                ],
+                [
+                    Some("not-an-instance".into()),
+                    complete[1].clone(),
+                    complete[2].clone(),
+                    complete[3].clone(),
+                    complete[4].clone(),
+                ],
+            ] {
                 let row = sqlx::query("SELECT ?1 AS objective_origin, ?2 AS objective_source_instance_id, ?3 AS objective_source_product_conversation_id, ?4 AS objective_source_transcript_id, ?5 AS objective_source_message_id, ?6 AS objective_source_tool_use_id, NULL AS objective_slack_request_id")
-                    .bind(kind).bind(&fields[0]).bind(&fields[1]).bind(&fields[2]).bind(&fields[3]).bind(&fields[4]).fetch_one(&pool).await.unwrap();
-                assert_eq!(ProductCreationOrigin::from_row(&row).is_ok(), missing == 5);
+                    .bind(kind).bind(&malformed[0]).bind(&malformed[1]).bind(&malformed[2]).bind(&malformed[3]).bind(&malformed[4]).fetch_one(&pool).await.unwrap();
+                assert!(ProductCreationOrigin::from_row(&row).is_err());
             }
         }
+
+        let raw = [
+            "raw\0product".to_owned(),
+            "\t".to_owned(),
+            "  message  ".to_owned(),
+            "tool".to_owned(),
+        ];
+        let row = sqlx::query("SELECT 'historical_internal' AS objective_origin, NULL AS objective_source_instance_id, ?1 AS objective_source_product_conversation_id, ?2 AS objective_source_transcript_id, ?3 AS objective_source_message_id, ?4 AS objective_source_tool_use_id, NULL AS objective_slack_request_id")
+            .bind(&raw[0]).bind(&raw[1]).bind(&raw[2]).bind(&raw[3])
+            .fetch_one(&pool).await.unwrap();
+        let historical = ProductCreationOrigin::from_row(&row).unwrap();
+        let ProductCreationOrigin::HistoricalInternal(origin) = &historical else {
+            panic!("historical discriminator must decode to the explicit historical origin");
+        };
+        assert_eq!(origin.product_conversation_id(), raw[0].as_bytes());
+        assert_eq!(origin.transcript_id(), raw[1].as_bytes());
+        assert_eq!(origin.message_id(), raw[2].as_bytes());
+        assert_eq!(origin.tool_use_id(), raw[3].as_bytes());
+        assert_eq!(historical.as_str(), "historical_internal");
+        assert_eq!(
+            historical.input_origin(),
+            phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical
+        );
+
+        let raw_optional = raw.clone().map(Some);
+        for (kind, instance, slack, locators) in [
+            (
+                "historical_internal",
+                Some(local.as_str()),
+                None,
+                raw_optional.to_vec(),
+            ),
+            (
+                "historical_internal",
+                None,
+                Some("slack-request"),
+                raw_optional.to_vec(),
+            ),
+            ("historical_internal", None, None, complete[1..].to_vec()),
+            (
+                "historical_internal",
+                None,
+                None,
+                [
+                    None,
+                    raw_optional[1].clone(),
+                    raw_optional[2].clone(),
+                    raw_optional[3].clone(),
+                ]
+                .to_vec(),
+            ),
+            (
+                "historical_internal",
+                None,
+                None,
+                [
+                    Some("   ".into()),
+                    raw_optional[1].clone(),
+                    raw_optional[2].clone(),
+                    raw_optional[3].clone(),
+                ]
+                .to_vec(),
+            ),
+            ("internal_conversation", None, None, raw_optional.to_vec()),
+            ("federated_conversation", None, None, raw_optional.to_vec()),
+            (
+                "internal_conversation",
+                Some(local.as_str()),
+                Some("slack-request"),
+                complete[1..].to_vec(),
+            ),
+        ] {
+            let row = sqlx::query("SELECT ?1 AS objective_origin, ?2 AS objective_source_instance_id, ?3 AS objective_source_product_conversation_id, ?4 AS objective_source_transcript_id, ?5 AS objective_source_message_id, ?6 AS objective_source_tool_use_id, ?7 AS objective_slack_request_id")
+                .bind(kind).bind(instance).bind(&locators[0]).bind(&locators[1]).bind(&locators[2]).bind(&locators[3]).bind(slack)
+                .fetch_one(&pool).await.unwrap();
+            assert!(ProductCreationOrigin::from_row(&row).is_err());
+        }
+
         let row = sqlx::query("SELECT 'unknown-origin' AS objective_origin, NULL AS objective_source_instance_id, NULL AS objective_source_product_conversation_id, NULL AS objective_source_transcript_id, NULL AS objective_source_message_id, NULL AS objective_source_tool_use_id, NULL AS objective_slack_request_id").fetch_one(&pool).await.unwrap();
         assert!(ProductCreationOrigin::from_row(&row).is_err());
+    }
+
+    #[tokio::test]
+    async fn historical_creation_reads_invalid_utf8_text_without_qualifying_it() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let raw = [
+            b"pc\xff\0source".as_slice(),
+            b"transcript\xfe".as_slice(),
+            b"message\x80".as_slice(),
+            b"tool\xc0".as_slice(),
+        ];
+        let query = "SELECT ?1 AS objective_origin, ?2 AS objective_source_instance_id,
+            CAST(?3 AS TEXT) AS objective_source_product_conversation_id,
+            CAST(?4 AS TEXT) AS objective_source_transcript_id,
+            CAST(?5 AS TEXT) AS objective_source_message_id,
+            CAST(?6 AS TEXT) AS objective_source_tool_use_id,
+            NULL AS objective_slack_request_id";
+        let row = sqlx::query(query)
+            .bind("historical_internal")
+            .bind(None::<&str>)
+            .bind(raw[0])
+            .bind(raw[1])
+            .bind(raw[2])
+            .bind(raw[3])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let ProductCreationOrigin::HistoricalInternal(origin) =
+            ProductCreationOrigin::from_row(&row).unwrap()
+        else {
+            panic!("invalid UTF-8 historical TEXT must remain untrusted");
+        };
+        assert_eq!(origin.product_conversation_id(), raw[0]);
+        assert_eq!(origin.transcript_id(), raw[1]);
+        assert_eq!(origin.message_id(), raw[2]);
+        assert_eq!(origin.tool_use_id(), raw[3]);
+
+        let row = sqlx::query(query)
+            .bind("internal_conversation")
+            .bind(InstanceId::new().to_string())
+            .bind(raw[0])
+            .bind(raw[1])
+            .bind(raw[2])
+            .bind(raw[3])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(ProductCreationOrigin::from_row(&row).is_err());
+    }
+
+    #[tokio::test]
+    async fn historical_internal_origin_cannot_create_a_new_job() {
+        let db = Database::open_in_memory().await.unwrap();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let mut candidate = intent("/repo/historical", "objective");
+        candidate.origin =
+            ProductCreationOrigin::HistoricalInternal(HistoricalInternalCreationOrigin::decoded(
+                "pc_source".into(),
+                " \t ".into(),
+                "message".into(),
+                "tool".into(),
+            ));
+
+        assert!(matches!(
+            db.accept_product_creation(&request_id, &candidate).await,
+            Err(DbError::ProductCreationIntentInvalid(_))
+        ));
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM product_creation_jobs WHERE request_id = ?1")
+                .bind(&request_id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
     }
 
     async fn advance_to_metadata(db: &Database, request_id: &str, claim: &ProductCreationClaim) {

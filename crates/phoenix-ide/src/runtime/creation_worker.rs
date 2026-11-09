@@ -470,7 +470,8 @@ async fn expand_product_creation_objective(
         | crate::db::ProductCreationOrigin::SlackGateway { .. } => {
             crate::send_chat_service::MessageExpansionPolicy::ExpandReferences
         }
-        crate::db::ProductCreationOrigin::InternalConversation { .. }
+        crate::db::ProductCreationOrigin::HistoricalInternal(_)
+        | crate::db::ProductCreationOrigin::InternalConversation { .. }
         | crate::db::ProductCreationOrigin::FederatedConversation { .. } => {
             crate::send_chat_service::MessageExpansionPolicy::LiteralText
         }
@@ -4398,6 +4399,65 @@ mod product_creation_delivery_replay_tests {
             assert!(expanded.llm_text.is_none());
             assert!(expanded.skill_invocation.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn historical_internal_creation_objective_remains_literal() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("notes.md"), "should not be expanded").unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "historical-objective",
+            "historical-objective",
+            root.path().to_str().unwrap(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.accept_product_creation(
+            "historical-origin-job",
+            &ProductCreationIntent {
+                origin: crate::db::ProductCreationOrigin::UserApi,
+                cwd: root.path().to_string_lossy().into_owned(),
+                objective: "Read @notes.md".into(),
+                model: None,
+                effort: None,
+                images: Vec::new(),
+                llm_language: LlmLanguage::Caveman,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE product_creation_jobs SET objective_origin = 'historical_internal', objective_source_product_conversation_id = 'pc_source', objective_source_transcript_id = char(9), objective_source_message_id = 'message', objective_source_tool_use_id = 'tool' WHERE request_id = 'historical-origin-job'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let origin = db
+            .get_product_creation_job("historical-origin-job")
+            .await
+            .unwrap()
+            .unwrap()
+            .intent
+            .origin;
+        assert!(matches!(
+            &origin,
+            crate::db::ProductCreationOrigin::HistoricalInternal(_)
+        ));
+        let manager = test_runtime_manager(db);
+
+        let expanded = expand_product_creation_objective(
+            &manager,
+            "historical-objective",
+            "Read @notes.md",
+            &origin,
+        )
+        .await
+        .unwrap();
+        assert_eq!(expanded.display_text, "Read @notes.md");
+        assert!(expanded.llm_text.is_none());
+        assert!(expanded.skill_invocation.is_none());
     }
 
     #[tokio::test]

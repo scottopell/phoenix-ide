@@ -2,6 +2,7 @@ use phoenix_core::domain::product_conversation::ProductConversationId;
 use serde::Serialize;
 use sqlx::{Connection, Row};
 
+use crate::product_creation::HistoricalSqliteText;
 use crate::{Database, DbError, DbResult, FederationConversationAuthority};
 use phoenix_core::domain::instance_identity::InstanceId;
 
@@ -45,10 +46,10 @@ pub struct ProductConversationRenameReceiptSource {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HistoricalProductConversationRenameReceiptSource {
-    pub product_conversation_id: String,
-    pub transcript_id: String,
-    pub message_id: String,
-    pub tool_use_id: String,
+    pub product_conversation_id: HistoricalSqliteText,
+    pub transcript_id: HistoricalSqliteText,
+    pub message_id: HistoricalSqliteText,
+    pub tool_use_id: HistoricalSqliteText,
 }
 
 impl From<&ProductConversationRenameSource> for ProductConversationRenameReceiptSource {
@@ -537,10 +538,12 @@ fn decode_receipt(
                     name_revision_before: row.try_get("name_revision_before")?,
                     committed_at_unix_micros: row.try_get("committed_at_unix_micros")?,
                     source: HistoricalProductConversationRenameReceiptSource {
-                        product_conversation_id: row.try_get("source_product_conversation_id")?,
-                        transcript_id: row.try_get("source_transcript_id")?,
-                        message_id: row.try_get("source_message_id")?,
-                        tool_use_id: row.try_get("source_tool_use_id")?,
+                        product_conversation_id: row
+                            .try_get::<Vec<u8>, _>("source_product_conversation_id")?
+                            .into(),
+                        transcript_id: row.try_get::<Vec<u8>, _>("source_transcript_id")?.into(),
+                        message_id: row.try_get::<Vec<u8>, _>("source_message_id")?.into(),
+                        tool_use_id: row.try_get::<Vec<u8>, _>("source_tool_use_id")?.into(),
                     },
                 },
             ),
@@ -1381,10 +1384,10 @@ mod tests {
             .bind(&expected.naming_root_transcript_id)
             .bind(expected.name_revision_before)
             .bind(expected.committed_at_unix_micros)
-            .bind(&expected.source.product_conversation_id)
-            .bind(&expected.source.transcript_id)
-            .bind(&expected.source.message_id)
-            .bind(&expected.source.tool_use_id)
+            .bind(locators[0])
+            .bind(locators[1])
+            .bind(locators[2])
+            .bind(locators[3])
             .execute(db.pool())
             .await
             .unwrap();
@@ -1417,6 +1420,80 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[tokio::test]
+    async fn historical_receipt_reads_invalid_utf8_text_as_lossless_json_bytes() {
+        let db = Database::open_in_memory().await.unwrap();
+        let gc = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let raw = [
+            b"pc\xff\0source".as_slice(),
+            b"transcript\xfe".as_slice(),
+            b"message\x80".as_slice(),
+            b"tool\xc0".as_slice(),
+        ];
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let product_conversation_id = ProductConversationId::new();
+        let insert = "INSERT INTO product_conversation_rename_receipts
+            (operation_id, product_conversation_id, title, slug_at_commit,
+             naming_root_transcript_id, name_revision_before, committed_at_unix_micros,
+             source_instance_id, source_product_conversation_id, source_transcript_id,
+             source_message_id, source_tool_use_id)
+            VALUES (?1, ?2, 'Historical', 'historical', 'root', 0, 123,
+                ?3, CAST(?4 AS TEXT), CAST(?5 AS TEXT), CAST(?6 AS TEXT), CAST(?7 AS TEXT))";
+        sqlx::query(insert)
+            .bind(&operation_id)
+            .bind(product_conversation_id.as_str())
+            .bind(None::<&str>)
+            .bind(raw[0])
+            .bind(raw[1])
+            .bind(raw[2])
+            .bind(raw[3])
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let record = db
+            .read_product_conversation_rename_receipt(&gc.id, &operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let ProductConversationRenameReceiptRecord::HistoricalUnqualified(receipt) = &record else {
+            panic!("invalid UTF-8 historical TEXT must remain unqualified");
+        };
+        assert_eq!(receipt.source.product_conversation_id.as_bytes(), raw[0]);
+        assert_eq!(receipt.source.transcript_id.as_bytes(), raw[1]);
+        assert_eq!(receipt.source.message_id.as_bytes(), raw[2]);
+        assert_eq!(receipt.source.tool_use_id.as_bytes(), raw[3]);
+        assert_eq!(
+            serde_json::to_value(&record).unwrap()["source"],
+            serde_json::json!({
+                "product_conversation_id": raw[0],
+                "transcript_id": raw[1],
+                "message_id": raw[2],
+                "tool_use_id": raw[3],
+            })
+        );
+
+        let qualified_operation_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(insert)
+            .bind(&qualified_operation_id)
+            .bind(product_conversation_id.as_str())
+            .bind(InstanceId::new().to_string())
+            .bind(raw[0])
+            .bind(raw[1])
+            .bind(raw[2])
+            .bind(raw[3])
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(db
+            .read_product_conversation_rename_receipt(&gc.id, &qualified_operation_id)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

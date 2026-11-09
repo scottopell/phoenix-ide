@@ -25,6 +25,88 @@ value NativeActionSourceCall {
     source_tool_use_id: String
 }
 
+-- REQ-FED-021. Historical SQLite TEXT locators are opaque stored bytes, not
+-- NativeActionSourceCall strings. Every retained native locator is a TEXT
+-- value, but its bytes need not decode to a trusted live identity.
+value HistoricalNativeActionSourceCall {
+    source_product_conversation_bytes: List<Integer>
+    source_transcript_bytes: List<Integer>
+    source_assistant_message_bytes: List<Integer>
+    source_tool_use_bytes: List<Integer>
+}
+
+entity HistoricalInternalCreation {
+    request_id: String
+    objective: String
+    source: HistoricalNativeActionSourceCall
+}
+
+entity HistoricalUnqualifiedRenameReceipt {
+    operation_id: String
+    source: HistoricalNativeActionSourceCall
+}
+
+-- Helpers:
+-- historical_rename_locator_qualifies(source): all four byte sequences decode
+-- as UTF-8, are nonblank after trimming, and have no NUL.
+-- historical_creation_locator_qualifies(source): rename qualification plus
+-- a parsed source ProductConversation ID. Only qualifying historical records
+-- receive the database's durable local instance identity.
+-- historical_locator_bytes_unchanged(source): each SQLite TEXT value
+-- retains its exact stored octets through migration, without lossy decoding.
+-- historical_locator_values_are_octets(source): every Integer in each stored
+-- byte sequence is in the inclusive range 0 through 255.
+-- historical_creation_objective_literal(creation): the stored agent-authored
+-- objective is processed as-is, not re-expanded or reconstructed.
+-- live_rename_source_call_valid(source): trusted write constructor accepts
+-- only four valid UTF-8, nonblank-after-trim, NUL-free locator strings.
+-- live_creation_source_call_valid(source): rename validity plus a parsed
+-- source ProductConversation ID. SQLite CHECK enforces structural shapes,
+-- not UTF-8 validity.
+-- historical_rename_has_no_peer_authority(receipt): the missing source
+-- instance cannot be inferred from its locator or from a retrying peer.
+-- historical_creation_untrusted(creation): origin is historical_internal,
+-- with no source instance and no authority to admit a new request.
+
+invariant HistoricalNativeLocatorsRetainStoredBytes {
+    for c in HistoricalInternalCreations:
+        historical_locator_values_are_octets(c.source)
+        and historical_locator_bytes_unchanged(c.source)
+        and historical_creation_objective_literal(c)
+        and historical_creation_untrusted(c)
+    for r in HistoricalUnqualifiedRenameReceipts:
+        historical_locator_values_are_octets(r.source)
+        and historical_locator_bytes_unchanged(r.source)
+        and historical_rename_has_no_peer_authority(r)
+}
+
+invariant HistoricalNativeLocatorsCannotBeQualified {
+    for c in HistoricalInternalCreations:
+        not historical_creation_locator_qualifies(c.source)
+    for r in HistoricalUnqualifiedRenameReceipts:
+        not historical_rename_locator_qualifies(r.source)
+}
+
+invariant LiveNativeLocatorsAreTrustedStrings {
+    for a in NativeCreateAcceptances:
+        live_creation_source_call_valid(a.source)
+    for r in NativeRenameReceipts:
+        live_rename_source_call_valid(r.source)
+}
+
+rule HistoricalCreationRequestCannotBeAdmitted {
+    when: NativeCreateRequestAccepted(peer, request)
+    requires: exists HistoricalInternalCreation{request_id: request.request_id}
+    ensures: NativeCreateIdentityConflict(request)
+}
+
+rule HistoricalUnqualifiedRenameCannotReplay {
+    when: NativeRenameRequestAccepted(peer, request)
+    requires: exists HistoricalUnqualifiedRenameReceipt{operation_id: request.operation_id}
+    ensures: NativeRenameConflictResult(request)
+}
+
+
 entity RemoteMessageProvenance {
     kind: RemoteApiProvenance | RemoteConversationProvenance | RemoteCoordinatorProvenance
 }
@@ -1372,6 +1454,7 @@ rule PersistNativeCreateAcceptance {
     let prior = NativeCreateAcceptance{destination_instance_id: request.destination_instance_id, request_id: request.request_id}
     let product_conversation_id = destination_accept_native_create(request, peer)
     requires: not exists prior
+    requires: not exists HistoricalInternalCreation{request_id: request.request_id}
     ensures: NativeCreateAcceptance.created(
         caller_instance_id: request.caller_instance_id,
         destination_instance_id: request.destination_instance_id,
@@ -1414,6 +1497,7 @@ rule ApplyNativeRename {
     when: NativeRenameRequestAccepted(peer, request)
     let prior = NativeRenameReceipt{destination_instance_id: request.destination_instance_id, operation_id: request.operation_id}
     requires: not exists prior
+    requires: not exists HistoricalUnqualifiedRenameReceipt{operation_id: request.operation_id}
     requires: native_rename_target_exists(request)
     requires: native_rename_target_is_ordinary(request)
     requires: native_rename_target_admissible(request)
