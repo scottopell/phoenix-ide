@@ -77,16 +77,14 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         {
             return Unsupported(NativeTaskApprovalUnsupported::InstalledGoalControls);
         }
-        match self.resolve_task_approval_execution().await {
-            Ok(TaskApprovalExecution::Initial) => {}
-            Ok(TaskApprovalExecution::FollowUp) => {
-                return Unsupported(NativeTaskApprovalUnsupported::FollowUp)
-            }
+        let execution = match self.resolve_task_approval_execution().await {
+            Ok(TaskApprovalExecution::Initial) => TaskApprovalExecution::Initial,
+            Ok(TaskApprovalExecution::FollowUp) => TaskApprovalExecution::FollowUp,
             Ok(TaskApprovalExecution::DetachedApprovedTaskCheckpoint) => {
-                return Unsupported(NativeTaskApprovalUnsupported::DetachedCheckpoint)
+                return Unsupported(NativeTaskApprovalUnsupported::DetachedCheckpoint);
             }
             Err(_) => return Unavailable,
-        }
+        };
         if let Err(error) = check_native_target(
             &db,
             &command,
@@ -114,12 +112,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             receipt: None,
         };
         let result = self
-            .execute_approve_task_with_origin(
-                approval,
-                TaskApprovalExecution::Initial,
-                &mut admitted,
-                &mut origin,
-            )
+            .execute_approve_task_with_origin(approval, execution, &mut admitted, &mut origin)
             .await;
         self.settle_native_approval_outcome(origin, result, &mut admitted)
             .await
@@ -203,7 +196,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                 {
                     NativeTaskApprovalInspection::RequiresOwningActorAdmission => {}
                     NativeTaskApprovalInspection::Replay(_) => {
-                        return Err("approval became historical before Git".to_owned())
+                        return Err("approval became historical before Git".to_owned());
                     }
                 }
                 check_native_target(&db, &command, &scope, &cwd).await
@@ -321,6 +314,204 @@ mod tests {
             );
             assert_eq!(std::fs::read_dir(root.join("tasks")).unwrap().count(), 1);
         }
+    }
+
+    #[test]
+    fn follow_up_requires_the_exact_reviewed_path_after_the_source_gate() {
+        let (_tmp, root) = super::super::test_git_helpers::init_repo();
+        let reviewed = "tasks/53020-p1-ready--reviewed.md";
+        let promoted = "tasks/53020-p1-in-progress--reviewed.md";
+        std::fs::create_dir_all(root.join("tasks")).unwrap();
+        let body = "# Exact reviewed bytes\n";
+        std::fs::write(root.join(promoted), body).unwrap();
+        let before = git_snapshot(&root);
+        let mut progress = ApprovalGitProgress::BeforeEffects;
+        let result = persist_fresh_approved_task_artifact_blocking_with_progress(
+            &root,
+            "tasks",
+            reviewed,
+            "Exact title",
+            crate::task_source::Priority::P1,
+            body,
+            Some(Box::new(|| Ok(()))),
+            true,
+            &mut progress,
+        );
+        assert!(result.is_err());
+        assert_eq!(progress, ApprovalGitProgress::BeforeEffects);
+        assert_eq!(std::fs::read(root.join(promoted)).unwrap(), body.as_bytes());
+        assert!(!root.join(reviewed).exists());
+        assert_eq!(git_snapshot(&root), before);
+    }
+
+    #[test]
+    fn follow_up_rechecks_disk_after_the_source_gate() {
+        let (_tmp, root) = super::super::test_git_helpers::init_repo();
+        std::fs::create_dir_all(root.join("tasks")).unwrap();
+        let reviewed = "tasks/53022-p1-ready--reviewed.md";
+        let body = "# Exact reviewed bytes\n";
+        std::fs::write(root.join(reviewed), body).unwrap();
+        let before = git_snapshot(&root);
+        let gate_root = root.clone();
+        let mut progress = ApprovalGitProgress::BeforeEffects;
+        let result = persist_fresh_approved_task_artifact_blocking_with_progress(
+            &root,
+            "tasks",
+            reviewed,
+            "Exact title",
+            crate::task_source::Priority::P1,
+            body,
+            Some(Box::new(move || {
+                std::fs::write(gate_root.join(reviewed), "edited during source gate")
+                    .map_err(|error| error.to_string())
+            })),
+            true,
+            &mut progress,
+        );
+        assert!(result.is_err());
+        assert_eq!(progress, ApprovalGitProgress::BeforeEffects);
+        assert_eq!(
+            std::fs::read(root.join(reviewed)).unwrap(),
+            b"edited during source gate"
+        );
+        assert_eq!(git_snapshot(&root), before);
+    }
+
+    #[test]
+    fn follow_up_source_check_refusal_precedes_artifact_mutation() {
+        let (_tmp, root) = super::super::test_git_helpers::init_repo();
+        std::fs::create_dir_all(root.join("tasks")).unwrap();
+        let reviewed = "tasks/53021-p1-ready--reviewed.md";
+        let body = "# Exact reviewed bytes\n";
+        std::fs::write(root.join(reviewed), body).unwrap();
+        let before = git_snapshot(&root);
+        let mut progress = ApprovalGitProgress::BeforeEffects;
+        let result = persist_fresh_approved_task_artifact_blocking_with_progress(
+            &root,
+            "tasks",
+            reviewed,
+            "Exact title",
+            crate::task_source::Priority::P1,
+            body,
+            Some(Box::new(|| Err("source cancelled".into()))),
+            true,
+            &mut progress,
+        );
+        assert!(result.is_err());
+        assert_eq!(progress, ApprovalGitProgress::BeforeEffects);
+        assert!(root.join(reviewed).exists());
+        assert_eq!(git_snapshot(&root), before);
+    }
+
+    #[test]
+    fn follow_up_rejects_clean_index_when_head_does_not_contain_reviewed_bytes() {
+        let (_tmp, root) = super::super::test_git_helpers::init_repo();
+        std::fs::create_dir_all(root.join("tasks")).unwrap();
+        let reviewed = "tasks/reviewed.md";
+        std::fs::write(root.join(reviewed), "# Previous bytes\n").unwrap();
+        run_git(&root, &["add", "--", reviewed]).unwrap();
+        run_git(&root, &["commit", "-m", "seed previous artifact"]).unwrap();
+        run_git(
+            &root,
+            &["update-index", "--assume-unchanged", "--", reviewed],
+        )
+        .unwrap();
+        let body = "# Exact reviewed bytes\r\n";
+        std::fs::write(root.join(reviewed), body).unwrap();
+        let before = git_snapshot(&root);
+        let mut progress = ApprovalGitProgress::BeforeEffects;
+        let result = persist_fresh_approved_task_artifact_blocking_with_progress(
+            &root,
+            "tasks",
+            reviewed,
+            "Exact title",
+            crate::task_source::Priority::P1,
+            body,
+            None,
+            true,
+            &mut progress,
+        );
+        assert!(
+            matches!(result, Err(FollowUpArtifactError::AfterGit(ref error))
+            if error == "committed task artifact differs from the reviewed bytes")
+        );
+        assert_eq!(progress, ApprovalGitProgress::EffectsMayHaveOccurred);
+        let after = git_snapshot(&root);
+        assert_eq!((after.0, after.1), (before.0, before.1));
+        assert_eq!(std::fs::read(root.join(reviewed)).unwrap(), body.as_bytes());
+        assert_eq!(
+            run_git(&root, &["show", "HEAD:tasks/reviewed.md"]).unwrap(),
+            "# Previous bytes"
+        );
+    }
+
+    #[test]
+    fn follow_up_reports_effects_after_successful_taskmd_compensation() {
+        let (_tmp, root) = super::super::test_git_helpers::init_repo();
+        std::fs::create_dir_all(root.join("tasks")).unwrap();
+        let reviewed = "tasks/53023-p1-ready--reviewed.md";
+        let body = "# Exact title\n";
+        std::fs::write(root.join(reviewed), body).unwrap();
+        let output = phoenix_core::git::command()
+            .current_dir(&root)
+            .args(["add", "--", reviewed])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let output = phoenix_core::git::command()
+            .current_dir(&root)
+            .args(["commit", "-m", "seed ready task"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let before = git_snapshot(&root);
+        let exclude = root.join(".git/info/exclude");
+        std::fs::remove_file(&exclude).unwrap();
+        std::fs::create_dir(&exclude).unwrap();
+        let mut progress = ApprovalGitProgress::BeforeEffects;
+        let result = persist_fresh_approved_task_artifact_blocking_with_progress(
+            &root,
+            "tasks",
+            reviewed,
+            "Exact title",
+            crate::task_source::Priority::P1,
+            body,
+            None,
+            true,
+            &mut progress,
+        );
+        assert!(
+            matches!(result, Err(FollowUpArtifactError::BeforeGit(_))),
+            "successful compensation retains the legacy error label, not native no-effect truth"
+        );
+        assert_eq!(progress, ApprovalGitProgress::EffectsMayHaveOccurred);
+        assert_eq!(std::fs::read(root.join(reviewed)).unwrap(), body.as_bytes());
+        assert!(!root
+            .join("tasks/53023-p1-in-progress--reviewed.md")
+            .exists());
+        let after = git_snapshot(&root);
+        assert_eq!(after.0, before.0);
+        assert_eq!(after.1, before.1);
+        assert!(exclude.is_dir());
+    }
+
+    fn git_snapshot(root: &std::path::Path) -> (String, String, Option<Vec<u8>>) {
+        let output = phoenix_core::git::command()
+            .current_dir(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let head = String::from_utf8(output.stdout).unwrap();
+        let output = phoenix_core::git::command()
+            .current_dir(root)
+            .args(["status", "--porcelain=v1"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let status = String::from_utf8(output.stdout).unwrap();
+        let exclude = std::fs::read(root.join(".git/info/exclude")).ok();
+        (head, status, exclude)
     }
 
     #[test]

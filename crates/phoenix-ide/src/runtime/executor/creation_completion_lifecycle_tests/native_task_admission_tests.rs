@@ -633,6 +633,8 @@ enum InitialApprovalScenario {
     FreezeFailure,
     ProviderSuccess,
     DroppedCallerProviderSuccess,
+    FollowUpProviderSuccess,
+    FollowUpCompensatedFailure,
 }
 
 struct InitialApprovalHarness {
@@ -686,6 +688,33 @@ async fn production_initial_approval_provider_success_preserves_body_and_replays
     Box::pin(assert_production_initial_approval(
         InitialApprovalScenario::ProviderSuccess,
         ReviewedTaskKind::PlainMarkdown,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn production_native_follow_up_plain_markdown_approval_succeeds_and_replays() {
+    Box::pin(assert_production_initial_approval(
+        InitialApprovalScenario::FollowUpProviderSuccess,
+        ReviewedTaskKind::PlainMarkdown,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn production_native_follow_up_taskmd_approval_succeeds_and_replays() {
+    Box::pin(assert_production_initial_approval(
+        InitialApprovalScenario::FollowUpProviderSuccess,
+        ReviewedTaskKind::Taskmd,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn production_native_follow_up_taskmd_compensates_promotion_failure() {
+    Box::pin(assert_production_initial_approval(
+        InitialApprovalScenario::FollowUpCompensatedFailure,
+        ReviewedTaskKind::Taskmd,
     ))
     .await;
 }
@@ -781,7 +810,14 @@ async fn assert_production_initial_approval_inner(
         git(&worktree, &["add", "--", task_file]);
         git(&worktree, &["commit", "-m", "Seed existing ready taskmd"]);
     }
-    let before_head = git(&worktree, &["rev-parse", "HEAD"]).trim().to_owned();
+    if matches!(
+        scenario,
+        InitialApprovalScenario::FollowUpProviderSuccess
+            | InitialApprovalScenario::FollowUpCompensatedFailure
+    ) {
+        std::fs::write(worktree.join("unrelated-staged.txt"), "keep staged").unwrap();
+        git(&worktree, &["add", "--", "unrelated-staged.txt"]);
+    }
     let f = AdmissionFixture::with_cwd_and_task_file("/nonexistent", task_file).await;
     assert_eq!(
         f.db.goal_control_installation(),
@@ -799,12 +835,64 @@ async fn assert_production_initial_approval_inner(
     )
     .await
     .unwrap();
+    let old_approved = if matches!(
+        scenario,
+        InitialApprovalScenario::FollowUpProviderSuccess
+            | InitialApprovalScenario::FollowUpCompensatedFailure
+    ) {
+        let old = phoenix_core::task_handoff::TaskApprovalHandoffData {
+            task_id: "old-task-id".into(),
+            task_title: "Old objective".into(),
+            title: "Old objective".into(),
+            priority: Priority::P2,
+            plan: "Old approved plan".into(),
+            task_file: "tasks/old-approved.md".into(),
+            artifact_body: "Old artifact body".into(),
+        };
+        std::fs::write(worktree.join(&old.task_file), &old.artifact_body).unwrap();
+        git(&worktree, &["add", "--", &old.task_file]);
+        git(
+            &worktree,
+            &[
+                "commit",
+                "--only",
+                "-m",
+                "Seed old approved artifact",
+                "--",
+                &old.task_file,
+            ],
+        );
+        f.db.persist_approved_task_authority("actor-target", &old)
+            .await
+            .unwrap();
+        Some(old)
+    } else {
+        None
+    };
+    let before_head = git(&worktree, &["rev-parse", "HEAD"]).trim().to_owned();
+    let before_branch = git(&worktree, &["symbolic-ref", "--short", "HEAD"]);
+    // HEAD must change for the approval checkpoint; worktree identity must not.
+    let worktree_identity = || {
+        git(&root, &["worktree", "list", "--porcelain"])
+            .lines()
+            .filter(|line| !line.starts_with("HEAD "))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let before_worktrees = worktree_identity();
     let InitialSource {
         source,
         command,
         source_blocks,
         inspected_owner,
     } = initial_source(&f, task_file, kind).await;
+    let before_target = f.db.get_conversation("actor-target").await.unwrap();
+    let before_binding = native_authority_binding(&f.db).await;
+    let before_provenance_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM product_conversation_sources")
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
     let (request_tx, mut requests) = mpsc::unbounded_channel();
     let llm = Arc::new(NativeApprovalLlm {
         calls: std::sync::atomic::AtomicUsize::new(0),
@@ -821,7 +909,9 @@ async fn assert_production_initial_approval_inner(
         }
         InitialApprovalScenario::FreezeFailure => phoenix_llm::ModelRegistry::new_empty(),
         InitialApprovalScenario::ProviderSuccess
-        | InitialApprovalScenario::DroppedCallerProviderSuccess => {
+        | InitialApprovalScenario::DroppedCallerProviderSuccess
+        | InitialApprovalScenario::FollowUpProviderSuccess
+        | InitialApprovalScenario::FollowUpCompensatedFailure => {
             phoenix_llm::ModelRegistry::for_test_with_sonnet(llm.clone())
         }
     };
@@ -892,6 +982,102 @@ async fn assert_production_initial_approval_inner(
         harness.handle = Some(handle.clone());
         let broadcaster = manager.conversation_broadcaster("actor-target").await;
         let events = broadcaster.subscribe();
+        if scenario == InitialApprovalScenario::FollowUpCompensatedFailure {
+            let old = old_approved.as_ref().expect("follow-up old objective");
+            let old_authority_rows = native_approval_rows(&f.db).await;
+            let old_objective =
+                f.db.get_approved_task_objective("actor-target")
+                    .await
+                    .unwrap()
+                    .expect("old approved objective");
+            assert_eq!(
+                old_objective,
+                phoenix_core::task_handoff::ApprovedTaskSnapshot::from(old)
+            );
+            let old_conversation = f.db.get_conversation("actor-target").await.unwrap();
+            let old_scope_id = old_conversation.attached_work_scope_id.clone();
+            let old_scope_authority = sqlx::query_as::<_, (String, String, i64)>(
+                "SELECT work_scope_id, objective_conversation_id, created_at_us FROM work_scope_approved_task_authorities WHERE objective_conversation_id = ?1",
+            )
+            .bind("actor-target")
+            .fetch_all(f.db.pool())
+            .await
+            .unwrap();
+            assert_eq!(old_scope_authority.len(), 1);
+            let old_provenance = sqlx::query_as::<_, (String, String, String, String, i64)>(
+                "SELECT target_product_conversation_id, source_product_conversation_id, source_conversation_id, relation_key, created_at_us FROM product_conversation_sources WHERE target_product_conversation_id = ?1",
+            )
+            .bind(old_conversation.product_conversation_id.as_str())
+            .fetch_all(f.db.pool())
+            .await
+            .unwrap();
+            let before_head = git(&worktree, &["rev-parse", "HEAD"]).trim().to_owned();
+            let before_branch = git(&worktree, &["symbolic-ref", "--short", "HEAD"]);
+            let git_path = git(&worktree, &["rev-parse", "--git-path", "info/exclude"]);
+            let git_path = std::path::PathBuf::from(git_path.trim());
+            let exclude = if git_path.is_absolute() {
+                git_path
+            } else {
+                worktree.join(git_path)
+            };
+            if exclude.exists() {
+                std::fs::remove_file(&exclude).unwrap();
+            }
+            std::fs::create_dir_all(&exclude).unwrap();
+
+            let outcome = manager.execute_native_task_approval(command.clone()).await;
+            assert_eq!(outcome, NativeTaskApprovalOutcome::Unavailable);
+            handle.event_tx.closed().await;
+            assert_eq!(
+                f.db.get_approved_task_objective("actor-target")
+                    .await
+                    .unwrap(),
+                Some(old_objective)
+            );
+            assert_eq!(native_approval_rows(&f.db).await, old_authority_rows);
+            let current = f.db.get_conversation("actor-target").await.unwrap();
+            assert_eq!(current.conv_mode, old_conversation.conv_mode);
+            assert_eq!(current.state, old_conversation.state);
+            assert_eq!(current.cwd, old_conversation.cwd);
+            assert_eq!(current.attached_work_scope_id, old_scope_id);
+            assert_eq!(
+                sqlx::query_as::<_, (String, String, i64)>(
+                    "SELECT work_scope_id, objective_conversation_id, created_at_us FROM work_scope_approved_task_authorities WHERE objective_conversation_id = ?1",
+                )
+                .bind("actor-target")
+                .fetch_all(f.db.pool())
+                .await
+                .unwrap(),
+                old_scope_authority
+            );
+            assert_eq!(
+                sqlx::query_as::<_, (String, String, String, String, i64)>(
+                    "SELECT target_product_conversation_id, source_product_conversation_id, source_conversation_id, relation_key, created_at_us FROM product_conversation_sources WHERE target_product_conversation_id = ?1",
+                )
+                .bind(current.product_conversation_id.as_str())
+                .fetch_all(f.db.pool())
+                .await
+                .unwrap(),
+                old_provenance
+            );
+            assert_eq!(git(&worktree, &["rev-parse", "HEAD"]).trim(), before_head);
+            assert_eq!(
+                git(&worktree, &["symbolic-ref", "--short", "HEAD"]),
+                before_branch
+            );
+            assert_eq!(
+                std::fs::read(worktree.join(task_file)).unwrap(),
+                BODY.as_bytes()
+            );
+            assert!(!worktree.join(committed_task_file).exists());
+            assert_eq!(
+                git(&worktree, &["show", ":unrelated-staged.txt"]),
+                "keep staged"
+            );
+            assert!(requests.try_recv().is_err());
+            assert_eq!(llm.calls.load(Ordering::SeqCst), 0);
+            return;
+        }
         let result = manager.execute_native_task_approval(command.clone()).await;
         (handle, events, None, result)
     };
@@ -924,9 +1110,46 @@ async fn assert_production_initial_approval_inner(
             .unwrap()
             .unwrap();
     assert_eq!(approved.title, "Exact title");
+    if let Some(old) = &old_approved {
+        assert_ne!(approved.task_id, old.task_id);
+        assert_ne!(approved.task_title, old.task_title);
+        assert_ne!(approved.title, old.title);
+        assert_ne!(approved.priority, old.priority);
+        assert_ne!(approved.plan, old.plan);
+        assert_ne!(approved.task_file, old.task_file);
+        assert_ne!(approved.artifact_body, old.artifact_body);
+    }
+    let after_target = f.db.get_conversation("actor-target").await.unwrap();
+    assert_eq!(after_target.id, before_target.id);
+    assert_eq!(
+        after_target.product_conversation_id,
+        before_target.product_conversation_id
+    );
+    assert_eq!(
+        after_target.attached_work_scope_id,
+        before_target.attached_work_scope_id
+    );
+    assert_eq!(after_target.cwd, before_target.cwd);
+    assert_eq!(after_target.conv_mode, before_target.conv_mode);
+    if old_approved.is_some() {
+        assert_eq!(native_authority_binding(&f.db).await, before_binding);
+    }
+    let after_provenance_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM product_conversation_sources")
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(after_provenance_count, before_provenance_count);
     assert_eq!(approved.task_title, "Exact title");
     assert_eq!(approved.priority, Priority::P1);
-    assert_eq!(approved.task_file, task_file);
+    assert_eq!(
+        approved.task_file,
+        if old_approved.is_some() && kind == ReviewedTaskKind::Taskmd {
+            committed_task_file
+        } else {
+            task_file
+        }
+    );
     if kind == ReviewedTaskKind::Taskmd {
         assert_eq!(approved.task_id, "53019");
     }
@@ -942,10 +1165,28 @@ async fn assert_production_initial_approval_inner(
     let MessageContent::User(content) = &approvals[0].content else {
         panic!("approval is a persisted user meta message");
     };
-    assert!(content.text.contains("Task approved."));
+    let approval_prefix = if old_approved.is_some() {
+        "Follow-up task approved"
+    } else {
+        "Task approved."
+    };
+    assert!(content.text.contains(approval_prefix));
     assert!(content.text.contains(BODY));
     let after_head = git(&worktree, &["rev-parse", "HEAD"]).trim().to_owned();
     assert_ne!(after_head, before_head);
+    if old_approved.is_some() {
+        assert_eq!(
+            git(&worktree, &["symbolic-ref", "--short", "HEAD"]),
+            before_branch
+        );
+        assert_eq!(worktree_identity(), before_worktrees);
+    } else {
+        // Initial approval deliberately renames the temporary Explore branch.
+        assert_ne!(
+            git(&worktree, &["symbolic-ref", "--short", "HEAD"]),
+            before_branch
+        );
+    }
     assert_eq!(
         git(
             &worktree,
@@ -962,6 +1203,15 @@ async fn assert_production_initial_approval_inner(
         std::fs::read(worktree.join(committed_task_file)).unwrap(),
         BODY.as_bytes()
     );
+    if old_approved.is_some() {
+        assert!(!git(&worktree, &["ls-tree", "-r", "--name-only", "HEAD"])
+            .lines()
+            .any(|path| path == "unrelated-staged.txt"));
+        assert_eq!(
+            git(&worktree, &["show", ":unrelated-staged.txt"]),
+            "keep staged"
+        );
+    }
     if kind == ReviewedTaskKind::Taskmd {
         assert!(!worktree.join(task_file).exists());
         assert_eq!(
@@ -992,6 +1242,7 @@ async fn assert_production_initial_approval_inner(
     if matches!(
         scenario,
         InitialApprovalScenario::ProviderSuccess
+            | InitialApprovalScenario::FollowUpProviderSuccess
             | InitialApprovalScenario::DroppedCallerProviderSuccess
     ) {
         let request = match provider_request.take() {
@@ -1012,7 +1263,7 @@ async fn assert_production_initial_approval_inner(
         assert_eq!(submitted_approval.role, phoenix_llm::MessageRole::User);
         assert!(submitted_approval.content.iter().any(|block| {
             matches!(block, ContentBlock::Text { text }
-                if text.contains("Task approved.") && text.contains(BODY))
+                if text.contains(approval_prefix) && text.contains(BODY))
         }));
 
         let mut saw_approval_state = false;
@@ -1160,11 +1411,14 @@ async fn assert_production_initial_approval_inner(
             );
         }
     }
-    let expected_calls = usize::from(matches!(
-        scenario,
+    let expected_calls = match scenario {
         InitialApprovalScenario::ProviderSuccess
-            | InitialApprovalScenario::DroppedCallerProviderSuccess
-    ));
+        | InitialApprovalScenario::DroppedCallerProviderSuccess
+        | InitialApprovalScenario::FollowUpProviderSuccess => 1,
+        InitialApprovalScenario::ContextPressure
+        | InitialApprovalScenario::FreezeFailure
+        | InitialApprovalScenario::FollowUpCompensatedFailure => 0,
+    };
     assert_eq!(llm.calls.load(Ordering::SeqCst), expected_calls);
     assert!(requests.try_recv().is_err(), "no additional provider entry");
     manager.begin_process_shutdown();
@@ -1237,6 +1491,15 @@ async fn assert_production_initial_approval_inner(
         git(&worktree, &["status", "--porcelain=v1"]),
         before_replay_git_status
     );
+    if old_approved.is_some() {
+        assert!(git(&worktree, &["diff", "--cached", "--name-only"])
+            .lines()
+            .any(|path| path == "unrelated-staged.txt"));
+        assert_eq!(
+            std::fs::read(worktree.join("unrelated-staged.txt")).unwrap(),
+            b"keep staged"
+        );
+    }
     assert_eq!(
         git(&worktree, &["show", &format!("HEAD:{committed_task_file}")]),
         BODY
@@ -1357,6 +1620,13 @@ fn git(path: &std::path::Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
+}
+
+async fn native_authority_binding(db: &Database) -> Vec<(String, String)> {
+    sqlx::query_as("SELECT work_scope_id, objective_conversation_id FROM work_scope_approved_task_authorities ORDER BY work_scope_id")
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
 }
 
 async fn native_approval_rows(db: &Database) -> Vec<i64> {

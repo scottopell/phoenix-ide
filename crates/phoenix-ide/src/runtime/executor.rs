@@ -11986,7 +11986,7 @@ where
         Ok(TaskApprovalExecution::Initial)
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     async fn approve_follow_up_in_existing_scope(
         &mut self,
         task_file: &str,
@@ -11994,46 +11994,66 @@ where
         priority: crate::task_source::Priority,
         plan: &str,
         admitted: &mut crate::runtime::AdmittedOperation,
+        origin: &mut native_task_approval::ApprovalOrigin,
     ) -> Result<(), FollowUpApprovalError> {
-        reread_reviewed_task_handoff_snapshot(
-            self.context.filesystem_root(),
-            self.context.filesystem_root(),
-            &self.context.tasks_dir_name,
-            task_file,
-            title,
-            priority,
-            plan,
-        )
-        .map_err(FollowUpApprovalError::BeforeGit)?;
+        if !origin.is_native() {
+            reread_reviewed_task_handoff_snapshot(
+                self.context.filesystem_root(),
+                self.context.filesystem_root(),
+                &self.context.tasks_dir_name,
+                task_file,
+                title,
+                priority,
+                plan,
+            )
+            .map_err(FollowUpApprovalError::BeforeGit)?;
+        }
         let cwd = self.context.filesystem_root().to_path_buf();
         let tasks_dir_name = self.context.tasks_dir_name.clone();
         let task_file_owned = task_file.to_string();
         let title_owned = title.to_string();
         let plan_owned = plan.to_string();
         let blocking_admission = admitted.reborrow();
-        let reviewed =
+        let pre_git = self
+            .native_pre_git_check(origin)
+            .map_err(FollowUpApprovalError::BeforeGit)?;
+        let native = origin.is_native();
+        let worker =
             crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move || {
-                persist_fresh_approved_task_artifact_blocking(
+                let mut progress = native_task_approval::ApprovalGitProgress::BeforeEffects;
+                let result = persist_fresh_approved_task_artifact_blocking_with_progress(
                     &cwd,
                     &tasks_dir_name,
                     &task_file_owned,
                     &title_owned,
                     priority,
                     &plan_owned,
-                )
-            })
-            .await
-            .map_err(|error| {
-                FollowUpApprovalError::AuthorityLost(format!(
-                    "Follow-up task approval join error after Git admission: {error}"
-                ))
-            })?
-            .map_err(|error| match error {
-                FollowUpArtifactError::BeforeGit(error) => FollowUpApprovalError::BeforeGit(error),
-                FollowUpArtifactError::AfterGit(error) => {
-                    FollowUpApprovalError::AuthorityLost(error)
-                }
-            })?;
+                    pre_git,
+                    native,
+                    &mut progress,
+                );
+                (result, progress)
+            });
+        // A dropped/panicked worker cannot report how far it progressed. Until
+        // normal completion supplies a precise boundary, conservatively retain
+        // possible effects just as the Initial native worker does.
+        if native {
+            origin.set_progress(native_task_approval::ApprovalGitProgress::EffectsMayHaveOccurred);
+        }
+        let (reviewed, progress) = worker.await.map_err(|error| {
+            FollowUpApprovalError::AuthorityLost(format!(
+                "Follow-up task approval join error after Git admission: {error}"
+            ))
+        })?;
+        origin.set_progress(progress);
+        let reviewed = reviewed.map_err(|error| match error {
+            FollowUpArtifactError::BeforeGit(error) if !origin.is_native() => {
+                FollowUpApprovalError::BeforeGit(error)
+            }
+            FollowUpArtifactError::BeforeGit(error) | FollowUpArtifactError::AfterGit(error) => {
+                FollowUpApprovalError::AuthorityLost(error)
+            }
+        })?;
 
         let approval_msg = format!(
             "Follow-up task approved in the existing worktree {}.\n\n## Approved plan: {title}\n\nPriority: {priority}\n\n{plan}",
@@ -12056,8 +12076,8 @@ where
         let approved_state = ConvState::LlmRequesting { attempt: 1 };
         let state_updated_at = Utc::now();
         let establishment = self
-            .storage
-            .persist_approved_task_authority_and_state(
+            .settle_task_approval(
+                origin,
                 &self.context.conversation_id,
                 &TaskApprovalHandoffData {
                     task_id: reviewed.task_id,
@@ -12194,16 +12214,19 @@ where
             plan,
             reviewed_proposal: reviewed_proposal_backup,
         } = approval;
-        if origin.is_native() && execution != TaskApprovalExecution::Initial {
-            return Err("native execution path is unsupported".to_owned());
+        if origin.is_native() && execution == TaskApprovalExecution::DetachedApprovedTaskCheckpoint
+        {
+            return Err("native detached checkpoint is unsupported".to_owned());
         }
         if execution == TaskApprovalExecution::FollowUp {
             let result = self
-                .approve_follow_up_in_existing_scope(&task_file, &title, priority, &plan, admitted)
+                .approve_follow_up_in_existing_scope(
+                    &task_file, &title, priority, &plan, admitted, origin,
+                )
                 .await;
             return match result {
                 Ok(()) => Ok(()),
-                Err(FollowUpApprovalError::BeforeGit(error)) => {
+                Err(FollowUpApprovalError::BeforeGit(error)) if !origin.is_native() => {
                     self.restore_retryable_task_approval(
                         TaskApprovalInput {
                             task_file,
@@ -12217,6 +12240,7 @@ where
                     )?;
                     Err(error)
                 }
+                Err(FollowUpApprovalError::BeforeGit(error)) => Err(error),
                 Err(FollowUpApprovalError::PersistenceFailed(error)) => {
                     self.recovery_disposition = RuntimeRecoveryDisposition::RecreateFromDatabase;
                     Err(format!(
@@ -12707,7 +12731,6 @@ fn compensate_follow_up_artifact_failure(
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn persist_fresh_approved_task_artifact_blocking(
     cwd: &std::path::Path,
     tasks_dir_name: &str,
@@ -12716,20 +12739,61 @@ fn persist_fresh_approved_task_artifact_blocking(
     expected_priority: crate::task_source::Priority,
     expected_plan: &str,
 ) -> Result<ReviewedTaskHandoffSnapshot, FollowUpArtifactError> {
-    let _guard = TASK_APPROVAL_MUTEX
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let original_path_was_tracked =
-        run_git(cwd, &["ls-files", "--error-unmatch", "--", task_file]).is_ok();
-    let mut snapshot = reread_reviewed_task_handoff_snapshot(
-        cwd,
+    let mut progress = native_task_approval::ApprovalGitProgress::BeforeEffects;
+    persist_fresh_approved_task_artifact_blocking_with_progress(
         cwd,
         tasks_dir_name,
         task_file,
         expected_title,
         expected_priority,
         expected_plan,
+        None,
+        false,
+        &mut progress,
     )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn persist_fresh_approved_task_artifact_blocking_with_progress(
+    cwd: &std::path::Path,
+    tasks_dir_name: &str,
+    task_file: &str,
+    expected_title: &str,
+    expected_priority: crate::task_source::Priority,
+    expected_plan: &str,
+    pre_git: Option<native_task_approval::PreGitCheck>,
+    native: bool,
+    progress: &mut native_task_approval::ApprovalGitProgress,
+) -> Result<ReviewedTaskHandoffSnapshot, FollowUpArtifactError> {
+    let _guard = TASK_APPROVAL_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let original_path_was_tracked =
+        run_git(cwd, &["ls-files", "--error-unmatch", "--", task_file]).is_ok();
+    if let Some(check) = pre_git {
+        check().map_err(FollowUpArtifactError::BeforeGit)?;
+    }
+    let mut snapshot = if native {
+        reread_reviewed_task_handoff_snapshot_at_exact_path(
+            cwd,
+            cwd,
+            tasks_dir_name,
+            task_file,
+            expected_title,
+            expected_priority,
+            expected_plan,
+        )
+    } else {
+        reread_reviewed_task_handoff_snapshot(
+            cwd,
+            cwd,
+            tasks_dir_name,
+            task_file,
+            expected_title,
+            expected_priority,
+            expected_plan,
+        )
+    }
     .map_err(FollowUpArtifactError::BeforeGit)?;
     let mut promotion: Option<(String, String, std::path::PathBuf, std::path::PathBuf)> = None;
     if snapshot.task_file == task_file && detect_plain_markdown_task_stem(task_file).is_none() {
@@ -12744,6 +12808,9 @@ fn persist_fresh_approved_task_artifact_blocking(
         let parsed = taskmd_core::filename::parse_filename(filename).ok_or_else(|| {
             FollowUpArtifactError::BeforeGit(format!("invalid taskmd filename: '{filename}'"))
         })?;
+        if native {
+            *progress = native_task_approval::ApprovalGitProgress::EffectsMayHaveOccurred;
+        }
         let promoted = promote_task_status_to_in_progress(
             &cwd.join(tasks_dir_name),
             &parsed.id,
@@ -12776,6 +12843,9 @@ fn persist_fresh_approved_task_artifact_blocking(
         }
         None => FollowUpArtifactError::BeforeGit(error),
     };
+    if native {
+        *progress = native_task_approval::ApprovalGitProgress::EffectsMayHaveOccurred;
+    }
     crate::git_ops::ensure_local_exclude_has_phoenix(cwd).map_err(&compensate)?;
     run_git(cwd, &["add", "--", &snapshot.task_file]).map_err(&compensate)?;
     let mut approved_paths = vec![snapshot.task_file.as_str()];
@@ -12784,7 +12854,8 @@ fn persist_fresh_approved_task_artifact_blocking(
     }
     let mut diff_args = vec!["diff", "--cached", "--quiet", "--"];
     diff_args.extend(approved_paths.iter().copied());
-    if run_git(cwd, &diff_args).is_err() {
+    let checkpoint_created = run_git(cwd, &diff_args).is_err();
+    if checkpoint_created {
         let commit_message = format!("task {}: {}", snapshot.task_id, expected_title);
         let mut commit_args = vec![
             "commit",
@@ -12798,6 +12869,11 @@ fn persist_fresh_approved_task_artifact_blocking(
         run_git(cwd, &commit_args).map_err(|error| {
             compensate(format!("Failed to commit approved task artifact: {error}"))
         })?;
+    }
+    // A clean index is not proof of matching bytes (e.g. assume-unchanged or
+    // a clean filter). Native settlement must prove the exact HEAD artifact
+    // even when no new commit was necessary. Keep the User path unchanged.
+    if native || checkpoint_created {
         let mut hash = phoenix_core::git::command()
             .arg("hash-object")
             .arg("--stdin")
@@ -14500,7 +14576,11 @@ fn execute_approve_task_blocking_reviewed_with_progress(
         ));
     }
 
-    let reread = if pre_git.is_some() {
+    let native = pre_git.is_some();
+    if let Some(check) = pre_git {
+        check()?;
+    }
+    let reread = if native {
         reread_reviewed_task_handoff_snapshot_at_exact_path
     } else {
         reread_reviewed_task_handoff_snapshot
@@ -14514,9 +14594,6 @@ fn execute_approve_task_blocking_reviewed_with_progress(
         priority,
         reviewed_artifact,
     )?;
-    if let Some(check) = pre_git {
-        check()?;
-    }
     if let Some(stem) = detect_plain_markdown_task_stem(task_file) {
         *progress = native_task_approval::ApprovalGitProgress::EffectsMayHaveOccurred;
         return execute_approve_plain_markdown_blocking(
