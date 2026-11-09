@@ -59,6 +59,7 @@ use tracing::Instrument;
 
 mod capacity;
 mod continuation;
+mod native_task_approval;
 mod self_goal;
 #[cfg(test)]
 mod self_goal_tests;
@@ -3240,6 +3241,16 @@ where
                 Some(request) = self.acknowledged_event_rx.recv() => {
                     let super::AcknowledgedEventRequest { event, acknowledgement, retirement } = match request {
                         AcknowledgedRuntimeRequest::Event(event) => *event,
+                        AcknowledgedRuntimeRequest::ExecuteNativeTaskApproval { command, response, admission } => {
+                            // The queued command, not its caller, owns mutation admission to settlement.
+                            let _admission = admission;
+                            let result = self.execute_native_task_approval(*command).await;
+                            let _ = response.send(result);
+                            if self.fatal_local_authority_fence.fatal_authority_loss_is_latched() {
+                                return self.fatal_local_authority_exit();
+                            }
+                            continue;
+                        }
                         AcknowledgedRuntimeRequest::InspectNativeTaskApprovalAdmission { expected, response } => {
                             let result = self.check_native_task_approval_admission(&expected).await;
                             let _ = response.send(result);
@@ -12137,6 +12148,23 @@ where
         execution: TaskApprovalExecution,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
+        self.execute_approve_task_with_origin(
+            approval,
+            execution,
+            admitted,
+            &mut native_task_approval::ApprovalOrigin::User,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute_approve_task_with_origin(
+        &mut self,
+        approval: TaskApprovalInput,
+        execution: TaskApprovalExecution,
+        admitted: &mut crate::runtime::AdmittedOperation,
+        origin: &mut native_task_approval::ApprovalOrigin,
+    ) -> Result<(), String> {
         let TaskApprovalInput {
             task_file,
             title,
@@ -12144,6 +12172,9 @@ where
             plan,
             reviewed_proposal: reviewed_proposal_backup,
         } = approval;
+        if origin.is_native() && execution != TaskApprovalExecution::Initial {
+            return Err("native execution path is unsupported".to_owned());
+        }
         if execution == TaskApprovalExecution::FollowUp {
             let result = self
                 .approve_follow_up_in_existing_scope(&task_file, &title, priority, &plan, admitted)
@@ -12247,7 +12278,6 @@ where
         let conversation_id = self.context.conversation_id.clone();
         let desired_base_branch = self.context.desired_base_branch.clone();
         let tasks_dir_name = self.context.tasks_dir_name.clone();
-        let storage = self.storage.clone();
 
         // Clone for state revert on failure (originals moved into spawn_blocking)
         let task_file_backup = task_file.clone();
@@ -12257,9 +12287,12 @@ where
 
         // Run blocking git/fs operations on a blocking thread.
         let blocking_admission = admitted.reborrow();
-        let result =
+        let pre_git = self.native_pre_git_check(origin)?;
+        origin.effects_may_have_occurred();
+        let (result, progress) =
             crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move || {
-                execute_approve_task_blocking_reviewed(
+                let mut progress = native_task_approval::ApprovalGitProgress::BeforeEffects;
+                let result = execute_approve_task_blocking_reviewed_with_progress(
                     &cwd,
                     &repo_root,
                     &conversation_id,
@@ -12269,10 +12302,14 @@ where
                     priority,
                     &plan,
                     desired_base_branch.as_deref(),
-                )
+                    pre_git,
+                    &mut progress,
+                );
+                (result, progress)
             })
             .await
             .map_err(|e| format!("Task approval join error: {e}"))?;
+        origin.set_progress(progress);
 
         match result {
             Ok(approval_result) => {
@@ -12300,8 +12337,9 @@ where
                 };
                 let approved_state = ConvState::LlmRequesting { attempt: 1 };
                 let state_updated_at = Utc::now();
-                let establishment = match storage
-                    .persist_approved_task_authority_and_state(
+                let establishment = match self
+                    .settle_task_approval(
+                        origin,
                         &self.context.conversation_id,
                         &TaskApprovalHandoffData {
                             task_id: approval_result.task_id.clone(),
@@ -12412,6 +12450,9 @@ where
                 Ok(())
             }
             Err(e) => {
+                if origin.is_native() {
+                    return Err(e);
+                }
                 tracing::error!(
                     error = %e,
                     conv_id = %self.context.conversation_id,
@@ -14375,6 +14416,7 @@ fn detect_plain_markdown_task_stem(task_file: &str) -> Option<String> {
 /// Approval validates and promotes `cwd` directly rather than reconstructing a
 /// path from either conversation identity.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[cfg(test)]
 fn execute_approve_task_blocking_reviewed(
     cwd: &std::path::Path,
     repo_root: &std::path::Path,
@@ -14385,6 +14427,35 @@ fn execute_approve_task_blocking_reviewed(
     priority: crate::task_source::Priority,
     reviewed_artifact: &str,
     desired_base_branch: Option<&str>,
+) -> Result<TaskApprovalResult, String> {
+    execute_approve_task_blocking_reviewed_with_progress(
+        cwd,
+        repo_root,
+        conv_id,
+        tasks_dir_name,
+        task_file,
+        title,
+        priority,
+        reviewed_artifact,
+        desired_base_branch,
+        None,
+        &mut native_task_approval::ApprovalGitProgress::BeforeEffects,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn execute_approve_task_blocking_reviewed_with_progress(
+    cwd: &std::path::Path,
+    repo_root: &std::path::Path,
+    conv_id: &str,
+    tasks_dir_name: &str,
+    task_file: &str,
+    title: &str,
+    priority: crate::task_source::Priority,
+    reviewed_artifact: &str,
+    desired_base_branch: Option<&str>,
+    pre_git: Option<native_task_approval::PreGitCheck>,
+    progress: &mut native_task_approval::ApprovalGitProgress,
 ) -> Result<TaskApprovalResult, String> {
     let _guard = TASK_APPROVAL_MUTEX
         .lock()
@@ -14400,7 +14471,12 @@ fn execute_approve_task_blocking_reviewed(
         ));
     }
 
-    let reviewed = reread_reviewed_task_handoff_snapshot(
+    let reread = if pre_git.is_some() {
+        reread_reviewed_task_handoff_snapshot_at_exact_path
+    } else {
+        reread_reviewed_task_handoff_snapshot
+    };
+    let reviewed = reread(
         cwd,
         repo_root,
         tasks_dir_name,
@@ -14409,7 +14485,11 @@ fn execute_approve_task_blocking_reviewed(
         priority,
         reviewed_artifact,
     )?;
+    if let Some(check) = pre_git {
+        check()?;
+    }
     if let Some(stem) = detect_plain_markdown_task_stem(task_file) {
+        *progress = native_task_approval::ApprovalGitProgress::EffectsMayHaveOccurred;
         return execute_approve_plain_markdown_blocking(
             cwd,
             repo_root,
@@ -14422,6 +14502,7 @@ fn execute_approve_task_blocking_reviewed(
         );
     }
 
+    *progress = native_task_approval::ApprovalGitProgress::EffectsMayHaveOccurred;
     let base_branch = resolve_approval_base_branch(cwd, repo_root, desired_base_branch)?;
 
     let rel_path = std::path::Path::new(task_file);

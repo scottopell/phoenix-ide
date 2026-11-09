@@ -141,9 +141,55 @@ request enum's size imbalance under clippy; the Event and frozen-snapshot payloa
 are now boxed on the same channel. Other build/musl lanes failed during sccache
 setup with HTTP 504, before running tests. New exact-head qualification is required.
 
+## Internal mutating command leaf (unqualified)
+
+`RuntimeManager::execute_native_task_approval` accepts the normalized DB command,
+proves current Coordinator/exact source before replay, and sends a dedicated typed
+request on the existing acknowledged actor queue. The queued request owns mutation
+admission even when its response receiver disappears. The target actor retains
+its actual pending state while calling the existing Initial approval Git engine;
+there is no readiness-to-unbound-event bridge. Existing HTTP approval and Event
+acknowledgement/retirement semantics are unchanged. Nothing is registered or exposed.
+
+Initial ContinueHere uses an explicit execution origin and the production Storage
+native settlement sibling. The existing BEGIN IMMEDIATE settlement returns a receipt
+constructed/read inside that transaction along with the existing message, objective,
+WorkScope authority, state and continuation-request obligation. Exact replay returns
+the original receipt without writing a replacement message or redispatching work.
+Current-Coordinator source rotation remains denied. Full captured-pending/CURRENT,
+role, target lifecycle and active WorkScope checks precede new effects. Exact artifact
+reread and a fresh source/target check execute inside the admitted Git worker before
+its first possible mutation, including worktree creation/ref-fetching paths.
+
+Native Git progress is bounded as BeforeEffects or EffectsMayHaveOccurred. A worker
+join failure is conservative. Any post-boundary error without an established receipt
+closes the existing owning fatal-authority fence and returns typed Unavailable;
+it never restores pending/reports NotApplied. Projection/dispatch failures after
+settlement preserve the committed receipt fact and fail-stop live ownership.
+Committed means continuation requested durably, not exactly-once network dispatch.
+
+This bounded leaf explicitly returns typed Unsupported for FollowUp,
+DetachedCheckpoint and all new work when goal controls are installed. It does not
+bypass/initialize the Stop latch or claim Stop-gate integration. Historical exact
+replay precedes this restriction. FollowUp/detached native execution and verified
+Stop-versus-first-mutation routing remain mandatory gates before exposure.
+
+Authored, NOT RUN: public native typed receipt/original-message replay and complete
+rollback fault cut; Git exact-bytes/source refusal before effects and conservative
+Git-failure progress; production DatabaseStorage/manager cancellation before native
+command without approval artifacts. Existing DB rollback/replay/source-policy tests
+remain in place. Missing runtime qualification includes positive disposable-Git
+manager approval/one obligation, queued Cancel race, lost-ACK/after-Stop canonical
+replay, concurrent distinct approvers, ABA/path/kind/member/role/lifecycle cuts,
+post-Git source cancellation/rollback fail-stop and postcommit projection failure.
+No full Part B completion or runtime test pass is claimed. Local native compilation,
+builds, tests, codegen and installs are held; only direct installed rustfmt (edition
+2021, skip_children) and git diff checks were performed. Baseline hosted run
+42576713776 for 7bc5bae6c was still in progress at inspection.
+
 ## Coverage and proposed verification
 
-Part A (canonical pending-state capture) and Part B leaf 1 (executing-source proof/read-only inspection) have focused tests written but NOT RUN locally. Leaf 1's `Database::inspect_pending_task_from_coordinator` performs current-Coordinator admission before target lookup in one SQLite read transaction, matches the source transcript/message/current call and unique canonical block name/input against the typed request, then reads the ordinary product aggregate's CURRENT member. It returns owned exact pending fields and provenance, distinct `NoPending`, or legacy `UnavailableRepropose`; it neither reads task files nor reconstructs provenance. A nonempty occurrence alone is not classified as captured: within the same read transaction it requires the existing canonical receipt keyed by target transcript and proposing assistant, plus that actual assistant message owned by the target. The reused canonical-write validator checks unique tool-use identity across tool names, typed `propose_task` path, reviewed body digest and task kind. Missing messages/receipts, foreign ownership and mismatches preserve the exact snapshot and return typed `UnavailableIntegrity` with a repair/re-propose consequence. Twelve focused tests are authored, including actual ordinary/provider canonical target checkpoints with the Coordinator source assistant still absent from messages, missing/foreign receipt/message, forged occurrence, duplicate/wrong-name calls, stale input path, body/digest/kind drift, existing source-admission/continuation cases and unchanged persisted tables. Scoped direct rustfmt 1.95 (edition 2021, skip children) and static diff checks are the local validation; hosted compile/clippy/tests remain required. The leaf does not inspect the runtime Stop latch and its captured-proposal result explicitly requires later admission; no approval eligibility or full REQ-TAT-002 stopped-state explanation is claimed. The DB command/receipt foundation is described above; remaining Part B public typed settlement, actual mutating actor, historical service-handle routing and Stop work, Part C (native approval), and Close are deferred.
+Part A (canonical pending-state capture) and Part B leaf 1 (executing-source proof/read-only inspection) have focused tests written but NOT RUN locally. Leaf 1's `Database::inspect_pending_task_from_coordinator` performs current-Coordinator admission before target lookup in one SQLite read transaction, matches the source transcript/message/current call and unique canonical block name/input against the typed request, then reads the ordinary product aggregate's CURRENT member. It returns owned exact pending fields and provenance, distinct `NoPending`, or legacy `UnavailableRepropose`; it neither reads task files nor reconstructs provenance. A nonempty occurrence alone is not classified as captured: within the same read transaction it requires the existing canonical receipt keyed by target transcript and proposing assistant, plus that actual assistant message owned by the target. The reused canonical-write validator checks unique tool-use identity across tool names, typed `propose_task` path, reviewed body digest and task kind. Missing messages/receipts, foreign ownership and mismatches preserve the exact snapshot and return typed `UnavailableIntegrity` with a repair/re-propose consequence. Twelve focused tests are authored, including actual ordinary/provider canonical target checkpoints with the Coordinator source assistant still absent from messages, missing/foreign receipt/message, forged occurrence, duplicate/wrong-name calls, stale input path, body/digest/kind drift, existing source-admission/continuation cases and unchanged persisted tables. Scoped direct rustfmt 1.95 (edition 2021, skip children) and static diff checks are the local validation; hosted compile/clippy/tests remain required. The leaf does not inspect the runtime Stop latch and its captured-proposal result explicitly requires later admission; no approval eligibility or full REQ-TAT-002 stopped-state explanation is claimed. The DB command/receipt foundation is described above; remaining Part B native FollowUp/detached execution, historical service-handle routing and Stop work, Part C (native approval), and Close are deferred.
 
 | Requirement | Implementation | Tests | Runtime | Focused verification to add |
 |---|---|---|---|---|
@@ -161,4 +207,4 @@ Part A (canonical pending-state capture) and Part B leaf 1 (executing-source pro
 1. Owner authorized bounded Part A; proposed ADR-244 reflects the existing canonical receipt as its ownership witness.
 2. Part A head `05dcca22` passed hosted clippy. Leaf head `5335c1ee` subsequently failed hosted compilation in its dynamic SQL test helper, while musl/UI setup also encountered hosted sccache HTTP 504 failures. The bounded witness fix corrects the two introduced compiler errors; exact-head hosted qualification remains pending. No local compiler, build, tests or codegen was run. Complete source actor/receipt/replay and owning Stop admission before enabling any native mutator. The private receipt foundation does not satisfy the remaining end-to-end native approval gates.
 
-No native execution, local build/tests/codegen, registration, RC2, release or production work is included in Part A or Part B leaf 1. A draft PR triggers standard hosted CI; runtime behavior remains unverified pending those results. The README index labels ADR-244 Proposed; Stop/pause policy is resolved but its implementation is deferred.
+The internal Initial execution leaf above is unqualified; no local build/tests/codegen, registration, RC2, release or production work is included. A draft PR triggers standard hosted CI; runtime behavior remains unverified pending those results. The README index labels ADR-244 Proposed; Stop/pause policy is resolved but its implementation is deferred.

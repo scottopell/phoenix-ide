@@ -281,6 +281,11 @@ pub(crate) struct AcknowledgedEventRequest {
 
 pub(crate) enum AcknowledgedRuntimeRequest {
     Event(Box<AcknowledgedEventRequest>),
+    ExecuteNativeTaskApproval {
+        command: Box<phoenix_db::native_task_approval::NativeTaskApprovalCommand>,
+        response: tokio::sync::oneshot::Sender<task_approval_admission::NativeTaskApprovalOutcome>,
+        admission: tokio::sync::OwnedMutexGuard<()>,
+    },
     InspectNativeTaskApprovalAdmission {
         expected: Box<task_approval_admission::FrozenPendingTask>,
         response: tokio::sync::oneshot::Sender<
@@ -7009,6 +7014,51 @@ impl RuntimeManager {
 
     /// Readiness at the owning actor, not approval authority or an effect reservation.
     #[allow(dead_code)]
+    /// Internal command only; no tool registration or HTTP route is installed.
+    #[allow(dead_code)]
+    pub(crate) async fn execute_native_task_approval(
+        self: &Arc<Self>,
+        command: phoenix_db::native_task_approval::NativeTaskApprovalCommand,
+    ) -> task_approval_admission::NativeTaskApprovalOutcome {
+        use phoenix_db::native_task_approval::NativeTaskApprovalInspection;
+        use task_approval_admission::NativeTaskApprovalOutcome;
+        // Prove current source even for replay; target actor/Stop admission follows replay.
+        match self.db.inspect_native_task_approval_command(&command).await {
+            Ok(NativeTaskApprovalInspection::Replay(receipt)) => {
+                return NativeTaskApprovalOutcome::Committed(receipt)
+            }
+            Ok(NativeTaskApprovalInspection::RequiresOwningActorAdmission) => {}
+            Err(error) => return NativeTaskApprovalOutcome::preflight_error(error),
+        }
+        let admission = match self
+            .mutation_admission(&command.current_transcript_id)
+            .await
+        {
+            Ok(admission) => admission.lock_owned().await,
+            Err(_) => return NativeTaskApprovalOutcome::Unavailable,
+        };
+        let handle = match self.get_or_create(&command.current_transcript_id).await {
+            Ok(handle) => handle,
+            Err(_) => return NativeTaskApprovalOutcome::Unavailable,
+        };
+        let (response, result) = tokio::sync::oneshot::channel();
+        if handle
+            .acknowledged_event_tx
+            .send(AcknowledgedRuntimeRequest::ExecuteNativeTaskApproval {
+                command: Box::new(command),
+                response,
+                admission,
+            })
+            .await
+            .is_err()
+        {
+            return NativeTaskApprovalOutcome::Unavailable;
+        }
+        result
+            .await
+            .unwrap_or(NativeTaskApprovalOutcome::Unavailable)
+    }
+
     pub(crate) async fn check_native_task_approval_admission(
         self: &Arc<Self>,
         expected: task_approval_admission::FrozenPendingTask,

@@ -9165,7 +9165,7 @@ impl Database {
             .persist_approved_task_authority_inner(conversation_id, approval, None)
             .await?
         {
-            crate::workflow::LocalAuthorityResult::DurableFactEstablished(()) => Ok(()),
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(_) => Ok(()),
             crate::workflow::LocalAuthorityResult::DurableFactUnclassified => {
                 Err(DbError::Serialization(
                     "approved-task authority commit is unclassified".to_string(),
@@ -9197,6 +9197,49 @@ impl Database {
             )),
         )
         .await
+        .map(native_task_approval::ApprovalFact::user_result)
+    }
+
+    /// Settle native approval and return the immutable receipt proven inside the transaction.
+    ///
+    /// # Errors
+    /// Rejects changed source/target authority and database failures.
+    pub async fn persist_native_approved_task_authority_and_state(
+        &self,
+        command: &native_task_approval::NativeTaskApprovalCommand,
+        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        approval_message: &Message,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> DbResult<
+        crate::workflow::LocalAuthorityResult<native_task_approval::NativeTaskApprovalReceipt>,
+    > {
+        use crate::workflow::LocalAuthorityResult;
+        match self
+            .persist_approved_task_authority_inner(
+                &command.current_transcript_id,
+                approval,
+                Some(native_task_approval::ApprovalSettlement::Native(
+                    approval_message,
+                    state,
+                    state_updated_at,
+                    command,
+                )),
+            )
+            .await?
+        {
+            LocalAuthorityResult::DurableFactEstablished(
+                native_task_approval::ApprovalFact::Native(receipt),
+            ) => Ok(LocalAuthorityResult::DurableFactEstablished(receipt)),
+            LocalAuthorityResult::DurableFactEstablished(
+                native_task_approval::ApprovalFact::User,
+            ) => Err(DbError::Serialization(
+                "native settlement returned a user fact".into(),
+            )),
+            LocalAuthorityResult::DurableFactUnclassified => {
+                Ok(LocalAuthorityResult::DurableFactUnclassified)
+            }
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -9205,7 +9248,7 @@ impl Database {
         conversation_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
         settlement: Option<native_task_approval::ApprovalSettlement<'_>>,
-    ) -> DbResult<crate::workflow::LocalAuthorityResult<()>> {
+    ) -> DbResult<crate::workflow::LocalAuthorityResult<native_task_approval::ApprovalFact>> {
         let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
         let priority = serde_json::to_string(&snapshot.priority)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
@@ -9225,7 +9268,7 @@ impl Database {
         let now_us = Utc::now().timestamp_micros();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let (Some(command), Some((message, state, _))) = (native_command, settlement) {
-            if native_task_approval::prepare_tx(
+            if let Some(receipt) = native_task_approval::prepare_tx(
                 &mut tx,
                 command,
                 conversation_id,
@@ -9236,7 +9279,11 @@ impl Database {
             .await?
             {
                 tx.rollback().await?;
-                return Ok(crate::workflow::LocalAuthorityResult::DurableFactEstablished(()));
+                return Ok(
+                    crate::workflow::LocalAuthorityResult::DurableFactEstablished(
+                        native_task_approval::ApprovalFact::Native(receipt),
+                    ),
+                );
             }
         }
         let work_scope_id: Option<String> =
@@ -9296,6 +9343,7 @@ impl Database {
         .bind(work_scope_id)
         .execute(&mut *tx)
         .await?;
+        let mut fact = native_task_approval::ApprovalFact::User;
         if let Some((approval_message, state, state_updated_at)) = settlement {
             insert_message_tx(&mut tx, approval_message).await?;
             sqlx::query(
@@ -9323,11 +9371,14 @@ impl Database {
             .execute(&mut *tx)
             .await?;
             if let Some(command) = native_command {
-                native_task_approval::insert_receipt_tx(&mut tx, command, approval_message).await?;
+                fact = native_task_approval::ApprovalFact::Native(
+                    native_task_approval::insert_receipt_tx(&mut tx, command, approval_message)
+                        .await?,
+                );
             }
         }
         match tx.commit().await {
-            Ok(()) => Ok(crate::workflow::LocalAuthorityResult::DurableFactEstablished(())),
+            Ok(()) => Ok(crate::workflow::LocalAuthorityResult::DurableFactEstablished(fact)),
             Err(commit_error) => {
                 let Some((message_id, expected_state, expected_kind, expected_updated_at)) =
                     settlement_identity
@@ -9372,7 +9423,7 @@ impl Database {
                                 ),
                             }
                         }
-                        Ok(crate::workflow::LocalAuthorityResult::DurableFactEstablished(()))
+                        Ok(crate::workflow::LocalAuthorityResult::DurableFactEstablished(fact))
                     }
                     Ok(false) => Err(commit_error.into()),
                     Err(_) => Ok(crate::workflow::LocalAuthorityResult::DurableFactUnclassified),

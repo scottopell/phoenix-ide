@@ -109,11 +109,30 @@ impl Database {
     }
 }
 
+#[derive(Debug)]
+pub(super) enum ApprovalFact {
+    User,
+    Native(NativeTaskApprovalReceipt),
+}
+
+impl ApprovalFact {
+    pub(super) fn user_result(
+        result: crate::workflow::LocalAuthorityResult<Self>,
+    ) -> crate::workflow::LocalAuthorityResult<()> {
+        match result {
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(_) => {
+                crate::workflow::LocalAuthorityResult::DurableFactEstablished(())
+            }
+            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                crate::workflow::LocalAuthorityResult::DurableFactUnclassified
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum ApprovalSettlement<'a> {
     User(&'a Message, &'a ConvState, DateTime<Utc>),
-    // The owning pre-Git actor has not been integrated; this variant is internal only.
-    #[allow(dead_code)]
     Native(
         &'a Message,
         &'a ConvState,
@@ -349,7 +368,7 @@ pub(super) async fn prepare_tx(
     approved: &ApprovedTaskSnapshot,
     message: &Message,
     next_state: &ConvState,
-) -> DbResult<bool> {
+) -> DbResult<Option<NativeTaskApprovalReceipt>> {
     let replay = source_and_replay_tx(tx, command)
         .await
         .map_err(NativeTaskApprovalError::into_db_error)?;
@@ -359,7 +378,7 @@ pub(super) async fn prepare_tx(
         ));
     }
     if replay.is_some() {
-        return Ok(true);
+        return Ok(replay);
     }
 
     if command.current_transcript_id != target
@@ -375,7 +394,7 @@ pub(super) async fn prepare_tx(
         ));
     }
     require_pending_tx(tx, command).await?;
-    Ok(false)
+    Ok(None)
 }
 
 async fn require_pending_tx(
@@ -396,6 +415,25 @@ async fn require_pending_tx(
             segment.transcript_row.conversation.id == aggregate.latest_transcript_row_id
         })
         .ok_or_else(|| conflict("native approval target transcript is missing"))?;
+    if current.transcript_row.conversation.runtime_role
+        != phoenix_core::work_scope::RuntimeRole::User
+        || !matches!(
+            crate::close_foundation::admit_product_conversation_operation_tx(tx, target).await?,
+            crate::close_foundation::ProductConversationAdmission::Accepted { .. }
+        )
+    {
+        return Err(conflict("native approval target role or lifecycle refused"));
+    }
+    let active_scope: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM conversations c JOIN work_scopes s ON s.id=c.work_scope_id
+         WHERE c.id=?1 AND s.lifecycle='active')",
+    )
+    .bind(target)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !active_scope {
+        return Err(conflict("native approval WorkScope is missing or retired"));
+    }
     let state = &current.transcript_row.conversation.state;
     let ConvState::AwaitingTaskApproval {
         task_file,
@@ -443,7 +481,7 @@ pub(super) async fn insert_receipt_tx(
     tx: &mut Transaction<'_, Sqlite>,
     command: &NativeTaskApprovalCommand,
     approval_message: &Message,
-) -> DbResult<()> {
+) -> DbResult<NativeTaskApprovalReceipt> {
     sqlx::query(
         "INSERT INTO native_task_approval_source_calls
          (source_transcript_id, source_message_id, source_tool_use_id) VALUES (?1, ?2, ?3)
@@ -474,7 +512,10 @@ pub(super) async fn insert_receipt_tx(
     .bind(Utc::now().timestamp_micros())
     .execute(&mut **tx)
     .await?;
-    Ok(())
+    receipt_tx(tx, command)
+        .await?
+        .map(|(_, receipt)| receipt)
+        .ok_or_else(|| conflict("native receipt missing inside approval transaction"))
 }
 
 /// Additional native commit-error witness, never the user settlement's older-state test alone.

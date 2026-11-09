@@ -1,4 +1,4 @@
-//! Internal actor readiness inspection only; no source authority, receipt or approval effects.
+//! Internal frozen-pending checks and closed outcomes for the unexposed native command.
 
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use phoenix_core::domain::sm_state::ConvState;
@@ -119,5 +119,59 @@ impl FrozenPendingTask {
             return Ok(Unavailable);
         }
         Ok(PendingMatchesRequiresFullAdmission)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NativeTaskApprovalOutcome {
+    Committed(phoenix_db::native_task_approval::NativeTaskApprovalReceipt),
+    NotApplied(NativeTaskApprovalRefusal),
+    Unsupported(NativeTaskApprovalUnsupported),
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeTaskApprovalRefusal {
+    PendingChanged,
+    TargetChanged,
+    SourceOrRequestRefused,
+    RequestConflict,
+    BeforeGitRefused,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeTaskApprovalUnsupported {
+    FollowUp,
+    DetachedCheckpoint,
+    InstalledGoalControls,
+}
+
+impl NativeTaskApprovalOutcome {
+    pub(crate) fn preflight_error(
+        error: phoenix_db::native_task_approval::NativeTaskApprovalError,
+    ) -> Self {
+        use phoenix_db::native_task_approval::NativeTaskApprovalError;
+        tracing::debug!(%error, "native task approval preflight refused");
+        match error {
+            NativeTaskApprovalError::RequestConflict => {
+                Self::NotApplied(NativeTaskApprovalRefusal::RequestConflict)
+            }
+            NativeTaskApprovalError::Database(
+                DbError::MessageConflict(_) | DbError::ConversationNotFound(_),
+            ) => Self::NotApplied(NativeTaskApprovalRefusal::SourceOrRequestRefused),
+            NativeTaskApprovalError::Database(_) => Self::Unavailable,
+        }
+    }
+}
+
+impl FrozenPendingTask {
+    pub(crate) fn from_command(
+        command: &phoenix_db::native_task_approval::NativeTaskApprovalCommand,
+    ) -> Self {
+        Self {
+            owner: command.owner.clone(),
+            transcript_id: command.current_transcript_id.clone(),
+            pending: command.pending.clone(),
+        }
     }
 }

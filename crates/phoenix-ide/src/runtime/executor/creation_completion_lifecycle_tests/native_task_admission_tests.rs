@@ -402,3 +402,114 @@ fn pending_state(captured: bool) -> ConvState {
         }),
     }
 }
+
+#[tokio::test]
+async fn production_manager_cancel_before_native_command_has_no_approval_artifacts() {
+    use crate::runtime::task_approval_admission::NativeTaskApprovalOutcome;
+    use phoenix_db::native_task_approval::{
+        NativeApprovalIntent, NativeApprovalPlacement, NativeTaskApprovalCommand,
+        APPROVE_TASK_TOOL_NAME,
+    };
+    let f = AdmissionFixture::new().await;
+    let coordinator =
+        f.db.get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+    let source = SourceToolCall {
+        message_id: "executing-inspector".into(),
+        tool_use_id: "inspection-call".into(),
+    };
+    let inspection =
+        f.db.inspect_pending_task_from_coordinator(
+            &coordinator.id,
+            &source,
+            &InspectPendingTaskInput {
+                target: f
+                    .db
+                    .get_conversation(&f.target)
+                    .await
+                    .unwrap()
+                    .product_conversation_id,
+            },
+        )
+        .await
+        .unwrap();
+    let phoenix_db::task_approval_inspection::PendingTaskStatus::Pending(pending) =
+        inspection.pending
+    else {
+        panic!("captured pending task");
+    };
+    let command = NativeTaskApprovalCommand {
+        source_transcript_id: coordinator.id.clone(),
+        source: source.clone(),
+        owner: inspection.owner,
+        current_transcript_id: f.target.clone(),
+        pending,
+        placement: NativeApprovalPlacement::ContinueHere,
+        intent: NativeApprovalIntent::ApproveTaskAndRequestContinuation,
+    };
+    let input = command.input_value().unwrap();
+    let source_state = ConvState::ToolExecuting {
+        current_tool: ToolCall::new(
+            &source.tool_use_id,
+            ToolInput::Unknown {
+                name: APPROVE_TASK_TOOL_NAME.into(),
+                input: input.clone(),
+            },
+        ),
+        remaining_tools: vec![],
+        completed_results: vec![],
+        pending_sub_agents: vec![],
+        assistant_message: crate::state_machine::AssistantMessage::new(
+            source.message_id.clone(),
+            vec![ContentBlock::ToolUse {
+                id: source.tool_use_id.clone(),
+                name: APPROVE_TASK_TOOL_NAME.into(),
+                input,
+            }],
+            None,
+            None,
+        ),
+    };
+    f.db.update_conversation_state(&coordinator.id, &source_state)
+        .await
+        .unwrap();
+    let manager = Arc::new(crate::runtime::RuntimeManager::new(
+        f.db.clone(),
+        Arc::new(ModelRegistry::new_empty()),
+        crate::platform::PlatformCapability::None {
+            details: "native test".into(),
+        },
+        Arc::new(crate::tools::mcp::McpClientManager::new()),
+        None,
+    ));
+    let handle = manager.get_or_create(&f.target).await.unwrap();
+    assert_eq!(
+        event_settled(
+            &handle.acknowledged_event_tx,
+            Event::UserCancel {
+                reason: None,
+                cause: CancelCause::UserRequested,
+            }
+        )
+        .await,
+        AcknowledgedEventOutcome::Settled
+    );
+    let before = f.db.get_messages(&f.target).await.unwrap().len();
+    assert!(matches!(
+        manager.execute_native_task_approval(command).await,
+        NativeTaskApprovalOutcome::NotApplied(_)
+    ));
+    assert_eq!(f.db.get_messages(&f.target).await.unwrap().len(), before);
+    assert_eq!(
+        f.db.get_conversation(&f.target).await.unwrap().state,
+        ConvState::Idle
+    );
+    assert_eq!(objective_count(&f.db).await, 0);
+    let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM native_task_approval_receipts")
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(receipts, 0);
+    handle.event_tx.send(Event::Shutdown).await.unwrap();
+}

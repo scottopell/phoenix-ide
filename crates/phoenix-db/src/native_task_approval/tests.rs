@@ -135,6 +135,7 @@ impl Fixture {
                 )),
             )
             .await
+            .map(ApprovalFact::user_result)
     }
 
     async fn install_source(&self) {
@@ -1174,4 +1175,70 @@ async fn dispatch_and_later_approval_do_not_invalidate_old_receipt_or_requeue_on
             .await
             .unwrap();
     assert_eq!(receipt_message, f.message.message_id);
+}
+
+#[tokio::test]
+async fn public_native_settlement_returns_transaction_receipt_and_replays_original_message() {
+    let f = Fixture::new(false).await;
+    let first =
+        f.db.persist_native_approved_task_authority_and_state(
+            &f.command,
+            &f.approval,
+            &f.message,
+            &f.state,
+            f.message.created_at,
+        )
+        .await
+        .unwrap();
+    let LocalAuthorityResult::DurableFactEstablished(first) = first else {
+        panic!("native receipt not established");
+    };
+    assert_eq!(first.approval_message_id, f.message.message_id);
+    assert!(first.continuation_requested);
+    f.checkpoint_source().await;
+    f.db.update_conversation_state(&f.command.current_transcript_id, &ConvState::Idle)
+        .await
+        .unwrap();
+    let before = database_rows(&f.db).await;
+    let mut replacement = f.message.clone();
+    replacement.message_id = "must-not-be-used-for-replay".into();
+    let replay =
+        f.db.persist_native_approved_task_authority_and_state(
+            &f.command,
+            &f.approval,
+            &replacement,
+            &f.state,
+            replacement.created_at,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(replay, LocalAuthorityResult::DurableFactEstablished(receipt) if receipt == first)
+    );
+    assert_eq!(database_rows(&f.db).await, before);
+}
+
+#[tokio::test]
+async fn public_native_receipt_failure_rolls_back_message_state_authority_and_obligation() {
+    let f = Fixture::new(false).await;
+    sqlx::query(
+        "CREATE TRIGGER reject_native_receipt BEFORE INSERT ON native_task_approval_receipts
+        BEGIN SELECT RAISE(ABORT, 'injected native receipt failure'); END",
+    )
+    .execute(f.db.pool())
+    .await
+    .unwrap();
+    let before = database_rows(&f.db).await;
+    assert!(f
+        .db
+        .persist_native_approved_task_authority_and_state(
+            &f.command,
+            &f.approval,
+            &f.message,
+            &f.state,
+            f.message.created_at,
+        )
+        .await
+        .is_err());
+    assert_eq!(database_rows(&f.db).await, before);
 }
