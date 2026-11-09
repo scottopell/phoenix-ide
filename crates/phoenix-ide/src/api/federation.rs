@@ -2665,7 +2665,8 @@ pub(crate) struct NativeRenameOptionsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativeActionSourceCall {
-    pub(crate) source_product_conversation_id: ProductConversationId,
+    #[serde(rename = "source_product_conversation_id")]
+    pub(crate) product_conversation: ProductConversationId,
     pub(crate) source_transcript_id: String,
     pub(crate) source_assistant_message_id: String,
     pub(crate) source_tool_use_id: String,
@@ -2705,8 +2706,8 @@ pub(crate) struct NativeCreateStatusRequest {
     pub(crate) caller_instance_id: InstanceId,
     #[serde(deserialize_with = "native_canonical_uuid")]
     pub(crate) destination_instance_id: InstanceId,
-    #[serde(deserialize_with = "native_canonical_uuid")]
-    pub(crate) request_id: String,
+    #[serde(rename = "request_id", deserialize_with = "native_canonical_uuid")]
+    pub(crate) request: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2962,10 +2963,8 @@ fn native_action_source(
     source: &phoenix_db::ProductConversationRenameReceiptSource,
 ) -> Result<NativeActionSourceCall, NativeActionFailure> {
     Ok(NativeActionSourceCall {
-        source_product_conversation_id: ProductConversationId::parse(
-            source.product_conversation_id.clone(),
-        )
-        .map_err(native_error)?,
+        product_conversation: ProductConversationId::parse(source.product_conversation_id.clone())
+            .map_err(native_error)?,
         source_transcript_id: source.transcript_id.clone(),
         source_assistant_message_id: source.message_id.clone(),
         source_tool_use_id: source.tool_use_id.clone(),
@@ -3064,12 +3063,12 @@ impl IntoResponse for NativeActionFailure {
     }
 }
 
-fn native_json_rejection(error: axum::extract::rejection::JsonRejection) -> NativeActionFailure {
+fn native_json_rejection(error: &axum::extract::rejection::JsonRejection) -> NativeActionFailure {
     NativeActionFailure::from(error.status())
 }
 
 fn native_source_valid(source: &NativeActionSourceCall) -> bool {
-    native_domain_identity_valid(source.source_product_conversation_id.as_str())
+    native_domain_identity_valid(source.product_conversation.as_str())
         && native_domain_identity_valid(&source.source_transcript_id)
         && native_domain_identity_valid(&source.source_assistant_message_id)
         && native_domain_identity_valid(&source.source_tool_use_id)
@@ -3210,7 +3209,7 @@ pub(crate) async fn native_create_options(
     peer: PeerAuthenticated,
     request: Result<Json<NativeCreateOptionsRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, NativeActionFailure> {
-    let Json(request) = request.map_err(native_json_rejection)?;
+    let Json(request) = request.map_err(|error| native_json_rejection(&error))?;
     let (caller, destination, correlation_id, cwd) = match request {
         NativeCreateOptionsRequest::WithoutCwd {
             caller_instance_id,
@@ -3247,46 +3246,7 @@ pub(crate) async fn native_create_options(
         }
         None => None,
     };
-    let mut projects = Vec::new();
-    let mut cursor = None::<String>;
-    while projects.len() <= NATIVE_CREATE_PROJECT_LIMIT {
-        let rows = state
-            .db
-            .product_creation_project_options_as_federation(&authority, cursor.as_deref())
-            .await
-            .map_err(native_error)?;
-        let Some((last, _)) = rows.last() else {
-            break;
-        };
-        cursor = Some(last.clone());
-        let home = state.runtime.runtime_home().to_path_buf();
-        let usable = tokio::task::spawn_blocking(move || {
-            rows.into_iter()
-                .filter_map(
-                    |(project_id, path)| match normalized_native_cwd(&path, &home) {
-                        Ok(cwd) => Some(NativeCreateProjectOption { project_id, cwd }),
-                        Err(_) => {
-                            tracing::debug!(
-                                %project_id,
-                                %path,
-                                "omitting unusable creation project option"
-                            );
-                            None
-                        }
-                    },
-                )
-                .collect::<Vec<_>>()
-        })
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        projects.extend(
-            usable
-                .into_iter()
-                .take(NATIVE_CREATE_PROJECT_LIMIT + 1 - projects.len()),
-        );
-    }
-    let truncated = projects.len() > NATIVE_CREATE_PROJECT_LIMIT;
-    projects.truncate(NATIVE_CREATE_PROJECT_LIMIT);
+    let (projects, truncated) = native_create_projects(&state, &authority).await?;
     let registry = state.runtime.model_registry();
     let models = registry
         .available_execution_routes()
@@ -3310,11 +3270,57 @@ pub(crate) async fn native_create_options(
             projects,
             projects_truncated: truncated,
             models,
-            default_model: registry.default_model_id().to_string(),
+            default_model: registry.default_model_id().clone(),
             default_llm_language: default_llm_language.as_str().to_string(),
         },
         NATIVE_CREATE_OPTIONS_RESPONSE_BYTES,
     )
+}
+
+async fn native_create_projects(
+    state: &AppState,
+    authority: &phoenix_db::FederationConversationAuthority,
+) -> Result<(Vec<NativeCreateProjectOption>, bool), NativeActionFailure> {
+    let mut projects = Vec::new();
+    let mut cursor = None::<String>;
+    while projects.len() <= NATIVE_CREATE_PROJECT_LIMIT {
+        let rows = state
+            .db
+            .product_creation_project_options_as_federation(authority, cursor.as_deref())
+            .await
+            .map_err(native_error)?;
+        let Some((last, _)) = rows.last() else {
+            break;
+        };
+        cursor = Some(last.clone());
+        let home = state.runtime.runtime_home().to_path_buf();
+        let usable = tokio::task::spawn_blocking(move || {
+            rows.into_iter()
+                .filter_map(|(project_id, path)| {
+                    if let Ok(cwd) = normalized_native_cwd(&path, &home) {
+                        Some(NativeCreateProjectOption { project_id, cwd })
+                    } else {
+                        tracing::debug!(
+                            %project_id,
+                            %path,
+                            "omitting unusable creation project option"
+                        );
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        projects.extend(
+            usable
+                .into_iter()
+                .take(NATIVE_CREATE_PROJECT_LIMIT + 1 - projects.len()),
+        );
+    }
+    let truncated = projects.len() > NATIVE_CREATE_PROJECT_LIMIT;
+    projects.truncate(NATIVE_CREATE_PROJECT_LIMIT);
+    Ok((projects, truncated))
 }
 
 pub(crate) async fn native_rename_options(
@@ -3322,7 +3328,7 @@ pub(crate) async fn native_rename_options(
     peer: PeerAuthenticated,
     request: Result<Json<NativeRenameOptionsRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, NativeActionFailure> {
-    let Json(request) = request.map_err(native_json_rejection)?;
+    let Json(request) = request.map_err(|error| native_json_rejection(&error))?;
     let lookup_identity = conversation_lookup_identity(&request.reference)
         .map_err(|_| NativeActionFailure::from(StatusCode::BAD_REQUEST))?;
     let local = state.db.instance_id().await.map_err(native_error)?;
@@ -3374,7 +3380,7 @@ pub(crate) async fn native_create(
     peer: PeerAuthenticated,
     request: Result<Json<NativeCreateRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, NativeActionFailure> {
-    let Json(request) = request.map_err(native_json_rejection)?;
+    let Json(request) = request.map_err(|error| native_json_rejection(&error))?;
     if !native_create_intent_valid(&request) {
         return Err(StatusCode::BAD_REQUEST.into());
     }
@@ -3409,7 +3415,7 @@ pub(crate) async fn native_create(
             llm_language: language,
             images: Vec::new(),
         },
-        request.source.source_product_conversation_id,
+        request.source.product_conversation,
         request.source.source_transcript_id,
         phoenix_core::domain::db_schema::SourceToolCall {
             message_id: request.source.source_assistant_message_id,
@@ -3435,7 +3441,7 @@ pub(crate) async fn native_create_status(
     peer: PeerAuthenticated,
     request: Result<Json<NativeCreateStatusRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, NativeActionFailure> {
-    let Json(request) = request.map_err(native_json_rejection)?;
+    let Json(request) = request.map_err(|error| native_json_rejection(&error))?;
     let local = state.db.instance_id().await.map_err(native_error)?;
     let authority = native_peer_authority(
         peer,
@@ -3446,7 +3452,7 @@ pub(crate) async fn native_create_status(
     let status = crate::conversation_actions::read_create_status_from_federation(
         &state.runtime,
         &authority,
-        &request.request_id,
+        &request.request,
     )
     .await
     .map_err(native_app_error)?;
@@ -3454,7 +3460,7 @@ pub(crate) async fn native_create_status(
         None => NativeCreateStatusResponse::Unknown {
             caller_instance_id: request.caller_instance_id,
             destination_instance_id: local,
-            request_id: request.request_id,
+            request_id: request.request,
         },
         Some(status) => {
             let publication = match status.publication {
@@ -3476,7 +3482,7 @@ pub(crate) async fn native_create_status(
             NativeCreateStatusResponse::Known {
                 caller_instance_id: request.caller_instance_id,
                 destination_instance_id: local,
-                request_id: request.request_id,
+                request_id: request.request,
                 product_conversation_id: status.product_conversation_id,
                 creation_status,
                 provisioning_stage: status.provisioning_stage,
@@ -3497,6 +3503,7 @@ pub(crate) async fn native_create_status(
 fn native_bound_status_diagnostics(
     response: &mut NativeCreateStatusResponse,
 ) -> Result<(), NativeActionFailure> {
+    const OMITTED: &str = "diagnostic omitted: response size limit";
     let fits = |response: &NativeCreateStatusResponse| {
         serde_json::to_vec(response)
             .map(|bytes| bytes.len() <= NATIVE_CREATE_STATUS_RESPONSE_BYTES)
@@ -3505,7 +3512,6 @@ fn native_bound_status_diagnostics(
     if fits(response)? {
         return Ok(());
     }
-    const OMITTED: &str = "diagnostic omitted: response size limit";
     if let NativeCreateStatusResponse::Known {
         error,
         initial_execution,
@@ -3548,7 +3554,7 @@ pub(crate) async fn native_rename(
     peer: PeerAuthenticated,
     request: Result<Json<NativeRenameRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, NativeActionFailure> {
-    let Json(request) = request.map_err(native_json_rejection)?;
+    let Json(request) = request.map_err(|error| native_json_rejection(&error))?;
     if !native_rename_intent_valid(&request) {
         return Err(StatusCode::BAD_REQUEST.into());
     }
@@ -3564,7 +3570,7 @@ pub(crate) async fn native_rename(
     )?;
     let source = phoenix_db::ProductConversationRenameSource {
         source_instance_id: authority.caller_instance_id(),
-        product_conversation_id: request.source.source_product_conversation_id,
+        product_conversation_id: request.source.product_conversation,
         transcript_id: request.source.source_transcript_id,
         message_id: request.source.source_assistant_message_id,
         tool_use_id: request.source.source_tool_use_id,
@@ -3595,7 +3601,7 @@ pub(crate) async fn native_rename(
                 receipt_slug_at_commit: receipt.slug_at_commit,
                 receipt_name_revision_before: receipt.name_revision_before,
                 receipt_committed_at_unix_micros: receipt.committed_at_unix_micros,
-                receipt_source_instance_id: receipt.source.source_instance_id.clone(),
+                receipt_source_instance_id: receipt.source.source_instance_id,
                 receipt_source: native_action_source(&receipt.source)?,
             }
         }
@@ -3610,7 +3616,7 @@ pub(crate) async fn native_rename(
                 receipt_slug_at_commit: receipt.slug_at_commit,
                 receipt_name_revision_before: receipt.name_revision_before,
                 receipt_committed_at_unix_micros: receipt.committed_at_unix_micros,
-                receipt_source_instance_id: receipt.source.source_instance_id.clone(),
+                receipt_source_instance_id: receipt.source.source_instance_id,
                 receipt_source: native_action_source(&receipt.source)?,
             }
         }
@@ -3756,7 +3762,12 @@ fn native_response_error(status: reqwest::StatusCode, body: &[u8]) -> Federation
             NativeActionErrorCode::Unavailable | NativeActionErrorCode::Internal => {
                 FederationClientError::NativeRemoteFailure(error.error)
             }
-            _ => FederationClientError::NativeDomainRejected(error.error),
+            NativeActionErrorCode::InvalidRequest
+            | NativeActionErrorCode::NotFound
+            | NativeActionErrorCode::Conflict
+            | NativeActionErrorCode::TooLarge => {
+                FederationClientError::NativeDomainRejected(error.error)
+            }
         };
     }
     match status {
@@ -4034,7 +4045,7 @@ fn native_verify_status(
         request.destination_instance_id,
         caller,
         destination,
-        &request.request_id,
+        &request.request,
         witness,
     )?;
     if let NativeCreateStatusResponse::Known {
@@ -4049,18 +4060,10 @@ fn native_verify_status(
     {
         use phoenix_db::ProductCreationProvisioningStage as Stage;
         use NativeCreationState as S;
-        if *provisioning_stage_updated_at_unix_micros < 0
-            || chrono::DateTime::from_timestamp_micros(*provisioning_stage_updated_at_unix_micros)
-                .is_none()
-        {
-            return Err(native_protocol("creation stage timestamp is invalid"));
-        }
-        if matches!(initial_execution, NativeCreateInitialExecution::Failed { reason } if reason.trim().is_empty())
-        {
-            return Err(native_protocol(
-                "failed initial execution has no failure reason",
-            ));
-        }
+        native_verify_status_stage(
+            *provisioning_stage_updated_at_unix_micros,
+            initial_execution,
+        )?;
         if (*creation_status == S::RetryScheduled && retry_at_unix_micros.is_none())
             || (retry_at_unix_micros.is_some()
                 && !matches!(
@@ -4117,6 +4120,24 @@ fn native_verify_status(
                 return Err(native_protocol("published route is not canonical"));
             }
         }
+    }
+    Ok(())
+}
+
+fn native_verify_status_stage(
+    updated_at_unix_micros: i64,
+    initial_execution: &NativeCreateInitialExecution,
+) -> Result<(), FederationClientError> {
+    if updated_at_unix_micros < 0
+        || chrono::DateTime::from_timestamp_micros(updated_at_unix_micros).is_none()
+    {
+        return Err(native_protocol("creation stage timestamp is invalid"));
+    }
+    if matches!(initial_execution, NativeCreateInitialExecution::Failed { reason } if reason.trim().is_empty())
+    {
+        return Err(native_protocol(
+            "failed initial execution has no failure reason",
+        ));
     }
     Ok(())
 }
@@ -4203,7 +4224,7 @@ pub(crate) async fn remote_native_create(
             let status_request = NativeCreateStatusRequest {
                 caller_instance_id: request.caller_instance_id,
                 destination_instance_id: request.destination_instance_id,
-                request_id: request.request_id.clone(),
+                request: request.request_id.clone(),
             };
             match remote_native_create_status(db, peer, &status_request).await {
                 Ok(status) => Ok(NativeCreateOutcome::Reconciled { status }),
@@ -4289,6 +4310,14 @@ fn native_verify_rename(
             "rename target witnesses do not match request",
         ));
     }
+    native_verify_rename_receipt(request, response, product)
+}
+
+fn native_verify_rename_receipt(
+    request: &NativeRenameRequest,
+    response: &NativeRenameResponse,
+    product: &ProductConversationId,
+) -> Result<(), FederationClientError> {
     match response {
         NativeRenameResponse::Applied {
             receipt_title,
@@ -4311,15 +4340,11 @@ fn native_verify_rename(
             let title =
                 crate::conversation_actions::normalize_product_conversation_title(&request.title)
                     .map_err(|_| native_protocol("invalid rename title"))?;
-            let source_matches = match response {
-                NativeRenameResponse::Applied { .. } => receipt_source == &request.source,
-                NativeRenameResponse::Replayed { .. } => {
-                    receipt_source.source_product_conversation_id
-                        == request.source.source_product_conversation_id
-                        && receipt_source.source_transcript_id
-                            == request.source.source_transcript_id
-                }
-                _ => unreachable!(),
+            let source_matches = if matches!(response, NativeRenameResponse::Applied { .. }) {
+                receipt_source == &request.source
+            } else {
+                receipt_source.product_conversation == request.source.product_conversation
+                    && receipt_source.source_transcript_id == request.source.source_transcript_id
             };
             if receipt_source_instance_id != &request.caller_instance_id
                 || !native_source_valid(receipt_source)
@@ -4340,7 +4365,10 @@ fn native_verify_rename(
                 ));
             }
         }
-        _ => {}
+        NativeRenameResponse::Stale { .. }
+        | NativeRenameResponse::Conflict { .. }
+        | NativeRenameResponse::NotFound { .. }
+        | NativeRenameResponse::Unavailable { .. } => {}
     }
     Ok(())
 }

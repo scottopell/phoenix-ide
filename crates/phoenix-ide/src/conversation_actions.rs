@@ -144,14 +144,13 @@ pub(crate) async fn read_create_status_from_federation(
 }
 
 fn product_creation_db_to_app(error: DbError) -> AppError {
-    match error {
-        DbError::ProductCreationRequestConflict => {
-            AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                "request_id conflicts with immutable creation intent",
-                "product_creation_request_conflict",
-            )))
-        }
-        error => db_to_app(error),
+    if let DbError::ProductCreationRequestConflict = error {
+        AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "request_id conflicts with immutable creation intent",
+            "product_creation_request_conflict",
+        )))
+    } else {
+        db_to_app(error)
     }
 }
 
@@ -410,7 +409,7 @@ where
         .map_err(|_| AppError::BadRequest("request_id must be a UUID".to_owned()))?;
     let existing = match &source {
         CreateSource::FederatedConversation { .. } => None,
-        _ => runtime
+        CreateSource::UserApi | CreateSource::CurrentCoordinator { .. } => runtime
             .db()
             .get_product_creation_job(&req.request_id)
             .await
@@ -461,7 +460,7 @@ where
                 })
                 .await
         }
-        _ => {
+        CreateSource::UserApi | CreateSource::CurrentCoordinator { .. } => {
             runtime
                 .db()
                 .accept_product_creation_resolved(

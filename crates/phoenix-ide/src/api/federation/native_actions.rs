@@ -119,7 +119,7 @@ fn responses_reject_payloads_beyond_route_bound() {
 
 fn source_call() -> NativeActionSourceCall {
     NativeActionSourceCall {
-        source_product_conversation_id: ProductConversationId::new(),
+        product_conversation: ProductConversationId::new(),
         source_transcript_id: uuid::Uuid::new_v4().to_string(),
         source_assistant_message_id: uuid::Uuid::new_v4().to_string(),
         source_tool_use_id: "call_provider_123".into(),
@@ -232,7 +232,7 @@ fn native_rename_receipt_preflight_covers_both_variants_at_field_bounds() {
         ProductConversationId::parse("p".repeat(NATIVE_DOMAIN_ID_MAX_BYTES)).unwrap();
     rename.expected_root_transcript_id = "r".repeat(NATIVE_DOMAIN_ID_MAX_BYTES);
     rename.title = "İ".repeat(200);
-    rename.source.source_product_conversation_id =
+    rename.source.product_conversation =
         ProductConversationId::parse("p".repeat(NATIVE_DOMAIN_ID_MAX_BYTES)).unwrap();
     rename.source.source_transcript_id = "t".repeat(NATIVE_DOMAIN_ID_MAX_BYTES);
     rename.source.source_assistant_message_id = "m".repeat(NATIVE_DOMAIN_ID_MAX_BYTES);
@@ -436,13 +436,13 @@ fn status_fixture() -> (NativeCreateStatusRequest, serde_json::Value) {
     let request = NativeCreateStatusRequest {
         caller_instance_id: InstanceId::new(),
         destination_instance_id: InstanceId::new(),
-        request_id: uuid::Uuid::new_v4().to_string(),
+        request: uuid::Uuid::new_v4().to_string(),
     };
     let response = serde_json::json!({
         "kind": "known",
         "caller_instance_id": request.caller_instance_id,
         "destination_instance_id": request.destination_instance_id,
-        "request_id": request.request_id,
+        "request_id": request.request,
         "product_conversation_id": ProductConversationId::new(),
         "creation_status": "accepted",
         "provisioning_stage": "validate_intent",

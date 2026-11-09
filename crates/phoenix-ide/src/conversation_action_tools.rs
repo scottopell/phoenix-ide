@@ -231,7 +231,7 @@ async fn remote_source(
 ) -> Result<federation::NativeActionSourceCall, String> {
     let source = mutation_source(runtime, ctx).await?;
     Ok(federation::NativeActionSourceCall {
-        source_product_conversation_id: source.product_conversation_id,
+        product_conversation: source.product_conversation_id,
         source_transcript_id: source.transcript_id,
         source_assistant_message_id: source.source_call.message_id,
         source_tool_use_id: source.source_call.tool_use_id,
@@ -555,7 +555,7 @@ impl CreateConversation {
                 let request = federation::NativeCreateStatusRequest {
                     caller_instance_id,
                     destination_instance_id,
-                    request_id: request_id.0,
+                    request: request_id.0,
                 };
                 let response = federation::remote_native_create_status(self.0.db(), peer, &request)
                     .await

@@ -468,6 +468,7 @@ async fn native_registered_rename_is_guarded_replayable_and_revision_checked() {
             .await
             .unwrap()
             .product_conversation_id
+            .as_str()
     );
     assert_eq!(durable.source.transcript_id, gc);
     assert_eq!(durable.source.message_id, "native-message");
@@ -1434,10 +1435,7 @@ async fn native_federated_source_comes_only_from_trusted_context() {
     let context = native_context(&gc);
     let source = remote_source(&runtime, &context).await.unwrap();
     let row = db.get_conversation(&gc).await.unwrap();
-    assert_eq!(
-        source.source_product_conversation_id,
-        row.product_conversation_id
-    );
+    assert_eq!(source.product_conversation, row.product_conversation_id);
     assert_eq!(source.source_transcript_id, gc);
     assert_eq!(source.source_assistant_message_id, "native-message");
     assert_eq!(source.source_tool_use_id, "native-call");
