@@ -8,12 +8,14 @@ use phoenix_core::domain::db_schema::{
 };
 use phoenix_core::domain::llm_types::ContentBlock;
 use phoenix_core::domain::task_approval::{ProposalOccurrence, ReviewedProposal};
+use phoenix_core::domain::ConvMode;
 use phoenix_core::task_source::{Priority, TaskSource};
 use phoenix_db::task_approval_inspection::{
     InspectPendingTaskInput, INSPECT_PENDING_TASK_TOOL_NAME,
 };
 use phoenix_db::Database;
 use serde_json::json;
+use std::sync::atomic::Ordering;
 
 const BODY: &str = "# Exact reviewed task\r\n\nKeep these bytes.\n";
 
@@ -803,15 +805,15 @@ fn git(path: &std::path::Path, args: &[&str]) -> String {
 
 async fn native_approval_rows(db: &Database) -> Vec<i64> {
     let mut counts = Vec::new();
-    for table in [
-        "messages",
-        "conversation_approved_task_objectives",
-        "work_scope_approved_task_authorities",
-        "native_task_approval_receipts",
-        "approval_request_obligations",
+    for query in [
+        "SELECT COUNT(*) FROM messages",
+        "SELECT COUNT(*) FROM conversation_approved_task_objectives",
+        "SELECT COUNT(*) FROM work_scope_approved_task_authorities",
+        "SELECT COUNT(*) FROM native_task_approval_receipts",
+        "SELECT COUNT(*) FROM approval_request_obligations",
     ] {
         counts.push(
-            sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            sqlx::query_scalar(query)
                 .fetch_one(db.pool())
                 .await
                 .unwrap(),
