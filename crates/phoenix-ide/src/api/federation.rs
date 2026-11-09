@@ -4077,6 +4077,24 @@ pub(crate) async fn remote_native_create_options(
     Ok(response)
 }
 
+fn native_rename_reference_matches_detail(
+    reference: &str,
+    detail: &NativeRenameDetail,
+) -> Result<bool, FederationClientError> {
+    if reference.starts_with("@conv:") || reference.starts_with("@transcript:") {
+        return Ok(match validate_remote_resolve_reference(reference)? {
+            RemoteConversationTarget::ProductConversation {
+                product_conversation_id,
+            } => product_conversation_id == detail.product_conversation_id.as_str(),
+            RemoteConversationTarget::ExactTranscript { transcript_id, .. } => {
+                transcript_id == detail.root_transcript_id
+            }
+        });
+    }
+    conversation_lookup_identity(reference)?;
+    Ok(true)
+}
+
 fn native_verify_rename_options(
     request: &NativeRenameOptionsRequest,
     response: &NativeRenameOptionsResponse,
@@ -4100,9 +4118,7 @@ fn native_verify_rename_options(
     };
     if !native_domain_identity_valid(detail.product_conversation_id.as_str())
         || !native_domain_identity_valid(&detail.root_transcript_id)
-        || (request.reference.starts_with("@conv:")
-            && conversation_lookup_identity(&request.reference)?
-                != detail.product_conversation_id.as_str())
+        || !native_rename_reference_matches_detail(&request.reference, detail)?
         || detail.name_revision < 0
         || (detail.can_rename && detail.name_revision == i64::MAX)
         || response.canonical_route

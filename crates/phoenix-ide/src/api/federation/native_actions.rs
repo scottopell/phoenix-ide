@@ -584,6 +584,7 @@ fn rename_options_closes_direct_product_reference_and_validates_target_ids() {
     assert!(native_verify_rename_options(&request, &response).is_err());
     for reference in [
         "@transcript:opaque-root",
+        "@transcript:opaque-root#message-source-message",
         "opaque-product",
         "destination-slug",
     ] {
@@ -593,6 +594,9 @@ fn rename_options_closes_direct_product_reference_and_validates_target_ids() {
             "{reference}"
         );
     }
+    request.reference = "@transcript:other-root".into();
+    assert!(native_verify_rename_options(&request, &response).is_err());
+    request.reference = "@transcript:opaque-root".into();
     for invalid in ["", " ", "root\ninvalid"] {
         response.detail.root_transcript_id = invalid.into();
         assert!(
