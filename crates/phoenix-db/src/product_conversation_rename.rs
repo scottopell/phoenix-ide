@@ -730,7 +730,7 @@ mod tests {
         let authority = enroll_test_peer(&db, caller, b"rename-peer").await;
         let other_caller = InstanceId::new();
         let other = enroll_test_peer(&db, other_caller, b"rename-other").await;
-        let mut command = test_command(root.id.clone(), 0);
+        let mut command = test_command(uuid::Uuid::new_v4().hyphenated().to_string(), 0);
         command.product_conversation_id = root.product_conversation_id.clone();
         command.expected_root_transcript_id = root.id.clone();
         command.source.source_instance_id = caller;

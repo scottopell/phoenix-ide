@@ -341,8 +341,7 @@ fn remote_rename_response(response: federation::NativeRenameResponse) -> Value {
                 committed_at_unix_micros: receipt_committed_at_unix_micros,
                 source: remote_rename_receipt_source(receipt_source_instance_id, receipt_source),
             };
-            let result = remote_rename_receipt_result(receipt, replayed);
-            result
+            remote_rename_receipt_result(receipt, replayed)
         }
         Response::Stale {
             caller_instance_id: _,
