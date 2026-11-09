@@ -3268,6 +3268,10 @@ fn native_app_error(error: super::handlers::AppError) -> NativeActionFailure {
     NativeActionFailure::from(error.into_response().status())
 }
 
+fn native_db_error(error: crate::db::DbError) -> NativeActionFailure {
+    native_app_error(super::product_conversations::db_to_app(error))
+}
+
 fn normalized_native_cwd(cwd: &str, home: &std::path::Path) -> Result<String, NativeActionFailure> {
     let cwd = cwd.trim();
     let path = if cwd == "~" {
@@ -3424,7 +3428,7 @@ pub(crate) async fn native_rename_options(
         .db
         .read_product_conversation_rename_detail_as_federation(&authority, &lookup_identity)
         .await
-        .map_err(native_error)?;
+        .map_err(native_db_error)?;
     let route = crate::api::product_conversations::product_route(
         detail.slug.as_deref(),
         detail.product_conversation_id.as_str(),

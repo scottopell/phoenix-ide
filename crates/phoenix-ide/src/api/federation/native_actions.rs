@@ -99,6 +99,13 @@ fn rename_detail_targets_normalize_destination_lookup_identities() {
 }
 
 #[test]
+fn native_database_errors_preserve_http_classification() {
+    let failure = native_db_error(crate::db::DbError::ConversationNotFound);
+    assert_eq!(failure.status, StatusCode::NOT_FOUND);
+    assert_eq!(failure.body.error_type, NativeActionErrorCode::NotFound);
+}
+
+#[test]
 fn responses_reject_payloads_beyond_route_bound() {
     let failure = native_error(format!("secret detail: {}", "x".repeat(100_000)));
     let body = serde_json::to_vec(&failure.body).unwrap();
