@@ -605,6 +605,22 @@ final class AppModel {
         }
     }
 
+    nonisolated static func composedMessages(
+        snapshot: [Message],
+        live: [Message]
+    ) -> [Message] {
+        var messagesById: [String: Message] = [:]
+        for message in snapshot {
+            messagesById[message.message_id] = message
+        }
+        for message in live {
+            messagesById[message.message_id] = message
+        }
+        return messagesById.values.sorted {
+            ($0.sequence_id, $0.message_id) < ($1.sequence_id, $1.message_id)
+        }
+    }
+
     private func sessionBelongsToAggregate(
         _ session: ConversationSession,
         transcriptId: String,
@@ -801,14 +817,12 @@ final class AppModel {
         guard let aggregateId = listStore.aggregateId(forTranscriptRowId: notifiedId) else {
             return notifiedId
         }
-        if listStore.conversations.contains(where: {
-            $0.aggregateIdentity == aggregateId && $0.archived == true
+        if let conversation = listStore.conversations.first(where: {
+            $0.aggregateIdentity == aggregateId && $0.isCoordinator
         }) {
-            return aggregateId
+            return navigationConversationId(for: conversation)
         }
-        return resolvedNavigationConversationId(
-            aggregateId: aggregateId,
-            latestTranscriptRowId: notifiedId)
+        return aggregateId
     }
 
     func loadProductHistory(productConversationId: String) async throws -> CachedProductHistory {
@@ -1032,11 +1046,7 @@ final class AppModel {
     }
 
 
-    /// Resolve the Coordinator conversation to open. Online: get-or-create
-    /// on the server (it's an ordinary conversation; everything downstream
-    /// is the normal conversation surface). Offline: fall back to the
-    /// remembered id so the cached transcript still opens — asking new
-    /// questions then queues through the outbox like any conversation.
+    /// Resolve the Coordinator transcript destination, with a cached offline fallback.
     func openCoordinator() async -> String? {
         if let api, connectivity.isOnline {
             let startedGeneration = apiGeneration

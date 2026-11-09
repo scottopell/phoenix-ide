@@ -218,9 +218,12 @@ struct StreamingBubble: View {
 /// server's copy of the same message_id lands.
 struct OutboxSection: View {
     let session: ConversationSession
+    var authoritativeMessageIds: Set<String> = []
 
     var body: some View {
-        ForEach(session.outbox.visibleEntries) { entry in
+        ForEach(session.outbox.visibleEntries.filter {
+            !$0.isReflected(in: authoritativeMessageIds)
+        }) { entry in
             OutboxEntryView(entry: entry, session: session)
         }
         .accessibilityElement(children: .combine)
