@@ -1659,7 +1659,7 @@ pub(crate) fn validate_remote_resolve_reference(
 pub(crate) fn conversation_lookup_identity(
     reference: &str,
 ) -> Result<String, FederationClientError> {
-    if reference.starts_with('@') {
+    if reference.starts_with("@conv:") || reference.starts_with("@transcript:") {
         return validate_remote_resolve_reference(reference)
             .map(|target| target.lookup_identity().to_owned());
     }

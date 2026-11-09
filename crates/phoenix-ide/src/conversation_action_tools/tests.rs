@@ -89,6 +89,7 @@ fn rename_detail_normalizes_canonical_typed_references_to_raw_identity() {
         "root-id"
     );
     assert_eq!(rename_detail_reference("plain-id").unwrap(), "plain-id");
+    assert_eq!(rename_detail_reference("@legacy").unwrap(), "@legacy");
     assert!(rename_detail_reference(" @conv:product-id").is_err());
     assert!(rename_detail_reference("@transcript:root-id#invalid").is_err());
 }
