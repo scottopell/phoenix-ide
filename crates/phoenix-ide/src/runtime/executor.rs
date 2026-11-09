@@ -147,12 +147,14 @@ enum AuthoritativeEffect {
         title: String,
         priority: crate::task_source::Priority,
         plan: String,
+        reviewed_proposal: Option<phoenix_core::domain::task_approval::ReviewedProposal>,
     },
     ApproveTaskFreshHandoff {
         task_file: String,
         title: String,
         priority: crate::task_source::Priority,
         plan: String,
+        reviewed_proposal: Option<phoenix_core::domain::task_approval::ReviewedProposal>,
     },
     PersistForkProposal {
         proposal_id: String,
@@ -349,22 +351,26 @@ impl ClassifiedEffect {
                 title,
                 priority,
                 plan,
+                reviewed_proposal,
             } => Self::Authoritative(Box::new(AuthoritativeEffect::ApproveTask {
                 task_file,
                 title,
                 priority,
                 plan,
+                reviewed_proposal,
             })),
             Effect::ApproveTaskFreshHandoff {
                 task_file,
                 title,
                 priority,
                 plan,
+                reviewed_proposal,
             } => Self::Authoritative(Box::new(AuthoritativeEffect::ApproveTaskFreshHandoff {
                 task_file,
                 title,
                 priority,
                 plan,
+                reviewed_proposal,
             })),
             Effect::PersistForkProposal {
                 proposal_id,
@@ -8129,12 +8135,14 @@ where
                 title,
                 priority,
                 plan,
+                reviewed_proposal,
             } => {
                 self.execute_approve_task(
                     task_file,
                     title,
                     priority,
                     plan,
+                    reviewed_proposal,
                     task_approval_execution.ok_or_else(|| {
                         "task approval execution was not resolved before effect admission"
                             .to_string()
@@ -8150,10 +8158,11 @@ where
                 title,
                 priority,
                 plan,
+                reviewed_proposal,
             } => {
                 let authority = admitted.reborrow();
                 let completion = self
-                    .execute_approve_task_fresh_handoff(task_file, title, priority, plan, authority)
+                    .execute_approve_task_fresh_handoff(task_file, title, priority, plan, reviewed_proposal, authority)
                     .await?;
                 self.retain_handoff_completion_authority(
                     completion.as_ref(),
@@ -12038,6 +12047,7 @@ where
         title: String,
         priority: crate::task_source::Priority,
         plan: String,
+        reviewed_proposal: Option<phoenix_core::domain::task_approval::ReviewedProposal>,
         error: &str,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
@@ -12047,6 +12057,7 @@ where
                 title,
                 priority,
                 plan,
+                reviewed_proposal,
             },
             Utc::now(),
             true,
@@ -12081,6 +12092,7 @@ where
         title: String,
         priority: crate::task_source::Priority,
         plan: String,
+        reviewed_proposal_backup: Option<phoenix_core::domain::task_approval::ReviewedProposal>,
         execution: TaskApprovalExecution,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
@@ -12092,7 +12104,7 @@ where
                 Ok(()) => Ok(()),
                 Err(FollowUpApprovalError::BeforeGit(error)) => {
                     self.restore_retryable_task_approval(
-                        task_file, title, priority, plan, &error, admitted,
+                        task_file, title, priority, plan, reviewed_proposal_backup, &error, admitted,
                     )?;
                     Err(error)
                 }
@@ -12360,6 +12372,7 @@ where
                         title: title_backup,
                         priority: priority_backup,
                         plan: plan_backup,
+                        reviewed_proposal: reviewed_proposal_backup,
                     },
                     Utc::now(),
                     true,
@@ -12395,6 +12408,7 @@ where
         title: String,
         priority: crate::task_source::Priority,
         plan: String,
+        reviewed_proposal_backup: Option<phoenix_core::domain::task_approval::ReviewedProposal>,
         authority: crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
         let cwd = self.context.filesystem_root().to_path_buf();
@@ -12436,6 +12450,7 @@ where
                         title: title_backup,
                         priority: priority_backup,
                         plan: plan_backup,
+                        reviewed_proposal: reviewed_proposal_backup,
                     },
                     Utc::now(),
                     true,
@@ -18683,6 +18698,7 @@ mod authoritative_user_message_effect_tests {
             title: "Handoff completion".to_string(),
             priority: crate::task_source::Priority::P1,
             plan: "Complete the handoff".to_string(),
+            reviewed_proposal: None,
         };
         let (state_tx, state_rx) = watch::channel(rt.state.clone());
         rt.state_watcher = Some(state_tx);
@@ -18741,6 +18757,7 @@ mod authoritative_user_message_effect_tests {
             title: "Terminal settlement".to_string(),
             priority: crate::task_source::Priority::P1,
             plan: "Preserve exact terminal evidence".to_string(),
+            reviewed_proposal: None,
         };
 
         assert!(rt
@@ -18861,6 +18878,7 @@ mod authoritative_user_message_effect_tests {
             title: "Admitted terminal".to_string(),
             priority: crate::task_source::Priority::P1,
             plan: "Finish the admitted atomic unit".to_string(),
+            reviewed_proposal: None,
         };
         let settlement = tokio::spawn(async move {
             let result = rt
@@ -20367,6 +20385,7 @@ mod approved_explore_follow_up_tests {
                 title: "Follow up".to_string(),
                 priority: crate::task_source::Priority::P1,
                 plan: plan.to_string(),
+                reviewed_proposal: None,
             },
             storage,
             Arc::new(MockLlmClient::new("test-model")),
@@ -20437,6 +20456,7 @@ mod approved_explore_follow_up_tests {
                 "Detached checkpoint".to_string(),
                 crate::task_source::Priority::P1,
                 plan.to_string(),
+                None,
                 execution,
                 &mut admitted,
             )
@@ -20508,6 +20528,7 @@ mod approved_explore_follow_up_tests {
                 "Follow up".to_string(),
                 crate::task_source::Priority::P1,
                 plan.to_string(),
+                None,
                 TaskApprovalExecution::Initial,
                 &mut admitted,
             )
@@ -20549,6 +20570,11 @@ mod approved_explore_follow_up_tests {
         let mut runtime =
             approved_explore_runtime(worktree, task_file, reviewed_plan, storage, broadcast_tx);
         runtime.state = ConvState::LlmRequesting { attempt: 1 };
+        let reviewed = phoenix_core::domain::task_approval::ReviewedProposal::capture(
+            phoenix_core::domain::task_approval::ProposalOccurrence::capture("assistant-1", "call-1").unwrap(),
+            &crate::task_source::TaskSource::detect("72004-p1-ready--follow-up.md").unwrap(),
+            reviewed_plan,
+        );
         let authority_fence = crate::runtime::FatalLocalAuthorityFence::new();
         let mut admitted = authority_fence.try_acquire().expect("open authority fence");
 
@@ -20558,6 +20584,7 @@ mod approved_explore_follow_up_tests {
                 "Follow up".to_string(),
                 crate::task_source::Priority::P1,
                 reviewed_plan.to_string(),
+                Some(reviewed.clone()),
                 TaskApprovalExecution::FollowUp,
                 &mut admitted,
             )
@@ -20567,7 +20594,7 @@ mod approved_explore_follow_up_tests {
         assert!(error.contains("no longer matches the approved plan"));
         assert!(matches!(
             runtime.state,
-            ConvState::AwaitingTaskApproval { .. }
+            ConvState::AwaitingTaskApproval { reviewed_proposal: Some(ref saved), .. } if saved == &reviewed
         ));
     }
 
@@ -20603,6 +20630,7 @@ mod approved_explore_follow_up_tests {
                 "Follow up".to_string(),
                 crate::task_source::Priority::P1,
                 plan.to_string(),
+                None,
                 TaskApprovalExecution::FollowUp,
                 &mut admitted,
             )
@@ -20629,6 +20657,7 @@ mod approved_explore_follow_up_tests {
                 "Follow up".to_string(),
                 crate::task_source::Priority::P1,
                 plan.to_string(),
+                None,
                 TaskApprovalExecution::FollowUp,
                 &mut admitted,
             )
@@ -20675,6 +20704,7 @@ mod approved_explore_follow_up_tests {
                 "Follow up".to_string(),
                 crate::task_source::Priority::P1,
                 plan.to_string(),
+                None,
                 TaskApprovalExecution::FollowUp,
                 &mut admitted,
             )
@@ -20727,6 +20757,7 @@ mod approved_explore_follow_up_tests {
                 "Follow up".to_string(),
                 crate::task_source::Priority::P1,
                 plan.to_string(),
+                None,
                 TaskApprovalExecution::FollowUp,
                 &mut admitted,
             )
@@ -21869,6 +21900,7 @@ mod approve_task_failure_effect_tests {
                 title: "Fresh handoff".to_string(),
                 priority: crate::task_source::Priority::P2,
                 plan: "Plan\n".to_string(),
+                reviewed_proposal: None,
             },
             Arc::new(InMemoryStorage::new()),
             llm,
@@ -21938,6 +21970,7 @@ mod approve_task_failure_effect_tests {
                 title: "Persist failure".to_string(),
                 priority: crate::task_source::Priority::P2,
                 plan: "# Persist failure\n".to_string(),
+                reviewed_proposal: None,
             },
             storage,
             Arc::new(MockLlmClient::new("test-model")),
@@ -21992,6 +22025,7 @@ mod approve_task_failure_effect_tests {
                 title: "Fix the login bug".to_string(),
                 priority: crate::task_source::Priority::P2,
                 plan: "Plan".to_string(),
+                reviewed_proposal: None,
             },
             Arc::new(InMemoryStorage::new()),
             llm.clone(),
@@ -29329,6 +29363,7 @@ mod steer_drain_detector_tests {
                 title: "task".into(),
                 priority: phoenix_core::task_source::Priority::P1,
                 plan: "plan".into(),
+                reviewed_proposal: None,
             },
             ConvState::AwaitingUserResponse {
                 questions: vec![],

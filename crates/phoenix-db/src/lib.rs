@@ -25804,6 +25804,7 @@ mod tests {
             title: "Fix the widget".to_string(),
             priority: phoenix_core::task_source::Priority::P1,
             plan: "Step 1: read code\nStep 2: fix bug".to_string(),
+            reviewed_proposal: None,
         };
         db.update_conversation_state("conv-1", &approval_state)
             .await
@@ -25822,6 +25823,7 @@ mod tests {
             title,
             priority,
             plan,
+            ..
         } = conv_after.state
         {
             assert_eq!(task_file, "tasks/12345-p1-ready--fix-the-widget.md");
@@ -29694,6 +29696,7 @@ mod tests {
             title: "Rollback".to_string(),
             priority: phoenix_core::task_source::Priority::P1,
             plan: "reviewed".to_string(),
+            reviewed_proposal: None,
         };
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2 WHERE id = 'handoff-parent'",

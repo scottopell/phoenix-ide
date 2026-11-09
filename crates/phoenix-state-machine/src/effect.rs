@@ -229,12 +229,14 @@ pub enum Effect {
         title: String,
         priority: phoenix_core::task_source::Priority,
         plan: String,
+        reviewed_proposal: Option<phoenix_core::domain::task_approval::ReviewedProposal>,
     },
     ApproveTaskFreshHandoff {
         task_file: String,
         title: String,
         priority: phoenix_core::task_source::Priority,
         plan: String,
+        reviewed_proposal: Option<phoenix_core::domain::task_approval::ReviewedProposal>,
     },
     /// Atomically persist a decoupled fork proposal together with the
     /// originating turn's tool round (REQ-PROJ-033). The synthetic success ack

@@ -73,6 +73,7 @@ struct TaskFileSnapshot {
     /// A fork commits this verbatim, so it must equal the reviewed file
     /// byte-for-byte (REQ-PROJ-033).
     body_raw: String,
+    source: phoenix_core::task_source::TaskSource,
 }
 
 /// Read and validate a task file referenced by `propose_task`.
@@ -200,6 +201,7 @@ fn resolve_task_file(
         title,
         priority,
         body_raw: body,
+        source,
     })
 }
 
@@ -2467,6 +2469,7 @@ pub fn transition_parent(
                 title,
                 priority,
                 plan,
+                reviewed_proposal,
             },
             ParentEvent::Parent(ParentOnlyEvent::TaskApprovalDecided {
                 outcome:
@@ -2481,6 +2484,7 @@ pub fn transition_parent(
                     title: title.clone(),
                     priority: *priority,
                     plan: plan.clone(),
+                    reviewed_proposal: reviewed_proposal.clone(),
                 })
                 .with_effect(Effect::notify_state_change())
                 .with_effect(Effect::RequestLlm),
@@ -2491,6 +2495,7 @@ pub fn transition_parent(
                 title,
                 priority,
                 plan,
+                reviewed_proposal,
             },
             ParentEvent::Parent(ParentOnlyEvent::TaskApprovalDecided {
                 outcome:
@@ -2504,12 +2509,14 @@ pub fn transition_parent(
                 title: title.clone(),
                 priority: *priority,
                 plan: plan.clone(),
+                reviewed_proposal: reviewed_proposal.clone(),
             })
             .with_effect(Effect::ApproveTaskFreshHandoff {
                 task_file: task_file.clone(),
                 title: title.clone(),
                 priority: *priority,
                 plan: plan.clone(),
+                reviewed_proposal: reviewed_proposal.clone(),
             }),
         ),
 
@@ -3144,6 +3151,11 @@ pub fn transition_parent(
                             title: snapshot.title.clone(),
                             priority: snapshot.priority,
                             plan: snapshot.body_raw.clone(),
+                            reviewed_proposal: phoenix_core::domain::task_approval::ProposalOccurrence::capture(
+                                &request_id, &tool.id,
+                            ).map(|occurrence| phoenix_core::domain::task_approval::ReviewedProposal::capture(
+                                occurrence, &snapshot.source, &snapshot.body_raw,
+                            )),
                         })
                         .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                         .with_effect(Effect::PersistState)
@@ -6236,6 +6248,7 @@ mod tests {
             title: "Review".to_string(),
             priority: phoenix_core::task_source::Priority::P1,
             plan: "Check the result".to_string(),
+            reviewed_proposal: None,
         };
         let result = transition(
             &state,
@@ -6270,6 +6283,7 @@ mod tests {
             title: "Review".to_string(),
             priority: phoenix_core::task_source::Priority::P1,
             plan: "Check the result".to_string(),
+            reviewed_proposal: None,
         };
         let result = transition(
             &state,
@@ -6301,6 +6315,7 @@ mod tests {
             title: "Review".to_string(),
             priority: phoenix_core::task_source::Priority::P1,
             plan: "Check the result".to_string(),
+            reviewed_proposal: None,
         };
         let result = transition(
             &state,
@@ -10070,9 +10085,18 @@ mod tests {
             )
             .expect("transition must succeed");
 
-            let ConvState::AwaitingTaskApproval { plan, .. } = result.new_state else {
-                panic!("write-authority proposal must await approval");
+            let ConvState::AwaitingTaskApproval { plan, reviewed_proposal: Some(reviewed), .. } = result.new_state else {
+                panic!("write-authority proposal must capture reviewed provenance");
             };
+            assert_eq!(reviewed.occurrence.assistant_message_id, "test-req-id");
+            assert_eq!(reviewed.occurrence.tool_use_id, "tool-propose-1");
+            assert_eq!(reviewed.kind, phoenix_core::domain::task_approval::ReviewedTaskKind::Taskmd);
+            assert_eq!(reviewed.body_sha256.len(), 64);
+            assert_ne!(reviewed.body_sha256, phoenix_core::domain::task_approval::ReviewedProposal::capture(
+                reviewed.occurrence.clone(), &phoenix_core::task_source::TaskSource::detect("12345-p1-ready--fix-the-bug.md").unwrap(),
+                raw.trim(),
+            ).body_sha256);
+            assert!(matches!(result.effects.first(), Some(Effect::PersistCheckpoint { .. })));
             assert_eq!(plan, raw, "approval plan must preserve raw file bytes");
             assert_ne!(plan, raw.trim(), "approval plan must not be trimmed");
         }

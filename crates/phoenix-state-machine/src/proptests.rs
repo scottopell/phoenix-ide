@@ -226,6 +226,7 @@ fn arb_awaiting_task_approval_state() -> impl Strategy<Value = ConvState> {
                 title,
                 priority,
                 plan,
+                reviewed_proposal: None,
             }
         })
 }

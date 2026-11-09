@@ -14,6 +14,42 @@ use sqlx::Row;
 mod canonical_receipt;
 pub(crate) use canonical_receipt::CanonicalReceipt;
 
+fn validate_task_proposal(
+    conversation_id: &str,
+    assistant: &Message,
+    state: &phoenix_core::domain::sm_state::ConvState,
+) -> DbResult<()> {
+    use phoenix_core::domain::{
+        db_schema::MessageContent,
+        llm_types::ContentBlock,
+        sm_state::ConvState,
+        task_approval::ReviewedProposal,
+    };
+    let ConvState::AwaitingTaskApproval {
+        task_file,
+        plan,
+        reviewed_proposal: Some(reviewed),
+        ..
+    } = state else {
+        return Ok(());
+    };
+    let occurrence = &reviewed.occurrence;
+    let valid_source = assistant.conversation_id == conversation_id
+        && assistant.message_id == occurrence.assistant_message_id
+        && matches!(&assistant.content, MessageContent::Agent(blocks) if blocks.iter().filter(|block| matches!(block,
+            ContentBlock::ToolUse { id, name, .. } if id == &occurrence.tool_use_id && name == "propose_task"
+        )).count() == 1);
+    let source = std::path::Path::new(task_file)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(phoenix_core::task_source::TaskSource::detect)
+        .ok_or_else(|| DbError::Serialization("task proposal path is not markdown".into()))?;
+    if !valid_source || reviewed != &ReviewedProposal::capture(occurrence.clone(), &source, plan) {
+        return Err(DbError::Serialization("task proposal source or reviewed bytes differ".into()));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_goal_round_replay(
     assistant: &Message,
     update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
@@ -145,6 +181,7 @@ impl Database {
             }
         }
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        validate_task_proposal(conversation_id, assistant, state)?;
         let mut receipt =
             canonical_receipt::CanonicalReceipt::new(state, state_updated_at, update)?;
         let round::RoundWriteOutcome {

@@ -10,6 +10,138 @@ async fn receipt_count(db: &Database) -> i64 {
         .unwrap()
 }
 
+fn proposal_state(assistant: &Message) -> ConvState {
+    use phoenix_core::{domain::task_approval::{ProposalOccurrence, ReviewedProposal}, task_source::{Priority, TaskSource}};
+    let source = TaskSource::detect("plan.md").unwrap();
+    ConvState::AwaitingTaskApproval {
+        task_file: "tasks/plan.md".into(),
+        title: "Plan".into(),
+        priority: Priority::P2,
+        plan: "# Exact plan\n".into(),
+        reviewed_proposal: Some(ReviewedProposal::capture(
+            ProposalOccurrence::capture(&assistant.message_id, "checkpoint-call").unwrap(),
+            &source,
+            "# Exact plan\n",
+        )),
+    }
+}
+
+fn proposal_round(round: &mut ReportRound) {
+    round.assistant.content = MessageContent::Agent(vec![ContentBlock::ToolUse {
+        id: "checkpoint-call".into(),
+        name: "propose_task".into(),
+        input: serde_json::json!({"task_file": "tasks/plan.md"}),
+    }]);
+    round.state = proposal_state(&round.assistant);
+}
+
+async fn saved_proposal(db: &Database, assistant: &Message) -> ConvState {
+    db.get_conversation(&assistant.conversation_id).await.unwrap().state
+}
+
+#[tokio::test]
+async fn proposal_checkpoint_commits_and_replays_with_ordinary_and_provider_routes() {
+    for provider in [false, true] {
+        let (db, _owner, mut round) = report_fixture().await;
+        proposal_round(&mut round);
+        let result = finalized_result(&round.assistant, &ordinary_result());
+        let write = |db: &Database, round: &ReportRound, result: &FinalizedToolResult| {
+            let db = db.clone();
+            let assistant = round.assistant.clone();
+            let state = round.state.clone();
+            let result = result.clone();
+            let timestamp = round.timestamp;
+            let replay = round.replay();
+            async move {
+                if provider {
+                    db.persist_tool_round_state_and_replay(&assistant.conversation_id, &assistant,
+                        &[result], &state, timestamp, &replay).await
+                } else {
+                    db.persist_tool_round_and_state(&assistant.conversation_id, &assistant,
+                        &[result], &state, timestamp).await
+                }
+            }
+        };
+        write(&db, &round, &result).await.unwrap();
+        assert_eq!(saved_proposal(&db, &round.assistant).await, round.state);
+        assert_eq!(receipt_count(&db).await, 1);
+        write(&db, &round, &result).await.unwrap();
+        assert_eq!(saved_proposal(&db, &round.assistant).await, round.state);
+        assert_eq!(receipt_count(&db).await, 1);
+        let first = round.state.clone();
+
+        let mut next = round;
+        next.assistant.message_id.push_str("-next");
+        next.assistant.sequence_id += 2;
+        next.timestamp += chrono::Duration::seconds(1);
+        next.state = proposal_state(&next.assistant);
+        let next_result = finalized_result(&next.assistant, &ordinary_result());
+        write(&db, &next, &next_result).await.unwrap();
+        assert_eq!(saved_proposal(&db, &next.assistant).await, next.state);
+        assert_ne!(first, next.state, "same body must not ABA-match");
+        assert_eq!(receipt_count(&db).await, 2);
+    }
+}
+
+#[tokio::test]
+async fn proposal_rejects_foreign_occurrence_and_rolls_back_checkpoint() {
+    let (db, _owner, mut round) = report_fixture().await;
+    proposal_round(&mut round);
+    let result = finalized_result(&round.assistant, &ordinary_result());
+    let ConvState::AwaitingTaskApproval { reviewed_proposal: Some(reviewed), .. } = &mut round.state else {
+        unreachable!()
+    };
+    reviewed.occurrence.assistant_message_id = "foreign-assistant".into();
+    let error = db.persist_tool_round_and_state(&round.assistant.conversation_id, &round.assistant,
+        &[result.clone()], &round.state, round.timestamp).await.unwrap_err();
+    assert!(error.to_string().contains("proposal source"));
+    assert_eq!(receipt_count(&db).await, 0);
+    let message_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE message_id = ?1")
+        .bind(&round.assistant.message_id).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(message_count, 0);
+
+    let mut legacy = proposal_state(&round.assistant);
+    let ConvState::AwaitingTaskApproval { reviewed_proposal, .. } = &mut legacy else { unreachable!() };
+    *reviewed_proposal = None;
+    let mut json = serde_json::to_value(&legacy).unwrap();
+    json.as_object_mut().unwrap().remove("reviewed_proposal");
+    let old: ConvState = serde_json::from_value(json).unwrap();
+    assert!(matches!(old, ConvState::AwaitingTaskApproval { reviewed_proposal: None, .. }));
+    db.persist_tool_round_and_state(&round.assistant.conversation_id, &round.assistant,
+        &[result], &old, round.timestamp).await.unwrap();
+    assert_eq!(saved_proposal(&db, &round.assistant).await, old);
+    assert_eq!(receipt_count(&db).await, 1);
+}
+
+#[tokio::test]
+async fn foreign_tool_use_cannot_bind_proposal_checkpoint() {
+    let (db, _owner, mut round) = report_fixture().await;
+    proposal_round(&mut round);
+    if let ConvState::AwaitingTaskApproval { reviewed_proposal: Some(ref mut reviewed), .. } = round.state {
+        reviewed.occurrence.tool_use_id = "foreign-tool-use".into();
+    }
+    let result = finalized_result(&round.assistant, &ordinary_result());
+    let error = db.persist_tool_round_and_state(&round.assistant.conversation_id,
+        &round.assistant, &[result], &round.state, round.timestamp).await.unwrap_err();
+    assert!(error.to_string().contains("proposal source"));
+    assert_eq!(receipt_count(&db).await, 0);
+}
+
+#[tokio::test]
+async fn proposal_checkpoint_rolls_back_at_canonical_cut() {
+    let (db, _owner, mut round) = report_fixture().await;
+    proposal_round(&mut round);
+    let result = finalized_result(&round.assistant, &ordinary_result());
+    let err = db.persist_canonical_state_and_replay_input(
+        &round.assistant.conversation_id, &round.assistant,
+        crate::conversation_goals::round::ToolRoundWrite::Finalized(&[result]),
+        &round.state, round.timestamp, None, Some(CanonicalCommitCut::BeforeCanonicalCommit),
+    ).await.unwrap_err();
+    assert!(err.to_string().contains("injected before canonical commit"));
+    assert_ne!(saved_proposal(&db, &round.assistant).await, round.state);
+    assert_eq!(receipt_count(&db).await, 0);
+}
+
 #[tokio::test]
 async fn canonical_goal_report_wakes_federated_waiter_after_commit() {
     let (db, owner, round) = report_fixture().await;

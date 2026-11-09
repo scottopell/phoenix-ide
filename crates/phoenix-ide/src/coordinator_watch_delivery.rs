@@ -192,6 +192,7 @@ mod tests {
             title: "Example".into(),
             priority: phoenix_core::task_source::Priority::P1,
             plan: "Review".into(),
+            reviewed_proposal: None,
         };
         db.update_conversation_state(&source.id, &waiting)
             .await
@@ -258,6 +259,7 @@ mod tests {
                 title: "Example".into(),
                 priority: phoenix_core::task_source::Priority::P1,
                 plan: "Review".into(),
+                reviewed_proposal: None,
             },
         )
         .await

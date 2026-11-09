@@ -1,19 +1,19 @@
 # Native Task Approval Tools — Executive
 
-## Draft status and authority
+## Status and authority
 
-**Draft only; owner review blocked.** Requirements and Proposed ADR-244 are a review packet, not shipped behavior. Slice A has added core identity vocabulary only; it does not capture canonical proposals or enable/register native approval. Focused tests are written but NOT RUN; all requirements remain NOT DONE and runtime verification is NOT DONE. No schema, migration, native tool, generated type or wire change is delivered.
+**Bounded Part A underway; NOT verified.** Owner authorized canonical proposal capture using the existing conversation/assistant canonical receipt as the ownership witness. The code captures typed provenance in the pending aggregate and preserves it on approval retry, but no native approval tool is enabled or registered. Focused tests are written but NOT RUN locally; hosted CI is pending. Source-live proof, native approval, Close, and runtime verification remain NOT DONE. No schema, migration, generated type or wire change is delivered.
 
 The native Stop/pause policy is resolved: the Coordinator, acting within saved standing authority / the commissioned Goal, selected refusal of new approval effects while the explicit target conversation latch is set, conveyed through owner `a52`'s question response. This is not new human approval or authority to resume. Existing human resume is required; a suspended saved Goal alone does not block approval. Inspection remains read-only and may expose stopped pending proposals with ineligibility and consequences. Exact historical receipt replay after current-source admission returns `Committed` without redispatch even after target Stop.
 
-This revision is the owner `a52` minimization direction, superseding the full normalized-snapshot-row draft. Task 53019's body correction is explicitly authorized; its filename/status is unchanged. Policy selection is resolved; owner review, not another policy decision, remains the gate.
+Owner's minimized single-aggregate direction governs this bounded implementation. The supported task remains in progress; the native source policy and mutator are separate follow-on gates.
 
 ## Bounded supplied facts; no new audit
 
 - HTTP approval follows `mutation_admission` → reload `AwaitingTaskApproval` → `GitBackedActiveWorkScope` → task lifecycle admission → unbound event → `RequestLlm`.
 - Lifecycle admission rejects SubAgents, Close/history violations, and states other than `Accepted` / `StandaloneAvailable`. `TaskLifecycleAction` does not exist.
 - HTTP approval has no blanket GoalStop/pause predicate. Its unbound event does not prove a native source call.
-- No independent SQL body/path lookup or lifetime need has been established. Preserve the single typed pending aggregate and existing HTTP/wire projection; normalize only canonical proposal occurrence/full-message ownership and immutable scoped native receipts for joins, FKs and deduplication. The native source call is proven by validating full transcript/message/tool-use identity against server-owned persisted `ToolExecuting` replay input/state using typed Rust; the assistant message is not yet a finalized messages row while its tool runs. Retain only a minimum immutable source-call occurrence row for receipt identity, without a source-message FK.
+- No independent SQL body/path lookup or lifetime need has been established. Preserve the single typed pending aggregate and existing HTTP/wire projection; reuse the existing canonical receipt for proposal ownership, and reserve immutable scoped native approval receipts for the later mutator. The native source call is proven by validating full transcript/message/tool-use identity against server-owned persisted `ToolExecuting` replay input/state using typed Rust; the assistant message is not yet a finalized messages row while its tool runs. The future source-call receipt must not require a source-message FK before tool completion.
 
 ## Minimized proposed impact
 
@@ -28,14 +28,14 @@ No REQ-BED-028/REQ-PROJ-003 amendment is required by this minimized aggregate mo
 
 ## Coverage and proposed verification
 
-Every status below is **NOT DONE**; scenarios are a plan, not evidence.
+Part A (canonical pending-state capture) is in progress. Focused tests are written but have NOT RUN locally; hosted CI is required. Parts B (source-live proof), C (native approval), and Close remain deferred.
 
 | Requirement | Implementation | Tests | Runtime | Focused verification to add |
 |---|---|---|---|---|
 | REQ-TAT-001 | NOT DONE | NOT DONE | NOT DONE | Current Coordinator; full transcript/message/tool-use identity matched against persisted typed `ToolExecuting` replay input/state; forged/mismatched state rejected; source assistant messages row absent while tool runs; explicit owner and concrete CURRENT returned/frozen; no successor retargeting |
 | REQ-TAT-002 | NOT DONE | NOT DONE | NOT DONE | Exact aggregate inspection; stopped pending and missing-occurrence proposals remain inspectable with ineligibility/consequences; missing occurrence reports native approval unavailable; no mutation |
 | REQ-TAT-003 | NOT DONE | NOT DONE | NOT DONE | Explicit ContinueHere; typed StartFresh refusal/no substitution; HTTP unchanged; stale identical-body re-proposal; disk drift; lifecycle/Close/history; prove pre-Git Stop-first ordering returns typed refusal with no new effects before mutator enablement; later Stop follows existing cancellation ownership; Goal suspension alone is not Stop |
-| REQ-TAT-004 | NOT DONE | NOT DONE | NOT DONE | Atomic canonical occurrence/whole-state checkpoint; full-message ownership FKs; one typed aggregate; unchanged HTTP/wire projection; approved normalization consumes pending authority |
+| REQ-TAT-004 | PARTIAL A: typed occurrence/digest/kind captured before canonical checkpoint, validated against same-round assistant/tool-use and receipt; no separate occurrence table | WRITTEN, NOT RUN | NOT VERIFIED | Atomic canonical receipt/whole-state checkpoint and rollback; foreign occurrence rejection; same-body/new-assistant identity; unchanged HTTP/wire projection; approved normalization consumes pending authority |
 | REQ-TAT-005 | NOT DONE | NOT DONE | NOT DONE | Receipt/approval atomicity; scoped target-proposal full-message FKs and minimum source-call occurrence reference (no finalized source-message FK); source-call identity validated against typed persisted replay input/state; source gate before lookup before pending/Stop; exact historical replay even stopped, no redispatch; payload conflict |
 | REQ-TAT-006 | NOT DONE | NOT DONE | NOT DONE | Committed/requested vs dispatched/response/provisioned; fatal/unclassified and post-Git/pre-DB fail-stop; post-commit projection failure retains committed fact; no NotApplied or second continuation obligation |
 | REQ-TAT-007 | NOT DONE | NOT DONE | NOT DONE | Missing atomically captured canonical occurrence keeps proposal inspectable but native approval unavailable; preserve history/actionable re-proposal; no heuristic reconstruction, enrichment, backfill, fabricated provenance/receipts or hydration refactor |
@@ -43,7 +43,7 @@ Every status below is **NOT DONE**; scenarios are a plan, not evidence.
 
 ## Review gates and exclusions
 
-1. Owner review of the minimized contract and Proposed ADR-244; implementation remains blocked.
-2. Follow-on implementation and focused evidence for all eight requirements only after authorization; update NOT DONE with checkable evidence.
+1. Owner authorized bounded Part A; proposed ADR-244 reflects the existing canonical receipt as its ownership witness.
+2. Complete hosted CI verification of Part A, then separately prove source-live identity before enabling any native mutator. Remaining requirements are not implemented.
 
-No audit, build, tests, native execution, runtime verification, commit, push, registration or RC2 work is part of this revision. Only static `git diff --check` is permitted. ADR allocation was locally checked in the earlier draft (244 selected; known unmerged 243 collision avoided), not remotely reserved. The README index labels ADR-244 Proposed pending owner draft review; the Stop/pause policy is resolved.
+No native execution, local build/tests/codegen, registration, RC2, release or production work is included in Part A. A draft PR triggers standard hosted CI; runtime behavior remains unverified pending those results. The README index labels ADR-244 Proposed; Stop/pause policy is resolved but its implementation is deferred.

@@ -7445,6 +7445,7 @@ mod tests {
             title: "t".to_string(),
             priority: phoenix_core::task_source::Priority::P1,
             plan: "p".to_string(),
+            reviewed_proposal: None,
         }
     }
 

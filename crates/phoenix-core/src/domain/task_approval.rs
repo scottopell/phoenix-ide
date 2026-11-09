@@ -1,119 +1,56 @@
-//! Typed identity vocabulary for native task approval capture.
+//! Canonical identity for a blocking task proposal.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ConversationId(String);
+use crate::task_source::TaskSource;
 
-impl ConversationId {
-    pub fn new(value: impl Into<String>) -> Result<Self, EmptyIdentity> {
-        nonempty(value.into()).map(Self)
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct MessageId(String);
-
-impl MessageId {
-    pub fn new(value: impl Into<String>) -> Result<Self, EmptyIdentity> {
-        nonempty(value.into()).map(Self)
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ToolUseId(String);
-
-impl ToolUseId {
-    pub fn new(value: impl Into<String>) -> Result<Self, EmptyIdentity> {
-        nonempty(value.into()).map(Self)
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
+/// An occurrence is the assistant message AND its tool-use, not a task path or
+/// a generated proposal handle. Re-proposing identical Markdown has new identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SourceCallIdentity {
-    pub conversation_id: ConversationId,
-    pub assistant_message_id: MessageId,
-    pub tool_use_id: ToolUseId,
+pub struct ProposalOccurrence {
+    pub assistant_message_id: String,
+    pub tool_use_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct MemberId(String);
-
-impl MemberId {
-    pub fn new(value: impl Into<String>) -> Result<Self, EmptyIdentity> {
-        nonempty(value.into()).map(Self)
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct CanonicalProposalId(String);
-
-impl CanonicalProposalId {
-    pub fn new(value: impl Into<String>) -> Result<Self, EmptyIdentity> {
-        nonempty(value.into()).map(Self)
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
+impl ProposalOccurrence {
+    /// Only the canonical transition should construct this; persisted legacy
+    /// pending states have `None`, never reconstructed from transcript text.
+    pub fn capture(assistant_message_id: &str, tool_use_id: &str) -> Option<Self> {
+        if assistant_message_id.trim().is_empty() || tool_use_id.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
+            assistant_message_id: assistant_message_id.to_owned(),
+            tool_use_id: tool_use_id.to_owned(),
+        })
     }
 }
 
+/// Single whole-read authority carried by a pending approval. The existing
+/// state fields hold the exact reviewed body and path; no second body is stored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProposalOwner {
-    pub conversation_id: ConversationId,
-    pub member_id: MemberId,
-    pub proposal_id: CanonicalProposalId,
+pub struct ReviewedProposal {
+    pub occurrence: ProposalOccurrence,
+    pub kind: ReviewedTaskKind,
+    pub body_sha256: String,
 }
 
-/// Native approval is deliberately scoped to continuation in the owning target.
-/// Fresh-start is not a representable native target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ApprovalScope {
-    ContinueHere,
+#[serde(rename_all = "snake_case")]
+pub enum ReviewedTaskKind {
+    Taskmd,
+    PlainMarkdown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeApprovalCapture {
-    pub source: SourceCallIdentity,
-    pub target: ProposalOwner,
-    pub scope: ApprovalScope,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("identity must not be empty")]
-pub struct EmptyIdentity;
-
-fn nonempty(value: String) -> Result<String, EmptyIdentity> {
-    if value.is_empty() {
-        Err(EmptyIdentity)
-    } else {
-        Ok(value)
+impl ReviewedProposal {
+    pub fn capture(occurrence: ProposalOccurrence, source: &TaskSource, body: &str) -> Self {
+        let kind = match source {
+            TaskSource::Taskmd { .. } => ReviewedTaskKind::Taskmd,
+            TaskSource::PlainMarkdown { .. } => ReviewedTaskKind::PlainMarkdown,
+        };
+        let body_sha256 = format!("{:x}", Sha256::digest(body.as_bytes()));
+        Self { occurrence, kind, body_sha256 }
     }
 }
 
@@ -121,63 +58,29 @@ fn nonempty(value: String) -> Result<String, EmptyIdentity> {
 mod tests {
     use super::*;
 
-    fn source(conversation: &str, message: &str, tool_use: &str) -> SourceCallIdentity {
-        SourceCallIdentity {
-            conversation_id: ConversationId::new(conversation).unwrap(),
-            assistant_message_id: MessageId::new(message).unwrap(),
-            tool_use_id: ToolUseId::new(tool_use).unwrap(),
-        }
-    }
-
-    fn target(conversation: &str, member: &str, proposal: &str) -> ProposalOwner {
-        ProposalOwner {
-            conversation_id: ConversationId::new(conversation).unwrap(),
-            member_id: MemberId::new(member).unwrap(),
-            proposal_id: CanonicalProposalId::new(proposal).unwrap(),
-        }
+    #[test]
+    fn occurrence_changes_on_same_body_reproposal() {
+        let first = ProposalOccurrence::capture("assistant-1", "tool-1").unwrap();
+        let second = ProposalOccurrence::capture("assistant-2", "tool-1").unwrap();
+        let source = TaskSource::detect("plan.md").unwrap();
+        let a = ReviewedProposal::capture(first, &source, "# Identical\n");
+        let b = ReviewedProposal::capture(second, &source, "# Identical\n");
+        assert_eq!(a.body_sha256, b.body_sha256);
+        assert_ne!(a.occurrence, b.occurrence);
+        assert!(ProposalOccurrence::capture("", "tool").is_none());
+        assert!(ProposalOccurrence::capture("assistant", " ").is_none());
     }
 
     #[test]
-    fn capture_identity_includes_full_source_and_target_ownership() {
-        let captured = NativeApprovalCapture {
-            source: source("source-conversation", "assistant-message", "tool-use"),
-            target: target("owner-conversation", "member", "proposal"),
-            scope: ApprovalScope::ContinueHere,
-        };
-        assert_eq!(captured.source.assistant_message_id.as_str(), "assistant-message");
-        assert_eq!(captured.target.member_id.as_str(), "member");
-
-        let other_owner = NativeApprovalCapture {
-            target: target("different-owner", "member", "proposal"),
-            ..captured.clone()
-        };
-        let other_member = NativeApprovalCapture {
-            target: target("owner-conversation", "different-member", "proposal"),
-            ..captured.clone()
-        };
-        let other_proposal = NativeApprovalCapture {
-            target: target("owner-conversation", "member", "different-proposal"),
-            ..captured.clone()
-        };
-        assert_ne!(captured, other_owner);
-        assert_ne!(captured, other_member);
-        assert_ne!(captured, other_proposal);
-        assert_ne!(captured.source, source("source-conversation", "other-message", "tool-use"));
-        assert_ne!(captured.source, source("source-conversation", "assistant-message", "other-tool"));
-    }
-
-    #[test]
-    fn identity_constructors_reject_empty_values() {
-        assert!(ConversationId::new("").is_err());
-        assert!(MessageId::new("").is_err());
-        assert!(ToolUseId::new("").is_err());
-        assert!(MemberId::new("").is_err());
-        assert!(CanonicalProposalId::new("").is_err());
-    }
-
-    #[test]
-    fn native_scope_has_no_fresh_start_variant() {
-        let scope = ApprovalScope::ContinueHere;
-        assert_eq!(scope, ApprovalScope::ContinueHere);
+    fn reviewed_bytes_and_kind_are_distinguished() {
+        let occurrence = ProposalOccurrence::capture("assistant", "tool").unwrap();
+        let plain = TaskSource::detect("plan.md").unwrap();
+        let taskmd = TaskSource::detect("53019-p1-ready--plan.md").unwrap();
+        let a = ReviewedProposal::capture(occurrence.clone(), &plain, "# Plan\n");
+        let b = ReviewedProposal::capture(occurrence.clone(), &plain, "# Plan");
+        let c = ReviewedProposal::capture(occurrence, &taskmd, "# Plan\n");
+        assert_ne!(a.body_sha256, b.body_sha256);
+        assert_eq!(a.body_sha256, c.body_sha256);
+        assert_ne!(a.kind, c.kind);
     }
 }
