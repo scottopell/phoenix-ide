@@ -68,7 +68,7 @@ pub use product_conversation_rename::{
     ProductConversationRenameReceipt, ProductConversationRenameResult,
     ProductConversationRenameSource,
 };
-mod native_task_approval;
+pub mod native_task_approval;
 mod product_conversation_read;
 pub mod retrieval;
 mod sqlite_native_statement;

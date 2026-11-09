@@ -103,7 +103,7 @@ impl Fixture {
             sequence_id: 3,
             message_type: MessageType::User,
             content: MessageContent::User(UserContent::meta(
-                &ApprovedTaskSnapshot::from(&approval).seed_message(),
+                ApprovedTaskSnapshot::from(&approval).seed_message(),
             )),
             display_data: None,
             usage_data: None,
@@ -147,6 +147,60 @@ impl Fixture {
             .update_conversation_state(&self.command.source_transcript_id, &state)
             .await
             .unwrap();
+    }
+
+    fn source_message(&self) -> Message {
+        let ConvState::ToolExecuting {
+            assistant_message, ..
+        } = &self.executing
+        else {
+            unreachable!()
+        };
+        Message {
+            message_id: self.command.source.message_id.clone(),
+            conversation_id: self.command.source_transcript_id.clone(),
+            sequence_id: 1,
+            message_type: MessageType::Agent,
+            content: MessageContent::Agent(assistant_message.content.clone()),
+            display_data: None,
+            usage_data: None,
+            origin: InputOrigin::SystemGenerated,
+            created_at: Utc::now(),
+        }
+    }
+
+    async fn checkpoint_source(&self) {
+        let assistant = self.source_message();
+        let result = FinalizedToolResult::new(
+            &assistant.message_id,
+            &assistant.conversation_id,
+            2,
+            assistant.created_at,
+            &ToolResult::success(self.command.source.tool_use_id.clone(), "committed".into()),
+        );
+        self.db
+            .persist_tool_round_and_state(
+                &assistant.conversation_id,
+                &assistant,
+                &[result],
+                &ConvState::Idle,
+                assistant.created_at,
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn inspect(&self) -> Result<NativeTaskApprovalInspection, NativeTaskApprovalError> {
+        self.db
+            .inspect_native_task_approval_command(&self.command)
+            .await
+    }
+
+    async fn replay(&self) -> NativeTaskApprovalReceipt {
+        let NativeTaskApprovalInspection::Replay(receipt) = self.inspect().await.unwrap() else {
+            panic!("expected historical receipt")
+        };
+        receipt
     }
 
     async fn assert_source_not_finalized(&self) {
@@ -369,6 +423,246 @@ async fn native_settlement_atomically_establishes_receipt_and_existing_authority
 }
 
 #[tokio::test]
+async fn live_preflight_is_read_only_transient_and_has_no_finalized_source_row() {
+    let f = Fixture::new(false).await;
+    let before = database_rows(&f.db).await;
+    assert_eq!(
+        f.inspect().await.unwrap(),
+        NativeTaskApprovalInspection::RequiresOwningActorAdmission
+    );
+    f.assert_source_not_finalized().await;
+    assert_eq!(database_rows(&f.db).await, before);
+    f.db.update_conversation_state(&f.command.current_transcript_id, &ConvState::Idle)
+        .await
+        .unwrap();
+    let before = database_rows(&f.db).await;
+    assert!(f.inspect().await.is_err());
+    assert_eq!(database_rows(&f.db).await, before);
+}
+
+#[tokio::test]
+async fn canonical_source_replay_preserves_exact_receipt_after_progress_and_stop_like_invalidation()
+{
+    let f = Fixture::new(false).await;
+    f.settle().await.unwrap();
+    let receipt = f.replay().await;
+    assert_eq!(receipt.source_transcript_id, f.command.source_transcript_id);
+    assert_eq!(receipt.source, f.command.source);
+    assert_eq!(receipt.owner, f.command.owner);
+    assert_eq!(
+        receipt.target_transcript_id,
+        f.command.current_transcript_id
+    );
+    assert_eq!(
+        receipt.proposal,
+        f.command
+            .pending
+            .reviewed_proposal
+            .as_ref()
+            .unwrap()
+            .occurrence
+    );
+    assert_eq!(receipt.approval_message_id, f.message.message_id);
+    assert_eq!(receipt.continuation, NativeApprovalContinuation::Requested);
+    assert!(receipt.committed_at_us > 0);
+    f.checkpoint_source().await;
+    let before = database_rows(&f.db).await;
+    assert_eq!(f.replay().await, receipt);
+    f.settle().await.unwrap();
+    assert_eq!(database_rows(&f.db).await, before);
+
+    // Uses the ordinary state-progress invalidation trigger, not a runtime Stop-latch proof.
+    f.db.update_conversation_state(&f.command.current_transcript_id, &ConvState::Idle)
+        .await
+        .unwrap();
+    let owed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM approval_request_obligations")
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(owed, 0);
+    let before = database_rows(&f.db).await;
+    assert_eq!(f.replay().await, receipt);
+    f.settle().await.unwrap();
+    assert_eq!(database_rows(&f.db).await, before);
+}
+
+#[tokio::test]
+async fn finalized_canonical_source_without_same_exact_native_receipt_cannot_start_approval() {
+    for other_receipt in [false, true] {
+        let mut f = Fixture::new(false).await;
+        if other_receipt {
+            f.settle().await.unwrap();
+            f.command.source.tool_use_id.push_str("-new");
+            f.executing = executing_source(
+                &f.command.source,
+                APPROVE_TASK_TOOL_NAME,
+                f.command.input_value().unwrap(),
+            );
+            f.db.update_conversation_state(&f.command.current_transcript_id, &pending_state(true))
+                .await
+                .unwrap();
+        }
+        f.checkpoint_source().await;
+        let before = database_rows(&f.db).await;
+        assert!(f.inspect().await.is_err());
+        assert!(f.settle().await.is_err());
+        assert_eq!(database_rows(&f.db).await, before);
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn canonical_source_proof_refuses_forged_missing_foreign_and_ambiguous_evidence() {
+    for broken in 0..10 {
+        let mut f = Fixture::new(false).await;
+        f.settle().await.unwrap();
+        f.checkpoint_source().await;
+        let mut message = f.source_message();
+        match broken {
+            0 => {
+                sqlx::query("DELETE FROM canonical_tool_round_receipts WHERE conversation_id=?1")
+                    .bind(&f.command.source_transcript_id)
+                    .execute(f.db.pool())
+                    .await
+                    .unwrap();
+            }
+            1 => {
+                sqlx::query(
+                    "UPDATE messages SET conversation_id=?1, sequence_id=99 WHERE message_id=?2",
+                )
+                .bind(&f.command.current_transcript_id)
+                .bind(&f.command.source.message_id)
+                .execute(f.db.pool())
+                .await
+                .unwrap();
+            }
+            2 => {
+                sqlx::query("DELETE FROM messages WHERE message_id=?1")
+                    .bind(&f.command.source.message_id)
+                    .execute(f.db.pool())
+                    .await
+                    .unwrap();
+            }
+            3..=7 => {
+                let MessageContent::Agent(blocks) = &mut message.content else {
+                    unreachable!()
+                };
+                match broken {
+                    3 => {
+                        if let ContentBlock::ToolUse { name, .. } = &mut blocks[0] {
+                            *name = "foreign_tool".into();
+                        }
+                    }
+                    4 => {
+                        if let ContentBlock::ToolUse { input, .. } = &mut blocks[0] {
+                            *input = json!({"forged":true});
+                        }
+                    }
+                    5 => {
+                        if let ContentBlock::ToolUse { id, .. } = &mut blocks[0] {
+                            id.push('x');
+                        }
+                    }
+                    6 => blocks.push(blocks[0].clone()),
+                    7 => {
+                        let mut duplicate = blocks[0].clone();
+                        if let ContentBlock::ToolUse { name, .. } = &mut duplicate {
+                            *name = "different_tool".into();
+                        }
+                        blocks.push(duplicate);
+                    }
+                    _ => unreachable!(),
+                }
+                sqlx::query("UPDATE messages SET content=?1 WHERE message_id=?2")
+                    .bind(serde_json::to_string(&message.content.to_stored_json()).unwrap())
+                    .bind(&f.command.source.message_id)
+                    .execute(f.db.pool())
+                    .await
+                    .unwrap();
+            }
+            8 => {
+                sqlx::query("UPDATE canonical_tool_round_receipts SET conversation_id=?1 WHERE assistant_message_id=?2")
+                    .bind(&f.command.current_transcript_id).bind(&f.command.source.message_id)
+                    .execute(f.db.pool()).await.unwrap();
+            }
+            9 => f.command.source.message_id.push('x'),
+            _ => unreachable!(),
+        }
+        let before = database_rows(&f.db).await;
+        assert!(
+            f.inspect().await.is_err(),
+            "forged canonical evidence {broken}"
+        );
+        assert!(
+            f.settle().await.is_err(),
+            "forged canonical settlement {broken}"
+        );
+        assert_eq!(
+            database_rows(&f.db).await,
+            before,
+            "forged canonical evidence {broken}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn canonical_replay_requires_the_stored_source_to_still_be_current_coordinator() {
+    let mut f = Fixture::new(false).await;
+    f.settle().await.unwrap();
+    f.checkpoint_source().await;
+    sqlx::query("DELETE FROM product_conversation_transcripts WHERE transcript_row_id=?1")
+        .bind(&f.command.source_transcript_id)
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    f.command.pending.title.push_str(" changed");
+    let before = database_rows(&f.db).await;
+    let error = f.inspect().await.unwrap_err();
+    assert!(
+        matches!(error, NativeTaskApprovalError::Database(DbError::MessageConflict(ref reason))
+        if reason.contains("current Coordinator"))
+    );
+    assert!(f.settle().await.is_err());
+    assert_eq!(database_rows(&f.db).await, before);
+}
+
+#[tokio::test]
+async fn canonical_payload_must_prove_the_request_before_typed_fingerprint_conflict() {
+    let mut f = Fixture::new(false).await;
+    f.settle().await.unwrap();
+    f.checkpoint_source().await;
+    f.command.pending.title.push_str(" changed");
+    let before = database_rows(&f.db).await;
+    assert!(matches!(
+        f.inspect().await,
+        Err(NativeTaskApprovalError::Database(DbError::MessageConflict(
+            _
+        )))
+    ));
+    assert_eq!(database_rows(&f.db).await, before);
+    let mut source = f.source_message();
+    let MessageContent::Agent(blocks) = &mut source.content else {
+        unreachable!()
+    };
+    if let ContentBlock::ToolUse { input, .. } = &mut blocks[0] {
+        *input = f.command.input_value().unwrap();
+    }
+    sqlx::query("UPDATE messages SET content=?1 WHERE message_id=?2")
+        .bind(serde_json::to_string(&source.content.to_stored_json()).unwrap())
+        .bind(&f.command.source.message_id)
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    let before = database_rows(&f.db).await;
+    assert!(matches!(
+        f.inspect().await,
+        Err(NativeTaskApprovalError::RequestConflict)
+    ));
+    assert!(f.settle().await.is_err());
+    assert_eq!(database_rows(&f.db).await, before);
+}
+
+#[tokio::test]
 async fn failures_at_every_write_roll_back_all_rows_including_native_source() {
     let triggers = [
         "CREATE TRIGGER fail_native BEFORE INSERT ON conversation_approved_task_objectives BEGIN SELECT RAISE(ABORT, 'objective failure'); END",
@@ -438,7 +732,7 @@ async fn full_identity_hash_is_deterministic_and_covers_every_frozen_field() {
                 .body_sha256
                 .push('x'),
             7 => {
-                changed.pending.reviewed_proposal.as_mut().unwrap().kind = ReviewedTaskKind::Taskmd
+                changed.pending.reviewed_proposal.as_mut().unwrap().kind = ReviewedTaskKind::Taskmd;
             }
             8 => changed
                 .pending
@@ -526,7 +820,7 @@ async fn source_policy_rejects_invalid_sources_before_an_existing_receipt_can_re
                     &f.command.source,
                     "not_approve_task",
                     f.command.input_value().unwrap(),
-                )
+                );
             }
             6 => {
                 f.command.source.tool_use_id.push('x');

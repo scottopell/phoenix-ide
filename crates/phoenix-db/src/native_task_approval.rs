@@ -1,10 +1,11 @@
-//! Private approval-transaction foundation; no runtime or tool capability is exported.
+//! DB command inspection and approval settlement foundation; observations do not authorize Git.
 
 use chrono::{DateTime, Utc};
-use phoenix_core::domain::db_schema::{Message, SourceToolCall};
+use phoenix_core::domain::db_schema::{Message, MessageContent, MessageType, SourceToolCall};
+use phoenix_core::domain::llm_types::ContentBlock;
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use phoenix_core::domain::sm_state::ConvState;
-use phoenix_core::domain::task_approval::ReviewedProposal;
+use phoenix_core::domain::task_approval::{ProposalOccurrence, ReviewedProposal};
 use phoenix_core::task_handoff::ApprovedTaskSnapshot;
 use phoenix_core::task_source::Priority;
 use serde::Serialize;
@@ -21,20 +22,18 @@ const APPROVE_TASK_TOOL_NAME: &str = "approve_task";
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum NativeApprovalPlacement {
-    #[allow(dead_code)] // Constructed by the future owning actor, not an exported DB service.
+pub enum NativeApprovalPlacement {
     ContinueHere,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum NativeApprovalIntent {
-    #[allow(dead_code)] // Constructed by the future owning actor, not an exported DB service.
+pub enum NativeApprovalIntent {
     ApproveTaskAndRequestContinuation,
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct NativeTaskApprovalCommand {
+pub struct NativeTaskApprovalCommand {
     pub source_transcript_id: String,
     pub source: SourceToolCall,
     pub owner: ProductConversationId,
@@ -42,6 +41,72 @@ pub(super) struct NativeTaskApprovalCommand {
     pub pending: PendingTaskSnapshot,
     pub placement: NativeApprovalPlacement,
     pub intent: NativeApprovalIntent,
+}
+
+/// A historical DB fact, not current target eligibility, dispatch or Git authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeTaskApprovalReceipt {
+    pub source_transcript_id: String,
+    pub source: SourceToolCall,
+    pub owner: ProductConversationId,
+    pub target_transcript_id: String,
+    pub proposal: ProposalOccurrence,
+    pub approval_message_id: String,
+    pub continuation: NativeApprovalContinuation,
+    pub committed_at_us: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeApprovalContinuation {
+    Requested,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeTaskApprovalInspection {
+    Replay(NativeTaskApprovalReceipt),
+    /// Transient DB observation only; the owning actor must revalidate and admit effects.
+    RequiresOwningActorAdmission,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NativeTaskApprovalError {
+    #[error("native approval source call was committed with a different request")]
+    RequestConflict,
+    #[error(transparent)]
+    Database(#[from] DbError),
+}
+
+impl NativeTaskApprovalError {
+    fn into_db_error(self) -> DbError {
+        match self {
+            Self::RequestConflict => {
+                conflict("native approval source call was committed with a different request")
+            }
+            Self::Database(error) => error,
+        }
+    }
+}
+
+impl Database {
+    /// Proves current Coordinator/source identity before replay, then checks frozen pending data.
+    /// This read-only observation is not a reservation or a pre-Git admission token.
+    ///
+    /// # Errors
+    /// Rejects invalid sources/targets, changed same-source requests and DB failures.
+    pub async fn inspect_native_task_approval_command(
+        &self,
+        command: &NativeTaskApprovalCommand,
+    ) -> Result<NativeTaskApprovalInspection, NativeTaskApprovalError> {
+        let mut tx = self.pool.begin().await.map_err(DbError::from)?;
+        let result = if let Some(receipt) = source_and_replay_tx(&mut tx, command).await? {
+            NativeTaskApprovalInspection::Replay(receipt)
+        } else {
+            require_pending_tx(&mut tx, command).await?;
+            NativeTaskApprovalInspection::RequiresOwningActorAdmission
+        };
+        tx.rollback().await.map_err(DbError::from)?;
+        Ok(result)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -107,7 +172,11 @@ impl NativeTaskApprovalCommand {
         })
     }
 
-    fn input_value(&self) -> DbResult<serde_json::Value> {
+    /// The exact normalized tool input expected by source proof, not mutation authority.
+    ///
+    /// # Errors
+    /// Rejects missing captured provenance and serialization failures.
+    pub fn input_value(&self) -> DbResult<serde_json::Value> {
         serde_json::to_value(self.input()?)
             .map_err(|error| DbError::Serialization(error.to_string()))
     }
@@ -136,9 +205,143 @@ fn conflict(message: &str) -> DbError {
     DbError::MessageConflict(message.to_owned())
 }
 
-/// Returns true only for an exact historical receipt after current/live source proof.
-/// No caller can use this module as a receipt lookup API.
-#[allow(clippy::too_many_lines)]
+async fn source_and_replay_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    command: &NativeTaskApprovalCommand,
+) -> Result<Option<NativeTaskApprovalReceipt>, NativeTaskApprovalError> {
+    crate::product_conversation_rename::require_current_gc_tx(tx, &command.source_transcript_id)
+        .await?;
+    let state_json: String = sqlx::query_scalar("SELECT state FROM conversations WHERE id=?1")
+        .bind(&command.source_transcript_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(DbError::from)?;
+    let source_state: ConvState = serde_json::from_str(&state_json)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let requested = command.input_value()?;
+    if require_executing_source(
+        &source_state,
+        &command.source,
+        APPROVE_TASK_TOOL_NAME,
+        &requested,
+    )
+    .is_err()
+    {
+        require_committed_canonical_source_tx(tx, command, &requested).await?;
+    }
+    let Some((fingerprint, receipt)) = receipt_tx(tx, command).await? else {
+        return Ok(None);
+    };
+    if fingerprint != command.fingerprint()? {
+        return Err(NativeTaskApprovalError::RequestConflict);
+    }
+    Ok(Some(receipt))
+}
+
+async fn require_committed_canonical_source_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    command: &NativeTaskApprovalCommand,
+    requested: &serde_json::Value,
+) -> DbResult<()> {
+    use crate::conversation_goals::round;
+
+    let witnessed: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM native_task_approval_receipts r
+         JOIN native_task_approval_source_calls s USING
+              (source_transcript_id, source_message_id, source_tool_use_id)
+         JOIN canonical_tool_round_receipts c
+           ON c.conversation_id=r.source_transcript_id
+          AND c.assistant_message_id=r.source_message_id
+         WHERE r.source_transcript_id=?1 AND r.source_message_id=?2 AND r.source_tool_use_id=?3)",
+    )
+    .bind(&command.source_transcript_id)
+    .bind(&command.source.message_id)
+    .bind(&command.source.tool_use_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !witnessed {
+        return Err(conflict(
+            "native approval source lacks committed canonical evidence",
+        ));
+    }
+    let assistant = round::retained_message_tx(tx, &command.source.message_id)
+        .await
+        .map_err(round::db_error)?
+        .ok_or_else(|| conflict("native approval canonical source message is missing"))?;
+    let MessageContent::Agent(blocks) = &assistant.content else {
+        return Err(conflict(
+            "native approval canonical source is not an assistant",
+        ));
+    };
+    if assistant.conversation_id != command.source_transcript_id
+        || assistant.message_type != MessageType::Agent
+    {
+        return Err(conflict(
+            "native approval canonical source ownership differs",
+        ));
+    }
+    let mut calls = blocks.iter().filter_map(|block| match block {
+        ContentBlock::ToolUse { id, name, input } if id == &command.source.tool_use_id => {
+            Some((name, input))
+        }
+        _ => None,
+    });
+    let Some((name, input)) = calls.next() else {
+        return Err(conflict("native approval canonical source call is missing"));
+    };
+    if calls.next().is_some() || name != APPROVE_TASK_TOOL_NAME || input != requested {
+        return Err(conflict(
+            "native approval canonical source call differs or is ambiguous",
+        ));
+    }
+    Ok(())
+}
+
+async fn receipt_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    command: &NativeTaskApprovalCommand,
+) -> DbResult<Option<(Vec<u8>, NativeTaskApprovalReceipt)>> {
+    let row = sqlx::query(
+        "SELECT r.* FROM native_task_approval_receipts r
+         JOIN native_task_approval_source_calls s USING
+              (source_transcript_id, source_message_id, source_tool_use_id)
+         WHERE r.source_transcript_id=?1 AND r.source_message_id=?2 AND r.source_tool_use_id=?3",
+    )
+    .bind(&command.source_transcript_id)
+    .bind(&command.source.message_id)
+    .bind(&command.source.tool_use_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    if row.try_get::<i64, _>("continuation_requested")? != 1 {
+        return Err(conflict(
+            "native approval receipt lacks requested continuation fact",
+        ));
+    }
+    Ok(Some((
+        row.try_get("request_sha256")?,
+        NativeTaskApprovalReceipt {
+            source_transcript_id: row.try_get("source_transcript_id")?,
+            source: SourceToolCall {
+                message_id: row.try_get("source_message_id")?,
+                tool_use_id: row.try_get("source_tool_use_id")?,
+            },
+            owner: ProductConversationId::parse(
+                row.try_get::<String, _>("target_product_conversation_id")?,
+            )
+            .map_err(|error| DbError::Serialization(error.to_string()))?,
+            target_transcript_id: row.try_get("target_transcript_id")?,
+            proposal: ProposalOccurrence {
+                assistant_message_id: row.try_get("proposal_message_id")?,
+                tool_use_id: row.try_get("proposal_tool_use_id")?,
+            },
+            approval_message_id: row.try_get("approval_message_id")?,
+            continuation: NativeApprovalContinuation::Requested,
+            committed_at_us: row.try_get("committed_at_us")?,
+        },
+    )))
+}
+
 pub(super) async fn prepare_tx(
     tx: &mut Transaction<'_, Sqlite>,
     command: &NativeTaskApprovalCommand,
@@ -147,43 +350,16 @@ pub(super) async fn prepare_tx(
     message: &Message,
     next_state: &ConvState,
 ) -> DbResult<bool> {
-    crate::product_conversation_rename::require_current_gc_tx(tx, &command.source_transcript_id)
-        .await?;
-    let state_json: String = sqlx::query_scalar("SELECT state FROM conversations WHERE id=?1")
-        .bind(&command.source_transcript_id)
-        .fetch_one(&mut **tx)
-        .await?;
-    let source_state: ConvState = serde_json::from_str(&state_json)
-        .map_err(|error| DbError::Serialization(error.to_string()))?;
-    require_executing_source(
-        &source_state,
-        &command.source,
-        APPROVE_TASK_TOOL_NAME,
-        &command.input_value()?,
-    )?;
+    let replay = source_and_replay_tx(tx, command)
+        .await
+        .map_err(NativeTaskApprovalError::into_db_error)?;
     if command.current_transcript_id != target {
         return Err(conflict(
             "native approval target does not match the command",
         ));
     }
-    let fingerprint = command.fingerprint()?;
-    let existing: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT request_sha256 FROM native_task_approval_receipts
-         WHERE source_transcript_id=?1 AND source_message_id=?2 AND source_tool_use_id=?3",
-    )
-    .bind(&command.source_transcript_id)
-    .bind(&command.source.message_id)
-    .bind(&command.source.tool_use_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    if let Some(existing) = existing {
-        return if existing == fingerprint {
-            Ok(true)
-        } else {
-            Err(conflict(
-                "native approval source call was committed with a different request",
-            ))
-        };
+    if replay.is_some() {
+        return Ok(true);
     }
 
     if command.current_transcript_id != target
@@ -198,6 +374,15 @@ pub(super) async fn prepare_tx(
             "native approval settlement does not match the frozen request",
         ));
     }
+    require_pending_tx(tx, command).await?;
+    Ok(false)
+}
+
+async fn require_pending_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    command: &NativeTaskApprovalCommand,
+) -> DbResult<()> {
+    let target = command.current_transcript_id.as_str();
     let aggregate = Database::get_ordinary_product_conversation_on(tx, &command.owner).await?;
     if aggregate.latest_transcript_row_id != target {
         return Err(conflict(
@@ -251,7 +436,7 @@ pub(super) async fn prepare_tx(
             "native approval proposal was already committed by another source call",
         ));
     }
-    Ok(false)
+    Ok(())
 }
 
 pub(super) async fn insert_receipt_tx(

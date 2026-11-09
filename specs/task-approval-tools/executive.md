@@ -2,26 +2,45 @@
 
 ## Status and authority
 
-**Bounded Part A, Part B inspection/readiness and private DB receipt foundation implemented; NOT fully verified.** Part A captures typed provenance in the pending aggregate and preserves it on approval retry. Read-only inspection proves the actual executing Coordinator source. The DB foundation adds migration 156 and an internal native/user settlement sum sharing the existing approval transaction; it does not enable an actor, tool, Git operation or application-level `Committed` claim. No native approval or inspection tool is enabled or registered. Tests are authored but NOT RUN locally, by owner instruction. Only the installed Rust 1.95 formatter (edition 2021, skip children) and `git diff --check` are permitted locally; execution remains hosted-CI work on PR #1058. No generated type or wire change is delivered. The mutating actor, canonical completed-source replay policy, pre-Git revalidation and runtime Stop integration remain unfinished; native approval, Close and runtime verification are NOT DONE.
+**Bounded Part A, Part B inspection/readiness and DB command/receipt foundation implemented; NOT fully verified.** Part A captures typed provenance in the pending aggregate and preserves it on approval retry. Read-only inspection proves the actual executing Coordinator source. The DB foundation adds migration 156 and an internal native/user settlement sum sharing the existing approval transaction; it does not enable an actor, tool, Git operation or application-level `Committed` claim. No native approval or inspection tool is enabled or registered. Tests are authored but NOT RUN locally, by owner instruction. Only the installed Rust 1.95 formatter (edition 2021, skip children) and `git diff --check` are permitted locally; execution remains hosted-CI work on PR #1058. No generated type or wire change is delivered. The mutating actor, public typed native settlement API, historical service-handle replay routing, pre-Git revalidation and runtime Stop integration remain unfinished; native approval, Close and runtime verification are NOT DONE.
 
 The native Stop/pause policy is resolved: the Coordinator, acting within saved standing authority / the commissioned Goal, selected refusal of new approval effects while the explicit target conversation latch is set, conveyed through owner `a52`'s question response. This is not new human approval or authority to resume. Existing human resume is required; a suspended saved Goal alone does not block approval. Inspection remains read-only and may expose stopped pending proposals with ineligibility and consequences. Exact historical receipt replay after current-source admission returns `Committed` without redispatch even after target Stop.
 
-Owner's minimized single-aggregate direction governs this bounded implementation. The supported task remains in progress; the mutating actor and completed-source replay policy are separate follow-on gates.
+Owner's minimized single-aggregate direction governs this bounded implementation. The supported task remains in progress; the mutating actor and historical service-handle replay routing are separate follow-on gates.
 
-## Private DB receipt foundation (not full Part B)
+## DB command inspection and receipt foundation (not full Part B)
 
-`native_task_approval` is private to the DB crate. Its fixed-field, versioned typed
-encoding includes owner, concrete transcript, exact reviewed path/body/kind/digest
-and proposal occurrence, title, priority, source occurrence, `ContinueHere` and
-explicit approval/continuation intent. It is an internal command identity, not an
-approved wire input or caller-supplied source proof. Full actual persisted tool
-input and its assistant tool-use block must match that deterministic typed form.
+`phoenix-db::native_task_approval` exposes normalized DB command/intent/placement
+DTOs and `Database::inspect_native_task_approval_command`, not a tool, executor,
+factory or approved-effect capability. The command freezes the stable owner,
+CURRENT transcript, complete captured pending snapshot, placement and explicit
+approval/continuation intent. Full actual persisted tool input and its unique
+assistant tool-use block must match that deterministic typed form. The read-only
+API returns `Replay(NativeTaskApprovalReceipt)` or
+`RequiresOwningActorAdmission`; the latter is a transient observation, never a
+reservation or pre-Git authorization. A proven same-source changed fingerprint
+returns typed `NativeTaskApprovalError::RequestConflict`. The receipt reports
+exact source, target owner/transcript, proposal occurrence, approval-context
+message ID, requested-continuation fact and original commit timestamp; it does
+not assert current eligibility or dispatch.
 
-The existing `persist_approved_task_authority_inner` transaction performs current
-Coordinator and exact live `ToolExecuting` source proof before receipt lookup.
-An exact receipt returns the DB durable fact without any new writes before
-requiring target pending state. Changed identity conflicts. For a new settlement,
+The existing `persist_approved_task_authority_inner` transaction and public
+preflight share current Coordinator/source proof and replay ordering. Current
+Coordinator role is checked first. Live proof uses the existing exact
+`ToolExecuting` validator. Finalized-source replay additionally requires a native
+source-call/receipt for the same exact source key, the server-owned canonical
+round receipt, and the actual source-owned assistant's unique `approve_task`
+block with matching typed input. A matching message alone is insufficient; an
+arbitrary finalized/cancelled call cannot create an approval. An exact receipt
+returns the historical DB fact before target pending/lifecycle or Stop admission,
+without writes or restoration of an invalidated obligation. For a new settlement,
 the target must still match CURRENT and the captured canonical pending proposal.
+
+The native settlement sibling remains private with its existing
+`LocalAuthorityResult<()>` result. No public wrapper rereads a receipt after
+commit or misrepresents `()` as a typed settlement result. A public native
+settlement API carrying the receipt and commit classification out of the owning
+transaction remains an integration gate. Public user approval is unchanged.
 The normalized immutable source occurrence and immutable receipt are inserted in
 that same `BEGIN IMMEDIATE` transaction as objective, WorkScope authority, approval
 context message, continuation obligation and state. Commit-error classification
@@ -39,12 +58,26 @@ at each write stage, exact live replay after consumed pending/progress, changed
 payload, invalid/historical/non-Coordinator/cancelling source refusal before lookup,
 duplicate proposal conflicts, immutable/FK/foreign-owner constraints, receipt-aware
 commit-error proof, dispatch/later-approval independence and unchanged user approval.
-These tests are pending hosted execution, not claimed passed. The persisted Idle
-replay test is not a runtime Stop-latch ordering test. Completed/canonical source
-replay is deliberately refused until a precise same-call policy is integrated;
-there is no public receipt-lookup API that bypasses source proof. A future actor
-must still revalidate at the actual pre-Git boundary, own Stop/lifecycle/fail-stop
-and effect ordering, and expose typed outcomes only after that integration review.
+Additional authored cases checkpoint the actual source after native settlement,
+then replay the exact typed receipt after progress and ordinary Stop-like
+obligation invalidation, without changing any persisted row. They cover read-only
+live preflight, finalized new-attempt refusal, missing/foreign canonical receipts
+and assistant messages, wrong tool name/input/tool-use, duplicate-call refusal,
+source mismatch, typed fingerprint conflict after source proof, and current-role
+gating before proof/lookup. These tests are pending hosted execution, not claimed
+passed. Persisted Idle/ordinary invalidation is not a runtime Stop-latch ordering
+test. After Coordinator continuation replaces the stored source transcript's
+current role, replay remains denied; historical service-handle replay routing is
+a later gate, not a caller flag or a relaxed role check. A future actor must still
+revalidate at the actual pre-Git boundary and own Stop/lifecycle/fail-stop and
+effect ordering. This foundation does not complete Part B.
+
+Local validation is direct installed rustfmt 1.95 (edition 2021, skip children)
+and `git diff --check` only; no local Cargo/rustc/build/test/codegen was run.
+Predecessor run `42575553778` on `317de7cf8` reported three in-scope clippy errors:
+a needless borrow of `seed_message()` and missing semicolons in two match arms.
+Those test-authoring lints are corrected here; exact-head hosted validation is
+still required.
 
 Migration **156** follows local 155 (`ordinary_self_goal_admission`). Federation
 has reserved an unpublished 156 in a different checkout; integration must renumber
@@ -110,7 +143,7 @@ setup with HTTP 504, before running tests. New exact-head qualification is requi
 
 ## Coverage and proposed verification
 
-Part A (canonical pending-state capture) and Part B leaf 1 (executing-source proof/read-only inspection) have focused tests written but NOT RUN locally. Leaf 1's `Database::inspect_pending_task_from_coordinator` performs current-Coordinator admission before target lookup in one SQLite read transaction, matches the source transcript/message/current call and unique canonical block name/input against the typed request, then reads the ordinary product aggregate's CURRENT member. It returns owned exact pending fields and provenance, distinct `NoPending`, or legacy `UnavailableRepropose`; it neither reads task files nor reconstructs provenance. A nonempty occurrence alone is not classified as captured: within the same read transaction it requires the existing canonical receipt keyed by target transcript and proposing assistant, plus that actual assistant message owned by the target. The reused canonical-write validator checks unique tool-use identity across tool names, typed `propose_task` path, reviewed body digest and task kind. Missing messages/receipts, foreign ownership and mismatches preserve the exact snapshot and return typed `UnavailableIntegrity` with a repair/re-propose consequence. Twelve focused tests are authored, including actual ordinary/provider canonical target checkpoints with the Coordinator source assistant still absent from messages, missing/foreign receipt/message, forged occurrence, duplicate/wrong-name calls, stale input path, body/digest/kind drift, existing source-admission/continuation cases and unchanged persisted tables. Scoped direct rustfmt 1.95 (edition 2021, skip children) and static diff checks are the local validation; hosted compile/clippy/tests remain required. The leaf does not inspect the runtime Stop latch and its captured-proposal result explicitly requires later admission; no approval eligibility or full REQ-TAT-002 stopped-state explanation is claimed. The private DB receipt foundation is described above; remaining Part B mutating actor/completed-source replay/Stop work, Part C (native approval), and Close are deferred.
+Part A (canonical pending-state capture) and Part B leaf 1 (executing-source proof/read-only inspection) have focused tests written but NOT RUN locally. Leaf 1's `Database::inspect_pending_task_from_coordinator` performs current-Coordinator admission before target lookup in one SQLite read transaction, matches the source transcript/message/current call and unique canonical block name/input against the typed request, then reads the ordinary product aggregate's CURRENT member. It returns owned exact pending fields and provenance, distinct `NoPending`, or legacy `UnavailableRepropose`; it neither reads task files nor reconstructs provenance. A nonempty occurrence alone is not classified as captured: within the same read transaction it requires the existing canonical receipt keyed by target transcript and proposing assistant, plus that actual assistant message owned by the target. The reused canonical-write validator checks unique tool-use identity across tool names, typed `propose_task` path, reviewed body digest and task kind. Missing messages/receipts, foreign ownership and mismatches preserve the exact snapshot and return typed `UnavailableIntegrity` with a repair/re-propose consequence. Twelve focused tests are authored, including actual ordinary/provider canonical target checkpoints with the Coordinator source assistant still absent from messages, missing/foreign receipt/message, forged occurrence, duplicate/wrong-name calls, stale input path, body/digest/kind drift, existing source-admission/continuation cases and unchanged persisted tables. Scoped direct rustfmt 1.95 (edition 2021, skip children) and static diff checks are the local validation; hosted compile/clippy/tests remain required. The leaf does not inspect the runtime Stop latch and its captured-proposal result explicitly requires later admission; no approval eligibility or full REQ-TAT-002 stopped-state explanation is claimed. The DB command/receipt foundation is described above; remaining Part B public typed settlement, actual mutating actor, historical service-handle routing and Stop work, Part C (native approval), and Close are deferred.
 
 | Requirement | Implementation | Tests | Runtime | Focused verification to add |
 |---|---|---|---|---|
