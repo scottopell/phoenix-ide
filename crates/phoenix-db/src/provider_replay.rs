@@ -30,7 +30,8 @@ fn validate_task_proposal(
         plan,
         reviewed_proposal: Some(reviewed),
         ..
-    } = state else {
+    } = state
+    else {
         return Ok(());
     };
     let occurrence = &reviewed.occurrence;
@@ -78,7 +79,9 @@ fn validate_task_proposal(
         .and_then(phoenix_core::task_source::TaskSource::detect)
         .ok_or_else(|| DbError::Serialization("task proposal path is not markdown".into()))?;
     if !valid_source || reviewed != &ReviewedProposal::capture(occurrence.clone(), &source, plan) {
-        return Err(DbError::Serialization("task proposal source or reviewed bytes differ".into()));
+        return Err(DbError::Serialization(
+            "task proposal source or reviewed bytes differ".into(),
+        ));
     }
     Ok(())
 }

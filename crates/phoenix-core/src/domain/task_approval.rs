@@ -52,7 +52,11 @@ impl ReviewedProposal {
             TaskSource::PlainMarkdown { .. } => ReviewedTaskKind::PlainMarkdown,
         };
         let body_sha256 = format!("{:x}", Sha256::digest(body.as_bytes()));
-        Self { occurrence, kind, body_sha256 }
+        Self {
+            occurrence,
+            kind,
+            body_sha256,
+        }
     }
 }
 

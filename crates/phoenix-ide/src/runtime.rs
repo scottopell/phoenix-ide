@@ -5584,7 +5584,7 @@ impl RuntimeManager {
                 Ok(child) => child,
                 Err(crate::db::DbError::ConversationNotFound(_)) => continue,
                 Err(error) => {
-                    return Err(DatabaseTerminalRecoveryError::Retryable(error.to_string()))
+                    return Err(DatabaseTerminalRecoveryError::Retryable(error.to_string()));
                 }
             };
             if child.runtime_role == crate::work_scope::RuntimeRole::SubAgent

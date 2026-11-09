@@ -452,7 +452,9 @@ pub enum DbError {
     DormantGitRepositoryReadinessCatchupInProgress,
     #[error("dormant git repository readiness receipt targeted a different database lifecycle")]
     DormantGitRepositoryReadinessReceiptTargetMismatch,
-    #[error("dormant git repository readiness receipt did not match an exact completed catch-up operation")]
+    #[error(
+        "dormant git repository readiness receipt did not match an exact completed catch-up operation"
+    )]
     DormantGitRepositoryReadinessReceiptOperationMismatch,
 }
 
@@ -4638,8 +4640,8 @@ impl Database {
                         if values.0.as_ref() != *expected_scope {
                             tx.rollback().await?;
                             return Err(DbError::CloseFoundationConflict(format!(
-                            "parent conversation {parent_id} no longer owns captured WorkScope {expected_scope:?}"
-                        )));
+                                "parent conversation {parent_id} no longer owns captured WorkScope {expected_scope:?}"
+                            )));
                         }
                         values
                     }
@@ -9112,7 +9114,7 @@ impl Database {
             other => {
                 return Err(DbError::Serialization(format!(
                     "unknown WorkScope lifecycle: {other}"
-                )))
+                )));
             }
         };
         let environment = match environment.as_str() {
@@ -9142,7 +9144,7 @@ impl Database {
             other => {
                 return Err(DbError::Serialization(format!(
                     "unknown WorkScope environment kind: {other}"
-                )))
+                )));
             }
         };
         Ok((authority, lifecycle, environment))
@@ -11231,7 +11233,7 @@ impl Database {
                     _ => {
                         return Err(DbError::Serialization(
                             "Candidate has invalid source revision".to_string(),
-                        ))
+                        ));
                     }
                 };
                 let origin = match row.get::<&str, _>("origin") {
@@ -11246,7 +11248,7 @@ impl Database {
                         ContinuationSourceRevision::ExhaustedState { .. } => {
                             return Err(DbError::Serialization(
                                 "Oversized summary lacks operation revision".to_string(),
-                            ))
+                            ));
                         }
                     },
                     "ai_shortening" => ContinuationCandidateOrigin::AiShortening { revision },
@@ -11254,7 +11256,7 @@ impl Database {
                     other => {
                         return Err(DbError::Serialization(format!(
                             "Unknown candidate origin {other}"
-                        )))
+                        )));
                     }
                 };
                 Ok(ContinuationHandoffCandidate {
@@ -11275,7 +11277,7 @@ impl Database {
                         (Some(_), Some(_)) => {
                             return Err(DbError::Serialization(
                                 "Candidate has conflicting sources".to_string(),
-                            ))
+                            ));
                         }
                     },
                     text: row.get("candidate_text"),
@@ -13139,7 +13141,7 @@ impl Database {
                     value => {
                         return Err(DbError::Serialization(format!(
                             "unknown startup parent action {value}"
-                        )))
+                        )));
                     }
                 };
                 Ok(StartupParentActionRecord {
@@ -19513,7 +19515,10 @@ mod tests {
             "SELECT server_name, resource_uri, scopes, expires_at FROM mcp_oauth_tokens",
             "SELECT id, caller_instance_id, caller_display_name, created_at_us, revoked_at_us FROM federation_enrollments",
         ] {
-            assert!(!db.coordinator_query(sql).await.unwrap().rows.is_empty(), "{sql}");
+            assert!(
+                !db.coordinator_query(sql).await.unwrap().rows.is_empty(),
+                "{sql}"
+            );
         }
     }
 
@@ -24176,8 +24181,10 @@ mod tests {
                         .take_native_statement_shapes_for_test(),
                 );
                 assert!(small_tail_steps > 0);
-                assert!(large_tail_steps <= small_tail_steps + 32,
-                    "tail work grew with 64 older parents: {small_tail_steps} -> {large_tail_steps} VM steps");
+                assert!(
+                    large_tail_steps <= small_tail_steps + 32,
+                    "tail work grew with 64 older parents: {small_tail_steps} -> {large_tail_steps} VM steps"
+                );
             }
             db.pool()
                 .acquire()

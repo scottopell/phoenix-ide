@@ -8162,7 +8162,14 @@ where
             } => {
                 let authority = admitted.reborrow();
                 let completion = self
-                    .execute_approve_task_fresh_handoff(task_file, title, priority, plan, reviewed_proposal, authority)
+                    .execute_approve_task_fresh_handoff(
+                        task_file,
+                        title,
+                        priority,
+                        plan,
+                        reviewed_proposal,
+                        authority,
+                    )
                     .await?;
                 self.retain_handoff_completion_authority(
                     completion.as_ref(),
@@ -20571,7 +20578,11 @@ mod approved_explore_follow_up_tests {
             approved_explore_runtime(worktree, task_file, reviewed_plan, storage, broadcast_tx);
         runtime.state = ConvState::LlmRequesting { attempt: 1 };
         let reviewed = phoenix_core::domain::task_approval::ReviewedProposal::capture(
-            phoenix_core::domain::task_approval::ProposalOccurrence::capture("assistant-1", "call-1").unwrap(),
+            phoenix_core::domain::task_approval::ProposalOccurrence::capture(
+                "assistant-1",
+                "call-1",
+            )
+            .unwrap(),
             &crate::task_source::TaskSource::detect("72004-p1-ready--follow-up.md").unwrap(),
             reviewed_plan,
         );

@@ -436,7 +436,7 @@ fn parse_close_run_row(row: SqliteRow) -> DbResult<CloseRun> {
         _ => {
             return Err(DbError::Serialization(format!(
                 "unknown Close run status {status}"
-            )))
+            )));
         }
     };
     Ok(CloseRun {
@@ -507,7 +507,7 @@ fn parse_close_attempt_scope_row(row: SqliteRow) -> DbResult<CloseAttemptScope> 
             _ => {
                 return Err(DbError::Serialization(
                     "partial worktree identity".to_string(),
-                ))
+                ));
             }
         },
         captured_at: parse_rfc3339_utc(row.try_get("captured_at")?, "captured_at")?,
@@ -1246,7 +1246,9 @@ async fn validate_cleanup_observed_resource_tx(
         LossItemIdentity::GitPath(_) | LossItemIdentity::GitOid(_) => false,
     };
     if !valid {
-        return Err(close_precondition("observed resource requires exact captured scope/worktree or process-epoch identity; tmux requires sealed expected authority"));
+        return Err(close_precondition(
+            "observed resource requires exact captured scope/worktree or process-epoch identity; tmux requires sealed expected authority",
+        ));
     }
     Ok(())
 }
@@ -3387,7 +3389,7 @@ impl Database {
                 _ => {
                     return Err(DbError::Serialization(
                         "partial worktree identity".to_string(),
-                    ))
+                    ));
                 }
             };
             if scope.inventory.worktree != captured_worktree {
@@ -3577,7 +3579,7 @@ impl Database {
                 _ => {
                     return Err(DbError::Serialization(
                         "partial worktree identity".to_string(),
-                    ))
+                    ));
                 }
             };
             if scope.inventory.worktree != environment {
@@ -5145,7 +5147,7 @@ impl Database {
                     other => {
                         return Err(DbError::Serialization(format!(
                             "unknown process kind {other}"
-                        )))
+                        )));
                     }
                 },
                 identity: OpaqueIdentity::parse(row.try_get::<String, _>("identity_value")?)
@@ -5156,7 +5158,7 @@ impl Database {
                     other => {
                         return Err(DbError::Serialization(format!(
                             "unknown process outcome {other}"
-                        )))
+                        )));
                     }
                 },
                 observed_at_us: row.try_get("observed_at_us")?,
@@ -5192,7 +5194,9 @@ impl Database {
             || request.precondition_resolution.trim().is_empty()
             || request.safety_evidence.trim().is_empty()
         {
-            return Err(close_precondition("safe retry requires fresh read-only precondition and safety evidence and exact remaining effects"));
+            return Err(close_precondition(
+                "safe retry requires fresh read-only precondition and safety evidence and exact remaining effects",
+            ));
         }
         let eligible: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM close_runs run
@@ -5456,7 +5460,11 @@ impl Database {
         .bind(&latest)
         .fetch_one(&mut *tx)
         .await?;
-        let content = MessageContent::system(format!("Close retry run {} for attempt {} completed; cleanup retired and conversation archived in History.", run.ordinal.get(), run.attempt_id));
+        let content = MessageContent::system(format!(
+            "Close retry run {} for attempt {} completed; cleanup retired and conversation archived in History.",
+            run.ordinal.get(),
+            run.attempt_id
+        ));
         let content = serde_json::to_string(&content.to_stored_json())
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         sqlx::query("INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, created_at)
@@ -5696,7 +5704,7 @@ impl Database {
                 other => {
                     return Err(DbError::Serialization(format!(
                         "unknown cleanup stop certainty {other}"
-                    )))
+                    )));
                 }
             };
             let failure_occurrence_id: String = row.try_get("failure_occurrence_id")?;
@@ -5810,7 +5818,9 @@ impl Database {
                 .is_some_and(|value| value < 0)
             || request.failure_occurrence_id.trim().is_empty()
         {
-            return Err(close_precondition("cleanup failure requires nonnegative timestamps and a nonempty occurrence identity"));
+            return Err(close_precondition(
+                "cleanup failure requires nonnegative timestamps and a nonempty occurrence identity",
+            ));
         }
         let (scope, resource, snapshot) = match &request.authority {
             CloseCleanupFailureAuthority::AttemptInterrupted => {
@@ -5890,7 +5900,9 @@ impl Database {
                 | RetiredResourceKind::BrowserSession
                 | RetiredResourceKind::EquivalentLiveResource
         ) {
-            return Err(close_precondition("observed-process failure requires a process-epoch resource; tmux requires expected authority"));
+            return Err(close_precondition(
+                "observed-process failure requires a process-epoch resource; tmux requires expected authority",
+            ));
         }
         let captured_scope_authority = matches!(
             &request.authority,
@@ -5924,7 +5936,9 @@ impl Database {
                     prior.scope == remaining.scope && prior.resource == remaining.resource
                 })
             {
-                return Err(close_precondition("remaining resources require distinct exact identities and a matching failed or scope-unknown authority resource"));
+                return Err(close_precondition(
+                    "remaining resources require distinct exact identities and a matching failed or scope-unknown authority resource",
+                ));
             }
             authority_resource_present |= is_authority_resource;
             if snapshot.is_none() {
