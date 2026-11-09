@@ -4,7 +4,8 @@ use crate::state_machine::event::CancelCause;
 use crate::state_machine::state::TaskApprovalOutcome;
 use chrono::Utc;
 use phoenix_core::domain::db_schema::{
-    ConvMode, FinalizedToolResult, InputOrigin, Message, MessageType, SourceToolCall,
+    ConvMode, FinalizedToolResult, InputOrigin, Message, MessageType, NonEmptyString,
+    SourceToolCall,
 };
 use phoenix_core::domain::llm_types::ContentBlock;
 use phoenix_core::domain::task_approval::{ProposalOccurrence, ReviewedProposal};
@@ -570,7 +571,10 @@ async fn assert_production_initial_approval(context_pressure: bool) {
     f.db.update_conversation_mode_and_cwd(
         "actor-target",
         &ConvMode::Explore {
-            worktree_path: Some(worktree.to_string_lossy().into_owned()),
+            worktree_path: Some(
+                NonEmptyString::new(worktree.to_string_lossy().into_owned()).unwrap(),
+            ),
+            next_taskmd_id_hint: None,
         },
         worktree.to_str().unwrap(),
     )
