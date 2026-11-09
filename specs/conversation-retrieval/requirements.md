@@ -167,6 +167,15 @@ idempotently
 THE SYSTEM SHALL be able to rebuild the entire index from `messages`
 with no loss of source data
 
+WHEN a message's `display_data.hidden` is the JSON boolean `true`
+THE SYSTEM SHALL index empty searchable text for that message
+AND SHALL make ranked search eligibility depend on the indexed text,
+without rechecking the source hidden flag for each match
+
+WHEN a standalone index upsert follows a source-message commit
+THE SYSTEM SHALL read the source message's hidden state under the index
+write's transaction before replacing its indexed text
+
 THE SYSTEM SHALL be able to report the index's **freshness** — at
 minimum, whether startup reconciliation has completed and whether any
 message in `messages` is newer than the index has caught up to — so that
