@@ -3239,7 +3239,7 @@ where
                 }
                 Some(request) = self.acknowledged_event_rx.recv() => {
                     let super::AcknowledgedEventRequest { event, acknowledgement, retirement } = match request {
-                        AcknowledgedRuntimeRequest::Event(event) => event,
+                        AcknowledgedRuntimeRequest::Event(event) => *event,
                         AcknowledgedRuntimeRequest::InspectNativeTaskApprovalAdmission { expected, response } => {
                             let result = self.check_native_task_approval_admission(&expected).await;
                             let _ = response.send(result);
@@ -16561,13 +16561,13 @@ mod creation_completion_lifecycle_tests {
         let (retirement_tx, retirement_rx) = oneshot::channel();
 
         acknowledged_event_tx
-            .send(AcknowledgedRuntimeRequest::Event(
+            .send(AcknowledgedRuntimeRequest::Event(Box::new(
                 AcknowledgedEventRequest {
                     event: creation_event(),
                     acknowledgement: ack_tx,
                     retirement: retirement_rx,
                 },
-            ))
+            )))
             .await
             .unwrap();
 
@@ -16628,13 +16628,13 @@ mod creation_completion_lifecycle_tests {
         let (ack_tx, mut ack_rx) = oneshot::channel();
         let (_retirement_tx, retirement_rx) = oneshot::channel();
         acknowledged_event_tx
-            .send(AcknowledgedRuntimeRequest::Event(
+            .send(AcknowledgedRuntimeRequest::Event(Box::new(
                 AcknowledgedEventRequest {
                     event: creation_event(),
                     acknowledgement: ack_tx,
                     retirement: retirement_rx,
                 },
-            ))
+            )))
             .await
             .unwrap();
 

@@ -60,6 +60,10 @@ Hosted run `42569939431` for actor leaf `12603354b` found a `TaskSource::detect`
 Option/Result pattern mismatch and the predecessor DB test's implicit
 `CancelCause` default lint. Both are corrected in the follow-up; its exact-head
 hosted validation remains pending. No actor regression is claimed passed.
+Hosted run `42570366055` then type-checked the corrected leaf but rejected the
+request enum's size imbalance under clippy; the Event and frozen-snapshot payloads
+are now boxed on the same channel. Other build/musl lanes failed during sccache
+setup with HTTP 504, before running tests. New exact-head qualification is required.
 
 ## Coverage and proposed verification
 

@@ -14300,7 +14300,7 @@ pub(crate) mod hard_delete_cascade_tests {
         let (_retirement_tx, retirement_rx) = tokio::sync::oneshot::channel();
         handle
             .acknowledged_event_tx
-            .send(crate::runtime::AcknowledgedRuntimeRequest::Event(
+            .send(crate::runtime::AcknowledgedRuntimeRequest::Event(Box::new(
                 crate::runtime::AcknowledgedEventRequest {
                     event: Event::SteerMessage {
                         origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
@@ -14315,7 +14315,7 @@ pub(crate) mod hard_delete_cascade_tests {
                     acknowledgement: ack_tx,
                     retirement: retirement_rx,
                 },
-            ))
+            )))
             .await
             .expect("notify runtime of queued steering");
         ack_rx

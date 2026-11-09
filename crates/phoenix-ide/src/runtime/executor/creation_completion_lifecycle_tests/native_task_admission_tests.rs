@@ -120,7 +120,12 @@ async fn checked(
 ) -> NativeTaskAdmissionReadiness {
     let (response, result) = oneshot::channel();
     sender
-        .send(AcknowledgedRuntimeRequest::InspectNativeTaskApprovalAdmission { expected, response })
+        .send(
+            AcknowledgedRuntimeRequest::InspectNativeTaskApprovalAdmission {
+                expected: Box::new(expected),
+                response,
+            },
+        )
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(10), result)
@@ -137,13 +142,13 @@ async fn event_settled(
     let (acknowledgement, result) = oneshot::channel();
     let (_retirement, retirement) = oneshot::channel();
     sender
-        .send(AcknowledgedRuntimeRequest::Event(
+        .send(AcknowledgedRuntimeRequest::Event(Box::new(
             AcknowledgedEventRequest {
                 event,
                 acknowledgement,
                 retirement,
             },
-        ))
+        )))
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(10), result)

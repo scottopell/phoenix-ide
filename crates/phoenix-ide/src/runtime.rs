@@ -280,9 +280,9 @@ pub(crate) struct AcknowledgedEventRequest {
 }
 
 pub(crate) enum AcknowledgedRuntimeRequest {
-    Event(AcknowledgedEventRequest),
+    Event(Box<AcknowledgedEventRequest>),
     InspectNativeTaskApprovalAdmission {
-        expected: task_approval_admission::FrozenPendingTask,
+        expected: Box<task_approval_admission::FrozenPendingTask>,
         response: tokio::sync::oneshot::Sender<
             Result<task_approval_admission::NativeTaskAdmissionReadiness, String>,
         >,
@@ -295,7 +295,7 @@ mod task_approval_admission;
 impl AcknowledgedRuntimeRequest {
     fn into_event(self) -> AcknowledgedEventRequest {
         match self {
-            Self::Event(event) => event,
+            Self::Event(event) => *event,
             Self::InspectNativeTaskApprovalAdmission { .. } => panic!("expected event request"),
         }
     }
@@ -7024,7 +7024,7 @@ impl RuntimeManager {
             .acknowledged_event_tx
             .send(
                 AcknowledgedRuntimeRequest::InspectNativeTaskApprovalAdmission {
-                    expected,
+                    expected: Box::new(expected),
                     response,
                 },
             )
@@ -7056,13 +7056,13 @@ impl RuntimeManager {
         let (retirement_tx, retirement_rx) = tokio::sync::oneshot::channel();
         handle
             .acknowledged_event_tx
-            .send(AcknowledgedRuntimeRequest::Event(
+            .send(AcknowledgedRuntimeRequest::Event(Box::new(
                 AcknowledgedEventRequest {
                     event,
                     acknowledgement: ack_tx,
                     retirement: retirement_rx,
                 },
-            ))
+            )))
             .await
             .map_err(|error| error.to_string())?;
         let outcome = ack_rx
@@ -7294,13 +7294,13 @@ impl RuntimeManager {
         let (_retirement_tx, retirement_rx) = tokio::sync::oneshot::channel();
         handle
             .acknowledged_event_tx
-            .send(AcknowledgedRuntimeRequest::Event(
+            .send(AcknowledgedRuntimeRequest::Event(Box::new(
                 AcknowledgedEventRequest {
                     event: Event::UserTriggerContinuation { operation_id },
                     acknowledgement: ack_tx,
                     retirement: retirement_rx,
                 },
-            ))
+            )))
             .await
             .map_err(|error| format!("Failed to send continuation admission: {error}"))?;
         ack_rx
