@@ -716,7 +716,26 @@ fn remote_create_options_match_local_shape_without_transport_identity() {
             cwd: "/destination/project".into(),
         }],
         projects_truncated: false,
-        models: Vec::new(),
+        models: vec![
+            federation::NativeCreateModelOption {
+                model: "supported-model".into(),
+                supported_efforts: phoenix_llm::EffortCapabilities::supported_known(
+                    &[
+                        phoenix_core::domain::llm_types::ModelEffort::Low,
+                        phoenix_core::domain::llm_types::ModelEffort::Medium,
+                    ],
+                    phoenix_core::domain::llm_types::ModelEffort::Medium,
+                ),
+            },
+            federation::NativeCreateModelOption {
+                model: "unsupported-model".into(),
+                supported_efforts: phoenix_llm::EffortCapabilities::Unsupported,
+            },
+            federation::NativeCreateModelOption {
+                model: "unknown-model".into(),
+                supported_efforts: phoenix_llm::EffortCapabilities::Unknown,
+            },
+        ],
         default_model: "destination-default".into(),
         default_llm_language: "phoenix-native".into(),
     };
@@ -731,7 +750,24 @@ fn remote_create_options_match_local_shape_without_transport_identity() {
                 "cwd": "/destination/project",
             }],
             "projects_truncated": false,
-            "models": [],
+            "models": [
+                {
+                    "model": "supported-model",
+                    "supported_efforts": {
+                        "support": "supported",
+                        "levels": ["low", "medium"],
+                        "native_default": {"known": "medium"},
+                    },
+                },
+                {
+                    "model": "unsupported-model",
+                    "supported_efforts": {"support": "unsupported"},
+                },
+                {
+                    "model": "unknown-model",
+                    "supported_efforts": {"support": "unknown"},
+                },
+            ],
             "default_model": "destination-default",
             "default_llm_language": "phoenix-native",
         })
@@ -1860,11 +1896,15 @@ async fn native_save_routing_peer(
     name: &str,
 ) {
     use phoenix_core::domain::instance_identity::{PeerBearerCredential, PeerTlsTrust};
-    let credential = PeerBearerCredential::parse(format!("phx_peer_{}", "1".repeat(43))).unwrap();
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    static NEXT_PORT: AtomicU16 = AtomicU16::new(20_000);
+    let port = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
+    let credential = PeerBearerCredential::parse(format!("phx_peer_{port:043}")).unwrap();
     db.save_federation_peer_connection(
         id,
         &name.parse().unwrap(),
-        &"https://127.0.0.1:1".parse().unwrap(),
+        &format!("https://127.0.0.1:{port}").parse().unwrap(),
         &credential,
         &PeerTlsTrust::PlatformRoots,
     )

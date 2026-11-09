@@ -2737,7 +2737,81 @@ pub(crate) struct NativeCreateProjectOption {
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativeCreateModelOption {
     pub(crate) model: String,
-    pub(crate) supported_efforts: Vec<phoenix_core::domain::llm_types::ModelEffort>,
+    #[serde(deserialize_with = "deserialize_effort_capabilities")]
+    pub(crate) supported_efforts: phoenix_llm::EffortCapabilities,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NativeDefaultWire {
+    Known(phoenix_core::domain::llm_types::ModelEffort),
+    Unknown,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "support", rename_all = "snake_case", deny_unknown_fields)]
+enum EffortCapabilitiesWire {
+    Unsupported {},
+    Unknown {},
+    Supported {
+        levels: Vec<phoenix_core::domain::llm_types::ModelEffort>,
+        native_default: NativeDefaultWire,
+    },
+}
+
+fn deserialize_effort_capabilities<'de, D>(
+    deserializer: D,
+) -> Result<phoenix_llm::EffortCapabilities, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match EffortCapabilitiesWire::deserialize(deserializer)? {
+        EffortCapabilitiesWire::Unsupported {} => Ok(phoenix_llm::EffortCapabilities::Unsupported),
+        EffortCapabilitiesWire::Unknown {} => Ok(phoenix_llm::EffortCapabilities::Unknown),
+        EffortCapabilitiesWire::Supported {
+            levels,
+            native_default,
+        } => {
+            if levels.is_empty() {
+                return Err(serde::de::Error::custom(
+                    "supported effort capabilities require at least one level",
+                ));
+            }
+            let mut unique_levels = std::collections::HashSet::new();
+            if levels
+                .iter()
+                .any(|level| !unique_levels.insert(level.as_wire_name()))
+            {
+                return Err(serde::de::Error::custom(
+                    "supported effort capabilities contain duplicate levels",
+                ));
+            }
+            let native_default = match native_default {
+                NativeDefaultWire::Known(level) if !levels.contains(&level) => {
+                    return Err(serde::de::Error::custom(
+                        "native effort default must be a supported level",
+                    ));
+                }
+                NativeDefaultWire::Known(level) => phoenix_llm::NativeDefault::Known(level),
+                NativeDefaultWire::Unknown => phoenix_llm::NativeDefault::Unknown,
+            };
+            Ok(phoenix_llm::EffortCapabilities::supported(
+                &levels,
+                native_default,
+            ))
+        }
+    }
+}
+
+fn effort_levels(
+    capabilities: &phoenix_llm::EffortCapabilities,
+) -> Option<&[phoenix_core::domain::llm_types::ModelEffort]> {
+    match capabilities {
+        phoenix_llm::EffortCapabilities::Supported(supported) => Some(supported.levels()),
+        phoenix_llm::EffortCapabilities::Unsupported | phoenix_llm::EffortCapabilities::Unknown => {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2946,17 +3020,6 @@ pub(crate) enum NativeRenameResponse {
         product_conversation_id: ProductConversationId,
         root_transcript_id: String,
     },
-}
-
-fn supported_efforts(
-    capabilities: &phoenix_llm::EffortCapabilities,
-) -> Vec<phoenix_core::domain::llm_types::ModelEffort> {
-    match capabilities {
-        phoenix_llm::EffortCapabilities::Supported(supported) => supported.levels().to_vec(),
-        phoenix_llm::EffortCapabilities::Unsupported | phoenix_llm::EffortCapabilities::Unknown => {
-            Vec::new()
-        }
-    }
 }
 
 fn native_action_source(
@@ -3254,7 +3317,7 @@ pub(crate) async fn native_create_options(
         .into_iter()
         .map(|route| NativeCreateModelOption {
             model: route.model,
-            supported_efforts: supported_efforts(&route.supported_efforts),
+            supported_efforts: route.supported_efforts,
         })
         .collect();
     let default_llm_language = state
@@ -3554,6 +3617,15 @@ pub(crate) async fn native_rename(
     State(state): State<AppState>,
     peer: PeerAuthenticated,
     request: Result<Json<NativeRenameRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let response = native_rename_result(&state, peer, request).await;
+    publish_native_rename_response(&state.runtime, response).await
+}
+
+async fn native_rename_result(
+    state: &AppState,
+    peer: PeerAuthenticated,
+    request: Result<Json<NativeRenameRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, NativeActionFailure> {
     let Json(request) = request.map_err(|error| native_json_rejection(&error))?;
     if !native_rename_intent_valid(&request) {
@@ -3653,6 +3725,13 @@ pub(crate) async fn native_rename(
         }
     };
     native_json(&response, NATIVE_RENAME_RESPONSE_BYTES)
+}
+
+async fn publish_native_rename_response(
+    runtime: &crate::runtime::RuntimeManager,
+    response: Result<Response, NativeActionFailure>,
+) -> Response {
+    peer_authority_response(runtime, response.into_response()).await
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3888,10 +3967,11 @@ fn native_verify_create_options(
         let mut efforts = std::collections::HashSet::new();
         if !native_option_string(&model.model)
             || !names.insert(&model.model)
-            || model
-                .supported_efforts
-                .iter()
-                .any(|effort| !efforts.insert(effort.as_wire_name()))
+            || effort_levels(&model.supported_efforts).is_some_and(|levels| {
+                levels
+                    .iter()
+                    .any(|effort| !efforts.insert(effort.as_wire_name()))
+            })
         {
             return Err(native_protocol(
                 "destination model/effort choices are invalid",
@@ -4419,6 +4499,7 @@ fn native_verify_rename_receipt(
                 || receipt_name_revision_before != &request.expected_name_revision
                 || *receipt_name_revision_before < 0
                 || *receipt_name_revision_before == i64::MAX
+                || *receipt_committed_at_unix_micros < 0
                 || chrono::DateTime::from_timestamp_micros(*receipt_committed_at_unix_micros)
                     .is_none()
                 || !native_product_route_shape(&crate::api::product_conversations::product_route(

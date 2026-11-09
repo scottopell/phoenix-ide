@@ -1714,9 +1714,42 @@ value NativeCreateProjectOption {
     cwd: String
 }
 
+enum NativeModelEffort {
+    none
+    | minimal
+    | low
+    | medium
+    | high
+    | xhigh
+    | max
+}
+
+entity NativeEffortCapabilities {
+    support: NativeEffortUnsupported | NativeEffortUnknown | NativeEffortSupported
+}
+
+variant NativeEffortUnsupported : NativeEffortCapabilities {}
+
+variant NativeEffortUnknown : NativeEffortCapabilities {}
+
+variant NativeEffortSupported : NativeEffortCapabilities {
+    levels: List<NativeModelEffort>
+    native_default: NativeEffortDefault
+}
+
+entity NativeEffortDefault {
+    kind: NativeEffortDefaultUnknown | NativeEffortDefaultKnown
+}
+
+variant NativeEffortDefaultUnknown : NativeEffortDefault {}
+
+variant NativeEffortDefaultKnown : NativeEffortDefault {
+    level: NativeModelEffort
+}
+
 value NativeCreateModelOption {
     model: String
-    supported_efforts: List<String>
+    supported_efforts: NativeEffortCapabilities
 }
 
 entity NativeCreateOptionsResponse {
@@ -2065,6 +2098,20 @@ invariant NativeCreateOptionsResponseClosesOverRequest {
         and r.default_model != "" and r.default_llm_language != ""
         and (for p in r.projects: p.project_id != "" and p.cwd != "")
         and (for m in r.models: m.model != "")
+}
+
+invariant NativeCreateModelEffortCapabilitiesAreClosed {
+    for r in NativeCreateOptionsResponses:
+        (for m in r.models:
+            m.supported_efforts.support = NativeEffortUnsupported
+                or m.supported_efforts.support = NativeEffortUnknown
+                or (m.supported_efforts.support = NativeEffortSupported
+                    and m.supported_efforts.levels.count > 0
+                    and m.supported_efforts.levels.unique.count = m.supported_efforts.levels.count
+                    and (m.supported_efforts.native_default.kind = NativeEffortDefaultUnknown
+                        or (m.supported_efforts.native_default.kind = NativeEffortDefaultKnown
+                            and m.supported_efforts.native_default.level in m.supported_efforts.levels)))
+        )
 }
 
 invariant NativeRenameOptionsRequestIdentityIsClosed {

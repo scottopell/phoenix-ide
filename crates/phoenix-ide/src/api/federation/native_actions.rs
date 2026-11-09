@@ -117,6 +117,82 @@ fn responses_reject_payloads_beyond_route_bound() {
     assert_eq!(NATIVE_RENAME_RESPONSE_BYTES, 16_384);
 }
 
+#[test]
+fn create_model_options_round_trip_closed_effort_capabilities() {
+    let capabilities = [
+        phoenix_llm::EffortCapabilities::supported_known(
+            &[
+                phoenix_core::domain::llm_types::ModelEffort::Low,
+                phoenix_core::domain::llm_types::ModelEffort::Medium,
+            ],
+            phoenix_core::domain::llm_types::ModelEffort::Medium,
+        ),
+        phoenix_llm::EffortCapabilities::supported_unknown(&[
+            phoenix_core::domain::llm_types::ModelEffort::Low,
+            phoenix_core::domain::llm_types::ModelEffort::High,
+        ]),
+        phoenix_llm::EffortCapabilities::Unsupported,
+        phoenix_llm::EffortCapabilities::Unknown,
+    ];
+    for (index, supported_efforts) in capabilities.into_iter().enumerate() {
+        let option = NativeCreateModelOption {
+            model: format!("destination-model-{index}"),
+            supported_efforts,
+        };
+        let encoded = serde_json::to_value(&option).unwrap();
+        let decoded: NativeCreateModelOption = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, option);
+    }
+}
+
+#[test]
+fn create_model_options_reject_malformed_effort_capabilities() {
+    let invalid = [
+        serde_json::json!({"support": "unsupported", "levels": []}),
+        serde_json::json!({"support": "unknown", "native_default": "unknown"}),
+        serde_json::json!({"support": "supported", "native_default": "unknown"}),
+        serde_json::json!({"support": "supported", "levels": []}),
+        serde_json::json!({"support": "supported", "levels": ["low"]}),
+        serde_json::json!({
+            "support": "supported",
+            "levels": ["low", "low"],
+            "native_default": {"known": "low"},
+        }),
+        serde_json::json!({
+            "support": "supported",
+            "levels": ["bogus"],
+            "native_default": "unknown",
+        }),
+        serde_json::json!({
+            "support": "bogus",
+            "levels": ["low"],
+            "native_default": "unknown",
+        }),
+        serde_json::Value::Null,
+        serde_json::json!({
+            "support": "supported",
+            "levels": ["low"],
+            "native_default": {"known": "medium"},
+        }),
+        serde_json::json!({
+            "support": "supported",
+            "levels": ["low"],
+            "native_default": "unknown",
+            "extra": true,
+        }),
+    ];
+    for supported_efforts in invalid {
+        let option = serde_json::json!({
+            "model": "destination-model",
+            "supported_efforts": supported_efforts,
+        });
+        assert!(
+            serde_json::from_value::<NativeCreateModelOption>(option.clone()).is_err(),
+            "accepted malformed effort capabilities: {option}"
+        );
+    }
+}
+
 fn source_call() -> NativeActionSourceCall {
     NativeActionSourceCall {
         product_conversation: ProductConversationId::new(),
@@ -137,6 +213,61 @@ fn native_rename_request() -> NativeRenameRequest {
         title: "new title".into(),
         source: source_call(),
     }
+}
+
+fn native_rename_receipt(
+    request: &NativeRenameRequest,
+    status: &str,
+    committed_at_unix_micros: i64,
+) -> NativeRenameResponse {
+    serde_json::from_value(serde_json::json!({
+        "status": status,
+        "caller_instance_id": request.caller_instance_id,
+        "destination_instance_id": request.destination_instance_id,
+        "operation_id": request.operation_id,
+        "product_conversation_id": request.product_conversation_id,
+        "root_transcript_id": request.expected_root_transcript_id,
+        "receipt_title": request.title,
+        "receipt_slug_at_commit": "fixed-slug",
+        "receipt_name_revision_before": request.expected_name_revision,
+        "receipt_committed_at_unix_micros": committed_at_unix_micros,
+        "receipt_source_instance_id": request.caller_instance_id,
+        "receipt_source": request.source,
+    }))
+    .unwrap()
+}
+
+#[test]
+fn applied_rename_receipt_rejects_negative_commit_timestamp() {
+    let request = native_rename_request();
+    let nonnegative = native_rename_receipt(&request, "applied", 0);
+    assert!(native_verify_rename(&request, &nonnegative).is_ok());
+    let negative = native_rename_receipt(&request, "applied", -1);
+    assert!(native_verify_rename(&request, &negative).is_err());
+}
+
+#[test]
+fn replayed_rename_receipt_rejects_negative_commit_timestamp() {
+    let request = native_rename_request();
+    let nonnegative = native_rename_receipt(&request, "replayed", 0);
+    assert!(native_verify_rename(&request, &nonnegative).is_ok());
+    let negative = native_rename_receipt(&request, "replayed", -1);
+    assert!(native_verify_rename(&request, &negative).is_err());
+}
+
+#[tokio::test]
+async fn native_rename_error_is_not_published_after_authority_closes() {
+    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let owner = state.runtime.acquire_local_authority_pass().unwrap();
+    owner.close("test_native_rename_response_authority_closure");
+    let response = Err(NativeActionFailure::from(StatusCode::INTERNAL_SERVER_ERROR));
+    let publication = publish_native_rename_response(&state.runtime, response);
+    tokio::pin!(publication);
+    assert!(tokio::select! {
+        biased;
+        _ = &mut publication => false,
+        () = std::future::ready(()) => true,
+    });
 }
 
 #[test]
@@ -267,7 +398,7 @@ fn create_options_verifies_the_servers_fifty_project_limit_even_with_cwd() {
         projects_truncated: true,
         models: vec![NativeCreateModelOption {
             model: "destination-model".into(),
-            supported_efforts: vec![],
+            supported_efforts: phoenix_llm::EffortCapabilities::Unsupported,
         }],
         default_model: "destination-model".into(),
         default_llm_language: "phoenix-native".into(),
@@ -311,7 +442,7 @@ fn create_options_accepts_opaque_project_ids_and_rejects_malformed_ids() {
         projects_truncated: false,
         models: vec![NativeCreateModelOption {
             model: "destination-model".into(),
-            supported_efforts: vec![],
+            supported_efforts: phoenix_llm::EffortCapabilities::Unsupported,
         }],
         default_model: "destination-model".into(),
         default_llm_language: "phoenix-native".into(),
