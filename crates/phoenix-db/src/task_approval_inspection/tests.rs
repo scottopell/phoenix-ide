@@ -1,5 +1,11 @@
 use super::*;
-use phoenix_core::domain::db_schema::{MessageContent, ToolResult};
+use chrono::Utc;
+use phoenix_core::domain::db_schema::{
+    FinalizedToolResult, InputOrigin, Message, MessageContent, MessageType, ToolResult,
+};
+use phoenix_core::domain::provider_replay::{
+    AnthropicResponseIdentity, AnthropicResponseSet, ProviderReplayUpdate,
+};
 use phoenix_core::domain::sm_state::{AssistantMessage, ToolCall, ToolInput};
 use phoenix_core::domain::task_approval::ProposalOccurrence;
 use phoenix_core::task_source::TaskSource;
@@ -19,6 +25,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_replay(false).await
+    }
+
+    async fn with_replay(with_replay: bool) -> Self {
         let db = Database::open_in_memory().await.unwrap();
         let target = db
             .create_conversation(
@@ -68,9 +78,7 @@ impl Fixture {
         db.update_conversation_state(&coordinator.id, &executing)
             .await
             .unwrap();
-        db.update_conversation_state(&target.id, &pending_state(true))
-            .await
-            .unwrap();
+        checkpoint_proposal(&db, &target.id, with_replay).await;
         let fixture = Self {
             db,
             coordinator: coordinator.id,
@@ -102,6 +110,83 @@ impl Fixture {
     }
 }
 
+fn proposal_message(target: &str) -> Message {
+    Message {
+        message_id: "proposal-assistant".into(),
+        conversation_id: target.into(),
+        sequence_id: 1,
+        message_type: MessageType::Agent,
+        content: MessageContent::Agent(vec![ContentBlock::ToolUse {
+            id: "proposal-call".into(),
+            name: "propose_task".into(),
+            input: json!({"task_file":"tasks/reviewed.md"}),
+        }]),
+        display_data: None,
+        usage_data: None,
+        origin: InputOrigin::SystemGenerated,
+        created_at: Utc::now(),
+    }
+}
+
+async fn checkpoint_proposal(db: &Database, target: &str, with_replay: bool) {
+    let assistant = proposal_message(target);
+    let result = FinalizedToolResult::new(
+        &assistant.message_id,
+        target,
+        2,
+        assistant.created_at,
+        &ToolResult::success("proposal-call".into(), "awaiting approval".into()),
+    );
+    let state = pending_state(true);
+    if with_replay {
+        let MessageContent::Agent(blocks) = &assistant.content else {
+            unreachable!()
+        };
+        let replay = ProviderReplayUpdate::Anthropic(
+            AnthropicResponseSet::with_public_content(
+                AnthropicResponseIdentity {
+                    response_id: "proposal-response".into(),
+                    model: "checkpoint-model".into(),
+                },
+                blocks.clone(),
+                vec![],
+            )
+            .unwrap()
+            .with_owner_message_id(assistant.message_id.clone()),
+        );
+        db.persist_tool_round_state_and_replay(
+            target,
+            &assistant,
+            &[result],
+            &state,
+            assistant.created_at,
+            &replay,
+        )
+        .await
+        .unwrap();
+    } else {
+        db.persist_tool_round_and_state(
+            target,
+            &assistant,
+            &[result],
+            &state,
+            assistant.created_at,
+        )
+        .await
+        .unwrap();
+    }
+    let witnesses: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM canonical_tool_round_receipts r JOIN messages m
+         ON m.conversation_id=r.conversation_id AND m.message_id=r.assistant_message_id
+         WHERE r.conversation_id=?1 AND r.assistant_message_id='proposal-assistant'",
+    )
+    .bind(target)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(witnesses, 1);
+}
+
 fn pending_state(captured: bool) -> ConvState {
     ConvState::AwaitingTaskApproval {
         task_file: "tasks/reviewed.md".into(),
@@ -128,10 +213,13 @@ async fn database_rows(db: &Database) -> Vec<(String, Vec<String>)> {
     let mut snapshot = vec![];
     for table in tables {
         let quoted_table = format!("\"{}\"", table.replace('"', "\"\""));
-        let columns = sqlx::query(&format!("PRAGMA table_info({quoted_table})"))
-            .fetch_all(db.pool())
-            .await
-            .unwrap();
+        // Identifiers come from this test database's schema and are double-quote escaped.
+        let columns = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "PRAGMA table_info({quoted_table})"
+        )))
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
         let projection = columns
             .iter()
             .map(|row| {
@@ -140,9 +228,9 @@ async fn database_rows(db: &Database) -> Vec<(String, Vec<String>)> {
             })
             .collect::<Vec<_>>()
             .join(" || ',' || ");
-        let rows: Vec<String> = sqlx::query_scalar(&format!(
+        let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT {projection} AS value FROM {quoted_table} ORDER BY value"
-        ))
+        )))
         .fetch_all(db.pool())
         .await
         .unwrap();
@@ -178,6 +266,182 @@ async fn executing_source_without_finalized_message_inspects_exact_aggregate_rea
     );
     assert_eq!(database_rows(&f.db).await, before);
     f.assert_no_finalized_source().await;
+}
+
+fn assert_exact_snapshot(snapshot: &PendingTaskSnapshot, state: &ConvState) {
+    let ConvState::AwaitingTaskApproval {
+        task_file,
+        title,
+        priority,
+        plan,
+        reviewed_proposal,
+    } = state
+    else {
+        panic!("pending fixture")
+    };
+    assert_eq!(&snapshot.task_file, task_file);
+    assert_eq!(&snapshot.title, title);
+    assert_eq!(&snapshot.priority, priority);
+    assert_eq!(snapshot.plan.as_bytes(), plan.as_bytes());
+    assert_eq!(&snapshot.reviewed_proposal, reviewed_proposal);
+}
+
+async fn assert_integrity_read_only(
+    f: &Fixture,
+    state: &ConvState,
+    failure: ProposalIntegrityFailure,
+) {
+    let before = database_rows(&f.db).await;
+    let inspected = f.inspect().await.unwrap();
+    assert_eq!(inspected.owner, f.input.target);
+    assert_eq!(inspected.current_transcript_id, f.target);
+    let PendingTaskStatus::Pending(snapshot) = inspected.pending else {
+        panic!("invalid provenance must remain inspectable")
+    };
+    assert_exact_snapshot(&snapshot, state);
+    assert_eq!(
+        snapshot.native_approval_availability(),
+        NativeTaskApprovalAvailability::UnavailableIntegrity(failure)
+    );
+    f.assert_no_finalized_source().await;
+    assert_eq!(database_rows(&f.db).await, before);
+}
+
+#[tokio::test]
+async fn provider_checkpoint_has_target_witness_without_finalized_coordinator_source() {
+    let f = Fixture::with_replay(true).await;
+    let before = database_rows(&f.db).await;
+    let PendingTaskStatus::Pending(snapshot) = f.inspect().await.unwrap().pending else {
+        panic!("canonical provider proposal")
+    };
+    assert_exact_snapshot(&snapshot, &pending_state(true));
+    assert_eq!(
+        snapshot.native_approval_availability(),
+        NativeTaskApprovalAvailability::CapturedProposalRequiresAdmission
+    );
+    f.assert_no_finalized_source().await;
+    assert_eq!(database_rows(&f.db).await, before);
+}
+
+#[tokio::test]
+async fn missing_or_foreign_receipt_and_missing_or_foreign_message_remain_inspectable() {
+    for (statement, failure) in [
+        (
+            "DELETE FROM canonical_tool_round_receipts WHERE conversation_id=?1",
+            ProposalIntegrityFailure::MissingCanonicalReceipt,
+        ),
+        (
+            "DELETE FROM messages WHERE conversation_id=?1",
+            ProposalIntegrityFailure::MissingProposalMessage,
+        ),
+        (
+            "UPDATE canonical_tool_round_receipts SET conversation_id=?2 WHERE conversation_id=?1",
+            ProposalIntegrityFailure::MissingCanonicalReceipt,
+        ),
+        (
+            "UPDATE messages SET conversation_id=?2,sequence_id=1009 WHERE conversation_id=?1",
+            ProposalIntegrityFailure::ProposalMismatch,
+        ),
+    ] {
+        let f = Fixture::new().await;
+        let mut query = sqlx::query(statement).bind(&f.target);
+        if statement.contains("?2") {
+            query = query.bind(&f.coordinator);
+        }
+        query.execute(f.db.pool()).await.unwrap();
+        assert_integrity_read_only(&f, &pending_state(true), failure).await;
+    }
+}
+
+#[tokio::test]
+async fn forged_occurrence_and_changed_snapshot_do_not_claim_captured_provenance() {
+    for change in 0..8 {
+        let f = Fixture::new().await;
+        let mut state = pending_state(true);
+        let ConvState::AwaitingTaskApproval {
+            task_file,
+            plan,
+            reviewed_proposal: Some(reviewed),
+            ..
+        } = &mut state
+        else {
+            unreachable!()
+        };
+        match change {
+            0 => reviewed.occurrence.assistant_message_id = "invented-assistant".into(),
+            1 => reviewed.occurrence.tool_use_id = "invented-call".into(),
+            2 => *task_file = "tasks/stale-input-path.md".into(),
+            3 => plan.push_str("changed reviewed bytes"),
+            4 => reviewed.body_sha256 = "0".repeat(64),
+            5 => reviewed.kind = phoenix_core::domain::task_approval::ReviewedTaskKind::Taskmd,
+            6 => reviewed.occurrence.tool_use_id = " ".into(),
+            7 => *task_file = "tasks/not-markdown.txt".into(),
+            _ => unreachable!(),
+        }
+        f.db.update_conversation_state(&f.target, &state)
+            .await
+            .unwrap();
+        let failure = if change == 0 {
+            ProposalIntegrityFailure::MissingProposalMessage
+        } else {
+            ProposalIntegrityFailure::ProposalMismatch
+        };
+        assert_integrity_read_only(&f, &state, failure).await;
+    }
+}
+
+#[tokio::test]
+async fn changed_or_duplicate_proposing_tool_use_fails_witness_validation() {
+    for change in 0..6 {
+        let f = Fixture::new().await;
+        let mut assistant = proposal_message(&f.target);
+        let MessageContent::Agent(blocks) = &mut assistant.content else {
+            unreachable!()
+        };
+        match change {
+            0 => blocks.clear(),
+            1 => blocks.push(blocks[0].clone()),
+            2 => blocks.push(ContentBlock::ToolUse {
+                id: "proposal-call".into(),
+                name: "different_tool".into(),
+                input: json!({}),
+            }),
+            3 => {
+                blocks[0] = ContentBlock::ToolUse {
+                    id: "proposal-call".into(),
+                    name: "propose_task".into(),
+                    input: json!({"task_file":"tasks/stale.md"}),
+                }
+            }
+            4 => {
+                blocks[0] = ContentBlock::ToolUse {
+                    id: "proposal-call".into(),
+                    name: "different_tool".into(),
+                    input: json!({"task_file":"tasks/reviewed.md"}),
+                }
+            }
+            5 => {
+                blocks[0] = ContentBlock::ToolUse {
+                    id: "proposal-call".into(),
+                    name: "propose_task".into(),
+                    input: json!({"task_file":42}),
+                }
+            }
+            _ => unreachable!(),
+        }
+        sqlx::query("UPDATE messages SET content=?1 WHERE message_id=?2")
+            .bind(serde_json::to_string(&assistant.content).unwrap())
+            .bind(&assistant.message_id)
+            .execute(f.db.pool())
+            .await
+            .unwrap();
+        assert_integrity_read_only(
+            &f,
+            &pending_state(true),
+            ProposalIntegrityFailure::ProposalMismatch,
+        )
+        .await;
+    }
 }
 
 #[tokio::test]

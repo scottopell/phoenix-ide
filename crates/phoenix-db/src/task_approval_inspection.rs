@@ -40,24 +40,30 @@ pub struct PendingTaskSnapshot {
     pub priority: Priority,
     pub plan: String,
     pub reviewed_proposal: Option<ReviewedProposal>,
+    native_approval_availability: NativeTaskApprovalAvailability,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeTaskApprovalAvailability {
-    /// Provenance was captured; mutation, Stop and lifecycle admission are still required.
+    /// Canonical receipt/message witness validated; mutation, Stop and lifecycle admission remain.
     CapturedProposalRequiresAdmission,
     /// Re-propose the task to capture canonical provenance before native approval.
     UnavailableRepropose,
+    /// Preserve the snapshot for inspection; repair/re-propose before native approval.
+    UnavailableIntegrity(ProposalIntegrityFailure),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposalIntegrityFailure {
+    MissingProposalMessage,
+    MissingCanonicalReceipt,
+    ProposalMismatch,
 }
 
 impl PendingTaskSnapshot {
     #[must_use]
     pub fn native_approval_availability(&self) -> NativeTaskApprovalAvailability {
-        if self.reviewed_proposal.is_some() {
-            NativeTaskApprovalAvailability::CapturedProposalRequiresAdmission
-        } else {
-            NativeTaskApprovalAvailability::UnavailableRepropose
-        }
+        self.native_approval_availability
     }
 }
 
@@ -111,6 +117,12 @@ impl Database {
                 priority: *priority,
                 plan: plan.clone(),
                 reviewed_proposal: reviewed_proposal.clone(),
+                native_approval_availability: proposal_availability_tx(
+                    &mut tx,
+                    &aggregate.latest_transcript_row_id,
+                    &current.transcript_row.conversation.state,
+                )
+                .await?,
             })
         } else {
             PendingTaskStatus::NoPending
@@ -123,6 +135,52 @@ impl Database {
         tx.commit().await?;
         Ok(inspection)
     }
+}
+
+async fn proposal_availability_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    target_transcript: &str,
+    state: &ConvState,
+) -> DbResult<NativeTaskApprovalAvailability> {
+    use crate::conversation_goals::round;
+    use NativeTaskApprovalAvailability::{
+        CapturedProposalRequiresAdmission, UnavailableIntegrity, UnavailableRepropose,
+    };
+    use ProposalIntegrityFailure::{
+        MissingCanonicalReceipt, MissingProposalMessage, ProposalMismatch,
+    };
+
+    let ConvState::AwaitingTaskApproval {
+        reviewed_proposal: Some(reviewed),
+        ..
+    } = state
+    else {
+        return Ok(UnavailableRepropose);
+    };
+    let assistant_id = &reviewed.occurrence.assistant_message_id;
+    let Some(assistant) = round::retained_message_tx(tx, assistant_id)
+        .await
+        .map_err(round::db_error)?
+    else {
+        return Ok(UnavailableIntegrity(MissingProposalMessage));
+    };
+    if crate::provider_replay::validate_task_proposal(target_transcript, &assistant, state).is_err()
+    {
+        return Ok(UnavailableIntegrity(ProposalMismatch));
+    }
+    let witnessed: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM canonical_tool_round_receipts
+         WHERE conversation_id=?1 AND assistant_message_id=?2)",
+    )
+    .bind(target_transcript)
+    .bind(assistant_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(if witnessed {
+        CapturedProposalRequiresAdmission
+    } else {
+        UnavailableIntegrity(MissingCanonicalReceipt)
+    })
 }
 
 fn invalid_source() -> DbError {

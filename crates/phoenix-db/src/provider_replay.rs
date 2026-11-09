@@ -14,7 +14,7 @@ use sqlx::Row;
 mod canonical_receipt;
 pub(crate) use canonical_receipt::CanonicalReceipt;
 
-fn validate_task_proposal(
+pub(crate) fn validate_task_proposal(
     conversation_id: &str,
     assistant: &Message,
     state: &phoenix_core::domain::sm_state::ConvState,
@@ -38,10 +38,8 @@ fn validate_task_proposal(
     let matching_call = match &assistant.content {
         MessageContent::Agent(blocks) => {
             let mut calls = blocks.iter().filter_map(|block| match block {
-                ContentBlock::ToolUse { id, name, input }
-                    if id == &occurrence.tool_use_id && name == "propose_task" =>
-                {
-                    Some(input)
+                ContentBlock::ToolUse { id, name, input } if id == &occurrence.tool_use_id => {
+                    Some((name, input))
                 }
                 ContentBlock::Text { .. }
                 | ContentBlock::Image { .. }
@@ -58,8 +56,10 @@ fn validate_task_proposal(
                 | ContentBlock::McpToolResult { .. } => None,
             });
             match (calls.next(), calls.next()) {
-                (Some(input), None) => serde_json::from_value::<ProposeTaskInput>(input.clone())
-                    .is_ok_and(|call| call.task_file.replace('\\', "/") == task_file.as_str()),
+                (Some((name, input)), None) if name == "propose_task" => {
+                    serde_json::from_value::<ProposeTaskInput>(input.clone())
+                        .is_ok_and(|call| call.task_file.replace('\\', "/") == task_file.as_str())
+                }
                 _ => false,
             }
         }
@@ -72,6 +72,9 @@ fn validate_task_proposal(
     };
     let valid_source = assistant.conversation_id == conversation_id
         && assistant.message_id == occurrence.assistant_message_id
+        && assistant.message_type == phoenix_core::domain::db_schema::MessageType::Agent
+        && !occurrence.assistant_message_id.trim().is_empty()
+        && !occurrence.tool_use_id.trim().is_empty()
         && matching_call;
     let source = std::path::Path::new(task_file)
         .file_name()
