@@ -849,7 +849,7 @@ async fn native_registered_creation_read_replays_historical_publication_after_ta
     assert_eq!(historical["error"], Value::Null, "{historical}");
     let replay = create
         .run(
-            request.clone(),
+            create_input(request.clone()),
             native_context(&gc).with_tool_use_id("native-history-replay"),
         )
         .await;
