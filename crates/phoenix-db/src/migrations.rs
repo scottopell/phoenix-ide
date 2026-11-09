@@ -13504,42 +13504,42 @@ mod tests {
             .unwrap();
         let pool = db.pool();
 
-        run_through_for_test(&pool, 155).await.unwrap();
+        run_through_for_test(pool, 155).await.unwrap();
         let migration_158 = MIGRATIONS
             .iter()
             .find(|migration| migration.version == 158)
             .expect("migration 158 must remain registered");
-        federated_conversation_actions::run(&pool, migration_158)
+        federated_conversation_actions::run(pool, migration_158)
             .await
             .unwrap();
 
         let before: Vec<i64> = sqlx::query_scalar(
             "SELECT version FROM _migrations WHERE version >= 156 ORDER BY version",
         )
-        .fetch_all(&pool)
+        .fetch_all(pool)
         .await
         .unwrap();
         assert_eq!(before, vec![158]);
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(run_pending_migrations(pool).await.unwrap(), 1);
 
         let after: Vec<i64> = sqlx::query_scalar(
             "SELECT version FROM _migrations WHERE version >= 156 ORDER BY version",
         )
-        .fetch_all(&pool)
+        .fetch_all(pool)
         .await
         .unwrap();
         assert_eq!(after, vec![156, 158]);
         sqlx::query("SELECT enrollment_id FROM conversation_goal_actors LIMIT 0")
-            .execute(&pool)
+            .execute(pool)
             .await
             .unwrap();
         sqlx::query("SELECT objective_source_instance_id FROM product_creation_jobs LIMIT 0")
-            .execute(&pool)
+            .execute(pool)
             .await
             .unwrap();
         assert!(sqlx::query("PRAGMA foreign_key_check")
-            .fetch_optional(&pool)
+            .fetch_optional(pool)
             .await
             .unwrap()
             .is_none());
