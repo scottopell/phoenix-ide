@@ -720,8 +720,16 @@ async fn assert_production_initial_approval(context_pressure: bool) {
     );
     let mut saw_approval_state = false;
     let mut saw_immediate_settlement = false;
+    let mut saw_context_terminal = false;
     while let Ok(event) = events.try_recv() {
         if let SseEvent::StateChange { state, .. } = event {
+            if matches!(state, ConvState::RecoverableContinuationFailure { .. }) {
+                assert!(
+                    saw_immediate_settlement,
+                    "terminal failure must follow context pressure"
+                );
+                saw_context_terminal = true;
+            }
             saw_approval_state |= matches!(state, ConvState::LlmRequesting { attempt: 1 });
             saw_immediate_settlement |= if context_pressure {
                 matches!(state, ConvState::AwaitingContinuation { .. })
@@ -743,17 +751,35 @@ async fn assert_production_initial_approval(context_pressure: bool) {
         ConvState::LlmRequesting { attempt: 1 }
     ));
 
-    assert_eq!(
-        event_settled(
-            &handle.acknowledged_event_tx,
-            Event::UserCancel {
-                reason: None,
-                cause: CancelCause::UserRequested,
-            }
-        )
-        .await,
-        AcknowledgedEventOutcome::Settled
-    );
+    if context_pressure {
+        // This fixed capacity failure settles inline before approval returns.
+        // UserCancel is not valid in the resulting recoverable rest state.
+        assert!(saw_context_terminal);
+        assert!(matches!(
+            &*handle.state_rx.borrow(),
+            ConvState::RecoverableContinuationFailure { failure }
+                if failure.error_kind == crate::db::ErrorKind::ContextCapacityConflict
+        ));
+        assert!(matches!(
+            f.db.get_conversation("actor-target").await.unwrap().state,
+            ConvState::RecoverableContinuationFailure { failure }
+                if failure.error_kind == crate::db::ErrorKind::ContextCapacityConflict
+        ));
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 0);
+    } else {
+        // Keep the acknowledged real Stop probe in the cancellable branch.
+        assert_eq!(
+            event_settled(
+                &handle.acknowledged_event_tx,
+                Event::UserCancel {
+                    reason: None,
+                    cause: CancelCause::UserRequested,
+                }
+            )
+            .await,
+            AcknowledgedEventOutcome::Settled
+        );
+    }
     manager.begin_process_shutdown();
     manager.drain_process_shutdown().await;
     let source_message = Message {
@@ -785,11 +811,16 @@ async fn assert_production_initial_approval(context_pressure: bool) {
     .unwrap();
     let before_replay = native_approval_rows(&f.db).await;
     let calls = llm.calls.load(Ordering::SeqCst);
+    let before_replay_state = f.db.get_conversation("actor-target").await.unwrap().state;
     assert_eq!(
         manager.execute_native_task_approval(command).await,
         NativeTaskApprovalOutcome::Committed(receipt)
     );
     assert_eq!(native_approval_rows(&f.db).await, before_replay);
+    assert_eq!(
+        f.db.get_conversation("actor-target").await.unwrap().state,
+        before_replay_state
+    );
     assert_eq!(git(&worktree, &["rev-parse", "HEAD"]).trim(), after_head);
     assert_eq!(llm.calls.load(Ordering::SeqCst), calls);
 }
