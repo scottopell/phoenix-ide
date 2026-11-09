@@ -8,14 +8,32 @@ use std::path::Path;
 
 type NativeRuntime = ConversationRuntime<DatabaseStorage, RegistryLlmClient, Arc<MockToolExecutor>>;
 
-struct ReleaseOnDrop(Option<std::sync::mpsc::Sender<()>>);
+enum ReleaseOnDrop {
+    Blocking(Option<std::sync::mpsc::Sender<()>>),
+    Async(Option<oneshot::Sender<()>>),
+}
 
 impl Drop for ReleaseOnDrop {
     fn drop(&mut self) {
-        if let Some(release) = self.0.take() {
-            let _ = release.send(());
+        match self {
+            Self::Blocking(release) => {
+                if let Some(release) = release.take() {
+                    let _ = release.send(());
+                }
+            }
+            Self::Async(release) => {
+                if let Some(release) = release.take() {
+                    let _ = release.send(());
+                }
+            }
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CancellationStage {
+    BeforeGit,
+    AfterGit,
 }
 
 fn native_runtime(
@@ -44,8 +62,23 @@ fn native_runtime(
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn production_initial_source_cancel_at_pre_git_refuses_without_approval_effects() {
+    Box::pin(run_initial_source_cancel_interleaving(
+        CancellationStage::BeforeGit,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn production_initial_source_cancel_after_git_fails_stop_before_sqlite() {
+    Box::pin(run_initial_source_cancel_interleaving(
+        CancellationStage::AfterGit,
+    ))
+    .await;
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_initial_source_cancel_interleaving(stage: CancellationStage) {
     use super::super::super::test_git_helpers::{add_explore_worktree, init_repo};
     use phoenix_db::conversation_goals::control::GoalControlInstallation;
     use phoenix_db::native_task_approval::NativeTaskApprovalInspection;
@@ -121,6 +154,11 @@ async fn production_initial_source_cancel_at_pre_git_refuses_without_approval_ef
             .await
             .unwrap();
     let before_rows = native_approval_rows(&f.db).await;
+    let before_source_calls =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM native_task_approval_source_calls")
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
     assert_eq!(&before_rows[1..], &[0, 0, 0, 0]);
     let before_messages =
         serde_json::to_value(f.db.get_messages(&f.target).await.unwrap()).unwrap();
@@ -147,17 +185,49 @@ async fn production_initial_source_cancel_at_pre_git_refuses_without_approval_ef
         .is_empty());
 
     let (entered_tx, entered) = oneshot::channel();
-    let (release_tx, release) = std::sync::mpsc::channel();
-    *target.native_pre_git_gate.lock().unwrap() = Some(Box::new(move || {
-        let _ = entered_tx.send(());
-        // This closure is consumed by the real Initial Git blocking worker, not an async task.
-        let _ = release.recv();
-    }));
-    let release = ReleaseOnDrop(Some(release_tx));
+    let release = match stage {
+        CancellationStage::BeforeGit => {
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            *target.native_pre_git_gate.lock().unwrap() = Some(Box::new(move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+            }));
+            ReleaseOnDrop::Blocking(Some(release_tx))
+        }
+        CancellationStage::AfterGit => {
+            let (release_tx, release_rx) = oneshot::channel();
+            target.native_post_git_gate = Some((entered_tx, release_rx));
+            ReleaseOnDrop::Async(Some(release_tx))
+        }
+    };
     let mut approval = Box::pin(target.execute_native_task_approval(command.clone()));
     let cancel_source = async {
         let _release = release;
         entered.await.map_err(|error| error.to_string())?;
+        let post_git = if stage == CancellationStage::AfterGit {
+            let snapshot = try_git_snapshot(&root, &worktree)?;
+            let files = try_worktree_files(&worktree)?;
+            let expected_branch = phoenix_core::task_source::TaskSource::detect("reviewed.md")
+                .ok_or_else(|| "reviewed task filename has no TaskSource".to_owned())?
+                .branch_and_id(&f.target)
+                .0;
+            let actual_branch = try_git(&worktree, &["branch", "--show-current"])?;
+            let committed_body = try_git(&worktree, &["show", "HEAD:tasks/reviewed.md"])?;
+            let worktree_body =
+                std::fs::read(worktree.join(task_file)).map_err(|error| error.to_string())?;
+            if snapshot[4] == before_git[4]
+                || actual_branch.trim_end() != expected_branch
+                || committed_body != BODY
+                || worktree_body != BODY.as_bytes()
+            {
+                return Err(
+                    "post-Git gate must observe the real committed task and branch".to_owned(),
+                );
+            }
+            Some((snapshot, files))
+        } else {
+            None
+        };
         let acknowledged = source_runtime
             .process_acknowledged_event(Event::UserCancel {
                 reason: None,
@@ -188,7 +258,7 @@ async fn production_initial_source_cancel_at_pre_git_refuses_without_approval_ef
                     .to_owned(),
             );
         }
-        Ok::<(), String>(())
+        Ok::<_, String>(post_git)
         // Dropping _release permits the unchanged real DB source/current-Coordinator proof.
     };
     let joined = tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -204,13 +274,26 @@ async fn production_initial_source_cancel_at_pre_git_refuses_without_approval_ef
         }
     };
     drop(approval);
-    cancellation.expect("real acknowledged source cancellation precedes pre-Git proof");
-    assert_eq!(
-        outcome,
-        NativeTaskApprovalOutcome::NotApplied(NativeTaskApprovalRefusal::BeforeGitRefused)
-    );
+    let post_git = cancellation.expect("real acknowledged source cancellation at Git boundary");
+    match stage {
+        CancellationStage::BeforeGit => assert_eq!(
+            outcome,
+            NativeTaskApprovalOutcome::NotApplied(NativeTaskApprovalRefusal::BeforeGitRefused)
+        ),
+        CancellationStage::AfterGit => {
+            assert_eq!(outcome, NativeTaskApprovalOutcome::Unavailable);
+            assert!(target.native_post_git_gate.is_none());
+            assert!(target.fatal_local_authority_fence.is_closed());
+            assert_eq!(
+                target.recovery_disposition,
+                RuntimeRecoveryDisposition::RecreateFromDatabase
+            );
+        }
+    }
     assert!(target.native_pre_git_gate.lock().unwrap().is_none());
-    assert!(!target.fatal_local_authority_fence.is_closed());
+    if stage == CancellationStage::BeforeGit {
+        assert!(!target.fatal_local_authority_fence.is_closed());
+    }
     assert_eq!(source_runtime.tool_execution.generation(), 0);
     assert!(source_runtime
         .tool_executor
@@ -229,6 +312,14 @@ async fn production_initial_source_cancel_at_pre_git_refuses_without_approval_ef
         "no target approval message, Work publication or provider-state publication"
     );
     assert_eq!(native_approval_rows(&f.db).await, before_rows);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM native_task_approval_source_calls")
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap(),
+        before_source_calls,
+        "source-call rows remain unchanged independently of approval artifact counts"
+    );
     assert_eq!(
         serde_json::to_value(f.db.get_messages(&f.target).await.unwrap()).unwrap(),
         before_messages
@@ -271,48 +362,95 @@ async fn production_initial_source_cancel_at_pre_git_refuses_without_approval_ef
         .message_exists(&command.source.message_id)
         .await
         .unwrap());
-    assert_eq!(git_snapshot(&root, &worktree), before_git);
-    assert_eq!(worktree_files(&worktree), before_files);
-    assert_eq!(
-        std::fs::read(worktree.join(task_file)).unwrap(),
-        BODY.as_bytes()
-    );
+    match (stage, post_git) {
+        (CancellationStage::BeforeGit, None) => {
+            assert_eq!(git_snapshot(&root, &worktree), before_git);
+            assert_eq!(worktree_files(&worktree), before_files);
+        }
+        (CancellationStage::AfterGit, Some((post_git_snapshot, post_git_files))) => {
+            assert_ne!(post_git_snapshot, before_git);
+            assert_eq!(git_snapshot(&root, &worktree), post_git_snapshot);
+            assert_eq!(worktree_files(&worktree), post_git_files);
+            assert_eq!(git(&worktree, &["show", "HEAD:tasks/reviewed.md"]), BODY);
+        }
+        (CancellationStage::BeforeGit, Some(_)) | (CancellationStage::AfterGit, None) => {
+            panic!("Git snapshot matches the configured interleaving");
+        }
+    }
 }
 
-fn git_snapshot(root: &Path, worktree: &Path) -> Vec<String> {
-    vec![
-        git(root, &["rev-parse", "HEAD"]),
-        git(root, &["show-ref"]),
-        git(root, &["worktree", "list", "--porcelain"]),
-        git(root, &["status", "--porcelain=v1", "--untracked-files=all"]),
-        git(worktree, &["rev-parse", "HEAD"]),
-        git(worktree, &["symbolic-ref", "HEAD"]),
-        git(
+fn try_git_snapshot(root: &Path, worktree: &Path) -> Result<Vec<String>, String> {
+    Ok(vec![
+        try_git(root, &["rev-parse", "HEAD"])?,
+        try_git(root, &["show-ref"])?,
+        try_git(root, &["worktree", "list", "--porcelain"])?,
+        try_git(root, &["status", "--porcelain=v1", "--untracked-files=all"])?,
+        try_git(worktree, &["rev-parse", "HEAD"])?,
+        try_git(worktree, &["symbolic-ref", "HEAD"])?,
+        try_git(
             worktree,
             &["status", "--porcelain=v1", "--untracked-files=all"],
-        ),
-        git(worktree, &["diff", "--binary", "HEAD"]),
-    ]
+        )?,
+        try_git(worktree, &["diff", "--binary", "HEAD"])?,
+    ])
 }
 
-fn worktree_files(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
-    fn visit(root: &Path, dir: &Path, files: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let entry = entry.unwrap();
+fn try_git(path: &Path, args: &[&str]) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .current_dir(path)
+        .args(args)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|error| error.to_string())
+}
+
+fn try_worktree_files(root: &Path) -> Result<BTreeMap<PathBuf, Option<Vec<u8>>>, String> {
+    fn visit(
+        root: &Path,
+        dir: &Path,
+        files: &mut BTreeMap<PathBuf, Option<Vec<u8>>>,
+    ) -> Result<(), String> {
+        for entry in std::fs::read_dir(dir).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
             if entry.file_name() == ".git" {
                 continue;
             }
             let path = entry.path();
-            let relative = path.strip_prefix(root).unwrap().to_path_buf();
-            if entry.file_type().unwrap().is_dir() {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|error| error.to_string())?
+                .to_path_buf();
+            if entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_dir()
+            {
                 files.insert(relative, None);
-                visit(root, &path, files);
+                visit(root, &path, files)?;
             } else {
-                files.insert(relative, Some(std::fs::read(path).unwrap()));
+                files.insert(
+                    relative,
+                    Some(std::fs::read(path).map_err(|error| error.to_string())?),
+                );
             }
         }
+        Ok(())
     }
     let mut files = BTreeMap::new();
-    visit(root, root, &mut files);
-    files
+    visit(root, root, &mut files)?;
+    Ok(files)
+}
+
+fn git_snapshot(root: &Path, worktree: &Path) -> Vec<String> {
+    try_git_snapshot(root, worktree).expect("Git snapshot outside the paused approval schedule")
+}
+
+fn worktree_files(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    try_worktree_files(root).expect("filesystem snapshot outside the paused approval schedule")
 }

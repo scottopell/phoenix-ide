@@ -2185,6 +2185,11 @@ where
     native_task_admission_db: Option<crate::db::Database>,
     #[cfg(test)]
     native_pre_git_gate: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    native_post_git_gate: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
     handoff_review_rx: Option<mpsc::Receiver<super::HandoffReviewRequest>>,
     exhausted_maintenance: bool,
     broadcast_tx: SseBroadcaster,
@@ -2512,6 +2517,8 @@ where
             native_task_admission_db: None,
             #[cfg(test)]
             native_pre_git_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            native_post_git_gate: None,
             handoff_review_rx: None,
             exhausted_maintenance: false,
             tool_execution: ToolExecutionSlot::default(),
@@ -12328,6 +12335,13 @@ where
 
         match result {
             Ok(approval_result) => {
+                #[cfg(test)]
+                if origin.is_native() {
+                    if let Some((entered, release)) = self.native_post_git_gate.take() {
+                        let _ = entered.send(());
+                        let _ = release.await;
+                    }
+                }
                 let branch_msg = format!(
                     "Task approved. You are on branch {} in {}.\n\n\
                      ## Approved plan: {}\n\n\
