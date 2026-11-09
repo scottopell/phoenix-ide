@@ -135,7 +135,7 @@ impl Fixture {
                 )),
             )
             .await
-            .map(ApprovalFact::user_result)
+            .map(|result| ApprovalFact::user_result(&result))
     }
 
     async fn install_source(&self) {

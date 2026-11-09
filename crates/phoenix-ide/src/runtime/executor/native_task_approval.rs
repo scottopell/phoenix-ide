@@ -21,7 +21,7 @@ pub(super) enum ApprovalOrigin {
     Native {
         command: Box<NativeTaskApprovalCommand>,
         progress: ApprovalGitProgress,
-        receipt: Option<NativeTaskApprovalReceipt>,
+        receipt: Option<Box<NativeTaskApprovalReceipt>>,
     },
 }
 
@@ -56,7 +56,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         match db.inspect_native_task_approval_command(&command).await {
             Ok(NativeTaskApprovalInspection::Replay(receipt)) => return Committed(receipt),
             Ok(NativeTaskApprovalInspection::RequiresOwningActorAdmission) => {}
-            Err(error) => return NativeTaskApprovalOutcome::preflight_error(error),
+            Err(error) => return NativeTaskApprovalOutcome::preflight_error(&error),
         }
         if self.context.conversation_id != command.current_transcript_id
             || self.context.is_coordinator
@@ -98,9 +98,8 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             tracing::debug!(%error, "native approval target refused before Git");
             return NotApplied(NativeTaskApprovalRefusal::TargetChanged);
         }
-        let mut admitted = match self.admit_authoritative_effect() {
-            Ok(admitted) => admitted,
-            Err(_) => return Unavailable,
+        let Ok(mut admitted) = self.admit_authoritative_effect() else {
+            return Unavailable;
         };
         let approval = TaskApprovalInput {
             task_file: command.pending.task_file.clone(),
@@ -122,6 +121,17 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                 &mut origin,
             )
             .await;
+        self.settle_native_approval_outcome(origin, result, &mut admitted)
+            .await
+    }
+
+    async fn settle_native_approval_outcome(
+        &mut self,
+        origin: ApprovalOrigin,
+        result: Result<(), String>,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> NativeTaskApprovalOutcome {
+        use NativeTaskApprovalOutcome::{Committed, NotApplied, Unavailable};
         let ApprovalOrigin::Native {
             progress, receipt, ..
         } = origin
@@ -150,7 +160,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                     admitted.close("native_approval_postcommit_dispatch");
                 }
             }
-            return Committed(receipt);
+            return Committed(*receipt);
         }
         if progress == ApprovalGitProgress::EffectsMayHaveOccurred {
             tracing::error!(
@@ -227,7 +237,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                     .await?
                 {
                     LocalAuthorityResult::DurableFactEstablished(stored) => {
-                        *receipt = Some(stored);
+                        *receipt = Some(Box::new(stored));
                         Ok(LocalAuthorityResult::DurableFactEstablished(()))
                     }
                     LocalAuthorityResult::DurableFactUnclassified => {
@@ -285,8 +295,8 @@ mod tests {
         for reviewed in ["changed bytes", body] {
             let mut progress = ApprovalGitProgress::BeforeEffects;
             let result = execute_approve_task_blocking_reviewed_with_progress(
-                root.to_str().unwrap(),
-                root.to_str().unwrap(),
+                &root,
+                &root,
                 "native-proof",
                 "tasks",
                 "tasks/reviewed.md",
@@ -315,8 +325,8 @@ mod tests {
         std::fs::write(tmp.path().join("tasks/reviewed.md"), body).unwrap();
         let mut progress = ApprovalGitProgress::BeforeEffects;
         assert!(execute_approve_task_blocking_reviewed_with_progress(
-            tmp.path().to_str().unwrap(),
-            tmp.path().to_str().unwrap(),
+            tmp.path(),
+            tmp.path(),
             "native-git-error",
             "tasks",
             "tasks/reviewed.md",

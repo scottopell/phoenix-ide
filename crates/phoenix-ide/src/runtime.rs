@@ -7014,8 +7014,6 @@ impl RuntimeManager {
             .map(|_| ())
     }
 
-    /// Readiness at the owning actor, not approval authority or an effect reservation.
-    #[allow(dead_code)]
     /// Internal command only; no tool registration or HTTP route is installed.
     #[allow(dead_code)]
     pub(crate) async fn execute_native_task_approval(
@@ -7030,7 +7028,7 @@ impl RuntimeManager {
                 return NativeTaskApprovalOutcome::Committed(receipt)
             }
             Ok(NativeTaskApprovalInspection::RequiresOwningActorAdmission) => {}
-            Err(error) => return NativeTaskApprovalOutcome::preflight_error(error),
+            Err(error) => return NativeTaskApprovalOutcome::preflight_error(&error),
         }
         let admission = match self
             .mutation_admission(&command.current_transcript_id)
@@ -7039,9 +7037,8 @@ impl RuntimeManager {
             Ok(admission) => admission.lock_owned().await,
             Err(_) => return NativeTaskApprovalOutcome::Unavailable,
         };
-        let handle = match self.get_or_create(&command.current_transcript_id).await {
-            Ok(handle) => handle,
-            Err(_) => return NativeTaskApprovalOutcome::Unavailable,
+        let Ok(handle) = self.get_or_create(&command.current_transcript_id).await else {
+            return NativeTaskApprovalOutcome::Unavailable;
         };
         let (response, result) = tokio::sync::oneshot::channel();
         if handle

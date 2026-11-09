@@ -46,6 +46,7 @@ impl FrozenPendingTask {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn transcript_id(&self) -> &str {
         &self.transcript_id
     }
@@ -148,7 +149,7 @@ pub(crate) enum NativeTaskApprovalUnsupported {
 
 impl NativeTaskApprovalOutcome {
     pub(crate) fn preflight_error(
-        error: phoenix_db::native_task_approval::NativeTaskApprovalError,
+        error: &phoenix_db::native_task_approval::NativeTaskApprovalError,
     ) -> Self {
         use phoenix_db::native_task_approval::NativeTaskApprovalError;
         tracing::debug!(%error, "native task approval preflight refused");

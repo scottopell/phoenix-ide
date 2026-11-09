@@ -224,3 +224,20 @@ fixture, uses the typed continuation receipt field, completes exhaustive source-
 matching, and confines superseded readiness-only queue helpers to tests. Hosted failures
 at `beaac9e6a` included source compile/lint errors; they are not classified as infrastructure.
 No local native compilation or tests were run.
+
+### Positive Initial actor regressions (authored; not yet executed)
+
+Two disposable-Git manager/DatabaseStorage regressions now exercise Initial approval
+with controls explicitly Disabled: tiny model limits produce immediate context pressure,
+and an empty model registry produces an immediate freeze failure. Both assert the durable
+receipt/objective/approval message, one Git checkpoint, approval state SSE and reducer
+settlement of the immediate event. They then acknowledge UserCancel, stop the fixture
+manager, canonically finalize the source call, and assert exact receipt replay without
+another Git checkpoint, obligation write or provider call. Independent static review found
+no grounded defect in the authored fixtures; hosted execution remains required.
+
+This is not installed-controls acceptance. Source-cancellation ordering at the first-Git
+barrier, post-Git/source/DB fault cuts, concurrent approvers, and enabled-runtime follow-up
+modes remain outstanding. Source compilation/lint diagnostics at `31d5ac2d8` were corrected
+with reference mappings, test-only readiness accessors, boxed receipt storage and a separate
+outcome-settlement method; no build/test gates were relaxed and no local native checks ran.
