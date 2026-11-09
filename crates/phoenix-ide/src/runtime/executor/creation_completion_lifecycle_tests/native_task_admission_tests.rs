@@ -27,16 +27,13 @@ struct AdmissionFixture {
 
 impl AdmissionFixture {
     async fn new() -> Self {
+        Self::with_cwd("/nonexistent").await
+    }
+
+    async fn with_cwd(cwd: &str) -> Self {
         let db = Database::open_in_memory().await.unwrap();
         let target = db
-            .create_conversation(
-                "actor-target",
-                "actor-target",
-                "/nonexistent",
-                true,
-                None,
-                None,
-            )
+            .create_conversation("actor-target", "actor-target", cwd, true, None, None)
             .await
             .unwrap();
         let pending = pending_state(true);
@@ -411,7 +408,8 @@ async fn production_manager_cancel_before_native_command_has_no_approval_artifac
     use phoenix_db::native_task_approval::{
         NativeApprovalIntent, NativeApprovalPlacement, NativeTaskApprovalCommand,
     };
-    let f = AdmissionFixture::new().await;
+    let cwd = tempfile::tempdir().unwrap();
+    let f = AdmissionFixture::with_cwd(cwd.path().to_str().unwrap()).await;
     let coordinator =
         f.db.get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
             .await

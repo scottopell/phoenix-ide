@@ -368,7 +368,7 @@ async fn rename_receipt_retention_migration_preserves_rows_and_rolls_back_atomic
         .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 9);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 10);
     let foreign_keys: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_foreign_key_list('product_conversation_rename_receipts')",
     )
