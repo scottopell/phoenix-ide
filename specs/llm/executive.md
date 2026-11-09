@@ -48,12 +48,21 @@ Active Responses exchanges retain original output envelopes, including assistant
 
 ## Capacity-policy specification
 
-REQ-LLM-004j–004m have backend implementation and bounded deterministic
-qualification under task 44018. Shared prepared-request accounting reserves the
-selected model's full output allowance; counting has one bounded optional attempt
-and labelled fallback. Capacity diagnostics identify deliberate prefix changes.
-UI delivery, full integration validation, deployment and production recovery
-remain separate gates. ADR-146 records the decisions.
+REQ-LLM-004j–004m have backend and UI delivery, bounded deterministic
+qualification, and dated incident-scoped production acceptance in completed
+task 44018. Shared prepared-request accounting reserves the selected model's
+full output allowance; counting has one bounded optional attempt and labelled
+fallback. Capacity diagnostics identify deliberate prefix changes. PR #977
+merged as `3b602a0b6dd7f92a3304b97c475a66b4eafc2113`. The [PR #979
+acceptance account](https://github.com/scottopell/phoenix-ide/pull/979) reports
+2026-10-25 native deployment on that commit and successful supported recovery
+and ordinary provider/tool rounds for two incident conversations on their
+Codex-auth routes, with the full 128,000-token output reservation. Independent
+read-only verification in [task 67011](../../tasks/67011-p2-done--coordinator-drive-eval.md)
+confirms the committed deployment transaction and running source commit, not
+the conversation-level details or all reported validation gates. This is not
+cross-provider, measured cache, or semantic-continuity qualification. ADR-146
+records the capacity decisions.
 
 Qualification reuses focused fixtures rather than claiming cache performance:
 `capacity_diagnostics_prefix_causes_are_multiple_and_content_free` covers a cold
@@ -85,6 +94,7 @@ the exhausted state contains the mock-generated summary. All seven owning API
 model-guard tests pass. These deterministic fixtures do not establish model
 understanding, cache hits, or full cross-provider interoperability.
 
-Independent specs-only review is recorded in
-`docs/reviews/context-capacity-spec-review.md`; independent implementation review
-and final integration remain delivery gates.
+Independent specs-only and implementation reviews are recorded in
+`docs/reviews/context-capacity-spec-review.md` and
+`docs/reviews/context-capacity-implementation-review.md`; PR #979 records the
+subsequent reported integration and scoped production acceptance.
