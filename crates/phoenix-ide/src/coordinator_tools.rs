@@ -119,6 +119,9 @@ mod previous_transcripts_tool_tests {
             serde_json::json!({"request":{"op":"search","query":"needle","cursor":"bad"}}),
             serde_json::json!({"request":{"op":"read","transcript_ref":"@transcript:abc","query":"bad"}}),
             serde_json::json!({"request":{"op":"search","query":null}}),
+            serde_json::json!({"request":{"op":"search","query":""}}),
+            serde_json::json!({"request":{"op":"search","query":"   "}}),
+            serde_json::json!({"request":{"op":"search","query":"x".repeat(1025)}}),
             serde_json::json!({"request":{"op":"list","cursor":17}}),
             serde_json::json!({"request":{"op":"delete"}}),
             serde_json::json!({"op":"list"}),
@@ -150,6 +153,10 @@ mod previous_transcripts_tool_tests {
             (
                 serde_json::json!({"request":{"op":"search","query":"private-needle","cursor":"bad"}}),
                 "search requires",
+            ),
+            (
+                serde_json::json!({"request":{"op":"search","query":"   "}}),
+                "search requires a nonblank query",
             ),
             (
                 serde_json::json!({"request":{"op":"read"}}),
@@ -261,6 +268,13 @@ impl Tool for PreviousTranscriptsTool {
             };
             return ToolOutput::error(format!("Invalid previous_transcripts request: {guidance}."));
         };
+        if let PreviousTranscriptsRequest::Search { query } = &request {
+            if query.trim().is_empty() || query.chars().count() > 1024 {
+                return ToolOutput::error(
+                    "Invalid previous_transcripts request: search requires a nonblank query of at most 1024 characters.",
+                );
+            }
+        }
         let result = self
             .service
             .previous_transcripts(&self.binding, request)
