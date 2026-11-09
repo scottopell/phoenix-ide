@@ -370,6 +370,12 @@ async function verifyNarrowMarkdownTable({ page, id, outDir }) {
       throw new Error(`Markdown table wrapper does not own horizontal overflow: ${JSON.stringify(sample)}`);
     }
   }
+  if (desktop.patched.tableLayout !== 'auto' || desktop.patched.cellOverflowWrap !== 'normal') {
+    throw new Error(`Narrow table desktop behavior regressed: ${JSON.stringify(desktop.patched)}`);
+  }
+  if (desktop.patched.tableClientWidth !== desktop.patched.wrapperClientWidth) {
+    throw new Error(`Narrow table desktop width regressed: ${JSON.stringify(desktop.patched)}`);
+  }
   if (narrow.patched.tableLayout !== 'fixed' || narrow.patched.cellOverflowWrap !== 'anywhere') {
     throw new Error(`Narrow table did not receive the narrow readability rule: ${JSON.stringify(narrow.patched)}`);
   }

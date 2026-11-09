@@ -2290,15 +2290,19 @@ describe('markdown table rendering', () => {
     '| Revision | Destination |',
     '| --- | --- |',
     '| `4fd574ee` | `0123456789abcdef0123456789abcdef01234567` |',
+    '',
+    '| Merge | What it unblocks |',
+    '| --- | --- |',
   ].join('\n');
 
   function expectSemanticTableAnnotations(container: HTMLElement) {
     const wrappers = container.querySelectorAll('.conversation-markdown-table-scroll');
     const tables = container.querySelectorAll('.markdown-table-scroll table');
-    expect(wrappers).toHaveLength(3);
+    expect(wrappers).toHaveLength(4);
     expect([...wrappers].map((wrapper) => wrapper.getAttribute('data-column-count')))
-      .toEqual(['6', '2', '2']);
-    expect(tables).toHaveLength(3);
+      .toEqual(['6', '2', '2', '2']);
+    expect(tables).toHaveLength(4);
+    expect(tables[3]!.querySelectorAll('tbody td')).toHaveLength(0);
     expect([...tables[0]!.querySelectorAll('th')].map((cell) => cell.dataset['columnKind']))
       .toEqual(['atomic', 'numeric', 'numeric', 'numeric', 'numeric', 'numeric']);
     expect([...tables[1]!.querySelectorAll('th')].map((cell) => cell.dataset['columnKind']))
@@ -2404,7 +2408,7 @@ describe('markdown table rendering', () => {
       </MemoryRouter>,
     );
 
-    await waitFor(() => expect(container.querySelectorAll('table')).toHaveLength(3));
+    await waitFor(() => expect(container.querySelectorAll('table')).toHaveLength(4));
     expectSemanticTableAnnotations(container);
   });
 

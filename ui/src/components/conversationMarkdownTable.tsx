@@ -26,6 +26,26 @@ function tableBodyRows(children: React.ReactNode): string[][] {
   return rows;
 }
 
+function tableColumnCount(children: React.ReactNode): number {
+  let columnCount = 0;
+  const visit = (node: React.ReactNode): void => {
+    React.Children.forEach(node, (child) => {
+      if (!React.isValidElement<{ children?: React.ReactNode }>(child)) return;
+      const element = child as ElementWithChildren;
+      if (element.type === 'tr') {
+        const cells = React.Children.toArray(element.props.children).filter(
+          (cell) => React.isValidElement(cell) && (cell.type === 'th' || cell.type === 'td'),
+        );
+        columnCount = Math.max(columnCount, cells.length);
+        return;
+      }
+      visit(element.props.children);
+    });
+  };
+  visit(children);
+  return columnCount;
+}
+
 function annotateCells(node: React.ReactNode, kinds: TableColumnKind[]): React.ReactNode {
   return React.Children.map(node, (child) => {
     if (!React.isValidElement<{ children?: React.ReactNode }>(child)) return child;
@@ -48,7 +68,7 @@ function annotateCells(node: React.ReactNode, kinds: TableColumnKind[]): React.R
 export function ConversationMarkdownTable({ node, children, ...props }: MarkdownTableProps) {
   void node;
   const rows = tableBodyRows(children);
-  const columnCount = Math.max(0, ...rows.map((row) => row.length));
+  const columnCount = tableColumnCount(children);
   const kinds = Array.from({ length: columnCount }, (_, column) => (
     classifyTableColumn(rows.map((row) => row[column] ?? ''))
   ));
