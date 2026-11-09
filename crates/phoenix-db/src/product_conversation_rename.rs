@@ -1451,7 +1451,7 @@ mod tests {
         .bind(command.expected_name_revision)
         .bind(command.source.product_conversation_id.as_str())
         .bind(&command.source.transcript_id)
-        .bind(&command.source.message_id)
+        .bind("")
         .bind(&command.source.tool_use_id)
         .execute(db.pool())
         .await

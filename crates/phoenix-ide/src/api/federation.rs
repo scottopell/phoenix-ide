@@ -2815,7 +2815,7 @@ pub(crate) struct NativeCreateResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum NativeCreatePublication {
-    None,
+    None {},
     Available {
         conversation_id: String,
         canonical_route: String,
@@ -2828,14 +2828,14 @@ pub(crate) enum NativeCreatePublication {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum NativeCreateInitialExecution {
-    Queued,
-    Running,
-    Completed,
+    Queued {},
+    Running {},
+    Completed {},
     Failed { reason: String },
-    Cancelled,
-    AwaitingUserResponse,
-    AwaitingTaskApproval,
-    Unavailable,
+    Cancelled {},
+    AwaitingUserResponse {},
+    AwaitingTaskApproval {},
+    Unavailable {},
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2976,16 +2976,16 @@ fn native_initial_execution(
 ) -> NativeCreateInitialExecution {
     use crate::db::ProductCreationInitialExecution as Execution;
     match execution {
-        Execution::Queued => NativeCreateInitialExecution::Queued,
-        Execution::Running => NativeCreateInitialExecution::Running,
-        Execution::Completed => NativeCreateInitialExecution::Completed,
+        Execution::Queued => NativeCreateInitialExecution::Queued {},
+        Execution::Running => NativeCreateInitialExecution::Running {},
+        Execution::Completed => NativeCreateInitialExecution::Completed {},
         Execution::Failed { reason } => NativeCreateInitialExecution::Failed {
             reason: reason.clone(),
         },
-        Execution::Cancelled => NativeCreateInitialExecution::Cancelled,
-        Execution::AwaitingUserResponse => NativeCreateInitialExecution::AwaitingUserResponse,
-        Execution::AwaitingTaskApproval => NativeCreateInitialExecution::AwaitingTaskApproval,
-        Execution::Unavailable => NativeCreateInitialExecution::Unavailable,
+        Execution::Cancelled => NativeCreateInitialExecution::Cancelled {},
+        Execution::AwaitingUserResponse => NativeCreateInitialExecution::AwaitingUserResponse {},
+        Execution::AwaitingTaskApproval => NativeCreateInitialExecution::AwaitingTaskApproval {},
+        Execution::Unavailable => NativeCreateInitialExecution::Unavailable {},
     }
 }
 
@@ -3465,7 +3465,7 @@ pub(crate) async fn native_create_status(
         },
         Some(status) => {
             let publication = match status.publication {
-                None => NativeCreatePublication::None,
+                None => NativeCreatePublication::None {},
                 Some(phoenix_db::ProductCreationPublicationRead::Available {
                     conversation_id,
                     aggregate,
@@ -4102,7 +4102,7 @@ fn native_verify_status(
             || (matches!(publication, NativeCreatePublication::Available { .. })
                 && *creation_status != S::Published)
             || (*creation_status == S::Published
-                && matches!(publication, NativeCreatePublication::None))
+                && matches!(publication, NativeCreatePublication::None {}))
             || (matches!(publication, NativeCreatePublication::Historical { .. })
                 && !matches!(
                     creation_status,
@@ -4121,7 +4121,10 @@ fn native_verify_status(
             || (!matches!(
                 creation_status,
                 S::Published | S::DeliveryPending | S::DeliveryFailed | S::DeletionPending
-            ) && !matches!(initial_execution, NativeCreateInitialExecution::Unavailable))
+            ) && !matches!(
+                initial_execution,
+                NativeCreateInitialExecution::Unavailable {}
+            ))
         {
             return Err(native_protocol(
                 "publication/initial execution does not match creation state",
