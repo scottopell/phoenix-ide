@@ -66,6 +66,27 @@ async fn malformed_create_calls_are_non_durable_and_errors_are_operation_guided(
         assert!(!message.contains("/secret/path"), "{message}");
         assert!(!message.contains("private objective"), "{message}");
     }
+    for instance in [None, Some("unknown-peer")] {
+        let mut input = create_input(json!({
+            "op": "create", "request_id": request_id,
+            "cwd": "/secret/path", "objective": "private objective",
+            "start": "submit_objective"
+        }));
+        input["source"] = json!("untrusted root field");
+        if let Some(instance) = instance {
+            input["instance"] = json!(instance);
+        }
+        let refused = tool.run(input, native_context(&gc)).await;
+        assert!(matches!(refused, ToolOutput::Error { .. }));
+        assert!(
+            refused.output().contains("create requires"),
+            "{}",
+            refused.output()
+        );
+        assert!(!refused.output().contains("/secret/path"));
+        assert!(!refused.output().contains("private objective"));
+        assert!(!refused.output().contains("peer connection not found"));
+    }
     let count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_jobs WHERE request_id=?1")
             .bind(&request_id)
@@ -2002,7 +2023,7 @@ async fn native_federated_authority_precedes_peer_lookup_and_argument_provenance
                 refused
                     .output()
                     .contains(if tool.name() == "create_conversation" {
-                        "create requires"
+                        "options accepts only op and optional cwd"
                     } else {
                         "unknown field"
                     }),
