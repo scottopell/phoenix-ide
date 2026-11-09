@@ -132,11 +132,11 @@ describe('reminder visibility and management', () => {
     vi.mocked(api.manageReminder).mockRejectedValueOnce(new Error('Network response lost'))
       .mockRejectedValueOnce(new ApiResponseError('Already due', 409));
     render(<RemindersPanel conversationId="owner" />);
-    fireEvent.click((await screen.findAllByRole('button', { name: 'Cancel reminder' }))[0]);
+    fireEvent.click((await screen.findAllByRole('button', { name: 'Cancel reminder' }))[0]!);
     await waitFor(() => expect(api.listReminders).toHaveBeenCalledTimes(2));
-    fireEvent.click(screen.getAllByRole('button', { name: 'Reschedule' })[1]);
+    fireEvent.click(screen.getAllByRole('button', { name: 'Reschedule' })[1]!);
     expect(screen.getByRole('alert')).toHaveTextContent('Could not confirm cancel reminder');
-    fireEvent.click(screen.getAllByRole('button', { name: 'Cancel reminder' })[1]);
+    fireEvent.click(screen.getAllByRole('button', { name: 'Cancel reminder' })[1]!);
     await waitFor(() => expect(screen.getAllByRole('alert')).toHaveLength(2));
     expect(screen.getByText('Could not confirm cancel reminder: Network response lost')).toBeInTheDocument();
     expect(screen.getByText('Could not cancel reminder: Already due')).toBeInTheDocument();
@@ -148,9 +148,9 @@ describe('reminder visibility and management', () => {
     vi.mocked(api.listReminders).mockResolvedValue([reminder(), other]);
     vi.mocked(api.manageReminder).mockRejectedValueOnce(new ApiResponseError('Already due', 409));
     render(<RemindersPanel conversationId="owner" />);
-    fireEvent.click((await screen.findAllByRole('button', { name: 'Cancel reminder' }))[0]);
+    fireEvent.click((await screen.findAllByRole('button', { name: 'Cancel reminder' }))[0]!);
     expect(await screen.findByRole('alert')).toHaveTextContent('Could not cancel reminder: Already due');
-    fireEvent.click(screen.getAllByRole('button', { name: 'Reschedule' })[1]);
+    fireEvent.click(screen.getAllByRole('button', { name: 'Reschedule' })[1]!);
     expect(screen.getByRole('alert')).toHaveTextContent('Could not cancel reminder: Already due');
     expect(api.manageReminder).toHaveBeenCalledTimes(1);
   });
