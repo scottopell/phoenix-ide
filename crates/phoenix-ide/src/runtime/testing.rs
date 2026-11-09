@@ -2540,6 +2540,23 @@ impl StateStore for InMemoryStorage {
         Ok(())
     }
 
+    async fn persist_native_approved_task_authority_and_state(
+        &self,
+        command: &phoenix_db::native_task_approval::NativeTaskApprovalCommand,
+        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        approval_message: &Message,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<
+        phoenix_db::workflow::LocalAuthorityResult<
+            phoenix_db::native_task_approval::NativeTaskApprovalReceipt,
+        >,
+        String,
+    > {
+        let _ = (command, approval, approval_message, state, state_updated_at);
+        Err("in-memory storage does not implement native approval settlement".to_owned())
+    }
+
     async fn persist_approved_task_authority_and_state(
         &self,
         conv_id: &str,

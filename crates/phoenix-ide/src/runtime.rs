@@ -279,6 +279,35 @@ pub(crate) struct AcknowledgedEventRequest {
     pub retirement: tokio::sync::oneshot::Receiver<()>,
 }
 
+pub(crate) enum AcknowledgedRuntimeRequest {
+    Event(Box<AcknowledgedEventRequest>),
+    ExecuteNativeTaskApproval {
+        command: Box<phoenix_db::native_task_approval::NativeTaskApprovalCommand>,
+        response: tokio::sync::oneshot::Sender<task_approval_admission::NativeTaskApprovalOutcome>,
+        admission: tokio::sync::OwnedMutexGuard<()>,
+    },
+    #[cfg(test)]
+    InspectNativeTaskApprovalAdmission {
+        expected: Box<task_approval_admission::FrozenPendingTask>,
+        response: tokio::sync::oneshot::Sender<
+            Result<task_approval_admission::NativeTaskAdmissionReadiness, String>,
+        >,
+    },
+}
+
+mod task_approval_admission;
+
+#[cfg(test)]
+impl AcknowledgedRuntimeRequest {
+    fn into_event(self) -> AcknowledgedEventRequest {
+        match self {
+            Self::Event(event) => *event,
+            Self::InspectNativeTaskApprovalAdmission { .. }
+            | Self::ExecuteNativeTaskApproval { .. } => panic!("expected event request"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HandoffCapacityStatus {
@@ -738,6 +767,8 @@ pub struct RuntimeManager {
     #[cfg(test)]
     runtime_materialization_panics: AsyncMutex<HashSet<String>>,
     #[cfg(test)]
+    native_pre_git_gates: std::sync::Mutex<HashMap<String, Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
     runtime_materialization_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     subagent_cancel_dispatch_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
@@ -915,7 +946,7 @@ type SharedStartupLlmRecoveryReceipt = Arc<AsyncMutex<Option<StartupLlmRecoveryR
 #[derive(Clone)]
 pub struct ConversationHandle {
     pub event_tx: mpsc::Sender<Event>,
-    pub(crate) acknowledged_event_tx: mpsc::Sender<AcknowledgedEventRequest>,
+    pub(crate) acknowledged_event_tx: mpsc::Sender<AcknowledgedRuntimeRequest>,
     handoff_review_tx: Option<mpsc::Sender<HandoffReviewRequest>>,
     /// Turn-trigger slot shared with this conversation's executor (see
     /// [`TurnTriggerSlot`]). Event senders deposit the ambient span here so
@@ -1952,6 +1983,19 @@ pub struct CachedPrSummary {
 /// the extra display fields.
 pub(crate) fn public_conversation_state(state: &ConvState) -> serde_json::Value {
     match state {
+        ConvState::AwaitingTaskApproval {
+            task_file,
+            title,
+            priority,
+            plan,
+            ..
+        } => serde_json::json!({
+            "type": "awaiting_task_approval",
+            "task_file": task_file,
+            "title": title,
+            "priority": priority,
+            "plan": plan,
+        }),
         ConvState::ServerOverloadRetrying { retry } => serde_json::json!({
             "type": "server_overload_retrying",
             "attempt": retry.attempt,
@@ -2642,6 +2686,8 @@ impl RuntimeManager {
             subagent_dispatch: ConversationMutexGates::default(),
             #[cfg(test)]
             runtime_materialization_panics: AsyncMutex::new(HashSet::new()),
+            #[cfg(test)]
+            native_pre_git_gates: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             runtime_materialization_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
@@ -5571,7 +5617,7 @@ impl RuntimeManager {
                 Ok(child) => child,
                 Err(crate::db::DbError::ConversationNotFound(_)) => continue,
                 Err(error) => {
-                    return Err(DatabaseTerminalRecoveryError::Retryable(error.to_string()))
+                    return Err(DatabaseTerminalRecoveryError::Retryable(error.to_string()));
                 }
             };
             if child.runtime_role == crate::work_scope::RuntimeRole::SubAgent
@@ -6562,7 +6608,15 @@ impl RuntimeManager {
         );
         let runtime = runtime
             .with_acknowledged_event_receiver(acknowledged_event_rx)
+            .with_native_task_admission_database(self.db.clone())
             .with_handoff_review_receiver(handoff_review_rx);
+        #[cfg(test)]
+        let runtime = runtime.with_native_pre_git_gate_for_test(
+            self.native_pre_git_gates
+                .lock()
+                .unwrap()
+                .remove(conversation_id),
+        );
 
         let runtime = runtime
             .with_model_route_switch(model_upgrade.unwrap_or(false))
@@ -6971,6 +7025,50 @@ impl RuntimeManager {
             .map(|_| ())
     }
 
+    /// Internal command only; no tool registration or HTTP route is installed.
+    #[allow(dead_code)]
+    pub(crate) async fn execute_native_task_approval(
+        self: &Arc<Self>,
+        command: phoenix_db::native_task_approval::NativeTaskApprovalCommand,
+    ) -> task_approval_admission::NativeTaskApprovalOutcome {
+        use phoenix_db::native_task_approval::NativeTaskApprovalInspection;
+        use task_approval_admission::NativeTaskApprovalOutcome;
+        // Prove current source even for replay; target actor/Stop admission follows replay.
+        match self.db.inspect_native_task_approval_command(&command).await {
+            Ok(NativeTaskApprovalInspection::Replay(receipt)) => {
+                return NativeTaskApprovalOutcome::Committed(receipt)
+            }
+            Ok(NativeTaskApprovalInspection::RequiresOwningActorAdmission) => {}
+            Err(error) => return NativeTaskApprovalOutcome::preflight_error(&error),
+        }
+        let admission = match self
+            .mutation_admission(&command.current_transcript_id)
+            .await
+        {
+            Ok(admission) => admission.lock_owned().await,
+            Err(_) => return NativeTaskApprovalOutcome::Unavailable,
+        };
+        let Ok(handle) = self.get_or_create(&command.current_transcript_id).await else {
+            return NativeTaskApprovalOutcome::Unavailable;
+        };
+        let (response, result) = tokio::sync::oneshot::channel();
+        if handle
+            .acknowledged_event_tx
+            .send(AcknowledgedRuntimeRequest::ExecuteNativeTaskApproval {
+                command: Box::new(command),
+                response,
+                admission,
+            })
+            .await
+            .is_err()
+        {
+            return NativeTaskApprovalOutcome::Unavailable;
+        }
+        result
+            .await
+            .unwrap_or(NativeTaskApprovalOutcome::Unavailable)
+    }
+
     async fn send_acknowledged_event(
         self: &Arc<Self>,
         conversation_id: &str,
@@ -6992,11 +7090,13 @@ impl RuntimeManager {
         let (retirement_tx, retirement_rx) = tokio::sync::oneshot::channel();
         handle
             .acknowledged_event_tx
-            .send(AcknowledgedEventRequest {
-                event,
-                acknowledgement: ack_tx,
-                retirement: retirement_rx,
-            })
+            .send(AcknowledgedRuntimeRequest::Event(Box::new(
+                AcknowledgedEventRequest {
+                    event,
+                    acknowledgement: ack_tx,
+                    retirement: retirement_rx,
+                },
+            )))
             .await
             .map_err(|error| error.to_string())?;
         let outcome = ack_rx
@@ -7228,11 +7328,13 @@ impl RuntimeManager {
         let (_retirement_tx, retirement_rx) = tokio::sync::oneshot::channel();
         handle
             .acknowledged_event_tx
-            .send(AcknowledgedEventRequest {
-                event: Event::UserTriggerContinuation { operation_id },
-                acknowledgement: ack_tx,
-                retirement: retirement_rx,
-            })
+            .send(AcknowledgedRuntimeRequest::Event(Box::new(
+                AcknowledgedEventRequest {
+                    event: Event::UserTriggerContinuation { operation_id },
+                    acknowledgement: ack_tx,
+                    retirement: retirement_rx,
+                },
+            )))
             .await
             .map_err(|error| format!("Failed to send continuation admission: {error}"))?;
         ack_rx
@@ -7935,7 +8037,23 @@ impl RuntimeManager {
             })
     }
 
-    /// Get the database handle
+    #[cfg(test)]
+    pub(crate) fn set_native_pre_git_gate_for_test(
+        &self,
+        conversation_id: &str,
+        gate: impl FnOnce() + Send + 'static,
+    ) {
+        let previous = self
+            .native_pre_git_gates
+            .lock()
+            .unwrap()
+            .insert(conversation_id.to_owned(), Box::new(gate));
+        assert!(
+            previous.is_none(),
+            "native pre-Git test gate already installed"
+        );
+    }
+
     pub(crate) async fn mutation_admission(
         &self,
         conversation_id: &str,
@@ -10938,7 +11056,7 @@ mod scope_liveness_tests {
         conversation_id: &str,
     ) -> (
         mpsc::Receiver<Event>,
-        mpsc::Receiver<AcknowledgedEventRequest>,
+        mpsc::Receiver<AcknowledgedRuntimeRequest>,
     ) {
         let (event_tx, event_rx) = mpsc::channel(4);
         let (acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(4);
@@ -11162,6 +11280,7 @@ mod scope_liveness_tests {
             .await
             .unwrap()
             .unwrap();
+        let request = request.into_event();
         assert!(matches!(request.event, Event::UserCancel { .. }));
         assert_controller_fenced(&manager, &owner, child_id).await;
         assert!(!cancel.is_finished(), "runtime settlement remains required");
@@ -11313,6 +11432,7 @@ mod scope_liveness_tests {
             .await
             .expect("ordinary child cancellation reaches acknowledged dispatch")
             .unwrap();
+        let request = request.into_event();
         assert!(manager
             .bash_handles()
             .reserve_spawn_for_controller(
@@ -12349,7 +12469,7 @@ mod scope_liveness_tests {
     async fn insert_acknowledged_idle_handle(
         manager: &RuntimeManager,
         conversation_id: &str,
-    ) -> mpsc::Receiver<AcknowledgedEventRequest> {
+    ) -> mpsc::Receiver<AcknowledgedRuntimeRequest> {
         let (event_tx, _event_rx) = mpsc::channel(1);
         let (acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
         let (_state_tx, state_rx) = watch::channel(ConvState::Idle);
@@ -12384,15 +12504,16 @@ mod scope_liveness_tests {
                     .await
             })
         };
-        let AcknowledgedEventRequest {
-            acknowledgement, ..
-        } = tokio::time::timeout(
+        let request = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             acknowledged_event_rx.recv(),
         )
         .await
         .expect("runtime event delivery must not hang")
         .expect("event must reach the runtime settlement channel");
+        let AcknowledgedEventRequest {
+            acknowledgement, ..
+        } = request.into_event();
         assert!(!sender.is_finished(), "channel admission is not success");
         drop(acknowledgement);
         assert_eq!(
@@ -16034,6 +16155,7 @@ mod scope_liveness_tests {
             title: "Example".into(),
             priority: phoenix_core::task_source::Priority::P1,
             plan: "Review".into(),
+            reviewed_proposal: None,
         };
         manager
             .db()

@@ -1149,6 +1149,7 @@ mod tests {
                 title: "t".into(),
                 priority: crate::task_source::Priority::P1,
                 plan: "plan".into(),
+                reviewed_proposal: None,
             },
             ConvState::AwaitingUserResponse {
                 questions: vec![],
@@ -1628,6 +1629,9 @@ pub enum ConvState {
         title: String,
         priority: crate::task_source::Priority,
         plan: String,
+        // owned: pre-capture pending rows have no occurrence; absence is ineligible for native approval.
+        #[serde(default)]
+        reviewed_proposal: Option<crate::domain::task_approval::ReviewedProposal>,
     },
 
     /// Awaiting user answers to clarifying questions (REQ-AUQ-001).
@@ -1747,6 +1751,7 @@ pub enum ParentState {
         title: String,
         priority: crate::task_source::Priority,
         plan: String,
+        reviewed_proposal: Option<crate::domain::task_approval::ReviewedProposal>,
     },
     AwaitingUserResponse {
         questions: Vec<UserQuestion>,
@@ -1801,11 +1806,13 @@ impl From<ParentState> for ConvState {
                 title,
                 priority,
                 plan,
+                reviewed_proposal,
             } => ConvState::AwaitingTaskApproval {
                 task_file,
                 title,
                 priority,
                 plan,
+                reviewed_proposal,
             },
             ParentState::AwaitingUserResponse {
                 questions,
@@ -2028,11 +2035,13 @@ impl TryFrom<ConvState> for ParentState {
                 title,
                 priority,
                 plan,
+                reviewed_proposal,
             } => Ok(ParentState::AwaitingTaskApproval {
                 task_file,
                 title,
                 priority,
                 plan,
+                reviewed_proposal,
             }),
             ConvState::AwaitingUserResponse {
                 questions,

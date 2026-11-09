@@ -705,6 +705,7 @@ mod tests {
                     title: "Example".into(),
                     priority: phoenix_core::task_source::Priority::P1,
                     plan: "Review".into(),
+                    reviewed_proposal: None,
                 },
             ),
         ] {

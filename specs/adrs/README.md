@@ -38,6 +38,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [244](244_native-task-approval-source-snapshot-and-receipt.md) | Bind native task approval to canonical source, snapshot and receipt | Proposed | REQ-TAT-001–008; REQ-PROJ-003; REQ-BED-028/046; REQ-COMP-001/002; REQ-DWF-043 |
 | [242](242_execution-bound-own-goal-creation-and-enable.md) | Execution-bound own Goal creation and explicit continuation enable | Accepted | REQ-SGT-001–008; REQ-GOAL-AC-001–004 |
 | [230](230_simplify-macos-deployment-to-candidate-migration-and-manual-recovery.md) | Simplify macOS deployment to candidate migration and manual recovery | Accepted | REQ-LDD-001–032, REQ-PD-031, REQ-COMP-021, REQ-SDC-001–023, REQ-RU-008 |
 | [208](208_codex-reset-credits-are-manual-and-resume-the-stopped-conversation.md) | Codex reset credits are redeemed manually through a Phoenix proxy, and a redemption from the quota error resumes that conversation | Accepted | REQ-CRR-001–010 |

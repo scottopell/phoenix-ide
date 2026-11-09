@@ -1,0 +1,43 @@
+name: Set up verified sccache
+description: Fetch the qualified Mozilla release through gh before upstream tool-cache setup.
+runs:
+  using: composite
+  steps:
+    - name: Fetch and verify canonical sccache release
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        test "$RUNNER_OS/$RUNNER_ARCH" = Linux/X64
+        version=0.19.0
+        archive="sccache-v${version}-x86_64-unknown-linux-musl.tar.gz"
+        stage=$(mktemp -d "$RUNNER_TEMP/phoenix-sccache.XXXXXX")
+        trap 'rm -rf "$stage"' EXIT
+        # gh uses the canonical GitHub release API asset route, not a mirror.
+        # The browser asset URL intermittently returned 504 before compiler startup.
+        gh release download "v${version}" --repo mozilla/sccache \
+          --pattern "$archive" --pattern "$archive.sha256" --dir "$stage"
+        cd "$stage"
+        printf '%s  %s\n' "$(cat "$archive.sha256")" "$archive" | sha256sum --check --strict
+        printf '%s  %s\n' \
+          aa73c7270c997894038c0d8f0d297865f57569e1687883322bc431713d4bb9dd \
+          "$archive" | sha256sum --check --strict
+        tar -xzf "$archive"
+        # @actions/tool-cache's documented layout and completion marker; the
+        # upstream action's find('sccache', version) consumes this verified install.
+        destination="$RUNNER_TOOL_CACHE/sccache/$version/x64"
+        test ! -e "$destination"
+        test ! -e "$destination.complete"
+        mkdir -p "$(dirname "$destination")"
+        mv "sccache-v${version}-x86_64-unknown-linux-musl" "$destination"
+        touch "$destination.complete"
+    - name: Configure upstream sccache action
+      uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      with:
+        version: v0.19.0
+    - name: Verify installed executable
+      shell: bash
+      run: |
+        set -euo pipefail
+        test "$(sccache --version)" = 'sccache 0.19.0'

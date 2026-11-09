@@ -3852,6 +3852,7 @@ async fn real_creation_wait_token_and_cancelled_cleanup_paths_never_add_terminal
         title: "approval".into(),
         priority: phoenix_core::task_source::Priority::P2,
         plan: "pending approval".into(),
+        reviewed_proposal: None,
     };
     f.db.settle_conversation_creation_runtime(
         &f.source.id,

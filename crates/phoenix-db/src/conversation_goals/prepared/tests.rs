@@ -323,6 +323,7 @@ async fn goal_preparation_migration_follows_conversation_tool_migrations() {
             (152, "goal_preparation_inflight_source".into()),
             (153, "close_writer_observations".into()),
             (155, "ordinary_self_goal_admission".into()),
+            (156, "native_task_approval_receipts".into()),
         ]
     );
 }

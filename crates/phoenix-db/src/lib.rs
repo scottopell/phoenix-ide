@@ -68,6 +68,7 @@ pub use product_conversation_rename::{
     ProductConversationRenameReceipt, ProductConversationRenameResult,
     ProductConversationRenameSource,
 };
+pub mod native_task_approval;
 mod product_conversation_read;
 pub mod retrieval;
 mod sqlite_native_statement;
@@ -75,6 +76,7 @@ mod sqlite_telemetry;
 mod sqlite_workload;
 mod sub_agent_lifecycle;
 mod sub_agent_summary;
+pub mod task_approval_inspection;
 pub mod workflow;
 pub use sub_agent_lifecycle::*;
 // The schema *types* (MessageContent, ToolResult, ConvState's persisted shape,
@@ -452,7 +454,9 @@ pub enum DbError {
     DormantGitRepositoryReadinessCatchupInProgress,
     #[error("dormant git repository readiness receipt targeted a different database lifecycle")]
     DormantGitRepositoryReadinessReceiptTargetMismatch,
-    #[error("dormant git repository readiness receipt did not match an exact completed catch-up operation")]
+    #[error(
+        "dormant git repository readiness receipt did not match an exact completed catch-up operation"
+    )]
     DormantGitRepositoryReadinessReceiptOperationMismatch,
 }
 
@@ -4638,8 +4642,8 @@ impl Database {
                         if values.0.as_ref() != *expected_scope {
                             tx.rollback().await?;
                             return Err(DbError::CloseFoundationConflict(format!(
-                            "parent conversation {parent_id} no longer owns captured WorkScope {expected_scope:?}"
-                        )));
+                                "parent conversation {parent_id} no longer owns captured WorkScope {expected_scope:?}"
+                            )));
                         }
                         values
                     }
@@ -9112,7 +9116,7 @@ impl Database {
             other => {
                 return Err(DbError::Serialization(format!(
                     "unknown WorkScope lifecycle: {other}"
-                )))
+                )));
             }
         };
         let environment = match environment.as_str() {
@@ -9142,7 +9146,7 @@ impl Database {
             other => {
                 return Err(DbError::Serialization(format!(
                     "unknown WorkScope environment kind: {other}"
-                )))
+                )));
             }
         };
         Ok((authority, lifecycle, environment))
@@ -9161,7 +9165,7 @@ impl Database {
             .persist_approved_task_authority_inner(conversation_id, approval, None)
             .await?
         {
-            crate::workflow::LocalAuthorityResult::DurableFactEstablished(()) => Ok(()),
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(_) => Ok(()),
             crate::workflow::LocalAuthorityResult::DurableFactUnclassified => {
                 Err(DbError::Serialization(
                     "approved-task authority commit is unclassified".to_string(),
@@ -9186,9 +9190,56 @@ impl Database {
         self.persist_approved_task_authority_inner(
             conversation_id,
             approval,
-            Some((approval_message, state, state_updated_at)),
+            Some(native_task_approval::ApprovalSettlement::User(
+                approval_message,
+                state,
+                state_updated_at,
+            )),
         )
         .await
+        .map(|result| native_task_approval::ApprovalFact::user_result(&result))
+    }
+
+    /// Settle native approval and return the immutable receipt proven inside the transaction.
+    ///
+    /// # Errors
+    /// Rejects changed source/target authority and database failures.
+    pub async fn persist_native_approved_task_authority_and_state(
+        &self,
+        command: &native_task_approval::NativeTaskApprovalCommand,
+        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        approval_message: &Message,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> DbResult<
+        crate::workflow::LocalAuthorityResult<native_task_approval::NativeTaskApprovalReceipt>,
+    > {
+        use crate::workflow::LocalAuthorityResult;
+        match self
+            .persist_approved_task_authority_inner(
+                &command.current_transcript_id,
+                approval,
+                Some(native_task_approval::ApprovalSettlement::Native(
+                    approval_message,
+                    state,
+                    state_updated_at,
+                    command,
+                )),
+            )
+            .await?
+        {
+            LocalAuthorityResult::DurableFactEstablished(
+                native_task_approval::ApprovalFact::Native(receipt),
+            ) => Ok(LocalAuthorityResult::DurableFactEstablished(receipt)),
+            LocalAuthorityResult::DurableFactEstablished(
+                native_task_approval::ApprovalFact::User,
+            ) => Err(DbError::Serialization(
+                "native settlement returned a user fact".into(),
+            )),
+            LocalAuthorityResult::DurableFactUnclassified => {
+                Ok(LocalAuthorityResult::DurableFactUnclassified)
+            }
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -9196,11 +9247,13 @@ impl Database {
         &self,
         conversation_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
-        settlement: Option<(&Message, &ConvState, DateTime<Utc>)>,
-    ) -> DbResult<crate::workflow::LocalAuthorityResult<()>> {
+        settlement: Option<native_task_approval::ApprovalSettlement<'_>>,
+    ) -> DbResult<crate::workflow::LocalAuthorityResult<native_task_approval::ApprovalFact>> {
         let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
         let priority = serde_json::to_string(&snapshot.priority)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let native_command = settlement.and_then(native_task_approval::ApprovalSettlement::native);
+        let settlement = settlement.map(native_task_approval::ApprovalSettlement::state);
         let settlement_identity = settlement
             .map(|(message, state, updated_at)| {
                 Ok::<_, DbError>((
@@ -9214,6 +9267,25 @@ impl Database {
             .transpose()?;
         let now_us = Utc::now().timestamp_micros();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let (Some(command), Some((message, state, _))) = (native_command, settlement) {
+            if let Some(receipt) = native_task_approval::prepare_tx(
+                &mut tx,
+                command,
+                conversation_id,
+                &snapshot,
+                message,
+                state,
+            )
+            .await?
+            {
+                tx.rollback().await?;
+                return Ok(
+                    crate::workflow::LocalAuthorityResult::DurableFactEstablished(
+                        native_task_approval::ApprovalFact::Native(receipt),
+                    ),
+                );
+            }
+        }
         let work_scope_id: Option<String> =
             sqlx::query_scalar("SELECT work_scope_id FROM conversations WHERE id = ?1")
                 .bind(conversation_id)
@@ -9271,6 +9343,7 @@ impl Database {
         .bind(work_scope_id)
         .execute(&mut *tx)
         .await?;
+        let mut fact = native_task_approval::ApprovalFact::User;
         if let Some((approval_message, state, state_updated_at)) = settlement {
             insert_message_tx(&mut tx, approval_message).await?;
             sqlx::query(
@@ -9297,9 +9370,15 @@ impl Database {
             .bind(conversation_id)
             .execute(&mut *tx)
             .await?;
+            if let Some(command) = native_command {
+                fact = native_task_approval::ApprovalFact::Native(
+                    native_task_approval::insert_receipt_tx(&mut tx, command, approval_message)
+                        .await?,
+                );
+            }
         }
         match tx.commit().await {
-            Ok(()) => Ok(crate::workflow::LocalAuthorityResult::DurableFactEstablished(())),
+            Ok(()) => Ok(crate::workflow::LocalAuthorityResult::DurableFactEstablished(fact)),
             Err(commit_error) => {
                 let Some((message_id, expected_state, expected_kind, expected_updated_at)) =
                     settlement_identity
@@ -9330,7 +9409,21 @@ impl Database {
                 .await;
                 match established {
                     Ok(true) => {
-                        Ok(crate::workflow::LocalAuthorityResult::DurableFactEstablished(()))
+                        if let (Some(command), Some((message, _, _))) = (native_command, settlement)
+                        {
+                            match native_task_approval::receipt_established(
+                                self, command, &snapshot, message,
+                            )
+                            .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => return Err(commit_error.into()),
+                                Err(_) => return Ok(
+                                    crate::workflow::LocalAuthorityResult::DurableFactUnclassified,
+                                ),
+                            }
+                        }
+                        Ok(crate::workflow::LocalAuthorityResult::DurableFactEstablished(fact))
                     }
                     Ok(false) => Err(commit_error.into()),
                     Err(_) => Ok(crate::workflow::LocalAuthorityResult::DurableFactUnclassified),
@@ -11231,7 +11324,7 @@ impl Database {
                     _ => {
                         return Err(DbError::Serialization(
                             "Candidate has invalid source revision".to_string(),
-                        ))
+                        ));
                     }
                 };
                 let origin = match row.get::<&str, _>("origin") {
@@ -11246,7 +11339,7 @@ impl Database {
                         ContinuationSourceRevision::ExhaustedState { .. } => {
                             return Err(DbError::Serialization(
                                 "Oversized summary lacks operation revision".to_string(),
-                            ))
+                            ));
                         }
                     },
                     "ai_shortening" => ContinuationCandidateOrigin::AiShortening { revision },
@@ -11254,7 +11347,7 @@ impl Database {
                     other => {
                         return Err(DbError::Serialization(format!(
                             "Unknown candidate origin {other}"
-                        )))
+                        )));
                     }
                 };
                 Ok(ContinuationHandoffCandidate {
@@ -11275,7 +11368,7 @@ impl Database {
                         (Some(_), Some(_)) => {
                             return Err(DbError::Serialization(
                                 "Candidate has conflicting sources".to_string(),
-                            ))
+                            ));
                         }
                     },
                     text: row.get("candidate_text"),
@@ -13139,7 +13232,7 @@ impl Database {
                     value => {
                         return Err(DbError::Serialization(format!(
                             "unknown startup parent action {value}"
-                        )))
+                        )));
                     }
                 };
                 Ok(StartupParentActionRecord {
@@ -19513,7 +19606,10 @@ mod tests {
             "SELECT server_name, resource_uri, scopes, expires_at FROM mcp_oauth_tokens",
             "SELECT id, caller_instance_id, caller_display_name, created_at_us, revoked_at_us FROM federation_enrollments",
         ] {
-            assert!(!db.coordinator_query(sql).await.unwrap().rows.is_empty(), "{sql}");
+            assert!(
+                !db.coordinator_query(sql).await.unwrap().rows.is_empty(),
+                "{sql}"
+            );
         }
     }
 
@@ -24176,8 +24272,10 @@ mod tests {
                         .take_native_statement_shapes_for_test(),
                 );
                 assert!(small_tail_steps > 0);
-                assert!(large_tail_steps <= small_tail_steps + 32,
-                    "tail work grew with 64 older parents: {small_tail_steps} -> {large_tail_steps} VM steps");
+                assert!(
+                    large_tail_steps <= small_tail_steps + 32,
+                    "tail work grew with 64 older parents: {small_tail_steps} -> {large_tail_steps} VM steps"
+                );
             }
             db.pool()
                 .acquire()
@@ -25804,6 +25902,7 @@ mod tests {
             title: "Fix the widget".to_string(),
             priority: phoenix_core::task_source::Priority::P1,
             plan: "Step 1: read code\nStep 2: fix bug".to_string(),
+            reviewed_proposal: None,
         };
         db.update_conversation_state("conv-1", &approval_state)
             .await
@@ -25822,6 +25921,7 @@ mod tests {
             title,
             priority,
             plan,
+            ..
         } = conv_after.state
         {
             assert_eq!(task_file, "tasks/12345-p1-ready--fix-the-widget.md");
@@ -29694,6 +29794,7 @@ mod tests {
             title: "Rollback".to_string(),
             priority: phoenix_core::task_source::Priority::P1,
             plan: "reviewed".to_string(),
+            reviewed_proposal: None,
         };
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2 WHERE id = 'handoff-parent'",

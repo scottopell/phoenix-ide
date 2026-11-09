@@ -33,6 +33,7 @@ pub mod retry_policy;
 pub mod skill_invocation;
 pub mod sm_event;
 pub mod sm_state;
+pub mod task_approval;
 pub mod tool_availability;
 pub mod tool_result_identity;
 pub mod tool_round;

@@ -3818,6 +3818,7 @@ mod tests {
                 title: "Close".to_string(),
                 priority: phoenix_core::task_source::Priority::P1,
                 plan: "plan".to_string(),
+                reviewed_proposal: None,
             },
         )
         .await
