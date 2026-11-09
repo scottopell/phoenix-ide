@@ -68,6 +68,7 @@ pub use product_conversation_rename::{
     ProductConversationRenameReceipt, ProductConversationRenameResult,
     ProductConversationRenameSource,
 };
+mod native_task_approval;
 mod product_conversation_read;
 pub mod retrieval;
 mod sqlite_native_statement;
@@ -9189,7 +9190,11 @@ impl Database {
         self.persist_approved_task_authority_inner(
             conversation_id,
             approval,
-            Some((approval_message, state, state_updated_at)),
+            Some(native_task_approval::ApprovalSettlement::User(
+                approval_message,
+                state,
+                state_updated_at,
+            )),
         )
         .await
     }
@@ -9199,11 +9204,13 @@ impl Database {
         &self,
         conversation_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
-        settlement: Option<(&Message, &ConvState, DateTime<Utc>)>,
+        settlement: Option<native_task_approval::ApprovalSettlement<'_>>,
     ) -> DbResult<crate::workflow::LocalAuthorityResult<()>> {
         let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
         let priority = serde_json::to_string(&snapshot.priority)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let native_command = settlement.and_then(native_task_approval::ApprovalSettlement::native);
+        let settlement = settlement.map(native_task_approval::ApprovalSettlement::state);
         let settlement_identity = settlement
             .map(|(message, state, updated_at)| {
                 Ok::<_, DbError>((
@@ -9217,6 +9224,21 @@ impl Database {
             .transpose()?;
         let now_us = Utc::now().timestamp_micros();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let (Some(command), Some((message, state, _))) = (native_command, settlement) {
+            if native_task_approval::prepare_tx(
+                &mut tx,
+                command,
+                conversation_id,
+                &snapshot,
+                message,
+                state,
+            )
+            .await?
+            {
+                tx.rollback().await?;
+                return Ok(crate::workflow::LocalAuthorityResult::DurableFactEstablished(()));
+            }
+        }
         let work_scope_id: Option<String> =
             sqlx::query_scalar("SELECT work_scope_id FROM conversations WHERE id = ?1")
                 .bind(conversation_id)
@@ -9300,6 +9322,9 @@ impl Database {
             .bind(conversation_id)
             .execute(&mut *tx)
             .await?;
+            if let Some(command) = native_command {
+                native_task_approval::insert_receipt_tx(&mut tx, command, approval_message).await?;
+            }
         }
         match tx.commit().await {
             Ok(()) => Ok(crate::workflow::LocalAuthorityResult::DurableFactEstablished(())),
@@ -9333,6 +9358,20 @@ impl Database {
                 .await;
                 match established {
                     Ok(true) => {
+                        if let (Some(command), Some((message, _, _))) = (native_command, settlement)
+                        {
+                            match native_task_approval::receipt_established(
+                                self, command, &snapshot, message,
+                            )
+                            .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => return Err(commit_error.into()),
+                                Err(_) => return Ok(
+                                    crate::workflow::LocalAuthorityResult::DurableFactUnclassified,
+                                ),
+                            }
+                        }
                         Ok(crate::workflow::LocalAuthorityResult::DurableFactEstablished(()))
                     }
                     Ok(false) => Err(commit_error.into()),

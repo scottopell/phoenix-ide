@@ -46,3 +46,40 @@ revalidation remain NOT DONE. Local validation is scoped direct installed 1.95
 rustfmt (edition 2021, skip children) and static diff review only. No local
 Cargo/rustc/build/tests/install/codegen was run. Hosted exact-head checks are
 required and pending; tests are authored, not claimed passed.
+
+## Bounded Part B: private atomic DB receipt foundation
+
+The DB-only sibling leaf adds normalized immutable source-call occurrence and
+receipt tables in migration 156, after local 155. The receipt references the exact
+source key, full target owner/transcript, canonical proposal/message witness and
+approval context message; it stores no body/path/pending snapshot and has no FK to
+the mutable continuation obligation. Live source assistant rows remain absent.
+
+A private user/native settlement sum shares the existing authority transaction.
+Native settlement proves current Coordinator plus exact live source typed input
+and assistant block before receipt lookup, checks exact replay/conflict before
+requiring target pending state, then inserts source/receipt in the same transaction
+as all existing objective/scope/message/obligation/state writes. Native commit-error
+classification additionally requires the exact receipt and snapshot/message facts.
+No public native DB API, source-proof-bypassing receipt lookup, tool registration,
+Git effect, actor integration or application-level Committed outcome is enabled.
+
+Fourteen DB regression tests are authored for success with canonical target
+checkpoints and absent source messages, all-write-stage trigger rollback, live
+exact replay, changed identity, invalid/historical/cancelling/non-Coordinator
+source policy, duplicate proposals, immutable/FK/foreign ownership constraints,
+receipt-aware commit proof, queue independence and unchanged user approval.
+**NOT RUN locally**: owner forbids local compiler/build/test/install/codegen.
+Only scoped installed 1.95 rustfmt (edition 2021, skip children) and git diff checks
+were run. Exact-head hosted CI is required; no green test claim is made here.
+
+Remaining: finalized/canonical source replay policy (private helper currently
+requires the exact live ToolExecuting call), actual pre-Git actor revalidation,
+Stop/lifecycle/authority/effect ordering, Git admission, fail-stop and typed public
+outcomes. Idle-state DB replay is not a runtime Stop-latch test. This is not full B.
+The shared integration-owner seam is not released. No worktree, production,
+factory, runtime/executor/API, registration, Close or build-hold changes.
+
+Integration risk: Federation has an unpublished migration 156 reserved in another
+checkout. Renumber one leaf and its ledger assertions before integrating both;
+this leaf does not modify that checkout.

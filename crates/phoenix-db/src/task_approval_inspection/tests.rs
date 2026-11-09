@@ -339,7 +339,9 @@ async fn missing_or_foreign_receipt_and_missing_or_foreign_message_remain_inspec
             ProposalIntegrityFailure::MissingCanonicalReceipt,
         ),
         (
-            "UPDATE messages SET conversation_id=?2,sequence_id=1009 WHERE conversation_id=?1",
+            "UPDATE messages SET conversation_id=?2,sequence_id=(
+                SELECT COALESCE(MAX(sequence_id), 0) + 1 FROM messages WHERE conversation_id=?2
+            ) WHERE conversation_id=?1",
             ProposalIntegrityFailure::ProposalMismatch,
         ),
     ] {

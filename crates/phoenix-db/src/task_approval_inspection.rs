@@ -91,7 +91,14 @@ impl Database {
                 .await?;
         let source_state: ConvState = serde_json::from_str(&state_json)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
-        require_executing_source(&source_state, source_call, input)?;
+        let requested = serde_json::to_value(input)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        require_executing_source(
+            &source_state,
+            source_call,
+            INSPECT_PENDING_TASK_TOOL_NAME,
+            &requested,
+        )?;
 
         let aggregate = Self::get_ordinary_product_conversation_on(&mut tx, &input.target).await?;
         let current = aggregate
@@ -137,7 +144,7 @@ impl Database {
     }
 }
 
-async fn proposal_availability_tx(
+pub(super) async fn proposal_availability_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     target_transcript: &str,
     state: &ConvState,
@@ -185,14 +192,15 @@ async fn proposal_availability_tx(
 
 fn invalid_source() -> DbError {
     DbError::MessageConflict(
-        "pending-task inspection requires the exact executing source occurrence and payload".into(),
+        "native task command requires the exact executing source occurrence and payload".into(),
     )
 }
 
-fn require_executing_source(
+pub(super) fn require_executing_source(
     state: &ConvState,
     source: &SourceToolCall,
-    input: &InspectPendingTaskInput,
+    tool_name: &str,
+    requested: &serde_json::Value,
 ) -> DbResult<()> {
     let ConvState::ToolExecuting {
         current_tool,
@@ -208,7 +216,7 @@ fn require_executing_source(
         || source.tool_use_id.trim().is_empty()
         || assistant_message.message_id != source.message_id
         || current_tool.id != source.tool_use_id
-        || current_tool.name() != INSPECT_PENDING_TASK_TOOL_NAME
+        || current_tool.name() != tool_name
         || remaining_tools
             .iter()
             .any(|tool| tool.id == source.tool_use_id)
@@ -218,8 +226,6 @@ fn require_executing_source(
     {
         return Err(invalid_source());
     }
-    let requested =
-        serde_json::to_value(input).map_err(|error| DbError::Serialization(error.to_string()))?;
     let executing = current_tool.input.to_value();
     let mut occurrences = assistant_message.content.iter().filter_map(|block| {
         if let ContentBlock::ToolUse { id, name, input } = block {
@@ -232,9 +238,9 @@ fn require_executing_source(
         return Err(invalid_source());
     };
     if occurrences.next().is_some()
-        || name != INSPECT_PENDING_TASK_TOOL_NAME
+        || name != tool_name
         || canonical != &executing
-        || canonical != &requested
+        || canonical != requested
     {
         return Err(invalid_source());
     }
