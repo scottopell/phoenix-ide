@@ -58,17 +58,21 @@ JSON). An ordinary indexed `message_fts_rows` table is the sole owner of
 chunk provenance and content fingerprints and maps them to FTS rowids;
 scope filtering and maintenance use its B-tree indexes while ranking and
 snippets use FTS text. Both tables form a single **derived cache** over
-the `messages` table (the source of truth): they
-are kept current atomically on message persistence, reconciled by an
-idempotent startup backfill, and can be rebuilt from `messages` at any
-time. Their schema and backfills are introduced through migrations.
+the `messages` table (the source of truth): some writes update the index
+atomically with message persistence, while post-commit upserts read the
+source hidden state under their own write transaction. An idempotent
+startup backfill reconciles missing or changed index rows, and the index
+can be rebuilt from `messages`. Until repair, stale indexed text can
+produce a hidden-message search hit: ranked search deliberately trusts
+the index instead of checking source `display_data` for every candidate.
+Their schema and backfills are introduced through migrations.
 
 Retrieval is exposed behind a `MessageRetriever` trait. The first
 backend is FTS5/BM25 (lexical), chosen because the bundled SQLite ships
 FTS5 with bounded query-side Porter suffix handling — no embedding provider and no
 network on the query path. The trait is the seam: a vector backend (embeddings +
 similarity) or a hybrid backend (rank-fused lexical + vector) drops in
-behind it without changing any caller. Scope is an enum (`Conversations(set)` / `Global` / `GlobalExcluding(set)`) and the typed request also selects visibility, result grouping, and lexical match mode. Scope and visibility are applied as query predicates, and best-per-conversation grouping is applied in SQL before the final limit, so the requested bound is honored after all eligibility and grouping rules.
+behind it without changing any caller. Scope is an enum (`Conversations(set)` / `Global` / `GlobalExcluding(set)`) and the typed request also selects visibility, result grouping, and lexical match mode. Scope and top-level-conversation eligibility are applied as query predicates; hidden messages are represented by empty indexed text. Best-per-conversation grouping is applied in SQL before the final limit, so the requested bound is honored after indexed eligibility and grouping rules.
 
 Chain Q&A consumes this primitive as a **read-only agent loop**, not a
 one-shot bundle: the agent is given a search tool (this primitive, scoped
