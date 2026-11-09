@@ -1125,7 +1125,7 @@ final class ConversationSession {
                 ).map(\.message_id)))
     }
 
-    private func rebuildToolUseIndex() {
+    nonisolated static func toolUseIndex(for messages: [Message]) -> [String: ToolUseRef] {
         var index: [String: ToolUseRef] = [:]
         for message in messages where message.message_type == "agent" {
             guard let blocks = message.content.arrayValue else { continue }
@@ -1136,13 +1136,17 @@ final class ConversationSession {
                 index[id] = ToolUseRef(name: name, input: block["input"])
             }
         }
-        toolUseIndex = index
+        return index
+    }
+
+    private func rebuildToolUseIndex() {
+        toolUseIndex = Self.toolUseIndex(for: messages)
     }
 }
 
 /// The identity of a tool invocation, joined from an agent message's
 /// tool_use block to the tool result that answers it.
-struct ToolUseRef: Equatable {
+struct ToolUseRef: Equatable, Sendable {
     var name: String
     var input: JSONValue?
 }
