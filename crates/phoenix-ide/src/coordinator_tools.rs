@@ -268,12 +268,14 @@ impl Tool for PreviousTranscriptsTool {
             };
             return ToolOutput::error(format!("Invalid previous_transcripts request: {guidance}."));
         };
-        if let PreviousTranscriptsRequest::Search { query } = &request {
-            if query.trim().is_empty() || query.chars().count() > 1024 {
-                return ToolOutput::error(
-                    "Invalid previous_transcripts request: search requires a nonblank query of at most 1024 characters.",
-                );
-            }
+        if matches!(
+            &request,
+            PreviousTranscriptsRequest::Search { query }
+                if query.trim().is_empty() || query.chars().count() > 1024
+        ) {
+            return ToolOutput::error(
+                "Invalid previous_transcripts request: search requires a nonblank query of at most 1024 characters.",
+            );
         }
         let result = self
             .service
