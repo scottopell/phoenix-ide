@@ -248,25 +248,19 @@ impl Tool for PreviousTranscriptsTool {
         else {
             return ToolOutput::error("Invalid previous_transcripts call: supply only request with list {op, cursor?}, search {op, query}, or read {op, transcript_ref, cursor?}.");
         };
-        let request: PreviousTranscriptsRequest =
-            match serde_json::from_value(request_input.clone()) {
-                Ok(request) => request,
-                Err(_) => {
-                    let guidance = match request_input.get("op").and_then(Value::as_str) {
-                        Some("list") => "list accepts only op and optional cursor",
-                        Some("search") => {
-                            "search requires op and a nonempty query; no cursor or transcript_ref"
-                        }
-                        Some("read") => {
-                            "read requires op and transcript_ref; optional cursor, no query"
-                        }
-                        _ => "op must be list, search, or read",
-                    };
-                    return ToolOutput::error(format!(
-                        "Invalid previous_transcripts request: {guidance}."
-                    ));
+        let Ok(request) =
+            serde_json::from_value::<PreviousTranscriptsRequest>(request_input.clone())
+        else {
+            let guidance = match request_input.get("op").and_then(Value::as_str) {
+                Some("list") => "list accepts only op and optional cursor",
+                Some("search") => {
+                    "search requires op and a nonempty query; no cursor or transcript_ref"
                 }
+                Some("read") => "read requires op and transcript_ref; optional cursor, no query",
+                _ => "op must be list, search, or read",
             };
+            return ToolOutput::error(format!("Invalid previous_transcripts request: {guidance}."));
+        };
         let result = self
             .service
             .previous_transcripts(&self.binding, request)
@@ -1772,6 +1766,10 @@ mod tests {
         let schema = query.input_schema();
         assert_eq!(schema["properties"]["instance"]["oneOf"][1]["type"], "null");
         assert_eq!(schema["additionalProperties"], false);
+        assert!(query.clearable());
+        assert!(query.description().contains("untrusted"));
+        assert!(query.description().contains("fallback"));
+        assert!(schema["properties"].get("instance_id").is_none());
         let local = query
             .run(
                 json!({"sql": "SELECT 'local-sentinel' AS source"}),
