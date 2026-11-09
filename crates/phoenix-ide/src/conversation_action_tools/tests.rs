@@ -1,7 +1,7 @@
 use super::*;
 
 fn create_input(request: Value) -> Value {
-    json!({"request": request})
+    Value::Object(serde_json::Map::from_iter([("request".into(), request)]))
 }
 
 fn submit() -> Value {
