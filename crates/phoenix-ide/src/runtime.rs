@@ -279,6 +279,28 @@ pub(crate) struct AcknowledgedEventRequest {
     pub retirement: tokio::sync::oneshot::Receiver<()>,
 }
 
+pub(crate) enum AcknowledgedRuntimeRequest {
+    Event(AcknowledgedEventRequest),
+    InspectNativeTaskApprovalAdmission {
+        expected: task_approval_admission::FrozenPendingTask,
+        response: tokio::sync::oneshot::Sender<
+            Result<task_approval_admission::NativeTaskAdmissionReadiness, String>,
+        >,
+    },
+}
+
+mod task_approval_admission;
+
+#[cfg(test)]
+impl AcknowledgedRuntimeRequest {
+    fn into_event(self) -> AcknowledgedEventRequest {
+        match self {
+            Self::Event(event) => event,
+            Self::InspectNativeTaskApprovalAdmission { .. } => panic!("expected event request"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HandoffCapacityStatus {
@@ -915,7 +937,7 @@ type SharedStartupLlmRecoveryReceipt = Arc<AsyncMutex<Option<StartupLlmRecoveryR
 #[derive(Clone)]
 pub struct ConversationHandle {
     pub event_tx: mpsc::Sender<Event>,
-    pub(crate) acknowledged_event_tx: mpsc::Sender<AcknowledgedEventRequest>,
+    pub(crate) acknowledged_event_tx: mpsc::Sender<AcknowledgedRuntimeRequest>,
     handoff_review_tx: Option<mpsc::Sender<HandoffReviewRequest>>,
     /// Turn-trigger slot shared with this conversation's executor (see
     /// [`TurnTriggerSlot`]). Event senders deposit the ambient span here so
@@ -6575,6 +6597,7 @@ impl RuntimeManager {
         );
         let runtime = runtime
             .with_acknowledged_event_receiver(acknowledged_event_rx)
+            .with_native_task_admission_database(self.db.clone())
             .with_handoff_review_receiver(handoff_review_rx);
 
         let runtime = runtime
@@ -6984,6 +7007,34 @@ impl RuntimeManager {
             .map(|_| ())
     }
 
+    /// Readiness at the owning actor, not approval authority or an effect reservation.
+    #[allow(dead_code)]
+    pub(crate) async fn check_native_task_approval_admission(
+        self: &Arc<Self>,
+        expected: task_approval_admission::FrozenPendingTask,
+    ) -> Result<task_approval_admission::NativeTaskAdmissionReadiness, String> {
+        let admission = self
+            .mutation_admission(expected.transcript_id())
+            .await
+            .map_err(|error| error.to_string())?;
+        let _guard = admission.lock().await;
+        let handle = self.get_or_create(expected.transcript_id()).await?;
+        let (response, result) = tokio::sync::oneshot::channel();
+        handle
+            .acknowledged_event_tx
+            .send(
+                AcknowledgedRuntimeRequest::InspectNativeTaskApprovalAdmission {
+                    expected,
+                    response,
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        result
+            .await
+            .map_err(|_| "runtime stopped before native task admission check".to_string())?
+    }
+
     async fn send_acknowledged_event(
         self: &Arc<Self>,
         conversation_id: &str,
@@ -7005,11 +7056,13 @@ impl RuntimeManager {
         let (retirement_tx, retirement_rx) = tokio::sync::oneshot::channel();
         handle
             .acknowledged_event_tx
-            .send(AcknowledgedEventRequest {
-                event,
-                acknowledgement: ack_tx,
-                retirement: retirement_rx,
-            })
+            .send(AcknowledgedRuntimeRequest::Event(
+                AcknowledgedEventRequest {
+                    event,
+                    acknowledgement: ack_tx,
+                    retirement: retirement_rx,
+                },
+            ))
             .await
             .map_err(|error| error.to_string())?;
         let outcome = ack_rx
@@ -7241,11 +7294,13 @@ impl RuntimeManager {
         let (_retirement_tx, retirement_rx) = tokio::sync::oneshot::channel();
         handle
             .acknowledged_event_tx
-            .send(AcknowledgedEventRequest {
-                event: Event::UserTriggerContinuation { operation_id },
-                acknowledgement: ack_tx,
-                retirement: retirement_rx,
-            })
+            .send(AcknowledgedRuntimeRequest::Event(
+                AcknowledgedEventRequest {
+                    event: Event::UserTriggerContinuation { operation_id },
+                    acknowledgement: ack_tx,
+                    retirement: retirement_rx,
+                },
+            ))
             .await
             .map_err(|error| format!("Failed to send continuation admission: {error}"))?;
         ack_rx
@@ -10951,7 +11006,7 @@ mod scope_liveness_tests {
         conversation_id: &str,
     ) -> (
         mpsc::Receiver<Event>,
-        mpsc::Receiver<AcknowledgedEventRequest>,
+        mpsc::Receiver<AcknowledgedRuntimeRequest>,
     ) {
         let (event_tx, event_rx) = mpsc::channel(4);
         let (acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(4);
@@ -11175,6 +11230,7 @@ mod scope_liveness_tests {
             .await
             .unwrap()
             .unwrap();
+        let request = request.into_event();
         assert!(matches!(request.event, Event::UserCancel { .. }));
         assert_controller_fenced(&manager, &owner, child_id).await;
         assert!(!cancel.is_finished(), "runtime settlement remains required");
@@ -11326,6 +11382,7 @@ mod scope_liveness_tests {
             .await
             .expect("ordinary child cancellation reaches acknowledged dispatch")
             .unwrap();
+        let request = request.into_event();
         assert!(manager
             .bash_handles()
             .reserve_spawn_for_controller(
@@ -12362,7 +12419,7 @@ mod scope_liveness_tests {
     async fn insert_acknowledged_idle_handle(
         manager: &RuntimeManager,
         conversation_id: &str,
-    ) -> mpsc::Receiver<AcknowledgedEventRequest> {
+    ) -> mpsc::Receiver<AcknowledgedRuntimeRequest> {
         let (event_tx, _event_rx) = mpsc::channel(1);
         let (acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
         let (_state_tx, state_rx) = watch::channel(ConvState::Idle);
@@ -12397,15 +12454,16 @@ mod scope_liveness_tests {
                     .await
             })
         };
-        let AcknowledgedEventRequest {
-            acknowledgement, ..
-        } = tokio::time::timeout(
+        let request = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             acknowledged_event_rx.recv(),
         )
         .await
         .expect("runtime event delivery must not hang")
         .expect("event must reach the runtime settlement channel");
+        let AcknowledgedEventRequest {
+            acknowledgement, ..
+        } = request.into_event();
         assert!(!sender.is_finished(), "channel admission is not success");
         drop(acknowledgement);
         assert_eq!(

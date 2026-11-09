@@ -22,3 +22,27 @@ Policy selection is resolved. Authorized scope includes slice A foundations and 
 - Eight focused tests written: real persisted ToolExecuting/no finalized source row; exact readonly aggregate; legacy versus no pending; target continuation; source mismatch matrix; current versus historical Coordinator continuation; request/identity/head gate failures; finalized-row non-rescue; validated-owner input. Read-only tests compare all persisted table contents.
 - Validation: tests NOT RUN locally as instructed; direct installed new-file-only rustfmt and static diff checks only. Hosted compile/clippy/tests for this leaf are pending after push. Prior Part A head `05dcca22` passed hosted clippy; other prior lanes were pending at handoff.
 - Explicit unfinished gates: full Part B actor and receipts/replay (including canonical-finalized same-call policy), owning runtime Stop inspection/admission and consequences, tool integration, native approval, dispatch/publication, Close and runtime verification. This leaf neither mutates nor adds disconnected Stop controls.
+
+## Part B owning-actor readiness leaf — implemented, hosted validation required
+
+The existing acknowledged runtime channel now has an explicit Event/admission-check
+sum type. The internal manager check holds the shared mutation-admission lock through
+the actor reply. The actor checks its own transcript and actual in-memory pending
+aggregate against the frozen inspected owner/CURRENT/captured canonical occurrence,
+plus ordinary lifecycle eligibility. A matching observation is named
+`PendingMatchesRequiresFullAdmission`, never `Committed`, approved or dispatched;
+it grants no authority or effect reservation. No native tools/controls are registered.
+
+Actor-loop tests are authored for real UserCancel → persisted Idle/Task rejected →
+typed stale check with cancellation writes measured separately; matching readiness
+then later Stop; changed pending fields and same-body/new occurrences; legacy
+unavailability; wrong actor and real DB CURRENT continuation. Existing Event
+settlement/retirement and HTTP stale-event absorption are retained. Independent
+ordinary-event queues have no chronological priority guarantee.
+
+No Git, receipt/objective mutation, source-approval proof, HTTP policy, Close,
+release or production change is included. Receipt/effect integration and full-B
+revalidation remain NOT DONE. Local validation is scoped direct installed 1.95
+rustfmt (edition 2021, skip children) and static diff review only. No local
+Cargo/rustc/build/tests/install/codegen was run. Hosted exact-head checks are
+required and pending; tests are authored, not claimed passed.

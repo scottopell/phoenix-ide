@@ -18,7 +18,7 @@ use super::traits::{
     TerminalMutationEstablishment, TerminalSubAgentEvidence, ToolExecutor,
 };
 use super::{
-    AcknowledgedEventOutcome, AcknowledgedEventRequest, SseBroadcaster, SseEvent,
+    AcknowledgedEventOutcome, AcknowledgedRuntimeRequest, SseBroadcaster, SseEvent,
     SteeringWakeOutcome, SubAgentCancelRequest, SubAgentSpawnRequest, TaskApprovalHandoffData,
     TaskApprovalHandoffRequest,
 };
@@ -2180,7 +2180,8 @@ where
     terminals: crate::terminal::ActiveTerminals,
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
-    acknowledged_event_rx: mpsc::Receiver<AcknowledgedEventRequest>,
+    acknowledged_event_rx: mpsc::Receiver<AcknowledgedRuntimeRequest>,
+    native_task_admission_db: Option<crate::db::Database>,
     handoff_review_rx: Option<mpsc::Receiver<super::HandoffReviewRequest>>,
     exhausted_maintenance: bool,
     broadcast_tx: SseBroadcaster,
@@ -2505,6 +2506,7 @@ where
             event_tx,
             broadcast_tx,
             acknowledged_event_rx,
+            native_task_admission_db: None,
             handoff_review_rx: None,
             exhausted_maintenance: false,
             tool_execution: ToolExecutionSlot::default(),
@@ -2747,9 +2749,14 @@ where
     /// Set the parent event channel (for sub-agents)
     pub fn with_acknowledged_event_receiver(
         mut self,
-        receiver: mpsc::Receiver<AcknowledgedEventRequest>,
+        receiver: mpsc::Receiver<AcknowledgedRuntimeRequest>,
     ) -> Self {
         self.acknowledged_event_rx = receiver;
+        self
+    }
+
+    pub(crate) fn with_native_task_admission_database(mut self, db: crate::db::Database) -> Self {
+        self.native_task_admission_db = Some(db);
         self
     }
 
@@ -3230,7 +3237,15 @@ where
                         return RuntimeExitDisposition::CoordinatedShutdown;
                     }
                 }
-                Some(AcknowledgedEventRequest { event, acknowledgement, retirement }) = self.acknowledged_event_rx.recv() => {
+                Some(request) = self.acknowledged_event_rx.recv() => {
+                    let super::AcknowledgedEventRequest { event, acknowledgement, retirement } = match request {
+                        AcknowledgedRuntimeRequest::Event(event) => event,
+                        AcknowledgedRuntimeRequest::InspectNativeTaskApprovalAdmission { expected, response } => {
+                            let result = self.check_native_task_approval_admission(&expected).await;
+                            let _ = response.send(result);
+                            continue;
+                        }
+                    };
                     let result = self.process_acknowledged_event(event).await;
                     let terminal = matches!(self.state.step_result(), StepResult::Terminal(_));
                     if terminal {
@@ -3804,6 +3819,24 @@ where
         {
             self.pending_trusted_tool_results.clear();
         }
+    }
+
+    async fn check_native_task_approval_admission(
+        &self,
+        expected: &super::task_approval_admission::FrozenPendingTask,
+    ) -> Result<super::task_approval_admission::NativeTaskAdmissionReadiness, String> {
+        use super::task_approval_admission::NativeTaskAdmissionReadiness;
+        if self.context.conversation_id != expected.transcript_id() {
+            return Ok(NativeTaskAdmissionReadiness::TargetChanged);
+        }
+        // A processed UserCancel has already consumed AwaitingTaskApproval into Idle.
+        if !matches!(self.state, ConvState::AwaitingTaskApproval { .. }) {
+            return Ok(NativeTaskAdmissionReadiness::StalePending);
+        }
+        let Some(db) = &self.native_task_admission_db else {
+            return Ok(NativeTaskAdmissionReadiness::Unavailable);
+        };
+        expected.check_at_actor(db, &self.state).await
     }
 
     async fn process_acknowledged_event(
@@ -16371,7 +16404,10 @@ mod test_git_helpers {
 #[cfg(test)]
 mod creation_completion_lifecycle_tests {
     use super::*;
+    mod native_task_admission_tests;
+
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::runtime::AcknowledgedEventRequest;
     use crate::tools::BrowserSessionManager;
     use phoenix_llm::ModelRegistry;
     use std::path::PathBuf;
@@ -16525,11 +16561,13 @@ mod creation_completion_lifecycle_tests {
         let (retirement_tx, retirement_rx) = oneshot::channel();
 
         acknowledged_event_tx
-            .send(AcknowledgedEventRequest {
-                event: creation_event(),
-                acknowledgement: ack_tx,
-                retirement: retirement_rx,
-            })
+            .send(AcknowledgedRuntimeRequest::Event(
+                AcknowledgedEventRequest {
+                    event: creation_event(),
+                    acknowledgement: ack_tx,
+                    retirement: retirement_rx,
+                },
+            ))
             .await
             .unwrap();
 
@@ -16590,11 +16628,13 @@ mod creation_completion_lifecycle_tests {
         let (ack_tx, mut ack_rx) = oneshot::channel();
         let (_retirement_tx, retirement_rx) = oneshot::channel();
         acknowledged_event_tx
-            .send(AcknowledgedEventRequest {
-                event: creation_event(),
-                acknowledgement: ack_tx,
-                retirement: retirement_rx,
-            })
+            .send(AcknowledgedRuntimeRequest::Event(
+                AcknowledgedEventRequest {
+                    event: creation_event(),
+                    acknowledgement: ack_tx,
+                    retirement: retirement_rx,
+                },
+            ))
             .await
             .unwrap();
 

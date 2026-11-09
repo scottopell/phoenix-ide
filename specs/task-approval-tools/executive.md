@@ -2,7 +2,7 @@
 
 ## Status and authority
 
-**Bounded Part A plus Part B leaf 1 implemented; NOT fully verified.** Part A captures typed provenance in the pending aggregate and preserves it on approval retry. Part B leaf 1 adds only DB read-only inspection and proof of the actual executing Coordinator source. No native approval or inspection tool is enabled or registered. Tests are written but NOT RUN locally, by owner instruction. Hosted CI for leaf head `5335c1ee` failed compilation on two dynamic SQL audit wrappers in its read-only test helper; those wrappers are corrected with the target-witness inspection fix. The corrected head requires new hosted CI on PR #1058; results are pending, not passed. No schema, migration, generated type or wire change is delivered. The Part B actor, scoped receipts/replay and runtime Stop integration remain explicitly unfinished; native approval, Close and runtime verification are NOT DONE.
+**Bounded Part A, Part B read-only inspection and owning-actor readiness leaf implemented; NOT fully verified.** Part A captures typed provenance in the pending aggregate and preserves it on approval retry. Part B leaf 1 adds only DB read-only inspection and proof of the actual executing Coordinator source. No native approval or inspection tool is enabled or registered. Tests are written but NOT RUN locally, by owner instruction. Hosted CI for leaf head `5335c1ee` failed compilation on two dynamic SQL audit wrappers in its read-only test helper; those wrappers are corrected with the target-witness inspection fix. The corrected head requires new hosted CI on PR #1058; results are pending, not passed. No schema, migration, generated type or wire change is delivered. The Part B actor, scoped receipts/replay and runtime Stop integration remain explicitly unfinished; native approval, Close and runtime verification are NOT DONE.
 
 The native Stop/pause policy is resolved: the Coordinator, acting within saved standing authority / the commissioned Goal, selected refusal of new approval effects while the explicit target conversation latch is set, conveyed through owner `a52`'s question response. This is not new human approval or authority to resume. Existing human resume is required; a suspended saved Goal alone does not block approval. Inspection remains read-only and may expose stopped pending proposals with ineligibility and consequences. Exact historical receipt replay after current-source admission returns `Committed` without redispatch even after target Stop.
 
@@ -25,6 +25,36 @@ Owner's minimized single-aggregate direction governs this bounded implementation
 - Fatal/unclassified and post-Git/pre-DB failures use owning fail-stop, not `NotApplied`. Projection failure after commit retains the durable fact and uses owning fail-stop, not a false no-effect result.
 
 No REQ-BED-028/REQ-PROJ-003 amendment is required by this minimized aggregate model absent a concrete conflict; none is identified in the supplied facts. REQ-BED-046, REQ-COMP-001/002 and REQ-DWF-043 retain authority. The prior assertion that bedrock amendment and projection refactoring were prerequisites is withdrawn.
+
+## Owning-actor admission-readiness leaf
+
+The internal `check_native_task_approval_admission` request travels through the
+same acknowledged runtime channel as acknowledged events. It freezes the inspected
+stable owner, concrete transcript and exact captured pending snapshot, then checks
+the actor's own in-memory pending state, proposal occurrence, CURRENT membership
+and ordinary lifecycle eligibility. Its matching result is explicitly
+`PendingMatchesRequiresFullAdmission`, not approval, dispatch, a reservation or an
+externally released authority token. It does not prove Coordinator source authority
+or run Git, write an objective/receipt, or install native approval controls.
+
+The manager holds the shared target mutation-admission lock through the reply;
+the actor does not reacquire it. This serializes the check with HTTP mutation
+admission, not chronological arrival across the independent ordinary-event and
+acknowledged-request queues. A real Stop processed first consumes pending approval
+into Idle and makes the frozen check return typed `StalePending`. Stop processed
+after a matching readiness observation retains ordinary cancellation semantics;
+there is no completed approval to roll back. The existing acknowledged Event
+settlement/retirement branch and absorbed stale HTTP-event behavior are preserved.
+
+Authored actor-loop regressions cover real Stop before a frozen check, matching
+readiness followed by real Stop, all pending fields and same-body new occurrences,
+legacy unavailability, wrong actor identity and CURRENT advancement using the real
+DB continuation API. They measure cancellation writes separately and check for no
+approval authority, tool/LLM execution or objective additions. These regressions
+are **not locally executed**; hosted exact-head compile/test results are required.
+This leaf does not complete any end-to-end native approval requirement. Receipt and
+actual effect integration must revalidate full source/target authority at the
+owning effect boundary; they remain NOT DONE.
 
 ## Coverage and proposed verification
 
