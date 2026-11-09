@@ -7058,33 +7058,6 @@ impl RuntimeManager {
             .unwrap_or(NativeTaskApprovalOutcome::Unavailable)
     }
 
-    #[cfg(test)]
-    pub(crate) async fn check_native_task_approval_admission(
-        self: &Arc<Self>,
-        expected: task_approval_admission::FrozenPendingTask,
-    ) -> Result<task_approval_admission::NativeTaskAdmissionReadiness, String> {
-        let admission = self
-            .mutation_admission(expected.transcript_id())
-            .await
-            .map_err(|error| error.to_string())?;
-        let _guard = admission.lock().await;
-        let handle = self.get_or_create(expected.transcript_id()).await?;
-        let (response, result) = tokio::sync::oneshot::channel();
-        handle
-            .acknowledged_event_tx
-            .send(
-                AcknowledgedRuntimeRequest::InspectNativeTaskApprovalAdmission {
-                    expected: Box::new(expected),
-                    response,
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        result
-            .await
-            .map_err(|_| "runtime stopped before native task admission check".to_string())?
-    }
-
     async fn send_acknowledged_event(
         self: &Arc<Self>,
         conversation_id: &str,

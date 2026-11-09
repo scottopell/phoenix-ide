@@ -501,6 +501,11 @@ async fn production_manager_cancel_before_native_command_has_no_approval_artifac
         manager.execute_native_task_approval(command).await,
         NativeTaskApprovalOutcome::NotApplied(_)
     ));
+    assert_cancelled_native_approval_unchanged(&f, before).await;
+    handle.event_tx.send(Event::Shutdown).await.unwrap();
+}
+
+async fn assert_cancelled_native_approval_unchanged(f: &AdmissionFixture, before: usize) {
     assert_eq!(f.db.get_messages(&f.target).await.unwrap().len(), before);
     assert_eq!(
         f.db.get_conversation(&f.target).await.unwrap().state,
@@ -512,7 +517,6 @@ async fn production_manager_cancel_before_native_command_has_no_approval_artifac
         .await
         .unwrap();
     assert_eq!(receipts, 0);
-    handle.event_tx.send(Event::Shutdown).await.unwrap();
 }
 
 #[derive(Default)]
