@@ -2,6 +2,8 @@ use super::*;
 use phoenix_core::domain::instance_identity::InstanceId;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
+type HistoricalLocatorBytes = (String, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+
 fn table_sql(script: &str, name: &str, destination: &str) -> String {
     let start = script.find(&format!("CREATE TABLE {name} (")).unwrap();
     let end = start + script.get(start..).unwrap().find("\n);").unwrap() + 3;
@@ -474,6 +476,7 @@ async fn migration158_failure_rolls_back_columns_and_restores_schema_guard() {
     );
 }
 
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn migration158_reclassifies_legacy_incomplete_creation_locators_as_historical_internal() {
     let (pool, local) = fixture().await;
@@ -708,7 +711,7 @@ async fn migration158_preserves_invalid_utf8_creation_text_without_qualifying_it
         .await
         .unwrap();
     }
-    let before: Vec<(String, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+    let before: Vec<HistoricalLocatorBytes> = sqlx::query_as(
         "SELECT request_id, CAST(objective_source_product_conversation_id AS BLOB), CAST(objective_source_transcript_id AS BLOB), CAST(objective_source_message_id AS BLOB), CAST(objective_source_tool_use_id AS BLOB) FROM product_creation_jobs ORDER BY request_id"
     ).fetch_all(&pool).await.unwrap();
     for (index, row) in before.iter().enumerate() {
@@ -755,7 +758,7 @@ async fn migration158_preserves_invalid_utf8_creation_text_without_qualifying_it
         .await
         .unwrap();
     }
-    let after: Vec<(String, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+    let after: Vec<HistoricalLocatorBytes> = sqlx::query_as(
         "SELECT request_id, CAST(objective_source_product_conversation_id AS BLOB), CAST(objective_source_transcript_id AS BLOB), CAST(objective_source_message_id AS BLOB), CAST(objective_source_tool_use_id AS BLOB) FROM product_creation_jobs ORDER BY request_id"
     ).fetch_all(&pool).await.unwrap();
     assert_eq!(after, before);
@@ -793,7 +796,7 @@ async fn migration158_preserves_invalid_utf8_rename_text_without_qualifying_it()
         )))
         .bind(&operation).execute(&pool).await.unwrap();
     }
-    let before: Vec<(String, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+    let before: Vec<HistoricalLocatorBytes> = sqlx::query_as(
         "SELECT operation_id, CAST(source_product_conversation_id AS BLOB), CAST(source_transcript_id AS BLOB), CAST(source_message_id AS BLOB), CAST(source_tool_use_id AS BLOB) FROM product_conversation_rename_receipts ORDER BY operation_id"
     ).fetch_all(&pool).await.unwrap();
     for (index, row) in before.iter().enumerate() {
@@ -834,7 +837,7 @@ async fn migration158_preserves_invalid_utf8_rename_text_without_qualifying_it()
         sqlx::query("UPDATE product_conversation_rename_receipts SET title='still historical' WHERE operation_id=?1")
             .bind(&operation).execute(&pool).await.unwrap();
     }
-    let after: Vec<(String, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+    let after: Vec<HistoricalLocatorBytes> = sqlx::query_as(
         "SELECT operation_id, CAST(source_product_conversation_id AS BLOB), CAST(source_transcript_id AS BLOB), CAST(source_message_id AS BLOB), CAST(source_tool_use_id AS BLOB) FROM product_conversation_rename_receipts ORDER BY operation_id"
     ).fetch_all(&pool).await.unwrap();
     assert_eq!(after, before);

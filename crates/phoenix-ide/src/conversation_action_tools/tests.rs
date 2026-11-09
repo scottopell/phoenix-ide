@@ -407,7 +407,10 @@ async fn remote_dispatch_revalidates_coordinator_after_admission() {
     drop(admission);
 
     let error = dispatch.await.unwrap().unwrap_err();
-    assert!(error.contains("current Coordinator"), "{error}");
+    assert!(
+        error.contains("current persisted Global Coordinator transcript is required"),
+        "{error}"
+    );
 }
 
 pub(super) fn native_context_without_source_identity(transcript: &str) -> ToolContext {

@@ -6420,49 +6420,91 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn native_create_response_remains_pending_after_authority_closes() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
-        let runtime = state.runtime.clone();
-        let caller = InstanceId::new();
+    async fn assert_response_remains_pending_after_authority_closes(
+        runtime: &Arc<RuntimeManager>,
+        response: Response,
+    ) {
         let owner = runtime.acquire_local_authority_pass().unwrap();
         owner.close("test_native_create_response_authority_closure");
-        let response = native_create(
-            State(state),
-            PeerAuthenticated {
-                send_authority: phoenix_db::FederationSendAuthority::new(
-                    caller,
-                    phoenix_core::domain::instance_identity::FederationCredentialVerifier::from_bearer(
-                        b"peer-test",
-                    ),
-                ),
-                caller_instance_id: caller,
-                caller_display_name: "peer".to_string(),
-            },
-            Ok(Json(NativeCreateRequest {
-                caller_instance_id: caller,
-                destination_instance_id: InstanceId::new(),
-                request_id: uuid::Uuid::new_v4().to_string(),
-                cwd: "/tmp".to_string(),
-                objective: "test".to_string(),
-                model: None,
-                effort: None,
-                language: None,
-                start: NativeCreateStart::SubmitObjective,
-                source: NativeActionSourceCall {
-                    product_conversation: ProductConversationId::parse("source").unwrap(),
-                    source_transcript_id: "transcript".to_string(),
-                    source_assistant_message_id: "message".to_string(),
-                    source_tool_use_id: "tool".to_string(),
-                },
-            })),
-        );
+        let response = peer_authority_response(runtime, response);
         tokio::pin!(response);
         assert!(tokio::select! {
             biased;
             _ = &mut response => false,
             () = std::future::ready(()) => true,
         });
+    }
+
+    fn test_native_create_peer(caller: InstanceId) -> PeerAuthenticated {
+        PeerAuthenticated {
+            send_authority: phoenix_db::FederationSendAuthority::new(
+                caller,
+                phoenix_core::domain::instance_identity::FederationCredentialVerifier::from_bearer(
+                    b"peer-test",
+                ),
+            ),
+            caller_instance_id: caller,
+            caller_display_name: "peer".to_string(),
+        }
+    }
+
+    fn test_native_create_request(
+        caller: InstanceId,
+        destination: InstanceId,
+        cwd: String,
+    ) -> NativeCreateRequest {
+        NativeCreateRequest {
+            caller_instance_id: caller,
+            destination_instance_id: destination,
+            request_id: uuid::Uuid::new_v4().to_string(),
+            cwd,
+            objective: "test".to_string(),
+            model: None,
+            effort: None,
+            language: None,
+            start: NativeCreateStart::SubmitObjective,
+            source: NativeActionSourceCall {
+                product_conversation: ProductConversationId::parse("source").unwrap(),
+                source_transcript_id: "transcript".to_string(),
+                source_assistant_message_id: "message".to_string(),
+                source_tool_use_id: "tool".to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn native_create_error_response_remains_pending_after_authority_closes() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let caller = InstanceId::new();
+        let response = native_create_inner(
+            &state,
+            test_native_create_peer(caller),
+            test_native_create_request(caller, InstanceId::new(), "/tmp".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        assert_response_remains_pending_after_authority_closes(&state.runtime, response).await;
+    }
+
+    #[tokio::test]
+    async fn native_create_success_response_remains_pending_after_authority_closes() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let caller = InstanceId::new();
+        let local = state.db.instance_id().await.unwrap();
+        let cwd = state.runtime.runtime_home().join("native-create-cwd");
+        std::fs::create_dir(&cwd).unwrap();
+        let response = native_create_inner(
+            &state,
+            test_native_create_peer(caller),
+            test_native_create_request(caller, local, cwd.to_string_lossy().into_owned()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert_response_remains_pending_after_authority_closes(&state.runtime, response).await;
     }
 
     #[tokio::test]
