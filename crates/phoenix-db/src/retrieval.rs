@@ -648,8 +648,7 @@ fn build_retrieval_sql(
            JOIN message_fts_rows meta ON meta.fts_rowid = message_fts.rowid \
            JOIN messages source ON source.message_id = meta.message_id \
            JOIN conversations c ON c.id = meta.conversation_id \
-           WHERE message_fts MATCH ? \
-             AND COALESCE(json_extract(source.display_data, '$.hidden'), 0) != 1",
+           WHERE message_fts MATCH ?",
     );
     if request.visibility == RetrievalVisibility::UserTopLevel {
         sql.push_str(
@@ -1007,7 +1006,26 @@ pub async fn fts_upsert(
         })
         .await
         .map_err(sqlx_from_db_error)?;
-    fts_upsert_conn(&mut tx, message, FtsObservation::Standalone(&telemetry)).await?;
+    let authoritative = telemetry
+        .observe_sqlx(
+            SqlitePhase::LocatorLookup,
+            sqlx::query("SELECT display_data FROM messages WHERE message_id = ?1")
+                .bind(&message.message_id)
+                .fetch_one(&mut *tx),
+        )
+        .await?;
+    let display_data: Option<String> = authoritative.try_get("display_data")?;
+    let mut current_message = message.clone();
+    current_message.display_data = display_data
+        .map(|json| serde_json::from_str(&json))
+        .transpose()
+        .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
+    fts_upsert_conn(
+        &mut tx,
+        &current_message,
+        FtsObservation::Standalone(&telemetry),
+    )
+    .await?;
     telemetry
         .observe_commit_db(transaction_timing, async { Ok(tx.commit().await?) })
         .await
@@ -1637,17 +1655,16 @@ mod tests {
     #[tokio::test]
     async fn standalone_fts_upsert_records_exact_shared_collector_outcomes() {
         let db = seed().await;
-        let message = Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "fts-outcome".to_string(),
-            conversation_id: "c-a".to_string(),
-            sequence_id: 1,
-            message_type: MessageType::User,
-            content: MessageContent::user("shared collector outcome"),
-            display_data: None,
-            usage_data: None,
-            created_at: Utc::now(),
-        };
+        let message = db
+            .add_message(
+                "fts-outcome",
+                "c-a",
+                &MessageContent::user("shared collector outcome"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         let before = db.sqlite_workload_aggregate_report(
             crate::SqliteSnapshotWindow::OneHour,
             crate::sqlite_workload::unix_now_micros(),
@@ -1914,6 +1931,93 @@ mod tests {
 
         assert!(retriever
             .retrieve(global_request("confidential recovery"))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn standalone_upsert_does_not_restore_stale_text_after_hide_commits() {
+        let db = seed().await;
+        db.add_message(
+            "hidden-race",
+            "c-a",
+            &MessageContent::user("stale confidential artifact"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let stale_message = Message {
+            message_id: "hidden-race".into(),
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
+            conversation_id: "c-a".into(),
+            sequence_id: 1,
+            message_type: MessageType::User,
+            content: MessageContent::user("stale confidential artifact"),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+
+        db.update_message_display_data("hidden-race", &serde_json::json!({ "hidden": true }))
+            .await
+            .unwrap();
+        fts_upsert(
+            db.pool(),
+            &stale_message,
+            db.sqlite_workload_collector.clone(),
+        )
+        .await
+        .unwrap();
+
+        let indexed_text: String = sqlx::query_scalar(
+            "SELECT f.text FROM message_fts f JOIN message_fts_rows r ON r.fts_rowid = f.rowid WHERE r.message_id = ?1",
+        )
+        .bind("hidden-race")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(indexed_text.is_empty());
+        assert!(db
+            .fts_retriever()
+            .retrieve(global_request("confidential artifact"))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_trusts_index_text_until_stale_hidden_row_is_reconciled() {
+        let db = seed().await;
+        db.add_message(
+            "stale-hidden",
+            "c-a",
+            &MessageContent::user("stale index sentinel"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE messages SET display_data = ?1 WHERE message_id = ?2")
+            .bind(serde_json::json!({ "hidden": true }).to_string())
+            .bind("stale-hidden")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let retriever = db.fts_retriever();
+        assert_eq!(
+            retriever
+                .retrieve(global_request("stale index sentinel"))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        retriever.reconcile().await.unwrap();
+        assert!(retriever
+            .retrieve(global_request("stale index sentinel"))
             .await
             .unwrap()
             .is_empty());

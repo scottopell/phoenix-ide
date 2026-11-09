@@ -42,6 +42,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [246](246_search-hidden-visibility-trusts-fts-index.md) | Ranked search trusts indexed text for hidden-message eligibility | Accepted | REQ-RET-003, REQ-RET-007 |
 | [242](242_execution-bound-own-goal-creation-and-enable.md) | Execution-bound own Goal creation and explicit continuation enable | Accepted | REQ-SGT-001–008; REQ-GOAL-AC-001–004 |
 | [243](243_federated-native-create-and-rename-use-destination-actions.md) | Federated native create and rename use destination actions | Accepted | REQ-FED-021–024; REQ-GR-024; REQ-CCR-013; REQ-CID-007 |
 | [245](245_historical-native-locators-preserve-bytes-without-fabricating-trust.md) | Historical native locators preserve bytes without fabricating trust | Accepted; qualifies ADR-243 historical assumptions only | REQ-FED-021; REQ-FED-023 |
