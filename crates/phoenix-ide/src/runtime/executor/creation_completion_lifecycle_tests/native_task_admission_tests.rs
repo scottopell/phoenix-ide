@@ -17,6 +17,8 @@ use phoenix_db::Database;
 use serde_json::json;
 use std::sync::atomic::Ordering;
 
+mod interleavings;
+
 const BODY: &str = "# Exact reviewed task\r\n\nKeep these bytes.\n";
 
 struct AdmissionFixture {
@@ -670,8 +672,7 @@ async fn assert_production_initial_approval(
     use crate::runtime::{RuntimeManager, SseEvent};
     use phoenix_db::conversation_goals::control::GoalControlInstallation;
     use phoenix_db::native_task_approval::{
-        NativeApprovalContinuation, NativeApprovalIntent, NativeApprovalPlacement,
-        NativeTaskApprovalCommand, NativeTaskApprovalInspection,
+        NativeApprovalContinuation, NativeTaskApprovalInspection,
     };
 
     let (_temp, root) = init_repo();
@@ -707,81 +708,12 @@ async fn assert_production_initial_approval(
     )
     .await
     .unwrap();
-    let source =
-        f.db.get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
-            .await
-            .unwrap();
-    let inspection =
-        f.db.inspect_pending_task_from_coordinator(
-            &source.id,
-            &SourceToolCall {
-                message_id: "executing-inspector".into(),
-                tool_use_id: "inspection-call".into(),
-            },
-            &InspectPendingTaskInput {
-                target: f
-                    .db
-                    .get_conversation(&f.target)
-                    .await
-                    .unwrap()
-                    .product_conversation_id,
-            },
-        )
-        .await
-        .unwrap();
-    let phoenix_db::task_approval_inspection::PendingTaskStatus::Pending(pending) =
-        inspection.pending
-    else {
-        panic!("canonical pending proposal");
-    };
-    assert_eq!(pending.task_file, task_file);
-    assert_eq!(pending.title, "Exact title");
-    assert_eq!(pending.priority, Priority::P1);
-    assert_eq!(pending.plan, BODY);
-    assert_eq!(pending.reviewed_proposal.as_ref().unwrap().kind, kind);
-    let command = NativeTaskApprovalCommand {
-        source_transcript_id: source.id.clone(),
-        source: SourceToolCall {
-            message_id: "initial-source-message".into(),
-            tool_use_id: "initial-source-call".into(),
-        },
-        owner: inspection.owner.clone(),
-        current_transcript_id: f.target.clone(),
-        pending,
-        placement: NativeApprovalPlacement::ContinueHere,
-        intent: NativeApprovalIntent::ApproveTaskAndRequestContinuation,
-    };
-    let source_blocks = vec![ContentBlock::ToolUse {
-        id: command.source.tool_use_id.clone(),
-        name: "approve_task".into(),
-        input: command.input_value().unwrap(),
-    }];
-    let source_state = ConvState::ToolExecuting {
-        current_tool: ToolCall::new(
-            &command.source.tool_use_id,
-            ToolInput::Unknown {
-                name: "approve_task".into(),
-                input: command.input_value().unwrap(),
-            },
-        ),
-        remaining_tools: vec![],
-        completed_results: vec![],
-        pending_sub_agents: vec![],
-        assistant_message: crate::state_machine::AssistantMessage::new(
-            command.source.message_id.clone(),
-            source_blocks.clone(),
-            None,
-            None,
-        ),
-    };
-    f.db.update_conversation_state(&source.id, &source_state)
-        .await
-        .unwrap();
-    assert!(!f
-        .db
-        .message_exists(&command.source.message_id)
-        .await
-        .unwrap());
+    let InitialSource {
+        source,
+        command,
+        source_blocks,
+        inspected_owner,
+    } = initial_source(&f, task_file, kind).await;
     let (request_tx, mut requests) = mpsc::unbounded_channel();
     let llm = Arc::new(NativeApprovalLlm {
         calls: std::sync::atomic::AtomicUsize::new(0),
@@ -818,7 +750,7 @@ async fn assert_production_initial_approval(
         panic!("Initial approval must commit through the owning production actor: {result:?}");
     };
     assert_eq!(receipt.source, command.source);
-    assert_eq!(receipt.owner, inspection.owner);
+    assert_eq!(receipt.owner, inspected_owner);
     assert_eq!(receipt.target_transcript_id, "actor-target");
     assert_eq!(receipt.continuation, NativeApprovalContinuation::Requested);
     assert_eq!(receipt.source_transcript_id, source.id);
@@ -1153,6 +1085,104 @@ async fn assert_production_initial_approval(
         std::fs::read(worktree.join(committed_task_file)).unwrap(),
         BODY.as_bytes()
     );
+}
+
+struct InitialSource {
+    source: crate::db::Conversation,
+    command: phoenix_db::native_task_approval::NativeTaskApprovalCommand,
+    source_blocks: Vec<ContentBlock>,
+    inspected_owner: phoenix_core::domain::product_conversation::ProductConversationId,
+}
+
+async fn initial_source(
+    f: &AdmissionFixture,
+    task_file: &str,
+    kind: ReviewedTaskKind,
+) -> InitialSource {
+    use phoenix_db::native_task_approval::{
+        NativeApprovalIntent, NativeApprovalPlacement, NativeTaskApprovalCommand,
+    };
+    let source =
+        f.db.get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+    let inspection =
+        f.db.inspect_pending_task_from_coordinator(
+            &source.id,
+            &SourceToolCall {
+                message_id: "executing-inspector".into(),
+                tool_use_id: "inspection-call".into(),
+            },
+            &InspectPendingTaskInput {
+                target: f
+                    .db
+                    .get_conversation(&f.target)
+                    .await
+                    .unwrap()
+                    .product_conversation_id,
+            },
+        )
+        .await
+        .unwrap();
+    let phoenix_db::task_approval_inspection::PendingTaskStatus::Pending(pending) =
+        inspection.pending
+    else {
+        panic!("canonical pending proposal");
+    };
+    assert_eq!(pending.task_file, task_file);
+    assert_eq!(pending.title, "Exact title");
+    assert_eq!(pending.priority, Priority::P1);
+    assert_eq!(pending.plan, BODY);
+    assert_eq!(pending.reviewed_proposal.as_ref().unwrap().kind, kind);
+    let command = NativeTaskApprovalCommand {
+        source_transcript_id: source.id.clone(),
+        source: SourceToolCall {
+            message_id: "initial-source-message".into(),
+            tool_use_id: "initial-source-call".into(),
+        },
+        owner: inspection.owner.clone(),
+        current_transcript_id: f.target.clone(),
+        pending,
+        placement: NativeApprovalPlacement::ContinueHere,
+        intent: NativeApprovalIntent::ApproveTaskAndRequestContinuation,
+    };
+    let source_blocks = vec![ContentBlock::ToolUse {
+        id: command.source.tool_use_id.clone(),
+        name: "approve_task".into(),
+        input: command.input_value().unwrap(),
+    }];
+    let source_state = ConvState::ToolExecuting {
+        current_tool: ToolCall::new(
+            &command.source.tool_use_id,
+            ToolInput::Unknown {
+                name: "approve_task".into(),
+                input: command.input_value().unwrap(),
+            },
+        ),
+        remaining_tools: vec![],
+        completed_results: vec![],
+        pending_sub_agents: vec![],
+        assistant_message: crate::state_machine::AssistantMessage::new(
+            command.source.message_id.clone(),
+            source_blocks.clone(),
+            None,
+            None,
+        ),
+    };
+    f.db.update_conversation_state(&source.id, &source_state)
+        .await
+        .unwrap();
+    assert!(!f
+        .db
+        .message_exists(&command.source.message_id)
+        .await
+        .unwrap());
+    InitialSource {
+        source,
+        command,
+        source_blocks,
+        inspected_owner: inspection.owner,
+    }
 }
 
 fn git(path: &std::path::Path, args: &[&str]) -> String {

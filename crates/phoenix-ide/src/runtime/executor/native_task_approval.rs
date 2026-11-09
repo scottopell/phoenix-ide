@@ -188,7 +188,13 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         let scope = self.context.resource_scope.clone();
         let cwd = self.context.filesystem_root().to_path_buf();
         let handle = tokio::runtime::Handle::current();
+        #[cfg(test)]
+        let gate = self.native_pre_git_gate.lock().unwrap().take();
         Ok(Some(Box::new(move || {
+            #[cfg(test)]
+            if let Some(gate) = gate {
+                gate();
+            }
             handle.block_on(async move {
                 match db
                     .inspect_native_task_approval_command(&command)

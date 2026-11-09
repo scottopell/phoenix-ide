@@ -2183,6 +2183,8 @@ where
     event_tx: mpsc::Sender<Event>,
     acknowledged_event_rx: mpsc::Receiver<AcknowledgedRuntimeRequest>,
     native_task_admission_db: Option<crate::db::Database>,
+    #[cfg(test)]
+    native_pre_git_gate: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     handoff_review_rx: Option<mpsc::Receiver<super::HandoffReviewRequest>>,
     exhausted_maintenance: bool,
     broadcast_tx: SseBroadcaster,
@@ -2508,6 +2510,8 @@ where
             broadcast_tx,
             acknowledged_event_rx,
             native_task_admission_db: None,
+            #[cfg(test)]
+            native_pre_git_gate: std::sync::Mutex::new(None),
             handoff_review_rx: None,
             exhausted_maintenance: false,
             tool_execution: ToolExecutionSlot::default(),
