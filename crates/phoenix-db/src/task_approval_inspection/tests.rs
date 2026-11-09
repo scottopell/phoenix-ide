@@ -579,7 +579,7 @@ async fn canonical_source_mismatch_matrix_is_rejected_without_writes() {
             "cancelling" => {
                 state = ConvState::CancellingTool {
                     tool_use_id: f.source.tool_use_id.clone(),
-                    cause: Default::default(),
+                    cause: phoenix_core::domain::sm_event::CancelCause::default(),
                     skipped_tools: vec![],
                     completed_results: vec![],
                     assistant_message: assistant_message.clone(),

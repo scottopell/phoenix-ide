@@ -215,7 +215,7 @@ async fn real_stop_consumes_pending_then_bound_check_is_typed_stale_without_appr
             &sender,
             Event::TaskApprovalDecided {
                 outcome: TaskApprovalOutcome::Approved {
-                    handoff: Default::default()
+                    handoff: crate::state_machine::state::TaskApprovalHandoff::ContinueInCurrentConversation
                 },
             }
         )

@@ -109,7 +109,7 @@ impl FrozenPendingTask {
         {
             return Ok(StalePending);
         }
-        let Ok(source) = TaskSource::detect(task_file) else {
+        let Some(source) = TaskSource::detect(task_file) else {
             return Ok(Unavailable);
         };
         if reviewed.occurrence.assistant_message_id.trim().is_empty()
