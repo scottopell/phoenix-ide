@@ -15,7 +15,7 @@ export function installNewConversationFixtureApi(scenario: NewConversationScenar
   };
 
   api.getEnv = async () => ({ home_dir: '/Users/alex' });
-  api.listRecentManagementRootSuggestions = async () => ({ suggestions: [] });
+  api.listRecentManagementRootSuggestions = async () => ({ suggestions: (scenario.recentPaths ?? []).map((path) => ({ path })) });
   api.listArchivedConversations = async () => [];
   api.listConversations = async () => [];
   api.listDirectory = async () => ({ entries: [] });

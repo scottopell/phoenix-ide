@@ -1,0 +1,92 @@
+.directory-picker-recent {
+  position: relative;
+  z-index: 11;
+  min-width: 0;
+  margin-top: 7px;
+}
+
+.directory-picker-recent-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.directory-picker-recent-toggle[aria-expanded="true"] svg {
+  transform: rotate(90deg);
+}
+
+.directory-picker-recent-toggle:hover,
+.directory-picker-recent-toggle:focus-visible {
+  color: var(--text-primary);
+}
+
+.directory-picker-recent-panel {
+  min-width: 0;
+  margin-top: 6px;
+  padding: 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-primary);
+}
+
+.directory-picker-recent-search {
+  margin-bottom: 6px;
+}
+
+.directory-picker-recent-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.directory-picker-recent-entry {
+  display: block;
+  width: 100%;
+  padding: 6px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.directory-picker-recent-toggle:focus-visible,
+.directory-picker-recent-entry:focus-visible {
+  outline: 2px solid var(--accent-color, #6b9cff);
+  outline-offset: 2px;
+}
+
+.directory-picker-recent-entry:hover,
+.directory-picker-recent-entry[aria-current="true"] {
+  background: var(--bg-secondary);
+}
+
+.directory-picker-recent-empty {
+  padding: 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+@media (width <= 768px) {
+  .directory-picker .settings-input {
+    font-size: 16px;
+  }
+
+  .directory-picker-recent-toggle,
+  .directory-picker-recent-entry {
+    min-height: 44px;
+  }
+}

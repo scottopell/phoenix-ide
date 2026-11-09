@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, act } from '@testing-library/react';
+import { render, act, fireEvent, screen } from '@testing-library/react';
+import { useState } from 'react';
 import { DirectoryPicker } from './DirectoryPicker';
 import { api } from '../api';
 
@@ -88,5 +89,89 @@ describe('DirectoryPicker validation', () => {
 
     expect(statuses.at(-1)).toBe('will-create');
     expect(api.validateCwd).toHaveBeenCalledWith('/existing/missing/nested');
+  });
+});
+
+function RecentPicker({ recentPaths, initialPath = '/selected' }: { recentPaths: string[]; initialPath?: string }) {
+  const [path, setPath] = useState(initialPath);
+  return <DirectoryPicker value={path} onChange={setPath} recentPaths={recentPaths} />;
+}
+
+describe('DirectoryPicker recent locations', () => {
+  beforeEach(() => {
+    vi.mocked(api.validateCwd).mockResolvedValue({ valid: true, is_git: true });
+  });
+
+  it('keeps the selected path editable without showing a picker when there are no suggestions', () => {
+    render(<RecentPicker recentPaths={[]} />);
+    expect(screen.getByRole('textbox', { name: 'Directory path' })).toHaveValue('/selected');
+    expect(screen.queryByRole('button', { name: /Choose recent location/ })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole('textbox', { name: 'Directory path' }), { target: { value: '/outside/recent' } });
+    expect(screen.getByRole('textbox', { name: 'Directory path' })).toHaveValue('/outside/recent');
+  });
+
+  it('switches between the path autocomplete and recent locations', () => {
+    const { container } = render(<RecentPicker recentPaths={['/selected', '/second']} />);
+    const path = screen.getByRole('textbox', { name: 'Directory path' });
+    fireEvent.focus(path);
+    expect(container.querySelector('.directory-list')).toBeInTheDocument();
+    const toggle = screen.getByRole('button', { name: 'Choose recent location (2)' });
+    fireEvent.click(toggle);
+    expect(container.querySelector('.directory-list')).not.toBeInTheDocument();
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    fireEvent.focus(path);
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  });
+
+  it('keeps a short suggestion set collapsed until requested', () => {
+    render(<RecentPicker recentPaths={['/selected', '/second']} />);
+    expect(screen.queryByRole('button', { name: '/second' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Choose recent location (2)' }));
+    fireEvent.click(screen.getByRole('button', { name: '/second' }));
+    expect(screen.getByRole('textbox', { name: 'Directory path' })).toHaveValue('/second');
+  });
+
+  it('discloses every returned location, filters paths, and restores focus after selection', () => {
+    const paths = Array.from({ length: 20 }, (_, i) => `/repositories/project-${i + 1}`);
+    render(<RecentPicker recentPaths={paths} />);
+    const toggle = screen.getByRole('button', { name: 'Choose recent location (20)' });
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByRole('searchbox', { name: 'Search recent locations' })).not.toBeInTheDocument();
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    for (const path of paths) expect(screen.getByRole('button', { name: path })).toBeInTheDocument();
+    const search = screen.getByRole('searchbox', { name: 'Search recent locations' });
+    expect(search).toHaveFocus();
+    fireEvent.change(search, { target: { value: 'project-20' } });
+    expect(screen.queryByRole('button', { name: paths[0]! })).not.toBeInTheDocument();
+    const lastPath = paths.at(-1)!;
+    const selection = screen.getByRole('button', { name: lastPath });
+    fireEvent.click(selection);
+    expect(screen.getByRole('textbox', { name: 'Directory path' })).toHaveValue(lastPath);
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(toggle).toHaveFocus();
+    fireEvent.click(toggle);
+    expect(screen.getByRole('button', { name: paths[0]! })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: lastPath })).toHaveAttribute('aria-current', 'true');
+  });
+
+  it('shows a no-match state, and Escape closes search without changing the selected path', () => {
+    render(<RecentPicker recentPaths={['/first', '/second']} />);
+    const toggle = screen.getByRole('button', { name: 'Choose recent location (2)' });
+    fireEvent.click(toggle);
+    const search = screen.getByRole('searchbox', { name: 'Search recent locations' });
+    fireEvent.change(search, { target: { value: 'missing' } });
+    expect(screen.getByText('No matching locations')).toBeInTheDocument();
+    fireEvent.keyDown(search, { key: 'Escape' });
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(toggle).toHaveFocus();
+    fireEvent.click(toggle);
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search recent locations' }), { target: { value: '' } });
+    const result = screen.getByRole('button', { name: '/first' });
+    result.focus();
+    fireEvent.keyDown(result, { key: 'Escape' });
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(toggle).toHaveFocus();
+    expect(screen.getByRole('textbox', { name: 'Directory path' })).toHaveValue('/selected');
   });
 });
