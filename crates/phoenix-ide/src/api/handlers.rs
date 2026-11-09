@@ -744,6 +744,36 @@ pub fn create_router(state: AppState) -> Router {
             )),
         )
         .route(
+            "/api/federation/peer/native-create-options",
+            post(super::federation::native_create_options).layer(DefaultBodyLimit::max(
+                super::federation::NATIVE_CREATE_OPTIONS_REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/peer/native-rename-options",
+            post(super::federation::native_rename_options).layer(DefaultBodyLimit::max(
+                super::federation::NATIVE_RENAME_OPTIONS_REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/peer/native-create",
+            post(super::federation::native_create).layer(DefaultBodyLimit::max(
+                super::federation::NATIVE_CREATE_REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/peer/native-create-status",
+            post(super::federation::native_create_status).layer(DefaultBodyLimit::max(
+                super::federation::NATIVE_CREATE_STATUS_REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/peer/native-rename",
+            post(super::federation::native_rename).layer(DefaultBodyLimit::max(
+                super::federation::NATIVE_RENAME_REQUEST_BYTES,
+            )),
+        )
+        .route(
             "/api/federation/peer/query-database",
             post(super::federation::query_database)
                 .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),

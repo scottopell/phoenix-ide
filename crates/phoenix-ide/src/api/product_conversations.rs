@@ -124,12 +124,8 @@ pub async fn rename_product_conversation(
     Path(reference): Path<String>,
     Json(req): Json<RenameProductConversationRequest>,
 ) -> Result<Json<ProductConversationListRow>, AppError> {
-    let title = normalize_product_conversation_title(&req.title)?;
-    let product_conversation_id = state
-        .db
-        .set_ordinary_product_conversation_title(&reference, &title)
-        .await
-        .map_err(db_to_app)?;
+    let product_conversation_id =
+        conversation_actions::rename_from_user_api(&state.runtime, &reference, &req.title).await?;
     let projection = state
         .db
         .list_ordinary_product_conversation_projections()
@@ -234,7 +230,7 @@ pub async fn regenerate_product_conversation_name(
     Ok(Json(list_row(&projection)))
 }
 
-use crate::conversation_actions::normalize_product_conversation_title;
+use crate::conversation_actions::{self, normalize_product_conversation_title};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct AggregateCursor {
@@ -3359,6 +3355,78 @@ mod tests {
                     .unwrap();
             assert_eq!(snapshot["canonical_route"], expected_route);
         }
+    }
+
+    #[tokio::test]
+    async fn http_rename_returns_browser_projection_without_native_authority_or_receipt() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation(
+                "http-rename-root",
+                "http-rename-root",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE conversations SET coordinator_head = 0 WHERE runtime_role = 'coordinator'",
+        )
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let response = create_router(state.clone()).oneshot(
+            Request::builder().method("PATCH")
+                .uri(format!("/api/product-conversations/{}/title", root.id))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({
+                    "title": "  HTTP Shared  ",
+                    "operation_id": operation_id,
+                    "source": {"source_instance_id": uuid::Uuid::new_v4().to_string(),
+                        "transcript_id": "not-a-coordinator", "message_id": "forged", "tool_use_id": "forged"},
+                    "expected_name_revision": 999
+                }).to_string())).unwrap(),
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body["product_conversation_id"],
+            root.product_conversation_id.as_str()
+        );
+        assert_eq!(body["canonical_root"]["transcript_row_id"], root.id);
+        assert_eq!(body["canonical_root"]["title"], "HTTP Shared");
+        assert_eq!(body["canonical_root"]["slug"], "http-shared");
+        assert_eq!(body["canonical_route"], "/c/http-shared");
+        assert!(body.get("receipt").is_none());
+        assert!(body.get("status").is_none());
+        let projection = state
+            .db
+            .list_ordinary_product_conversation_projections()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|projection| projection.product_conversation_id == root.product_conversation_id)
+            .unwrap();
+        assert_eq!(body, serde_json::to_value(list_row(&projection)).unwrap());
+        let revision: i64 =
+            sqlx::query_scalar("SELECT name_revision FROM conversations WHERE id = ?1")
+                .bind(&root.id)
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(revision, 1);
+        let receipts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM product_conversation_rename_receipts")
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(receipts, 0);
     }
 
     #[tokio::test]

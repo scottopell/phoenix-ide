@@ -241,6 +241,7 @@ async fn native_goal_discovery_prepare_apply_read_and_replay_without_dispatch() 
             (152, "goal_preparation_inflight_source".into()),
             (153, "close_writer_observations".into()),
             (155, "ordinary_self_goal_admission".into()),
+            (158, "federated_conversation_actions".into()),
         ]
     );
     for name in [
@@ -1316,6 +1317,8 @@ async fn production_coordinator_registry_has_exact_instance_selector_contract() 
         "unwatch_conversation",
         "list_watched_conversations",
         "read_goal",
+        "create_conversation",
+        "rename_conversation",
     ];
 
     assert!(!definitions
@@ -1332,6 +1335,8 @@ async fn production_coordinator_registry_has_exact_instance_selector_contract() 
                 | "watch_conversation"
                 | "unwatch_conversation"
                 | "list_watched_conversations"
+                | "create_conversation"
+                | "rename_conversation"
         ) {
             crate::coordinator_tools::instance::InstanceSelector::schema()
         } else {
