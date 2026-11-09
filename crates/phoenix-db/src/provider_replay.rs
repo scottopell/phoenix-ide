@@ -42,7 +42,19 @@ fn validate_task_proposal(
                 {
                     Some(input)
                 }
-                _ => None,
+                ContentBlock::Text { .. }
+                | ContentBlock::Image { .. }
+                | ContentBlock::ToolUse { .. }
+                | ContentBlock::ToolResult { .. }
+                | ContentBlock::ServerToolUse { .. }
+                | ContentBlock::ToolSearchToolResult { .. }
+                | ContentBlock::WebSearchToolResult { .. }
+                | ContentBlock::WebFetchToolResult { .. }
+                | ContentBlock::CodeExecutionToolResult { .. }
+                | ContentBlock::BashCodeExecutionToolResult { .. }
+                | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+                | ContentBlock::McpToolUse { .. }
+                | ContentBlock::McpToolResult { .. } => None,
             });
             match (calls.next(), calls.next()) {
                 (Some(input), None) => serde_json::from_value::<ProposeTaskInput>(input.clone())
@@ -50,7 +62,12 @@ fn validate_task_proposal(
                 _ => false,
             }
         }
-        _ => false,
+        MessageContent::User(_)
+        | MessageContent::Tool(_)
+        | MessageContent::System(_)
+        | MessageContent::Error(_)
+        | MessageContent::Continuation(_)
+        | MessageContent::Skill(_) => false,
     };
     let valid_source = assistant.conversation_id == conversation_id
         && assistant.message_id == occurrence.assistant_message_id

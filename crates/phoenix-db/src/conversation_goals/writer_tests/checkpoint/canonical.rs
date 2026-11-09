@@ -93,7 +93,7 @@ async fn proposal_rejects_foreign_occurrence_and_rolls_back_checkpoint() {
     };
     reviewed.occurrence.assistant_message_id = "foreign-assistant".into();
     let error = db.persist_tool_round_and_state(&round.assistant.conversation_id, &round.assistant,
-        &[result.clone()], &round.state, round.timestamp).await.unwrap_err();
+        std::slice::from_ref(&result), &round.state, round.timestamp).await.unwrap_err();
     assert!(error.to_string().contains("proposal source"));
     assert_eq!(receipt_count(&db).await, 0);
     let message_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE message_id = ?1")
