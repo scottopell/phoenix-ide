@@ -43,6 +43,14 @@ pub struct ProductConversationRenameReceiptSource {
     pub tool_use_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HistoricalProductConversationRenameReceiptSource {
+    pub product_conversation_id: String,
+    pub transcript_id: String,
+    pub message_id: String,
+    pub tool_use_id: String,
+}
+
 impl From<&ProductConversationRenameSource> for ProductConversationRenameReceiptSource {
     fn from(source: &ProductConversationRenameSource) -> Self {
         Self {
@@ -75,6 +83,25 @@ pub struct ProductConversationRenameReceipt {
     pub name_revision_before: i64,
     pub committed_at_unix_micros: i64,
     pub source: ProductConversationRenameReceiptSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HistoricalProductConversationRenameReceipt {
+    pub operation_id: String,
+    pub product_conversation_id: ProductConversationId,
+    pub title: String,
+    pub slug_at_commit: String,
+    pub naming_root_transcript_id: String,
+    pub name_revision_before: i64,
+    pub committed_at_unix_micros: i64,
+    pub source: HistoricalProductConversationRenameReceiptSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum ProductConversationRenameReceiptRecord {
+    Qualified(ProductConversationRenameReceipt),
+    HistoricalUnqualified(HistoricalProductConversationRenameReceipt),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,7 +207,7 @@ impl Database {
         &self,
         transcript_id: &str,
         operation_id: &str,
-    ) -> DbResult<Option<ProductConversationRenameReceipt>> {
+    ) -> DbResult<Option<ProductConversationRenameReceiptRecord>> {
         let mut conn = self.pool.acquire().await?;
         let mut tx = conn.begin().await?;
         let result = async {
@@ -277,7 +304,9 @@ impl Database {
             }
             if let Some(row) = sqlx::query("SELECT * FROM product_conversation_rename_receipts WHERE operation_id = ?1")
                 .bind(&command.operation_id).fetch_optional(&mut *tx).await? {
-                let receipt = decode_receipt(&row)?;
+                let ProductConversationRenameReceiptRecord::Qualified(receipt) = decode_receipt(&row)? else {
+                    return Ok(ProductConversationRenameResult::Conflict);
+                };
                 return Ok(if same_intent(&receipt, command) { ProductConversationRenameResult::Replayed(receipt) } else { ProductConversationRenameResult::Conflict });
             }
             if let RenameAuthority::Local(current_gc_transcript_id) = authority {
@@ -405,14 +434,19 @@ fn validate_operation_id(operation_id: &str) -> DbResult<()> {
     Ok(())
 }
 
+fn valid_source_locator(value: &str) -> bool {
+    !value.trim().is_empty() && !value.contains('\0')
+}
+
 fn validate_command(command: &ProductConversationRenameCommand) -> DbResult<()> {
     validate_operation_id(&command.operation_id)?;
     if command.expected_name_revision < 0
         || command.expected_name_revision == i64::MAX
         || command.expected_root_transcript_id.trim().is_empty()
-        || command.source.transcript_id.trim().is_empty()
-        || command.source.message_id.trim().is_empty()
-        || command.source.tool_use_id.trim().is_empty()
+        || !valid_source_locator(command.source.product_conversation_id.as_str())
+        || !valid_source_locator(&command.source.transcript_id)
+        || !valid_source_locator(&command.source.message_id)
+        || !valid_source_locator(&command.source.tool_use_id)
     {
         return Err(DbError::ConversationTitleInvalid);
     }
@@ -482,35 +516,58 @@ fn same_intent(
         && receipt.source.transcript_id == command.source.transcript_id
 }
 
-fn decode_receipt(row: &sqlx::sqlite::SqliteRow) -> DbResult<ProductConversationRenameReceipt> {
+fn decode_receipt(
+    row: &sqlx::sqlite::SqliteRow,
+) -> DbResult<ProductConversationRenameReceiptRecord> {
     let product = |key: &str| -> DbResult<ProductConversationId> {
         row.try_get::<String, _>(key)?
             .parse::<ProductConversationId>()
             .map_err(|e| DbError::Serialization(e.to_string()))
     };
-    Ok(ProductConversationRenameReceipt {
-        operation_id: row.try_get("operation_id")?,
-        product_conversation_id: product("product_conversation_id")?,
-        title: row.try_get("title")?,
-        slug_at_commit: row.try_get("slug_at_commit")?,
-        naming_root_transcript_id: row.try_get("naming_root_transcript_id")?,
-        name_revision_before: row.try_get("name_revision_before")?,
-        committed_at_unix_micros: row.try_get("committed_at_unix_micros")?,
-        source: ProductConversationRenameReceiptSource {
-            source_instance_id: row
-                .try_get::<String, _>("source_instance_id")?
-                .parse()
-                .map_err(
+    let source_instance_id: Option<String> = row.try_get("source_instance_id")?;
+    let Some(source_instance_id) = source_instance_id else {
+        return Ok(
+            ProductConversationRenameReceiptRecord::HistoricalUnqualified(
+                HistoricalProductConversationRenameReceipt {
+                    operation_id: row.try_get("operation_id")?,
+                    product_conversation_id: product("product_conversation_id")?,
+                    title: row.try_get("title")?,
+                    slug_at_commit: row.try_get("slug_at_commit")?,
+                    naming_root_transcript_id: row.try_get("naming_root_transcript_id")?,
+                    name_revision_before: row.try_get("name_revision_before")?,
+                    committed_at_unix_micros: row.try_get("committed_at_unix_micros")?,
+                    source: HistoricalProductConversationRenameReceiptSource {
+                        product_conversation_id: row.try_get("source_product_conversation_id")?,
+                        transcript_id: row.try_get("source_transcript_id")?,
+                        message_id: row.try_get("source_message_id")?,
+                        tool_use_id: row.try_get("source_tool_use_id")?,
+                    },
+                },
+            ),
+        );
+    };
+    Ok(ProductConversationRenameReceiptRecord::Qualified(
+        ProductConversationRenameReceipt {
+            operation_id: row.try_get("operation_id")?,
+            product_conversation_id: product("product_conversation_id")?,
+            title: row.try_get("title")?,
+            slug_at_commit: row.try_get("slug_at_commit")?,
+            naming_root_transcript_id: row.try_get("naming_root_transcript_id")?,
+            name_revision_before: row.try_get("name_revision_before")?,
+            committed_at_unix_micros: row.try_get("committed_at_unix_micros")?,
+            source: ProductConversationRenameReceiptSource {
+                source_instance_id: source_instance_id.parse().map_err(
                     |e: phoenix_core::domain::instance_identity::InstanceIdParseError| {
                         DbError::Serialization(e.to_string())
                     },
                 )?,
-            product_conversation_id: row.try_get("source_product_conversation_id")?,
-            transcript_id: row.try_get("source_transcript_id")?,
-            message_id: row.try_get("source_message_id")?,
-            tool_use_id: row.try_get("source_tool_use_id")?,
+                product_conversation_id: row.try_get("source_product_conversation_id")?,
+                transcript_id: row.try_get("source_transcript_id")?,
+                message_id: row.try_get("source_message_id")?,
+                tool_use_id: row.try_get("source_tool_use_id")?,
+            },
         },
-    })
+    ))
 }
 
 #[cfg(test)]
@@ -819,6 +876,16 @@ mod tests {
             .await
             .unwrap()
             .expect("the injected acknowledgement loss follows a real commit");
+        let ProductConversationRenameReceiptRecord::Qualified(receipt) = receipt else {
+            panic!("new renames must have qualified receipts");
+        };
+        assert_eq!(
+            serde_json::to_value(ProductConversationRenameReceiptRecord::Qualified(
+                receipt.clone()
+            ))
+            .unwrap(),
+            serde_json::to_value(&receipt).unwrap()
+        );
         assert_eq!(receipt.title, command.title.as_str());
         assert_eq!(receipt.name_revision_before, 0);
         assert_eq!(
@@ -975,7 +1042,7 @@ mod tests {
             db.read_product_conversation_rename_receipt(&gc.id, &command.operation_id)
                 .await
                 .unwrap(),
-            Some(first)
+            Some(ProductConversationRenameReceiptRecord::Qualified(first))
         );
         assert!(matches!(
             db.read_product_conversation_rename_receipt(&root.id, &command.operation_id)
@@ -1137,7 +1204,9 @@ mod tests {
             db.read_product_conversation_rename_receipt(&gc.id, &command.operation_id)
                 .await
                 .unwrap(),
-            Some(receipt.clone())
+            Some(ProductConversationRenameReceiptRecord::Qualified(
+                receipt.clone()
+            ))
         );
         assert_eq!(
             db.rename_product_conversation(&gc.id, &command)
@@ -1165,7 +1234,7 @@ mod tests {
             db.read_product_conversation_rename_receipt(&gc.id, &command.operation_id)
                 .await
                 .unwrap(),
-            Some(receipt)
+            Some(ProductConversationRenameReceiptRecord::Qualified(receipt))
         );
     }
 
@@ -1202,7 +1271,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retained_whitespace_locators_replay_or_conflict_without_losing_receipt() {
+    async fn qualified_locator_bytes_replay_or_conflict_without_normalization() {
         let db = Database::open_in_memory().await.unwrap();
         let root = db
             .create_conversation("legacy-rename-target", "before", "/tmp", true, None, None)
@@ -1218,7 +1287,7 @@ mod tests {
         command.source.source_instance_id = db.instance_id().await.unwrap();
         command.source.product_conversation_id = gc.product_conversation_id.clone();
         command.source.transcript_id = gc.id.clone();
-        sqlx::query("INSERT INTO product_conversation_rename_receipts (operation_id, product_conversation_id, name_revision_before, title, source_product_conversation_id, source_transcript_id, source_message_id, source_tool_use_id, naming_root_transcript_id, slug_at_commit, committed_at_unix_micros, source_instance_id) VALUES (?1,?2,0,'title',?3,?4,'  ','\t',?5,'retained-slug',10,?6)")
+        sqlx::query("INSERT INTO product_conversation_rename_receipts (operation_id, product_conversation_id, name_revision_before, title, source_product_conversation_id, source_transcript_id, source_message_id, source_tool_use_id, naming_root_transcript_id, slug_at_commit, committed_at_unix_micros, source_instance_id) VALUES (?1,?2,0,'title',?3,?4,'  message  ','\ttool\t',?5,'retained-slug',10,?6)")
             .bind(&command.operation_id)
             .bind(command.product_conversation_id.as_str())
             .bind(command.source.product_conversation_id.as_str())
@@ -1232,8 +1301,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(receipt.source.message_id, "  ");
-        assert_eq!(receipt.source.tool_use_id, "\t");
+        let ProductConversationRenameReceiptRecord::Qualified(receipt) = receipt else {
+            panic!("a source with an instance identity must have a qualified receipt");
+        };
+        assert_eq!(receipt.source.message_id, "  message  ");
+        assert_eq!(receipt.source.tool_use_id, "\ttool\t");
         assert_eq!(
             db.rename_product_conversation(&gc.id, &command)
                 .await
@@ -1242,14 +1314,17 @@ mod tests {
                 .unwrap(),
             ProductConversationRenameResult::Replayed(receipt)
         );
-        sqlx::query("UPDATE product_conversation_rename_receipts SET source_product_conversation_id=' \t ' WHERE operation_id=?1")
+        sqlx::query("UPDATE product_conversation_rename_receipts SET source_product_conversation_id=' \tproduct\t ' WHERE operation_id=?1")
             .bind(&command.operation_id).execute(db.pool()).await.unwrap();
         let retained = db
             .read_product_conversation_rename_receipt(&gc.id, &command.operation_id)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(retained.source.product_conversation_id, " \t ");
+        let ProductConversationRenameReceiptRecord::Qualified(retained) = retained else {
+            panic!("a source with an instance identity must have a qualified receipt");
+        };
+        assert_eq!(retained.source.product_conversation_id, " \tproduct\t ");
         assert_eq!(
             db.rename_product_conversation(&gc.id, &command)
                 .await
@@ -1260,11 +1335,159 @@ mod tests {
         );
     }
 
-    #[test]
-    fn command_rejects_whitespace_only_native_locator_values() {
+    #[tokio::test]
+    async fn historical_unqualified_receipts_preserve_exact_snapshots_and_locator_bytes() {
+        let db = Database::open_in_memory().await.unwrap();
+        let gc = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let product_conversation_id = ProductConversationId::new();
+        for missing_locator in 0..4 {
+            let mut locators = [
+                " \tproduct\0é ",
+                "\ttranscript\n ",
+                "  \0message ",
+                "\rtool-use\t ",
+            ];
+            locators[missing_locator] = "";
+            let expected = HistoricalProductConversationRenameReceipt {
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                product_conversation_id: product_conversation_id.clone(),
+                title: " Historical\0title \t ".into(),
+                slug_at_commit: " historical-slug ".into(),
+                naming_root_transcript_id: " root\0snapshot \t ".into(),
+                name_revision_before: 7,
+                committed_at_unix_micros: 1_234_567_890_123,
+                source: HistoricalProductConversationRenameReceiptSource {
+                    product_conversation_id: locators[0].into(),
+                    transcript_id: locators[1].into(),
+                    message_id: locators[2].into(),
+                    tool_use_id: locators[3].into(),
+                },
+            };
+            sqlx::query(
+                "INSERT INTO product_conversation_rename_receipts
+                 (operation_id, product_conversation_id, title, slug_at_commit,
+                  naming_root_transcript_id, name_revision_before, committed_at_unix_micros,
+                  source_instance_id, source_product_conversation_id, source_transcript_id,
+                  source_message_id, source_tool_use_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, ?11)",
+            )
+            .bind(&expected.operation_id)
+            .bind(expected.product_conversation_id.as_str())
+            .bind(&expected.title)
+            .bind(&expected.slug_at_commit)
+            .bind(&expected.naming_root_transcript_id)
+            .bind(expected.name_revision_before)
+            .bind(expected.committed_at_unix_micros)
+            .bind(&expected.source.product_conversation_id)
+            .bind(&expected.source.transcript_id)
+            .bind(&expected.source.message_id)
+            .bind(&expected.source.tool_use_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+            let record = db
+                .read_product_conversation_rename_receipt(&gc.id, &expected.operation_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                record,
+                ProductConversationRenameReceiptRecord::HistoricalUnqualified(expected.clone())
+            );
+            assert_eq!(
+                serde_json::to_value(&record).unwrap(),
+                serde_json::json!({
+                    "operation_id": expected.operation_id,
+                    "product_conversation_id": expected.product_conversation_id,
+                    "title": expected.title,
+                    "slug_at_commit": expected.slug_at_commit,
+                    "naming_root_transcript_id": expected.naming_root_transcript_id,
+                    "name_revision_before": expected.name_revision_before,
+                    "committed_at_unix_micros": expected.committed_at_unix_micros,
+                    "source": {
+                        "product_conversation_id": locators[0],
+                        "transcript_id": locators[1],
+                        "message_id": locators[2],
+                        "tool_use_id": locators[3],
+                    },
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_of_unqualified_historical_operation_conflicts_without_rewriting_it() {
+        let db = Database::open_in_memory().await.unwrap();
+        let gc = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let root = db
+            .create_conversation("unqualified-target", "Original", "/tmp", true, None, None)
+            .await
+            .unwrap();
         let mut command = test_command(uuid::Uuid::new_v4().to_string(), 0);
-        command.source.message_id = "  \t".into();
-        assert!(validate_command(&command).is_err());
+        command.product_conversation_id = root.product_conversation_id.clone();
+        command.expected_root_transcript_id = root.id.clone();
+        command.source.source_instance_id = db.instance_id().await.unwrap();
+        command.source.product_conversation_id = gc.product_conversation_id.clone();
+        command.source.transcript_id = gc.id.clone();
+        sqlx::query(
+            "INSERT INTO product_conversation_rename_receipts
+             (operation_id, product_conversation_id, title, slug_at_commit,
+              naming_root_transcript_id, name_revision_before, committed_at_unix_micros,
+              source_instance_id, source_product_conversation_id, source_transcript_id,
+              source_message_id, source_tool_use_id)
+             VALUES (?1, ?2, ?3, 'historical-slug', ?4, ?5, 123, NULL, ?6, ?7, ?8, ?9)",
+        )
+        .bind(&command.operation_id)
+        .bind(command.product_conversation_id.as_str())
+        .bind(command.title.as_str())
+        .bind(&command.expected_root_transcript_id)
+        .bind(command.expected_name_revision)
+        .bind(command.source.product_conversation_id.as_str())
+        .bind(&command.source.transcript_id)
+        .bind(&command.source.message_id)
+        .bind(&command.source.tool_use_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let before = db
+            .read_product_conversation_rename_receipt(&gc.id, &command.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            &before,
+            ProductConversationRenameReceiptRecord::HistoricalUnqualified(_)
+        ));
+
+        assert_rename_conflict(&db, &gc.id, &command).await;
+        assert_eq!(
+            db.read_product_conversation_rename_receipt(&gc.id, &command.operation_id)
+                .await
+                .unwrap(),
+            Some(before)
+        );
+        let detail = db
+            .read_product_conversation_rename_detail(&gc.id, root.product_conversation_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(detail.title, root.title);
+        assert_eq!(detail.name_revision, 0);
+    }
+
+    #[test]
+    fn command_rejects_invalid_native_locator_values() {
+        let mut command = test_command(uuid::Uuid::new_v4().to_string(), 0);
+        for invalid in ["  \t", "message\0suffix"] {
+            command.source.message_id = invalid.into();
+            assert!(validate_command(&command).is_err());
+        }
         command.source.message_id = "message".into();
         command.expected_root_transcript_id = "  ".into();
         assert!(validate_command(&command).is_err());

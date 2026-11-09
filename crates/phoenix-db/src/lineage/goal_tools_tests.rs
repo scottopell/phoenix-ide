@@ -153,7 +153,7 @@ async fn canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent() {
             crate::migrations::run_pending_migrations(db.pool())
                 .await
                 .unwrap(),
-            154 - through
+            155 - through
         );
         assert_goal_rows(&db, &owner, source.is_some()).await;
         let tail: Vec<i64> = sqlx::query_scalar(
@@ -164,7 +164,7 @@ async fn canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent() {
         .unwrap();
         assert_eq!(
             tail,
-            vec![143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155]
+            vec![143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 158]
         );
         let before = snapshot(db.pool()).await;
         assert_eq!(

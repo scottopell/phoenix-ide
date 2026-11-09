@@ -66,9 +66,11 @@ pub use native_continuation::{
 };
 mod product_conversation_rename;
 pub use product_conversation_rename::{
+    HistoricalProductConversationRenameReceipt, HistoricalProductConversationRenameReceiptSource,
     NormalizedConversationTitle, ProductConversationRenameCommand, ProductConversationRenameDetail,
-    ProductConversationRenameReceipt, ProductConversationRenameReceiptSource,
-    ProductConversationRenameResult, ProductConversationRenameSource,
+    ProductConversationRenameReceipt, ProductConversationRenameReceiptRecord,
+    ProductConversationRenameReceiptSource, ProductConversationRenameResult,
+    ProductConversationRenameSource,
 };
 mod product_conversation_read;
 pub mod retrieval;

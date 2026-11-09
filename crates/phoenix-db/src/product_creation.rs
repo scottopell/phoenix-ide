@@ -541,6 +541,10 @@ fn require_creation_retry_owner(
     }
 }
 
+fn valid_creation_locator(value: &str) -> bool {
+    !value.trim().is_empty() && !value.contains('\0')
+}
+
 async fn require_creation_origin_tx(
     conn: &mut SqliteConnection,
     local_instance_id: InstanceId,
@@ -552,14 +556,15 @@ async fn require_creation_origin_tx(
         return match origin {
             ProductCreationOrigin::FederatedConversation {
                 source_instance_id,
+                product_conversation_id,
                 transcript_id,
                 source_call,
-                ..
             } if *source_instance_id == authority.caller_instance_id()
                 && *source_instance_id != local_instance_id
-                && !transcript_id.trim().is_empty()
-                && !source_call.message_id.trim().is_empty()
-                && !source_call.tool_use_id.trim().is_empty() =>
+                && valid_creation_locator(product_conversation_id.as_str())
+                && valid_creation_locator(transcript_id)
+                && valid_creation_locator(&source_call.message_id)
+                && valid_creation_locator(&source_call.tool_use_id) =>
             {
                 Ok(())
             }
@@ -583,8 +588,10 @@ async fn require_creation_origin_tx(
             },
         ) if *source_instance_id == local_instance_id
             && caller == transcript_id
-            && !source_call.message_id.is_empty()
-            && !source_call.tool_use_id.is_empty() =>
+            && valid_creation_locator(product_conversation_id.as_str())
+            && valid_creation_locator(transcript_id)
+            && valid_creation_locator(&source_call.message_id)
+            && valid_creation_locator(&source_call.tool_use_id) =>
         {
             let owner: Option<String> = sqlx::query_scalar(
                 "SELECT product_conversation_id FROM conversations WHERE id = ?1",
@@ -2067,6 +2074,7 @@ impl Database {
              SET status = 'delivery_pending', delivery_attempt_count = 1,
                  delivery_retry_at_unix_micros = ?1, updated_at_unix_micros = ?1
              WHERE request_id = ?2 AND status = 'delivery_failed'
+               AND objective_origin <> 'federated_conversation'
                AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = product_creation_jobs.published_conversation_id)
                AND EXISTS (
                  SELECT 1 FROM product_conversations product
@@ -2090,6 +2098,7 @@ impl Database {
     pub async fn product_creation_delivery_retryable(&self, request_id: &str) -> DbResult<bool> {
         let retryable: bool = sqlx::query_scalar(
             "SELECT CASE WHEN j.status = 'delivery_failed'
+               AND j.objective_origin <> 'federated_conversation'
                AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = j.published_conversation_id)
                AND EXISTS (
                SELECT 1 FROM product_conversations product
@@ -2117,7 +2126,7 @@ impl Database {
         sqlx::query(
             "SELECT request_id, cwd, objective, objective_origin, objective_slack_request_id, objective_source_instance_id, objective_source_product_conversation_id, objective_source_transcript_id, objective_source_message_id, objective_source_tool_use_id, model, effort, llm_language, status,
                     published_product_id, updated_at_unix_micros, last_error,
-                    CASE WHEN j.status = 'delivery_failed' AND EXISTS (
+                    CASE WHEN j.status = 'delivery_failed' AND j.objective_origin <> 'federated_conversation' AND EXISTS (
                       SELECT 1 FROM product_conversations product
                       WHERE product.id = j.published_product_id
                         AND product.kind = 'ordinary'
@@ -2145,6 +2154,7 @@ impl Database {
                     'delivery_pending',
                     'cleanup_ambiguous'
                   )
+               AND j.objective_origin <> 'federated_conversation'
                AND (status NOT IN ('delivery_pending', 'delivery_failed') OR EXISTS (
                     SELECT 1 FROM conversations c WHERE c.id = j.published_conversation_id
                ))
@@ -2490,6 +2500,7 @@ impl Database {
                  published_product_id = NULL, published_conversation_id = NULL,
                  deletion_requested_at_unix_micros = NULL, updated_at_unix_micros = ?2
              WHERE request_id = ?1
+               AND objective_origin <> 'federated_conversation'
                AND (status IN ('accepted', 'claimed', 'retry_scheduled')
                     OR (status = 'delivery_pending' AND EXISTS (
                         SELECT 1 FROM conversations c
@@ -2537,6 +2548,7 @@ impl Database {
         let job: Option<i64> = sqlx::query_scalar(
             "SELECT claim_generation FROM product_creation_jobs
              WHERE request_id = ?1
+               AND objective_origin <> 'federated_conversation'
                AND status IN ('accepted', 'claimed', 'retry_scheduled', 'cancelling', 'cancelled', 'failed', 'cleanup_ambiguous')
                AND published_product_id IS NULL AND published_conversation_id IS NULL",
         )
@@ -2556,6 +2568,7 @@ impl Database {
                  last_error = NULL, cancelled_at_unix_micros = NULL,
                  deletion_requested_at_unix_micros = ?2, updated_at_unix_micros = ?2
              WHERE request_id = ?1 AND claim_generation = ?3
+               AND objective_origin <> 'federated_conversation'
                AND status IN ('accepted', 'claimed', 'retry_scheduled', 'cancelling', 'cancelled', 'failed', 'cleanup_ambiguous')
                AND published_product_id IS NULL AND published_conversation_id IS NULL",
         )
@@ -2992,6 +3005,14 @@ mod product_creation_tests {
     use phoenix_core::domain::db_schema::{Message, MessageContent, UserContent};
     use phoenix_core::domain::sm_state::ConvState;
     use phoenix_core::llm_language::LlmLanguage;
+
+    #[test]
+    fn creation_locators_reject_empty_and_nul_text() {
+        assert!(valid_creation_locator("source"));
+        assert!(!valid_creation_locator("  "));
+        assert!(!valid_creation_locator("\0source"));
+        assert!(!valid_creation_locator("source\0suffix"));
+    }
 
     #[tokio::test]
     async fn peer_project_options_match_coordinator_order_and_page_limit_without_a_transcript() {
@@ -8161,6 +8182,256 @@ mod product_creation_tests {
             .retry_failed_product_creation_delivery("req-published-lifecycle")
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn generic_lifecycle_mutations_exclude_federated_jobs() {
+        use crate::federation_conversation_authority::enroll_test_peer;
+        use phoenix_core::domain::db_schema::SourceToolCall;
+
+        let db = Database::open_in_memory().await.unwrap();
+        let now = Utc::now();
+        let caller = InstanceId::new();
+        let authority = enroll_test_peer(&db, caller, b"lifecycle-peer").await;
+
+        let federated_intent = |suffix: &str| {
+            let mut value = intent("/repo/federated", "federated lifecycle");
+            value.origin = ProductCreationOrigin::FederatedConversation {
+                source_instance_id: caller,
+                product_conversation_id: ProductConversationId::new(),
+                transcript_id: format!("source-transcript-{suffix}"),
+                source_call: SourceToolCall {
+                    message_id: format!("source-message-{suffix}"),
+                    tool_use_id: format!("source-tool-{suffix}"),
+                },
+            };
+            value
+        };
+        for (request_id, suffix) in [
+            ("federated-cancel", "cancel"),
+            ("federated-delete", "delete"),
+            ("federated-delivery", "delivery"),
+        ] {
+            let value = federated_intent(suffix);
+            db.accept_product_creation_as_federation(&authority, request_id, |_| Ok(value))
+                .await
+                .unwrap();
+        }
+
+        assert!(!db
+            .cancel_product_creation("federated-cancel", now)
+            .await
+            .unwrap());
+        assert!(!db
+            .request_product_creation_deletion("federated-delete", now)
+            .await
+            .unwrap());
+        assert_eq!(
+            db.get_product_creation_job("federated-cancel")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "accepted"
+        );
+        assert_eq!(
+            db.get_product_creation_job("federated-delete")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "accepted"
+        );
+
+        let claimed = db
+            .claim_product_creation(
+                "federated-delivery",
+                "worker",
+                "token",
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        advance_to_metadata(&db, "federated-delivery", &claimed.claim).await;
+        let published = db
+            .publish_product_creation_atomically(&ProductCreationPublishInput {
+                request_id: "federated-delivery".into(),
+                claim: claimed.claim,
+                conversation: published_conversation(
+                    "conv-federated-delivery",
+                    claimed.job.product_conversation_id,
+                    WorkScopeId::new(),
+                    "/repo/federated",
+                ),
+                authority_kind: AuthorityKind::Work,
+                environment: EnvironmentContext::UnownedCwd {
+                    cwd: "/repo/federated".into(),
+                },
+                git_publication: Some(ProductCreationGitPublicationFacts {
+                    repository_root: "/repo/federated".into(),
+                    exact_checkout_oid: "abc123".into(),
+                }),
+            })
+            .await
+            .unwrap();
+        assert!(published);
+        sqlx::query(
+            "UPDATE product_creation_jobs
+             SET status = 'delivery_failed', delivery_retry_at_unix_micros = NULL,
+                 claim_worker_id = NULL, claim_token = NULL, claim_lease_until_unix_micros = NULL
+             WHERE request_id = 'federated-delivery'",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert!(!db
+            .product_creation_delivery_retryable("federated-delivery")
+            .await
+            .unwrap());
+        assert!(!db
+            .retry_failed_product_creation_delivery("federated-delivery")
+            .await
+            .unwrap());
+        assert_eq!(
+            db.get_product_creation_job("federated-delivery")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "delivery_failed"
+        );
+
+        db.accept_product_creation("ordinary-cancel", &intent("/repo/a", "ordinary"))
+            .await
+            .unwrap();
+        assert!(db
+            .cancel_product_creation("ordinary-cancel", now)
+            .await
+            .unwrap());
+        db.accept_product_creation("ordinary-delete", &intent("/repo/a", "ordinary"))
+            .await
+            .unwrap();
+        assert!(db
+            .request_product_creation_deletion("ordinary-delete", now)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn recovery_discovery_excludes_federated_jobs_in_every_recovery_status() {
+        use crate::federation_conversation_authority::enroll_test_peer;
+        use phoenix_core::domain::db_schema::SourceToolCall;
+
+        let db = Database::open_in_memory().await.unwrap();
+        let caller = InstanceId::new();
+        let authority = enroll_test_peer(&db, caller, b"recovery-peer").await;
+        let statuses = [
+            "accepted",
+            "claimed",
+            "retry_scheduled",
+            "cancelling",
+            "failed",
+            "cancelled",
+            "delivery_failed",
+            "delivery_pending",
+            "cleanup_ambiguous",
+        ];
+        for status in statuses {
+            let local_request = format!("local-{status}");
+            let remote_request = format!("federated-{status}");
+            db.accept_product_creation(&local_request, &intent("/repo/recovery", status))
+                .await
+                .unwrap();
+            let mut remote_intent = intent("/repo/recovery", status);
+            remote_intent.origin = ProductCreationOrigin::FederatedConversation {
+                source_instance_id: caller,
+                product_conversation_id: ProductConversationId::new(),
+                transcript_id: format!("source-transcript-{status}"),
+                source_call: SourceToolCall {
+                    message_id: format!("source-message-{status}"),
+                    tool_use_id: format!("source-tool-{status}"),
+                },
+            };
+            db.accept_product_creation_as_federation(&authority, &remote_request, |_| {
+                Ok(remote_intent)
+            })
+            .await
+            .unwrap();
+
+            for request_id in [&local_request, &remote_request] {
+                if matches!(status, "delivery_pending" | "delivery_failed") {
+                    let claimed = db
+                        .claim_product_creation(
+                            request_id,
+                            "worker",
+                            "token",
+                            Utc::now(),
+                            chrono::Duration::minutes(5),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    advance_to_metadata(&db, request_id, &claimed.claim).await;
+                    assert!(db
+                        .publish_product_creation_atomically(&ProductCreationPublishInput {
+                            request_id: request_id.clone(),
+                            claim: claimed.claim,
+                            conversation: published_conversation(
+                                &format!("conv-{request_id}"),
+                                claimed.job.product_conversation_id,
+                                WorkScopeId::new(),
+                                "/repo/recovery",
+                            ),
+                            authority_kind: AuthorityKind::Work,
+                            environment: EnvironmentContext::UnownedCwd {
+                                cwd: "/repo/recovery".into(),
+                            },
+                            git_publication: Some(ProductCreationGitPublicationFacts {
+                                repository_root: "/repo/recovery".into(),
+                                exact_checkout_oid: "abc123".into(),
+                            }),
+                        })
+                        .await
+                        .unwrap());
+                }
+                sqlx::query(
+                    "UPDATE product_creation_jobs
+                     SET status = ?2,
+                         claim_worker_id = CASE WHEN ?2 = 'claimed' THEN 'worker' END,
+                         claim_token = CASE WHEN ?2 = 'claimed' THEN 'token' END,
+                         claim_lease_until_unix_micros = CASE WHEN ?2 = 'claimed' THEN ?3 END,
+                         retry_at_unix_micros = CASE WHEN ?2 = 'retry_scheduled' THEN ?3 END,
+                         cancelled_at_unix_micros = CASE WHEN ?2 = 'cancelled' THEN ?3 END,
+                         delivery_retry_at_unix_micros = NULL
+                     WHERE request_id = ?1",
+                )
+                .bind(request_id)
+                .bind(status)
+                .bind(Utc::now().timestamp_micros())
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            }
+        }
+
+        let rows = db.list_product_creation_recovery_jobs(None).await.unwrap();
+        assert_eq!(rows.len(), statuses.len());
+        for status in statuses {
+            let row = rows
+                .iter()
+                .find(|row| row.request_id == format!("local-{status}"))
+                .unwrap_or_else(|| panic!("local {status} job must remain discoverable"));
+            assert_eq!(row.status, status);
+            assert_eq!(row.intent.origin, ProductCreationOrigin::UserApi);
+        }
+        assert!(!rows.iter().any(|row| matches!(
+            row.intent.origin,
+            ProductCreationOrigin::FederatedConversation { .. }
+        )));
     }
 
     #[tokio::test]

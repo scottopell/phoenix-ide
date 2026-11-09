@@ -208,7 +208,7 @@ fn constructed_native_intents_are_validated_before_transport() {
     create.objective = " \n ".into();
     assert!(!native_create_intent_valid(&create));
     create.objective = "objective".into();
-    create.model = Some("".into());
+    create.model = Some(String::new());
     assert!(!native_create_intent_valid(&create));
     create.model = None;
     create.source.source_assistant_message_id = "bad-message".into();
@@ -718,7 +718,7 @@ fn rename_replay_preserves_historical_tool_locator_but_not_foreign_provenance() 
     };
     assert!(!native_rename_intent_valid(&too_long));
     too_long.title = "bounded".into();
-    too_long.expected_root_transcript_id = "".into();
+    too_long.expected_root_transcript_id = String::new();
     assert!(!native_rename_intent_valid(&too_long));
     let request = NativeRenameRequest {
         caller_instance_id: InstanceId::new(),
@@ -783,17 +783,298 @@ fn rename_replay_preserves_historical_tool_locator_but_not_foreign_provenance() 
     }
     receipt["receipt_source"]["source_assistant_message_id"] = "message:opaque".into();
     assert!(serde_json::from_value::<NativeRenameResponse>(receipt.clone()).is_ok());
-    receipt["receipt_source"]["source_assistant_message_id"] = "".into();
+    receipt["receipt_source"]["source_assistant_message_id"] = String::new().into();
     let response: NativeRenameResponse = serde_json::from_value(receipt).unwrap();
     assert!(native_verify_rename(&request, &response).is_err());
 }
 
-#[tokio::test]
-async fn native_create_reconciles_only_uncertain_dispatch_failures_without_retrying_create() {
+struct NativeCreateCaseResponses {
+    expect_status_post: bool,
+    first_response: Vec<u8>,
+    known_body: Vec<u8>,
+}
+
+struct NativeCreateServerCase {
+    case: &'static str,
+    expected_create: serde_json::Value,
+    expected_status: serde_json::Value,
+    responses: NativeCreateCaseResponses,
+    coordinator_rotation: Option<(Database, String)>,
+}
+
+fn native_create_case_responses(
+    case: &str,
+    caller: InstanceId,
+    destination: InstanceId,
+    request: &NativeCreateRequest,
+) -> NativeCreateCaseResponses {
+    let expect_status_post = matches!(
+        case,
+        "disconnect"
+            | "remote_failure"
+            | "status_malformed"
+            | "status_witness_mismatch"
+            | "status_invalid_product"
+    );
+    let mut receipt = serde_json::json!({
+        "caller_instance_id": caller, "destination_instance_id": destination,
+        "request_id": request.request_id, "product_conversation_id": ProductConversationId::new(),
+        "status": "accepted"
+    });
+    let mut status = "200 OK";
+    let body = match case {
+        "malformed" => b"not json".to_vec(),
+        "oversized" | "oversized_stream" => vec![b' '; NATIVE_CREATE_RESPONSE_BYTES + 1],
+        "wrong_caller" => {
+            receipt["caller_instance_id"] = serde_json::json!(InstanceId::new());
+            serde_json::to_vec(&receipt).unwrap()
+        }
+        "wrong_destination" => {
+            receipt["destination_instance_id"] = serde_json::json!(InstanceId::new());
+            serde_json::to_vec(&receipt).unwrap()
+        }
+        "wrong_request" => {
+            receipt["request_id"] = uuid::Uuid::new_v4().to_string().into();
+            serde_json::to_vec(&receipt).unwrap()
+        }
+        "missing_receipt" => {
+            receipt
+                .as_object_mut()
+                .unwrap()
+                .remove("product_conversation_id");
+            serde_json::to_vec(&receipt).unwrap()
+        }
+        "invalid_product" => {
+            receipt["product_conversation_id"] = "   ".into();
+            serde_json::to_vec(&receipt).unwrap()
+        }
+        "domain_rejection" => {
+            status = "409 Conflict";
+            br#"{"error_type":"conflict","error":"conflict"}"#.to_vec()
+        }
+        "remote_failure" => {
+            status = "500 Internal Server Error";
+            br#"{"error_type":"internal","error":"response outcome unavailable"}"#.to_vec()
+        }
+        "unsupported" => {
+            status = "404 Not Found";
+            Vec::new()
+        }
+        "disconnect"
+        | "disconnect_after_rotation"
+        | "status_malformed"
+        | "status_witness_mismatch"
+        | "status_invalid_product" => Vec::new(),
+        _ => unreachable!(),
+    };
+    let create_response_dropped = matches!(
+        case,
+        "disconnect"
+            | "disconnect_after_rotation"
+            | "status_malformed"
+            | "status_witness_mismatch"
+            | "status_invalid_product"
+    );
+    let first_response = if create_response_dropped {
+        Vec::new()
+    } else if case == "oversized_stream" {
+        format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+            body.len(),
+            String::from_utf8(body).unwrap()
+        )
+        .into_bytes()
+    } else {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes()
+        .into_iter()
+        .chain(body)
+        .collect()
+    };
+    let (_, mut known) = status_fixture();
+    known["caller_instance_id"] = serde_json::json!(caller);
+    known["destination_instance_id"] = serde_json::json!(destination);
+    known["request_id"] = request.request_id.clone().into();
+    if case == "status_witness_mismatch" {
+        known["destination_instance_id"] = serde_json::json!(InstanceId::new());
+    }
+    if case == "status_invalid_product" {
+        known["product_conversation_id"] = "   ".into();
+    }
+    let known_body = if case == "status_malformed" {
+        b"not json".to_vec()
+    } else {
+        serde_json::to_vec(&known).unwrap()
+    };
+    NativeCreateCaseResponses {
+        expect_status_post,
+        first_response,
+        known_body,
+    }
+}
+
+async fn rotate_coordinator(db: &Database, transcript_id: &str) {
+    db.update_conversation_state(
+        transcript_id,
+        &phoenix_core::domain::sm_state::ConvState::ContextExhausted {
+            summary: "rotate coordinator before reconciliation".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        db.continue_conversation(transcript_id).await.unwrap(),
+        phoenix_db::ContinueOutcome::Created(_)
+    ));
+}
+
+async fn serve_native_create_case(
+    listener: tokio::net::TcpListener,
+    tls: tokio_rustls::TlsAcceptor,
+    server_case: NativeCreateServerCase,
+) -> tokio::net::TcpListener {
     use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
 
+    let NativeCreateServerCase {
+        case,
+        expected_create,
+        expected_status,
+        responses,
+        coordinator_rotation,
+    } = server_case;
+    for step in 0..=usize::from(responses.expect_status_post) {
+        let (socket, _) = listener.accept().await.unwrap();
+        let socket = tls.accept(socket).await.unwrap();
+        let mut socket = tokio::io::BufReader::new(socket);
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            assert_ne!(socket.read_until(b'\n', &mut headers).await.unwrap(), 0);
+        }
+        let headers = String::from_utf8(headers).unwrap().to_ascii_lowercase();
+        let route = if step == 0 {
+            "native-create"
+        } else {
+            "native-create-status"
+        };
+        assert!(headers.starts_with(&format!("post /api/federation/peer/{route} http/1.1\r\n")));
+        assert!(headers.contains("authorization: bearer phx_peer_"));
+        let length: usize = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length: "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut body = vec![0; length];
+        socket.read_exact(&mut body).await.unwrap();
+        let actual: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let expected = if step == 0 {
+            &expected_create
+        } else {
+            &expected_status
+        };
+        assert_eq!(&actual, expected);
+        if step == 0 {
+            if case == "disconnect_after_rotation" {
+                let (db, transcript_id) = coordinator_rotation.as_ref().unwrap();
+                rotate_coordinator(db, transcript_id).await;
+                drop(socket);
+                continue;
+            }
+            if case != "disconnect" {
+                socket.write_all(&responses.first_response).await.unwrap();
+                socket.flush().await.unwrap();
+            }
+        } else {
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                responses.known_body.len()
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket.write_all(&responses.known_body).await.unwrap();
+            socket.flush().await.unwrap();
+        }
+    }
+    listener
+}
+
+fn assert_native_create_case_outcome(
+    case: &str,
+    outcome: &Result<NativeCreateOutcome, FederationClientError>,
+    request: &NativeCreateRequest,
+) {
+    match case {
+        "disconnect" | "remote_failure" => assert!(matches!(
+            outcome,
+            Ok(NativeCreateOutcome::Reconciled {
+                status: NativeCreateStatusResponse::Known {
+                    request_id,
+                    destination_instance_id,
+                    ..
+                }
+            }) if request_id == &request.request_id
+                && *destination_instance_id == request.destination_instance_id
+        )),
+        "status_malformed" | "status_witness_mismatch" | "status_invalid_product" => {
+            assert!(matches!(
+            outcome,
+            Err(FederationClientError::NativeCreateUncertain {
+                destination_instance_id,
+                request_id,
+                ..
+            }) if *destination_instance_id == request.destination_instance_id
+                && request_id == &request.request_id
+            ));
+        }
+        "disconnect_after_rotation" => assert!(matches!(
+            outcome,
+            Err(FederationClientError::NativeCreateUncertain {
+                destination_instance_id,
+                request_id,
+                message,
+            }) if *destination_instance_id == request.destination_instance_id
+                && request_id == &request.request_id
+                && message.contains("status lookup not sent")
+        )),
+        "oversized" | "oversized_stream" => assert!(matches!(
+            outcome,
+            Err(FederationClientError::ResponseTooLarge(
+                NATIVE_CREATE_RESPONSE_BYTES
+            ))
+        )),
+        "domain_rejection" => assert!(matches!(
+            outcome,
+            Err(FederationClientError::NativeDomainRejected(_))
+        )),
+        "unsupported" => assert!(matches!(
+            outcome,
+            Err(FederationClientError::NativeEndpointUnsupported)
+        )),
+        _ => assert!(matches!(
+            outcome,
+            Err(FederationClientError::NativeProtocolRejected(_))
+        )),
+    }
+}
+
+struct NativeCreateTestFixture {
+    state: crate::api::AppState,
+    caller: InstanceId,
+    coordinator_id: String,
+    acceptor: tokio_rustls::TlsAcceptor,
+    trust: PeerTlsTrust,
+}
+
+async fn native_create_test_fixture() -> NativeCreateTestFixture {
     let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
     let caller = state.db.instance_id().await.unwrap();
+    let coordinator = state
+        .db
+        .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+        .await
+        .unwrap();
     let cert_dir = tempfile::tempdir().unwrap();
     let mut config = crate::tls::load_config(&crate::tls::ConfigSource::Auto {
         dir: cert_dir.path().into(),
@@ -808,243 +1089,160 @@ async fn native_create_reconciles_only_uncertain_dispatch_failures_without_retry
         .unwrap(),
     };
     let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config.server));
+    NativeCreateTestFixture {
+        state,
+        caller,
+        coordinator_id: coordinator.id,
+        acceptor,
+        trust,
+    }
+}
+
+async fn run_native_create_case(fixture: &NativeCreateTestFixture, case: &'static str) {
+    let destination = InstanceId::new();
+    let request = NativeCreateRequest {
+        caller_instance_id: fixture.caller,
+        destination_instance_id: destination,
+        request_id: uuid::Uuid::new_v4().to_string(),
+        cwd: "/destination/project".into(),
+        objective: "Implement the change".into(),
+        model: None,
+        effort: None,
+        language: None,
+        start: NativeCreateStart::SubmitObjective,
+        source: NativeActionSourceCall {
+            source_transcript_id: fixture.coordinator_id.clone(),
+            ..source_call()
+        },
+    };
+    let responses = native_create_case_responses(case, fixture.caller, destination, &request);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_name = format!("native-{case}");
+    let address = format!(
+        "https://localhost:{}",
+        listener.local_addr().unwrap().port()
+    );
+    let credential = phoenix_core::domain::instance_identity::PeerBearerCredential::parse(format!(
+        "phx_peer_{}",
+        "n".repeat(43)
+    ))
+    .unwrap();
+    fixture
+        .state
+        .db
+        .save_federation_peer_connection(
+            destination,
+            &peer_name.parse().unwrap(),
+            &address.parse().unwrap(),
+            &credential,
+            &fixture.trust,
+        )
+        .await
+        .unwrap();
+    let peer = resolve_saved_peer_for_test(&fixture.state.db, &peer_name)
+        .await
+        .unwrap();
+    let expected_create = serde_json::to_value(&request).unwrap();
+    let expected_status = serde_json::json!({
+        "caller_instance_id": fixture.caller, "destination_instance_id": destination,
+        "request_id": request.request_id
+    });
+    let coordinator_rotation = (case == "disconnect_after_rotation")
+        .then(|| (fixture.state.db.clone(), fixture.coordinator_id.clone()));
+    let server = tokio::spawn(serve_native_create_case(
+        listener,
+        fixture.acceptor.clone(),
+        NativeCreateServerCase {
+            case,
+            expected_create,
+            expected_status,
+            responses,
+            coordinator_rotation,
+        },
+    ));
+    let mut invalid = request.clone();
+    invalid.objective.clear();
+    assert!(matches!(
+        remote_native_create(&fixture.state.db, &peer, &invalid).await,
+        Err(FederationClientError::NativeProtocolRejected(_))
+    ));
+    invalid.objective = "x".repeat(NATIVE_CREATE_REQUEST_BYTES);
+    assert!(matches!(
+        remote_native_create(&fixture.state.db, &peer, &invalid).await,
+        Err(FederationClientError::NativeRequestTooLarge(
+            NATIVE_CREATE_REQUEST_BYTES
+        ))
+    ));
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        remote_native_create(&fixture.state.db, &peer, &request),
+    )
+    .await
+    .unwrap();
+    assert_native_create_case_outcome(case, &outcome, &request);
+    let listener = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+    let listener = listener.into_std().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    assert!(
+        matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ),
+        "unexpected extra connection or listener error for {case}"
+    );
+}
+
+#[tokio::test]
+async fn native_create_reconciles_only_uncertain_dispatch_failures_without_retrying_create() {
+    let fixture = native_create_test_fixture().await;
     for case in [
         "malformed",
         "oversized",
         "oversized_stream",
         "status_malformed",
         "status_witness_mismatch",
+        "status_invalid_product",
         "wrong_caller",
         "wrong_destination",
         "wrong_request",
         "missing_receipt",
+        "invalid_product",
         "domain_rejection",
+        "remote_failure",
         "unsupported",
         "disconnect",
+        "disconnect_after_rotation",
     ] {
-        let should_reconcile = matches!(
-            case,
-            "disconnect" | "status_malformed" | "status_witness_mismatch"
-        );
-        let destination = InstanceId::new();
-        let request = NativeCreateRequest {
-            caller_instance_id: caller,
-            destination_instance_id: destination,
-            request_id: uuid::Uuid::new_v4().to_string(),
-            cwd: "/destination/project".into(),
-            objective: "Implement the change".into(),
-            model: None,
-            effort: None,
-            language: None,
-            start: NativeCreateStart::SubmitObjective,
-            source: source_call(),
-        };
-        let mut receipt = serde_json::json!({
-            "caller_instance_id": caller, "destination_instance_id": destination,
-            "request_id": request.request_id, "product_conversation_id": ProductConversationId::new(),
-            "status": "accepted"
-        });
-        let mut status = "200 OK";
-        let body = match case {
-            "malformed" => b"not json".to_vec(),
-            "oversized" | "oversized_stream" => vec![b' '; NATIVE_CREATE_RESPONSE_BYTES + 1],
-            "wrong_caller" => {
-                receipt["caller_instance_id"] = serde_json::json!(InstanceId::new());
-                serde_json::to_vec(&receipt).unwrap()
-            }
-            "wrong_destination" => {
-                receipt["destination_instance_id"] = serde_json::json!(InstanceId::new());
-                serde_json::to_vec(&receipt).unwrap()
-            }
-            "wrong_request" => {
-                receipt["request_id"] = uuid::Uuid::new_v4().to_string().into();
-                serde_json::to_vec(&receipt).unwrap()
-            }
-            "missing_receipt" => {
-                receipt
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("product_conversation_id");
-                serde_json::to_vec(&receipt).unwrap()
-            }
-            "domain_rejection" => {
-                status = "409 Conflict";
-                br#"{"error_type":"conflict","error":"conflict"}"#.to_vec()
-            }
-            "unsupported" => {
-                status = "404 Not Found";
-                Vec::new()
-            }
-            "disconnect" | "status_malformed" | "status_witness_mismatch" => Vec::new(),
-            _ => unreachable!(),
-        };
-        let first_response = if case == "disconnect"
-            || case == "status_malformed"
-            || case == "status_witness_mismatch"
-        {
-            Vec::new()
-        } else if case == "oversized_stream" {
-            format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n", body.len(), String::from_utf8(body).unwrap()).into_bytes()
-        } else {
-            format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()
-            ).into_bytes().into_iter().chain(body).collect::<Vec<_>>()
-        };
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let peer_name = format!("native-{case}");
-        let address = format!(
-            "https://localhost:{}",
-            listener.local_addr().unwrap().port()
-        );
-        let credential = phoenix_core::domain::instance_identity::PeerBearerCredential::parse(
-            format!("phx_peer_{}", "n".repeat(43)),
-        )
-        .unwrap();
-        state
-            .db
-            .save_federation_peer_connection(
-                destination,
-                &peer_name.parse().unwrap(),
-                &address.parse().unwrap(),
-                &credential,
-                &trust,
-            )
-            .await
-            .unwrap();
-        let peer = resolve_saved_peer_for_test(&state.db, &peer_name)
-            .await
-            .unwrap();
-        let expected_create = serde_json::to_value(&request).unwrap();
-        let expected_status = serde_json::json!({
-            "caller_instance_id": caller, "destination_instance_id": destination,
-            "request_id": request.request_id
-        });
-        let (_, mut known) = status_fixture();
-        known["caller_instance_id"] = serde_json::json!(caller);
-        known["destination_instance_id"] = serde_json::json!(destination);
-        known["request_id"] = request.request_id.clone().into();
-        if case == "status_witness_mismatch" {
-            known["destination_instance_id"] = serde_json::json!(InstanceId::new());
-        }
-        let known_body = if case == "status_malformed" {
-            b"not json".to_vec()
-        } else {
-            serde_json::to_vec(&known).unwrap()
-        };
-        let tls = acceptor.clone();
-        let server = tokio::spawn(async move {
-            for step in 0..(1 + usize::from(should_reconcile)) {
-                let (socket, _) = listener.accept().await.unwrap();
-                let socket = tls.accept(socket).await.unwrap();
-                let mut socket = tokio::io::BufReader::new(socket);
-                let mut headers = Vec::new();
-                while !headers.ends_with(b"\r\n\r\n") {
-                    assert_ne!(socket.read_until(b'\n', &mut headers).await.unwrap(), 0);
-                }
-                let headers = String::from_utf8(headers).unwrap().to_ascii_lowercase();
-                let route = if step == 0 {
-                    "native-create"
-                } else {
-                    "native-create-status"
-                };
-                assert!(
-                    headers.starts_with(&format!("post /api/federation/peer/{route} http/1.1\r\n"))
-                );
-                assert!(headers.contains("authorization: bearer phx_peer_"));
-                let length: usize = headers
-                    .lines()
-                    .find_map(|line| line.strip_prefix("content-length: "))
-                    .unwrap()
-                    .parse()
-                    .unwrap();
-                let mut body = vec![0; length];
-                socket.read_exact(&mut body).await.unwrap();
-                let actual: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                let expected = if step == 0 {
-                    &expected_create
-                } else {
-                    &expected_status
-                };
-                assert_eq!(&actual, expected);
-                if step == 0 {
-                    if case != "disconnect" {
-                        socket.write_all(&first_response).await.unwrap();
-                        socket.flush().await.unwrap();
-                    }
-                } else {
-                    socket.write_all(format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", known_body.len()
-                    ).as_bytes()).await.unwrap();
-                    socket.write_all(&known_body).await.unwrap();
-                    socket.flush().await.unwrap();
-                }
-            }
-        });
-        let mut invalid = request.clone();
-        invalid.objective.clear();
-        assert!(matches!(
-            remote_native_create(&state.db, &peer, &invalid).await,
-            Err(FederationClientError::NativeProtocolRejected(_))
-        ));
-        invalid.objective = "x".repeat(NATIVE_CREATE_REQUEST_BYTES);
-        assert!(matches!(
-            remote_native_create(&state.db, &peer, &invalid).await,
-            Err(FederationClientError::NativeRequestTooLarge(
-                NATIVE_CREATE_REQUEST_BYTES
-            ))
-        ));
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            remote_native_create(&state.db, &peer, &request),
-        )
-        .await
-        .unwrap();
-        match case {
-            "disconnect" => assert!(
-                matches!(outcome, Ok(NativeCreateOutcome::Reconciled {
-                    status: NativeCreateStatusResponse::Known {
-                        request_id,
-                        destination_instance_id,
-                        ..
-                    }
-                }) if request_id == request.request_id && destination_instance_id == destination),
-                "{case}"
-            ),
-            "status_malformed" | "status_witness_mismatch" => assert!(matches!(
-                outcome,
-                Err(FederationClientError::NativeCreateUncertain {
-                    destination_instance_id,
-                    request_id,
-                    ..
-                }) if destination_instance_id == destination && request_id == request.request_id
-            )),
-            "oversized" | "oversized_stream" => assert!(matches!(
-                outcome,
-                Err(FederationClientError::ResponseTooLarge(
-                    NATIVE_CREATE_RESPONSE_BYTES
-                ))
-            )),
-            "domain_rejection" => assert!(matches!(
-                outcome,
-                Err(FederationClientError::NativeDomainRejected(_))
-            )),
-            "unsupported" => assert!(matches!(
-                outcome,
-                Err(FederationClientError::NativeEndpointUnsupported)
-            )),
-            _ => assert!(
-                matches!(
-                    outcome,
-                    Err(FederationClientError::NativeProtocolRejected(_))
-                ),
-                "{case}"
-            ),
-        }
-        tokio::time::timeout(std::time::Duration::from_secs(5), server)
-            .await
-            .unwrap()
-            .unwrap();
+        run_native_create_case(&fixture, case).await;
     }
+}
+
+#[test]
+fn normalized_native_cwd_trims_before_expansion_and_resolution() {
+    let home = tempfile::tempdir().unwrap();
+    let project = home.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let expected = project
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        normalized_native_cwd("~/project", home.path()).unwrap(),
+        expected
+    );
+    assert_eq!(
+        normalized_native_cwd("  ~/project  ", home.path()).unwrap(),
+        expected
+    );
+    assert_eq!(
+        normalized_native_cwd(&format!("  {}  ", project.to_string_lossy()), home.path()).unwrap(),
+        expected
+    );
+    assert!(normalized_native_cwd("  \t\n ", home.path()).is_err());
 }
 
 #[test]
@@ -1079,17 +1277,21 @@ fn native_error_status_and_domain_classification_remain_distinct() {
         assert!(native_error_status_matches(status, code));
         assert!(!native_error_status_matches(StatusCode::OK, code));
         let body = serde_json::to_vec(&failure.body).unwrap();
-        match native_response_error(status, &body) {
-            FederationClientError::NativeIdentityRejected(_) => assert!(matches!(
+        let error = native_response_error(status, &body);
+        if matches!(&error, FederationClientError::NativeIdentityRejected(_)) {
+            assert!(matches!(
                 code,
                 NativeActionErrorCode::Unauthorized | NativeActionErrorCode::Forbidden
-            )),
-            FederationClientError::NativeRemoteFailure(_) => assert!(status.is_server_error()),
-            FederationClientError::NativeDomainRejected(_) => assert!(
+            ));
+        } else if matches!(&error, FederationClientError::NativeRemoteFailure(_)) {
+            assert!(status.is_server_error());
+        } else if matches!(&error, FederationClientError::NativeDomainRejected(_)) {
+            assert!(
                 status.is_client_error()
                     && !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
-            ),
-            unexpected => panic!("unexpected classification: {unexpected}"),
+            );
+        } else {
+            panic!("unexpected classification: {error}");
         }
     }
     let body = br#"{"error_type":"not_found","error":"missing"}"#;

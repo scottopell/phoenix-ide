@@ -3188,6 +3188,7 @@ fn native_app_error(error: super::handlers::AppError) -> NativeActionFailure {
 }
 
 fn normalized_native_cwd(cwd: &str, home: &std::path::Path) -> Result<String, NativeActionFailure> {
+    let cwd = cwd.trim();
     let path = if cwd == "~" {
         home.to_path_buf()
     } else if let Some(suffix) = cwd.strip_prefix("~/") {
@@ -3195,7 +3196,7 @@ fn normalized_native_cwd(cwd: &str, home: &std::path::Path) -> Result<String, Na
     } else {
         std::path::PathBuf::from(cwd)
     };
-    if cwd.trim().is_empty() || !path.is_dir() {
+    if cwd.is_empty() || !path.is_dir() {
         return Err(StatusCode::BAD_REQUEST.into());
     }
     let canonical = std::fs::canonicalize(path).map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -3913,6 +3914,14 @@ fn native_absolute_path(path: &str) -> bool {
                 && path.as_bytes()[0].is_ascii_alphabetic()))
 }
 
+fn source_native_options_cwd(cwd: &str) -> Result<String, FederationClientError> {
+    let cwd = cwd.trim();
+    if !native_option_string(cwd) {
+        return Err(native_protocol("invalid cwd"));
+    }
+    Ok(cwd.to_owned())
+}
+
 pub(crate) async fn remote_native_create_options(
     db: &Database,
     peer: &ResolvedPeer,
@@ -3931,19 +3940,19 @@ pub(crate) async fn remote_native_create_options(
         } => (*caller_instance_id, *destination_instance_id),
     };
     native_client_identity(db, peer, caller, destination).await?;
-    if matches!(request, NativeCreateOptionsRequest::WithCwd { cwd, .. } if !native_option_string(cwd))
-    {
-        return Err(native_protocol("invalid cwd"));
+    let mut request = request.clone();
+    if let NativeCreateOptionsRequest::WithCwd { cwd, .. } = &mut request {
+        *cwd = source_native_options_cwd(cwd)?;
     }
     let response = native_post(
         peer,
         "/api/federation/peer/native-create-options",
-        request,
+        &request,
         NATIVE_CREATE_OPTIONS_REQUEST_BYTES,
         NATIVE_CREATE_OPTIONS_RESPONSE_BYTES,
     )
     .await?;
-    native_verify_create_options(request, &response)?;
+    native_verify_create_options(&request, &response)?;
     Ok(response)
 }
 
@@ -4049,6 +4058,7 @@ fn native_verify_status(
         witness,
     )?;
     if let NativeCreateStatusResponse::Known {
+        product_conversation_id,
         creation_status,
         provisioning_stage,
         provisioning_stage_updated_at_unix_micros,
@@ -4058,6 +4068,11 @@ fn native_verify_status(
         ..
     } = response
     {
+        if !native_domain_identity_valid(product_conversation_id.as_str()) {
+            return Err(native_protocol(
+                "known create product conversation identity is invalid",
+            ));
+        }
         use phoenix_db::ProductCreationProvisioningStage as Stage;
         use NativeCreationState as S;
         native_verify_status_stage(
@@ -4160,6 +4175,22 @@ fn native_product_route_shape(route: &str) -> bool {
         && crate::api::product_conversations::product_route(Some(&decoded), "") == route
 }
 
+async fn remote_native_create_status_post(
+    peer: &ResolvedPeer,
+    request: &NativeCreateStatusRequest,
+) -> Result<NativeCreateStatusResponse, FederationClientError> {
+    let response = native_post(
+        peer,
+        "/api/federation/peer/native-create-status",
+        request,
+        NATIVE_CREATE_STATUS_REQUEST_BYTES,
+        NATIVE_CREATE_STATUS_RESPONSE_BYTES,
+    )
+    .await?;
+    native_verify_status(request, &response)?;
+    Ok(response)
+}
+
 pub(crate) async fn remote_native_create_status(
     db: &Database,
     peer: &ResolvedPeer,
@@ -4172,16 +4203,7 @@ pub(crate) async fn remote_native_create_status(
         request.destination_instance_id,
     )
     .await?;
-    let response = native_post(
-        peer,
-        "/api/federation/peer/native-create-status",
-        request,
-        NATIVE_CREATE_STATUS_REQUEST_BYTES,
-        NATIVE_CREATE_STATUS_RESPONSE_BYTES,
-    )
-    .await?;
-    native_verify_status(request, &response)?;
-    Ok(response)
+    remote_native_create_status_post(peer, request).await
 }
 
 pub(crate) async fn remote_native_create(
@@ -4216,17 +4238,53 @@ pub(crate) async fn remote_native_create(
                 &request.request_id,
                 &acceptance.request_id,
             )?;
+            if !native_domain_identity_valid(acceptance.product_conversation_id.as_str()) {
+                return Err(native_protocol(
+                    "accepted create product conversation identity is invalid",
+                ));
+            }
             Ok(acceptance)
         });
     match result {
         Ok(acceptance) => Ok(NativeCreateOutcome::Accepted { acceptance }),
-        Err(error @ FederationClientError::Request(_)) => {
+        Err(error)
+            if matches!(
+                &error,
+                FederationClientError::Request(_) | FederationClientError::NativeRemoteFailure(_)
+            ) =>
+        {
             let status_request = NativeCreateStatusRequest {
                 caller_instance_id: request.caller_instance_id,
                 destination_instance_id: request.destination_instance_id,
                 request: request.request_id.clone(),
             };
-            match remote_native_create_status(db, peer, &status_request).await {
+            if let Err(status_error) = native_client_identity(
+                db,
+                peer,
+                status_request.caller_instance_id,
+                status_request.destination_instance_id,
+            )
+            .await
+            {
+                return Err(FederationClientError::NativeCreateUncertain {
+                    destination_instance_id: request.destination_instance_id,
+                    request_id: request.request_id.clone(),
+                    message: format!(
+                        "{error}; original-destination status lookup failed: {status_error}"
+                    ),
+                });
+            }
+            if let Err(authority_error) = db
+                .require_current_coordinator_transcript(&request.source.source_transcript_id)
+                .await
+            {
+                return Err(FederationClientError::NativeCreateUncertain {
+                    destination_instance_id: request.destination_instance_id,
+                    request_id: request.request_id.clone(),
+                    message: format!("{error}; status lookup not sent: {authority_error}"),
+                });
+            }
+            match remote_native_create_status_post(peer, &status_request).await {
                 Ok(status) => Ok(NativeCreateOutcome::Reconciled { status }),
                 Err(status_error) => Err(FederationClientError::NativeCreateUncertain {
                     destination_instance_id: request.destination_instance_id,
