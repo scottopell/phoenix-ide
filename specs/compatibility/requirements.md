@@ -230,3 +230,16 @@ The canonical registry shall preserve migrations 130 `continuation_handoff_candi
 ### REQ-COMP-021 — Simple macOS forward deployment
 
 Routine macOS deployment SHALL delegate database eligibility, migrations and reconciliation to the selected candidate. It SHALL NOT add exhaustive database scans, schema-specific admission, rehearsals, snapshot recovery, automatic predecessor startup or transaction replay. After disruption failure it SHALL retain diagnostics and ownership for manual operator recovery under REQ-LDD-030–031. No availability or downgrade guarantee follows from routine deployment.
+
+### REQ-COMP-022 — Canonical migration 158-to-156 reconciliation
+
+WHEN the embedded migration registry contains canonical migrations 156 `remote_coordinator_goals` and 158 `federated_conversation_actions`
+AND a database migration ledger has canonical identities for every embedded migration from 129 through 155
+AND migration 158 is the highest recorded migration with its canonical identity
+AND migration 156 is the only missing embedded predecessor in the post-129 registered tail through migration 158
+THE SYSTEM SHALL admit the ledger and determine migration 156 is pending by individual version membership
+AND SHALL apply migration 156 through the ordinary forward-migration path without relabeling or mutating migration 158.
+
+THE SYSTEM SHALL NOT infer support for any other missing registered predecessor in the post-129 tail, wrong identity, unknown migration, conflict detected by the lineage schema-evidence validators, or ledger whose highest recorded migration exceeds 158 from this reconciliation.
+
+**Rationale:** The supported canonical source ledger contains migration 158 without migration 156. Exact admission of that post-129 predecessor-registry shape preserves ordinary forward migration while retaining fail-closed rejection for damaged or ambiguous registered tails.
