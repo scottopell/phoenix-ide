@@ -4,11 +4,10 @@ use crate::state_machine::event::CancelCause;
 use crate::state_machine::state::TaskApprovalOutcome;
 use chrono::Utc;
 use phoenix_core::domain::db_schema::{
-    FinalizedToolResult, InputOrigin, Message, MessageType, SourceToolCall,
+    ConvMode, FinalizedToolResult, InputOrigin, Message, MessageType, SourceToolCall,
 };
 use phoenix_core::domain::llm_types::ContentBlock;
 use phoenix_core::domain::task_approval::{ProposalOccurrence, ReviewedProposal};
-use phoenix_core::domain::ConvMode;
 use phoenix_core::task_source::{Priority, TaskSource};
 use phoenix_db::task_approval_inspection::{
     InspectPendingTaskInput, INSPECT_PENDING_TASK_TOOL_NAME,
