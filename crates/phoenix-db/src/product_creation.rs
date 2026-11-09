@@ -75,6 +75,7 @@ impl serde::Serialize for HistoricalSqliteText {
     }
 }
 
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoricalInternalCreationOrigin {
     product_conversation_id: HistoricalSqliteText,
@@ -633,16 +634,14 @@ fn require_creation_retry_owner(
             .map_err(|_| DbError::ProductCreationRequestConflict);
     }
     match origin {
-        ProductCreationOrigin::FederatedConversation { .. } => {
+        ProductCreationOrigin::FederatedConversation { .. }
+        | ProductCreationOrigin::HistoricalInternal(_) => {
             Err(DbError::ProductCreationRequestConflict)
         }
         ProductCreationOrigin::InternalConversation {
             source_instance_id, ..
         } if current_gc_transcript_id.is_none() || *source_instance_id != local_instance_id => {
             Err(DbError::CurrentCoordinatorRequired)
-        }
-        ProductCreationOrigin::HistoricalInternal(_) => {
-            Err(DbError::ProductCreationRequestConflict)
         }
         ProductCreationOrigin::InternalConversation { .. }
         | ProductCreationOrigin::UnknownHistorical
@@ -1311,23 +1310,31 @@ impl Database {
         .bind(intent.origin.as_str())
         .bind(match &intent.origin {
             ProductCreationOrigin::InternalConversation { product_conversation_id, .. } | ProductCreationOrigin::FederatedConversation { product_conversation_id, .. } => Some(product_conversation_id.as_str()),
-            ProductCreationOrigin::HistoricalInternal(_) => None,
-            ProductCreationOrigin::UnknownHistorical | ProductCreationOrigin::UserApi | ProductCreationOrigin::SlackGateway { .. } => None,
+            ProductCreationOrigin::UnknownHistorical
+            | ProductCreationOrigin::HistoricalInternal(_)
+            | ProductCreationOrigin::UserApi
+            | ProductCreationOrigin::SlackGateway { .. } => None,
         })
         .bind(match &intent.origin {
             ProductCreationOrigin::InternalConversation { transcript_id, .. } | ProductCreationOrigin::FederatedConversation { transcript_id, .. } => Some(transcript_id.as_str()),
-            ProductCreationOrigin::HistoricalInternal(_) => None,
-            ProductCreationOrigin::UnknownHistorical | ProductCreationOrigin::UserApi | ProductCreationOrigin::SlackGateway { .. } => None,
+            ProductCreationOrigin::UnknownHistorical
+            | ProductCreationOrigin::HistoricalInternal(_)
+            | ProductCreationOrigin::UserApi
+            | ProductCreationOrigin::SlackGateway { .. } => None,
         })
         .bind(match &intent.origin {
             ProductCreationOrigin::InternalConversation { source_call, .. } | ProductCreationOrigin::FederatedConversation { source_call, .. } => Some(source_call.message_id.as_str()),
-            ProductCreationOrigin::HistoricalInternal(_) => None,
-            ProductCreationOrigin::UnknownHistorical | ProductCreationOrigin::UserApi | ProductCreationOrigin::SlackGateway { .. } => None,
+            ProductCreationOrigin::UnknownHistorical
+            | ProductCreationOrigin::HistoricalInternal(_)
+            | ProductCreationOrigin::UserApi
+            | ProductCreationOrigin::SlackGateway { .. } => None,
         })
         .bind(match &intent.origin {
             ProductCreationOrigin::InternalConversation { source_call, .. } | ProductCreationOrigin::FederatedConversation { source_call, .. } => Some(source_call.tool_use_id.as_str()),
-            ProductCreationOrigin::HistoricalInternal(_) => None,
-            ProductCreationOrigin::UnknownHistorical | ProductCreationOrigin::UserApi | ProductCreationOrigin::SlackGateway { .. } => None,
+            ProductCreationOrigin::UnknownHistorical
+            | ProductCreationOrigin::HistoricalInternal(_)
+            | ProductCreationOrigin::UserApi
+            | ProductCreationOrigin::SlackGateway { .. } => None,
         })
         .bind(&intent.model)
         .bind(intent.effort.map(ModelEffort::as_wire_name))
@@ -3456,6 +3463,7 @@ mod product_creation_tests {
         ));
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn product_creation_origin_decode_requires_an_exact_discriminator_and_shape() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()

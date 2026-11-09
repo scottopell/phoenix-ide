@@ -1346,14 +1346,14 @@ mod tests {
             .await
             .unwrap();
         let product_conversation_id = ProductConversationId::new();
-        for missing_locator in 0..4 {
+        for unqualified_locator in 0..4 {
             let mut locators = [
                 " \tproduct\0é ",
                 "\ttranscript\n ",
                 "  \0message ",
                 "\rtool-use\t ",
             ];
-            locators[missing_locator] = "";
+            locators[unqualified_locator] = "\t";
             let expected = HistoricalProductConversationRenameReceipt {
                 operation_id: uuid::Uuid::new_v4().to_string(),
                 product_conversation_id: product_conversation_id.clone(),
@@ -1478,15 +1478,16 @@ mod tests {
             })
         );
 
+        let qualified_raw = [b"pc\xffsource".as_slice(), raw[1], raw[2], raw[3]];
         let qualified_operation_id = uuid::Uuid::new_v4().to_string();
         sqlx::query(insert)
             .bind(&qualified_operation_id)
             .bind(product_conversation_id.as_str())
             .bind(InstanceId::new().to_string())
-            .bind(raw[0])
-            .bind(raw[1])
-            .bind(raw[2])
-            .bind(raw[3])
+            .bind(qualified_raw[0])
+            .bind(qualified_raw[1])
+            .bind(qualified_raw[2])
+            .bind(qualified_raw[3])
             .execute(db.pool())
             .await
             .unwrap();
@@ -1528,7 +1529,7 @@ mod tests {
         .bind(command.expected_name_revision)
         .bind(command.source.product_conversation_id.as_str())
         .bind(&command.source.transcript_id)
-        .bind("")
+        .bind("\t")
         .bind(&command.source.tool_use_id)
         .execute(db.pool())
         .await

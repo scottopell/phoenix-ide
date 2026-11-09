@@ -21,15 +21,17 @@ fn live_rename_locators(locators: &[&[u8]; 4]) -> bool {
 }
 
 const CREATE_KIND_CHECK: &str = "objective_origin IN ('unknown_historical', 'user_api', 'slack_gateway', 'internal_conversation')";
-const CREATE_LEGACY_PROVENANCE_CHECK: &str = r#"CHECK ((objective_origin = 'internal_conversation'
+const CREATE_LEGACY_PROVENANCE_CHECK: &str = r"CHECK ((objective_origin = 'internal_conversation'
         AND objective_source_product_conversation_id IS NOT NULL AND typeof(objective_source_product_conversation_id) = 'text' AND length(trim(objective_source_product_conversation_id)) > 0
         AND objective_source_transcript_id IS NOT NULL AND typeof(objective_source_transcript_id) = 'text' AND length(trim(objective_source_transcript_id)) > 0
         AND objective_source_message_id IS NOT NULL AND typeof(objective_source_message_id) = 'text' AND length(trim(objective_source_message_id)) > 0
         AND objective_source_tool_use_id IS NOT NULL AND typeof(objective_source_tool_use_id) = 'text' AND length(trim(objective_source_tool_use_id)) > 0)
       OR (objective_origin IN ('unknown_historical', 'user_api', 'slack_gateway')
         AND objective_source_product_conversation_id IS NULL AND objective_source_transcript_id IS NULL
-        AND objective_source_message_id IS NULL AND objective_source_tool_use_id IS NULL))"#;
+        AND objective_source_message_id IS NULL AND objective_source_tool_use_id IS NULL))";
 const RUST_WHITESPACE_SQL: &str = "char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288)";
+
+type HistoricalLocatorRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
 fn locators_complete(columns: &[&str]) -> String {
     columns
@@ -149,7 +151,7 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
         let local: String = sqlx::query_scalar("SELECT instance_id FROM instance_identity WHERE singleton_key = 1").fetch_one(&mut *tx).await?;
         local.parse::<phoenix_core::domain::instance_identity::InstanceId>()
             .map_err(|error| DbError::Serialization(format!("migration 158 invalid local instance identity: {error}")))?;
-        let creation_rows: Vec<(i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        let creation_rows: Vec<HistoricalLocatorRow> = sqlx::query_as(
             "SELECT rowid, CAST(objective_source_product_conversation_id AS BLOB), CAST(objective_source_transcript_id AS BLOB), CAST(objective_source_message_id AS BLOB), CAST(objective_source_tool_use_id AS BLOB) FROM product_creation_jobs WHERE objective_origin = 'internal_conversation'",
         )
         .fetch_all(&mut *tx).await?;
@@ -157,7 +159,7 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
             .filter(|(_, product, transcript, message, tool)| live_creation_locators(&[product, transcript, message, tool]))
             .map(|(rowid, _, _, _, _)| rowid)
             .collect();
-        let rename_rows: Vec<(i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        let rename_rows: Vec<HistoricalLocatorRow> = sqlx::query_as(
             "SELECT rowid, CAST(source_product_conversation_id AS BLOB), CAST(source_transcript_id AS BLOB), CAST(source_message_id AS BLOB), CAST(source_tool_use_id AS BLOB) FROM product_conversation_rename_receipts",
         )
         .fetch_all(&mut *tx).await?;

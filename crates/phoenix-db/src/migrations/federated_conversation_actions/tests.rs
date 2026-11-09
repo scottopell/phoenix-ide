@@ -305,6 +305,7 @@ async fn migration158_qualifies_only_complete_local_native_history_and_preserves
     );
 }
 
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn migration158_schema_and_historical_text_survive_reopen() {
     let dir = tempfile::tempdir().unwrap();
