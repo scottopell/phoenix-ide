@@ -146,7 +146,6 @@ pub(crate) enum NativeTaskApprovalRefusal {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeTaskApprovalUnsupported {
-    FollowUp,
     DetachedCheckpoint,
     InstalledGoalControls,
 }
