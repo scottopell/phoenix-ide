@@ -110,7 +110,11 @@ impl FrozenPendingTask {
         {
             return Ok(StalePending);
         }
-        let Some(source) = TaskSource::detect(task_file) else {
+        let Some(source) = std::path::Path::new(task_file)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(TaskSource::detect)
+        else {
             return Ok(Unavailable);
         };
         if reviewed.occurrence.assistant_message_id.trim().is_empty()

@@ -8,7 +8,7 @@ use phoenix_core::domain::db_schema::{
     SourceToolCall,
 };
 use phoenix_core::domain::llm_types::ContentBlock;
-use phoenix_core::domain::task_approval::{ProposalOccurrence, ReviewedProposal};
+use phoenix_core::domain::task_approval::{ProposalOccurrence, ReviewedProposal, ReviewedTaskKind};
 use phoenix_core::task_source::{Priority, TaskSource};
 use phoenix_db::task_approval_inspection::{
     InspectPendingTaskInput, INSPECT_PENDING_TASK_TOOL_NAME,
@@ -31,13 +31,17 @@ impl AdmissionFixture {
     }
 
     async fn with_cwd(cwd: &str) -> Self {
+        Self::with_cwd_and_task_file(cwd, "tasks/reviewed.md").await
+    }
+
+    async fn with_cwd_and_task_file(cwd: &str, task_file: &str) -> Self {
         let db = Database::open_in_memory().await.unwrap();
         let target = db
             .create_conversation("actor-target", "actor-target", cwd, true, None, None)
             .await
             .unwrap();
-        let pending = pending_state(true);
-        let assistant = proposal_message(&target.id);
+        let pending = pending_state_at_path(true, task_file);
+        let assistant = proposal_message(&target.id, task_file);
         let result = FinalizedToolResult::new(
             &assistant.message_id,
             &target.id,
@@ -278,6 +282,59 @@ async fn matching_actor_pending_is_only_readiness_and_later_stop_still_cancels()
 }
 
 #[tokio::test]
+async fn canonical_taskmd_under_tasks_is_ready_at_actor_without_approval_effects() {
+    let task_file = "tasks/53019-p1-ready--plan.md";
+    let fixture = AdmissionFixture::with_cwd_and_task_file("/nonexistent", task_file).await;
+    let state = fixture
+        .db
+        .get_conversation(&fixture.target)
+        .await
+        .unwrap()
+        .state;
+    let ConvState::AwaitingTaskApproval {
+        task_file: captured_path,
+        title,
+        priority,
+        plan,
+        reviewed_proposal: Some(reviewed),
+    } = &state
+    else {
+        panic!("canonical persisted taskmd proposal");
+    };
+    assert_eq!(captured_path, task_file);
+    assert_eq!(title, "Exact title");
+    assert_eq!(*priority, Priority::P1);
+    assert_eq!(plan, BODY);
+    assert_eq!(reviewed.kind, ReviewedTaskKind::Taskmd);
+    let mut harness = fixture.harness(state.clone());
+    let (sender, receiver) = mpsc::channel(1);
+    harness.runtime = harness.runtime.with_acknowledged_event_receiver(receiver);
+    let running = tokio::spawn(harness.runtime.run());
+    assert_eq!(
+        checked(&sender, fixture.expected.clone()).await,
+        NativeTaskAdmissionReadiness::PendingMatchesRequiresFullAdmission
+    );
+    assert_eq!(
+        fixture
+            .db
+            .get_conversation(&fixture.target)
+            .await
+            .unwrap()
+            .state,
+        state
+    );
+    assert!(harness.storage.recorded_messages().is_empty());
+    assert!(harness
+        .storage
+        .approved_task_authority(&fixture.target)
+        .is_none());
+    assert!(harness.llm.recorded_requests().is_empty());
+    assert_eq!(objective_count(&fixture.db).await, 0);
+    harness.event_tx.send(Event::Shutdown).await.unwrap();
+    running.await.unwrap();
+}
+
+#[tokio::test]
 async fn actor_checks_every_pending_field_and_same_body_new_occurrence() {
     let fixture = AdmissionFixture::new().await;
     for change in 0..10 {
@@ -369,7 +426,7 @@ async fn current_owner_advance_refuses_frozen_actor_without_retargeting() {
     harness.event_tx.send(Event::Shutdown).await.unwrap();
     running.await.unwrap();
 }
-fn proposal_message(target: &str) -> Message {
+fn proposal_message(target: &str, task_file: &str) -> Message {
     Message {
         message_id: "proposal-assistant".into(),
         conversation_id: target.into(),
@@ -378,7 +435,7 @@ fn proposal_message(target: &str) -> Message {
         content: MessageContent::Agent(vec![ContentBlock::ToolUse {
             id: "proposal-call".into(),
             name: "propose_task".into(),
-            input: json!({"task_file":"tasks/reviewed.md"}),
+            input: json!({"task_file":task_file}),
         }]),
         display_data: None,
         usage_data: None,
@@ -387,15 +444,23 @@ fn proposal_message(target: &str) -> Message {
     }
 }
 fn pending_state(captured: bool) -> ConvState {
+    pending_state_at_path(captured, "tasks/reviewed.md")
+}
+
+fn pending_state_at_path(captured: bool, task_file: &str) -> ConvState {
     ConvState::AwaitingTaskApproval {
-        task_file: "tasks/reviewed.md".into(),
+        task_file: task_file.into(),
         title: "Exact title".into(),
         priority: Priority::P1,
         plan: BODY.into(),
         reviewed_proposal: captured.then(|| {
             ReviewedProposal::capture(
                 ProposalOccurrence::capture("proposal-assistant", "proposal-call").unwrap(),
-                &TaskSource::detect("tasks/reviewed.md").unwrap(),
+                &std::path::Path::new(task_file)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(TaskSource::detect)
+                    .unwrap(),
                 BODY,
             )
         }),
@@ -517,20 +582,25 @@ async fn assert_cancelled_native_approval_unchanged(f: &AdmissionFixture, before
     assert_eq!(receipts, 0);
 }
 
-#[derive(Default)]
+const NATIVE_APPROVAL_REPLY: &str = "Native approval continuation completed offline.";
+
 struct NativeApprovalLlm {
     calls: std::sync::atomic::AtomicUsize,
+    requests: mpsc::UnboundedSender<phoenix_llm::LlmRequest>,
 }
 
 #[async_trait::async_trait]
 impl phoenix_llm::LlmService for NativeApprovalLlm {
     async fn complete(
         &self,
-        _request: &phoenix_llm::LlmRequest,
+        request: &phoenix_llm::LlmRequest,
     ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Err(phoenix_llm::LlmError::invalid_request(
-            "native approval fixture does not contact a provider",
+        self.requests.send(request.clone()).unwrap();
+        Ok(phoenix_llm::LlmResponse::non_streaming(
+            vec![ContentBlock::text(NATIVE_APPROVAL_REPLY)],
+            true,
+            phoenix_llm::Usage::default(),
         ))
     }
 
@@ -539,18 +609,62 @@ impl phoenix_llm::LlmService for NativeApprovalLlm {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InitialApprovalScenario {
+    ContextPressure,
+    FreezeFailure,
+    ProviderSuccess,
+}
+
+#[tokio::test]
+async fn production_initial_approval_provider_success_preserves_body_and_replays() {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        assert_production_initial_approval(
+            InitialApprovalScenario::ProviderSuccess,
+            ReviewedTaskKind::PlainMarkdown,
+        ),
+    )
+    .await
+    .expect("real provider entry and durable terminal settlement before exact replay");
+}
+
+#[tokio::test]
+async fn production_initial_taskmd_approval_provider_success_preserves_body_and_replays() {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        assert_production_initial_approval(
+            InitialApprovalScenario::ProviderSuccess,
+            ReviewedTaskKind::Taskmd,
+        ),
+    )
+    .await
+    .expect("real taskmd approval, provider entry and durable settlement before exact replay");
+}
+
 #[tokio::test]
 async fn production_initial_approval_settles_immediate_context_pressure_and_replays() {
-    assert_production_initial_approval(true).await;
+    assert_production_initial_approval(
+        InitialApprovalScenario::ContextPressure,
+        ReviewedTaskKind::PlainMarkdown,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn production_initial_approval_settles_immediate_freeze_failure_and_replays() {
-    assert_production_initial_approval(false).await;
+    assert_production_initial_approval(
+        InitialApprovalScenario::FreezeFailure,
+        ReviewedTaskKind::PlainMarkdown,
+    )
+    .await;
 }
 
 #[allow(clippy::too_many_lines)]
-async fn assert_production_initial_approval(context_pressure: bool) {
+async fn assert_production_initial_approval(
+    scenario: InitialApprovalScenario,
+    kind: ReviewedTaskKind,
+) {
     use super::super::test_git_helpers::{add_explore_worktree, init_repo};
     use crate::runtime::task_approval_admission::NativeTaskApprovalOutcome;
     use crate::runtime::{RuntimeManager, SseEvent};
@@ -563,9 +677,20 @@ async fn assert_production_initial_approval(context_pressure: bool) {
     let (_temp, root) = init_repo();
     let worktree = add_explore_worktree(&root, "actor-target", "main");
     std::fs::create_dir_all(worktree.join("tasks")).unwrap();
-    std::fs::write(worktree.join("tasks/reviewed.md"), BODY).unwrap();
+    let (task_file, committed_task_file) = match kind {
+        ReviewedTaskKind::PlainMarkdown => ("tasks/reviewed.md", "tasks/reviewed.md"),
+        ReviewedTaskKind::Taskmd => (
+            "tasks/53019-p1-ready--plan.md",
+            "tasks/53019-p1-in-progress--plan.md",
+        ),
+    };
+    std::fs::write(worktree.join(task_file), BODY).unwrap();
+    if kind == ReviewedTaskKind::Taskmd {
+        git(&worktree, &["add", "--", task_file]);
+        git(&worktree, &["commit", "-m", "Seed existing ready taskmd"]);
+    }
     let before_head = git(&worktree, &["rev-parse", "HEAD"]).trim().to_owned();
-    let f = AdmissionFixture::new().await;
+    let f = AdmissionFixture::with_cwd_and_task_file("/nonexistent", task_file).await;
     assert_eq!(
         f.db.goal_control_installation(),
         GoalControlInstallation::Disabled
@@ -609,6 +734,11 @@ async fn assert_production_initial_approval(context_pressure: bool) {
     else {
         panic!("canonical pending proposal");
     };
+    assert_eq!(pending.task_file, task_file);
+    assert_eq!(pending.title, "Exact title");
+    assert_eq!(pending.priority, Priority::P1);
+    assert_eq!(pending.plan, BODY);
+    assert_eq!(pending.reviewed_proposal.as_ref().unwrap().kind, kind);
     let command = NativeTaskApprovalCommand {
         source_transcript_id: source.id.clone(),
         source: SourceToolCall {
@@ -652,16 +782,24 @@ async fn assert_production_initial_approval(context_pressure: bool) {
         .message_exists(&command.source.message_id)
         .await
         .unwrap());
-    let llm = Arc::new(NativeApprovalLlm::default());
-    let models = if context_pressure {
-        phoenix_llm::ModelRegistry::for_test_with_model_limits(vec![(
-            "claude-sonnet-5",
-            llm.clone(),
-            32,
-            1,
-        )])
-    } else {
-        phoenix_llm::ModelRegistry::new_empty()
+    let (request_tx, mut requests) = mpsc::unbounded_channel();
+    let llm = Arc::new(NativeApprovalLlm {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        requests: request_tx,
+    });
+    let models = match scenario {
+        InitialApprovalScenario::ContextPressure => {
+            phoenix_llm::ModelRegistry::for_test_with_model_limits(vec![(
+                "claude-sonnet-5",
+                llm.clone(),
+                32,
+                1,
+            )])
+        }
+        InitialApprovalScenario::FreezeFailure => phoenix_llm::ModelRegistry::new_empty(),
+        InitialApprovalScenario::ProviderSuccess => {
+            phoenix_llm::ModelRegistry::for_test_with_sonnet(llm.clone())
+        }
     };
     let manager = Arc::new(RuntimeManager::new(
         f.db.clone(),
@@ -683,12 +821,34 @@ async fn assert_production_initial_approval(context_pressure: bool) {
     assert_eq!(receipt.owner, inspection.owner);
     assert_eq!(receipt.target_transcript_id, "actor-target");
     assert_eq!(receipt.continuation, NativeApprovalContinuation::Requested);
+    assert_eq!(receipt.source_transcript_id, source.id);
+    assert_eq!(
+        receipt.proposal,
+        command
+            .pending
+            .reviewed_proposal
+            .as_ref()
+            .unwrap()
+            .occurrence
+    );
+    assert!(receipt.committed_at_us > 0);
+    let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM native_task_approval_receipts")
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(receipts, 1);
     let approved =
         f.db.get_approved_task_objective("actor-target")
             .await
             .unwrap()
             .unwrap();
     assert_eq!(approved.title, "Exact title");
+    assert_eq!(approved.task_title, "Exact title");
+    assert_eq!(approved.priority, Priority::P1);
+    assert_eq!(approved.task_file, task_file);
+    if kind == ReviewedTaskKind::Taskmd {
+        assert_eq!(approved.task_id, "53019");
+    }
     assert_eq!(approved.plan, BODY);
     assert_eq!(approved.artifact_body, BODY);
     let messages = f.db.get_messages("actor-target").await.unwrap();
@@ -713,73 +873,208 @@ async fn assert_production_initial_approval(context_pressure: bool) {
         .trim(),
         "1"
     );
-    assert_eq!(git(&worktree, &["show", "HEAD:tasks/reviewed.md"]), BODY);
+    assert_eq!(
+        git(&worktree, &["show", &format!("HEAD:{committed_task_file}")]),
+        BODY
+    );
+    assert_eq!(
+        std::fs::read(worktree.join(committed_task_file)).unwrap(),
+        BODY.as_bytes()
+    );
+    if kind == ReviewedTaskKind::Taskmd {
+        assert!(!worktree.join(task_file).exists());
+        assert_eq!(
+            git(&worktree, &["show", "-s", "--format=%s", "HEAD"]).trim(),
+            "task 53019: Exact title"
+        );
+        assert_eq!(
+            git(
+                &worktree,
+                &[
+                    "diff",
+                    "--name-status",
+                    "--find-renames",
+                    &before_head,
+                    "HEAD",
+                    "--",
+                    "tasks/"
+                ]
+            )
+            .trim(),
+            format!("R100\t{task_file}\t{committed_task_file}")
+        );
+    }
     assert!(
         matches!(f.db.inspect_native_task_approval_command(&command).await.unwrap(),
         NativeTaskApprovalInspection::Replay(ref stored) if stored == &receipt)
     );
-    let mut saw_approval_state = false;
-    let mut saw_immediate_settlement = false;
-    let mut saw_context_terminal = false;
-    while let Ok(event) = events.try_recv() {
-        if let SseEvent::StateChange { state, .. } = event {
-            if matches!(state, ConvState::RecoverableContinuationFailure { .. }) {
-                assert!(
-                    saw_immediate_settlement,
-                    "terminal failure must follow context pressure"
-                );
-                saw_context_terminal = true;
+    if scenario == InitialApprovalScenario::ProviderSuccess {
+        let request = requests
+            .recv()
+            .await
+            .expect("actual LlmService::complete entry");
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 1);
+        let submitted_approval = request
+            .messages
+            .iter()
+            .find(|message| {
+                message.source_message_id.as_deref() == Some(receipt.approval_message_id.as_str())
+            })
+            .expect("the actual provider request includes the committed approval message");
+        assert_eq!(submitted_approval.role, phoenix_llm::MessageRole::User);
+        assert!(submitted_approval.content.iter().any(|block| {
+            matches!(block, ContentBlock::Text { text }
+                if text.contains("Task approved.") && text.contains(BODY))
+        }));
+
+        let mut saw_approval_state = false;
+        let mut reply_message_id = None;
+        loop {
+            match events.recv().await.expect("terminal production SSE signal") {
+                SseEvent::StateChange {
+                    state: ConvState::LlmRequesting { attempt: 1 },
+                    ..
+                } => saw_approval_state = true,
+                SseEvent::Message { message, .. }
+                    if matches!(&message.content, MessageContent::Agent(blocks)
+                        if blocks.iter().any(|block| matches!(block,
+                            ContentBlock::Text { text } if text == NATIVE_APPROVAL_REPLY))) =>
+                {
+                    assert!(
+                        saw_approval_state,
+                        "approval state precedes the provider reply"
+                    );
+                    assert_eq!(message.message_type, MessageType::Agent);
+                    assert!(reply_message_id.replace(message.message_id).is_none());
+                }
+                SseEvent::AgentDone { .. } => break,
+                SseEvent::Init { .. }
+                | SseEvent::Message { .. }
+                | SseEvent::MessageUpdated { .. }
+                | SseEvent::StateChange { .. }
+                | SseEvent::Token { .. }
+                | SseEvent::LlmFirstByte { .. }
+                | SseEvent::LlmAttempt { .. }
+                | SseEvent::ConversationBecameTerminal { .. }
+                | SseEvent::ConversationUpdate { .. }
+                | SseEvent::Error { .. }
+                | SseEvent::ConversationHardDeleted { .. }
+                | SseEvent::BrowserSessionState { .. }
+                | SseEvent::BashToolProgress { .. }
+                | SseEvent::SteerMessageQueued { .. }
+                | SseEvent::SteerMessageCancelled { .. }
+                | SseEvent::RateLimitSnapshot { .. }
+                | SseEvent::WorkScopeUpdate { .. } => {}
             }
-            saw_approval_state |= matches!(state, ConvState::LlmRequesting { attempt: 1 });
-            saw_immediate_settlement |= if context_pressure {
-                matches!(state, ConvState::AwaitingContinuation { .. })
-            } else {
-                matches!(state, ConvState::LlmRequesting { attempt: 2 })
-            };
+        }
+        assert!(
+            saw_approval_state,
+            "Initial approval publishes its committed state"
+        );
+        let reply_message_id = reply_message_id.expect("provider reply precedes AgentDone");
+        assert_eq!(
+            f.db.get_conversation("actor-target").await.unwrap().state,
+            ConvState::Idle,
+            "AgentDone follows durable terminal state settlement"
+        );
+        let settled_messages = f.db.get_messages("actor-target").await.unwrap();
+        let replies: Vec<_> = settled_messages
+            .iter()
+            .filter(|message| {
+                matches!(&message.content, MessageContent::Agent(blocks)
+                if blocks.iter().any(|block| matches!(block,
+                    ContentBlock::Text { text } if text == NATIVE_APPROVAL_REPLY)))
+            })
+            .collect();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].message_id, reply_message_id);
+        assert!(matches!(&replies[0].content, MessageContent::Agent(blocks)
+            if blocks.len() == 1 && matches!(&blocks[0],
+                ContentBlock::Text { text } if text == NATIVE_APPROVAL_REPLY)));
+        let pending_approvals: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM approval_request_obligations WHERE conversation_id = ?1",
+        )
+        .bind("actor-target")
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            pending_approvals, 0,
+            "terminal response settles its obligation"
+        );
+        let mut live_state = handle.state_rx.clone();
+        live_state
+            .wait_for(|state| *state == ConvState::Idle)
+            .await
+            .unwrap();
+    } else {
+        let context_pressure = scenario == InitialApprovalScenario::ContextPressure;
+        let mut saw_approval_state = false;
+        let mut saw_immediate_settlement = false;
+        let mut saw_context_terminal = false;
+        while let Ok(event) = events.try_recv() {
+            if let SseEvent::StateChange { state, .. } = event {
+                if matches!(state, ConvState::RecoverableContinuationFailure { .. }) {
+                    assert!(
+                        saw_immediate_settlement,
+                        "terminal failure must follow context pressure"
+                    );
+                    saw_context_terminal = true;
+                }
+                saw_approval_state |= matches!(state, ConvState::LlmRequesting { attempt: 1 });
+                saw_immediate_settlement |= if context_pressure {
+                    matches!(state, ConvState::AwaitingContinuation { .. })
+                } else {
+                    matches!(state, ConvState::LlmRequesting { attempt: 2 })
+                };
+            }
+        }
+        assert!(
+            saw_approval_state,
+            "Initial approval must publish its committed state"
+        );
+        assert!(
+            saw_immediate_settlement,
+            "RequestLlm's immediate event must not be dropped"
+        );
+        assert!(!matches!(
+            f.db.get_conversation("actor-target").await.unwrap().state,
+            ConvState::LlmRequesting { attempt: 1 }
+        ));
+
+        if context_pressure {
+            // This fixed capacity failure settles inline before approval returns.
+            // UserCancel is not valid in the resulting recoverable rest state.
+            assert!(saw_context_terminal);
+            assert!(matches!(
+                &*handle.state_rx.borrow(),
+                ConvState::RecoverableContinuationFailure { failure }
+                    if failure.error_kind == crate::db::ErrorKind::ContextCapacityConflict
+            ));
+            assert!(matches!(
+                f.db.get_conversation("actor-target").await.unwrap().state,
+                ConvState::RecoverableContinuationFailure { failure }
+                    if failure.error_kind == crate::db::ErrorKind::ContextCapacityConflict
+            ));
+            assert_eq!(llm.calls.load(Ordering::SeqCst), 0);
+        } else {
+            // Keep the acknowledged real Stop probe in the cancellable branch.
+            assert_eq!(
+                event_settled(
+                    &handle.acknowledged_event_tx,
+                    Event::UserCancel {
+                        reason: None,
+                        cause: CancelCause::UserRequested,
+                    }
+                )
+                .await,
+                AcknowledgedEventOutcome::Settled
+            );
         }
     }
-    assert!(
-        saw_approval_state,
-        "Initial approval must publish its committed state"
-    );
-    assert!(
-        saw_immediate_settlement,
-        "RequestLlm's immediate event must not be dropped"
-    );
-    assert!(!matches!(
-        f.db.get_conversation("actor-target").await.unwrap().state,
-        ConvState::LlmRequesting { attempt: 1 }
-    ));
-
-    if context_pressure {
-        // This fixed capacity failure settles inline before approval returns.
-        // UserCancel is not valid in the resulting recoverable rest state.
-        assert!(saw_context_terminal);
-        assert!(matches!(
-            &*handle.state_rx.borrow(),
-            ConvState::RecoverableContinuationFailure { failure }
-                if failure.error_kind == crate::db::ErrorKind::ContextCapacityConflict
-        ));
-        assert!(matches!(
-            f.db.get_conversation("actor-target").await.unwrap().state,
-            ConvState::RecoverableContinuationFailure { failure }
-                if failure.error_kind == crate::db::ErrorKind::ContextCapacityConflict
-        ));
-        assert_eq!(llm.calls.load(Ordering::SeqCst), 0);
-    } else {
-        // Keep the acknowledged real Stop probe in the cancellable branch.
-        assert_eq!(
-            event_settled(
-                &handle.acknowledged_event_tx,
-                Event::UserCancel {
-                    reason: None,
-                    cause: CancelCause::UserRequested,
-                }
-            )
-            .await,
-            AcknowledgedEventOutcome::Settled
-        );
-    }
+    let expected_calls = usize::from(scenario == InitialApprovalScenario::ProviderSuccess);
+    assert_eq!(llm.calls.load(Ordering::SeqCst), expected_calls);
+    assert!(requests.try_recv().is_err(), "no additional provider entry");
     manager.begin_process_shutdown();
     manager.drain_process_shutdown().await;
     let source_message = Message {
@@ -812,17 +1107,52 @@ async fn assert_production_initial_approval(context_pressure: bool) {
     let before_replay = native_approval_rows(&f.db).await;
     let calls = llm.calls.load(Ordering::SeqCst);
     let before_replay_state = f.db.get_conversation("actor-target").await.unwrap().state;
+    let before_replay_source_state = f.db.get_conversation(&source.id).await.unwrap().state;
+    assert_eq!(before_replay_source_state, ConvState::Idle);
+    assert!(f
+        .db
+        .message_exists(&source_message.message_id)
+        .await
+        .unwrap());
+    let before_replay_git_status = git(&worktree, &["status", "--porcelain=v1"]);
     assert_eq!(
         manager.execute_native_task_approval(command).await,
         NativeTaskApprovalOutcome::Committed(receipt)
     );
     assert_eq!(native_approval_rows(&f.db).await, before_replay);
     assert_eq!(
+        f.db.get_approved_task_objective("actor-target")
+            .await
+            .unwrap(),
+        Some(approved)
+    );
+    assert_eq!(
         f.db.get_conversation("actor-target").await.unwrap().state,
         before_replay_state
     );
     assert_eq!(git(&worktree, &["rev-parse", "HEAD"]).trim(), after_head);
     assert_eq!(llm.calls.load(Ordering::SeqCst), calls);
+    assert_eq!(calls, expected_calls);
+    assert!(
+        requests.try_recv().is_err(),
+        "historical replay must not redispatch"
+    );
+    assert_eq!(
+        f.db.get_conversation(&source.id).await.unwrap().state,
+        before_replay_source_state
+    );
+    assert_eq!(
+        git(&worktree, &["status", "--porcelain=v1"]),
+        before_replay_git_status
+    );
+    assert_eq!(
+        git(&worktree, &["show", &format!("HEAD:{committed_task_file}")]),
+        BODY
+    );
+    assert_eq!(
+        std::fs::read(worktree.join(committed_task_file)).unwrap(),
+        BODY.as_bytes()
+    );
 }
 
 fn git(path: &std::path::Path, args: &[&str]) -> String {
