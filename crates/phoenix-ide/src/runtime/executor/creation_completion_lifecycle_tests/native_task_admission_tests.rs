@@ -1075,6 +1075,16 @@ async fn assert_production_initial_approval_inner(
             if committed_path != task_file {
                 expected_paths.push(task_file);
             }
+            if old_approved.is_none() {
+                // Initial approval prepares the repository's tracked ignore;
+                // FollowUp uses local excludes and must not sweep other files.
+                expected_paths.push(".gitignore");
+                assert_eq!(git(&worktree, &["show", "HEAD:.gitignore"]), ".phoenix/\n");
+                assert_eq!(
+                    std::fs::read(worktree.join(".gitignore")).unwrap(),
+                    b".phoenix/\n"
+                );
+            }
             expected_paths.sort_unstable();
             assert_eq!(changed_paths, expected_paths);
             assert_eq!(
