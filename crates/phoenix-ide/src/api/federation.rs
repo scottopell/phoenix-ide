@@ -695,7 +695,7 @@ pub(crate) async fn resolve_tool_peer_allow_self(
     resolve_saved_peer(db, selector.as_str()).await
 }
 
-pub(crate) async fn resolve_tool_peer(
+pub(crate) async fn resolve_tool_peer_reject_self(
     db: &crate::db::Database,
     selector: &crate::coordinator_tools::instance::RemoteInstanceSelector,
     resolution: crate::coordinator_tools::instance::PeerResolution,
@@ -5384,7 +5384,7 @@ mod tests {
             panic!("UUID selector must be remote");
         };
         assert!(matches!(
-            resolve_tool_peer(
+            resolve_tool_peer_reject_self(
                 &state.db,
                 &selector,
                 crate::coordinator_tools::instance::PeerResolution::WatchUuidIdentity,
@@ -5392,7 +5392,7 @@ mod tests {
             .await,
             Err(FederationClientError::PeerNotFound)
         ));
-        let peer = resolve_tool_peer(
+        let peer = resolve_tool_peer_reject_self(
             &state.db,
             &selector,
             crate::coordinator_tools::instance::PeerResolution::SavedUuidOrName,
@@ -5403,7 +5403,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_policy_can_allow_self_while_default_routing_rejects() {
+    async fn saved_self_peer_resolution_obeys_explicit_policy() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         let local_id = state.db.instance_id().await.unwrap();
         save_test_peer(&state, local_id, "self-alias", "https://self.example", "s").await;
@@ -5423,7 +5423,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(peer.instance_id(), local_id);
                 assert!(matches!(
-                    resolve_tool_peer(&state.db, &selector, resolution).await,
+                    resolve_tool_peer_reject_self(&state.db, &selector, resolution).await,
                     Err(FederationClientError::SelfPeerSelector)
                 ));
             }

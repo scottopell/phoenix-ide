@@ -213,6 +213,9 @@ impl super::instance::RoutedTool for GoalTool {
     fn resolution_db(&self) -> &crate::db::Database {
         self.runtime.db()
     }
+    fn self_peer_policy(&self) -> super::instance::SelfPeerPolicy {
+        super::instance::SelfPeerPolicy::Reject
+    }
     async fn authorize(&self, ctx: &ToolContext) -> Result<(), String> {
         self.service
             .authorize_coordinator(&ctx.conversation_id)
@@ -284,17 +287,8 @@ impl super::instance::RoutedTool for ReadGoalTool {
     fn resolution_db(&self) -> &crate::db::Database {
         self.runtime.db()
     }
-    async fn resolve_remote_peer(
-        &self,
-        selector: &super::instance::RemoteInstanceSelector,
-    ) -> Result<crate::api::federation::ResolvedPeer, crate::api::federation::FederationClientError>
-    {
-        crate::api::federation::resolve_tool_peer_allow_self(
-            self.resolution_db(),
-            selector,
-            self.peer_resolution(),
-        )
-        .await
+    fn self_peer_policy(&self) -> super::instance::SelfPeerPolicy {
+        super::instance::SelfPeerPolicy::Allow
     }
     async fn authorize(&self, ctx: &ToolContext) -> Result<(), String> {
         self.service

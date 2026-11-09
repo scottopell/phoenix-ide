@@ -59,6 +59,12 @@ pub(crate) enum PeerResolution {
     WatchUuidIdentity,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum SelfPeerPolicy {
+    Allow,
+    Reject,
+}
+
 #[async_trait::async_trait]
 pub(crate) trait RoutedTool: Send + Sync {
     fn name(&self) -> &'static str;
@@ -72,6 +78,7 @@ pub(crate) trait RoutedTool: Send + Sync {
     fn peer_resolution(&self) -> PeerResolution {
         PeerResolution::SavedUuidOrName
     }
+    fn self_peer_policy(&self) -> SelfPeerPolicy;
     async fn authorize(&self, _ctx: &ToolContext) -> Result<(), String> {
         Ok(())
     }
@@ -83,12 +90,24 @@ pub(crate) trait RoutedTool: Send + Sync {
         selector: &RemoteInstanceSelector,
     ) -> Result<crate::api::federation::ResolvedPeer, crate::api::federation::FederationClientError>
     {
-        crate::api::federation::resolve_tool_peer(
-            self.resolution_db(),
-            selector,
-            self.peer_resolution(),
-        )
-        .await
+        match self.self_peer_policy() {
+            SelfPeerPolicy::Allow => {
+                crate::api::federation::resolve_tool_peer_allow_self(
+                    self.resolution_db(),
+                    selector,
+                    self.peer_resolution(),
+                )
+                .await
+            }
+            SelfPeerPolicy::Reject => {
+                crate::api::federation::resolve_tool_peer_reject_self(
+                    self.resolution_db(),
+                    selector,
+                    self.peer_resolution(),
+                )
+                .await
+            }
+        }
     }
     async fn run_routed(
         &self,
