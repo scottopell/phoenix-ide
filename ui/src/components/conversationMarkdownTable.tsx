@@ -54,7 +54,10 @@ export function ConversationMarkdownTable({ node, children, ...props }: Markdown
   ));
 
   return (
-    <div className="markdown-table-scroll conversation-markdown-table-scroll">
+    <div
+      className="markdown-table-scroll conversation-markdown-table-scroll"
+      data-column-count={columnCount}
+    >
       <table {...props}>{annotateCells(children, kinds)}</table>
     </div>
   );

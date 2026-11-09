@@ -1272,12 +1272,16 @@ body.app-viewport-active #root {
 }
 
 @media (width <= 600px) {
-  .agent-text-block .conversation-markdown-table-scroll > table {
+  .agent-text-block
+    .conversation-markdown-table-scroll[data-column-count='2']
+    > table {
     width: 100%;
     table-layout: fixed;
   }
 
-  .agent-text-block .conversation-markdown-table-scroll :where(th, td) {
+  .agent-text-block
+    .conversation-markdown-table-scroll[data-column-count='2']
+    :where(th, td) {
     overflow-wrap: anywhere;
   }
 }

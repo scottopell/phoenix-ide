@@ -2293,7 +2293,11 @@ describe('markdown table rendering', () => {
   ].join('\n');
 
   function expectSemanticTableAnnotations(container: HTMLElement) {
+    const wrappers = container.querySelectorAll('.conversation-markdown-table-scroll');
     const tables = container.querySelectorAll('.markdown-table-scroll table');
+    expect(wrappers).toHaveLength(3);
+    expect([...wrappers].map((wrapper) => wrapper.getAttribute('data-column-count')))
+      .toEqual(['6', '2', '2']);
     expect(tables).toHaveLength(3);
     expect([...tables[0]!.querySelectorAll('th')].map((cell) => cell.dataset['columnKind']))
       .toEqual(['atomic', 'numeric', 'numeric', 'numeric', 'numeric', 'numeric']);
@@ -2317,6 +2321,7 @@ describe('markdown table rendering', () => {
     const wrapper = table.parentElement;
     expect(wrapper).toHaveClass('markdown-table-scroll');
     expect(wrapper).toHaveClass('conversation-markdown-table-scroll');
+    expect(wrapper).toHaveAttribute('data-column-count', '6');
     expect(wrapper?.parentElement).toHaveClass('agent-text-block');
 
     const inlineCode = screen.getByText('direct_turn_id');
@@ -2415,6 +2420,7 @@ describe('markdown table rendering', () => {
       const wrapper = table.parentElement;
       expect(wrapper).toHaveClass('markdown-table-scroll');
       expect(wrapper).toHaveClass('conversation-markdown-table-scroll');
+      expect(wrapper).toHaveAttribute('data-column-count', '6');
       expect(wrapper?.parentElement).toHaveClass('agent-text-block');
     });
 

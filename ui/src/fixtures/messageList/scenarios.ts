@@ -321,6 +321,7 @@ const markdownImageMessages: Message[] = [
 
 export const narrowWebKitMarkdownTableMessages: Message[] = [
   {
+    event_presentation: null,
     message_id: 'user-narrow-webkit-table-1',
     conversation_id: 'fixture-message-list-narrow-webkit-markdown-table',
     sequence_id: 1,
@@ -331,6 +332,7 @@ export const narrowWebKitMarkdownTableMessages: Message[] = [
     display_data: {},
   },
   {
+    event_presentation: null,
     message_id: 'agent-narrow-webkit-table-1',
     conversation_id: 'fixture-message-list-narrow-webkit-markdown-table',
     sequence_id: 2,

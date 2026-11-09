@@ -427,7 +427,7 @@ runSurfaceCapture({
       || await verifyNarrowMarkdownTable(context)
       || await captureContinuityReproduction(context)
   ),
-  onComplete: async ({ outDir }) => {
+  onComplete: async (outDir) => {
     if (narrowMarkdownTableMetrics.length > 0) {
       await writeFile(
         path.join(outDir, 'narrow-markdown-table-metrics.json'),
