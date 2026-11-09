@@ -75,6 +75,7 @@ mod sqlite_telemetry;
 mod sqlite_workload;
 mod sub_agent_lifecycle;
 mod sub_agent_summary;
+pub mod task_approval_inspection;
 pub mod workflow;
 pub use sub_agent_lifecycle::*;
 // The schema *types* (MessageContent, ToolResult, ConvState's persisted shape,
