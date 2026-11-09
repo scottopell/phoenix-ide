@@ -168,7 +168,7 @@ async fn run_initial_source_cancel_interleaving(stage: CancellationStage) {
             .fetch_one(f.db.pool())
             .await
             .unwrap();
-    assert_eq!(&before_rows[1..], &[0, 0, 0, 0]);
+    assert_eq!(&before_rows[1..], &[0, 0, 0, 0, 0]);
     let before_messages =
         serde_json::to_value(f.db.get_messages(&f.target).await.unwrap()).unwrap();
     let before_git = git_snapshot(&root, &worktree);
