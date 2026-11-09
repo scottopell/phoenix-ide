@@ -6498,6 +6498,15 @@ mod tests {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         let caller = InstanceId::new();
         let local = state.db.instance_id().await.unwrap();
+        let verifier =
+            phoenix_core::domain::instance_identity::FederationCredentialVerifier::from_bearer(
+                b"peer-test",
+            );
+        state
+            .db
+            .replace_federation_enrollment(caller, &"peer".parse().unwrap(), &verifier)
+            .await
+            .unwrap();
         let cwd = state.runtime.runtime_home().join("native-create-cwd");
         std::fs::create_dir(&cwd).unwrap();
         let peer = test_native_create_peer(caller);

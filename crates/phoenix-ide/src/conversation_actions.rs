@@ -848,6 +848,7 @@ mod tests {
         assert_eq!(job_count, 0);
     }
 
+    #[allow(clippy::too_many_lines)] // One fixture proves private ownership, conflicts, and replay after cwd removal.
     #[tokio::test]
     async fn federated_creation_request_uuid_is_private_to_its_accepting_peer() {
         use phoenix_core::domain::instance_identity::FederationCredentialVerifier;
