@@ -161,3 +161,169 @@ async fn unified_query_routes_by_uuid_and_name_with_typed_attribution_and_no_fal
 
     caller.stop().await;
 }
+
+struct ChildQuerySchemaRecorder {
+    parent_id: String,
+    requests: std::sync::Mutex<Vec<phoenix_llm::LlmRequest>>,
+    parent_requests: std::sync::atomic::AtomicUsize,
+    child_request_seen: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl phoenix_llm::LlmService for ChildQuerySchemaRecorder {
+    async fn complete(
+        &self,
+        request: &phoenix_llm::LlmRequest,
+    ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
+        use phoenix_llm::ContentBlock;
+
+        self.requests.lock().unwrap().push(request.clone());
+        let conversation_id = &request.telemetry.as_ref().unwrap().conversation_id;
+        if conversation_id != &self.parent_id {
+            self.child_request_seen.notify_one();
+        }
+        let content = if conversation_id == &self.parent_id
+            && self
+                .parent_requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+        {
+            ContentBlock::tool_use(
+                "spawn-query-child",
+                "spawn_agents",
+                json!({"tasks": [{"task": "Inspect the query_database tool schema."}]}),
+            )
+        } else if conversation_id == &self.parent_id {
+            ContentBlock::text("Finished")
+        } else {
+            ContentBlock::tool_use(
+                "finish-query-child",
+                "submit_result",
+                json!({"result": "Child query schema inspected."}),
+            )
+        };
+        let end_turn = matches!(content, ContentBlock::Text { .. });
+        Ok(phoenix_llm::LlmResponse::non_streaming(
+            vec![content],
+            end_turn,
+            phoenix_llm::Usage::default(),
+        ))
+    }
+
+    fn model_id(&self) -> &'static str {
+        "claude-sonnet-5"
+    }
+}
+
+async fn child_query_database_schema(parent_kind: &str) -> Option<Value> {
+    let instance = TestInstance::start().await;
+    let parent = if parent_kind == "Coordinator" {
+        instance
+            .state
+            .db
+            .get_or_create_coordinator(
+                Some("claude-sonnet-5"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap()
+    } else {
+        instance
+            .state
+            .db
+            .create_conversation(
+                "persisted-query-parent",
+                "Persisted query parent",
+                "/tmp",
+                true,
+                None,
+                Some("claude-sonnet-5"),
+            )
+            .await
+            .unwrap()
+    };
+    let recorder = Arc::new(ChildQuerySchemaRecorder {
+        parent_id: parent.id.clone(),
+        requests: std::sync::Mutex::new(Vec::new()),
+        parent_requests: std::sync::atomic::AtomicUsize::new(0),
+        child_request_seen: tokio::sync::Notify::new(),
+    });
+    let manager = Arc::new(crate::runtime::RuntimeManager::new(
+        instance.state.db.clone(),
+        Arc::new(phoenix_llm::ModelRegistry::for_test_with_sonnet(
+            recorder.clone(),
+        )),
+        instance.state.platform.clone(),
+        instance.state.mcp_manager.clone(),
+        None,
+    ));
+    manager.start_sub_agent_handler().await;
+    let handle = manager.get_or_create(&parent.id).await.unwrap();
+    manager
+        .send_event(
+            &parent.id,
+            crate::state_machine::event::Event::UserMessage {
+                text: "Inspect the child query schema".into(),
+                llm_text: None,
+                images: vec![],
+                files: vec![],
+                message_id: format!("{parent_kind}-query-schema-user"),
+                user_agent: None,
+                skill_invocation: None,
+            },
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        recorder.child_request_seen.notified(),
+    )
+    .await
+    .expect("RuntimeManager dispatched the child LLM request");
+    let mut states = handle.state_rx.clone();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        states
+            .wait_for(|state| matches!(state, crate::state_machine::state::ConvState::Idle))
+            .await
+    })
+    .await
+    .expect("parent and child runtime requests finish")
+    .expect("runtime state remains available");
+    let requests = recorder.requests.lock().unwrap().clone();
+    let child = requests
+        .iter()
+        .find(|request| {
+            request
+                .telemetry
+                .as_ref()
+                .is_some_and(|telemetry| telemetry.conversation_id != parent.id)
+        })
+        .expect("RuntimeManager dispatched a child LLM request");
+    let schema = child
+        .tool_availability
+        .declarations()
+        .iter()
+        .find(|tool| tool.name == "query_database")
+        .map(|tool| tool.input_schema.clone());
+    manager.begin_process_shutdown();
+    manager.drain_process_shutdown().await;
+    instance.stop().await;
+    schema
+}
+
+#[tokio::test]
+async fn persisted_parent_eligibility_controls_child_remote_query_selector() {
+    let coordinator_schema = child_query_database_schema("Coordinator")
+        .await
+        .expect("Coordinator child query_database declaration");
+    assert!(
+        coordinator_schema["properties"].get("instance").is_some(),
+        "Coordinator child query_database schema must expose instance: {coordinator_schema}"
+    );
+
+    let ordinary_schema = child_query_database_schema("ordinary").await;
+    assert!(
+        ordinary_schema.is_none(),
+        "ordinary Explore child must not receive Coordinator query_database: {ordinary_schema:?}"
+    );
+}
