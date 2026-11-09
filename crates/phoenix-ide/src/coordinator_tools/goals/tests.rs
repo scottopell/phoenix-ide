@@ -1317,6 +1317,8 @@ async fn production_coordinator_registry_has_exact_instance_selector_contract() 
         "unwatch_conversation",
         "list_watched_conversations",
         "read_goal",
+        "create_conversation",
+        "rename_conversation",
     ];
 
     assert!(!definitions
