@@ -1784,7 +1784,7 @@ mod tests {
         assert_eq!(schema["additionalProperties"], false);
         assert!(query.clearable());
         assert!(query.description().contains("untrusted"));
-        assert!(query.description().contains("fallback"));
+        assert!(query.description().contains("fall back locally"));
         assert!(schema["properties"].get("instance_id").is_none());
         let local = query
             .run(
