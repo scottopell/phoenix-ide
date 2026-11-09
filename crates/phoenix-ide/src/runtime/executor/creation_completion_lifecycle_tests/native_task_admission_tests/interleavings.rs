@@ -396,7 +396,7 @@ fn try_git_snapshot(root: &Path, worktree: &Path) -> Result<Vec<String>, String>
 }
 
 fn try_git(path: &Path, args: &[&str]) -> Result<String, String> {
-    let output = std::process::Command::new("git")
+    let output = phoenix_core::git::command()
         .current_dir(path)
         .args(args)
         .output()
