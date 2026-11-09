@@ -100,7 +100,9 @@ fn rename_detail_targets_normalize_destination_lookup_identities() {
 
 #[test]
 fn native_database_errors_preserve_http_classification() {
-    let failure = native_db_error(crate::db::DbError::ConversationNotFound);
+    let failure = native_db_error(crate::db::DbError::ConversationNotFound(
+        "missing-conversation".to_string(),
+    ));
     assert_eq!(failure.status, StatusCode::NOT_FOUND);
     assert_eq!(failure.body.error_type, NativeActionErrorCode::NotFound);
 }
