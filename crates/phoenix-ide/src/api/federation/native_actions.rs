@@ -802,6 +802,29 @@ struct NativeCreateServerCase {
     coordinator_rotation: Option<(Database, String)>,
 }
 
+fn native_create_status_case_body(
+    case: &str,
+    caller: InstanceId,
+    destination: InstanceId,
+    request: &NativeCreateRequest,
+) -> Vec<u8> {
+    let (_, mut known) = status_fixture();
+    known["caller_instance_id"] = serde_json::json!(caller);
+    known["destination_instance_id"] = serde_json::json!(destination);
+    known["request_id"] = request.request_id.clone().into();
+    if case == "status_witness_mismatch" {
+        known["destination_instance_id"] = serde_json::json!(InstanceId::new());
+    }
+    if case == "status_invalid_product" {
+        known["product_conversation_id"] = "   ".into();
+    }
+    if case == "status_malformed" {
+        b"not json".to_vec()
+    } else {
+        serde_json::to_vec(&known).unwrap()
+    }
+}
+
 fn native_create_case_responses(
     case: &str,
     caller: InstanceId,
@@ -894,21 +917,7 @@ fn native_create_case_responses(
         .chain(body)
         .collect()
     };
-    let (_, mut known) = status_fixture();
-    known["caller_instance_id"] = serde_json::json!(caller);
-    known["destination_instance_id"] = serde_json::json!(destination);
-    known["request_id"] = request.request_id.clone().into();
-    if case == "status_witness_mismatch" {
-        known["destination_instance_id"] = serde_json::json!(InstanceId::new());
-    }
-    if case == "status_invalid_product" {
-        known["product_conversation_id"] = "   ".into();
-    }
-    let known_body = if case == "status_malformed" {
-        b"not json".to_vec()
-    } else {
-        serde_json::to_vec(&known).unwrap()
-    };
+    let known_body = native_create_status_case_body(case, caller, destination, request);
     NativeCreateCaseResponses {
         expect_status_post,
         first_response,
@@ -1123,8 +1132,9 @@ async fn run_native_create_case(fixture: &NativeCreateTestFixture, case: &'stati
         listener.local_addr().unwrap().port()
     );
     let credential = phoenix_core::domain::instance_identity::PeerBearerCredential::parse(format!(
-        "phx_peer_{}",
-        "n".repeat(43)
+        "phx_peer_{}{}",
+        uuid::Uuid::new_v4().simple(),
+        "n".repeat(11)
     ))
     .unwrap();
     fixture

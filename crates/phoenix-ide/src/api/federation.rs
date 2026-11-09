@@ -4036,6 +4036,9 @@ fn native_verify_status(
     request: &NativeCreateStatusRequest,
     response: &NativeCreateStatusResponse,
 ) -> Result<(), FederationClientError> {
+    use phoenix_db::ProductCreationProvisioningStage as Stage;
+    use NativeCreationState as S;
+
     let (caller, destination, witness) = match response {
         NativeCreateStatusResponse::Unknown {
             caller_instance_id,
@@ -4073,8 +4076,6 @@ fn native_verify_status(
                 "known create product conversation identity is invalid",
             ));
         }
-        use phoenix_db::ProductCreationProvisioningStage as Stage;
-        use NativeCreationState as S;
         native_verify_status_stage(
             *provisioning_stage_updated_at_unix_micros,
             initial_execution,

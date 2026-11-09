@@ -211,14 +211,13 @@ fn rename_detail_response(detail: &crate::db::ProductConversationRenameDetail) -
 
 fn remote_rename_detail_response(response: federation::NativeRenameOptionsResponse) -> Value {
     let federation::NativeRenameOptionsResponse {
-        caller_instance_id,
-        destination_instance_id,
-        correlation_id,
+        caller_instance_id: _,
+        destination_instance_id: _,
+        correlation_id: _,
         canonical_route,
         detail,
         mut allowed_actions,
     } = response;
-    let _transport_identity = (caller_instance_id, destination_instance_id, correlation_id);
     allowed_actions.retain(|action| {
         if matches!(action, federation::NativeRenameDetailAction::Read) {
             tracing::debug!("omitting remote rename read action: operation_id alone cannot prove immutable intent");
@@ -238,9 +237,9 @@ fn remote_rename_detail_response(response: federation::NativeRenameOptionsRespon
 
 fn remote_create_options_response(response: federation::NativeCreateOptionsResponse) -> Value {
     let federation::NativeCreateOptionsResponse {
-        caller_instance_id,
-        destination_instance_id,
-        correlation_id,
+        caller_instance_id: _,
+        destination_instance_id: _,
+        correlation_id: _,
         cwd,
         projects,
         projects_truncated,
@@ -248,7 +247,6 @@ fn remote_create_options_response(response: federation::NativeCreateOptionsRespo
         default_model,
         default_llm_language,
     } = response;
-    let _transport_identity = (caller_instance_id, destination_instance_id, correlation_id);
     json!({
         "status": "options",
         "cwd": cwd,
@@ -290,15 +288,6 @@ fn remote_rename_receipt_source(
     }
 }
 
-fn remote_rename_result_consuming_target(
-    result: ProductConversationRenameResult,
-    instance_ids: (InstanceId, InstanceId),
-    transport_only_target: (String, ProductConversationId, String),
-) -> (InstanceId, InstanceId, ProductConversationRenameResult) {
-    let _transport_only_target: (String, ProductConversationId, String) = transport_only_target;
-    (instance_ids.0, instance_ids.1, result)
-}
-
 fn remote_rename_receipt_result(
     receipt: phoenix_db::ProductConversationRenameReceipt,
     replayed: bool,
@@ -315,10 +304,10 @@ fn remote_rename_response(response: federation::NativeRenameResponse) -> Value {
     use phoenix_db::ProductConversationRenameResult as RenameResult;
 
     let replayed = matches!(&response, Response::Replayed { .. });
-    let (caller, destination, result) = match response {
+    let result = match response {
         Response::Applied {
-            caller_instance_id,
-            destination_instance_id,
+            caller_instance_id: _,
+            destination_instance_id: _,
             operation_id,
             product_conversation_id,
             root_transcript_id,
@@ -330,8 +319,8 @@ fn remote_rename_response(response: federation::NativeRenameResponse) -> Value {
             receipt_source,
         }
         | Response::Replayed {
-            caller_instance_id,
-            destination_instance_id,
+            caller_instance_id: _,
+            destination_instance_id: _,
             operation_id,
             product_conversation_id,
             root_transcript_id,
@@ -353,54 +342,37 @@ fn remote_rename_response(response: federation::NativeRenameResponse) -> Value {
                 source: remote_rename_receipt_source(receipt_source_instance_id, receipt_source),
             };
             let result = remote_rename_receipt_result(receipt, replayed);
-            (caller_instance_id, destination_instance_id, result)
+            result
         }
         Response::Stale {
-            caller_instance_id,
-            destination_instance_id,
-            operation_id,
-            product_conversation_id,
-            root_transcript_id,
-        } => remote_rename_result_consuming_target(
-            RenameResult::Stale,
-            (caller_instance_id, destination_instance_id),
-            (operation_id, product_conversation_id, root_transcript_id),
-        ),
+            caller_instance_id: _,
+            destination_instance_id: _,
+            operation_id: _,
+            product_conversation_id: _,
+            root_transcript_id: _,
+        } => RenameResult::Stale,
         Response::Conflict {
-            caller_instance_id,
-            destination_instance_id,
-            operation_id,
-            product_conversation_id,
-            root_transcript_id,
-        } => remote_rename_result_consuming_target(
-            RenameResult::Conflict,
-            (caller_instance_id, destination_instance_id),
-            (operation_id, product_conversation_id, root_transcript_id),
-        ),
+            caller_instance_id: _,
+            destination_instance_id: _,
+            operation_id: _,
+            product_conversation_id: _,
+            root_transcript_id: _,
+        } => RenameResult::Conflict,
         Response::NotFound {
-            caller_instance_id,
-            destination_instance_id,
-            operation_id,
-            product_conversation_id,
-            root_transcript_id,
-        } => remote_rename_result_consuming_target(
-            RenameResult::NotFound,
-            (caller_instance_id, destination_instance_id),
-            (operation_id, product_conversation_id, root_transcript_id),
-        ),
+            caller_instance_id: _,
+            destination_instance_id: _,
+            operation_id: _,
+            product_conversation_id: _,
+            root_transcript_id: _,
+        } => RenameResult::NotFound,
         Response::Unavailable {
-            caller_instance_id,
-            destination_instance_id,
-            operation_id,
-            product_conversation_id,
-            root_transcript_id,
-        } => remote_rename_result_consuming_target(
-            RenameResult::Unavailable,
-            (caller_instance_id, destination_instance_id),
-            (operation_id, product_conversation_id, root_transcript_id),
-        ),
+            caller_instance_id: _,
+            destination_instance_id: _,
+            operation_id: _,
+            product_conversation_id: _,
+            root_transcript_id: _,
+        } => RenameResult::Unavailable,
     };
-    let _transport_only_instance_ids: (InstanceId, InstanceId) = (caller, destination);
     rename_response(result)
 }
 
@@ -651,8 +623,8 @@ fn native_creation_status(status: phoenix_db::ProductCreationStatusRead) -> Nati
 }
 
 fn native_creation_acceptance(
-    request_id: String,
-    product_conversation_id: ProductConversationId,
+    request_id: &str,
+    product_conversation_id: &ProductConversationId,
 ) -> Value {
     json!({
         "status": "accepted",
@@ -664,14 +636,13 @@ fn native_creation_acceptance(
 
 fn remote_native_creation_acceptance(acceptance: federation::NativeCreateResponse) -> Value {
     let federation::NativeCreateResponse {
-        status,
-        caller_instance_id,
-        destination_instance_id,
+        status: _,
+        caller_instance_id: _,
+        destination_instance_id: _,
         request_id,
         product_conversation_id,
     } = acceptance;
-    let _transport_only = (status, caller_instance_id, destination_instance_id);
-    native_creation_acceptance(request_id, product_conversation_id)
+    native_creation_acceptance(&request_id, &product_conversation_id)
 }
 
 fn remote_native_creation_status(
@@ -683,16 +654,13 @@ fn remote_native_creation_status(
 
     match response {
         federation::NativeCreateStatusResponse::Unknown {
-            caller_instance_id,
-            destination_instance_id,
+            caller_instance_id: _,
+            destination_instance_id: _,
             request_id,
-        } => {
-            let _transport_only_instance_ids = (caller_instance_id, destination_instance_id);
-            Ok(json!({"status": "unknown", "request_id": request_id}))
-        }
+        } => Ok(json!({"status": "unknown", "request_id": request_id})),
         federation::NativeCreateStatusResponse::Known {
-            caller_instance_id,
-            destination_instance_id,
+            caller_instance_id: _,
+            destination_instance_id: _,
             request_id,
             product_conversation_id,
             creation_status,
@@ -703,7 +671,6 @@ fn remote_native_creation_status(
             publication,
             initial_execution,
         } => {
-            let _transport_only_instance_ids = (caller_instance_id, destination_instance_id);
             let stage_updated_at =
                 chrono::DateTime::from_timestamp_micros(provisioning_stage_updated_at_unix_micros)
                     .ok_or("Invalid remote creation stage timestamp")?;
@@ -796,8 +763,8 @@ async fn native_creation_acceptance_receipt(
         .await?
         .ok_or("Accepted creation request is no longer available; reconcile request_id")?;
     Ok(native_creation_acceptance(
-        accepted.request_id,
-        accepted.product_conversation_id,
+        &accepted.request_id,
+        &accepted.product_conversation_id,
     ))
 }
 

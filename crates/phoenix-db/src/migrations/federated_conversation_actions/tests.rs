@@ -397,6 +397,30 @@ async fn migration158_rejects_incomplete_historical_locators_transactionally() {
     );
 }
 
+async fn assert_unqualified_rename_locators(
+    pool: &SqlitePool,
+    operation_id: &str,
+    expected: (&str, &str, &str, &str),
+) {
+    let retained: (String, String, String, String, Option<String>) = sqlx::query_as(
+        "SELECT source_product_conversation_id,source_transcript_id,source_message_id,source_tool_use_id,source_instance_id FROM product_conversation_rename_receipts WHERE operation_id=?1",
+    )
+    .bind(operation_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        retained,
+        (
+            expected.0.into(),
+            expected.1.into(),
+            expected.2.into(),
+            expected.3.into(),
+            None
+        )
+    );
+}
+
 #[tokio::test]
 async fn migration158_preserves_malformed_rename_locators_as_unqualified_history() {
     let (pool, local) = fixture().await;
@@ -429,51 +453,15 @@ async fn migration158_preserves_malformed_rename_locators_as_unqualified_history
     )
     .await
     .unwrap();
-    let retained: (String, String, String, String, Option<String>) = sqlx::query_as(
-        "SELECT source_product_conversation_id,source_transcript_id,source_message_id,source_tool_use_id,source_instance_id FROM product_conversation_rename_receipts WHERE operation_id='legacy'"
-    ).fetch_one(&pool).await.unwrap();
-    assert_eq!(
-        retained,
-        (
-            whitespace.0.into(),
-            whitespace.1.into(),
-            whitespace.2.into(),
-            whitespace.3.into(),
-            None
-        )
-    );
-    let incomplete_retained: (String, String, String, String, Option<String>) = sqlx::query_as(
-        "SELECT source_product_conversation_id,source_transcript_id,source_message_id,source_tool_use_id,source_instance_id FROM product_conversation_rename_receipts WHERE operation_id='incomplete'"
-    ).fetch_one(&pool).await.unwrap();
-    let bytes_retained: (String, String, String, String, Option<String>) = sqlx::query_as(
-        "SELECT source_product_conversation_id,source_transcript_id,source_message_id,source_tool_use_id,source_instance_id FROM product_conversation_rename_receipts WHERE operation_id='bytes'"
-    ).fetch_one(&pool).await.unwrap();
-    assert_eq!(
-        bytes_retained,
-        (
-            bytes.0.into(),
-            bytes.1.into(),
-            bytes.2.into(),
-            bytes.3.into(),
-            None
-        )
-    );
+    assert_unqualified_rename_locators(&pool, "legacy", whitespace).await;
+    assert_unqualified_rename_locators(&pool, "incomplete", incomplete).await;
+    assert_unqualified_rename_locators(&pool, "bytes", bytes).await;
     assert_eq!(
         sqlx::query_scalar::<_, i64>("PRAGMA ignore_check_constraints")
             .fetch_one(&pool)
             .await
             .unwrap(),
         0
-    );
-    assert_eq!(
-        incomplete_retained,
-        (
-            incomplete.0.into(),
-            incomplete.1.into(),
-            incomplete.2.into(),
-            incomplete.3.into(),
-            None
-        )
     );
     assert_eq!(
         sqlx::query_scalar::<_, String>("PRAGMA integrity_check")

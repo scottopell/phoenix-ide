@@ -742,7 +742,7 @@ fn remote_create_options_match_local_shape_without_transport_identity() {
 fn remote_create_acceptance_matches_exact_local_shape_without_transport_identity() {
     let request_id = uuid::Uuid::new_v4().to_string();
     let product_conversation_id = ProductConversationId::new();
-    let local = native_creation_acceptance(request_id.clone(), product_conversation_id.clone());
+    let local = native_creation_acceptance(&request_id, &product_conversation_id);
     let remote = remote_native_creation_acceptance(federation::NativeCreateResponse {
         status: federation::NativeCreateAcceptanceStatus::Accepted,
         caller_instance_id: InstanceId::new(),
