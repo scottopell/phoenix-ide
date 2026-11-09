@@ -1,4 +1,4 @@
-import { api, type Conversation, type Message } from '../../api';
+import { api, ApiResponseError, type Conversation, type Message } from '../../api';
 import { coordinatorSnapshot } from './scenarios';
 import type { ProductConversationScenario } from './types';
 
@@ -113,6 +113,9 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   };
 
   api.getProductConversationSnapshot = async (reference, options = {}) => {
+    if (scenario.aliasFallbackNotFound && reference === scenario.snapshot?.latest_transcript_row_id) {
+      throw new ApiResponseError('Conversation aggregate not found', 404);
+    }
     const history = await api.getProductConversationHistorySnapshot(reference, options);
     const { boundaries, segments, ...metadata } = history;
     const pages = scenario.kind === 'coordinator' ? [] : [scenario.snapshot, scenario.olderSnapshot, ...Object.values(scenario.olderPages ?? {})];
@@ -225,8 +228,62 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   };
   window.addEventListener('product-conversation-fixture-release-older', releaseOlderSnapshotResponse);
 
+  let reminderFailuresRemaining = scenario.reminderFixture?.initialFailures ?? 0;
+  let reminderFailuresAfterLoad = scenario.reminderFixture?.failuresAfterFirstLoad ?? 0;
+  let hasLoadedReminders = false;
+  let reminderRequestCount = 0;
+  let reminderMutationCount = 0;
+  let conflictRows: import('../../generated/Reminder').Reminder[] | undefined;
   globalThis.fetch = async (input, init) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    const requestUrl = new URL(url, location.href);
+    const reminderPath = `/api/conversations/${encodeURIComponent(conversation.id)}/reminders`;
+    if (scenario.reminderFixture && requestUrl.pathname === reminderPath && (init?.method ?? 'GET') === 'GET') {
+      if (scenario.reminderFixture.reminders.some((row) => row.product_conversation_id !== scenario.snapshot?.product_conversation_id)) {
+        throw new Error('Reminders fixture owner differs from product conversation');
+      }
+      reminderRequestCount += 1;
+      record('ReminderRequests', reminderRequestCount);
+      if (reminderFailuresRemaining > 0) {
+        reminderFailuresRemaining -= 1;
+        record('ReminderState', 'failed');
+        return Response.json({ error: 'Fixture reminder service unavailable' }, { status: 503 });
+      }
+      if (hasLoadedReminders && reminderFailuresAfterLoad > 0) {
+        reminderFailuresAfterLoad -= 1;
+        record('ReminderState', 'failed');
+        return Response.json({ error: 'Fixture reminder service unavailable after focus refresh' }, { status: 503 });
+      }
+      hasLoadedReminders = true;
+      record('ReminderState', 'loaded');
+      const rows = conflictRows ?? scenario.reminderFixture.reminders;
+      record('ReminderServedRevision', rows.find((row) => row.id === 'upcoming-fixture')?.revision ?? 0);
+      return Response.json(rows);
+    }
+    if (scenario.reminderFixture?.rejectMutation && requestUrl.pathname.startsWith(`${reminderPath}/`) && init?.method === 'POST') {
+      reminderMutationCount += 1;
+      record('ReminderMutations', reminderMutationCount);
+      const expectedRevision = (JSON.parse(String(init.body)) as { expected_revision: number }).expected_revision;
+      const current = (conflictRows ?? scenario.reminderFixture.reminders).find((row) => row.id === 'upcoming-fixture');
+      if (!current || !requestUrl.pathname.endsWith('/upcoming-fixture/cancel')) throw new Error('Unexpected fixture reminder mutation');
+      record('LastReminderRevision', expectedRevision);
+      if (!conflictRows) {
+        conflictRows = scenario.reminderFixture.reminders.map((row) => row.id === current.id
+          ? { ...row, revision: row.revision + 1, text: 'Check the release candidate — revised on server' }
+          : row);
+      }
+      const latest = conflictRows.find((row) => row.id === current.id)!;
+      if (expectedRevision !== latest.revision) {
+        record('ReminderMutation', 'rejected');
+        return Response.json({ kind: 'revision_conflict', error: 'The reminder changed in this fixture.', current: latest }, { status: 409 });
+      }
+      conflictRows = conflictRows.map((row) => row.id === latest.id
+        ? { ...row, revision: row.revision + 1, state: { kind: 'cancelled', cancelled_at_us: 1783000000000000 } }
+        : row);
+      record('ReminderMutation', 'accepted');
+      record('ReminderAcceptedRevision', conflictRows.find((row) => row.id === latest.id)?.revision ?? 0);
+      return Response.json({ reminder: conflictRows.find((row) => row.id === latest.id) });
+    }
     if (url.endsWith('/api/telemetry/conversation-open') || url.endsWith('/api/telemetry/product-conversation-open')) {
       return new Response(null, { status: 204 });
     }

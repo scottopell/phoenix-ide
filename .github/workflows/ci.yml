@@ -820,6 +820,10 @@ jobs:
           npm i -g corepack@latest
           corepack enable
           pnpm install --frozen-lockfile
+          node --check scripts/capture-reminders.mjs
+          node --check scripts/capture-reminders-baseline.mjs
+          node --check scripts/compare-reminders-layout.mjs
+          node --test scripts/capture-reminders.contract.check.mjs
           python3 -m unittest discover -s ../scripts/ci -p 'test_isolate_geometry_apt_source.py'
           sudo python3 ../scripts/ci/isolate_geometry_apt_source.py
           pnpm exec playwright install --with-deps chromium
@@ -828,7 +832,9 @@ jobs:
         env:
           LADLE_URL: http://127.0.0.1:61129
           PHOENIX_LADLE: '1'
+          BASE_SHA: 5f72f617869e001b534542c3c31d7628db6aeecc
         run: |
+          root="$PWD"
           mkdir -p ui/qa-artifacts/assistant-finalization
           git rev-parse HEAD > ui/qa-artifacts/assistant-finalization/source.txt
           server=''
@@ -854,6 +860,28 @@ jobs:
           node scripts/capture-subagent-task-details.mjs
           node scripts/capture-composer-rejection.mjs
           node scripts/capture-review-reading-position.mjs
+          node scripts/capture-reminders.mjs
+          if [ -n "${BASE_SHA:-}" ]; then
+            cd ..
+            stop_server
+            git fetch --no-tags --depth=1 origin "$BASE_SHA"
+            test "$(git rev-parse FETCH_HEAD)" = "$BASE_SHA"
+            baseline_backup=$(mktemp -d)
+            cp ui/src/reminders/RemindersPanel.tsx "$baseline_backup/RemindersPanel.tsx"
+            cp ui/src/reminders/RemindersPanel.css "$baseline_backup/RemindersPanel.css"
+            restore_reminders() {
+              cp "$baseline_backup/RemindersPanel.tsx" "$root/ui/src/reminders/RemindersPanel.tsx"
+              cp "$baseline_backup/RemindersPanel.css" "$root/ui/src/reminders/RemindersPanel.css"
+            }
+            trap 'stop_server; restore_reminders' EXIT
+            git show "FETCH_HEAD:ui/src/reminders/RemindersPanel.tsx" > ui/src/reminders/RemindersPanel.tsx
+            git show "FETCH_HEAD:ui/src/reminders/RemindersPanel.css" > ui/src/reminders/RemindersPanel.css
+            start_server
+            cd ui
+            node scripts/capture-reminders-baseline.mjs
+            printf 'baseline RemindersPanel source: %s; fixture and capture source: %s\n' "$BASE_SHA" "$(git rev-parse HEAD)" > qa-artifacts/reminders-baseline/source.txt
+            node scripts/compare-reminders-layout.mjs
+          fi
 
       - uses: actions/upload-artifact@v6
         if: always()

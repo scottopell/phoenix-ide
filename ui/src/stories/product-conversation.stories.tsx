@@ -64,3 +64,31 @@ export const CompactEventsOrdinary: Story = () => <ProductConversationFixture sc
 CompactEventsOrdinary.storyName = 'compact-events-ordinary';
 export const CompactEventsGlobal: Story = () => <ProductConversationFixture scenario={compactGlobal} />;
 CompactEventsGlobal.storyName = 'compact-events-global';
+
+const reminderBase = getProductConversationScenario('mobile-open');
+const reminderOwner = reminderBase.snapshot?.product_conversation_id;
+if (!reminderOwner) throw new globalThis.Error('Reminders fixture requires a product conversation owner');
+const reminderMember = reminderBase.snapshot?.latest_transcript_row_id;
+if (!reminderMember) throw new globalThis.Error('Reminders fixture requires a latest conversation member');
+const reminderRows = [
+  { id: 'due-fixture', product_conversation_id: reminderOwner, text: 'Review the stale incident report', due_at_us: 1782907200000000, timezone: 'America/Los_Angeles', revision: 1, created_at_us: 1782900000000000, state: { kind: 'due', occurred_at_us: 1782907200000000 } },
+  { id: 'upcoming-fixture', product_conversation_id: reminderOwner, text: 'Check the release candidate', due_at_us: 1782993600000000, timezone: 'America/Los_Angeles', revision: 4, created_at_us: 1782900000000000, state: { kind: 'scheduled' } },
+] as const;
+const withReminders = (id: Extract<ProductConversationScenarioId, `reminders-${string}`>, initialFailures: number, rejectMutation = false, failuresAfterFirstLoad = 0) => ({
+  ...reminderBase,
+  id,
+  title: `Reminders ${id.slice('reminders-'.length)}`,
+  reminderFixture: { reminders: [...reminderRows], initialFailures, rejectMutation, failuresAfterFirstLoad },
+});
+export const RemindersInitialFailure: Story = () => <ProductConversationFixture scenario={withReminders('reminders-initial-failure', 1)} />;
+RemindersInitialFailure.storyName = 'reminders-initial-failure';
+export const RemindersAliasFallbackInitialFailure: Story = () => <ProductConversationFixture scenario={{
+  ...withReminders('reminders-alias-fallback-initial-failure', 1),
+  initialEntry: `/c/${reminderMember}`,
+  aliasFallbackNotFound: true,
+}} />;
+RemindersAliasFallbackInitialFailure.storyName = 'reminders-alias-fallback-initial-failure';
+export const RemindersLoadedStaleAndUpcoming: Story = () => <ProductConversationFixture scenario={withReminders('reminders-loaded-stale-upcoming', 0, false, 1)} />;
+RemindersLoadedStaleAndUpcoming.storyName = 'reminders-loaded-stale-upcoming';
+export const RemindersRetryAndMutationRejection: Story = () => <ProductConversationFixture scenario={withReminders('reminders-retry-mutation-rejection', 0, true, 1)} />;
+RemindersRetryAndMutationRejection.storyName = 'reminders-retry-mutation-rejection';
