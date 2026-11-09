@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use phoenix_core::domain::instance_identity::InstanceId;
 use phoenix_core::domain::llm_types::ModelEffort;
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use phoenix_core::llm_language::LlmLanguage;
@@ -8,53 +9,16 @@ use phoenix_tools::{Tool, ToolContext, ToolOutput};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
-use crate::api::CreateProductConversationRequest;
+use crate::api::{federation, CreateProductConversationRequest};
 use crate::conversation_actions::{
-    accept_create, normalize_product_conversation_title, CreateSource,
+    self, accept_create, CoordinatorRenameIntent, CreateSource, LocalCoordinatorSource,
 };
-use crate::db::{
-    NormalizedConversationTitle, ProductConversationRenameCommand, ProductConversationRenameResult,
-    ProductConversationRenameSource,
-};
-use crate::runtime::{AdmittedOperation, RuntimeManager};
+use crate::coordinator_tools::instance::{Route, RouteTool, RoutedTool};
+use crate::db::ProductConversationRenameResult;
+use crate::runtime::RuntimeManager;
 
 mod automatic_continuation;
 mod continuation;
-
-struct RenameAuthorityPass {
-    owner: Option<AdmittedOperation>,
-}
-
-impl RenameAuthorityPass {
-    fn new(owner: AdmittedOperation) -> Self {
-        Self { owner: Some(owner) }
-    }
-
-    fn complete(
-        mut self,
-        result: phoenix_db::workflow::LocalAuthorityResult<
-            crate::db::DbResult<ProductConversationRenameResult>,
-        >,
-    ) -> Result<ProductConversationRenameResult, String> {
-        match result {
-            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
-                self.owner.take();
-                result.map_err(|error| error.to_string())
-            }
-            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
-                Err("local authority is unclassified; process admission closed".into())
-            }
-        }
-    }
-}
-
-impl Drop for RenameAuthorityPass {
-    fn drop(&mut self) {
-        if let Some(owner) = &self.owner {
-            owner.close("product_conversation_rename");
-        }
-    }
-}
 
 pub(crate) async fn tools(
     runtime: Arc<RuntimeManager>,
@@ -66,8 +30,8 @@ pub(crate) async fn tools(
         .await
     {
         Ok(()) => Ok(vec![
-            Arc::new(RenameConversation(runtime.clone())),
-            Arc::new(CreateConversation(runtime.clone())),
+            RouteTool::boxed(RenameConversation(runtime.clone())),
+            RouteTool::boxed(CreateConversation(runtime.clone())),
             Arc::new(continuation::ContinueConversation(runtime.clone())),
             Arc::new(automatic_continuation::AutomaticContinuationTool::read(
                 runtime.clone(),
@@ -154,7 +118,7 @@ fn output(result: Result<Value, String>) -> ToolOutput {
 async fn mutation_source(
     runtime: &RuntimeManager,
     ctx: &ToolContext,
-) -> Result<ProductConversationRenameSource, String> {
+) -> Result<LocalCoordinatorSource, String> {
     runtime
         .db()
         .require_current_coordinator_transcript(&ctx.conversation_id)
@@ -168,12 +132,31 @@ async fn mutation_source(
         .get_conversation(&ctx.conversation_id)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(ProductConversationRenameSource {
+    Ok(LocalCoordinatorSource {
         product_conversation_id: source.product_conversation_id,
         transcript_id: source.id,
-        message_id: call.message_id,
-        tool_use_id: call.tool_use_id,
+        source_call: call,
     })
+}
+
+async fn remote_dispatch_authority(
+    runtime: Arc<RuntimeManager>,
+    ctx: ToolContext,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+    let source = runtime
+        .db()
+        .get_conversation(&ctx.conversation_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let authority = runtime
+        .lock_product_message_admission(source.product_conversation_id.as_str())
+        .await;
+    runtime
+        .db()
+        .require_current_coordinator_transcript(&ctx.conversation_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(authority)
 }
 
 fn operation_schema() -> Value {
@@ -181,14 +164,22 @@ fn operation_schema() -> Value {
 }
 
 #[async_trait]
-impl Tool for RenameConversation {
+impl RoutedTool for RenameConversation {
+    fn validate_before_peer_lookup(&self, input: &Value) -> Result<(), String> {
+        let request: RenameRequest =
+            serde_json::from_value(input.clone()).map_err(|error| error.to_string())?;
+        if matches!(request, RenameRequest::Read { .. }) {
+            return Err("Remote rename receipt read by operation_id alone is unsupported. If the outcome is uncertain, retry op=rename with the same operation_id, destination instance, product_conversation_id, expected_root_transcript_id, expected_name_revision, title, and source ProductConversation/transcript. A later assistant-message/tool-use locator is allowed for that same source owner; the original receipt remains authoritative. Never mint a replacement operation.".into());
+        }
+        Ok(())
+    }
     fn name(&self) -> &'static str {
         "rename_conversation"
     }
     fn description(&self) -> String {
-        "Current Global Coordinator only. Detail resolves a reference to immutable product/root identity and naming revision; use those exact values for rename. A rename updates the title (1-200 characters) and allocated slug, never the immutable product/work identity. Choose a new operation UUID for each intentional rename; read/retry the same operation UUID after an uncertain result. Durable replay reports the historical receipt, not current title/lifecycle.".into()
+        "Current Global Coordinator only. Detail resolves a reference to immutable product/root identity and naming revision; use those exact values for rename. A rename updates the title (1-200 characters) and allocated slug, never the immutable product/work identity. Choose a new operation UUID for each intentional rename. Remote read by operation_id alone is unsupported; if rename outcome is uncertain, retry op=rename with the same operation UUID, destination instance, product/root/revision/title, and source ProductConversation/transcript. A later assistant-message/tool-use locator is allowed for that same source owner, and the original receipt remains authoritative. Never mint a replacement operation to recover uncertainty. Durable replay reports the historical receipt, not current title/lifecycle.".into()
     }
-    fn input_schema(&self) -> Value {
+    fn schema_without_instance(&self) -> Value {
         json!({"type":"object", "additionalProperties":false, "required":["op"], "properties":{
             "op":{"type":"string","enum":["detail","read","rename"]},
             "reference":{"type":"string","description":"Required for detail; product id or slug.","minLength":1},
@@ -199,9 +190,34 @@ impl Tool for RenameConversation {
             "title":{"type":"string","description":"Required for rename.","minLength":1,"maxLength":200}
         }})
     }
-    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
-        output(self.run_inner(input, ctx).await)
+    fn clearable(&self) -> bool {
+        false
     }
+    fn resolution_db(&self) -> &crate::db::Database {
+        self.0.db()
+    }
+    async fn authorize(&self, ctx: &ToolContext) -> Result<(), String> {
+        self.0
+            .db()
+            .require_current_coordinator_transcript(&ctx.conversation_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn run_routed(
+        &self,
+        input: Value,
+        route: Route<federation::ResolvedPeer>,
+        ctx: ToolContext,
+    ) -> ToolOutput {
+        output(match route {
+            Route::Local => self.run_inner(input, ctx).await,
+            Route::Remote(peer) => self.run_remote(input, &peer, ctx).await,
+        })
+    }
+}
+
+fn rename_detail_reference(reference: &str) -> Result<String, String> {
+    federation::conversation_lookup_identity(reference).map_err(|error| error.to_string())
 }
 
 fn rename_detail_response(detail: &crate::db::ProductConversationRenameDetail) -> Value {
@@ -213,7 +229,240 @@ fn rename_detail_response(detail: &crate::db::ProductConversationRenameDetail) -
         "allowed_actions": if detail.can_rename { vec!["detail", "read", "rename"] } else { vec!["detail", "read"] }})
 }
 
+fn remote_rename_detail_response(response: federation::NativeRenameOptionsResponse) -> Value {
+    let federation::NativeRenameOptionsResponse {
+        caller_instance_id: _,
+        destination_instance_id: _,
+        correlation_id: _,
+        canonical_route,
+        detail,
+        mut allowed_actions,
+    } = response;
+    allowed_actions.retain(|action| {
+        if matches!(action, federation::NativeRenameDetailAction::Read) {
+            tracing::debug!("omitting remote rename read action: operation_id alone cannot prove immutable intent");
+            false
+        } else {
+            true
+        }
+    });
+    json!({
+        "status": "detail",
+        "canonical_route": canonical_route,
+        "detail": detail,
+        "allowed_actions": allowed_actions,
+        "next": "Use these exact product/root/revision values and this same instance for rename. Remote read by operation_id alone is unsupported. If outcome is uncertain, retry op=rename with this same operation_id, destination, product/root/revision/title, and source ProductConversation/transcript. A later assistant-message/tool-use locator is allowed for that same source owner; the original receipt remains authoritative. Never mint a replacement operation."
+    })
+}
+
+fn remote_create_options_response(response: federation::NativeCreateOptionsResponse) -> Value {
+    let federation::NativeCreateOptionsResponse {
+        caller_instance_id: _,
+        destination_instance_id: _,
+        correlation_id: _,
+        cwd,
+        projects,
+        projects_truncated,
+        models,
+        default_model,
+        default_llm_language,
+    } = response;
+    json!({
+        "status": "options",
+        "cwd": cwd,
+        "projects": projects,
+        "projects_truncated": projects_truncated,
+        "models": models,
+        "default_model": default_model,
+        "default_llm_language": default_llm_language,
+    })
+}
+
+fn rename_response(result: ProductConversationRenameResult) -> Value {
+    match result {
+        ProductConversationRenameResult::Applied(receipt) => {
+            json!({"status":"applied", "receipt":receipt})
+        }
+        ProductConversationRenameResult::Replayed(receipt) => {
+            json!({"status":"replayed", "receipt":receipt, "historical":true})
+        }
+        ProductConversationRenameResult::Stale => {
+            json!({"status":"stale", "next":"read detail; use a new operation UUID with a fresh root/revision"})
+        }
+        ProductConversationRenameResult::Conflict => json!({"status":"conflict"}),
+        ProductConversationRenameResult::NotFound => json!({"status":"not_found"}),
+        ProductConversationRenameResult::Unavailable => json!({"status":"unavailable"}),
+    }
+}
+
+fn remote_rename_receipt_source(
+    receipt_source_instance_id: InstanceId,
+    receipt_source: federation::NativeActionSourceCall,
+) -> phoenix_db::ProductConversationRenameReceiptSource {
+    phoenix_db::ProductConversationRenameReceiptSource {
+        source_instance_id: receipt_source_instance_id,
+        product_conversation_id: receipt_source.product_conversation.as_str().to_owned(),
+        transcript_id: receipt_source.source_transcript_id,
+        message_id: receipt_source.source_assistant_message_id,
+        tool_use_id: receipt_source.source_tool_use_id,
+    }
+}
+
+fn remote_rename_receipt_result(
+    receipt: phoenix_db::ProductConversationRenameReceipt,
+    replayed: bool,
+) -> ProductConversationRenameResult {
+    if replayed {
+        ProductConversationRenameResult::Replayed(receipt)
+    } else {
+        ProductConversationRenameResult::Applied(receipt)
+    }
+}
+
+fn remote_rename_response(response: federation::NativeRenameResponse) -> Value {
+    use federation::NativeRenameResponse as Response;
+    use phoenix_db::ProductConversationRenameResult as RenameResult;
+
+    let replayed = matches!(&response, Response::Replayed { .. });
+    let result = match response {
+        Response::Applied {
+            caller_instance_id: _,
+            destination_instance_id: _,
+            operation_id,
+            product_conversation_id,
+            root_transcript_id,
+            receipt_title,
+            receipt_slug_at_commit,
+            receipt_name_revision_before,
+            receipt_committed_at_unix_micros,
+            receipt_source_instance_id,
+            receipt_source,
+        }
+        | Response::Replayed {
+            caller_instance_id: _,
+            destination_instance_id: _,
+            operation_id,
+            product_conversation_id,
+            root_transcript_id,
+            receipt_title,
+            receipt_slug_at_commit,
+            receipt_name_revision_before,
+            receipt_committed_at_unix_micros,
+            receipt_source_instance_id,
+            receipt_source,
+        } => {
+            let receipt = phoenix_db::ProductConversationRenameReceipt {
+                operation_id,
+                product_conversation_id,
+                title: receipt_title,
+                slug_at_commit: receipt_slug_at_commit,
+                naming_root_transcript_id: root_transcript_id,
+                name_revision_before: receipt_name_revision_before,
+                committed_at_unix_micros: receipt_committed_at_unix_micros,
+                source: remote_rename_receipt_source(receipt_source_instance_id, receipt_source),
+            };
+            remote_rename_receipt_result(receipt, replayed)
+        }
+        Response::Stale {
+            caller_instance_id: _,
+            destination_instance_id: _,
+            operation_id: _,
+            product_conversation_id: _,
+            root_transcript_id: _,
+        } => RenameResult::Stale,
+        Response::Conflict {
+            caller_instance_id: _,
+            destination_instance_id: _,
+            operation_id: _,
+            product_conversation_id: _,
+            root_transcript_id: _,
+        } => RenameResult::Conflict,
+        Response::NotFound {
+            caller_instance_id: _,
+            destination_instance_id: _,
+            operation_id: _,
+            product_conversation_id: _,
+            root_transcript_id: _,
+        } => RenameResult::NotFound,
+        Response::Unavailable {
+            caller_instance_id: _,
+            destination_instance_id: _,
+            operation_id: _,
+            product_conversation_id: _,
+            root_transcript_id: _,
+        } => RenameResult::Unavailable,
+    };
+    rename_response(result)
+}
+
+async fn remote_source(
+    runtime: &RuntimeManager,
+    ctx: &ToolContext,
+) -> Result<federation::NativeActionSourceCall, String> {
+    let source = mutation_source(runtime, ctx).await?;
+    Ok(federation::NativeActionSourceCall {
+        product_conversation: source.product_conversation_id,
+        source_transcript_id: source.transcript_id,
+        source_assistant_message_id: source.source_call.message_id,
+        source_tool_use_id: source.source_call.tool_use_id,
+    })
+}
+
 impl RenameConversation {
+    async fn run_remote(
+        &self,
+        input: Value,
+        peer: &federation::ResolvedPeer,
+        ctx: ToolContext,
+    ) -> Result<Value, String> {
+        let request: RenameRequest =
+            serde_json::from_value(input).map_err(|error| error.to_string())?;
+        self.authorize(&ctx).await?;
+        let _dispatch_authority = remote_dispatch_authority(self.0.clone(), ctx.clone()).await?;
+        let caller_instance_id = self
+            .0
+            .db()
+            .instance_id()
+            .await
+            .map_err(|error| error.to_string())?;
+        let destination_instance_id = peer.instance_id();
+        match request {
+            RenameRequest::Detail { reference } => {
+                let request = federation::NativeRenameOptionsRequest {
+                    caller_instance_id,
+                    destination_instance_id,
+                    correlation_id: uuid::Uuid::new_v4().to_string(),
+                    reference,
+                };
+                let response = federation::remote_native_rename_options(self.0.db(), peer, &request)
+                    .await.map_err(|error| error.to_string())?;
+                Ok(remote_rename_detail_response(response))
+            }
+            RenameRequest::Read { .. } => Err("Remote rename receipt read by operation_id alone is unsupported. If the outcome is uncertain, retry op=rename with the same operation_id, destination instance, product_conversation_id, expected_root_transcript_id, expected_name_revision, title, and source ProductConversation/transcript. A later assistant-message/tool-use locator is allowed for that same source owner; the original receipt remains authoritative. Never mint a replacement operation.".into()),
+            RenameRequest::Rename {
+                operation_id,
+                product_conversation_id,
+                expected_root_transcript_id,
+                expected_name_revision,
+                title,
+            } => {
+                let request = federation::NativeRenameRequest {
+                    caller_instance_id,
+                    destination_instance_id,
+                    operation_id: operation_id.0,
+                    product_conversation_id,
+                    expected_root_transcript_id,
+                    expected_name_revision,
+                    title,
+                    source: remote_source(&self.0, &ctx).await?,
+                };
+                let response = federation::remote_native_rename(self.0.db(), peer, &request)
+                    .await.map_err(|error| error.to_string())?;
+                Ok(remote_rename_response(response))
+            }
+        }
+    }
+
     async fn run_inner(&self, input: Value, ctx: ToolContext) -> Result<Value, String> {
         self.0
             .db()
@@ -223,11 +472,11 @@ impl RenameConversation {
         let request: RenameRequest = serde_json::from_value(input).map_err(|e| e.to_string())?;
         match request {
             RenameRequest::Detail { reference } => {
-                let reference = reference.strip_prefix("@conv:").unwrap_or(&reference);
+                let reference = rename_detail_reference(&reference)?;
                 let detail = self
                     .0
                     .db()
-                    .read_product_conversation_rename_detail(&ctx.conversation_id, reference)
+                    .read_product_conversation_rename_detail(&ctx.conversation_id, &reference)
                     .await
                     .map_err(|e| e.to_string())?;
                 Ok(rename_detail_response(&detail))
@@ -251,55 +500,39 @@ impl RenameConversation {
                 title,
             } => {
                 let source = mutation_source(&self.0, &ctx).await?;
-                let title =
-                    normalize_product_conversation_title(&title).map_err(|e| e.to_string())?;
-                let command = ProductConversationRenameCommand {
-                    operation_id: operation_id.0,
-                    product_conversation_id,
-                    expected_root_transcript_id,
-                    expected_name_revision,
-                    title: NormalizedConversationTitle::parse(&title).map_err(|e| e.to_string())?,
+                let result = conversation_actions::rename_from_current_coordinator(
+                    &self.0,
                     source,
-                };
-                let owner = self
-                    .0
-                    .acquire_local_authority_pass()
-                    .map_err(|()| "local authority is closed")?;
-                let authority = RenameAuthorityPass::new(owner);
-                let classified = self
-                    .0
-                    .db()
-                    .rename_product_conversation(&ctx.conversation_id, &command)
-                    .await;
-                let result = authority.complete(classified)?;
-                Ok(match result {
-                    ProductConversationRenameResult::Applied(receipt) => {
-                        json!({"status":"applied", "receipt":receipt})
-                    }
-                    ProductConversationRenameResult::Replayed(receipt) => {
-                        json!({"status":"replayed", "receipt":receipt, "historical":true})
-                    }
-                    ProductConversationRenameResult::Stale => {
-                        json!({"status":"stale", "next":"read detail; use a new operation UUID with a fresh root/revision"})
-                    }
-                    ProductConversationRenameResult::Conflict => json!({"status":"conflict"}),
-                    ProductConversationRenameResult::NotFound => json!({"status":"not_found"}),
-                    ProductConversationRenameResult::Unavailable => json!({"status":"unavailable"}),
-                })
+                    CoordinatorRenameIntent {
+                        operation_id: operation_id.0,
+                        product_conversation_id,
+                        expected_root_transcript_id,
+                        expected_name_revision,
+                        title,
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                Ok(rename_response(result))
             }
         }
     }
 }
 
 #[async_trait]
-impl Tool for CreateConversation {
+impl RoutedTool for CreateConversation {
+    fn validate_before_peer_lookup(&self, input: &Value) -> Result<(), String> {
+        serde_json::from_value::<CreateRequest>(input.clone())
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
     fn name(&self) -> &'static str {
         "create_conversation"
     }
     fn description(&self) -> String {
-        "Current Global Coordinator only. Explicitly create AND submit a nonblank text objective using start=submit_objective via the durable creation pipeline; dormant create is unsupported. Options discovers bounded project paths, normalized cwd, and available model/effort choices. Submit only an exact normalized absolute cwd. Objective text is literal agent content, never a user commission or slash command. Omit model/language to freeze current defaults on first acceptance; retry omission reuses those choices, while explicit different choices conflict. Omitted effort means native execution semantics, distinct from an explicit level. Choose a caller-owned request UUID before submission; read/retry that UUID after uncertainty (no duplicate or changed-intent retry). Accepted is not ready: read request_id for canonical pending/ready/failure status. No WorkScope attachment, artifact reference, cancellation, or retry-delivery operation is offered.".into()
+        "Current Global Coordinator only. Explicitly create AND submit a nonblank text objective using start=submit_objective via the durable creation pipeline; dormant create is unsupported. Options discovers bounded project paths, normalized cwd, and available model/effort choices. Submit only an exact normalized absolute cwd. Objective text is literal agent content, never a user commission or slash command. Omit model/language to freeze current defaults on first acceptance; retry omission reuses those choices, while explicit different choices conflict. Omitted effort means native execution semantics, distinct from an explicit level. Choose a caller-owned request UUID before submission; read/retry that UUID after uncertainty (no duplicate or changed-intent retry). Accepted is not ready: read request_id on the same instance for canonical pending/ready/failure status. Remote options and cwd are destination-scoped; never substitute source-local paths or defaults. No WorkScope attachment, artifact reference, cancellation, or retry-delivery operation is offered.".into()
     }
-    fn input_schema(&self) -> Value {
+    fn schema_without_instance(&self) -> Value {
         json!({"type":"object", "additionalProperties":false,"required":["op"],"properties":{
             "op":{"type":"string","enum":["options","read","create"]},"request_id":operation_schema(),
             "cwd":{"type":"string","description":"Optional path for options to normalize; required exact normalized absolute cwd for create.","minLength":1},
@@ -309,8 +542,29 @@ impl Tool for CreateConversation {
             "llm_language":{"type":"string","enum":["phoenix-native","caveman"]}
         }})
     }
-    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
-        output(self.run_inner(input, ctx).await)
+    fn clearable(&self) -> bool {
+        false
+    }
+    fn resolution_db(&self) -> &crate::db::Database {
+        self.0.db()
+    }
+    async fn authorize(&self, ctx: &ToolContext) -> Result<(), String> {
+        self.0
+            .db()
+            .require_current_coordinator_transcript(&ctx.conversation_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn run_routed(
+        &self,
+        input: Value,
+        route: Route<federation::ResolvedPeer>,
+        ctx: ToolContext,
+    ) -> ToolOutput {
+        output(match route {
+            Route::Local => self.run_inner(input, ctx).await,
+            Route::Remote(peer) => self.run_remote(input, &peer, ctx).await,
+        })
     }
 }
 
@@ -343,6 +597,8 @@ enum NativeCreationPublication {
         conversation_id: String,
     },
 }
+
+const CREATION_EXECUTION_INTERPRETATION: &str = "Publication means initial input accepted, not objective completed. Unavailable means no attributable outcome is retained; never infer success from later turns.";
 
 #[derive(Serialize)]
 struct NativeCreationStatus {
@@ -381,8 +637,129 @@ fn native_creation_status(status: phoenix_db::ProductCreationStatusRead) -> Nati
             }
         }),
         initial_objective_execution: status.initial_objective_execution,
-        execution_interpretation: "Publication means initial input accepted, not objective completed. Unavailable means no attributable outcome is retained; never infer success from later turns.",
+        execution_interpretation: CREATION_EXECUTION_INTERPRETATION,
         allowed_actions: ["read"],
+    }
+}
+
+fn native_creation_acceptance(
+    request_id: &str,
+    product_conversation_id: &ProductConversationId,
+) -> Value {
+    json!({
+        "status": "accepted",
+        "request_id": request_id,
+        "product_conversation_id": product_conversation_id,
+        "next": "read request_id; accepted does not imply ready",
+    })
+}
+
+fn remote_native_creation_acceptance(acceptance: federation::NativeCreateResponse) -> Value {
+    let federation::NativeCreateResponse {
+        status: _,
+        caller_instance_id: _,
+        destination_instance_id: _,
+        request_id,
+        product_conversation_id,
+    } = acceptance;
+    native_creation_acceptance(&request_id, &product_conversation_id)
+}
+
+fn remote_native_creation_status(
+    response: federation::NativeCreateStatusResponse,
+) -> Result<Value, String> {
+    use federation::{
+        NativeCreateInitialExecution as Execution, NativeCreatePublication as Publication,
+    };
+
+    match response {
+        federation::NativeCreateStatusResponse::Unknown {
+            caller_instance_id: _,
+            destination_instance_id: _,
+            request_id,
+        } => Ok(json!({"status": "unknown", "request_id": request_id})),
+        federation::NativeCreateStatusResponse::Known {
+            caller_instance_id: _,
+            destination_instance_id: _,
+            request_id,
+            product_conversation_id,
+            creation_status,
+            provisioning_stage,
+            provisioning_stage_updated_at_unix_micros,
+            retry_at_unix_micros,
+            error,
+            publication,
+            initial_execution,
+        } => {
+            let stage_updated_at =
+                chrono::DateTime::from_timestamp_micros(provisioning_stage_updated_at_unix_micros)
+                    .ok_or("Invalid remote creation stage timestamp")?;
+            let retry_at = retry_at_unix_micros
+                .map(|micros| {
+                    chrono::DateTime::from_timestamp_micros(micros)
+                        .ok_or("Invalid remote creation retry timestamp")
+                })
+                .transpose()?;
+            let publication = match publication {
+                Publication::None {} => None,
+                Publication::Available {
+                    conversation_id,
+                    canonical_route,
+                } => Some(NativeCreationPublication::Available {
+                    conversation_id,
+                    canonical_route,
+                }),
+                Publication::Historical { conversation_id } => {
+                    Some(NativeCreationPublication::Historical { conversation_id })
+                }
+            };
+            let initial_objective_execution = match initial_execution {
+                Execution::Queued {} => phoenix_db::ProductCreationInitialExecution::Queued,
+                Execution::Running {} => phoenix_db::ProductCreationInitialExecution::Running,
+                Execution::Completed {} => phoenix_db::ProductCreationInitialExecution::Completed,
+                Execution::Failed { reason } => {
+                    phoenix_db::ProductCreationInitialExecution::Failed { reason }
+                }
+                Execution::Cancelled {} => phoenix_db::ProductCreationInitialExecution::Cancelled,
+                Execution::AwaitingUserResponse {} => {
+                    phoenix_db::ProductCreationInitialExecution::AwaitingUserResponse
+                }
+                Execution::AwaitingTaskApproval {} => {
+                    phoenix_db::ProductCreationInitialExecution::AwaitingTaskApproval
+                }
+                Execution::Unavailable {} => {
+                    phoenix_db::ProductCreationInitialExecution::Unavailable
+                }
+            };
+            let status = match creation_status {
+                federation::NativeCreationState::Accepted => "accepted",
+                federation::NativeCreationState::Claimed => "claimed",
+                federation::NativeCreationState::RetryScheduled => "retry_scheduled",
+                federation::NativeCreationState::Cancelling => "cancelling",
+                federation::NativeCreationState::Cancelled => "cancelled",
+                federation::NativeCreationState::DeletionPending => "deletion_pending",
+                federation::NativeCreationState::DeliveryPending => "delivery_pending",
+                federation::NativeCreationState::DeliveryFailed => "delivery_failed",
+                federation::NativeCreationState::Published => "published",
+                federation::NativeCreationState::Failed => "failed",
+                federation::NativeCreationState::CleanupAmbiguous => "cleanup_ambiguous",
+            }
+            .to_owned();
+            serde_json::to_value(NativeCreationStatus {
+                request_id,
+                product_conversation_id,
+                status,
+                provisioning_stage,
+                provisioning_stage_updated_at: stage_updated_at,
+                retry_at,
+                error,
+                publication,
+                initial_objective_execution,
+                execution_interpretation: CREATION_EXECUTION_INTERPRETATION,
+                allowed_actions: ["read"],
+            })
+            .map_err(|error| error.to_string())
+        }
     }
 }
 
@@ -407,12 +784,99 @@ async fn native_creation_acceptance_receipt(
     let accepted = read_native_creation_status(runtime, transcript_id, request_id)
         .await?
         .ok_or("Accepted creation request is no longer available; reconcile request_id")?;
-    Ok(
-        json!({"status":"accepted", "request_id":accepted.request_id,"product_conversation_id":accepted.product_conversation_id,"next":"read request_id; accepted does not imply ready"}),
-    )
+    Ok(native_creation_acceptance(
+        &accepted.request_id,
+        &accepted.product_conversation_id,
+    ))
 }
 
 impl CreateConversation {
+    async fn run_remote(
+        &self,
+        input: Value,
+        peer: &federation::ResolvedPeer,
+        ctx: ToolContext,
+    ) -> Result<Value, String> {
+        let request: CreateRequest =
+            serde_json::from_value(input).map_err(|error| error.to_string())?;
+        self.authorize(&ctx).await?;
+        let _dispatch_authority = remote_dispatch_authority(self.0.clone(), ctx.clone()).await?;
+        let caller_instance_id = self
+            .0
+            .db()
+            .instance_id()
+            .await
+            .map_err(|error| error.to_string())?;
+        let destination_instance_id = peer.instance_id();
+        match request {
+            CreateRequest::Options { cwd } => {
+                let correlation_id = uuid::Uuid::new_v4().to_string();
+                let request = match cwd {
+                    None => federation::NativeCreateOptionsRequest::WithoutCwd {
+                        caller_instance_id,
+                        destination_instance_id,
+                        correlation_id,
+                    },
+                    Some(cwd) => federation::NativeCreateOptionsRequest::WithCwd {
+                        caller_instance_id,
+                        destination_instance_id,
+                        correlation_id,
+                        cwd,
+                    },
+                };
+                let response =
+                    federation::remote_native_create_options(self.0.db(), peer, &request)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                Ok(remote_create_options_response(response))
+            }
+            CreateRequest::Read { request_id } => {
+                let request = federation::NativeCreateStatusRequest {
+                    caller_instance_id,
+                    destination_instance_id,
+                    request: request_id.0,
+                };
+                let response = federation::remote_native_create_status(self.0.db(), peer, &request)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                remote_native_creation_status(response)
+            }
+            CreateRequest::Create {
+                request_id,
+                cwd,
+                objective,
+                start: CreateStart::SubmitObjective,
+                model,
+                effort,
+                llm_language,
+            } => {
+                let request = federation::NativeCreateRequest {
+                    caller_instance_id,
+                    destination_instance_id,
+                    request_id: request_id.0,
+                    cwd,
+                    objective,
+                    model,
+                    effort: effort.map(|effort| effort.to_string()),
+                    language: llm_language.map(|language| language.as_str().to_string()),
+                    start: federation::NativeCreateStart::SubmitObjective,
+                    source: remote_source(&self.0, &ctx).await?,
+                };
+                match federation::remote_native_create(self.0.db(), peer, &request)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    federation::NativeCreateOutcome::Accepted { acceptance } => {
+                        Ok(remote_native_creation_acceptance(acceptance))
+                    }
+                    federation::NativeCreateOutcome::Reconciled { status: response } => {
+                        remote_native_creation_status(response)
+                    }
+                }
+            }
+        }
+    }
+
     async fn project_options(&self, transcript_id: &str) -> Result<(Vec<Value>, bool), String> {
         let mut projects = Vec::new();
         let mut after_id = None::<String>;
@@ -494,9 +958,6 @@ impl CreateConversation {
                 llm_language,
             } => {
                 let source = mutation_source(&self.0, &ctx).await?;
-                let source_call = ctx
-                    .source_tool_call()
-                    .ok_or("Trusted source tool-call identity unavailable")?;
                 let accepted = accept_create(
                     &self.0,
                     CreateProductConversationRequest {
@@ -511,7 +972,7 @@ impl CreateConversation {
                     CreateSource::CurrentCoordinator {
                         product_conversation_id: source.product_conversation_id,
                         transcript_id: source.transcript_id,
-                        source_call,
+                        source_call: source.source_call,
                     },
                 )
                 .await

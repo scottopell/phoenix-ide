@@ -644,3 +644,16 @@ AND SHALL expose selected state on both `/global` and canonical `/global/<id>` r
 AND SHALL replace the mobile conversation-list view with the Ember destination when the user opens Ember, rather than retain a duplicate self-navigation entry
 AND SHALL use Ember as the primary visible identity in the destination's loading/accessibility labels and Coordinator-origin return breadcrumb
 AND SHALL retain the existing singleton route, identity, transcript, and authorization behavior.
+
+
+### REQ-GR-024: Create and Rename Ordinary Conversations on an Explicit Instance
+
+The current Global Coordinator SHALL expose native ordinary-conversation creation and rename capabilities under [Federation REQ-FED-021–024](../federation/requirements.md), using shared local and destination application actions rather than independent mutation implementations.
+
+Each capability MAY receive an optional instance selector: omission or exact `"local"` SHALL execute the local action directly; a saved peer UUID or unambiguous saved display name SHALL select that exact remote peer. Explicit null, unknown or ambiguous peers, and self-selection SHALL fail. Remote selection SHALL never fall back to local or another peer, including when the endpoint is unsupported, the peer is unavailable, or response identity validation fails.
+
+The source SHALL derive exact source ProductConversation, transcript, assistant message, and tool-use identities from trusted executing-call context. The destination SHALL derive source instance identity from the authenticated peer, authorize that peer for the operation, and persist the source call as peer-qualified provenance without requiring foreign identities to resolve as local rows.
+
+Creation SHALL use the existing request UUID as its durable operation identity and preserve the closed local native intent using a directory and model capabilities discovered from the selected destination. The destination owns validation, defaults for omitted optional selections, durable acceptance, and the ProductConversation identity. A successful response means durable request acceptance only. Rename SHALL pin one operation UUID, stable ProductConversation ID, canonical root transcript ID, nonnegative expected naming revision, and title; its destination and immutable retry identity SHALL be preserved. The destination owns canonical naming and route allocation and preserves the local `applied`, `replayed`, `stale`, `conflict`, `not_found`, or `unavailable` result classifications, with identity-closed results.
+
+No generic conversation CRUD, settings mutation, trust/enrollment control, or lifecycle authority is exposed by these capabilities.

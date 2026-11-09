@@ -864,8 +864,6 @@ pub(crate) enum DatabaseTerminalRecovery {
     AlreadyCommitted,
     Committed {
         projection: Box<phoenix_db::workflow::PersistedConversationProjection>,
-        is_sub_agent: bool,
-        worktree_path: Option<std::path::PathBuf>,
     },
 }
 
@@ -2462,6 +2460,28 @@ pub(crate) async fn conversation_retains_work_scope(
             crate::db::ProductConversationAdmission::Accepted { .. }
         )
     ))
+}
+
+pub(crate) async fn conversation_retains_work_scope_for_reclamation(
+    db: &crate::db::Database,
+    conv: &crate::db::Conversation,
+) -> Result<bool, crate::db::DbError> {
+    match db.message_target_admission(&conv.id).await? {
+        crate::db::MessageTargetAdmission::Aggregate(
+            crate::db::ProductConversationAdmission::Accepted { .. }
+            | crate::db::ProductConversationAdmission::Refused(_),
+        ) => Ok(true),
+        crate::db::MessageTargetAdmission::Aggregate(
+            crate::db::ProductConversationAdmission::History(product_conversation_id),
+        ) => Ok(db
+            .get_active_close_projection_for_product(&product_conversation_id)
+            .await?
+            .is_some()),
+        crate::db::MessageTargetAdmission::StandaloneAvailable
+        | crate::db::MessageTargetAdmission::StandaloneArchived => {
+            Ok(conversation_attachment_retains_work_scope(conv))
+        }
+    }
 }
 
 fn conversation_resource_scope(conv: &crate::db::Conversation) -> Option<ResourceScopeKey> {
@@ -5501,12 +5521,7 @@ impl RuntimeManager {
         conversation_id: &str,
         recovery: DatabaseTerminalRecovery,
     ) {
-        let DatabaseTerminalRecovery::Committed {
-            projection,
-            is_sub_agent,
-            worktree_path,
-        } = recovery
-        else {
+        let DatabaseTerminalRecovery::Committed { projection } = recovery else {
             return;
         };
         if !projection.state.is_terminal() {
@@ -5535,9 +5550,6 @@ impl RuntimeManager {
             });
             executor::emit_terminal_lifecycle_event(
                 conversation_id,
-                is_sub_agent,
-                &projection.state,
-                worktree_path.as_deref(),
                 Some(&self.fork_cmd_tx),
                 &broadcaster,
             )
@@ -5545,9 +5557,6 @@ impl RuntimeManager {
         } else {
             executor::complete_terminal_lifecycle_without_broadcast(
                 conversation_id,
-                is_sub_agent,
-                &projection.state,
-                worktree_path.as_deref(),
                 Some(&self.fork_cmd_tx),
             )
             .await;
@@ -5629,12 +5638,6 @@ impl RuntimeManager {
             };
             executor::complete_terminal_lifecycle_without_broadcast(
                 &conversation.id,
-                conversation.parent_conversation_id.is_some(),
-                &conversation.state,
-                conversation
-                    .conv_mode
-                    .worktree_path()
-                    .map(std::path::Path::new),
                 Some(&self.fork_cmd_tx),
             )
             .await;
@@ -5739,9 +5742,6 @@ impl RuntimeManager {
                             }
                             executor::complete_terminal_lifecycle_without_broadcast(
                                 &conversation_id,
-                                false,
-                                &projection.state,
-                                Some(std::path::Path::new(&projection.cwd)),
                                 Some(&self.fork_cmd_tx),
                             )
                             .await;
@@ -5873,11 +5873,6 @@ impl RuntimeManager {
                 ))
             })?;
         let parent_conversation_id = conversation.parent_conversation_id.clone();
-        let is_sub_agent = parent_conversation_id.is_some();
-        let worktree_path = conversation
-            .conv_mode
-            .worktree_path()
-            .map(std::path::PathBuf::from);
         let command = match obligation.terminal {
             phoenix_workflow::TurnTerminal::Completed => phoenix_workflow::TurnCommand::Complete {
                 turn_id: obligation.turn_id,
@@ -5925,8 +5920,6 @@ impl RuntimeManager {
                 }
                 Ok(DatabaseTerminalRecovery::Committed {
                     projection: Box::new(projection),
-                    is_sub_agent,
-                    worktree_path,
                 })
             }
             Err(settlement_error) => {
@@ -5959,8 +5952,6 @@ impl RuntimeManager {
                     phoenix_db::workflow::TerminalProjectionProbe::Current => {
                         Ok(DatabaseTerminalRecovery::Committed {
                             projection: Box::new(projection),
-                            is_sub_agent,
-                            worktree_path,
                         })
                     }
                     phoenix_db::workflow::TerminalProjectionProbe::Superseded => {
@@ -14991,8 +14982,6 @@ mod scope_liveness_tests {
                     state: ConvState::Idle,
                     state_updated_at: Utc::now(),
                 }),
-                is_sub_agent: false,
-                worktree_path: None,
             },
         )
         .await;

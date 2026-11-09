@@ -11,6 +11,7 @@ use phoenix_core::work_scope::WorkScopeId;
 
 use super::{DbError, DbResult, ProjectSeedId};
 
+mod federated_conversation_actions;
 mod federated_subscriptions;
 mod goal_execution;
 mod local_goal_watch;
@@ -811,6 +812,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 156,
         name: "remote_coordinator_goals",
         sql: include_str!("migrations/remote_coordinator_goals.sql"),
+    },
+    Migration {
+        version: 158,
+        name: "federated_conversation_actions",
+        sql: "-- Native conversation action source qualification (special migration runner).",
     },
 ];
 
@@ -12450,6 +12456,12 @@ async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbRe
             continue;
         }
 
+        if migration.version == 158 {
+            federated_conversation_actions::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
         if migration.version == 133 {
             federated_subscriptions::run(pool, migration).await?;
             applied += 1;
@@ -13482,6 +13494,55 @@ mod tests {
                 .await
                 .unwrap();
         assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[tokio::test]
+    async fn migration_156_applies_when_158_is_already_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("migration-156-after-158.db"))
+            .await
+            .unwrap();
+        let pool = db.pool();
+
+        run_through_for_test(&pool, 155).await.unwrap();
+        let migration_158 = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 158)
+            .expect("migration 158 must remain registered");
+        federated_conversation_actions::run(&pool, migration_158)
+            .await
+            .unwrap();
+
+        let before: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM _migrations WHERE version >= 156 ORDER BY version",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(before, vec![158]);
+
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+
+        let after: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM _migrations WHERE version >= 156 ORDER BY version",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(after, vec![156, 158]);
+        sqlx::query("SELECT enrollment_id FROM conversation_goal_actors LIMIT 0")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("SELECT objective_source_instance_id FROM product_creation_jobs LIMIT 0")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -15957,7 +16018,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(run_through_for_test(db.pool(), 152).await.unwrap(), 1);
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 3);
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 4);
         assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
         let ledger: Vec<(i64, String)> = sqlx::query_as(
             "SELECT version, name FROM _migrations WHERE version >= 150 ORDER BY version",
@@ -15974,6 +16035,7 @@ mod tests {
                 (153, "close_writer_observations".into()),
                 (155, "ordinary_self_goal_admission".into()),
                 (156, "remote_coordinator_goals".into()),
+                (158, "federated_conversation_actions".into()),
             ]
         );
     }
@@ -15983,6 +16045,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (158, "federated_conversation_actions"),
             (156, "remote_coordinator_goals"),
             (155, "ordinary_self_goal_admission"),
             (153, "close_writer_observations"),
@@ -20255,6 +20318,7 @@ mod tests {
                 (153, "close_writer_observations"),
                 (155, "ordinary_self_goal_admission"),
                 (156, "remote_coordinator_goals"),
+                (158, "federated_conversation_actions"),
             ]
         );
         let goal = MIGRATIONS
@@ -20268,7 +20332,7 @@ mod tests {
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 154);
+        assert_eq!(MIGRATIONS.len(), 155);
     }
 
     #[tokio::test]

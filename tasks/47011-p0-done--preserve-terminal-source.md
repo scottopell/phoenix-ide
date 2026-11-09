@@ -1,0 +1,5 @@
+# Preserve source during generic terminal lifecycle
+
+Remove generic conversation-terminal worktree deletion because terminal state carries no exact `ProductConversation` Close authority. Exact Close and explicit hard-delete remain unchanged. Startup and manual leftover reclamation must classify ownership from ordinary `ProductConversation` admission: Open, Close-fenced, and History aggregates with active Close recovery remain owners even when the transcript is terminal.
+
+Regression coverage must prove terminal lifecycle preserves clean, tracked-dirty, untracked, and nested descendant paths without invoking `git worktree remove --force`. Reconciliation coverage must prove Open terminal and active Close-recovery worktrees survive, while History and rowless fixtures exercise orphan reclamation without deleting Git branch references. Remove any descendant-path heuristic that becomes dead with the unauthorized cleanup path. Do not redesign the Close lifecycle or reproduce against real work.
