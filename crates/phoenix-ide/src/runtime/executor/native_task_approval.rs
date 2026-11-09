@@ -464,10 +464,15 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success());
-        let before = git_snapshot(&root);
         let exclude = root.join(".git/info/exclude");
-        std::fs::remove_file(&exclude).unwrap();
-        std::fs::create_dir(&exclude).unwrap();
+        // Fail staging the promoted untracked path without corrupting metadata
+        // that the compensating reset itself needs to read.
+        std::fs::write(
+            &exclude,
+            ".phoenix/\n/tasks/53023-p1-in-progress--reviewed.md\n",
+        )
+        .unwrap();
+        let before = git_snapshot(&root);
         let mut progress = ApprovalGitProgress::BeforeEffects;
         let result = persist_fresh_approved_task_artifact_blocking_with_progress(
             &root,
@@ -481,8 +486,8 @@ mod tests {
             &mut progress,
         );
         assert!(
-            matches!(result, Err(FollowUpArtifactError::BeforeGit(_))),
-            "successful compensation retains the legacy error label, not native no-effect truth"
+            matches!(&result, Err(FollowUpArtifactError::BeforeGit(error)) if error.contains("ignored")),
+            "successful compensation retains the legacy error label, not native no-effect truth: {result:?}"
         );
         assert_eq!(progress, ApprovalGitProgress::EffectsMayHaveOccurred);
         assert_eq!(std::fs::read(root.join(reviewed)).unwrap(), body.as_bytes());
@@ -490,9 +495,8 @@ mod tests {
             .join("tasks/53023-p1-in-progress--reviewed.md")
             .exists());
         let after = git_snapshot(&root);
-        assert_eq!(after.0, before.0);
-        assert_eq!(after.1, before.1);
-        assert!(exclude.is_dir());
+        assert_eq!(after, before);
+        assert!(exclude.is_file());
     }
 
     fn git_snapshot(root: &std::path::Path) -> (String, String, Option<Vec<u8>>) {

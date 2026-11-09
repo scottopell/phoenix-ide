@@ -635,6 +635,8 @@ enum InitialApprovalScenario {
     DroppedCallerProviderSuccess,
     FollowUpProviderSuccess,
     FollowUpCompensatedFailure,
+    InitialReceiptFailure,
+    FollowUpReceiptFailure,
 }
 
 struct InitialApprovalHarness {
@@ -714,6 +716,24 @@ async fn production_native_follow_up_taskmd_approval_succeeds_and_replays() {
 async fn production_native_follow_up_taskmd_compensates_promotion_failure() {
     Box::pin(assert_production_initial_approval(
         InitialApprovalScenario::FollowUpCompensatedFailure,
+        ReviewedTaskKind::Taskmd,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn production_initial_receipt_failure_after_git_rolls_back_and_fences() {
+    Box::pin(assert_production_initial_approval(
+        InitialApprovalScenario::InitialReceiptFailure,
+        ReviewedTaskKind::PlainMarkdown,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn production_follow_up_receipt_failure_after_git_rolls_back_and_fences() {
+    Box::pin(assert_production_initial_approval(
+        InitialApprovalScenario::FollowUpReceiptFailure,
         ReviewedTaskKind::Taskmd,
     ))
     .await;
@@ -814,6 +834,7 @@ async fn assert_production_initial_approval_inner(
         scenario,
         InitialApprovalScenario::FollowUpProviderSuccess
             | InitialApprovalScenario::FollowUpCompensatedFailure
+            | InitialApprovalScenario::FollowUpReceiptFailure
     ) {
         std::fs::write(worktree.join("unrelated-staged.txt"), "keep staged").unwrap();
         git(&worktree, &["add", "--", "unrelated-staged.txt"]);
@@ -839,6 +860,7 @@ async fn assert_production_initial_approval_inner(
         scenario,
         InitialApprovalScenario::FollowUpProviderSuccess
             | InitialApprovalScenario::FollowUpCompensatedFailure
+            | InitialApprovalScenario::FollowUpReceiptFailure
     ) {
         let old = phoenix_core::task_handoff::TaskApprovalHandoffData {
             task_id: "old-task-id".into(),
@@ -911,7 +933,9 @@ async fn assert_production_initial_approval_inner(
         InitialApprovalScenario::ProviderSuccess
         | InitialApprovalScenario::DroppedCallerProviderSuccess
         | InitialApprovalScenario::FollowUpProviderSuccess
-        | InitialApprovalScenario::FollowUpCompensatedFailure => {
+        | InitialApprovalScenario::FollowUpCompensatedFailure
+        | InitialApprovalScenario::InitialReceiptFailure
+        | InitialApprovalScenario::FollowUpReceiptFailure => {
             phoenix_llm::ModelRegistry::for_test_with_sonnet(llm.clone())
         }
     };
@@ -982,6 +1006,112 @@ async fn assert_production_initial_approval_inner(
         harness.handle = Some(handle.clone());
         let broadcaster = manager.conversation_broadcaster("actor-target").await;
         let events = broadcaster.subscribe();
+        if matches!(
+            scenario,
+            InitialApprovalScenario::InitialReceiptFailure
+                | InitialApprovalScenario::FollowUpReceiptFailure
+        ) {
+            let before = native_rollback_snapshot(&f.db, "actor-target").await;
+            // This final INSERT follows the real objective, authority, message,
+            // obligation, state and source-call writes in one transaction.
+            sqlx::query(
+                "CREATE TRIGGER reject_runtime_native_receipt BEFORE INSERT ON native_task_approval_receipts
+                 BEGIN SELECT RAISE(ABORT, 'injected native receipt failure'); END",
+            )
+            .execute(f.db.pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                manager.execute_native_task_approval(command.clone()).await,
+                NativeTaskApprovalOutcome::Unavailable
+            );
+            handle.event_tx.closed().await;
+            // Retirement and authority closure are separate postconditions. Check
+            // both before fixture cleanup can close the fence itself.
+            assert!(manager.local_authority_is_closed());
+            assert_eq!(
+                native_rollback_snapshot(&f.db, "actor-target").await,
+                before
+            );
+            let after_target = f.db.get_conversation("actor-target").await.unwrap();
+            assert_eq!(
+                after_target.product_conversation_id,
+                before_target.product_conversation_id
+            );
+            assert_eq!(
+                after_target.attached_work_scope_id,
+                before_target.attached_work_scope_id
+            );
+            assert_eq!(after_target.cwd, before_target.cwd);
+            assert_eq!(after_target.conv_mode, before_target.conv_mode);
+            assert_ne!(git(&worktree, &["rev-parse", "HEAD"]).trim(), before_head);
+            assert_eq!(
+                git(
+                    &worktree,
+                    &["rev-list", "--count", &format!("{before_head}..HEAD")]
+                )
+                .trim(),
+                "1"
+            );
+            let committed_path = if old_approved.is_some() && kind == ReviewedTaskKind::Taskmd {
+                committed_task_file
+            } else {
+                task_file
+            };
+            let changed_paths = git(
+                &worktree,
+                &[
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-only",
+                    "--no-renames",
+                    "-r",
+                    "HEAD",
+                ],
+            );
+            let mut changed_paths = changed_paths.lines().collect::<Vec<_>>();
+            changed_paths.sort_unstable();
+            let mut expected_paths = vec![committed_path];
+            if committed_path != task_file {
+                expected_paths.push(task_file);
+            }
+            expected_paths.sort_unstable();
+            assert_eq!(changed_paths, expected_paths);
+            assert_eq!(
+                git(&worktree, &["show", &format!("HEAD:{committed_path}")]),
+                BODY
+            );
+            assert_eq!(
+                std::fs::read(worktree.join(committed_path)).unwrap(),
+                BODY.as_bytes()
+            );
+            if old_approved.is_some() {
+                assert_eq!(
+                    git(&worktree, &["symbolic-ref", "--short", "HEAD"]),
+                    before_branch
+                );
+                assert_eq!(worktree_identity(), before_worktrees);
+                assert_eq!(
+                    git(&worktree, &["show", ":unrelated-staged.txt"]),
+                    "keep staged"
+                );
+                assert!(!git(&worktree, &["ls-tree", "-r", "--name-only", "HEAD"])
+                    .lines()
+                    .any(|path| path == "unrelated-staged.txt"));
+                if kind == ReviewedTaskKind::Taskmd {
+                    assert!(!worktree.join(task_file).exists());
+                }
+            }
+            assert_eq!(llm.calls.load(Ordering::SeqCst), 0);
+            assert!(requests.try_recv().is_err());
+            assert_eq!(
+                f.db.inspect_native_task_approval_command(&command)
+                    .await
+                    .unwrap(),
+                NativeTaskApprovalInspection::RequiresOwningActorAdmission
+            );
+            return;
+        }
         if scenario == InitialApprovalScenario::FollowUpCompensatedFailure {
             let old = old_approved.as_ref().expect("follow-up old objective");
             let old_authority_rows = native_approval_rows(&f.db).await;
@@ -1417,7 +1547,9 @@ async fn assert_production_initial_approval_inner(
         | InitialApprovalScenario::FollowUpProviderSuccess => 1,
         InitialApprovalScenario::ContextPressure
         | InitialApprovalScenario::FreezeFailure
-        | InitialApprovalScenario::FollowUpCompensatedFailure => 0,
+        | InitialApprovalScenario::FollowUpCompensatedFailure
+        | InitialApprovalScenario::InitialReceiptFailure
+        | InitialApprovalScenario::FollowUpReceiptFailure => 0,
     };
     assert_eq!(llm.calls.load(Ordering::SeqCst), expected_calls);
     assert!(requests.try_recv().is_err(), "no additional provider entry");
@@ -1508,6 +1640,32 @@ async fn assert_production_initial_approval_inner(
         std::fs::read(worktree.join(committed_task_file)).unwrap(),
         BODY.as_bytes()
     );
+}
+
+#[derive(Debug, PartialEq)]
+struct NativeRollbackSnapshot {
+    rows: Vec<i64>,
+    objective: Option<phoenix_core::task_handoff::ApprovedTaskSnapshot>,
+    authority: Vec<(String, String, i64)>,
+    scope_kinds: Vec<(String, Option<String>)>,
+    provenance: Vec<(String, String, String, String, i64)>,
+    state: ConvState,
+}
+
+async fn native_rollback_snapshot(db: &Database, target: &str) -> NativeRollbackSnapshot {
+    NativeRollbackSnapshot {
+        rows: native_approval_rows(db).await,
+        objective: db.get_approved_task_objective(target).await.unwrap(),
+        authority: sqlx::query_as(
+            "SELECT work_scope_id, objective_conversation_id, created_at_us FROM work_scope_approved_task_authorities ORDER BY work_scope_id",
+        ).fetch_all(db.pool()).await.unwrap(),
+        scope_kinds: sqlx::query_as("SELECT id, authority_kind FROM work_scopes ORDER BY id")
+            .fetch_all(db.pool()).await.unwrap(),
+        provenance: sqlx::query_as(
+            "SELECT target_product_conversation_id, source_product_conversation_id, source_conversation_id, relation_key, created_at_us FROM product_conversation_sources ORDER BY target_product_conversation_id, source_product_conversation_id, source_conversation_id, relation_key",
+        ).fetch_all(db.pool()).await.unwrap(),
+        state: db.get_conversation(target).await.unwrap().state,
+    }
 }
 
 struct InitialSource {
@@ -1636,6 +1794,7 @@ async fn native_approval_rows(db: &Database) -> Vec<i64> {
         "SELECT COUNT(*) FROM conversation_approved_task_objectives",
         "SELECT COUNT(*) FROM work_scope_approved_task_authorities",
         "SELECT COUNT(*) FROM native_task_approval_receipts",
+        "SELECT COUNT(*) FROM native_task_approval_source_calls",
         "SELECT COUNT(*) FROM approval_request_obligations",
     ] {
         counts.push(
