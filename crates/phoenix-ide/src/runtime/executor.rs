@@ -8138,11 +8138,13 @@ where
                 reviewed_proposal,
             } => {
                 self.execute_approve_task(
-                    task_file,
-                    title,
-                    priority,
-                    plan,
-                    reviewed_proposal,
+                    TaskApprovalInput {
+                        task_file,
+                        title,
+                        priority,
+                        plan,
+                        reviewed_proposal,
+                    },
                     task_approval_execution.ok_or_else(|| {
                         "task approval execution was not resolved before effect admission"
                             .to_string()
@@ -12050,14 +12052,17 @@ where
 
     fn restore_retryable_task_approval(
         &mut self,
-        task_file: String,
-        title: String,
-        priority: crate::task_source::Priority,
-        plan: String,
-        reviewed_proposal: Option<phoenix_core::domain::task_approval::ReviewedProposal>,
+        approval: TaskApprovalInput,
         error: &str,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
+        let TaskApprovalInput {
+            task_file,
+            title,
+            priority,
+            plan,
+            reviewed_proposal,
+        } = approval;
         self.install_live_state(
             ConvState::AwaitingTaskApproval {
                 task_file,
@@ -12095,14 +12100,17 @@ where
     #[allow(clippy::too_many_lines)] // NonEmptyString construction adds wrapping lines
     async fn execute_approve_task(
         &mut self,
-        task_file: String,
-        title: String,
-        priority: crate::task_source::Priority,
-        plan: String,
-        reviewed_proposal_backup: Option<phoenix_core::domain::task_approval::ReviewedProposal>,
+        approval: TaskApprovalInput,
         execution: TaskApprovalExecution,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
+        let TaskApprovalInput {
+            task_file,
+            title,
+            priority,
+            plan,
+            reviewed_proposal: reviewed_proposal_backup,
+        } = approval;
         if execution == TaskApprovalExecution::FollowUp {
             let result = self
                 .approve_follow_up_in_existing_scope(&task_file, &title, priority, &plan, admitted)
@@ -12111,7 +12119,15 @@ where
                 Ok(()) => Ok(()),
                 Err(FollowUpApprovalError::BeforeGit(error)) => {
                     self.restore_retryable_task_approval(
-                        task_file, title, priority, plan, reviewed_proposal_backup, &error, admitted,
+                        TaskApprovalInput {
+                            task_file,
+                            title,
+                            priority,
+                            plan,
+                            reviewed_proposal: reviewed_proposal_backup,
+                        },
+                        &error,
+                        admitted,
                     )?;
                     Err(error)
                 }
@@ -12509,6 +12525,14 @@ where
             successor_conv_id: response.successor_conv_id,
         }))
     }
+}
+
+struct TaskApprovalInput {
+    task_file: String,
+    title: String,
+    priority: crate::task_source::Priority,
+    plan: String,
+    reviewed_proposal: Option<phoenix_core::domain::task_approval::ReviewedProposal>,
 }
 
 /// Result of a successful task approval
@@ -20459,11 +20483,13 @@ mod approved_explore_follow_up_tests {
         );
         runtime
             .execute_approve_task(
-                task_file.to_string(),
-                "Detached checkpoint".to_string(),
-                crate::task_source::Priority::P1,
-                plan.to_string(),
-                None,
+                TaskApprovalInput {
+                    task_file: task_file.to_string(),
+                    title: "Detached checkpoint".to_string(),
+                    priority: crate::task_source::Priority::P1,
+                    plan: plan.to_string(),
+                    reviewed_proposal: None,
+                },
                 execution,
                 &mut admitted,
             )
@@ -20531,11 +20557,13 @@ mod approved_explore_follow_up_tests {
         );
         runtime
             .execute_approve_task(
-                task_file.to_string(),
-                "Follow up".to_string(),
-                crate::task_source::Priority::P1,
-                plan.to_string(),
-                None,
+                TaskApprovalInput {
+                    task_file: task_file.to_string(),
+                    title: "Follow up".to_string(),
+                    priority: crate::task_source::Priority::P1,
+                    plan: plan.to_string(),
+                    reviewed_proposal: None,
+                },
                 TaskApprovalExecution::Initial,
                 &mut admitted,
             )
@@ -20591,11 +20619,13 @@ mod approved_explore_follow_up_tests {
 
         let error = runtime
             .execute_approve_task(
-                task_file.to_string(),
-                "Follow up".to_string(),
-                crate::task_source::Priority::P1,
-                reviewed_plan.to_string(),
-                Some(reviewed.clone()),
+                TaskApprovalInput {
+                    task_file: task_file.to_string(),
+                    title: "Follow up".to_string(),
+                    priority: crate::task_source::Priority::P1,
+                    plan: reviewed_plan.to_string(),
+                    reviewed_proposal: Some(reviewed.clone()),
+                },
                 TaskApprovalExecution::FollowUp,
                 &mut admitted,
             )
@@ -20603,10 +20633,16 @@ mod approved_explore_follow_up_tests {
             .expect_err("edited task must fail approval");
 
         assert!(error.contains("no longer matches the approved plan"));
-        assert!(matches!(
+        assert_eq!(
             runtime.state,
-            ConvState::AwaitingTaskApproval { reviewed_proposal: Some(ref saved), .. } if saved == &reviewed
-        ));
+            ConvState::AwaitingTaskApproval {
+                task_file: task_file.to_string(),
+                title: "Follow up".to_string(),
+                priority: crate::task_source::Priority::P1,
+                plan: reviewed_plan.to_string(),
+                reviewed_proposal: Some(reviewed),
+            }
+        );
     }
 
     #[tokio::test]
@@ -20637,11 +20673,13 @@ mod approved_explore_follow_up_tests {
 
         let error = runtime
             .execute_approve_task(
-                task_file.to_string(),
-                "Follow up".to_string(),
-                crate::task_source::Priority::P1,
-                plan.to_string(),
-                None,
+                TaskApprovalInput {
+                    task_file: task_file.to_string(),
+                    title: "Follow up".to_string(),
+                    priority: crate::task_source::Priority::P1,
+                    plan: plan.to_string(),
+                    reviewed_proposal: None,
+                },
                 TaskApprovalExecution::FollowUp,
                 &mut admitted,
             )
@@ -20664,11 +20702,13 @@ mod approved_explore_follow_up_tests {
         );
         recovered
             .execute_approve_task(
-                task_file.to_string(),
-                "Follow up".to_string(),
-                crate::task_source::Priority::P1,
-                plan.to_string(),
-                None,
+                TaskApprovalInput {
+                    task_file: task_file.to_string(),
+                    title: "Follow up".to_string(),
+                    priority: crate::task_source::Priority::P1,
+                    plan: plan.to_string(),
+                    reviewed_proposal: None,
+                },
                 TaskApprovalExecution::FollowUp,
                 &mut admitted,
             )
@@ -20711,11 +20751,13 @@ mod approved_explore_follow_up_tests {
 
         let error = runtime
             .execute_approve_task(
-                task_file.to_string(),
-                "Follow up".to_string(),
-                crate::task_source::Priority::P1,
-                plan.to_string(),
-                None,
+                TaskApprovalInput {
+                    task_file: task_file.to_string(),
+                    title: "Follow up".to_string(),
+                    priority: crate::task_source::Priority::P1,
+                    plan: plan.to_string(),
+                    reviewed_proposal: None,
+                },
                 TaskApprovalExecution::FollowUp,
                 &mut admitted,
             )
@@ -20764,11 +20806,13 @@ mod approved_explore_follow_up_tests {
 
         runtime
             .execute_approve_task(
-                task_file.to_string(),
-                "Follow up".to_string(),
-                crate::task_source::Priority::P1,
-                plan.to_string(),
-                None,
+                TaskApprovalInput {
+                    task_file: task_file.to_string(),
+                    title: "Follow up".to_string(),
+                    priority: crate::task_source::Priority::P1,
+                    plan: plan.to_string(),
+                    reviewed_proposal: None,
+                },
                 TaskApprovalExecution::FollowUp,
                 &mut admitted,
             )
