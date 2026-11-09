@@ -4032,14 +4032,8 @@ pub(crate) async fn remote_native_rename_options(
     Ok(response)
 }
 
-fn native_verify_status(
-    request: &NativeCreateStatusRequest,
-    response: &NativeCreateStatusResponse,
-) -> Result<(), FederationClientError> {
-    use phoenix_db::ProductCreationProvisioningStage as Stage;
-    use NativeCreationState as S;
-
-    let (caller, destination, witness) = match response {
+fn native_status_echo(response: &NativeCreateStatusResponse) -> (InstanceId, InstanceId, &str) {
+    match response {
         NativeCreateStatusResponse::Unknown {
             caller_instance_id,
             destination_instance_id,
@@ -4051,7 +4045,17 @@ fn native_verify_status(
             request_id,
             ..
         } => (*caller_instance_id, *destination_instance_id, request_id),
-    };
+    }
+}
+
+fn native_verify_status(
+    request: &NativeCreateStatusRequest,
+    response: &NativeCreateStatusResponse,
+) -> Result<(), FederationClientError> {
+    use phoenix_db::ProductCreationProvisioningStage as Stage;
+    use NativeCreationState as S;
+
+    let (caller, destination, witness) = native_status_echo(response);
     native_echo_matches(
         request.caller_instance_id,
         request.destination_instance_id,

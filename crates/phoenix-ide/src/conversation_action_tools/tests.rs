@@ -829,7 +829,7 @@ fn remote_create_status_adapter_preserves_tool_shape_and_identity() {
         Publication::Historical {
             conversation_id: "past".into(),
         },
-        Execution::Unavailable,
+        Execution::Unavailable {},
         federation::NativeCreationState::Published,
     );
     assert_eq!(
@@ -842,8 +842,8 @@ fn remote_create_status_adapter_preserves_tool_shape_and_identity() {
     );
     assert_eq!(historical["status"], "published");
     let none = known(
-        Publication::None,
-        Execution::Queued,
+        Publication::None {},
+        Execution::Queued {},
         federation::NativeCreationState::Accepted,
     );
     assert!(none["publication"].is_null());
@@ -889,19 +889,19 @@ fn remote_create_status_adapter_covers_all_initial_execution_and_creation_states
         ),
     ];
     let executions = [
-        (Execution::Queued, "queued"),
-        (Execution::Running, "running"),
-        (Execution::Completed, "completed"),
+        (Execution::Queued {}, "queued"),
+        (Execution::Running {}, "running"),
+        (Execution::Completed {}, "completed"),
         (
             Execution::Failed {
                 reason: "failure".into(),
             },
             "failed",
         ),
-        (Execution::Cancelled, "cancelled"),
-        (Execution::AwaitingUserResponse, "awaiting_user_response"),
-        (Execution::AwaitingTaskApproval, "awaiting_task_approval"),
-        (Execution::Unavailable, "unavailable"),
+        (Execution::Cancelled {}, "cancelled"),
+        (Execution::AwaitingUserResponse {}, "awaiting_user_response"),
+        (Execution::AwaitingTaskApproval {}, "awaiting_task_approval"),
+        (Execution::Unavailable {}, "unavailable"),
     ];
     for (state, status) in states {
         for (execution, kind) in &executions {
@@ -917,7 +917,7 @@ fn remote_create_status_adapter_covers_all_initial_execution_and_creation_states
                     provisioning_stage_updated_at_unix_micros: 0,
                     retry_at_unix_micros: None,
                     error: None,
-                    publication: Publication::None,
+                    publication: Publication::None {},
                     initial_execution: execution.clone(),
                 })
                 .unwrap();
