@@ -96,6 +96,45 @@ pub async fn deployment_observations(
     })
 }
 
+pub(crate) async fn recorder_space(
+    environment: &phoenix_core::runtime_env::PhoenixRuntimeEnvironment,
+) -> [Option<u64>; 3] {
+    let targets = vec![
+        ("database".into(), environment.db_path().clone()),
+        ("data".into(), environment.data_dir().to_path_buf()),
+        ("temporary".into(), environment.tmp_root().to_path_buf()),
+    ];
+    tokio::task::spawn_blocking(move || {
+        let (groups, failures) = sample_space(targets, resolve_filesystem, available_space);
+        if !failures.is_empty() {
+            tracing::debug!(
+                code = "recorder_disk_space",
+                failed_roles = failures.len(),
+                "disk-role bytes unavailable"
+            );
+        }
+        recorder_roles(&groups)
+    })
+    .await
+    .unwrap_or([None; 3])
+}
+
+fn recorder_roles(groups: &[FilesystemSpaceObservation]) -> [Option<u64>; 3] {
+    let mut roles = [None; 3];
+    for group in groups {
+        for location in &group.locations {
+            let index = match location.label.as_str() {
+                "database" => 0,
+                "data" => 1,
+                "temporary" => 2,
+                _ => continue,
+            };
+            roles[index] = Some(group.available_bytes);
+        }
+    }
+    roles
+}
+
 fn targets(config: &DeploymentConfig, temporary_root: &Path) -> Vec<(String, PathBuf)> {
     let mut targets: Vec<_> = config
         .locations
@@ -205,6 +244,35 @@ fn sample_space(
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn recorder_projection_strips_paths_and_filesystem_ids_and_preserves_failed_roles_as_null() {
+        let (groups, failures) = sample_space(
+            vec![
+                ("database".into(), PathBuf::from("/private/SECRET/database")),
+                ("data".into(), PathBuf::from("/private/SECRET/data")),
+                (
+                    "temporary".into(),
+                    PathBuf::from("/private/SECRET/temporary"),
+                ),
+            ],
+            |path| {
+                if path.ends_with("temporary") {
+                    Err(io::Error::new(io::ErrorKind::PermissionDenied, "SECRET"))
+                } else {
+                    Ok((123_456_789, PathBuf::from("/private/SECRET")))
+                }
+            },
+            |_| Ok(42),
+        );
+        assert_eq!(failures.len(), 1);
+        let roles = recorder_roles(&groups);
+        assert_eq!(roles, [Some(42), Some(42), None]);
+        let encoded = serde_json::to_string(&roles).unwrap();
+        assert_eq!(encoded, "[42,42,null]");
+        assert!(!encoded.contains("SECRET"));
+        assert!(!encoded.contains("123456789"));
+    }
 
     #[test]
     fn space_sampling_deduplicates_filesystems_and_preserves_locations_and_errors() {

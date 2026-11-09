@@ -2534,6 +2534,13 @@ pub(crate) fn cleanup_branch_for_unretained_work_scope<'a>(
 }
 
 impl RuntimeManager {
+    pub(crate) fn live_materialized_handle_count(&self) -> Option<u64> {
+        self.runtimes
+            .try_read()
+            .ok()
+            .and_then(|runtimes| u64::try_from(runtimes.len()).ok())
+    }
+
     pub fn new(
         db: Database,
         llm_registry: Arc<ModelRegistry>,
@@ -9319,6 +9326,16 @@ mod scope_liveness_tests {
             Arc::new(McpClientManager::new()),
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn live_materialized_handle_count_is_unavailable_under_contention() {
+        let manager = test_manager().await;
+        assert_eq!(manager.live_materialized_handle_count(), Some(0));
+        let lock = manager.runtimes.write().await;
+        assert_eq!(manager.live_materialized_handle_count(), None);
+        drop(lock);
+        assert_eq!(manager.live_materialized_handle_count(), Some(0));
     }
 
     #[tokio::test]
