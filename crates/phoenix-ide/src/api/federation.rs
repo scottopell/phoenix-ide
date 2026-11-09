@@ -2742,9 +2742,21 @@ pub(crate) struct NativeCreateModelOption {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(untagged)]
 enum NativeDefaultWire {
-    Known(phoenix_core::domain::llm_types::ModelEffort),
+    Known(NativeDefaultKnownWire),
+    Unknown(NativeDefaultUnknownWire),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeDefaultKnownWire {
+    known: phoenix_core::domain::llm_types::ModelEffort,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NativeDefaultUnknownWire {
     Unknown,
 }
 
@@ -2787,13 +2799,19 @@ where
                 ));
             }
             let native_default = match native_default {
-                NativeDefaultWire::Known(level) if !levels.contains(&level) => {
+                NativeDefaultWire::Known(NativeDefaultKnownWire { known })
+                    if !levels.contains(&known) =>
+                {
                     return Err(serde::de::Error::custom(
                         "native effort default must be a supported level",
                     ));
                 }
-                NativeDefaultWire::Known(level) => phoenix_llm::NativeDefault::Known(level),
-                NativeDefaultWire::Unknown => phoenix_llm::NativeDefault::Unknown,
+                NativeDefaultWire::Known(NativeDefaultKnownWire { known }) => {
+                    phoenix_llm::NativeDefault::Known(known)
+                }
+                NativeDefaultWire::Unknown(NativeDefaultUnknownWire::Unknown) => {
+                    phoenix_llm::NativeDefault::Unknown
+                }
             };
             Ok(phoenix_llm::EffortCapabilities::supported(
                 &levels,

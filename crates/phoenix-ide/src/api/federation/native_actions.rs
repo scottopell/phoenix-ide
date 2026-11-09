@@ -209,6 +209,11 @@ fn create_model_options_reject_malformed_effort_capabilities() {
         serde_json::json!({
             "support": "supported",
             "levels": ["low"],
+            "native_default": {"known": "low", "extra": true},
+        }),
+        serde_json::json!({
+            "support": "supported",
+            "levels": ["low"],
             "native_default": {"known": "medium"},
         }),
         serde_json::json!({
