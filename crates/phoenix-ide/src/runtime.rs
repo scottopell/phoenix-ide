@@ -769,6 +769,8 @@ pub struct RuntimeManager {
     #[cfg(test)]
     native_pre_git_gates: std::sync::Mutex<HashMap<String, Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
+    native_projection_gates: std::sync::Mutex<HashMap<String, NativeTaskApprovalProjectionGate>>,
+    #[cfg(test)]
     runtime_materialization_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     subagent_cancel_dispatch_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
@@ -941,6 +943,14 @@ impl ExecutionOccurrenceRecovery {
 
 type StartupLlmRecoveryReceipt = oneshot::Receiver<Result<(), String>>;
 type SharedStartupLlmRecoveryReceipt = Arc<AsyncMutex<Option<StartupLlmRecoveryReceipt>>>;
+
+/// One-shot test scheduling boundary after classified native settlement, before
+/// live projection. It does not replace the actual projection operation/result.
+#[cfg(test)]
+pub(crate) struct NativeTaskApprovalProjectionGate {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
 
 /// Handle to interact with a running conversation
 #[derive(Clone)]
@@ -2688,6 +2698,8 @@ impl RuntimeManager {
             runtime_materialization_panics: AsyncMutex::new(HashSet::new()),
             #[cfg(test)]
             native_pre_git_gates: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            native_projection_gates: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             runtime_materialization_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
@@ -6618,6 +6630,14 @@ impl RuntimeManager {
                 .remove(conversation_id),
         );
 
+        #[cfg(test)]
+        let runtime = runtime.with_native_projection_gate_for_test(
+            self.native_projection_gates
+                .lock()
+                .unwrap()
+                .remove(conversation_id),
+        );
+
         let runtime = runtime
             .with_model_route_switch(model_upgrade.unwrap_or(false))
             .with_exhausted_maintenance(exhausted_maintenance)
@@ -8051,6 +8071,23 @@ impl RuntimeManager {
         assert!(
             previous.is_none(),
             "native pre-Git test gate already installed"
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_native_projection_gate_for_test(
+        &self,
+        conversation_id: &str,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let previous = self.native_projection_gates.lock().unwrap().insert(
+            conversation_id.to_owned(),
+            NativeTaskApprovalProjectionGate { entered, release },
+        );
+        assert!(
+            previous.is_none(),
+            "native projection test gate already installed"
         );
     }
 

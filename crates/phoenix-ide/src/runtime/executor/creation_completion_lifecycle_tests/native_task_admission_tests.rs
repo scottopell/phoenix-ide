@@ -637,6 +637,8 @@ enum InitialApprovalScenario {
     FollowUpCompensatedFailure,
     InitialReceiptFailure,
     FollowUpReceiptFailure,
+    InitialProjectionFailure,
+    FollowUpProjectionFailure,
 }
 
 struct InitialApprovalHarness {
@@ -647,6 +649,7 @@ struct InitialApprovalHarness {
         tokio::task::JoinHandle<crate::runtime::task_approval_admission::NativeTaskApprovalOutcome>,
     >,
     release: Option<NativeApprovalReleaseOnDrop>,
+    projection_release: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl InitialApprovalHarness {
@@ -657,10 +660,14 @@ impl InitialApprovalHarness {
             handle: None,
             caller: None,
             release: None,
+            projection_release: None,
         }
     }
 
     fn release_gate(&mut self) {
+        if let Some(release) = self.projection_release.take() {
+            let _ = release.send(());
+        }
         if let Some(release) = &mut self.release {
             release.release();
         }
@@ -734,6 +741,24 @@ async fn production_initial_receipt_failure_after_git_rolls_back_and_fences() {
 async fn production_follow_up_receipt_failure_after_git_rolls_back_and_fences() {
     Box::pin(assert_production_initial_approval(
         InitialApprovalScenario::FollowUpReceiptFailure,
+        ReviewedTaskKind::Taskmd,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn production_initial_postcommit_projection_failure_retains_receipt_and_fences() {
+    Box::pin(assert_production_initial_approval(
+        InitialApprovalScenario::InitialProjectionFailure,
+        ReviewedTaskKind::PlainMarkdown,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn production_follow_up_postcommit_projection_failure_retains_receipt_and_fences() {
+    Box::pin(assert_production_initial_approval(
+        InitialApprovalScenario::FollowUpProjectionFailure,
         ReviewedTaskKind::Taskmd,
     ))
     .await;
@@ -835,6 +860,7 @@ async fn assert_production_initial_approval_inner(
         InitialApprovalScenario::FollowUpProviderSuccess
             | InitialApprovalScenario::FollowUpCompensatedFailure
             | InitialApprovalScenario::FollowUpReceiptFailure
+            | InitialApprovalScenario::FollowUpProjectionFailure
     ) {
         std::fs::write(worktree.join("unrelated-staged.txt"), "keep staged").unwrap();
         git(&worktree, &["add", "--", "unrelated-staged.txt"]);
@@ -861,6 +887,7 @@ async fn assert_production_initial_approval_inner(
         InitialApprovalScenario::FollowUpProviderSuccess
             | InitialApprovalScenario::FollowUpCompensatedFailure
             | InitialApprovalScenario::FollowUpReceiptFailure
+            | InitialApprovalScenario::FollowUpProjectionFailure
     ) {
         let old = phoenix_core::task_handoff::TaskApprovalHandoffData {
             task_id: "old-task-id".into(),
@@ -935,7 +962,9 @@ async fn assert_production_initial_approval_inner(
         | InitialApprovalScenario::FollowUpProviderSuccess
         | InitialApprovalScenario::FollowUpCompensatedFailure
         | InitialApprovalScenario::InitialReceiptFailure
-        | InitialApprovalScenario::FollowUpReceiptFailure => {
+        | InitialApprovalScenario::FollowUpReceiptFailure
+        | InitialApprovalScenario::InitialProjectionFailure
+        | InitialApprovalScenario::FollowUpProjectionFailure => {
             phoenix_llm::ModelRegistry::for_test_with_sonnet(llm.clone())
         }
     };
@@ -949,6 +978,148 @@ async fn assert_production_initial_approval_inner(
         None,
     ));
     harness.manager = Some(Arc::clone(&manager));
+    if matches!(
+        scenario,
+        InitialApprovalScenario::InitialProjectionFailure
+            | InitialApprovalScenario::FollowUpProjectionFailure
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        manager.set_native_projection_gate_for_test("actor-target", entered_tx, release_rx);
+        harness.projection_release = Some(release_tx);
+        let handle = manager.get_or_create(&f.target).await.unwrap();
+        harness.handle = Some(handle.clone());
+        let live_before = handle.state_rx.borrow().clone();
+        assert!(matches!(
+            live_before,
+            ConvState::AwaitingTaskApproval { .. }
+        ));
+        let broadcaster = manager.conversation_broadcaster("actor-target").await;
+        let mut events = broadcaster.subscribe();
+        let caller_manager = Arc::clone(&manager);
+        let caller_command = command.clone();
+        harness.caller = Some(tokio::spawn(async move {
+            Box::pin(caller_manager.execute_native_task_approval(caller_command)).await
+        }));
+        entered_rx
+            .await
+            .expect("classified receipt gate must enter");
+
+        // Real DatabaseStorage settlement has committed, but the actual live
+        // install has not run. The gate neither simulates nor replaces its error.
+        let NativeTaskApprovalInspection::Replay(receipt) =
+            f.db.inspect_native_task_approval_command(&command)
+                .await
+                .unwrap()
+        else {
+            panic!("receipt must be durable at the postclassification gate");
+        };
+        assert_eq!(receipt.source, command.source);
+        assert_eq!(receipt.owner, inspected_owner);
+        assert_eq!(receipt.target_transcript_id, f.target);
+        assert_eq!(receipt.continuation, NativeApprovalContinuation::Requested);
+        let committed = native_rollback_snapshot(&f.db, "actor-target").await;
+        assert_eq!(&committed.rows[3..], &[1, 1, 1]);
+        assert_eq!(committed.state, ConvState::LlmRequesting { attempt: 1 });
+        let approved = committed.objective.as_ref().expect("committed objective");
+        assert_eq!(approved.plan, BODY);
+        assert_eq!(approved.artifact_body, BODY);
+        let approved_path = if old_approved.is_some() {
+            committed_task_file
+        } else {
+            task_file
+        };
+        assert_eq!(approved.task_file, approved_path);
+        assert_eq!(committed.authority.len(), 1);
+        if old_approved.is_some() {
+            assert_eq!(native_authority_binding(&f.db).await, before_binding);
+        }
+        let owed_message: String = sqlx::query_scalar(
+            "SELECT approval_message_id FROM approval_request_obligations WHERE conversation_id = ?1",
+        )
+        .bind("actor-target")
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(owed_message, receipt.approval_message_id);
+        let approval_message =
+            f.db.get_messages("actor-target")
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|message| message.message_id == receipt.approval_message_id)
+                .expect("committed approval context message");
+        let MessageContent::User(content) = &approval_message.content else {
+            panic!("approval context is a user meta message");
+        };
+        assert!(content.text.contains(BODY));
+        let committed_head = git(&worktree, &["rev-parse", "HEAD"]);
+        assert_ne!(committed_head.trim(), before_head);
+        assert_eq!(
+            git(&worktree, &["show", &format!("HEAD:{approved_path}")]),
+            BODY
+        );
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(*handle.state_rx.borrow(), live_before);
+
+        // Close the real authority fence; release into install_live_state's
+        // real owner acquisition. It must reject, not publish or dispatch.
+        manager.signal_fatal_local_authority("native_projection_fixture");
+        harness.release_gate();
+        let result = harness.caller.take().unwrap().await.unwrap();
+        assert_eq!(
+            result,
+            NativeTaskApprovalOutcome::Committed(receipt.clone())
+        );
+        handle.event_tx.closed().await;
+        // These observations precede fixture cleanup's shutdown/drain.
+        assert!(manager.local_authority_is_closed());
+        assert_eq!(*handle.state_rx.borrow(), live_before);
+        assert_eq!(
+            native_rollback_snapshot(&f.db, "actor-target").await,
+            committed
+        );
+        assert_eq!(
+            f.db.inspect_native_task_approval_command(&command)
+                .await
+                .unwrap(),
+            NativeTaskApprovalInspection::Replay(receipt.clone())
+        );
+        let still_owed: String = sqlx::query_scalar(
+            "SELECT approval_message_id FROM approval_request_obligations WHERE conversation_id = ?1",
+        )
+        .bind("actor-target")
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(still_owed, owed_message);
+        assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), committed_head);
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 0);
+        assert!(requests.try_recv().is_err());
+        loop {
+            match events.try_recv() {
+                Ok(SseEvent::StateChange {
+                    state: ConvState::LlmRequesting { .. },
+                    ..
+                }) => {
+                    panic!("failed live projection must not publish approval state");
+                }
+                Ok(SseEvent::ConversationUpdate { .. }) => {
+                    panic!("failed live projection must not publish approval metadata");
+                }
+                Ok(SseEvent::Message { message, .. }) => {
+                    assert_ne!(message.message_id, receipt.approval_message_id);
+                }
+                Ok(_) => {}
+                Err(
+                    tokio::sync::broadcast::error::TryRecvError::Empty
+                    | tokio::sync::broadcast::error::TryRecvError::Closed,
+                ) => break,
+                Err(error) => panic!("must not lose projection evidence: {error}"),
+            }
+        }
+        return;
+    }
     let (handle, mut events, mut provider_request, result) = if scenario
         == InitialApprovalScenario::DroppedCallerProviderSuccess
     {

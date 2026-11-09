@@ -2190,6 +2190,8 @@ where
         tokio::sync::oneshot::Sender<()>,
         tokio::sync::oneshot::Receiver<()>,
     )>,
+    #[cfg(test)]
+    native_projection_gate: std::sync::Mutex<Option<super::NativeTaskApprovalProjectionGate>>,
     handoff_review_rx: Option<mpsc::Receiver<super::HandoffReviewRequest>>,
     exhausted_maintenance: bool,
     broadcast_tx: SseBroadcaster,
@@ -2519,6 +2521,8 @@ where
             native_pre_git_gate: std::sync::Mutex::new(None),
             #[cfg(test)]
             native_post_git_gate: None,
+            #[cfg(test)]
+            native_projection_gate: std::sync::Mutex::new(None),
             handoff_review_rx: None,
             exhausted_maintenance: false,
             tool_execution: ToolExecutionSlot::default(),
@@ -2769,6 +2773,15 @@ where
 
     pub(crate) fn with_native_task_admission_database(mut self, db: crate::db::Database) -> Self {
         self.native_task_admission_db = Some(db);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_native_projection_gate_for_test(
+        mut self,
+        gate: Option<super::NativeTaskApprovalProjectionGate>,
+    ) -> Self {
+        *self.native_projection_gate.get_mut().unwrap() = gate;
         self
     }
 

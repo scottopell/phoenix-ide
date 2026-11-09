@@ -237,6 +237,16 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                 {
                     LocalAuthorityResult::DurableFactEstablished(stored) => {
                         *receipt = Some(Box::new(stored));
+                        #[cfg(test)]
+                        {
+                            // Hold only after classifying/storing the real receipt.
+                            // Releasing continues into the actual install_live_state.
+                            let gate = self.native_projection_gate.lock().unwrap().take();
+                            if let Some(gate) = gate {
+                                let _ = gate.entered.send(());
+                                let _ = gate.release.await;
+                            }
+                        }
                         Ok(LocalAuthorityResult::DurableFactEstablished(()))
                     }
                     LocalAuthorityResult::DurableFactUnclassified => {
