@@ -1952,6 +1952,19 @@ pub struct CachedPrSummary {
 /// the extra display fields.
 pub(crate) fn public_conversation_state(state: &ConvState) -> serde_json::Value {
     match state {
+        ConvState::AwaitingTaskApproval {
+            task_file,
+            title,
+            priority,
+            plan,
+            ..
+        } => serde_json::json!({
+            "type": "awaiting_task_approval",
+            "task_file": task_file,
+            "title": title,
+            "priority": priority,
+            "plan": plan,
+        }),
         ConvState::ServerOverloadRetrying { retry } => serde_json::json!({
             "type": "server_overload_retrying",
             "attempt": retry.attempt,

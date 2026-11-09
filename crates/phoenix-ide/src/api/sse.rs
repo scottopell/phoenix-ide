@@ -883,6 +883,58 @@ mod tests {
     }
 
     #[test]
+    fn pending_task_approval_rest_and_sse_hide_reviewed_proposal() {
+        use phoenix_core::{
+            domain::task_approval::{ProposalOccurrence, ReviewedProposal},
+            task_source::{Priority, TaskSource},
+        };
+
+        let source = TaskSource::detect("plan.md").unwrap();
+        let reviewed = ReviewedProposal::capture(
+            ProposalOccurrence::capture("assistant-1", "tool-1").unwrap(),
+            &source,
+            "# Plan\n",
+        );
+        for metadata in [Some(reviewed), None] {
+            let state = ConvState::AwaitingTaskApproval {
+                task_file: "tasks/plan.md".into(),
+                title: "Plan".into(),
+                priority: Priority::P2,
+                plan: "# Plan\n".into(),
+                reviewed_proposal: metadata,
+            };
+            let expected = serde_json::json!({
+                "type": "awaiting_task_approval",
+                "task_file": "tasks/plan.md",
+                "title": "Plan",
+                "priority": "p2",
+                "plan": "# Plan\n",
+            });
+            assert!(serde_json::to_value(&state)
+                .unwrap()
+                .get("reviewed_proposal")
+                .is_some());
+            assert_eq!(crate::runtime::public_conversation_state(&state), expected);
+
+            let mut conversation = fixture_conversation();
+            conversation.state = state.clone();
+            let rest = serde_json::to_value(crate::runtime::PresentationConversation(conversation))
+                .unwrap();
+            assert_eq!(rest["state"], expected);
+
+            let event = SseEvent::StateChange {
+                sequence_id: 1,
+                state,
+                presentation_mode: "idle".into(),
+                state_updated_at: ts(),
+            };
+            let wire = typed_sse_event_to_value(&event);
+            assert_eq!(wire["state"], expected);
+            assert!(wire["state"].get("reviewed_proposal").is_none());
+        }
+    }
+
+    #[test]
     fn parity_init() {
         let event = SseEvent::Init {
             opening: Some(crate::api::types::ContinuationOpeningView::None),

@@ -128,6 +128,58 @@ async fn foreign_tool_use_cannot_bind_proposal_checkpoint() {
 }
 
 #[tokio::test]
+async fn proposal_rejects_different_or_malformed_tool_input_on_both_write_routes() {
+    for provider in [false, true] {
+        for input in [
+            serde_json::json!({"task_file": "tasks/other.md"}),
+            serde_json::json!({"task_file": 42}),
+        ] {
+            let (db, _owner, mut round) = report_fixture().await;
+            proposal_round(&mut round);
+            round.assistant.content = MessageContent::Agent(vec![ContentBlock::ToolUse {
+                id: "checkpoint-call".into(),
+                name: "propose_task".into(),
+                input,
+            }]);
+            let original = saved_proposal(&db, &round.assistant).await;
+            let result = finalized_result(&round.assistant, &ordinary_result());
+            let error = if provider {
+                db.persist_tool_round_state_and_replay(
+                    &round.assistant.conversation_id,
+                    &round.assistant,
+                    &[result],
+                    &round.state,
+                    round.timestamp,
+                    &round.replay(),
+                )
+                .await
+                .unwrap_err()
+            } else {
+                db.persist_tool_round_and_state(
+                    &round.assistant.conversation_id,
+                    &round.assistant,
+                    &[result],
+                    &round.state,
+                    round.timestamp,
+                )
+                .await
+                .unwrap_err()
+            };
+            assert!(error.to_string().contains("proposal source"));
+            assert_eq!(saved_proposal(&db, &round.assistant).await, original);
+            let message_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE message_id = ?1")
+                    .bind(&round.assistant.message_id)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(message_count, 0);
+            assert_eq!(receipt_count(&db).await, 0);
+        }
+    }
+}
+
+#[tokio::test]
 async fn proposal_checkpoint_rolls_back_at_canonical_cut() {
     let (db, _owner, mut round) = report_fixture().await;
     proposal_round(&mut round);

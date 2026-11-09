@@ -22,7 +22,7 @@ fn validate_task_proposal(
     use phoenix_core::domain::{
         db_schema::MessageContent,
         llm_types::ContentBlock,
-        sm_state::ConvState,
+        sm_state::{ConvState, ProposeTaskInput},
         task_approval::ReviewedProposal,
     };
     let ConvState::AwaitingTaskApproval {
@@ -34,11 +34,27 @@ fn validate_task_proposal(
         return Ok(());
     };
     let occurrence = &reviewed.occurrence;
+    let matching_call = match &assistant.content {
+        MessageContent::Agent(blocks) => {
+            let mut calls = blocks.iter().filter_map(|block| match block {
+                ContentBlock::ToolUse { id, name, input }
+                    if id == &occurrence.tool_use_id && name == "propose_task" =>
+                {
+                    Some(input)
+                }
+                _ => None,
+            });
+            match (calls.next(), calls.next()) {
+                (Some(input), None) => serde_json::from_value::<ProposeTaskInput>(input.clone())
+                    .is_ok_and(|call| call.task_file.replace('\\', "/") == task_file.as_str()),
+                _ => false,
+            }
+        }
+        _ => false,
+    };
     let valid_source = assistant.conversation_id == conversation_id
         && assistant.message_id == occurrence.assistant_message_id
-        && matches!(&assistant.content, MessageContent::Agent(blocks) if blocks.iter().filter(|block| matches!(block,
-            ContentBlock::ToolUse { id, name, .. } if id == &occurrence.tool_use_id && name == "propose_task"
-        )).count() == 1);
+        && matching_call;
     let source = std::path::Path::new(task_file)
         .file_name()
         .and_then(|name| name.to_str())

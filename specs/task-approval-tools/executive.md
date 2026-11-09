@@ -2,7 +2,7 @@
 
 ## Status and authority
 
-**Bounded Part A underway; NOT verified.** Owner authorized canonical proposal capture using the existing conversation/assistant canonical receipt as the ownership witness. The code captures typed provenance in the pending aggregate and preserves it on approval retry, but no native approval tool is enabled or registered. Focused tests are written but NOT RUN locally; hosted CI is pending. Source-live proof, native approval, Close, and runtime verification remain NOT DONE. No schema, migration, generated type or wire change is delivered.
+**Bounded Part A underway; NOT verified.** Owner authorized canonical proposal capture using the existing conversation/assistant canonical receipt as the ownership witness. The code captures typed provenance in the pending aggregate and preserves it on approval retry, but no native approval tool is enabled or registered. Focused tests are written but NOT RUN locally; hosted CI on PR #1058 (run 42562161086) reported two `must_use_candidate` clippy errors, addressed in the follow-up commit but not yet verified. Review also found a pending-state metadata leak in HTTP/SSE projection and insufficient task-file input validation at canonical checkpoint; both have focused regression assertions written, NOT RUN. Source-live proof, native approval, Close, and runtime verification remain NOT DONE. No schema, migration, generated type or wire change is delivered.
 
 The native Stop/pause policy is resolved: the Coordinator, acting within saved standing authority / the commissioned Goal, selected refusal of new approval effects while the explicit target conversation latch is set, conveyed through owner `a52`'s question response. This is not new human approval or authority to resume. Existing human resume is required; a suspended saved Goal alone does not block approval. Inspection remains read-only and may expose stopped pending proposals with ineligibility and consequences. Exact historical receipt replay after current-source admission returns `Committed` without redispatch even after target Stop.
 
@@ -28,7 +28,7 @@ No REQ-BED-028/REQ-PROJ-003 amendment is required by this minimized aggregate mo
 
 ## Coverage and proposed verification
 
-Part A (canonical pending-state capture) is in progress. Focused tests are written but have NOT RUN locally; hosted CI is required. Parts B (source-live proof), C (native approval), and Close remain deferred.
+Part A (canonical pending-state capture) is in progress. Focused tests for the public HTTP/SSE projection and both checkpoint routes are written but have NOT RUN locally; hosted CI must verify the review fixes and clippy. Parts B (source-live proof), C (native approval), and Close remain deferred.
 
 | Requirement | Implementation | Tests | Runtime | Focused verification to add |
 |---|---|---|---|---|
@@ -44,6 +44,6 @@ Part A (canonical pending-state capture) is in progress. Focused tests are writt
 ## Review gates and exclusions
 
 1. Owner authorized bounded Part A; proposed ADR-244 reflects the existing canonical receipt as its ownership witness.
-2. Complete hosted CI verification of Part A, then separately prove source-live identity before enabling any native mutator. Remaining requirements are not implemented.
+2. Hosted CI run 42562161086 failed clippy on two missing `#[must_use]` attributes; the attributes and review fixes are awaiting a new hosted run. Complete hosted CI verification of Part A, then separately prove source-live identity before enabling any native mutator. Remaining requirements are not implemented.
 
 No native execution, local build/tests/codegen, registration, RC2, release or production work is included in Part A. A draft PR triggers standard hosted CI; runtime behavior remains unverified pending those results. The README index labels ADR-244 Proposed; Stop/pause policy is resolved but its implementation is deferred.

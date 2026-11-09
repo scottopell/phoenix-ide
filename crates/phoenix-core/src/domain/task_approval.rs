@@ -16,6 +16,7 @@ pub struct ProposalOccurrence {
 impl ProposalOccurrence {
     /// Only the canonical transition should construct this; persisted legacy
     /// pending states have `None`, never reconstructed from transcript text.
+    #[must_use]
     pub fn capture(assistant_message_id: &str, tool_use_id: &str) -> Option<Self> {
         if assistant_message_id.trim().is_empty() || tool_use_id.trim().is_empty() {
             return None;
@@ -44,6 +45,7 @@ pub enum ReviewedTaskKind {
 }
 
 impl ReviewedProposal {
+    #[must_use]
     pub fn capture(occurrence: ProposalOccurrence, source: &TaskSource, body: &str) -> Self {
         let kind = match source {
             TaskSource::Taskmd { .. } => ReviewedTaskKind::Taskmd,
