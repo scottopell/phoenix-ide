@@ -680,7 +680,7 @@ fn remote_native_creation_status(
                 })
                 .transpose()?;
             let publication = match publication {
-                Publication::None => None,
+                Publication::None {} => None,
                 Publication::Available {
                     conversation_id,
                     canonical_route,
@@ -693,20 +693,22 @@ fn remote_native_creation_status(
                 }
             };
             let initial_objective_execution = match initial_execution {
-                Execution::Queued => phoenix_db::ProductCreationInitialExecution::Queued,
-                Execution::Running => phoenix_db::ProductCreationInitialExecution::Running,
-                Execution::Completed => phoenix_db::ProductCreationInitialExecution::Completed,
+                Execution::Queued {} => phoenix_db::ProductCreationInitialExecution::Queued,
+                Execution::Running {} => phoenix_db::ProductCreationInitialExecution::Running,
+                Execution::Completed {} => phoenix_db::ProductCreationInitialExecution::Completed,
                 Execution::Failed { reason } => {
                     phoenix_db::ProductCreationInitialExecution::Failed { reason }
                 }
-                Execution::Cancelled => phoenix_db::ProductCreationInitialExecution::Cancelled,
-                Execution::AwaitingUserResponse => {
+                Execution::Cancelled {} => phoenix_db::ProductCreationInitialExecution::Cancelled,
+                Execution::AwaitingUserResponse {} => {
                     phoenix_db::ProductCreationInitialExecution::AwaitingUserResponse
                 }
-                Execution::AwaitingTaskApproval => {
+                Execution::AwaitingTaskApproval {} => {
                     phoenix_db::ProductCreationInitialExecution::AwaitingTaskApproval
                 }
-                Execution::Unavailable => phoenix_db::ProductCreationInitialExecution::Unavailable,
+                Execution::Unavailable {} => {
+                    phoenix_db::ProductCreationInitialExecution::Unavailable
+                }
             };
             let status = match creation_status {
                 federation::NativeCreationState::Accepted => "accepted",
