@@ -33,6 +33,7 @@ impl Drop for ReleaseOnDrop {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CancellationStage {
     BeforeGit,
+    BeforeGitAfterRotation,
     AfterGit,
 }
 
@@ -73,6 +74,14 @@ async fn production_initial_source_cancel_at_pre_git_refuses_without_approval_ef
 async fn production_initial_source_cancel_after_git_fails_stop_before_sqlite() {
     Box::pin(run_initial_source_cancel_interleaving(
         CancellationStage::AfterGit,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn production_initial_source_cancel_and_lawful_rotation_at_pre_git_refuses() {
+    Box::pin(run_initial_source_cancel_interleaving(
+        CancellationStage::BeforeGitAfterRotation,
     ))
     .await;
 }
@@ -171,11 +180,17 @@ async fn run_initial_source_cancel_interleaving(stage: CancellationStage) {
         persisted_source.state,
         ConvState::ToolExecuting { .. }
     ));
+    let (summary_tx, mut summary_requests) = mpsc::unbounded_channel();
+    let summary_llm = Arc::new(NativeApprovalLlm {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        requests: summary_tx,
+    });
+    let source_models = Arc::new(ModelRegistry::for_test_with_sonnet(summary_llm.clone()));
     let mut source_runtime = native_runtime(
         ConvContext::coordinator(&source.id, "claude-sonnet-5", 200_000, 16_384),
         persisted_source.state,
         &f.db,
-        models,
+        source_models,
     );
     // No local tool was dispatched: AbortTool's empty execution slot is intentionally a no-op.
     assert_eq!(source_runtime.tool_execution.generation(), 0);
@@ -186,7 +201,7 @@ async fn run_initial_source_cancel_interleaving(stage: CancellationStage) {
 
     let (entered_tx, entered) = oneshot::channel();
     let release = match stage {
-        CancellationStage::BeforeGit => {
+        CancellationStage::BeforeGit | CancellationStage::BeforeGitAfterRotation => {
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             *target.native_pre_git_gate.lock().unwrap() = Some(Box::new(move || {
                 let _ = entered_tx.send(());
@@ -258,7 +273,19 @@ async fn run_initial_source_cancel_interleaving(stage: CancellationStage) {
                     .to_owned(),
             );
         }
-        Ok::<_, String>(post_git)
+        let successor = if stage == CancellationStage::BeforeGitAfterRotation {
+            Some(
+                Box::pin(rotate_cancelled_source(
+                    &mut source_runtime,
+                    &f.db,
+                    &command,
+                ))
+                .await?,
+            )
+        } else {
+            None
+        };
+        Ok::<_, String>((post_git, successor))
         // Dropping _release permits the unchanged real DB source/current-Coordinator proof.
     };
     let joined = tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -270,13 +297,22 @@ async fn run_initial_source_cancel_interleaving(stage: CancellationStage) {
         Err(error) => {
             // The timed-out schedule drops its release guard; retain and drain the real worker.
             let _ = approval.as_mut().await;
-            panic!("pre-Git cancellation schedule timed out after worker drain: {error}");
+            if let Some(task) = source_runtime.llm_task_handle.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            panic!("source cancellation schedule timed out after worker drain: {error}");
         }
     };
     drop(approval);
-    let post_git = cancellation.expect("real acknowledged source cancellation at Git boundary");
+    if let Some(task) = source_runtime.llm_task_handle.take() {
+        task.abort();
+        let _ = task.await;
+    }
+    let (post_git, successor) =
+        cancellation.expect("real acknowledged source cancellation at Git boundary");
     match stage {
-        CancellationStage::BeforeGit => assert_eq!(
+        CancellationStage::BeforeGit | CancellationStage::BeforeGitAfterRotation => assert_eq!(
             outcome,
             NativeTaskApprovalOutcome::NotApplied(NativeTaskApprovalRefusal::BeforeGitRefused)
         ),
@@ -291,7 +327,7 @@ async fn run_initial_source_cancel_interleaving(stage: CancellationStage) {
         }
     }
     assert!(target.native_pre_git_gate.lock().unwrap().is_none());
-    if stage == CancellationStage::BeforeGit {
+    if stage != CancellationStage::AfterGit {
         assert!(!target.fatal_local_authority_fence.is_closed());
     }
     assert_eq!(source_runtime.tool_execution.generation(), 0);
@@ -311,7 +347,19 @@ async fn run_initial_source_cancel_interleaving(stage: CancellationStage) {
         ),
         "no target approval message, Work publication or provider-state publication"
     );
-    assert_eq!(native_approval_rows(&f.db).await, before_rows);
+    let after_rows = native_approval_rows(&f.db).await;
+    if stage == CancellationStage::BeforeGitAfterRotation {
+        // Cancellation checkpoint and continuation legitimately add source messages.
+        assert_eq!(&after_rows[1..], &before_rows[1..]);
+        assert!(after_rows[0] > before_rows[0]);
+        assert_eq!(summary_llm.calls.load(Ordering::SeqCst), 1);
+        assert!(summary_requests.try_recv().is_ok());
+        assert!(summary_requests.try_recv().is_err());
+    } else {
+        assert_eq!(after_rows, before_rows);
+        assert_eq!(summary_llm.calls.load(Ordering::SeqCst), 0);
+        assert!(summary_requests.try_recv().is_err());
+    }
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM native_task_approval_source_calls")
             .fetch_one(f.db.pool())
@@ -351,19 +399,20 @@ async fn run_initial_source_cancel_interleaving(stage: CancellationStage) {
         .is_none());
     assert_eq!(
         f.db.coordinator_conversation_id().await.unwrap(),
-        current_coordinator
+        successor.or(current_coordinator)
     );
     assert_eq!(
         f.db.get_conversation(&source.id).await.unwrap().state,
         source_runtime.state
     );
-    assert!(!f
-        .db
-        .message_exists(&command.source.message_id)
-        .await
-        .unwrap());
+    assert_eq!(
+        f.db.message_exists(&command.source.message_id)
+            .await
+            .unwrap(),
+        stage == CancellationStage::BeforeGitAfterRotation
+    );
     match (stage, post_git) {
-        (CancellationStage::BeforeGit, None) => {
+        (CancellationStage::BeforeGit | CancellationStage::BeforeGitAfterRotation, None) => {
             assert_eq!(git_snapshot(&root, &worktree), before_git);
             assert_eq!(worktree_files(&worktree), before_files);
         }
@@ -373,10 +422,169 @@ async fn run_initial_source_cancel_interleaving(stage: CancellationStage) {
             assert_eq!(worktree_files(&worktree), post_git_files);
             assert_eq!(git(&worktree, &["show", "HEAD:tasks/reviewed.md"]), BODY);
         }
-        (CancellationStage::BeforeGit, Some(_)) | (CancellationStage::AfterGit, None) => {
+        (CancellationStage::BeforeGit | CancellationStage::BeforeGitAfterRotation, Some(_))
+        | (CancellationStage::AfterGit, None) => {
             panic!("Git snapshot matches the configured interleaving");
         }
     }
+}
+
+// Cancellation has already invalidated the live source. This proves lawful rotation and
+// exact current-Coordinator gate precedence, not an isolated identity-only refusal.
+#[allow(clippy::too_many_lines)]
+async fn rotate_cancelled_source(
+    source: &mut NativeRuntime,
+    db: &Database,
+    command: &phoenix_db::native_task_approval::NativeTaskApprovalCommand,
+) -> Result<String, String> {
+    use phoenix_core::work_scope::RuntimeRole;
+    use phoenix_db::native_task_approval::NativeTaskApprovalError;
+
+    let source_id = &command.source_transcript_id;
+    // Completion is supplied by this test: no real source tool was dispatched or aborted.
+    let acknowledged = source
+        .process_acknowledged_event(Event::ToolAborted {
+            tool_use_id: command.source.tool_use_id.clone(),
+        })
+        .await?;
+    let idle = db
+        .get_conversation(source_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if acknowledged != AcknowledgedEventOutcome::Settled
+        || source.state != ConvState::Idle
+        || idle.state != ConvState::Idle
+        || !db
+            .message_exists(&command.source.message_id)
+            .await
+            .map_err(|error| error.to_string())?
+    {
+        return Err(
+            "matching test-owned ToolAborted must persist Idle and canonical checkpoint".into(),
+        );
+    }
+    let operation_id = "native-approval-cancel-rotation-summary".to_owned();
+    let acknowledged = source
+        .process_acknowledged_event(Event::UserTriggerContinuation {
+            operation_id: operation_id.clone(),
+        })
+        .await?;
+    let awaiting = db
+        .get_conversation(source_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if acknowledged != AcknowledgedEventOutcome::Settled
+        || source.state != awaiting.state
+        || !matches!(&awaiting.state, ConvState::AwaitingContinuation { request }
+            if request.operation_id == operation_id && request.attempt == 1)
+    {
+        return Err("real continuation trigger must persist its matching summary request".into());
+    }
+    // Leave the task in the runtime slot while awaiting: outer timeout cleanup can still
+    // abort/join it. The channel has capacity for this one actual completion event.
+    let task = source
+        .llm_task_handle
+        .as_mut()
+        .ok_or_else(|| "continuation did not retain its actual provider task".to_owned())?;
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .map_err(|error| error.to_string())?;
+    drop(source.llm_task_handle.take());
+    completed.map_err(|error| error.to_string())?;
+    let completion = source
+        .event_rx
+        .recv()
+        .await
+        .ok_or_else(|| "actual continuation completion channel closed".to_owned())?;
+    if !matches!(&completion, Event::ContinuationResponse { operation_id: actual, summary }
+        if actual == &operation_id && summary == NATIVE_APPROVAL_REPLY)
+    {
+        return Err(format!(
+            "expected actual matching offline summary completion, got {completion:?}"
+        ));
+    }
+    source.process_event(completion).await?;
+    let exhausted = db
+        .get_conversation(source_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if exhausted.state != source.state
+        || !matches!(&exhausted.state, ConvState::ContextExhausted { summary }
+            if summary == NATIVE_APPROVAL_REPLY)
+    {
+        return Err("real generated continuation must durably exhaust source context".into());
+    }
+    let successor = match db
+        .continue_conversation(source_id)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        phoenix_db::ContinueOutcome::Created(successor) => successor,
+        other @ (phoenix_db::ContinueOutcome::AlreadyContinued(_)
+        | phoenix_db::ContinueOutcome::ParentNotContextExhausted { .. }) => {
+            return Err(format!(
+                "expected first lawful Coordinator rotation, got {other:?}"
+            ));
+        }
+    };
+    let old = db
+        .get_conversation(source_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let old_head: i64 =
+        sqlx::query_scalar("SELECT coordinator_head FROM conversations WHERE id = ?")
+            .bind(source_id)
+            .fetch_one(db.pool())
+            .await
+            .map_err(|error| error.to_string())?;
+    let new_head: i64 =
+        sqlx::query_scalar("SELECT coordinator_head FROM conversations WHERE id = ?")
+            .bind(&successor.id)
+            .fetch_one(db.pool())
+            .await
+            .map_err(|error| error.to_string())?;
+    let current = db
+        .coordinator_conversation_id()
+        .await
+        .map_err(|error| error.to_string())?;
+    if successor.id == *source_id
+        || old.runtime_role != RuntimeRole::Coordinator
+        || successor.runtime_role != RuntimeRole::Coordinator
+        || old_head != 0
+        || new_head != 1
+        || old.continued_in_conv_id.as_deref() != Some(successor.id.as_str())
+        || successor.product_conversation_id != old.product_conversation_id
+        || current.as_deref() != Some(successor.id.as_str())
+    {
+        return Err(
+            "lawful continuation must preserve product/role and transfer only current head".into(),
+        );
+    }
+    match db
+        .continue_conversation(source_id)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        phoenix_db::ContinueOutcome::AlreadyContinued(replayed) if replayed.id == successor.id => {}
+        other @ (phoenix_db::ContinueOutcome::Created(_)
+        | phoenix_db::ContinueOutcome::AlreadyContinued(_)
+        | phoenix_db::ContinueOutcome::ParentNotContextExhausted { .. }) => {
+            return Err(format!(
+                "rotation replay must return exact retained successor: {other:?}"
+            ));
+        }
+    }
+    if !matches!(
+        db.inspect_native_task_approval_command(command).await,
+        Err(NativeTaskApprovalError::Database(
+            phoenix_db::DbError::CurrentCoordinatorRequired
+        ))
+    ) {
+        return Err(
+            "retired Coordinator must fail exact current-role gate before source/history".into(),
+        );
+    }
+    Ok(successor.id)
 }
 
 fn try_git_snapshot(root: &Path, worktree: &Path) -> Result<Vec<String>, String> {
