@@ -1808,6 +1808,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordinator_research_saved_peer_name_and_id_never_fall_back_after_transport_failure() {
+        use phoenix_core::domain::instance_identity::{
+            InstanceId, PeerBearerCredential, PeerTlsTrust,
+        };
+
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let peer_id = InstanceId::new();
+        db.save_federation_peer_connection(
+            peer_id,
+            &"research-target".parse().unwrap(),
+            &"https://localhost:1".parse().unwrap(),
+            &PeerBearerCredential::parse(format!("phx_peer_{}", "a".repeat(43))).unwrap(),
+            &PeerTlsTrust::PlatformRoots,
+        )
+        .await
+        .unwrap();
+        let query = crate::tools::ToolRegistry::coordinator_research(research_tools(
+            GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever())),
+            db,
+        ))
+        .find_tool("query_database")
+        .unwrap();
+
+        for selector in ["research-target".to_string(), peer_id.to_string()] {
+            let result = query
+                .run(
+                    json!({
+                        "instance": selector,
+                        "sql": "SELECT 'local-sentinel' AS source"
+                    }),
+                    context("research-child"),
+                )
+                .await;
+            assert!(!result.is_success(), "{result:?}");
+            assert!(!result.output().contains("local-sentinel"), "{result:?}");
+            assert!(
+                !result.output().contains("peer connection not found"),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn coordinator_research_reads_file_lines_only_with_an_active_explicit_scope() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("source.txt"), "alpha\nbeta\ngamma\n").unwrap();
