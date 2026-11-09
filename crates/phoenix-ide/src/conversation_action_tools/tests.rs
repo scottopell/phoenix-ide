@@ -1999,7 +1999,13 @@ async fn native_federated_authority_precedes_peer_lookup_and_argument_provenance
             let refused = tool.run(spoof, native_context(&gc)).await;
             assert!(matches!(refused, ToolOutput::Error { .. }));
             assert!(
-                refused.output().contains("unknown field"),
+                refused
+                    .output()
+                    .contains(if tool.name() == "create_conversation" {
+                        "create requires"
+                    } else {
+                        "unknown field"
+                    }),
                 "{}",
                 refused.output()
             );

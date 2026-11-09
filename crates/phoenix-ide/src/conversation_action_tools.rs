@@ -802,24 +802,34 @@ async fn native_creation_acceptance_receipt(
     ))
 }
 
+fn create_request_guidance(request: &Value) -> &'static str {
+    match request.get("op").and_then(Value::as_str) {
+        Some("options") => "options accepts only op and optional cwd",
+        Some("read") => "read requires op and request_id",
+        Some("create") => "create requires op, request_id, cwd, objective, and start=submit_objective; optional model, effort, llm_language",
+        _ => "op must be options, read, or create",
+    }
+}
+
 fn parse_create_request(input: &Value) -> Result<CreateRequest, String> {
-    let Some(request_input) = input
-        .as_object()
-        .filter(|root| root.len() == 1)
-        .and_then(|root| root.get("request"))
-    else {
+    let Some(root) = input.as_object() else {
         return Err("Invalid create_conversation call: supply only request with options {op, cwd?}, read {op, request_id}, or create {op, request_id, cwd, objective, start, model?, effort?, llm_language?}.".into());
     };
-    let request: CreateRequest = serde_json::from_value(request_input.clone()).map_err(|_| {
-        let guidance = match request_input.get("op").and_then(Value::as_str) {
-            Some("options") => "options accepts only op and optional cwd",
-            Some("read") => "read requires op and request_id",
-            Some("create") => "create requires op, request_id, cwd, objective, and start=submit_objective; optional model, effort, llm_language",
-            _ => "op must be options, read, or create",
-        };
-        format!("Invalid create_conversation request: {guidance}.")
-    })?;
-    Ok(request)
+    let Some(request_input) = root.get("request") else {
+        return Err("Invalid create_conversation call: supply only request with options {op, cwd?}, read {op, request_id}, or create {op, request_id, cwd, objective, start, model?, effort?, llm_language?}.".into());
+    };
+    if root.len() != 1 {
+        return Err(format!(
+            "Invalid create_conversation call: supply only request; {}.",
+            create_request_guidance(request_input)
+        ));
+    }
+    serde_json::from_value(request_input.clone()).map_err(|_| {
+        format!(
+            "Invalid create_conversation request: {}.",
+            create_request_guidance(request_input)
+        )
+    })
 }
 
 impl CreateConversation {
