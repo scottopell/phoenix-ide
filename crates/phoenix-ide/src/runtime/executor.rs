@@ -2765,6 +2765,15 @@ where
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_native_pre_git_gate_for_test(
+        mut self,
+        gate: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Self {
+        *self.native_pre_git_gate.get_mut().unwrap() = gate;
+        self
+    }
+
     pub fn with_parent_dispatch(
         mut self,
         parent_conversation_id: String,

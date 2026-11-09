@@ -767,6 +767,8 @@ pub struct RuntimeManager {
     #[cfg(test)]
     runtime_materialization_panics: AsyncMutex<HashSet<String>>,
     #[cfg(test)]
+    native_pre_git_gates: std::sync::Mutex<HashMap<String, Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
     runtime_materialization_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     subagent_cancel_dispatch_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
@@ -2684,6 +2686,8 @@ impl RuntimeManager {
             subagent_dispatch: ConversationMutexGates::default(),
             #[cfg(test)]
             runtime_materialization_panics: AsyncMutex::new(HashSet::new()),
+            #[cfg(test)]
+            native_pre_git_gates: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             runtime_materialization_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
@@ -6606,6 +6610,13 @@ impl RuntimeManager {
             .with_acknowledged_event_receiver(acknowledged_event_rx)
             .with_native_task_admission_database(self.db.clone())
             .with_handoff_review_receiver(handoff_review_rx);
+        #[cfg(test)]
+        let runtime = runtime.with_native_pre_git_gate_for_test(
+            self.native_pre_git_gates
+                .lock()
+                .unwrap()
+                .remove(conversation_id),
+        );
 
         let runtime = runtime
             .with_model_route_switch(model_upgrade.unwrap_or(false))
@@ -8026,7 +8037,23 @@ impl RuntimeManager {
             })
     }
 
-    /// Get the database handle
+    #[cfg(test)]
+    pub(crate) fn set_native_pre_git_gate_for_test(
+        &self,
+        conversation_id: &str,
+        gate: impl FnOnce() + Send + 'static,
+    ) {
+        let previous = self
+            .native_pre_git_gates
+            .lock()
+            .unwrap()
+            .insert(conversation_id.to_owned(), Box::new(gate));
+        assert!(
+            previous.is_none(),
+            "native pre-Git test gate already installed"
+        );
+    }
+
     pub(crate) async fn mutation_admission(
         &self,
         conversation_id: &str,

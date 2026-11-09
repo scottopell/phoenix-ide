@@ -611,37 +611,101 @@ impl phoenix_llm::LlmService for NativeApprovalLlm {
     }
 }
 
+struct NativeApprovalReleaseOnDrop(Option<std::sync::mpsc::Sender<()>>);
+
+impl NativeApprovalReleaseOnDrop {
+    fn release(&mut self) {
+        if let Some(release) = self.0.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+impl Drop for NativeApprovalReleaseOnDrop {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InitialApprovalScenario {
     ContextPressure,
     FreezeFailure,
     ProviderSuccess,
+    DroppedCallerProviderSuccess,
+}
+
+struct InitialApprovalHarness {
+    temp: Option<tempfile::TempDir>,
+    manager: Option<Arc<crate::runtime::RuntimeManager>>,
+    handle: Option<crate::runtime::ConversationHandle>,
+    caller: Option<
+        tokio::task::JoinHandle<crate::runtime::task_approval_admission::NativeTaskApprovalOutcome>,
+    >,
+    release: Option<NativeApprovalReleaseOnDrop>,
+}
+
+impl InitialApprovalHarness {
+    fn new() -> Self {
+        Self {
+            temp: None,
+            manager: None,
+            handle: None,
+            caller: None,
+            release: None,
+        }
+    }
+
+    fn release_gate(&mut self) {
+        if let Some(release) = &mut self.release {
+            release.release();
+        }
+    }
+
+    async fn cleanup(&mut self) {
+        self.release_gate();
+        if let Some(caller) = self.caller.take() {
+            caller.abort();
+            let _ = caller.await;
+        }
+        if let Some(manager) = &self.manager {
+            manager.begin_process_shutdown();
+            manager.drain_process_shutdown().await;
+        }
+        if let Some(handle) = &self.handle {
+            handle.event_tx.closed().await;
+        }
+        drop(self.manager.take());
+        drop(self.handle.take());
+        drop(self.temp.take());
+    }
 }
 
 #[tokio::test]
 async fn production_initial_approval_provider_success_preserves_body_and_replays() {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        Box::pin(assert_production_initial_approval(
-            InitialApprovalScenario::ProviderSuccess,
-            ReviewedTaskKind::PlainMarkdown,
-        )),
-    )
-    .await
-    .expect("real provider entry and durable terminal settlement before exact replay");
+    Box::pin(assert_production_initial_approval(
+        InitialApprovalScenario::ProviderSuccess,
+        ReviewedTaskKind::PlainMarkdown,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn production_initial_approval_retains_queued_admission_after_caller_abort() {
+    Box::pin(assert_production_initial_approval(
+        InitialApprovalScenario::DroppedCallerProviderSuccess,
+        ReviewedTaskKind::PlainMarkdown,
+    ))
+    .await;
 }
 
 #[tokio::test]
 async fn production_initial_taskmd_approval_provider_success_preserves_body_and_replays() {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        Box::pin(assert_production_initial_approval(
-            InitialApprovalScenario::ProviderSuccess,
-            ReviewedTaskKind::Taskmd,
-        )),
-    )
-    .await
-    .expect("real taskmd approval, provider entry and durable settlement before exact replay");
+    Box::pin(assert_production_initial_approval(
+        InitialApprovalScenario::ProviderSuccess,
+        ReviewedTaskKind::Taskmd,
+    ))
+    .await;
 }
 
 #[tokio::test]
@@ -662,10 +726,36 @@ async fn production_initial_approval_settles_immediate_freeze_failure_and_replay
     .await;
 }
 
-#[allow(clippy::too_many_lines)]
 async fn assert_production_initial_approval(
     scenario: InitialApprovalScenario,
     kind: ReviewedTaskKind,
+) {
+    use futures::FutureExt;
+
+    let mut harness = InitialApprovalHarness::new();
+    let result = std::panic::AssertUnwindSafe(tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        Box::pin(assert_production_initial_approval_inner(
+            scenario,
+            kind,
+            &mut harness,
+        )),
+    ))
+    .catch_unwind()
+    .await;
+    harness.cleanup().await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => panic!("initial approval fixture timed out after 30 seconds"),
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn assert_production_initial_approval_inner(
+    scenario: InitialApprovalScenario,
+    kind: ReviewedTaskKind,
+    harness: &mut InitialApprovalHarness,
 ) {
     use super::super::test_git_helpers::{add_explore_worktree, init_repo};
     use crate::runtime::task_approval_admission::NativeTaskApprovalOutcome;
@@ -675,7 +765,8 @@ async fn assert_production_initial_approval(
         NativeApprovalContinuation, NativeTaskApprovalInspection,
     };
 
-    let (_temp, root) = init_repo();
+    let (temp, root) = init_repo();
+    harness.temp = Some(temp);
     let worktree = add_explore_worktree(&root, "actor-target", "main");
     std::fs::create_dir_all(worktree.join("tasks")).unwrap();
     let (task_file, committed_task_file) = match kind {
@@ -729,7 +820,8 @@ async fn assert_production_initial_approval(
             )])
         }
         InitialApprovalScenario::FreezeFailure => phoenix_llm::ModelRegistry::new_empty(),
-        InitialApprovalScenario::ProviderSuccess => {
+        InitialApprovalScenario::ProviderSuccess
+        | InitialApprovalScenario::DroppedCallerProviderSuccess => {
             phoenix_llm::ModelRegistry::for_test_with_sonnet(llm.clone())
         }
     };
@@ -742,10 +834,67 @@ async fn assert_production_initial_approval(
         Arc::new(crate::tools::mcp::McpClientManager::new()),
         None,
     ));
-    let handle = manager.get_or_create(&f.target).await.unwrap();
-    let broadcaster = manager.conversation_broadcaster("actor-target").await;
-    let mut events = broadcaster.subscribe();
-    let result = manager.execute_native_task_approval(command.clone()).await;
+    harness.manager = Some(Arc::clone(&manager));
+    let (handle, mut events, mut provider_request, result) = if scenario
+        == InitialApprovalScenario::DroppedCallerProviderSuccess
+    {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        manager.set_native_pre_git_gate_for_test("actor-target", move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        harness.release = Some(NativeApprovalReleaseOnDrop(Some(release_tx)));
+        let handle = manager.get_or_create(&f.target).await.unwrap();
+        harness.handle = Some(handle.clone());
+        let broadcaster = manager.conversation_broadcaster("actor-target").await;
+        let events = broadcaster.subscribe();
+        let admission = manager.mutation_admission("actor-target").await;
+        let caller_manager = Arc::clone(&manager);
+        let caller_command = command.clone();
+        harness.caller = Some(tokio::spawn(async move {
+            Box::pin(caller_manager.execute_native_task_approval(caller_command)).await
+        }));
+        let entered = tokio::time::timeout(std::time::Duration::from_secs(10), entered_rx).await;
+        // Join cancellation before inspecting the mutex: abort() alone only schedules it.
+        let caller = harness.caller.take().unwrap();
+        caller.abort();
+        let cancelled = matches!(caller.await, Err(error) if error.is_cancelled());
+        let retained = admission
+            .as_ref()
+            .is_ok_and(|admission| admission.try_lock().is_err());
+        // Release on every schedule outcome before any assertion or async drain.
+        harness.release_gate();
+        assert!(
+            matches!(entered, Ok(Ok(()))) && cancelled && retained,
+            "pre-Git gate must enter, caller must join cancelled, and actor must retain admission"
+        );
+        let request = tokio::time::timeout(std::time::Duration::from_secs(10), requests.recv())
+            .await
+            .expect("provider must be entered after gate release")
+            .expect("actual provider request");
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 1);
+        let NativeTaskApprovalInspection::Replay(receipt) =
+            f.db.inspect_native_task_approval_command(&command)
+                .await
+                .unwrap()
+        else {
+            panic!("native receipt is durable before provider entry");
+        };
+        (
+            handle,
+            events,
+            Some(request),
+            NativeTaskApprovalOutcome::Committed(receipt),
+        )
+    } else {
+        let handle = manager.get_or_create(&f.target).await.unwrap();
+        harness.handle = Some(handle.clone());
+        let broadcaster = manager.conversation_broadcaster("actor-target").await;
+        let events = broadcaster.subscribe();
+        let result = manager.execute_native_task_approval(command.clone()).await;
+        (handle, events, None, result)
+    };
     let NativeTaskApprovalOutcome::Committed(receipt) = result else {
         panic!("Initial approval must commit through the owning production actor: {result:?}");
     };
@@ -840,11 +989,18 @@ async fn assert_production_initial_approval(
         matches!(f.db.inspect_native_task_approval_command(&command).await.unwrap(),
         NativeTaskApprovalInspection::Replay(ref stored) if stored == &receipt)
     );
-    if scenario == InitialApprovalScenario::ProviderSuccess {
-        let request = requests
-            .recv()
-            .await
-            .expect("actual LlmService::complete entry");
+    if matches!(
+        scenario,
+        InitialApprovalScenario::ProviderSuccess
+            | InitialApprovalScenario::DroppedCallerProviderSuccess
+    ) {
+        let request = match provider_request.take() {
+            Some(request) => request,
+            None => requests
+                .recv()
+                .await
+                .expect("actual LlmService::complete entry"),
+        };
         assert_eq!(llm.calls.load(Ordering::SeqCst), 1);
         let submitted_approval = request
             .messages
@@ -1004,7 +1160,11 @@ async fn assert_production_initial_approval(
             );
         }
     }
-    let expected_calls = usize::from(scenario == InitialApprovalScenario::ProviderSuccess);
+    let expected_calls = usize::from(matches!(
+        scenario,
+        InitialApprovalScenario::ProviderSuccess
+            | InitialApprovalScenario::DroppedCallerProviderSuccess
+    ));
     assert_eq!(llm.calls.load(Ordering::SeqCst), expected_calls);
     assert!(requests.try_recv().is_err(), "no additional provider entry");
     manager.begin_process_shutdown();
