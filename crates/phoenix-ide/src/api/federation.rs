@@ -3461,6 +3461,18 @@ pub(crate) async fn native_create(
     State(state): State<AppState>,
     peer: PeerAuthenticated,
     request: Result<Json<NativeCreateRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let runtime = state.runtime.clone();
+    let response = native_create_inner(state, peer, request)
+        .await
+        .into_response();
+    peer_authority_response(&runtime, response).await
+}
+
+async fn native_create_inner(
+    state: AppState,
+    peer: PeerAuthenticated,
+    request: Result<Json<NativeCreateRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, NativeActionFailure> {
     let Json(request) = request.map_err(|error| native_json_rejection(&error))?;
     if !native_create_intent_valid(&request) {
@@ -6406,6 +6418,51 @@ mod tests {
                 () = std::future::ready(()) => true,
             });
         }
+    }
+
+    #[tokio::test]
+    async fn native_create_response_remains_pending_after_authority_closes() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let runtime = state.runtime.clone();
+        let caller = InstanceId::new();
+        let owner = runtime.acquire_local_authority_pass().unwrap();
+        owner.close("test_native_create_response_authority_closure");
+        let response = native_create(
+            State(state),
+            PeerAuthenticated {
+                send_authority: phoenix_db::FederationSendAuthority::new(
+                    caller,
+                    phoenix_core::domain::instance_identity::FederationCredentialVerifier::from_bearer(
+                        b"peer-test",
+                    ),
+                ),
+                caller_instance_id: caller,
+                caller_display_name: "peer".to_string(),
+            },
+            Ok(Json(NativeCreateRequest {
+                caller_instance_id: caller,
+                destination_instance_id: InstanceId::new(),
+                request_id: uuid::Uuid::new_v4().to_string(),
+                cwd: "/tmp".to_string(),
+                objective: "test".to_string(),
+                model: None,
+                effort: None,
+                language: None,
+                start: NativeCreateStart::SubmitObjective,
+                source: NativeActionSourceCall {
+                    product_conversation: ProductConversationId::parse("source").unwrap(),
+                    source_transcript_id: "transcript".to_string(),
+                    source_assistant_message_id: "message".to_string(),
+                    source_tool_use_id: "tool".to_string(),
+                },
+            })),
+        );
+        tokio::pin!(response);
+        assert!(tokio::select! {
+            biased;
+            _ = &mut response => false,
+            () = std::future::ready(()) => true,
+        });
     }
 
     #[tokio::test]

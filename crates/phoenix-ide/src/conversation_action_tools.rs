@@ -139,6 +139,26 @@ async fn mutation_source(
     })
 }
 
+async fn remote_dispatch_authority(
+    runtime: Arc<RuntimeManager>,
+    ctx: ToolContext,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+    let source = runtime
+        .db()
+        .get_conversation(&ctx.conversation_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let authority = runtime
+        .lock_product_message_admission(source.product_conversation_id.as_str())
+        .await;
+    runtime
+        .db()
+        .require_current_coordinator_transcript(&ctx.conversation_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(authority)
+}
+
 fn operation_schema() -> Value {
     json!({"type":"string", "format":"uuid", "pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"})
 }
@@ -398,6 +418,7 @@ impl RenameConversation {
         let request: RenameRequest =
             serde_json::from_value(input).map_err(|error| error.to_string())?;
         self.authorize(&ctx).await?;
+        let _dispatch_authority = remote_dispatch_authority(self.0.clone(), ctx.clone()).await?;
         let caller_instance_id = self
             .0
             .db()
@@ -779,6 +800,7 @@ impl CreateConversation {
         let request: CreateRequest =
             serde_json::from_value(input).map_err(|error| error.to_string())?;
         self.authorize(&ctx).await?;
+        let _dispatch_authority = remote_dispatch_authority(self.0.clone(), ctx.clone()).await?;
         let caller_instance_id = self
             .0
             .db()

@@ -384,6 +384,32 @@ pub(crate) async fn native_runtime() -> (Arc<RuntimeManager>, crate::db::Databas
     (runtime, db, coordinator.id)
 }
 
+#[tokio::test]
+async fn remote_dispatch_revalidates_coordinator_after_admission() {
+    let (runtime, db, gc) = native_runtime().await;
+    let context = native_context(&gc);
+    db.require_current_coordinator_transcript(&gc)
+        .await
+        .unwrap();
+    let source = db.get_conversation(&gc).await.unwrap();
+    let admission = runtime
+        .lock_product_message_admission(source.product_conversation_id.as_str())
+        .await;
+    let dispatch = tokio::spawn(remote_dispatch_authority(runtime.clone(), context));
+    tokio::task::yield_now().await;
+    assert!(!dispatch.is_finished());
+
+    sqlx::query("UPDATE conversations SET coordinator_head=0 WHERE id=?1")
+        .bind(&gc)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    drop(admission);
+
+    let error = dispatch.await.unwrap().unwrap_err();
+    assert!(error.contains("current Coordinator"), "{error}");
+}
+
 pub(super) fn native_context_without_source_identity(transcript: &str) -> ToolContext {
     struct Offline;
     impl phoenix_core::llm_service::LlmSelector for Offline {
