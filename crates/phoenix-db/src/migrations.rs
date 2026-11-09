@@ -13499,7 +13499,7 @@ mod tests {
     #[tokio::test]
     async fn migration_156_applies_when_158_is_already_recorded() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(&dir.path().join("migration-156-after-158.db"))
+        let db = crate::Database::open(&dir.path().join("migration-156-after-158.db"))
             .await
             .unwrap();
         let pool = db.pool();
