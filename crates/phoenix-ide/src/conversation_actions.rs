@@ -76,12 +76,12 @@ pub(crate) async fn rename_from_current_coordinator(
     let owner = runtime
         .acquire_local_authority_pass()
         .map_err(|()| AppError::Internal("local authority is closed".into()))?;
-    let authority = RenameAuthorityPass::new(owner);
+    let authority = LocalAuthorityPass::new(owner);
     let classified = runtime
         .db()
         .rename_product_conversation(&command.source.transcript_id, &command)
         .await;
-    authority.complete(classified)
+    authority.complete(classified, db_to_app, local_authority_unclassified)
 }
 
 pub(crate) async fn rename_from_federation(
@@ -101,11 +101,13 @@ pub(crate) async fn rename_from_federation(
     let owner = runtime
         .acquire_local_authority_pass()
         .map_err(|()| AppError::Internal("local authority is closed".into()))?;
-    RenameAuthorityPass::new(owner).complete(
+    LocalAuthorityPass::new(owner).complete(
         runtime
             .db()
             .rename_product_conversation_as_federation(authority, &command)
             .await,
+        db_to_app,
+        local_authority_unclassified,
     )
 }
 
@@ -154,39 +156,42 @@ fn product_creation_db_to_app(error: DbError) -> AppError {
     }
 }
 
-struct RenameAuthorityPass {
+fn local_authority_unclassified() -> AppError {
+    AppError::Internal("local authority is unclassified; process admission closed".into())
+}
+
+struct LocalAuthorityPass {
     owner: Option<AdmittedOperation>,
 }
 
-impl RenameAuthorityPass {
+impl LocalAuthorityPass {
     fn new(owner: AdmittedOperation) -> Self {
         Self { owner: Some(owner) }
     }
 
-    fn complete(
+    fn complete<T, E>(
         mut self,
-        result: phoenix_db::workflow::LocalAuthorityResult<
-            crate::db::DbResult<ProductConversationRenameResult>,
-        >,
-    ) -> Result<ProductConversationRenameResult, AppError> {
+        result: phoenix_db::workflow::LocalAuthorityResult<crate::db::DbResult<T>>,
+        map_error: impl FnOnce(DbError) -> E,
+        unclassified_error: impl FnOnce() -> E,
+    ) -> Result<T, E> {
         match result {
             phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
                 self.owner.take();
-                result.map_err(db_to_app)
+                result.map_err(map_error)
             }
             phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
-                Err(AppError::Internal(
-                    "local authority is unclassified; process admission closed".into(),
-                ))
+                drop(map_error);
+                Err(unclassified_error())
             }
         }
     }
 }
 
-impl Drop for RenameAuthorityPass {
+impl Drop for LocalAuthorityPass {
     fn drop(&mut self) {
         if let Some(owner) = &self.owner {
-            owner.close("product_conversation_rename");
+            owner.close("local_authority");
         }
     }
 }
@@ -402,19 +407,16 @@ async fn accept_create_with_cwd_validator<F>(
 where
     F: FnOnce(&str, &Path, bool) -> Result<String, String> + Send + 'static,
 {
-    let _authority = runtime.acquire_local_authority_pass().map_err(|()| {
+    let owner = runtime.acquire_local_authority_pass().map_err(|()| {
         AppError::Internal("runtime admission closed after fatal local authority loss".to_owned())
     })?;
     uuid::Uuid::parse_str(&req.request_id)
         .map_err(|_| AppError::BadRequest("request_id must be a UUID".to_owned()))?;
-    let existing = match &source {
-        CreateSource::FederatedConversation { .. } => None,
-        CreateSource::UserApi | CreateSource::CurrentCoordinator { .. } => runtime
-            .db()
-            .get_product_creation_job(&req.request_id)
-            .await
-            .map_err(product_creation_db_to_app)?,
-    };
+    let existing = runtime
+        .db()
+        .get_product_creation_job(&req.request_id)
+        .await
+        .map_err(product_creation_db_to_app)?;
     let internal = !matches!(&source, CreateSource::UserApi);
     let cwd_preparation = if existing
         .as_ref()
@@ -446,7 +448,8 @@ where
     let local_instance_id = runtime.db().instance_id().await.map_err(db_to_app)?;
     let outcome = match &source {
         CreateSource::FederatedConversation { authority, .. } => {
-            runtime
+            let authority_pass = LocalAuthorityPass::new(owner);
+            let result = runtime
                 .db()
                 .accept_product_creation_as_federation(authority, &req.request_id, |resolution| {
                     resolve_intent(
@@ -458,12 +461,18 @@ where
                         &cwd_preparation,
                     )
                 })
-                .await
+                .await;
+            authority_pass.complete(
+                result,
+                product_creation_db_to_app,
+                local_authority_unclassified,
+            )?
         }
         CreateSource::UserApi | CreateSource::CurrentCoordinator { .. } => {
-            runtime
+            let authority_pass = LocalAuthorityPass::new(owner);
+            let result = runtime
                 .db()
-                .accept_product_creation_resolved(
+                .accept_product_creation_resolved_classified(
                     &req.request_id,
                     source.coordinator_transcript_id(),
                     |resolution| {
@@ -477,10 +486,14 @@ where
                         )
                     },
                 )
-                .await
+                .await;
+            authority_pass.complete(
+                result,
+                product_creation_db_to_app,
+                local_authority_unclassified,
+            )?
         }
-    }
-    .map_err(product_creation_db_to_app)?;
+    };
     let (job, newly_accepted): (ProductCreationJobRecord, bool) = match outcome {
         ProductCreationAcceptOutcome::Accepted(job) => (job, true),
         ProductCreationAcceptOutcome::Replayed(job) => (job, false),
@@ -511,14 +524,17 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn rename_unclassified_result_closes_fence_before_releasing_owner() {
+    async fn local_authority_unclassified_result_closes_fence_before_releasing_owner() {
         let runtime = runtime(
             Database::open_in_memory().await.unwrap(),
             ModelRegistry::new_empty(),
         );
-        let authority = RenameAuthorityPass::new(runtime.acquire_local_authority_pass().unwrap());
-        let result =
-            authority.complete(phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified);
+        let authority = LocalAuthorityPass::new(runtime.acquire_local_authority_pass().unwrap());
+        let result: Result<ProductConversationRenameResult, AppError> = authority.complete(
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified,
+            db_to_app,
+            local_authority_unclassified,
+        );
         assert!(result.is_err());
         assert!(runtime.local_authority_is_closed());
         assert_eq!(runtime.fatal_authority_owners_at_first_close(), Some(1));
@@ -526,27 +542,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rename_established_rejection_and_stale_result_keep_admission_open() {
+    async fn local_authority_established_results_keep_admission_open() {
         let runtime = runtime(
             Database::open_in_memory().await.unwrap(),
             ModelRegistry::new_empty(),
         );
-        let authority = RenameAuthorityPass::new(runtime.acquire_local_authority_pass().unwrap());
+        let authority = LocalAuthorityPass::new(runtime.acquire_local_authority_pass().unwrap());
         assert!(authority
             .complete(
                 phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err(
                     crate::db::DbError::CurrentCoordinatorRequired
-                ),)
+                ),),
+                db_to_app,
+                local_authority_unclassified,
             )
             .is_err());
         assert!(!runtime.local_authority_is_closed());
-        let authority = RenameAuthorityPass::new(runtime.acquire_local_authority_pass().unwrap());
+        let authority = LocalAuthorityPass::new(runtime.acquire_local_authority_pass().unwrap());
         assert_eq!(
             authority
                 .complete(
                     phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(
                         ProductConversationRenameResult::Stale
-                    ),)
+                    ),),
+                    db_to_app,
+                    local_authority_unclassified,
                 )
                 .unwrap(),
             ProductConversationRenameResult::Stale
@@ -556,7 +576,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_rename_authority_closes_fence_before_releasing_owner() {
+    async fn cancelled_local_authority_closes_fence_before_releasing_owner() {
         let runtime = runtime(
             Database::open_in_memory().await.unwrap(),
             ModelRegistry::new_empty(),
@@ -564,10 +584,15 @@ mod tests {
         let owner = runtime.acquire_local_authority_pass().unwrap();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            let authority = RenameAuthorityPass::new(owner);
+            let authority = LocalAuthorityPass::new(owner);
             entered_tx.send(()).unwrap();
             std::future::pending::<()>().await;
-            authority.complete(phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified)
+            let result: Result<ProductConversationRenameResult, AppError> = authority.complete(
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified,
+                db_to_app,
+                local_authority_unclassified,
+            );
+            result
         });
         entered_rx.await.unwrap();
         task.abort();
@@ -577,15 +602,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn panicked_rename_authority_closes_fence_before_releasing_owner() {
+    async fn panicked_local_authority_closes_fence_before_releasing_owner() {
         let runtime = runtime(
             Database::open_in_memory().await.unwrap(),
             ModelRegistry::new_empty(),
         );
         let owner = runtime.acquire_local_authority_pass().unwrap();
         let task = tokio::spawn(async move {
-            let _authority = RenameAuthorityPass::new(owner);
-            panic!("injected rename boundary panic");
+            let _authority = LocalAuthorityPass::new(owner);
+            panic!("injected local authority boundary panic");
         });
         assert!(task.await.unwrap_err().is_panic());
         assert!(runtime.local_authority_is_closed());
@@ -852,13 +877,21 @@ mod tests {
             message_id: "owner-message".into(),
             tool_use_id: "owner-tool".into(),
         };
-        let accepted = accept_create_from_federation(
+        let validation_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&validation_count);
+        let accepted = accept_create_with_cwd_validator(
             &manager,
-            owner.clone(),
             original,
-            product.clone(),
-            "owner-transcript".into(),
-            source_call.clone(),
+            CreateSource::FederatedConversation {
+                authority: owner.clone(),
+                product_conversation_id: product.clone(),
+                transcript_id: "owner-transcript".into(),
+                source_call: source_call.clone(),
+            },
+            move |cwd, home, internal| {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                validate_new_creation_cwd(cwd, home, internal)
+            },
         )
         .await
         .unwrap();
@@ -871,15 +904,22 @@ mod tests {
             if different_intent {
                 other_request.objective = "different objective".into();
             }
-            let result = accept_create_from_federation(
+            let count = Arc::clone(&validation_count);
+            let result = accept_create_with_cwd_validator(
                 &manager,
-                other.clone(),
                 other_request,
-                ProductConversationId::new(),
-                "other-transcript".into(),
-                SourceToolCall {
-                    message_id: "other-message".into(),
-                    tool_use_id: "other-tool".into(),
+                CreateSource::FederatedConversation {
+                    authority: other.clone(),
+                    product_conversation_id: ProductConversationId::new(),
+                    transcript_id: "other-transcript".into(),
+                    source_call: SourceToolCall {
+                        message_id: "other-message".into(),
+                        tool_use_id: "other-tool".into(),
+                    },
+                },
+                move |cwd, home, internal| {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    validate_new_creation_cwd(cwd, home, internal)
                 },
             )
             .await;
@@ -891,21 +931,56 @@ mod tests {
             );
         }
 
+        let mut changed_same_owner = request(cwd.to_str().unwrap());
+        changed_same_owner.request_id = request_id.clone();
+        changed_same_owner.objective = "different objective".into();
+        let count = Arc::clone(&validation_count);
+        let conflict = accept_create_with_cwd_validator(
+            &manager,
+            changed_same_owner,
+            CreateSource::FederatedConversation {
+                authority: owner.clone(),
+                product_conversation_id: ProductConversationId::new(),
+                transcript_id: "owner-transcript".into(),
+                source_call: SourceToolCall {
+                    message_id: "owner-message".into(),
+                    tool_use_id: "owner-tool".into(),
+                },
+            },
+            move |cwd, home, internal| {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                validate_new_creation_cwd(cwd, home, internal)
+            },
+        )
+        .await;
+        assert!(matches!(conflict, Err(AppError::Conflict(_))));
+
         let mut replay_request = request(cwd.to_str().unwrap());
         replay_request.request_id = request_id.clone();
-        let replay = accept_create_from_federation(
+        let count = Arc::clone(&validation_count);
+        let replay = accept_create_with_cwd_validator(
             &manager,
-            owner.clone(),
             replay_request,
-            product,
-            "owner-transcript".into(),
-            source_call,
+            CreateSource::FederatedConversation {
+                authority: owner.clone(),
+                product_conversation_id: product,
+                transcript_id: "owner-transcript".into(),
+                source_call,
+            },
+            move |cwd, home, internal| {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                validate_new_creation_cwd(cwd, home, internal)
+            },
         )
         .await
         .unwrap();
         assert_eq!(
             replay.product_conversation_id,
             accepted.product_conversation_id
+        );
+        assert_eq!(
+            validation_count.load(std::sync::atomic::Ordering::SeqCst),
+            1
         );
         assert_eq!(
             read_create_status_from_federation(&manager, &owner, &request_id)

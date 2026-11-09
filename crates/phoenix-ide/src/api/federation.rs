@@ -3466,7 +3466,14 @@ pub(crate) async fn native_create(
     let response = native_create_inner(state, peer, request)
         .await
         .into_response();
-    peer_authority_response(&runtime, response).await
+    native_create_response(&runtime, response).await
+}
+
+async fn native_create_response(
+    runtime: &crate::runtime::RuntimeManager,
+    response: Response,
+) -> Response {
+    peer_authority_response(runtime, response).await
 }
 
 async fn native_create_inner(
@@ -6426,7 +6433,7 @@ mod tests {
     ) {
         let owner = runtime.acquire_local_authority_pass().unwrap();
         owner.close("test_native_create_response_authority_closure");
-        let response = peer_authority_response(runtime, response);
+        let response = native_create_response(runtime, response);
         tokio::pin!(response);
         assert!(tokio::select! {
             biased;
@@ -6478,7 +6485,7 @@ mod tests {
         let caller = InstanceId::new();
         let peer = test_native_create_peer(caller);
         let request = test_native_create_request(caller, InstanceId::new(), "/tmp".to_string());
-        let response = native_create_inner(state.clone(), &peer, &request)
+        let response = native_create_inner(state.clone(), peer, Ok(Json(request)))
             .await
             .into_response();
         assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -6495,7 +6502,7 @@ mod tests {
         std::fs::create_dir(&cwd).unwrap();
         let peer = test_native_create_peer(caller);
         let request = test_native_create_request(caller, local, cwd.to_string_lossy().into_owned());
-        let response = native_create_inner(state.clone(), &peer, &request)
+        let response = native_create_inner(state.clone(), peer, Ok(Json(request)))
             .await
             .into_response();
         assert_eq!(response.status(), StatusCode::OK);

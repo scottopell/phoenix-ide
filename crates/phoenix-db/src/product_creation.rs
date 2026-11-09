@@ -16,6 +16,23 @@ const PRODUCT_CREATION_MAX_ATTEMPTS: i64 = 4;
 const PRODUCT_CREATION_RETRY_DELAYS_SECONDS: [i64; 3] = [2, 10, 30];
 const PRODUCT_CREATION_MAX_DELIVERY_ATTEMPTS: i64 = 4;
 
+enum ProductCreationCommit {
+    Normal,
+    #[cfg(test)]
+    LoseAcknowledgement,
+}
+
+impl ProductCreationCommit {
+    async fn execute(self, tx: sqlx::Transaction<'_, sqlx::Sqlite>) -> DbResult<()> {
+        tx.commit().await?;
+        match self {
+            Self::Normal => Ok(()),
+            #[cfg(test)]
+            Self::LoseAcknowledgement => Err(sqlx::Error::WorkerCrashed.into()),
+        }
+    }
+}
+
 enum ProjectOptionAuthority<'a> {
     Coordinator(&'a str),
     Federation(&'a FederationConversationAuthority),
@@ -1265,8 +1282,38 @@ impl Database {
     where
         F: FnOnce(ProductCreationResolution<'_>) -> DbResult<ProductCreationIntent>,
     {
-        self.accept_product_creation_authorized(request_id, current_gc_transcript_id, None, resolve)
+        match self
+            .accept_product_creation_resolved_classified(
+                request_id,
+                current_gc_transcript_id,
+                resolve,
+            )
             .await
+        {
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(result) => result,
+            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => Err(
+                DbError::Serialization("product creation commit outcome is unclassified".into()),
+            ),
+        }
+    }
+
+    pub async fn accept_product_creation_resolved_classified<F>(
+        &self,
+        request_id: &str,
+        current_gc_transcript_id: Option<&str>,
+        resolve: F,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<ProductCreationAcceptOutcome>>
+    where
+        F: FnOnce(ProductCreationResolution<'_>) -> DbResult<ProductCreationIntent>,
+    {
+        self.accept_product_creation_authorized(
+            request_id,
+            current_gc_transcript_id,
+            None,
+            resolve,
+            ProductCreationCommit::Normal,
+        )
+        .await
     }
 
     pub async fn accept_product_creation_as_federation<F>(
@@ -1274,12 +1321,18 @@ impl Database {
         authority: &FederationConversationAuthority,
         request_id: &str,
         resolve: F,
-    ) -> DbResult<ProductCreationAcceptOutcome>
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<ProductCreationAcceptOutcome>>
     where
         F: FnOnce(ProductCreationResolution<'_>) -> DbResult<ProductCreationIntent>,
     {
-        self.accept_product_creation_authorized(request_id, None, Some(authority), resolve)
-            .await
+        self.accept_product_creation_authorized(
+            request_id,
+            None,
+            Some(authority),
+            resolve,
+            ProductCreationCommit::Normal,
+        )
+        .await
     }
 
     async fn insert_product_creation_job_on(
@@ -1382,109 +1435,185 @@ impl Database {
         Ok(inserted)
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn accept_product_creation_authorized<F>(
         &self,
         request_id: &str,
         current_gc_transcript_id: Option<&str>,
         authority: Option<&FederationConversationAuthority>,
         resolve: F,
-    ) -> DbResult<ProductCreationAcceptOutcome>
+        commit: ProductCreationCommit,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<ProductCreationAcceptOutcome>>
     where
         F: FnOnce(ProductCreationResolution<'_>) -> DbResult<ProductCreationIntent>,
     {
-        let local_instance_id = self.instance_id().await?;
+        use crate::workflow::LocalAuthorityResult;
+        macro_rules! established_try {
+            ($result:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return LocalAuthorityResult::DurableFactEstablished(Err(error.into()))
+                    }
+                }
+            };
+        }
+        macro_rules! rollback_try {
+            ($transaction:ident, $result:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return match $transaction.rollback().await {
+                            Ok(()) => {
+                                LocalAuthorityResult::DurableFactEstablished(Err(error.into()))
+                            }
+                            Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+                        }
+                    }
+                }
+            };
+        }
+
+        let local_instance_id = established_try!(self.instance_id().await);
         let accepted_product_conversation_id = ProductConversationId::new();
         let now = unix_micros_now();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = established_try!(self.pool.begin_with("BEGIN IMMEDIATE").await);
         if let Some(transcript_id) = current_gc_transcript_id {
-            super::product_conversation_rename::require_current_gc_tx(&mut tx, transcript_id)
-                .await?;
+            rollback_try!(
+                tx,
+                super::product_conversation_rename::require_current_gc_tx(&mut tx, transcript_id)
+                    .await
+            );
         }
         if let Some(authority) = authority {
-            authority.require_tx(&mut tx).await?;
+            rollback_try!(tx, authority.require_tx(&mut tx).await);
         }
-        let existing = Self::get_product_creation_job_on(&mut tx, request_id).await?;
+        let existing = rollback_try!(
+            tx,
+            Self::get_product_creation_job_on(&mut tx, request_id).await
+        );
         if let Some(existing) = existing {
-            require_creation_retry_owner(
-                &existing.intent.origin,
-                local_instance_id,
-                current_gc_transcript_id,
-                authority,
-            )?;
-            let candidate = resolve(ProductCreationResolution::Existing(&existing))?;
-            tx.rollback().await?;
-            return Ok(if existing.intent.matches_retry(&candidate) {
-                ProductCreationAcceptOutcome::Replayed(existing)
-            } else {
-                ProductCreationAcceptOutcome::Conflict
-            });
+            rollback_try!(
+                tx,
+                require_creation_retry_owner(
+                    &existing.intent.origin,
+                    local_instance_id,
+                    current_gc_transcript_id,
+                    authority,
+                )
+            );
+            let candidate =
+                rollback_try!(tx, resolve(ProductCreationResolution::Existing(&existing)));
+            if tx.rollback().await.is_err() {
+                return LocalAuthorityResult::DurableFactUnclassified;
+            }
+            return LocalAuthorityResult::DurableFactEstablished(Ok(
+                if existing.intent.matches_retry(&candidate) {
+                    ProductCreationAcceptOutcome::Replayed(existing)
+                } else {
+                    ProductCreationAcceptOutcome::Conflict
+                },
+            ));
         }
-        let language: Option<String> =
+        let language: Option<String> = rollback_try!(
+            tx,
             sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'default_llm_language'")
                 .fetch_optional(&mut *tx)
-                .await?;
-        let intent = resolve(ProductCreationResolution::New {
-            default_llm_language: language
-                .as_deref()
-                .map(LlmLanguage::parse_or_default)
-                .unwrap_or_default(),
-        })?;
-        require_creation_origin_tx(
-            &mut tx,
-            local_instance_id,
-            current_gc_transcript_id,
-            authority,
-            &intent.origin,
-        )
-        .await?;
-        normalize_product_creation_intent(&intent)?;
-        let inserted = Self::insert_product_creation_job_on(
-            &mut tx,
-            request_id,
-            &accepted_product_conversation_id,
-            &intent,
-            now,
-        )
-        .await?;
-        if inserted == 0 {
-            tx.rollback().await?;
-            let mut race_tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-            if let Some(transcript_id) = current_gc_transcript_id {
-                super::product_conversation_rename::require_current_gc_tx(
-                    &mut race_tx,
-                    transcript_id,
-                )
-                .await?;
-            }
-            if let Some(authority) = authority {
-                authority.require_tx(&mut race_tx).await?;
-            }
-            let existing = Self::get_product_creation_job_on(&mut race_tx, request_id)
-                .await?
-                .ok_or_else(|| {
-                    DbError::Serialization("raced product creation disappeared".to_string())
-                })?;
-            require_creation_retry_owner(
-                &existing.intent.origin,
+                .await
+        );
+        let intent = rollback_try!(
+            tx,
+            resolve(ProductCreationResolution::New {
+                default_llm_language: language
+                    .as_deref()
+                    .map(LlmLanguage::parse_or_default)
+                    .unwrap_or_default(),
+            })
+        );
+        rollback_try!(
+            tx,
+            require_creation_origin_tx(
+                &mut tx,
                 local_instance_id,
                 current_gc_transcript_id,
                 authority,
-            )?;
-            race_tx.rollback().await?;
-            return Ok(if existing.intent.matches_retry(&intent) {
-                ProductCreationAcceptOutcome::Replayed(existing)
-            } else {
-                ProductCreationAcceptOutcome::Conflict
-            });
-        }
-        tx.commit().await?;
-        let record = self
-            .load_product_creation_job(request_id)
-            .await?
+                &intent.origin,
+            )
+            .await
+        );
+        rollback_try!(tx, normalize_product_creation_intent(&intent));
+        let inserted = rollback_try!(
+            tx,
+            Self::insert_product_creation_job_on(
+                &mut tx,
+                request_id,
+                &accepted_product_conversation_id,
+                &intent,
+                now,
+            )
+            .await
+        );
+        if inserted == 0 {
+            if tx.rollback().await.is_err() {
+                return LocalAuthorityResult::DurableFactUnclassified;
+            }
+            let mut race_tx = established_try!(self.pool.begin_with("BEGIN IMMEDIATE").await);
+            if let Some(transcript_id) = current_gc_transcript_id {
+                rollback_try!(
+                    race_tx,
+                    super::product_conversation_rename::require_current_gc_tx(
+                        &mut race_tx,
+                        transcript_id,
+                    )
+                    .await
+                );
+            }
+            if let Some(authority) = authority {
+                rollback_try!(race_tx, authority.require_tx(&mut race_tx).await);
+            }
+            let existing = rollback_try!(
+                race_tx,
+                Self::get_product_creation_job_on(&mut race_tx, request_id).await
+            )
             .ok_or_else(|| {
-                DbError::Serialization("accepted product creation job missing".to_string())
-            })?;
-        Ok(ProductCreationAcceptOutcome::Accepted(record))
+                DbError::Serialization("raced product creation disappeared".to_string())
+            });
+            let existing = rollback_try!(race_tx, existing);
+            rollback_try!(
+                race_tx,
+                require_creation_retry_owner(
+                    &existing.intent.origin,
+                    local_instance_id,
+                    current_gc_transcript_id,
+                    authority,
+                )
+            );
+            if race_tx.rollback().await.is_err() {
+                return LocalAuthorityResult::DurableFactUnclassified;
+            }
+            return LocalAuthorityResult::DurableFactEstablished(Ok(
+                if existing.intent.matches_retry(&intent) {
+                    ProductCreationAcceptOutcome::Replayed(existing)
+                } else {
+                    ProductCreationAcceptOutcome::Conflict
+                },
+            ));
+        }
+        if commit.execute(tx).await.is_err() {
+            return LocalAuthorityResult::DurableFactUnclassified;
+        }
+        let record = match self.load_product_creation_job(request_id).await {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                return LocalAuthorityResult::DurableFactEstablished(Err(DbError::Serialization(
+                    "accepted product creation job missing".to_string(),
+                )))
+            }
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error)),
+        };
+        LocalAuthorityResult::DurableFactEstablished(Ok(ProductCreationAcceptOutcome::Accepted(
+            record,
+        )))
     }
 
     pub async fn claim_product_creation(
@@ -3253,6 +3382,56 @@ mod product_creation_tests {
     }
 
     #[tokio::test]
+    async fn federated_creation_reports_lost_commit_acknowledgement_as_unclassified() {
+        use crate::federation_conversation_authority::enroll_test_peer;
+        use crate::workflow::LocalAuthorityResult;
+        use phoenix_core::domain::db_schema::SourceToolCall;
+
+        let db = Database::open_in_memory().await.unwrap();
+        let caller = InstanceId::new();
+        let authority = enroll_test_peer(&db, caller, b"creation-lost-ack").await;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let mut candidate = intent("/repo/federated", "ambiguous acceptance");
+        candidate.origin = ProductCreationOrigin::FederatedConversation {
+            source_instance_id: caller,
+            product_conversation_id: ProductConversationId::new(),
+            transcript_id: "source-transcript".into(),
+            source_call: SourceToolCall {
+                message_id: "source-message".into(),
+                tool_use_id: "source-tool".into(),
+            },
+        };
+
+        let expected = candidate.clone();
+        let result = db
+            .accept_product_creation_authorized(
+                &request_id,
+                None,
+                Some(&authority),
+                |_| Ok(candidate),
+                ProductCreationCommit::LoseAcknowledgement,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            LocalAuthorityResult::DurableFactUnclassified
+        ));
+        let durable = db
+            .get_product_creation_job(&request_id)
+            .await
+            .unwrap()
+            .expect("commit persisted the accepted row");
+        assert_eq!(durable.status, "accepted");
+        assert_eq!(durable.intent.cwd, expected.cwd);
+        assert_eq!(durable.intent.objective, expected.objective);
+        assert_eq!(durable.intent.origin, expected.origin);
+        assert_eq!(durable.intent.model, expected.model);
+        assert_eq!(durable.intent.effort, expected.effort);
+        assert_eq!(durable.intent.llm_language, expected.llm_language);
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn federated_creation_is_peer_owned_accepted_only_and_never_resolves_foreign_sources() {
         use crate::federation_conversation_authority::enroll_test_peer;
@@ -3275,6 +3454,8 @@ mod product_creation_tests {
         let ProductCreationAcceptOutcome::Accepted(first) = db
             .accept_product_creation_as_federation(&authority, &request, |_| Ok(native.clone()))
             .await
+            .established()
+            .expect("creation outcome classified")
             .unwrap()
         else {
             panic!("expected accepted")
@@ -3314,6 +3495,8 @@ mod product_creation_tests {
         assert!(matches!(
             db.accept_product_creation_as_federation(&authority, &request, |_| Ok(native.clone()))
                 .await
+                .established()
+                .expect("creation outcome classified")
                 .unwrap(),
             ProductCreationAcceptOutcome::Replayed(_)
         ));
@@ -3327,6 +3510,8 @@ mod product_creation_tests {
         let ProductCreationAcceptOutcome::Replayed(replayed) = db
             .accept_product_creation_as_federation(&authority, &request, |_| Ok(changed))
             .await
+            .established()
+            .expect("creation outcome classified")
             .unwrap()
         else {
             panic!("same-owner retry with a new call locator must replay")
@@ -3363,6 +3548,8 @@ mod product_creation_tests {
                         changed_owner
                     ))
                     .await
+                    .established()
+                    .expect("creation outcome classified")
                     .unwrap(),
                     ProductCreationAcceptOutcome::Conflict
                 ),
@@ -3374,6 +3561,8 @@ mod product_creation_tests {
         assert!(matches!(
             db.accept_product_creation_as_federation(&authority, &request, |_| Ok(changed_intent))
                 .await
+                .established()
+                .expect("creation outcome classified")
                 .unwrap(),
             ProductCreationAcceptOutcome::Conflict
         ));
@@ -3389,7 +3578,9 @@ mod product_creation_tests {
             db.accept_product_creation_as_federation(&other, &request, |_| panic!(
                 "must not expose another owner's receipt"
             ))
-            .await,
+            .await
+            .established()
+            .expect("pre-durability error classified"),
             Err(DbError::ProductCreationRequestConflict)
         ));
         assert_eq!(
@@ -3425,6 +3616,8 @@ mod product_creation_tests {
         assert!(db
             .accept_product_creation_as_federation(&authority, &request, |_| Ok(native.clone()))
             .await
+            .established()
+            .expect("pre-durability error classified")
             .is_err());
         assert!(matches!(
             db.accept_product_creation_as_federation(
@@ -3433,6 +3626,8 @@ mod product_creation_tests {
                 |_| Ok(native.clone())
             )
             .await
+            .established()
+            .expect("pre-durability error classified")
             .unwrap(),
             ProductCreationAcceptOutcome::Replayed(_)
         ));
@@ -8558,6 +8753,8 @@ mod product_creation_tests {
             let value = federated_intent(suffix);
             db.accept_product_creation_as_federation(&authority, request_id, |_| Ok(value))
                 .await
+                .established()
+                .expect("creation outcome classified")
                 .unwrap();
         }
 
@@ -8702,6 +8899,8 @@ mod product_creation_tests {
                 Ok(remote_intent)
             })
             .await
+            .established()
+            .expect("creation outcome classified")
             .unwrap();
 
             for request_id in [&local_request, &remote_request] {
