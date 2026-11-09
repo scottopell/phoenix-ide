@@ -1730,7 +1730,9 @@ async fn assert_production_initial_approval_inner(
         | InitialApprovalScenario::FreezeFailure
         | InitialApprovalScenario::FollowUpCompensatedFailure
         | InitialApprovalScenario::InitialReceiptFailure
-        | InitialApprovalScenario::FollowUpReceiptFailure => 0,
+        | InitialApprovalScenario::FollowUpReceiptFailure
+        | InitialApprovalScenario::InitialProjectionFailure
+        | InitialApprovalScenario::FollowUpProjectionFailure => 0,
     };
     assert_eq!(llm.calls.load(Ordering::SeqCst), expected_calls);
     assert!(requests.try_recv().is_err(), "no additional provider entry");
