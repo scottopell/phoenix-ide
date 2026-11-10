@@ -840,7 +840,14 @@ async fn registered_creation_receipt_retention_preserves_jobs_and_children_atomi
     .unwrap();
     assert_eq!(reservation_token.as_deref(), Some("token東京"));
     drop(conn);
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 9);
+    let pending = u32::try_from(
+        MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > 147)
+            .count(),
+    )
+    .unwrap();
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), pending);
 
     db.delete_conversation(&target.id).await.unwrap();
     let retained_ids: (String, String) = sqlx::query_as("SELECT published_product_id, published_conversation_id FROM product_creation_jobs WHERE request_id='old-user'")

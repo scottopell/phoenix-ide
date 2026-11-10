@@ -13525,7 +13525,7 @@ mod tests {
         .unwrap();
         assert_eq!(before, vec![158]);
 
-        assert_eq!(run_pending_migrations(pool).await.unwrap(), 1);
+        assert_eq!(run_pending_migrations(pool).await.unwrap(), 2);
 
         let after: Vec<i64> = sqlx::query_scalar(
             "SELECT version FROM _migrations WHERE version >= 156 ORDER BY version",
@@ -13533,7 +13533,7 @@ mod tests {
         .fetch_all(pool)
         .await
         .unwrap();
-        assert_eq!(after, vec![156, 158]);
+        assert_eq!(after, vec![156, 158, 159]);
         sqlx::query("SELECT enrollment_id FROM conversation_goal_actors LIMIT 0")
             .execute(pool)
             .await
