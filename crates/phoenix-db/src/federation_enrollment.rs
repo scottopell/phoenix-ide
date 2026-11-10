@@ -13,10 +13,6 @@ pub struct FederationSendAuthority {
 }
 
 impl FederationSendAuthority {
-    pub(crate) fn caller_instance_id(&self) -> &InstanceId {
-        &self.caller_instance_id
-    }
-
     #[must_use]
     pub(crate) fn caller_instance_id(&self) -> InstanceId {
         self.caller_instance_id
