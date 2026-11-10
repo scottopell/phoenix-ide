@@ -5,6 +5,10 @@ fn create_input(request: Value) -> Value {
     Value::Object(serde_json::Map::from_iter([("request".into(), request)]))
 }
 
+fn rename_input(request: Value) -> Value {
+    json!({"request": request})
+}
+
 fn submit() -> Value {
     json!({
         "op": "create", "request_id": "01b22123-04de-4b01-88dd-83e74eb2ed51",
@@ -425,10 +429,10 @@ async fn remote_rename_guidance_allows_new_locator_for_same_source_owner() {
     let (runtime, _, _) = native_runtime().await;
     let tool = RenameConversation(runtime);
     let error = tool
-        .validate_before_peer_lookup(&json!({
+        .validate_before_peer_lookup(&rename_input(json!({
             "op": "read",
             "operation_id": "01b22123-04de-4b01-88dd-83e74eb2ed51"
-        }))
+        })))
         .unwrap_err();
     assert!(error.contains("Remote rename receipt read by operation_id alone is unsupported"));
     assert!(error.contains("retry op=rename with the same operation_id"));
@@ -717,17 +721,17 @@ async fn native_registered_rename_is_guarded_replayable_and_revision_checked() {
         .unwrap();
     let detail = rename
         .run(
-            json!({"op":"detail", "reference":format!("@conv:{}", root.product_conversation_id)}),
+            rename_input(json!({"op":"detail", "reference":format!("@conv:{}", root.product_conversation_id)})),
             native_context(&gc),
         )
         .await;
     let detail: Value = serde_json::from_str(detail.output()).unwrap();
     assert_eq!(detail["status"], "detail");
     let operation = uuid::Uuid::new_v4().to_string();
-    let mut request = json!({"op":"rename", "operation_id":operation,
+    let mut request = rename_input(json!({"op":"rename", "operation_id":operation,
         "product_conversation_id":detail["detail"]["product_conversation_id"],
         "expected_root_transcript_id":detail["detail"]["root_transcript_id"],
-        "expected_name_revision":detail["detail"]["name_revision"], "title":"  Native 東京  "});
+        "expected_name_revision":detail["detail"]["name_revision"], "title":"  Native 東京  "}));
     let applied = rename.run(request.clone(), native_context(&gc)).await;
     let applied: Value = serde_json::from_str(applied.output()).unwrap();
     assert_eq!(applied["status"], "applied", "{applied}");
@@ -778,13 +782,13 @@ async fn native_registered_rename_is_guarded_replayable_and_revision_checked() {
         ProductConversationRenameReceiptRecord::Qualified(durable)
     );
     let mut changed = request.clone();
-    changed["title"] = json!("Different immutable intent");
+    changed["request"]["title"] = json!("Different immutable intent");
     let conflict = rename.run(changed, native_context(&gc)).await;
     assert_eq!(
         serde_json::from_str::<Value>(conflict.output()).unwrap()["status"],
         "conflict"
     );
-    request["operation_id"] = json!(uuid::Uuid::new_v4().to_string());
+    request["request"]["operation_id"] = json!(uuid::Uuid::new_v4().to_string());
     let stale = rename.run(request.clone(), native_context(&gc)).await;
     assert_eq!(
         serde_json::from_str::<Value>(stale.output()).unwrap()["status"],
@@ -811,7 +815,7 @@ async fn assert_historical_rename_read_is_revoked_after_coordinator_loss(
     db.delete_conversation(root_id).await.unwrap();
     let historical = rename
         .run(
-            json!({"op":"read", "operation_id":operation}),
+            rename_input(json!({"op":"read", "operation_id":operation})),
             native_context(gc),
         )
         .await;
@@ -827,7 +831,7 @@ async fn assert_historical_rename_read_is_revoked_after_coordinator_loss(
         .unwrap();
     let revoked = rename
         .run(
-            json!({"op":"read", "operation_id":operation}),
+            rename_input(json!({"op":"read", "operation_id":operation})),
             native_context(gc),
         )
         .await;
@@ -2048,14 +2052,16 @@ async fn native_rename_rechecks_archive_but_retains_authorized_replay() {
     let tool = RouteTool::boxed(RenameConversation(runtime));
     let detail = tool
         .run(
-            json!({"op":"detail", "reference":root.product_conversation_id}),
+            rename_input(json!({"op":"detail", "reference":root.product_conversation_id})),
             native_context(&gc),
         )
         .await;
     let detail: Value = serde_json::from_str(detail.output()).unwrap();
-    let mut request = json!({"op":"rename", "operation_id":uuid::Uuid::new_v4().to_string(),
+    let mut request = rename_input(
+        json!({"op":"rename", "operation_id":uuid::Uuid::new_v4().to_string(),
         "product_conversation_id":detail["detail"]["product_conversation_id"], "expected_root_transcript_id":detail["detail"]["root_transcript_id"],
-        "expected_name_revision":detail["detail"]["name_revision"], "title":"Archive fenced"});
+        "expected_name_revision":detail["detail"]["name_revision"], "title":"Archive fenced"}),
+    );
     let applied = tool.run(request.clone(), native_context(&gc)).await;
     let applied: Value = serde_json::from_str(applied.output()).unwrap();
     assert_eq!(applied["status"], "applied");
@@ -2068,13 +2074,16 @@ async fn native_rename_rechecks_archive_but_retains_authorized_replay() {
     let replay: Value = serde_json::from_str(replay.output()).unwrap();
     assert_eq!(replay["status"], "replayed");
     assert_eq!(replay["receipt"], applied["receipt"]);
-    request["operation_id"] = json!(uuid::Uuid::new_v4().to_string());
-    request["expected_name_revision"] = json!(1);
+    request["request"]["operation_id"] = json!(uuid::Uuid::new_v4().to_string());
+    request["request"]["expected_name_revision"] = json!(1);
     let refused = tool.run(request.clone(), native_context(&gc)).await;
     let refused: Value = serde_json::from_str(refused.output()).unwrap();
     assert_eq!(refused["status"], "unavailable");
     assert!(db
-        .read_product_conversation_rename_receipt(&gc, request["operation_id"].as_str().unwrap())
+        .read_product_conversation_rename_receipt(
+            &gc,
+            request["request"]["operation_id"].as_str().unwrap()
+        )
         .await
         .unwrap()
         .is_none());
@@ -2083,8 +2092,8 @@ async fn native_rename_rechecks_archive_but_retains_authorized_replay() {
         .execute(db.pool())
         .await
         .unwrap();
-    request["operation_id"] = applied["receipt"]["operation_id"].clone();
-    request["expected_name_revision"] = json!(0);
+    request["request"]["operation_id"] = applied["receipt"]["operation_id"].clone();
+    request["request"]["expected_name_revision"] = json!(0);
     let revoked = tool.run(request, native_context(&gc)).await;
     assert!(matches!(revoked, ToolOutput::Error { .. }));
 }
@@ -2183,7 +2192,7 @@ async fn native_archived_detail_does_not_advertise_rename() {
         .await
         .unwrap();
     let tool = RouteTool::boxed(RenameConversation(runtime));
-    let input = json!({"op":"detail", "reference":root.product_conversation_id});
+    let input = rename_input(json!({"op":"detail", "reference":root.product_conversation_id}));
     let open = tool.run(input.clone(), native_context(&gc)).await;
     let open: Value = serde_json::from_str(open.output()).unwrap();
     assert_eq!(open["allowed_actions"], json!(["detail", "read", "rename"]));
@@ -2215,14 +2224,7 @@ async fn native_federated_schema_registers_each_public_tool_once_without_nullabl
         let schema = matching[0].input_schema();
         assert_eq!(schema["properties"]["instance"]["type"], "string");
         assert!(schema["properties"]["instance"].get("oneOf").is_none());
-        assert_eq!(
-            schema["required"],
-            if name == "create_conversation" {
-                json!(["request"])
-            } else {
-                json!(["op"])
-            }
-        );
+        assert_eq!(schema["required"], json!(["request"]));
         assert_eq!(schema["additionalProperties"], false);
         for field in [
             "source",
@@ -2255,11 +2257,11 @@ async fn native_federated_exact_local_preserves_options_detail_and_receipt_reads
         (create, create_input(json!({"op":"options"}))),
         (
             rename.clone(),
-            json!({"op":"detail", "reference":root.product_conversation_id}),
+            rename_input(json!({"op":"detail", "reference":root.product_conversation_id})),
         ),
         (
             rename,
-            json!({"op":"read", "operation_id":uuid::Uuid::new_v4().to_string()}),
+            rename_input(json!({"op":"read", "operation_id":uuid::Uuid::new_v4().to_string()})),
         ),
     ] {
         let omitted = tool.run(input.clone(), native_context(&gc)).await;
@@ -2314,7 +2316,7 @@ async fn native_federated_authority_precedes_peer_lookup_and_argument_provenance
         ),
         (
             RouteTool::boxed(RenameConversation(runtime.clone())),
-            json!({"op":"detail", "reference":"missing"}),
+            rename_input(json!({"op":"detail", "reference":"missing"})),
         ),
     ] {
         let authority_error = tool.run(op.clone(), native_context(&ordinary.id)).await;
@@ -2419,7 +2421,7 @@ async fn native_federated_selection_rejects_self_ambiguity_and_never_falls_back(
         ),
         (
             RouteTool::boxed(RenameConversation(runtime.clone())),
-            json!({"op":"detail", "reference":gc}),
+            json!({"request":{"op":"detail", "reference":gc}}),
         ),
         (
             RouteTool::boxed(CreateConversation(runtime.clone())),
@@ -2505,9 +2507,9 @@ async fn assert_unique_peer_failure_does_not_fall_back(
         .create_conversation("no-fallback", "no-fallback", "/tmp", true, None, None)
         .await
         .unwrap();
-    let failed = rename.run(json!({"op":"rename", "instance":"unique-peer", "operation_id":operation_id,
+    let failed = rename.run(json!({"instance":"unique-peer", "request":{"op":"rename", "operation_id":operation_id,
         "product_conversation_id":root.product_conversation_id, "expected_root_transcript_id":root.id,
-        "expected_name_revision":0, "title":"must not apply locally"}),
+        "expected_name_revision":0, "title":"must not apply locally"}}),
         native_context(gc)
             .with_svg_assistant_message_id(uuid::Uuid::new_v4().to_string())
             .with_tool_use_id("native-call")).await;
@@ -2533,10 +2535,56 @@ async fn assert_unique_peer_failure_does_not_fall_back(
 }
 
 #[tokio::test]
+async fn native_rename_declares_closed_operation_branches_matching_strict_parser() {
+    let (runtime, _, _) = native_runtime().await;
+    let schema = RouteTool::boxed(RenameConversation(runtime)).input_schema();
+    let branches = schema["properties"]["request"]["oneOf"].as_array().unwrap();
+    assert_eq!(branches.len(), 3);
+    for (op, required) in [
+        ("detail", json!(["op", "reference"])),
+        ("read", json!(["op", "operation_id"])),
+        (
+            "rename",
+            json!([
+                "op",
+                "operation_id",
+                "product_conversation_id",
+                "expected_root_transcript_id",
+                "expected_name_revision",
+                "title"
+            ]),
+        ),
+    ] {
+        let branch = branches
+            .iter()
+            .find(|branch| branch["properties"]["op"]["const"] == op)
+            .unwrap();
+        assert_eq!(branch["additionalProperties"], false);
+        assert_eq!(branch["required"], required);
+        assert_eq!(
+            branch["properties"].as_object().unwrap().len(),
+            required.as_array().unwrap().len()
+        );
+    }
+    assert!(matches!(
+        parse_rename_request(rename_input(json!({"op":"detail","reference":"fixture"}))),
+        Ok(RenameRequest::Detail { .. })
+    ));
+    for request in [
+        json!({"op":"detail","reference":"fixture","operation_id":uuid::Uuid::new_v4().to_string()}),
+        json!({"op":"detail","reference":"fixture","title":null}),
+        json!({"op":"rename","operation_id":uuid::Uuid::new_v4().to_string(),"product_conversation_id":"fixture","expected_root_transcript_id":"root","expected_name_revision":0,"title":"Fixture","reference":"fixture"}),
+    ] {
+        assert!(parse_rename_request(rename_input(request)).is_err());
+    }
+    assert!(parse_rename_request(json!({"op":"detail","reference":"fixture"})).is_err());
+}
+
+#[tokio::test]
 async fn native_federated_rename_read_requires_immutable_intent_replay() {
     let (runtime, _, gc) = native_runtime().await;
     let tool = RouteTool::boxed(RenameConversation(runtime));
-    let failed = tool.run(json!({"op":"read", "instance":"unknown-peer", "operation_id":uuid::Uuid::new_v4().to_string()}), native_context(&gc)).await;
+    let failed = tool.run(json!({"instance":"unknown-peer", "request":{"op":"read", "operation_id":uuid::Uuid::new_v4().to_string()}}), native_context(&gc)).await;
     assert!(matches!(failed, ToolOutput::Error { .. }));
     for recovery_contract in [
         "retry op=rename with the same operation_id, destination instance, product_conversation_id, expected_root_transcript_id, expected_name_revision, title, and source ProductConversation/transcript",
