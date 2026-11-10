@@ -2350,7 +2350,7 @@ async fn native_federated_authority_precedes_peer_lookup_and_argument_provenance
                     .contains(if tool.name() == "create_conversation" {
                         "options accepts only op and optional cwd"
                     } else {
-                        "unknown field"
+                        "detail requires only op and reference"
                     }),
                 "{}",
                 refused.output()
