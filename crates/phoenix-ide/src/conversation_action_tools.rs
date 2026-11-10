@@ -80,6 +80,51 @@ enum RenameRequest {
     },
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenameEnvelope {
+    request: RenameRequest,
+}
+
+fn rename_request_guidance(request: &Value) -> &'static str {
+    match request.get("op").and_then(Value::as_str) {
+        Some("detail") => "detail requires only op and reference",
+        Some("read") => "read requires only op and operation_id",
+        Some("rename") => "rename requires only op, operation_id, product_conversation_id, expected_root_transcript_id, expected_name_revision, and title",
+        _ => "op must be detail, read, or rename",
+    }
+}
+
+fn parse_rename_request(input: Value) -> Result<RenameRequest, String> {
+    let guidance = input
+        .get("request")
+        .map(rename_request_guidance)
+        .unwrap_or("supply only request with detail {op, reference}, read {op, operation_id}, or rename {op, operation_id, product_conversation_id, expected_root_transcript_id, expected_name_revision, title}");
+    serde_json::from_value::<RenameEnvelope>(input)
+        .map(|envelope| envelope.request)
+        .map_err(|_| format!("Invalid rename_conversation request: {guidance}."))
+}
+fn rename_request_schema() -> Value {
+    json!({"type":"object", "additionalProperties":false, "required":["request"], "properties":{
+        "request":{"oneOf":[
+            {"type":"object","additionalProperties":false,"required":["op","reference"],"properties":{
+                "op":{"const":"detail"},
+                "reference":{"type":"string","description":"Product id or slug.","minLength":1}
+            }},
+            {"type":"object","additionalProperties":false,"required":["op","operation_id"],"properties":{
+                "op":{"const":"read"},"operation_id":operation_schema()
+            }},
+            {"type":"object","additionalProperties":false,"required":["op","operation_id","product_conversation_id","expected_root_transcript_id","expected_name_revision","title"],"properties":{
+                "op":{"const":"rename"},"operation_id":operation_schema(),
+                "product_conversation_id":{"type":"string","description":"Immutable product id returned by detail, never a slug or transcript.","minLength":1},
+                "expected_root_transcript_id":{"type":"string","description":"Returned by detail.","minLength":1},
+                "expected_name_revision":{"type":"integer","description":"Returned by detail.","minimum":0},
+                "title":{"type":"string","minLength":1,"maxLength":200}
+            }}
+        ]}
+    }})
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum CreateStart {
@@ -171,8 +216,7 @@ fn operation_schema() -> Value {
 #[async_trait]
 impl RoutedTool for RenameConversation {
     fn validate_before_peer_lookup(&self, input: &Value) -> Result<(), String> {
-        let request: RenameRequest =
-            serde_json::from_value(input.clone()).map_err(|error| error.to_string())?;
+        let request = parse_rename_request(input.clone())?;
         if matches!(request, RenameRequest::Read { .. }) {
             return Err("Remote rename receipt read by operation_id alone is unsupported. If the outcome is uncertain, retry op=rename with the same operation_id, destination instance, product_conversation_id, expected_root_transcript_id, expected_name_revision, title, and source ProductConversation/transcript. A later assistant-message/tool-use locator is allowed for that same source owner; the original receipt remains authoritative. Never mint a replacement operation.".into());
         }
@@ -182,18 +226,10 @@ impl RoutedTool for RenameConversation {
         "rename_conversation"
     }
     fn description(&self) -> String {
-        "Current Global Coordinator only. Detail resolves a reference to immutable product/root identity and naming revision; use those exact values for rename. A rename updates the title (1-200 characters) and allocated slug, never the immutable product/work identity. Choose a new operation UUID for each intentional rename. Remote read by operation_id alone is unsupported; if rename outcome is uncertain, retry op=rename with the same operation UUID, destination instance, product/root/revision/title, and source ProductConversation/transcript. A later assistant-message/tool-use locator is allowed for that same source owner, and the original receipt remains authoritative. Never mint a replacement operation to recover uncertainty. Durable replay reports the historical receipt, not current title/lifecycle.".into()
+        "Current Global Coordinator only. Supply exactly one operation in request. Detail resolves a reference to immutable product/root identity and naming revision; use those exact values for rename. A rename updates the title (1-200 characters) and allocated slug, never the immutable product/work identity. Choose a new operation UUID for each intentional rename. Remote read by operation_id alone is unsupported; if rename outcome is uncertain, retry op=rename with the same operation UUID, destination instance, product/root/revision/title, and source ProductConversation/transcript. A later assistant-message/tool-use locator is allowed for that same source owner, and the original receipt remains authoritative. Never mint a replacement operation to recover uncertainty. Durable replay reports the historical receipt, not current title/lifecycle.".into()
     }
     fn schema_without_instance(&self) -> Value {
-        json!({"type":"object", "additionalProperties":false, "required":["op"], "properties":{
-            "op":{"type":"string","enum":["detail","read","rename"]},
-            "reference":{"type":"string","description":"Required for detail; product id or slug.","minLength":1},
-            "operation_id":operation_schema(),
-            "product_conversation_id":{"type":"string","description":"Required for rename; immutable product id returned by detail, never a slug or transcript.","minLength":1},
-            "expected_root_transcript_id":{"type":"string","description":"Required for rename; returned by detail.","minLength":1},
-            "expected_name_revision":{"type":"integer","description":"Required for rename; returned by detail.","minimum":0},
-            "title":{"type":"string","description":"Required for rename.","minLength":1,"maxLength":200}
-        }})
+        rename_request_schema()
     }
     fn clearable(&self) -> bool {
         false
@@ -423,8 +459,7 @@ impl RenameConversation {
         peer: &federation::ResolvedPeer,
         ctx: ToolContext,
     ) -> Result<Value, String> {
-        let request: RenameRequest =
-            serde_json::from_value(input).map_err(|error| error.to_string())?;
+        let request = parse_rename_request(input)?;
         self.authorize(&ctx).await?;
         let _dispatch_authority = remote_dispatch_authority(self.0.clone(), ctx.clone()).await?;
         let caller_instance_id = self
@@ -477,7 +512,7 @@ impl RenameConversation {
             .require_current_coordinator_transcript(&ctx.conversation_id)
             .await
             .map_err(|e| e.to_string())?;
-        let request: RenameRequest = serde_json::from_value(input).map_err(|e| e.to_string())?;
+        let request = parse_rename_request(input)?;
         match request {
             RenameRequest::Detail { reference } => {
                 let reference = rename_detail_reference(&reference)?;
