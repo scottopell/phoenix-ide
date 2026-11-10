@@ -17,7 +17,7 @@ unambiguous saved display name. The peer HTTP request retains the typed
 `destination_instance_id`; public model selection and peer-wire destination
 identity are distinct contracts.
 
-The remote branch is a Coordinator-only, operator-level forensic read capability.
+The remote branch is an operator-level forensic read capability held by the Coordinator and its trusted inline research children, not ordinary ProductConversations or their sub-agents.
 It is not a general security sandbox: application data can include hidden
 messages, settings, serialized state, and workflow payloads that normal UI does
 not expose. Enrollment is directional; permission to query a receiver does not
@@ -41,7 +41,7 @@ scope.
 
 ### REQ-RQD-001: Explicit Enrolled Destination
 
-WHEN the Coordinator invokes `query_database` with an `instance` selector other
+WHEN the Coordinator or its trusted inline research child invokes `query_database` with an `instance` selector other
 than omission, explicit `null`, or exact `"local"`
 THE SYSTEM SHALL resolve the selector as one saved peer's canonical instance UUID
 or one unambiguous saved display name
@@ -54,9 +54,10 @@ IF the selector is unknown, ambiguous, malformed, or the peer connection lookup
 fails
 THE SYSTEM SHALL return a tool error before network or SQL execution.
 
-THE SYSTEM SHALL expose the optional `instance` property only in the Coordinator
-`query_database` schema, not to ordinary ProductConversations, restricted
-planning conversations, or sub-agents
+THE SYSTEM SHALL expose the optional `instance` property only to the Coordinator
+and trusted inline research children whose parent is the Coordinator, not to ordinary
+ProductConversations, restricted planning conversations, or their sub-agents
+AND SHALL derive trusted inline research authority from the persisted parent runtime role rather than model-supplied arguments
 AND SHALL expose no separate `remote_query_database` tool
 AND SHALL reject unknown fields, including `instance_id`.
 
@@ -188,7 +189,7 @@ THE SYSTEM SHALL preserve the receiver's diagnostic detail where available, incl
 
 ### REQ-RQD-010: Untrusted and Clearable Output
 
-THE Coordinator `query_database` description SHALL identify operator-level
+THE Coordinator and trusted inline research `query_database` descriptions SHALL identify operator-level
 forensic access, optional local or explicit enrolled destination selection, no
 remote-to-local fallback, and stored values as untrusted data rather than
 instructions.

@@ -122,7 +122,7 @@ WHILE a restricted planning conversation or a sub-agent of an ordinary conversat
 THE SYSTEM SHALL NOT provide Phoenix-wide history search, global conversation reads, database queries, global reference resolution, or cross-conversation messaging tools
 
 WHEN the Global Coordinator delegates bounded research, analysis, or authorized shell work through `spawn_agents`
-THE SYSTEM SHALL provide trusted inline children with bounded global history search, conversation reads, database queries, reference resolution, read-only file inspection, and the Coordinator's unsandboxed write-capable Bash tool
+THE SYSTEM SHALL provide trusted inline children with bounded global history search, conversation reads, database queries with the Coordinator's explicit saved-peer read selector, reference resolution, read-only file inspection, and the Coordinator's unsandboxed write-capable Bash tool
 AND SHALL require an explicit active WorkScope ID for each file read, resolve its authoritative server directory, and use ordinary numbered read_file offset/limit and path semantics
 AND SHALL require an explicit active WorkScope ID for every Bash run and reuse the Coordinator Bash target resolution, execution, handle-control, and lifecycle bounds
 AND SHALL permit the Coordinator home scope for general shell work and selected ordinary scopes for project work without treating the starting directory as filesystem confinement
@@ -569,7 +569,7 @@ THE operator SHALL stop the runtime and explicitly remove its database and retai
 
 ### REQ-GR-019: Continue an Exact Generated Ordinary Handoff
 
-WHEN the current authenticated Global Coordinator invokes native `continue_conversation` locally or selects an optional instance under [Federation REQ-FED-021–022](../federation/requirements.md): omission, explicit JSON `null`, or exact `"local"` retains the local operation; unknown or ambiguous peers and self-selection fail; remote execution never falls back to local or another peer
+WHEN the current authenticated Global Coordinator invokes native `continue_conversation` locally or selects an optional instance under [Federation REQ-FED-026–027](../federation/requirements.md): omission, explicit JSON `null`, or exact `"local"` retains the local operation; unknown or ambiguous peers and self-selection fail; remote execution never falls back to local or another peer
 THE SYSTEM SHALL require an exact ordinary ProductConversation ID, exact exhausted predecessor transcript ID and exact persisted system-generated summary message ID
 AND SHALL derive source transcript and tool-call identity from trusted execution context rather than agent input
 AND SHALL recheck current Coordinator authority in the local reservation transaction, including completed-opening replay; for a selected peer the source SHALL revalidate current Coordinator authority at remote dispatch while the authenticated destination SHALL trust that source attestation and transactionally recheck current Federation send authority, including replay
@@ -644,3 +644,16 @@ AND SHALL expose selected state on both `/global` and canonical `/global/<id>` r
 AND SHALL replace the mobile conversation-list view with the Ember destination when the user opens Ember, rather than retain a duplicate self-navigation entry
 AND SHALL use Ember as the primary visible identity in the destination's loading/accessibility labels and Coordinator-origin return breadcrumb
 AND SHALL retain the existing singleton route, identity, transcript, and authorization behavior.
+
+
+### REQ-GR-024: Create and Rename Ordinary Conversations on an Explicit Instance
+
+The current Global Coordinator SHALL expose native ordinary-conversation creation and rename capabilities under [Federation REQ-FED-021–024](../federation/requirements.md), using shared local and destination application actions rather than independent mutation implementations.
+
+Each capability MAY receive an optional instance selector: omission or exact `"local"` SHALL execute the local action directly; a saved peer UUID or unambiguous saved display name SHALL select that exact remote peer. Explicit null, unknown or ambiguous peers, and self-selection SHALL fail. Remote selection SHALL never fall back to local or another peer, including when the endpoint is unsupported, the peer is unavailable, or response identity validation fails.
+
+The source SHALL derive exact source ProductConversation, transcript, assistant message, and tool-use identities from trusted executing-call context. The destination SHALL derive source instance identity from the authenticated peer, authorize that peer for the operation, and persist the source call as peer-qualified provenance without requiring foreign identities to resolve as local rows.
+
+Creation SHALL use the existing request UUID as its durable operation identity and preserve the closed local native intent using a directory and model capabilities discovered from the selected destination. The destination owns validation, defaults for omitted optional selections, durable acceptance, and the ProductConversation identity. A successful response means durable request acceptance only. Rename SHALL pin one operation UUID, stable ProductConversation ID, canonical root transcript ID, nonnegative expected naming revision, and title; its destination and immutable retry identity SHALL be preserved. The destination owns canonical naming and route allocation and preserves the local `applied`, `replayed`, `stale`, `conflict`, `not_found`, or `unavailable` result classifications, with identity-closed results.
+
+No generic conversation CRUD, settings mutation, trust/enrollment control, or lifecycle authority is exposed by these capabilities.

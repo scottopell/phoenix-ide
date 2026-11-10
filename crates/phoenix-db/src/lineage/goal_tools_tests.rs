@@ -31,8 +31,27 @@ async fn seed_real_145_receipt(db: &Database, owner: &str) -> String {
     let source = coordinator.product_conversation_id.to_string();
     sqlx::query("INSERT INTO conversation_goal_actors(actor_id,owner_id,kind,source_product_id,transcript_id,workflow_id,turn_id,message_id,tool_use_id) VALUES (2,?,'coordinator',?,?,1,1,'migration-agent','migration-tool')")
         .bind(owner).bind(&source).bind(&coordinator.id).execute(db.pool()).await.unwrap();
-    sqlx::query("INSERT INTO conversation_goal_preparations(reference,owner_id,caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,tool_use_id,operation,expected_version,observed_goal_id,objective,disposition,reason) VALUES (zeroblob(16),?,?,?,1,1,'migration-agent','migration-tool','state',1,'legacy-goal',NULL,'blocked','waiting')")
-        .bind(owner).bind(&coordinator.id).bind(&source).execute(db.pool()).await.unwrap();
+    let has_source_kind: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM pragma_table_info('conversation_goal_preparations')
+             WHERE name='source_kind'
+         )",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let preparation_insert = if has_source_kind {
+        "INSERT INTO conversation_goal_preparations(reference,owner_id,source_kind,caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,tool_use_id,operation,expected_version,observed_goal_id,objective,disposition,reason) VALUES (zeroblob(16),?,'local',?,?,1,1,'migration-agent','migration-tool','state',1,'legacy-goal',NULL,'blocked','waiting')"
+    } else {
+        "INSERT INTO conversation_goal_preparations(reference,owner_id,caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,tool_use_id,operation,expected_version,observed_goal_id,objective,disposition,reason) VALUES (zeroblob(16),?,?,?,1,1,'migration-agent','migration-tool','state',1,'legacy-goal',NULL,'blocked','waiting')"
+    };
+    sqlx::query(preparation_insert)
+        .bind(owner)
+        .bind(&coordinator.id)
+        .bind(&source)
+        .execute(db.pool())
+        .await
+        .unwrap();
     let mut tx = db.pool().begin().await.unwrap();
     sqlx::query("INSERT INTO conversation_goal_coordinator_receipts(preparation_reference,owner_id,outcome,result_version,recorded_at_us) VALUES (zeroblob(16),?,'accepted',2,2)")
         .bind(owner).execute(&mut *tx).await.unwrap();
@@ -131,8 +150,9 @@ async fn table_data(pool: &SqlitePool) -> Vec<(String, Vec<Vec<String>>)> {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent() {
-    for through in 142..=154 {
+    for through in (142..=153).chain([155, 156, 158]) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("goal-tools.db");
         let db = Database::open(path.to_str().unwrap()).await.unwrap();
@@ -149,11 +169,17 @@ async fn canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent() {
         drop(db);
 
         let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        let expected_pending = u32::try_from(
+            crate::migrations::migration_identities()
+                .filter(|(version, _)| *version > through)
+                .count(),
+        )
+        .unwrap();
         assert_eq!(
             crate::migrations::run_pending_migrations(db.pool())
                 .await
                 .unwrap(),
-            154 - through
+            expected_pending
         );
         assert_goal_rows(&db, &owner, source.is_some()).await;
         let tail: Vec<i64> = sqlx::query_scalar(
@@ -164,7 +190,7 @@ async fn canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent() {
         .unwrap();
         assert_eq!(
             tail,
-            vec![143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154]
+            vec![143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 158, 159,]
         );
         let before = snapshot(db.pool()).await;
         assert_eq!(
@@ -297,7 +323,7 @@ async fn real_145_provenance_and_tools_retention_survive_upgrade_delete_and_reop
         crate::migrations::run_pending_migrations(db.pool())
             .await
             .unwrap(),
-        9
+        12
     );
     sqlx::query("INSERT INTO product_creation_initial_execution_receipts(request_id,terminal_kind,failure_reason) VALUES ('joint-create','Completed',NULL)")
         .execute(db.pool()).await.unwrap();

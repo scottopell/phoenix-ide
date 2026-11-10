@@ -104,7 +104,8 @@ jobs:
           cache-on-failure: true
           prefix-key: v1-rust
       - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: ./.github/actions/setup-sccache
+        timeout-minutes: 3
       - name: Set up uv
         uses: astral-sh/setup-uv@v7
       - name: Install cargo-nextest
@@ -266,7 +267,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           prefix-key: v1-rust
       - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: ./.github/actions/setup-sccache
+        timeout-minutes: 3
       - name: Install musl compiler
         timeout-minutes: 5
         run: sudo apt-get update && sudo apt-get install -y musl-tools
@@ -319,7 +321,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           prefix-key: v1-rust
       - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: ./.github/actions/setup-sccache
+        timeout-minutes: 3
       - name: Set up uv
         uses: astral-sh/setup-uv@v7
       - name: Configure git identity
@@ -358,7 +361,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           prefix-key: v1-rust
       - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: ./.github/actions/setup-sccache
+        timeout-minutes: 3
       - name: Set up uv
         uses: astral-sh/setup-uv@v7
       - name: Install cargo-nextest
@@ -411,7 +415,8 @@ jobs:
           shared-key: check-e2e
           prefix-key: v1-rust
           save-if: false
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: ./harness/.github/actions/setup-sccache
+        timeout-minutes: 3
       - uses: astral-sh/setup-uv@v7
       - uses: pnpm/action-setup@v5
         with:
@@ -752,7 +757,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           prefix-key: v1-rust
       - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: ./.github/actions/setup-sccache
+        timeout-minutes: 3
       - name: Set up pnpm
         uses: pnpm/action-setup@v5
         with:

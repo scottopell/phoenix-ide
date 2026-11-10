@@ -73,6 +73,32 @@ impl Database {
         .await
     }
 
+    /// Commit a Goal-aware round and its fork proposal under the canonical transaction.
+    ///
+    /// # Errors
+    /// Rejects invalid provenance, conflicting retries, or failed persistence.
+    pub async fn persist_goal_tool_round_state_replay_and_fork_proposal(
+        &self,
+        checkpoint: &crate::conversation_goals::GoalRoundCheckpoint<'_>,
+        update: Option<&ProviderReplayUpdate>,
+        proposal: &crate::ForkProposal,
+    ) -> DbResult<crate::conversation_goals::CommittedGoalRound> {
+        self.persist_canonical_state_and_replay_input_with_fork(
+            &checkpoint.assistant.conversation_id,
+            checkpoint.assistant,
+            crate::conversation_goals::round::ToolRoundWrite::Pending {
+                execution: checkpoint.execution,
+                results: checkpoint.results,
+            },
+            checkpoint.state,
+            checkpoint.state_updated_at,
+            update,
+            None,
+            Some(proposal),
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn persist_canonical_state_and_replay_input(
         &self,
@@ -84,14 +110,43 @@ impl Database {
         update: Option<&ProviderReplayUpdate>,
         cut: Option<CanonicalCommitCut>,
     ) -> DbResult<CanonicalWriteOutcome> {
+        self.persist_canonical_state_and_replay_input_with_fork(
+            conversation_id,
+            assistant,
+            input,
+            state,
+            state_updated_at,
+            update,
+            cut,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_canonical_state_and_replay_input_with_fork(
+        &self,
+        conversation_id: &str,
+        assistant: &Message,
+        input: crate::conversation_goals::round::ToolRoundWrite<'_>,
+        state: &phoenix_core::domain::sm_state::ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        update: Option<&ProviderReplayUpdate>,
+        cut: Option<CanonicalCommitCut>,
+        proposal: Option<&crate::ForkProposal>,
+    ) -> DbResult<CanonicalWriteOutcome> {
         use crate::conversation_goals::round;
+        if proposal.is_some_and(|proposal| proposal.origin_conversation_id != conversation_id) {
+            return Err(DbError::Serialization("fork proposal owner differs".into()));
+        }
         if matches!(&input, round::ToolRoundWrite::Pending { .. }) {
             if let Some(update) = update {
                 validate_goal_round_replay(assistant, update)?;
             }
         }
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
-        let receipt = canonical_receipt::CanonicalReceipt::new(state, state_updated_at, update)?;
+        let mut receipt =
+            canonical_receipt::CanonicalReceipt::new(state, state_updated_at, update)?;
         let round::RoundWriteOutcome {
             results,
             replayed,
@@ -106,6 +161,10 @@ impl Database {
             self.goal_write_policies(),
         )
         .await?;
+        receipt.bind_self_goal_evidence(input, &results)?;
+        if let Some(proposal) = proposal {
+            receipt.bind_evidence(proposal)?;
+        }
         if replayed {
             receipt
                 .verify(&mut tx, conversation_id, &assistant.message_id)
@@ -116,6 +175,9 @@ impl Database {
                 .await
                 .map_err(round::db_error)?;
         if !replayed {
+            if let Some(proposal) = proposal {
+                crate::insert_fork_proposal_tx(&mut tx, proposal).await?;
+            }
             if let Some(update) = update {
                 apply_replay_tx(&mut tx, conversation_id, update).await?;
             }

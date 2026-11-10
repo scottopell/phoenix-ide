@@ -5,7 +5,9 @@
 use phoenix_core::domain::tool_result_identity::latest_tool_result_message_id;
 #[cfg(test)]
 use phoenix_core::domain::tool_result_identity::tool_result_message_id;
-use phoenix_core::domain::tool_round::{tool_result_message, ToolRoundAssembly, ToolRoundError};
+use phoenix_core::domain::tool_round::{
+    tool_result_message, validate_tool_round_ids, ToolRoundError,
+};
 
 mod slack_gateway;
 pub use slack_gateway::*;
@@ -14,6 +16,8 @@ mod coordinator_authority;
 mod coordinator_query;
 mod coordinator_watches;
 mod coordinator_work_scope;
+mod federation_conversation_authority;
+pub use federation_conversation_authority::FederationConversationAuthority;
 mod federation_enrollment;
 pub use federation_enrollment::FederationSendAuthority;
 mod federation_peers;
@@ -63,8 +67,10 @@ pub use native_continuation::{
 };
 mod product_conversation_rename;
 pub use product_conversation_rename::{
+    HistoricalProductConversationRenameReceipt, HistoricalProductConversationRenameReceiptSource,
     NormalizedConversationTitle, ProductConversationRenameCommand, ProductConversationRenameDetail,
-    ProductConversationRenameReceipt, ProductConversationRenameResult,
+    ProductConversationRenameReceipt, ProductConversationRenameReceiptRecord,
+    ProductConversationRenameReceiptSource, ProductConversationRenameResult,
     ProductConversationRenameSource,
 };
 mod product_conversation_read;
@@ -405,6 +411,8 @@ pub enum DbError {
     ),
     #[error("federation send authority is no longer active")]
     FederationSendAuthorityInactive,
+    #[error("product creation request identity is owned by another acceptance source")]
+    ProductCreationRequestConflict,
     #[error("federation send identity is already owned by another conversation")]
     FederationSendIdentityConflict,
     #[error("saved federation peer not found")]
@@ -10614,9 +10622,9 @@ impl Database {
         obligation: &workflow::DirectTurnTerminalObligationInput,
         replay: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
         cut: TerminalEvidenceTransactionCut,
-    ) -> DbResult<conversation_goals::round::CommittedGoalTerminalRound> {
+    ) -> DbResult<conversation_goals::round::CommittedGoalRound> {
         use conversation_goals::round;
-        let receipt = provider_replay::CanonicalReceipt::new(
+        let mut receipt = provider_replay::CanonicalReceipt::new(
             &obligation.projection.state,
             obligation.projection.state_updated_at,
             replay,
@@ -10660,6 +10668,7 @@ impl Database {
         .await?;
         round::persist_round_terminal_obligation_tx(&mut tx, conversation_id, obligation, replayed)
             .await?;
+        receipt.bind_self_goal_evidence(input, &results)?;
         if replayed {
             receipt
                 .verify(&mut tx, conversation_id, &assistant.message_id)
@@ -10678,6 +10687,15 @@ impl Database {
                 .execute(&mut *tx)
                 .await?;
         }
+        let (state, state_updated_at) = round::selected_state_tx(
+            &mut tx,
+            conversation_id,
+            &obligation.projection.state,
+            obligation.projection.state_updated_at,
+            true,
+        )
+        .await
+        .map_err(round::db_error)?;
         if cut == TerminalEvidenceTransactionCut::BeforeCommit {
             tx.rollback().await?;
             return Err(DbError::Serialization(
@@ -10691,7 +10709,12 @@ impl Database {
                 "injected after-commit cut".to_string(),
             ));
         }
-        Ok(round::CommittedGoalTerminalRound { results, replayed })
+        Ok(round::CommittedGoalRound {
+            results,
+            state,
+            state_updated_at,
+            replayed,
+        })
     }
 
     /// Persist a terminal tool round and its obligation in one transaction.
@@ -15966,6 +15989,26 @@ struct RestartToolRoundPlan {
     completed_count: usize,
 }
 
+fn recovered_finalized_results(
+    results: Vec<phoenix_core::domain::conversation_goal::ToolRoundResult>,
+) -> Vec<ToolResult> {
+    results
+        .into_iter()
+        .map(|result| match result.into_finalized() {
+            Ok(result) => result,
+            Err(pending) => {
+                let mut result = ToolResult::error(
+                    pending.tool_use_id().to_owned(),
+                    "[Tool execution interrupted before canonical commit by server restart]"
+                        .to_owned(),
+                );
+                result.duration_ms = pending.duration_ms();
+                result
+            }
+        })
+        .collect()
+}
+
 /// Normalize a recovered in-flight tool round (`ToolExecuting` or
 /// `CancellingTool`) into the assistant message, the completed results, the flat
 /// list of interrupted `tool_use` ids, and any pending sub-agents — everything
@@ -15991,7 +16034,7 @@ fn normalize_in_flight_round(
             .collect::<Vec<_>>();
         return Some(NormalizedRound {
             assistant_message,
-            completed_results,
+            completed_results: recovered_finalized_results(completed_results),
             interrupted_tool_ids,
             pending_sub_agents,
         });
@@ -16010,7 +16053,7 @@ fn normalize_in_flight_round(
             .collect::<Vec<_>>();
         return Some(NormalizedRound {
             assistant_message,
-            completed_results,
+            completed_results: recovered_finalized_results(completed_results),
             interrupted_tool_ids,
             pending_sub_agents,
         });
@@ -16214,17 +16257,36 @@ fn build_materialized_tool_round(
         phoenix_core::domain::sm_state::SubAgentOutcome,
     >,
 ) -> Result<(Message, Vec<Message>), ToolRoundError> {
-    let round = ToolRoundAssembly::new(
-        assistant_message.clone(),
-        completed_results.to_vec(),
-        interrupted_tool_ids.iter().map(|tool_id| {
-            ToolResult::error(
-                tool_id.clone(),
-                "[Tool execution interrupted by server restart]".to_string(),
-            )
-        }),
+    let mut results = completed_results.to_vec();
+    results.extend(interrupted_tool_ids.iter().map(|tool_id| {
+        ToolResult::error(
+            tool_id.clone(),
+            "[Tool execution interrupted by server restart]".to_string(),
+        )
+    }));
+    validate_tool_round_ids(
+        assistant_message
+            .tool_uses()
+            .iter()
+            .filter_map(|block| match block {
+                phoenix_core::domain::llm_types::ContentBlock::ToolUse { id, .. } => {
+                    Some(id.as_str())
+                }
+                phoenix_core::domain::llm_types::ContentBlock::Text { .. }
+                | phoenix_core::domain::llm_types::ContentBlock::Image { .. }
+                | phoenix_core::domain::llm_types::ContentBlock::ToolResult { .. }
+                | phoenix_core::domain::llm_types::ContentBlock::ServerToolUse { .. }
+                | phoenix_core::domain::llm_types::ContentBlock::ToolSearchToolResult { .. }
+                | phoenix_core::domain::llm_types::ContentBlock::WebSearchToolResult { .. }
+                | phoenix_core::domain::llm_types::ContentBlock::WebFetchToolResult { .. }
+                | phoenix_core::domain::llm_types::ContentBlock::CodeExecutionToolResult { .. }
+                | phoenix_core::domain::llm_types::ContentBlock::BashCodeExecutionToolResult { .. }
+                | phoenix_core::domain::llm_types::ContentBlock::TextEditorCodeExecutionToolResult { .. }
+                | phoenix_core::domain::llm_types::ContentBlock::McpToolUse { .. }
+                | phoenix_core::domain::llm_types::ContentBlock::McpToolResult { .. } => None,
+            }),
+        results.iter().map(|result| result.tool_use_id.as_str()),
     )?;
-    let assistant_message = round.assistant_message();
     let mut next_seq = start_seq;
 
     let agent_content = MessageContent::agent(assistant_message.content.clone());
@@ -16251,8 +16313,8 @@ fn build_materialized_tool_round(
         sub_agent_outcomes,
     );
 
-    let mut tool_msgs = Vec::with_capacity(round.results().len());
-    for (ordinal, result) in round.results().iter().enumerate() {
+    let mut tool_msgs = Vec::with_capacity(results.len());
+    for (ordinal, result) in results.iter().enumerate() {
         let mut content = tool_result_transcript_content(result);
         let display = if ordinal < completed_results.len() {
             match spawn_fan_ins.get(&result.tool_use_id) {
@@ -26039,7 +26101,8 @@ mod tests {
             completed_results: vec![ToolResult::success(
                 "tool-1".to_string(),
                 "real output for tool-1".to_string(),
-            )],
+            )
+            .into()],
             pending_sub_agents: vec![],
             assistant_message: assistant,
         };
@@ -26178,7 +26241,8 @@ mod tests {
             completed_results: vec![ToolResult::success(
                 "tool-1".to_string(),
                 "real output for tool-1".to_string(),
-            )],
+            )
+            .into()],
             assistant_message: assistant,
             pending_sub_agents: vec![],
         };
@@ -26361,7 +26425,7 @@ mod tests {
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new("tool-2", think("t")),
             remaining_tools: vec![],
-            completed_results: vec![ToolResult::success("tool-1".to_string(), placeholder)],
+            completed_results: vec![ToolResult::success("tool-1".to_string(), placeholder).into()],
             pending_sub_agents: vec![
                 PendingSubAgent {
                     agent_id: agent_a.to_string(),
@@ -26550,7 +26614,8 @@ mod tests {
                 completed_results: vec![ToolResult::success(
                     "spawn-tool".to_string(),
                     format!("Spawning 1 sub-agent(s): {child_id}"),
-                )],
+                )
+                .into()],
                 pending_sub_agents: vec![PendingSubAgent {
                     agent_id: child_id.to_string(),
                     task: "audit".to_string(),
@@ -26693,7 +26758,6 @@ mod tests {
 
     #[tokio::test]
     async fn restart_tool_round_materialization_replays_with_persisted_timestamp() {
-        use phoenix_core::domain::db_schema::ToolResult;
         use phoenix_core::domain::llm_types::ContentBlock;
         use phoenix_core::domain::sm_state::{AssistantMessage, ThinkInput, ToolCall, ToolInput};
 
@@ -26722,7 +26786,8 @@ mod tests {
                 }),
             ),
             remaining_tools: Vec::new(),
-            completed_results: Vec::<ToolResult>::new(),
+            completed_results: Vec::<phoenix_core::domain::conversation_goal::ToolRoundResult>::new(
+            ),
             pending_sub_agents: Vec::new(),
             assistant_message: AssistantMessage::new(
                 "stable-assistant".to_string(),
@@ -27554,7 +27619,7 @@ mod tests {
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new("th", think("t")),
             remaining_tools: vec![],
-            completed_results: vec![ToolResult::success("sp".to_string(), placeholder)],
+            completed_results: vec![ToolResult::success("sp".to_string(), placeholder).into()],
             pending_sub_agents: vec![
                 PendingSubAgent {
                     agent_id: done_agent.to_string(),

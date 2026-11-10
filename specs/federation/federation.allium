@@ -18,6 +18,95 @@ external entity CoordinatorNotification {
     event_identity: String
 }
 
+value NativeActionSourceCall {
+    source_product_conversation_id: String
+    source_transcript_id: String
+    source_assistant_message_id: String
+    source_tool_use_id: String
+}
+
+-- REQ-FED-021. Historical SQLite TEXT locators are opaque stored bytes, not
+-- NativeActionSourceCall strings. Every retained native locator is a TEXT
+-- value, but its bytes need not decode to a trusted live identity.
+value HistoricalNativeActionSourceCall {
+    source_product_conversation_bytes: List<Integer>
+    source_transcript_bytes: List<Integer>
+    source_assistant_message_bytes: List<Integer>
+    source_tool_use_bytes: List<Integer>
+}
+
+entity HistoricalInternalCreation {
+    request_id: String
+    objective: String
+    source: HistoricalNativeActionSourceCall
+}
+
+entity HistoricalUnqualifiedRenameReceipt {
+    operation_id: String
+    source: HistoricalNativeActionSourceCall
+}
+
+-- Helpers:
+-- historical_rename_locator_qualifies(source): all four byte sequences decode
+-- as UTF-8, are nonblank after trimming, and have no NUL.
+-- historical_creation_locator_qualifies(source): rename qualification plus
+-- a parsed source ProductConversation ID. Only qualifying historical records
+-- receive the database's durable local instance identity.
+-- historical_locator_bytes_unchanged(source): each SQLite TEXT value
+-- retains its exact stored octets through migration, without lossy decoding.
+-- historical_locator_values_are_octets(source): every Integer in each stored
+-- byte sequence is in the inclusive range 0 through 255.
+-- historical_creation_objective_literal(creation): the stored agent-authored
+-- objective is processed as-is, not re-expanded or reconstructed.
+-- live_rename_source_call_valid(source): trusted write constructor accepts
+-- only four valid UTF-8, nonblank-after-trim, NUL-free locator strings.
+-- live_creation_source_call_valid(source): rename validity plus a parsed
+-- source ProductConversation ID. SQLite CHECK enforces structural shapes,
+-- not UTF-8 validity.
+-- historical_rename_has_no_peer_authority(receipt): the missing source
+-- instance cannot be inferred from its locator or from a retrying peer.
+-- historical_creation_untrusted(creation): origin is historical_internal,
+-- with no source instance and no authority to admit a new request.
+
+invariant HistoricalNativeLocatorsRetainStoredBytes {
+    for c in HistoricalInternalCreations:
+        historical_locator_values_are_octets(c.source)
+        and historical_locator_bytes_unchanged(c.source)
+        and historical_creation_objective_literal(c)
+        and historical_creation_untrusted(c)
+    for r in HistoricalUnqualifiedRenameReceipts:
+        historical_locator_values_are_octets(r.source)
+        and historical_locator_bytes_unchanged(r.source)
+        and historical_rename_has_no_peer_authority(r)
+}
+
+invariant HistoricalNativeLocatorsCannotBeQualified {
+    for c in HistoricalInternalCreations:
+        not historical_creation_locator_qualifies(c.source)
+    for r in HistoricalUnqualifiedRenameReceipts:
+        not historical_rename_locator_qualifies(r.source)
+}
+
+invariant LiveNativeLocatorsAreTrustedStrings {
+    for a in NativeCreateAcceptances:
+        live_creation_source_call_valid(a.source)
+    for r in NativeRenameReceipts:
+        live_rename_source_call_valid(r.source)
+}
+
+rule HistoricalCreationRequestCannotBeAdmitted {
+    when: NativeCreateRequestAccepted(peer, request)
+    requires: exists HistoricalInternalCreation{request_id: request.request_id}
+    ensures: NativeCreateIdentityConflict(request)
+}
+
+rule HistoricalUnqualifiedRenameCannotReplay {
+    when: NativeRenameRequestAccepted(peer, request)
+    requires: exists HistoricalUnqualifiedRenameReceipt{operation_id: request.operation_id}
+    ensures: NativeRenameConflictResult(request)
+}
+
+
 entity RemoteMessageProvenance {
     kind: RemoteApiProvenance | RemoteConversationProvenance | RemoteCoordinatorProvenance
 }
@@ -46,6 +135,10 @@ enum ToolKind {
     | read_automatic_continuation
     | set_automatic_continuation
     | continue_conversation
+    | prepare_goal
+    | apply_goal
+    | create_conversation
+    | rename_conversation
 }
 
 enum SubscriptionState {
@@ -151,7 +244,7 @@ entity AutomaticContinuationResult {
     auto_continue_on_context_exhaustion: Boolean
 }
 
--- REQ-FED-021–022. Continue accepts only the generated ordinary handoff
+-- REQ-FED-026–027. Continue accepts only the generated ordinary handoff
 -- boundary; source identity and retry identity come from trusted execution.
 entity ContinueSelector {
     kind: OmittedContinueSelector | LocalContinueSelector | NullContinueSelector | PeerContinueSelector
@@ -226,7 +319,7 @@ entity RemoteContinueResult {
 
 entity ToolSelection {
     tool: ToolKind
-    instance: String?
+    selector: ToolSelectorInput
     destination: Peer?
     failed: Boolean
 }
@@ -249,6 +342,131 @@ entity GoalRead {
     timeout: Duration
     resolved_transcript_id: String
     result: String
+}
+
+entity ToolSelectorInput {
+    kind: OmittedToolSelector | ExplicitNullToolSelector | ExplicitStringToolSelector
+}
+
+variant OmittedToolSelector : ToolSelectorInput {}
+
+variant ExplicitNullToolSelector : ToolSelectorInput {}
+
+variant ExplicitStringToolSelector : ToolSelectorInput {
+    value: String
+}
+
+entity AuthenticatedEnrollment {
+    instance_id: String
+    enrollment_id: String
+}
+
+entity SourceCallProvenance {
+    source_product_conversation: bedrock/ProductConversation
+    exact_transcript_id: String
+    workflow_id: String
+    turn_id: String
+    message_id: String
+    tool_use_id: String
+}
+
+entity GoalPrepareRetryKey {
+    source_product_conversation: bedrock/ProductConversation
+    workflow_id: String
+    turn_id: String
+    message_id: String
+    tool_use_id: String
+}
+
+entity RemoteGoalPreparation {
+    reference: String
+    authenticated_enrollment: AuthenticatedEnrollment
+    destination_instance_id: String
+    retry_key: GoalPrepareRetryKey
+    source_call: SourceCallProvenance
+    target: bedrock/ProductConversation
+    expected_goal_version: Integer
+    expires_at_us: Integer
+    operation: String
+    state: GoalPreparationState
+
+    transitions state {
+        prepared -> claimed
+    }
+}
+
+entity GoalPrepareResult {
+    reference: String
+    expires_at_us: Integer
+}
+
+enum GoalPreparationState {
+    prepared
+    | claimed
+}
+
+entity FrozenGoalWriteOutcome {
+    kind: AppliedFrozenGoalWrite | RejectedFrozenGoalWrite | UnclassifiedFrozenGoalWrite
+}
+
+variant AppliedFrozenGoalWrite : FrozenGoalWriteOutcome {
+    result: String
+}
+
+variant RejectedFrozenGoalWrite : FrozenGoalWriteOutcome {
+    reason: String
+}
+
+variant UnclassifiedFrozenGoalWrite : FrozenGoalWriteOutcome {}
+
+entity RemoteGoalWriteAttempt {
+    preparation: RemoteGoalPreparation
+    outcome: FrozenGoalWriteOutcome
+}
+
+entity GoalTerminalReceipt {
+    authenticated_enrollment: AuthenticatedEnrollment
+    destination_instance_id: String
+    reference: String
+    outcome: GoalTerminalOutcome
+}
+
+entity GoalTerminalOutcome {
+    kind: AppliedGoalReceipt | RejectedGoalReceipt
+}
+
+variant AppliedGoalReceipt : GoalTerminalOutcome {
+    result: String
+}
+
+variant RejectedGoalReceipt : GoalTerminalOutcome {
+    reason: String
+}
+
+entity GoalPrepareRequest {
+    source_call: SourceCallProvenance
+    target: bedrock/ProductConversation
+    coordinator_goal_operation: String
+}
+
+entity GoalApplyRequest {
+    reference: String
+}
+
+entity GoalApplyResult {
+    reference: String
+    destination_instance_id: String
+    result: String
+}
+
+entity GoalApplyRejection {
+    reference: String
+    reason: String
+}
+
+entity GoalApplyUnclassified {
+    reference: String
+    retry_closed: Boolean
 }
 
 entity RemoteSubscription {
@@ -358,14 +576,25 @@ config {
     max_disconnected_age: Duration
     terminal_prefix_authorization_attempts: Integer = 3
     federation_request_timeout: Duration = 5.seconds
+    goal_preparation_lifetime: Duration = 15.minutes
     terminal_evidence_lifetime: Duration = 30.days
+    native_create_options_request_max_bytes: Integer = 4096
+    native_create_options_response_max_bytes: Integer = 262144
+    native_create_request_max_bytes: Integer = 65536
+    native_create_response_max_bytes: Integer = 4096
+    native_create_status_request_max_bytes: Integer = 4096
+    native_create_status_response_max_bytes: Integer = 16384
+    native_rename_options_request_max_bytes: Integer = 4096
+    native_rename_options_response_max_bytes: Integer = 262144
+    native_rename_request_max_bytes: Integer = 16384
+    native_rename_response_max_bytes: Integer = 16384
 }
 
 -- saved_peer(instance) resolves exactly one saved peer by UUID or display name
 -- or fails. The exact string "local" is reserved before peer resolution; it is
 -- case-sensitive and is not trimmed. Peer-name creation and replacement reject
 -- the reserved name local under REQ-FED-019 in requirements.md.
--- ToolSelection.instance is the normalized selector: null means local.
+-- ToolSelection.selector retains the caller's omitted, explicit-null, or string form.
 -- A selected peer must be authenticated and destination identity-verified before dispatch.
 -- destination_send and destination_read_goal use the destination's ordinary
 -- domain admission and read services, respectively; they are not new tools.
@@ -380,58 +609,267 @@ config {
 -- without gaps or duplicates.
 
 rule SelectLocalTool {
-    when: SelectTool(tool, instance)
-    requires: instance = null or instance = "local"
-    ensures: ToolSelection.created(tool: tool, instance: null, destination: null, failed: false)
+    when: SelectTool(tool, selector)
+    requires: selector.kind = OmittedToolSelector or selector.kind = ExplicitStringToolSelector and selector_string_value(selector) = "local" or selector.kind = ExplicitNullToolSelector and selector_null_routes_local(tool)
+    ensures: ToolSelection.created(tool: tool, selector: selector, destination: null, failed: false)
+}
+
+rule RejectInvalidGoalSelector {
+    when: SelectTool(tool, selector)
+    requires: coordinator_goal_prepare_or_apply(tool)
+    requires: selector.kind = ExplicitNullToolSelector
+    ensures: SelectionError(tool, "instance must be omitted or a string")
+}
+
+rule ExplicitNullRejectedToolSelectionFails {
+    when: SelectTool(tool, selector)
+    requires: selector.kind = ExplicitNullToolSelector
+    requires: explicit_null_rejected(tool)
+    ensures: ToolSelection.created(tool: tool, selector: selector, destination: null, failed: true)
+    ensures: SelectionError(tool, "instance must be omitted or a string")
 }
 
 rule SelectRemoteTool {
-    when: SelectTool(tool, instance)
-    requires: instance != null and instance != "local"
-    requires: exists saved_peer(instance)
-    ensures: ToolSelection.created(tool: tool, instance: instance, destination: saved_peer(instance), failed: false)
+    when: SelectTool(tool, selector)
+    requires: selector.kind = ExplicitStringToolSelector and selector_string_value(selector) != "local"
+    requires: exists saved_peer(selector_string_value(selector))
+    requires: not (native_mutation_tool(tool) and local_peer(saved_peer(selector_string_value(selector))))
+    ensures: ToolSelection.created(tool: tool, selector: selector, destination: saved_peer(selector_string_value(selector)), failed: false)
+}
+
+rule NativeMutationSelfSelectionFails {
+    when: SelectTool(tool, selector)
+    requires: selector.kind = ExplicitStringToolSelector and selector_string_value(selector) != "local"
+    requires: native_mutation_tool(tool)
+    requires: exists saved_peer(selector_string_value(selector))
+    requires: local_peer(saved_peer(selector_string_value(selector)))
+    ensures: ToolSelection.created(tool: tool, selector: selector, destination: null, failed: true)
+    ensures: SelectionError(tool, selector_string_value(selector))
 }
 
 rule RemoteSelectionFails {
-    when: SelectTool(tool, instance)
-    requires: instance != null and instance != "local"
-    requires: not exists saved_peer(instance)
-    ensures: ToolSelection.created(tool: tool, instance: instance, destination: null, failed: true)
-    ensures: SelectionError(tool, instance)
+    when: SelectTool(tool, selector)
+    requires: selector.kind = ExplicitStringToolSelector and selector_string_value(selector) != "local"
+    requires: not exists saved_peer(selector_string_value(selector))
+    ensures: ToolSelection.created(tool: tool, selector: selector, destination: null, failed: true)
+    ensures: SelectionError(tool, selector_string_value(selector))
 }
 
 rule LocalToolDispatch {
     when: DispatchTool(selection)
     requires: selection.tool != continue_conversation
-    requires: selection.instance = null
+    requires: selection.destination = null
     requires: not selection.failed
+    requires: not native_mutation_tool(selection.tool)
     ensures: LocalToolExecution(selection.tool)
 }
 
 rule RemoteToolDispatch {
     when: DispatchTool(selection)
     requires: selection.tool != continue_conversation
-    requires: selection.instance != null
     requires: selection.destination != null
     requires: not selection.failed
     requires: selection.destination.trusted
     requires: not automatic_continuation_tool(selection.tool)
+    requires: not coordinator_goal_prepare_or_apply(selection.tool)
+    requires: not native_mutation_tool(selection.tool)
     ensures: RemoteToolExecution(selection.tool, selection.destination)
+}
+
+rule RejectSelfCoordinatorGoalSelection {
+    when: DispatchTool(selection)
+    requires: selection.destination != null and not selection.failed
+    requires: coordinator_goal_prepare_or_apply(selection.tool)
+    requires: local_peer(selection.destination)
+    ensures: SelectionError(selection.tool, selector_string_value(selection.selector))
+    -- No federation request, local Goal operation, or alternate-peer dispatch.
+}
+
+rule DispatchRemoteCoordinatorGoal {
+    when: DispatchTool(selection)
+    requires: selection.destination != null and not selection.failed
+    requires: selection.destination.trusted
+    requires: coordinator_goal_prepare_or_apply(selection.tool)
+    requires: not local_peer(selection.destination)
+    ensures: RemoteToolExecution(selection.tool, selection.destination)
+}
+
+rule DispatchLocalNativeCreateOptions {
+    when: DispatchNativeCreateOptions(selection, request)
+    requires: selection.tool = create_conversation
+    requires: selection.destination = null and not selection.failed
+    requires: request.caller_instance_id = executing_instance_id()
+    requires: request.destination_instance_id = executing_instance_id()
+    requires: current_coordinator_authorized()
+    ensures: LocalNativeCreateOptionsAction(request)
+}
+
+rule DispatchLocalNativeRenameOptions {
+    when: DispatchNativeRenameOptions(selection, request)
+    requires: selection.tool = rename_conversation
+    requires: selection.destination = null and not selection.failed
+    requires: request.caller_instance_id = executing_instance_id()
+    requires: request.destination_instance_id = executing_instance_id()
+    requires: current_coordinator_authorized()
+    ensures: LocalNativeRenameOptionsAction(request)
+}
+
+rule RejectNativeCreateOptionsSelfSelection {
+    when: DispatchNativeCreateOptions(selection, request)
+    requires: selection.destination != null
+    requires: local_peer(selection.destination)
+    ensures: NativeCreateOptionsFailedWithoutFallback(request)
+}
+
+rule RejectNativeRenameOptionsSelfSelection {
+    when: DispatchNativeRenameOptions(selection, request)
+    requires: selection.destination != null
+    requires: local_peer(selection.destination)
+    ensures: NativeRenameOptionsFailedWithoutFallback(request)
+}
+
+rule RejectUntrustedNativeCreateOptionsDestination {
+    when: DispatchNativeCreateOptions(selection, request)
+    requires: selection.destination != null
+    requires: not selection.destination.trusted
+    ensures: NativeCreateOptionsFailedWithoutFallback(request)
+}
+
+rule RejectUntrustedNativeRenameOptionsDestination {
+    when: DispatchNativeRenameOptions(selection, request)
+    requires: selection.destination != null
+    requires: not selection.destination.trusted
+    ensures: NativeRenameOptionsFailedWithoutFallback(request)
+}
+
+rule DispatchRemoteNativeCreateOptions {
+    when: DispatchNativeCreateOptions(selection, request)
+    requires: selection.tool = create_conversation
+    requires: selection.destination != null and not selection.failed
+    requires: selection.destination != null and selection.destination.trusted
+    requires: not local_peer(selection.destination)
+    requires: request.caller_instance_id = executing_instance_id()
+    requires: request.destination_instance_id = selection.destination.instance_id
+    requires: current_coordinator_authorized()
+    ensures: RemoteNativeCreateOptionsRequestSent(selection.destination, request)
+}
+
+rule DispatchRemoteNativeRenameOptions {
+    when: DispatchNativeRenameOptions(selection, request)
+    requires: selection.tool = rename_conversation
+    requires: selection.destination != null and not selection.failed
+    requires: selection.destination != null and selection.destination.trusted
+    requires: not local_peer(selection.destination)
+    requires: request.caller_instance_id = executing_instance_id()
+    requires: request.destination_instance_id = selection.destination.instance_id
+    requires: current_coordinator_authorized()
+    ensures: RemoteNativeRenameOptionsRequestSent(selection.destination, request)
+}
+
+rule DispatchLocalNativeCreate {
+    when: DispatchNativeCreate(selection, request)
+    requires: selection.tool = create_conversation
+    requires: selection.destination = null and not selection.failed
+    requires: request.caller_instance_id = executing_instance_id()
+    requires: request.destination_instance_id = executing_instance_id()
+    requires: current_coordinator_authorized()
+    requires: request.source = current_native_action_source_call()
+    ensures: LocalNativeCreateAction(request)
+}
+
+rule DispatchLocalNativeRename {
+    when: DispatchNativeRename(selection, request)
+    requires: selection.tool = rename_conversation
+    requires: selection.destination = null and not selection.failed
+    requires: request.caller_instance_id = executing_instance_id()
+    requires: request.destination_instance_id = executing_instance_id()
+    requires: current_coordinator_authorized()
+    requires: request.source = current_native_action_source_call()
+    ensures: LocalNativeRenameAction(request)
+}
+
+rule DispatchRemoteNativeCreate {
+    when: DispatchNativeCreate(selection, request)
+    requires: selection.tool = create_conversation
+    requires: selection.destination != null and not selection.failed
+    requires: selection.destination != null and selection.destination.trusted
+    requires: not local_peer(selection.destination)
+    requires: request.caller_instance_id = executing_instance_id()
+    requires: request.destination_instance_id = selection.destination.instance_id
+    requires: current_coordinator_authorized()
+    requires: request.source = current_native_action_source_call()
+    ensures: RemoteNativeCreateRequestSent(selection.destination, request)
+}
+
+rule DispatchRemoteNativeRename {
+    when: DispatchNativeRename(selection, request)
+    requires: selection.tool = rename_conversation
+    requires: selection.destination != null and not selection.failed
+    requires: selection.destination != null and selection.destination.trusted
+    requires: not local_peer(selection.destination)
+    requires: request.caller_instance_id = executing_instance_id()
+    requires: request.destination_instance_id = selection.destination.instance_id
+    requires: current_coordinator_authorized()
+    requires: request.source = current_native_action_source_call()
+    ensures: RemoteNativeRenameRequestSent(selection.destination, request)
+}
+
+rule UntrustedNativeCreateDestinationFails {
+    when: DispatchNativeCreate(selection, request)
+    requires: selection.destination != null and not selection.failed
+    requires: selection.destination != null and not selection.destination.trusted
+    ensures: NativeCreateFailedWithoutFallback(request)
+}
+
+rule UntrustedNativeRenameDestinationFails {
+    when: DispatchNativeRename(selection, request)
+    requires: selection.destination != null and not selection.failed
+    requires: selection.destination != null and not selection.destination.trusted
+    ensures: NativeRenameFailedWithoutFallback(request)
+}
+
+rule RemoteNativeCreateFailureIsTerminal {
+    when: RemoteNativeCreateFailed(request)
+    ensures: NativeCreateFailedWithoutFallback(request)
+}
+
+rule ReconcileUncertainNativeCreateAtExactDestination {
+    when: RemoteNativeCreateOutcomeUncertain(selection, create_request, status_request)
+    requires: selection.tool = create_conversation
+    requires: selection.destination != null and not selection.failed
+    requires: selection.destination != null and selection.destination.trusted
+    requires: not local_peer(selection.destination)
+    requires: status_request.request_id = create_request.request_id
+    requires: status_request.caller_instance_id = create_request.caller_instance_id
+    requires: status_request.destination_instance_id = create_request.destination_instance_id
+    requires: create_request.destination_instance_id = selection.destination.instance_id
+    requires: current_coordinator_authorized()
+    requires: create_request.source = current_native_action_source_call()
+    ensures: RemoteNativeCreateStatusRequestSent(selection.destination, status_request)
+}
+
+rule RemoteNativeCreateStatusFailureIsTerminal {
+    when: RemoteNativeCreateStatusFailed(request)
+    ensures: NativeCreateStatusReadFailedWithoutFallback(request)
+}
+
+rule RemoteNativeRenameFailureIsTerminal {
+    when: RemoteNativeRenameFailed(request)
+    ensures: NativeRenameFailedWithoutFallback(request)
 }
 
 rule UntrustedDestinationFails {
     when: DispatchTool(selection)
-    requires: selection.instance != null
     requires: selection.destination != null
     requires: not selection.destination.trusted
-    ensures: RemoteToolError(selection.tool, selection.instance)
+    ensures: RemoteToolError(selection.tool, selector_string_value(selection.selector))
     -- No local execution or substitution of a different peer.
 }
 
 rule RemoteDispatchFails {
     when: RemoteExecutionFailed(selection)
-    requires: selection.instance != null
-    ensures: RemoteToolError(selection.tool, selection.instance)
+    requires: selection.destination != null
+    ensures: RemoteToolError(selection.tool, selector_string_value(selection.selector))
     -- No LocalToolExecution and no dispatch to another peer.
 }
 
@@ -441,28 +879,103 @@ rule RemoteDispatchFails {
 -- identity. Optional instance is omitted or a non-null string, including for
 -- read; invalid shapes fail before selection.
 -- Helpers:
+-- transport_authenticated_enrollment(source, destination) is derived only from the
+-- authenticated connection and exact transport instance identities. It is never
+-- accepted from GoalPrepareRequest or SourceCallProvenance.
+-- goal_prepare_retry_key(provenance) contains only source ProductConversation,
+-- workflow, turn, agent message, and tool-use identity. The exact transcript,
+-- requested ordinary target, destination, and operation are conflict material.
+-- same_goal_prepare(prior, request, destination) compares that conflict material
+-- with the durable first admission after the retry-key lookup.
+-- goal_preparation_for(enrollment, destination, reference) and
+-- goal_terminal_receipt_for(enrollment, destination, reference) are internal exact-
+-- enrollment lookups. Retained rows are not observable through an inactive enrollment.
+-- execute_frozen_goal_write(preparation) performs at most one ordinary Goal-domain
+-- write using only preparation.target, expected_goal_version, and operation.
+-- Its typed durability outcome covers the ordinary Goal admission, frozen-version
+-- check, mutation, and classified receipt as one durable boundary.
 -- local_peer(peer): peer.instance_id is the executing instance's identity.
--- automatic_continuation_tool(tool): tool is ReadAutomaticContinuation or SetAutomaticContinuation.
--- source_current(request): trusted tool-call context and executing transcript
--- belong to the current Coordinator.
+-- executing_instance_id(): the executing instance's durable identity.
+-- native_mutation_tool(tool): tool is create_conversation or rename_conversation.
+-- selector_null_routes_local(tool): tool is read_goal, read_conversation,
+-- resolve_reference, or query_database.
+-- selector_string_value(selector): the exact case-sensitive string supplied by an
+-- ExplicitStringToolSelector; no whitespace or case normalization occurs.
+-- coordinator_goal_prepare_or_apply(tool): tool is prepare_goal or apply_goal.
+-- goal_preparation_deadline_us(now_us, 15_minutes): the destination's current
+-- microsecond timestamp plus the fixed fifteen-minute Goal preparation lifetime.
+-- destination_goal_version(destination, target): the destination-owned ordinary
+-- target's Goal version at preparation admission.
+-- explicit_null_rejected(tool): tool is send_conversation_message, read_automatic_continuation,
+-- set_automatic_continuation, create_conversation, rename_conversation, prepare_goal, or apply_goal.
+-- automatic_continuation_tool(tool): tool is read_automatic_continuation or set_automatic_continuation.
+-- current_coordinator_authorized(): the executing transcript belongs to the current
+-- Coordinator at dispatch.
+-- current_native_action_source_call(): the trusted tool-call context's exact source
+-- ProductConversation, transcript, assistant-message and tool-use identities.
+-- source_current(request): an automatic-continuation request's trusted context and
+-- executing transcript belong to the current Coordinator.
 -- destination_authorized(request, peer): authenticated peer equals caller,
 -- destination identity equals local instance, current Federation send authority
 -- holds, and the exact published target resolves in the preference transaction.
+-- native_action_authorized(peer, request): destination policy authorizes the authenticated
+-- peer for the exact native create or rename action; foreign source locators remain
+-- peer-attributed provenance and are not resolved as destination-local transcript rows.
+-- native_create_response_valid(peer, request, response): peer is the selected
+-- authenticated destination for the specific outstanding request; status is accepted;
+-- every caller, destination and request identity matches; and ProductConversation identity
+-- equals the durable NativeCreateAcceptance for request.request_id.
+-- destination_native_create_status(request_id): unknown or the complete creation readback
+-- from one destination persistence snapshot, including publication route and execution evidence.
+-- native_create_status_response_valid(peer, request, response): peer is the selected
+-- authenticated destination for this exact outstanding read; caller, destination and request
+-- identities match; and a known result is one complete destination snapshot for that request.
+-- native_rename_response_valid(peer, request, response): peer is the selected
+-- authenticated destination for the specific outstanding request; caller, destination,
+-- operation, ProductConversation and root identities match; the status is a bounded
+-- destination action outcome; and applied or replayed data is the original immutable receipt.
+-- source_owner_equal(request_instance, request_source, receipt_instance, receipt_source):
+-- instance, source ProductConversation and source transcript are equal; a retry may have
+-- a later assistant-message and tool-use locator while the receipt retains the first call.
+-- normalize_title(title): the destination naming action's canonical normalized title.
+-- destination_accept_native_create(request, peer): invokes the destination's shared
+-- creation action and returns its stable ProductConversation identity only after the
+-- creation job, accepted effective defaults and first peer-qualified provenance are durable.
+-- accepted_model_for(request) and accepted_language_for(request): the choices frozen by
+-- that acceptance; omission resolves only on first acceptance.
+-- native_create_retry_matches(prior, peer, request): request identity, destination-scoped
+-- intent and source instance/ProductConversation/transcript owner match; the retry's
+-- assistant-message and tool-use locator may differ and never replaces prior.source.
+-- native_rename_target_exists(request), native_rename_target_is_ordinary(request),
+-- native_rename_target_admissible(request) and native_rename_fence_matches(request):
+-- destination-owned target-kind, lifecycle/admission and fence classification.
+-- destination_slug_for(request): the route projection allocated atomically with rename.
+-- rename_commit_time_micros(request): the destination transaction's commit timestamp.
+-- native_rename_retry_matches(prior, peer, request): operation, target, root, expected
+-- revision, normalized title and source instance/ProductConversation/transcript owner match;
+-- the retry's assistant-message and tool-use locator may differ and never replaces prior.source.
+-- RemoteNativeCreateFailed and RemoteNativeRenameFailed cover definitive authentication,
+-- transport, unsupported-endpoint, strict-decoding, protocol and response-verification failures;
+-- RemoteNativeCreateOutcomeUncertain covers a create whose durable acceptance is unknown to
+-- the source. Committed destination action outcomes are not transport failures.
+-- encoded_json_bytes(value): byte length of the canonical strict JSON wire encoding.
+-- Native request and response entities exist only after a decoder rejects unknown fields,
+-- missing fields, malformed identifiers or enums, forbidden nulls and over-limit bodies.
 -- result_matches(request, result): caller, destination and target kind match;
 -- an ordinary stable ID matches exactly; a Coordinator result carries a
 -- syntactically valid stable ID returned by that authenticated exact destination
 -- for its Coordinator singleton; a set also matches the Boolean.
 rule RejectSelfAutomaticContinuationSelection {
     when: DispatchAutomaticContinuation(selection, request)
-    requires: selection.instance != null and not selection.failed
+    requires: selection.destination != null and not selection.failed
     requires: selection.destination != null and local_peer(selection.destination)
-    ensures: SelectionError(selection.tool, selection.instance)
+    ensures: SelectionError(selection.tool, selector_string_value(selection.selector))
     -- No remote request, local execution or alternate-peer dispatch.
 }
 
 rule DispatchRemoteAutomaticContinuation {
     when: DispatchAutomaticContinuation(selection, request)
-    requires: selection.instance != null and not selection.failed
+    requires: selection.destination != null and not selection.failed
     requires: selection.destination != null and selection.destination.trusted
     requires: not local_peer(selection.destination)
     requires: source_current(request)
@@ -506,7 +1019,7 @@ rule RejectMismatchedRemoteAutomaticContinuationResponse {
     -- No local execution or alternate-peer dispatch.
 }
 
--- REQ-FED-021: omission, explicit JSON null and exact "local" route locally
+-- REQ-FED-026: omission, explicit JSON null and exact "local" route locally
 -- before SelectTool normalizes local selection.
 -- Helpers:
 -- valid_continue_selector(selection, request): selection contains an
@@ -700,6 +1213,197 @@ rule ReadRemoteGoal {
     @guidance
         -- Resolve the stable conversation, wait for the requested version, and
         -- apply the destination local read_goal timeout and result semantics.
+}
+
+-- REQ-FED-025. Source routing retains omitted, explicit-null, and string selectors.
+-- Goal prepare/apply rejects explicit null; omission and exact "local" remain local.
+-- A non-local string must resolve to one non-self peer before a selector-free
+-- federation request is formed.
+
+rule PrepareRemoteCoordinatorGoal {
+    when: PrepareRemoteCoordinatorGoal(source, destination, request)
+    let deadline = goal_preparation_deadline_us(now_us, 15_minutes)
+    let expected_version = destination_goal_version(destination, request.target)
+    let reference = opaque_enrollment_scoped_reference(source, destination)
+    let authenticated_enrollment = transport_authenticated_enrollment(source, destination)
+    let retry_key = goal_prepare_retry_key(request.source_call)
+    requires: source.trusted and destination.trusted
+    requires: current_goal_prepare_authority(source, request.source_call)
+    requires: source_aggregate_admission_held_through_remote_call(source, request.source_call)
+    requires: destination_enrollment_authorized(authenticated_enrollment, destination)
+    requires: authenticated_enrollment.instance_id = source.instance_id
+    requires: authenticated_enrollment.enrollment_id != ""
+    requires: exact_transport_destination(destination)
+    requires: request.source_call.source_product_conversation.kind = coordinator
+    requires: source_exact_transcript(request.source_call.source_product_conversation, request.source_call.exact_transcript_id)
+    requires: request.source_call.exact_transcript_id != ""
+    requires: request.source_call.workflow_id != ""
+    requires: request.source_call.turn_id != ""
+    requires: request.source_call.message_id != ""
+    requires: request.source_call.tool_use_id != ""
+    requires: request.target.kind = ordinary
+    requires: destination_owns_product_conversation(destination, request.target)
+    requires: not exists RemoteGoalPreparation{authenticated_enrollment: authenticated_enrollment, retry_key: retry_key}
+    ensures: RemoteGoalPreparation.created(
+        reference: reference,
+        authenticated_enrollment: authenticated_enrollment,
+        destination_instance_id: destination.instance_id,
+        retry_key: retry_key,
+        source_call: request.source_call,
+        target: request.target,
+        expected_goal_version: expected_version,
+        expires_at_us: deadline,
+        operation: request.coordinator_goal_operation,
+        state: prepared
+    )
+    ensures: GoalPrepareResult.created(reference: reference, expires_at_us: deadline)
+    @guidance
+        -- Persist the exact ordinary target, its destination-derived version, the
+        -- complete operation, provenance, enrollment scope, and original deadline.
+}
+
+rule ReplayRemoteGoalPrepare {
+    when: PrepareRemoteCoordinatorGoal(source, destination, request)
+    let authenticated_enrollment = transport_authenticated_enrollment(source, destination)
+    let retry_key = goal_prepare_retry_key(request.source_call)
+    let prior = RemoteGoalPreparation{authenticated_enrollment: authenticated_enrollment, retry_key: retry_key}
+    requires: source.trusted and destination.trusted
+    requires: current_goal_prepare_authority(source, request.source_call)
+    requires: source_aggregate_admission_held_through_remote_call(source, request.source_call)
+    requires: destination_enrollment_authorized(authenticated_enrollment, destination)
+    requires: exists prior
+    requires: same_goal_prepare(prior, request, destination)
+    ensures: GoalPrepareResult.created(reference: prior.reference, expires_at_us: prior.expires_at_us)
+    -- Replay retains the first deadline even after expiry and performs no mutation.
+}
+
+rule RejectConflictingRemoteGoalPrepare {
+    when: PrepareRemoteCoordinatorGoal(source, destination, request)
+    let authenticated_enrollment = transport_authenticated_enrollment(source, destination)
+    let retry_key = goal_prepare_retry_key(request.source_call)
+    let prior = RemoteGoalPreparation{authenticated_enrollment: authenticated_enrollment, retry_key: retry_key}
+    requires: source.trusted and destination.trusted
+    requires: current_goal_prepare_authority(source, request.source_call)
+    requires: source_aggregate_admission_held_through_remote_call(source, request.source_call)
+    requires: destination_enrollment_authorized(authenticated_enrollment, destination)
+    requires: exists prior
+    requires: not same_goal_prepare(prior, request, destination)
+    ensures: GoalPrepareConflict(request.source_call.tool_use_id)
+    -- Transcript, target, destination, provenance, or operation drift cannot replace prior admission.
+}
+
+rule ReplayTerminalRemoteGoalReceipt {
+    when: ApplyRemoteCoordinatorGoal(source, destination, request)
+    let authenticated_enrollment = transport_authenticated_enrollment(source, destination)
+    let preparation = goal_preparation_for(authenticated_enrollment, destination.instance_id, request.reference)
+    let receipt = goal_terminal_receipt_for(authenticated_enrollment, destination.instance_id, request.reference)
+    requires: source.trusted and destination.trusted
+    requires: current_goal_apply_authority(source)
+    requires: source_goal_admission_held(source)
+    requires: destination_enrollment_authorized(authenticated_enrollment, destination)
+    requires: preparation.authenticated_enrollment = authenticated_enrollment
+    requires: preparation.destination_instance_id = destination.instance_id
+    requires: exists receipt
+    requires: receipt.authenticated_enrollment = authenticated_enrollment
+    requires: receipt.destination_instance_id = destination.instance_id
+    requires: receipt.reference = request.reference
+    ensures: replay_goal_terminal_receipt(receipt)
+    -- Receipt lookup and replay precede expiry, version, and claim-state evaluation.
+}
+
+rule RejectExpiredRemoteGoalPreparation {
+    when: ApplyRemoteCoordinatorGoal(source, destination, request)
+    let authenticated_enrollment = transport_authenticated_enrollment(source, destination)
+    let preparation = goal_preparation_for(authenticated_enrollment, destination.instance_id, request.reference)
+    requires: source.trusted and destination.trusted
+    requires: current_goal_apply_authority(source)
+    requires: source_goal_admission_held(source)
+    requires: destination_enrollment_authorized(authenticated_enrollment, destination)
+    requires: preparation.state = prepared
+    requires: now_us >= preparation.expires_at_us
+    ensures: GoalApplyRejection.created(reference: request.reference, reason: "expired")
+    ensures: preparation.state = prepared
+    ensures: not exists GoalTerminalReceipt{authenticated_enrollment: authenticated_enrollment, destination_instance_id: destination.instance_id, reference: request.reference}
+    -- Expiry is checked before claim and performs no Goal write.
+}
+
+rule ClaimRemoteCoordinatorGoalForWrite {
+    when: ApplyRemoteCoordinatorGoal(source, destination, request)
+    let authenticated_enrollment = transport_authenticated_enrollment(source, destination)
+    let preparation = goal_preparation_for(authenticated_enrollment, destination.instance_id, request.reference)
+    requires: source.trusted and destination.trusted
+    requires: current_goal_apply_authority(source)
+    requires: source_goal_admission_held(source)
+    requires: destination_enrollment_authorized(authenticated_enrollment, destination)
+    requires: preparation.authenticated_enrollment = authenticated_enrollment
+    requires: preparation.destination_instance_id = destination.instance_id
+    requires: preparation.state = prepared
+    requires: now_us < preparation.expires_at_us
+    ensures: preparation.state = claimed
+    ensures: ExecuteFrozenRemoteGoalWrite(preparation, request)
+    @guidance
+        -- Commit prepared -> claimed durably before issuing the one frozen Goal write.
+        -- The write uses only preparation.target, expected_goal_version, and operation.
+}
+
+rule ExecuteFrozenRemoteGoalWriteOnce {
+    when: ExecuteFrozenRemoteGoalWrite(preparation, request)
+    let outcome = execute_frozen_goal_write(preparation)
+    requires: preparation.state = claimed
+    requires: not exists RemoteGoalWriteAttempt{preparation: preparation}
+    ensures: RemoteGoalWriteAttempt.created(preparation: preparation, outcome: outcome)
+    ensures: outcome.kind = AppliedFrozenGoalWrite implies GoalTerminalReceipt.created(authenticated_enrollment: preparation.authenticated_enrollment, destination_instance_id: preparation.destination_instance_id, reference: preparation.reference, outcome: AppliedGoalReceipt.created(result: applied_frozen_goal_result(outcome)))
+    ensures: outcome.kind = AppliedFrozenGoalWrite implies GoalApplyResult.created(reference: request.reference, destination_instance_id: preparation.destination_instance_id, result: applied_frozen_goal_result(outcome))
+    ensures: outcome.kind = RejectedFrozenGoalWrite implies GoalTerminalReceipt.created(authenticated_enrollment: preparation.authenticated_enrollment, destination_instance_id: preparation.destination_instance_id, reference: preparation.reference, outcome: RejectedGoalReceipt.created(reason: rejected_frozen_goal_reason(outcome)))
+    ensures: outcome.kind = RejectedFrozenGoalWrite implies GoalApplyRejection.created(reference: request.reference, reason: rejected_frozen_goal_reason(outcome))
+    ensures: outcome.kind = UnclassifiedFrozenGoalWrite implies GoalApplyUnclassified.created(reference: request.reference, retry_closed: true)
+    ensures: outcome.kind = UnclassifiedFrozenGoalWrite implies not exists GoalTerminalReceipt{authenticated_enrollment: preparation.authenticated_enrollment, destination_instance_id: preparation.destination_instance_id, reference: preparation.reference}
+    ensures: outcome.kind = UnclassifiedFrozenGoalWrite implies not exists GoalApplyResult where GoalApplyResult.reference = preparation.reference
+    @guidance
+        -- Commit ordinary Goal admission, the frozen-version check, any mutation,
+        -- and the classified receipt in one destination transaction before replying.
+        -- A claimed reference without a receipt represents an unclassified durable
+        -- boundary, not a classified write awaiting a separate settlement step.
+}
+
+rule RetryClaimedRemoteGoalWithoutReceipt {
+    when: ApplyRemoteCoordinatorGoal(source, destination, request)
+    let authenticated_enrollment = transport_authenticated_enrollment(source, destination)
+    let preparation = goal_preparation_for(authenticated_enrollment, destination.instance_id, request.reference)
+    requires: source.trusted and destination.trusted
+    requires: current_goal_apply_authority(source)
+    requires: source_goal_admission_held(source)
+    requires: destination_enrollment_authorized(authenticated_enrollment, destination)
+    requires: preparation.state = claimed
+    requires: not exists GoalTerminalReceipt{authenticated_enrollment: authenticated_enrollment, destination_instance_id: destination.instance_id, reference: request.reference}
+    ensures: GoalApplyUnclassified.created(reference: request.reference, retry_closed: true)
+    ensures: remote_goal_write_attempt_count(preparation) <= 1
+    -- No ExecuteFrozenRemoteGoalWrite is emitted, so the retry cannot perform a second write.
+}
+
+rule RejectUnknownRemoteGoalReference {
+    when: ApplyRemoteCoordinatorGoal(source, destination, request)
+    let authenticated_enrollment = transport_authenticated_enrollment(source, destination)
+    requires: source.trusted and destination.trusted
+    requires: current_goal_apply_authority(source)
+    requires: source_goal_admission_held(source)
+    requires: destination_enrollment_authorized(authenticated_enrollment, destination)
+    requires: not exists RemoteGoalPreparation{authenticated_enrollment: authenticated_enrollment, destination_instance_id: destination.instance_id, reference: request.reference}
+    ensures: GoalApplyRejection.created(reference: request.reference, reason: "unknown")
+}
+
+rule DenyPrepareForRevokedOrReplacedEnrollment {
+    when: PrepareRemoteCoordinatorGoal(source, destination, request)
+    requires: revoked_or_replaced_transport_enrollment(source, destination)
+    ensures: GoalEnrollmentDenied(prepare_goal)
+    -- Do not inspect or disclose retained preparation or receipt rows.
+}
+
+rule DenyApplyForRevokedOrReplacedEnrollment {
+    when: ApplyRemoteCoordinatorGoal(source, destination, request)
+    requires: revoked_or_replaced_transport_enrollment(source, destination)
+    ensures: GoalEnrollmentDenied(apply_goal)
+    -- The supplied reference is neither looked up nor classified as known or unknown.
 }
 
 rule CreateRemoteSubscription {
@@ -1145,6 +1849,360 @@ rule PeerRevocationCommitted {
         -- destination transaction boundary; admitted work may finish and is audited.
 }
 
+-- canonical_uuid(id): canonical lowercase hyphenated UUID syntax.
+-- raw_body_octets(raw_bytes): count of the received transport octets, before
+-- UTF-8 conversion or JSON parsing; never the length of a re-encoded value.
+-- native_request_limit(family): create_options -> config.native_create_options_request_max_bytes;
+-- rename_options -> config.native_rename_options_request_max_bytes;
+-- create -> config.native_create_request_max_bytes;
+-- create_status -> config.native_create_status_request_max_bytes;
+-- rename -> config.native_rename_request_max_bytes.
+-- native_response_limit(family): create_options -> config.native_create_options_response_max_bytes;
+-- rename_options -> config.native_rename_options_response_max_bytes;
+-- create -> config.native_create_response_max_bytes;
+-- create_status -> config.native_create_status_response_max_bytes;
+-- rename -> config.native_rename_response_max_bytes.
+-- native_request_decodes/native_response_decodes: whether the family-specific
+-- closed JSON decoder accepts this exact body; unknown or operation-mismatched
+-- fields, absent required fields, forbidden nulls, malformed UUIDs and enums fail.
+-- decoded_native_request/decoded_native_response: the typed value produced only
+-- when the matching predicate succeeds. raw_request_checked/raw_response_checked
+-- require NativeRequestBodyChecked/NativeResponseBodyChecked for the exact raw
+-- body and decoded value.
+-- encoded_json_bytes(value): octets in the strict canonical emitted JSON body.
+-- The encoded-size invariants therefore constrain response emission as well as
+-- the raw receive-side rules above constraining acceptance before decoding.
+-- native_create_options_response_valid/native_rename_options_response_valid:
+-- authenticated selected peer and exact outstanding correlation, caller and
+-- destination identities match; returned data belongs to that destination.
+-- destination_create_options(request): local native project and model options,
+-- cwd normalization, truncation and defaults in this destination's namespace.
+-- destination_rename_detail(reference): local native detail for that reference;
+-- it does not perform rename, read a receipt, or confer other CRUD authority.
+
+rule BoundRawNativeRequestBeforeDecode {
+    when: ReceiveNativeProtocolRequestBytes(peer, family, raw_bytes, raw_byte_count)
+    requires: raw_byte_count = raw_body_octets(raw_bytes)
+    requires: raw_byte_count > 0 and raw_byte_count <= native_request_limit(family)
+    ensures: NativeRequestBodyBounded(peer, family, raw_bytes)
+    ensures: StrictNativeRequestDecodeAttempt(peer, family, raw_bytes)
+}
+
+rule RejectOversizeRawNativeRequestBeforeDecode {
+    when: ReceiveNativeProtocolRequestBytes(peer, family, raw_bytes, raw_byte_count)
+    requires: raw_byte_count = raw_body_octets(raw_bytes)
+    requires: raw_byte_count = 0 or raw_byte_count > native_request_limit(family)
+    ensures: NativeProtocolRequestRejectedWithoutDecodeOrAction(peer, family)
+}
+
+rule BoundRawNativeResponseBeforeDecode {
+    when: ReceiveNativeProtocolResponseBytes(peer, family, raw_bytes, raw_byte_count)
+    requires: raw_byte_count = raw_body_octets(raw_bytes)
+    requires: raw_byte_count > 0 and raw_byte_count <= native_response_limit(family)
+    ensures: NativeResponseBodyBounded(peer, family, raw_bytes)
+    ensures: StrictNativeResponseDecodeAttempt(peer, family, raw_bytes)
+}
+
+rule RejectOversizeRawNativeResponseBeforeDecode {
+    when: ReceiveNativeProtocolResponseBytes(peer, family, raw_bytes, raw_byte_count)
+    requires: raw_byte_count = raw_body_octets(raw_bytes)
+    requires: raw_byte_count = 0 or raw_byte_count > native_response_limit(family)
+    ensures: NativeProtocolResponseRejectedWithoutDecodeOrFallback(peer, family)
+}
+
+rule DecodeBoundedNativeRequest {
+    when: StrictNativeRequestDecodeAttempt(peer, family, raw_bytes)
+    requires: native_request_decodes(family, raw_bytes)
+    let request = decoded_native_request(family, raw_bytes)
+    ensures: NativeRequestBodyChecked(peer, family, raw_bytes, request)
+}
+
+rule DecodeBoundedNativeResponse {
+    when: StrictNativeResponseDecodeAttempt(peer, family, raw_bytes)
+    requires: native_response_decodes(family, raw_bytes)
+    let response = decoded_native_response(family, raw_bytes)
+    ensures: NativeResponseBodyChecked(peer, family, raw_bytes, response)
+}
+
+rule RejectMalformedBoundedNativeRequest {
+    when: StrictNativeRequestDecodeAttempt(peer, family, raw_bytes)
+    requires: not native_request_decodes(family, raw_bytes)
+    ensures: NativeProtocolRequestRejectedWithoutAction(peer, family)
+}
+
+rule RejectMalformedBoundedNativeResponse {
+    when: StrictNativeResponseDecodeAttempt(peer, family, raw_bytes)
+    requires: not native_response_decodes(family, raw_bytes)
+    ensures: NativeProtocolResponseRejectedWithoutFallback(peer, family)
+}
+
+rule ReadNativeCreateOptionsAtAuthenticatedDestination {
+    when: ReadNativeCreateOptions(peer, request)
+    requires: raw_request_checked(peer, create_options, request)
+    requires: peer.trusted and request.caller_instance_id = peer.instance_id
+    requires: request.destination_instance_id = executing_instance_id()
+    requires: native_action_authorized(peer, request)
+    ensures: NativeCreateOptionsReturned(request, destination_create_options(request))
+}
+
+rule ReadNativeRenameDetailAtAuthenticatedDestination {
+    when: ReadNativeRenameOptions(peer, request)
+    requires: raw_request_checked(peer, rename_options, request)
+    requires: peer.trusted and request.caller_instance_id = peer.instance_id
+    requires: request.destination_instance_id = executing_instance_id()
+    requires: native_action_authorized(peer, request)
+    ensures: NativeRenameOptionsReturned(request, destination_rename_detail(request.reference))
+}
+
+rule AcceptVerifiedNativeCreateOptionsResponse {
+    when: ReceiveNativeCreateOptionsResponse(peer, request, response)
+    requires: raw_response_checked(peer, create_options, response)
+    requires: native_create_options_response_valid(peer, request, response)
+    ensures: NativeCreateOptionsResponseAccepted(request, response)
+}
+
+rule RejectInvalidNativeCreateOptionsResponse {
+    when: ReceiveNativeCreateOptionsResponse(peer, request, response)
+    requires: not raw_response_checked(peer, create_options, response) or not native_create_options_response_valid(peer, request, response)
+    ensures: NativeCreateOptionsFailedWithoutFallback(request)
+}
+
+rule AcceptVerifiedNativeRenameOptionsResponse {
+    when: ReceiveNativeRenameOptionsResponse(peer, request, response)
+    requires: raw_response_checked(peer, rename_options, response)
+    requires: native_rename_options_response_valid(peer, request, response)
+    ensures: NativeRenameOptionsResponseAccepted(request, response)
+}
+
+rule RejectInvalidNativeRenameOptionsResponse {
+    when: ReceiveNativeRenameOptionsResponse(peer, request, response)
+    requires: not raw_response_checked(peer, rename_options, response) or not native_rename_options_response_valid(peer, request, response)
+    ensures: NativeRenameOptionsFailedWithoutFallback(request)
+}
+
+rule RemoteNativeCreateOptionsFailureIsTerminal {
+    when: RemoteNativeCreateOptionsFailed(request)
+    ensures: NativeCreateOptionsFailedWithoutFallback(request)
+}
+
+rule RemoteNativeRenameOptionsFailureIsTerminal {
+    when: RemoteNativeRenameOptionsFailed(request)
+    ensures: NativeRenameOptionsFailedWithoutFallback(request)
+}
+
+rule AcceptNativeCreateRequestFromAuthenticatedPeer {
+    when: CreateNativeConversation(peer, request)
+    requires: raw_request_checked(peer, create, request)
+    requires: peer.trusted
+    requires: request.caller_instance_id = peer.instance_id
+    requires: request.destination_instance_id = executing_instance_id()
+    requires: native_action_authorized(peer, request)
+    ensures: NativeCreateRequestAccepted(peer, request)
+}
+
+rule AcceptNativeRenameRequestFromAuthenticatedPeer {
+    when: RenameNativeConversation(peer, request)
+    requires: raw_request_checked(peer, rename, request)
+    requires: peer.trusted
+    requires: request.caller_instance_id = peer.instance_id
+    requires: request.destination_instance_id = executing_instance_id()
+    requires: native_action_authorized(peer, request)
+    ensures: NativeRenameRequestAccepted(peer, request)
+}
+
+rule PersistNativeCreateAcceptance {
+    when: NativeCreateRequestAccepted(peer, request)
+    let prior = NativeCreateAcceptance{destination_instance_id: request.destination_instance_id, request_id: request.request_id}
+    let product_conversation_id = destination_accept_native_create(request, peer)
+    requires: not exists prior
+    requires: not exists HistoricalInternalCreation{request_id: request.request_id}
+    ensures: NativeCreateAcceptance.created(
+        caller_instance_id: request.caller_instance_id,
+        destination_instance_id: request.destination_instance_id,
+        request_id: request.request_id,
+        product_conversation_id: product_conversation_id,
+        cwd: request.cwd,
+        objective: request.objective,
+        accepted_model: accepted_model_for(request),
+        effort: request.effort,
+        accepted_language: accepted_language_for(request),
+        start: request.start,
+        source_instance_id: peer.instance_id,
+        source: request.source
+    )
+    ensures: NativeCreateAcceptedResult(request, product_conversation_id)
+    @guidance
+        -- Durable acceptance, effective defaults, reserved ProductConversation identity
+        -- and first peer-qualified provenance commit before success is returned.
+}
+
+rule ReplayNativeCreateAcceptance {
+    when: NativeCreateRequestAccepted(peer, request)
+    let prior = NativeCreateAcceptance{destination_instance_id: request.destination_instance_id, request_id: request.request_id}
+    requires: exists prior
+    requires: native_create_retry_matches(prior, peer, request)
+    ensures: NativeCreateAcceptedResult(request, prior.product_conversation_id)
+    -- The retained acceptance and first source call are unchanged.
+}
+
+rule RejectChangedNativeCreateRetry {
+    when: NativeCreateRequestAccepted(peer, request)
+    let prior = NativeCreateAcceptance{destination_instance_id: request.destination_instance_id, request_id: request.request_id}
+    requires: exists prior
+    requires: not native_create_retry_matches(prior, peer, request)
+    ensures: NativeCreateIdentityConflict(request)
+    -- No second ProductConversation is reserved and the retained acceptance is unchanged.
+}
+
+rule ApplyNativeRename {
+    when: NativeRenameRequestAccepted(peer, request)
+    let prior = NativeRenameReceipt{destination_instance_id: request.destination_instance_id, operation_id: request.operation_id}
+    requires: not exists prior
+    requires: not exists HistoricalUnqualifiedRenameReceipt{operation_id: request.operation_id}
+    requires: native_rename_target_exists(request)
+    requires: native_rename_target_is_ordinary(request)
+    requires: native_rename_target_admissible(request)
+    requires: native_rename_fence_matches(request)
+    ensures: NativeRenameReceipt.created(
+        caller_instance_id: request.caller_instance_id,
+        destination_instance_id: request.destination_instance_id,
+        operation_id: request.operation_id,
+        product_conversation_id: request.product_conversation_id,
+        root_transcript_id: request.expected_root_transcript_id,
+        title: normalize_title(request.title),
+        slug_at_commit: destination_slug_for(request),
+        name_revision_before: request.expected_name_revision,
+        committed_at_unix_micros: rename_commit_time_micros(request),
+        source_instance_id: peer.instance_id,
+        source: request.source
+    )
+    ensures: NativeRenameAppliedResult(request)
+    @guidance
+        -- Commit the title and route projection mutation with this immutable receipt
+        -- in the destination naming transaction before returning applied.
+}
+
+rule ReplayNativeRename {
+    when: NativeRenameRequestAccepted(peer, request)
+    let prior = NativeRenameReceipt{destination_instance_id: request.destination_instance_id, operation_id: request.operation_id}
+    requires: exists prior
+    requires: native_rename_retry_matches(prior, peer, request)
+    ensures: NativeRenameReplayedResult(request, prior)
+    -- Replay reads the original receipt before resolving current target state.
+}
+
+rule RejectChangedNativeRenameRetry {
+    when: NativeRenameRequestAccepted(peer, request)
+    let prior = NativeRenameReceipt{destination_instance_id: request.destination_instance_id, operation_id: request.operation_id}
+    requires: exists prior
+    requires: not native_rename_retry_matches(prior, peer, request)
+    ensures: NativeRenameConflictResult(request)
+    -- The historical receipt and current name are unchanged.
+}
+
+rule ClassifyNativeRenameStale {
+    when: NativeRenameRequestAccepted(peer, request)
+    requires: not exists NativeRenameReceipt{destination_instance_id: request.destination_instance_id, operation_id: request.operation_id}
+    requires: native_rename_target_exists(request)
+    requires: native_rename_target_is_ordinary(request)
+    requires: native_rename_target_admissible(request)
+    requires: not native_rename_fence_matches(request)
+    ensures: NativeRenameStaleResult(request)
+}
+
+rule ClassifyNativeRenameNotFound {
+    when: NativeRenameRequestAccepted(peer, request)
+    requires: not exists NativeRenameReceipt{destination_instance_id: request.destination_instance_id, operation_id: request.operation_id}
+    requires: not native_rename_target_exists(request)
+    ensures: NativeRenameNotFoundResult(request)
+}
+
+rule ClassifyNativeRenameUnavailable {
+    when: NativeRenameRequestAccepted(peer, request)
+    requires: not exists NativeRenameReceipt{destination_instance_id: request.destination_instance_id, operation_id: request.operation_id}
+    requires: native_rename_target_exists(request)
+    requires: not native_rename_target_is_ordinary(request) or not native_rename_target_admissible(request)
+    ensures: NativeRenameUnavailableResult(request)
+}
+
+rule ReadKnownNativeCreateStatusFromAuthenticatedOwner {
+    when: ReadNativeCreateStatus(peer, request)
+    let acceptance = NativeCreateAcceptance{destination_instance_id: request.destination_instance_id, request_id: request.request_id}
+    requires: raw_request_checked(peer, create_status, request)
+    requires: peer.trusted
+    requires: request.caller_instance_id = peer.instance_id
+    requires: request.destination_instance_id = executing_instance_id()
+    requires: native_action_authorized(peer, request)
+    requires: exists acceptance
+    requires: acceptance.caller_instance_id = peer.instance_id
+    ensures: NativeCreateStatusSnapshotReturned(request, destination_native_create_status(request.request_id))
+    @guidance
+        -- Return one complete destination snapshot containing accepted identity,
+        -- provisioning status, publication/route and initial-execution evidence.
+}
+
+rule ReadUnknownNativeCreateStatusFromAuthenticatedPeer {
+    when: ReadNativeCreateStatus(peer, request)
+    requires: raw_request_checked(peer, create_status, request)
+    requires: peer.trusted
+    requires: request.caller_instance_id = peer.instance_id
+    requires: request.destination_instance_id = executing_instance_id()
+    requires: native_action_authorized(peer, request)
+    requires: not exists NativeCreateAcceptance{destination_instance_id: request.destination_instance_id, request_id: request.request_id}
+    ensures: NativeCreateStatusUnknownResult(request)
+}
+
+rule RejectNativeCreateStatusReadByDifferentOwner {
+    when: ReadNativeCreateStatus(peer, request)
+    let acceptance = NativeCreateAcceptance{destination_instance_id: request.destination_instance_id, request_id: request.request_id}
+    requires: raw_request_checked(peer, create_status, request)
+    requires: peer.trusted
+    requires: request.caller_instance_id = peer.instance_id
+    requires: request.destination_instance_id = executing_instance_id()
+    requires: exists acceptance
+    requires: acceptance.caller_instance_id != peer.instance_id
+    ensures: NativeCreateStatusReadRejected(request)
+}
+
+rule AcceptVerifiedNativeCreateStatusResponse {
+    when: ReceiveNativeCreateStatusResponse(peer, request, response)
+    requires: raw_response_checked(peer, create_status, response)
+    requires: native_create_status_response_valid(peer, request, response)
+    ensures: NativeCreateStatusResponseAccepted(request, response)
+}
+
+rule RejectInvalidNativeCreateStatusResponse {
+    when: ReceiveNativeCreateStatusResponse(peer, request, response)
+    requires: not raw_response_checked(peer, create_status, response) or not native_create_status_response_valid(peer, request, response)
+    ensures: NativeCreateStatusReadFailedWithoutFallback(request)
+}
+
+rule AcceptVerifiedNativeCreateResponse {
+    when: ReceiveNativeCreateConversationResponse(peer, request, response)
+    requires: raw_response_checked(peer, create, response)
+    requires: native_create_response_valid(peer, request, response)
+    ensures: NativeCreateResponseAccepted(request, response)
+}
+
+rule RejectInvalidNativeCreateResponse {
+    when: ReceiveNativeCreateConversationResponse(peer, request, response)
+    requires: not raw_response_checked(peer, create, response) or not native_create_response_valid(peer, request, response)
+    ensures: NativeCreateFailedWithoutFallback(request)
+}
+
+rule AcceptVerifiedNativeRenameResponse {
+    when: ReceiveNativeRenameConversationResponse(peer, request, response)
+    requires: raw_response_checked(peer, rename, response)
+    requires: native_rename_response_valid(peer, request, response)
+    ensures: NativeRenameResponseAccepted(request, response)
+}
+
+rule RejectInvalidNativeRenameResponse {
+    when: ReceiveNativeRenameConversationResponse(peer, request, response)
+    requires: not raw_response_checked(peer, rename, response) or not native_rename_response_valid(peer, request, response)
+    ensures: NativeRenameFailedWithoutFallback(request)
+}
+
 invariant TerminalEvidenceDeadlineIsFixed {
     for gap in GapTombstones:
         gap.terminal_evidence_expires_at = gap.failed_at + config.terminal_evidence_lifetime
@@ -1171,7 +2229,7 @@ invariant TerminalEvidenceDoesNotExpandReplay {
     -- event and never makes failed_gap eligible for normal ordered pulling.
 }
 
--- REQ-FED-021–022: durable reservations, not retry-cache age, own the
+-- REQ-FED-026–027: durable reservations, not retry-cache age, own the
 -- handoff's winning opening and cannot be replaced by a different call.
 rule CompleteRemoteContinueOpening {
     when: CompleteRemoteContinueOpening(reservation, accepted_opening_id)
@@ -1193,10 +2251,27 @@ invariant RemoteContinueReservationOwnsBoundary {
     for reservation in RemoteContinueReservations:
         not exists RemoteContinueReservation{product_conversation_id: reservation.product_conversation_id, predecessor_transcript_id: reservation.predecessor_transcript_id, retry_identity: other_retry_identity(reservation)}
 }
+
+invariant OmittedSelectionIsLocal {
+    for s in ToolSelections where s.selector.kind = OmittedToolSelector:
+        s.destination = null and not s.failed
+}
+
 invariant RemoteSelectionNeverFallsBack {
-    for s in ToolSelections where s.instance != null:
+    for s in ToolSelections where s.selector.kind = ExplicitStringToolSelector and selector_string_value(s.selector) != "local":
         s.destination != null or s.failed
     -- Remote failures cannot trigger LocalToolExecution or another destination.
+}
+
+invariant FrozenRemoteGoalWriteAtMostOnce {
+    for preparation in RemoteGoalPreparations:
+        remote_goal_write_attempt_count(preparation) <= 1
+}
+
+invariant ClassifiedRemoteGoalWriteHasAtomicReceipt {
+    for attempt in RemoteGoalWriteAttempts:
+        attempt.outcome.kind = AppliedFrozenGoalWrite implies exists GoalTerminalReceipt{authenticated_enrollment: attempt.preparation.authenticated_enrollment, destination_instance_id: attempt.preparation.destination_instance_id, reference: attempt.preparation.reference, outcome: AppliedGoalReceipt{result: applied_frozen_goal_result(attempt.outcome)}}
+        attempt.outcome.kind = RejectedFrozenGoalWrite implies exists GoalTerminalReceipt{authenticated_enrollment: attempt.preparation.authenticated_enrollment, destination_instance_id: attempt.preparation.destination_instance_id, reference: attempt.preparation.reference, outcome: RejectedGoalReceipt{reason: rejected_frozen_goal_reason(attempt.outcome)}}
 }
 
 invariant WatchCursorAndBacklogStayConsistent {
@@ -1229,12 +2304,16 @@ actor TrustedPeer {
 surface FederationToolSurface {
     facing peer: TrustedPeer
     context continue_request: RemoteContinueRequest
+    context goal_prepare: GoalPrepareRequest
+    context goal_apply: GoalApplyRequest
     provides:
         SendRemoteMessage(peer, message_id, target, content, provenance)
         ReadRemoteGoal(peer, target, requested_version, timeout)
         ReadRemotePreference(peer, request)
         SetRemotePreference(peer, request)
         ReceiveRemoteContinue(peer, continue_request)
+        PrepareRemoteCoordinatorGoal(peer, destination, goal_prepare)
+        ApplyRemoteCoordinatorGoal(peer, destination, goal_apply)
     @guarantee DomainParity
         -- Destination domain services enforce the same admission, stable
         -- conversation resolution, version wait, timeout, and result semantics.
@@ -1274,4 +2353,682 @@ surface FederationWatchSurface {
         -- instance's restart; continuation retains the stable subscription.
     @guarantee ExplicitTerminalGap
         -- A terminal gap requires a current-state read and new subscription.
+}
+
+
+enum NativeCreateAcceptanceStatus {
+    accepted
+}
+
+enum NativeCreatePublicationKind {
+    none
+    | available
+    | historical
+}
+
+enum NativeCreateInitialExecutionKind {
+    queued
+    | running
+    | completed
+    | failed
+    | cancelled
+    | awaiting_user_response
+    | awaiting_task_approval
+    | unavailable
+}
+
+enum NativeCreateStart {
+    submit_objective
+}
+
+enum NativeProtocolFamily {
+    create_options
+    | rename_options
+    | create
+    | create_status
+    | rename
+}
+
+entity NativeCreateOptionsRequest {
+    kind: NativeCreateOptionsWithoutCwd | NativeCreateOptionsWithCwd
+    caller_instance_id: String
+    destination_instance_id: String
+    correlation_id: String
+}
+
+variant NativeCreateOptionsWithoutCwd : NativeCreateOptionsRequest {}
+
+variant NativeCreateOptionsWithCwd : NativeCreateOptionsRequest {
+    cwd: String
+}
+
+value NativeCreateProjectOption {
+    project_id: String
+    cwd: String
+}
+
+enum NativeModelEffort {
+    none
+    | minimal
+    | low
+    | medium
+    | high
+    | xhigh
+    | max
+}
+
+entity NativeEffortCapabilities {
+    support: NativeEffortUnsupported | NativeEffortUnknown | NativeEffortSupported
+}
+
+variant NativeEffortUnsupported : NativeEffortCapabilities {}
+
+variant NativeEffortUnknown : NativeEffortCapabilities {}
+
+variant NativeEffortSupported : NativeEffortCapabilities {
+    levels: List<NativeModelEffort>
+    native_default: NativeEffortDefault
+}
+
+-- NativeEffortDefault uses an externally tagged strict JSON wire shape. Unknown
+-- is the string `"unknown"`; known is the one-key object
+-- `{"known": <NativeModelEffort>}`. `kind` is a model discriminant, not a wire
+-- field, and no alternate object fields are accepted.
+entity NativeEffortDefault {
+    kind: NativeEffortDefaultUnknown | NativeEffortDefaultKnown
+}
+
+variant NativeEffortDefaultUnknown : NativeEffortDefault {}
+
+variant NativeEffortDefaultKnown : NativeEffortDefault {
+    level: NativeModelEffort
+}
+
+value NativeCreateModelOption {
+    model: String
+    supported_efforts: NativeEffortCapabilities
+}
+
+entity NativeCreateOptionsResponse {
+    caller_instance_id: String
+    destination_instance_id: String
+    correlation_id: String
+    cwd: String?
+    projects: List<NativeCreateProjectOption>
+    projects_truncated: Boolean
+    models: List<NativeCreateModelOption>
+    default_model: String
+    default_llm_language: String
+}
+
+entity NativeRenameOptionsRequest {
+    caller_instance_id: String
+    destination_instance_id: String
+    correlation_id: String
+    reference: String
+}
+
+value NativeRenameDetail {
+    can_rename: Boolean
+    product_conversation_id: String
+    root_transcript_id: String
+    name_revision: Integer
+    title: String?
+    slug: String?
+}
+
+enum NativeRenameDetailAction {
+    detail
+    | read
+    | rename
+}
+
+entity NativeRenameOptionsResponse {
+    caller_instance_id: String
+    destination_instance_id: String
+    correlation_id: String
+    canonical_route: String
+    detail: NativeRenameDetail
+    allowed_actions: List<NativeRenameDetailAction>
+}
+
+-- Rename discovery resolves one reference to local native detail; it does not
+-- carry mutation fields or authorize generic conversation CRUD.
+
+entity NativeCreateConversationRequest {
+    caller_instance_id: String
+    destination_instance_id: String
+    request_id: String
+    cwd: String
+    objective: String
+    model: String?
+    effort: String?
+    language: String?
+    start: NativeCreateStart
+    source: NativeActionSourceCall
+}
+
+entity NativeRenameConversationRequest {
+    caller_instance_id: String
+    destination_instance_id: String
+    operation_id: String
+    product_conversation_id: String
+    expected_root_transcript_id: String
+    expected_name_revision: Integer
+    title: String
+    source: NativeActionSourceCall
+}
+
+entity NativeCreateAcceptance {
+    caller_instance_id: String
+    destination_instance_id: String
+    request_id: String
+    product_conversation_id: String
+    cwd: String
+    objective: String
+    accepted_model: String
+    effort: String?
+    accepted_language: String
+    start: NativeCreateStart
+    source_instance_id: String
+    source: NativeActionSourceCall
+}
+
+entity NativeRenameReceipt {
+    caller_instance_id: String
+    destination_instance_id: String
+    operation_id: String
+    product_conversation_id: String
+    root_transcript_id: String
+    title: String
+    slug_at_commit: String
+    name_revision_before: Integer
+    committed_at_unix_micros: Integer
+    source_instance_id: String
+    source: NativeActionSourceCall
+}
+
+entity NativeCreateStatusRequest {
+    caller_instance_id: String
+    destination_instance_id: String
+    request_id: String
+}
+
+entity NativeCreateStatusResponse {
+    kind: NativeCreateStatusKnown | NativeCreateStatusUnknown
+    caller_instance_id: String
+    destination_instance_id: String
+    request_id: String
+}
+
+variant NativeCreateStatusKnown : NativeCreateStatusResponse {
+    product_conversation_id: String
+    creation_status: String
+    provisioning_stage: String
+    provisioning_stage_updated_at_unix_micros: Integer
+    retry_at_unix_micros: Integer?
+    error: String?
+    publication_kind: NativeCreatePublicationKind
+    publication_conversation_id: String?
+    canonical_route: String?
+    initial_execution: NativeCreateInitialExecutionKind
+    initial_failure_reason: String?
+}
+
+variant NativeCreateStatusUnknown : NativeCreateStatusResponse {}
+
+entity NativeCreateConversationResponse {
+    caller_instance_id: String
+    destination_instance_id: String
+    request_id: String
+    product_conversation_id: String
+    status: NativeCreateAcceptanceStatus
+}
+
+entity NativeRenameConversationResponse {
+    caller_instance_id: String
+    destination_instance_id: String
+    operation_id: String
+    product_conversation_id: String
+    root_transcript_id: String
+    status: NativeRenameApplied | NativeRenameReplayed | NativeRenameStale | NativeRenameConflict | NativeRenameNotFound | NativeRenameUnavailable
+}
+
+variant NativeRenameApplied : NativeRenameConversationResponse {
+    receipt_title: String
+    receipt_slug_at_commit: String
+    receipt_name_revision_before: Integer
+    receipt_committed_at_unix_micros: Integer
+    receipt_source_instance_id: String
+    receipt_source: NativeActionSourceCall
+}
+
+variant NativeRenameReplayed : NativeRenameConversationResponse {
+    receipt_title: String
+    receipt_slug_at_commit: String
+    receipt_name_revision_before: Integer
+    receipt_committed_at_unix_micros: Integer
+    receipt_source_instance_id: String
+    receipt_source: NativeActionSourceCall
+}
+
+variant NativeRenameStale : NativeRenameConversationResponse {}
+
+variant NativeRenameConflict : NativeRenameConversationResponse {}
+
+variant NativeRenameNotFound : NativeRenameConversationResponse {}
+
+variant NativeRenameUnavailable : NativeRenameConversationResponse {}
+
+surface NativeProtocolRawRequestIngress {
+    facing peer: TrustedPeer
+    context family: NativeProtocolFamily
+    provides:
+        ReceiveNativeProtocolRequestBytes(peer, family, raw_bytes, raw_byte_count)
+}
+
+surface NativeProtocolRawResponseIngress {
+    facing peer: TrustedPeer
+    context family: NativeProtocolFamily
+    provides:
+        ReceiveNativeProtocolResponseBytes(peer, family, raw_bytes, raw_byte_count)
+}
+
+surface NativeCreateOptionsAction {
+    facing peer: TrustedPeer
+    context request: NativeCreateOptionsRequest
+    provides:
+        ReadNativeCreateOptions(peer, request)
+}
+
+surface NativeCreateOptionsResponseSurface {
+    facing peer: TrustedPeer
+    context request: NativeCreateOptionsRequest
+    context response: NativeCreateOptionsResponse
+    provides:
+        ReceiveNativeCreateOptionsResponse(peer, request, response)
+}
+
+surface NativeRenameOptionsAction {
+    facing peer: TrustedPeer
+    context request: NativeRenameOptionsRequest
+    provides:
+        ReadNativeRenameOptions(peer, request)
+}
+
+surface NativeRenameOptionsResponseSurface {
+    facing peer: TrustedPeer
+    context request: NativeRenameOptionsRequest
+    context response: NativeRenameOptionsResponse
+    provides:
+        ReceiveNativeRenameOptionsResponse(peer, request, response)
+}
+
+surface NativeCreateConversationAction {
+    facing peer: TrustedPeer
+    context request: NativeCreateConversationRequest
+    provides:
+        CreateNativeConversation(peer, request)
+    @guarantee AuthenticatedSourceIdentity
+        -- The destination derives source instance identity from peer credentials;
+        -- source-call locators are admitted only from trusted execution context.
+    @guarantee SharedDestinationActions
+        -- Local dispatch calls the local domain action directly. Remote dispatch
+        -- invokes the same application action at the authenticated destination.
+    @guarantee ExplicitTargetAndNoFallback
+        -- Omitted or exact local selection is local; a remote selection failure
+        -- cannot execute locally or at another destination.
+    @guarantee ClosedBoundedIdentityResponses
+        -- Requests and responses are strict, bounded JSON shapes, and a response
+        -- must identify the exact caller, destination, operation and target.
+    @guarantee BoundedDestinationOptionDiscovery
+        -- Create option discovery uses its strict request/response forms and
+        -- protocol-specific byte limits before native dispatch.
+    @guarantee NativeCreateAcceptanceOnly
+        -- Create preserves the destination-scoped local native intent and reports
+        -- durable request acceptance, not publication, delivery, execution or completion.
+    @guarantee UnsupportedEndpointFailsExplicitly
+        -- Missing peer endpoint is an explicit failure, never a legacy or local
+        -- fallback.
+}
+
+surface NativeRenameConversationAction {
+    facing peer: TrustedPeer
+    context request: NativeRenameConversationRequest
+    provides:
+        RenameNativeConversation(peer, request)
+    @guarantee AuthenticatedSourceIdentity
+        -- The destination derives source instance identity from peer credentials;
+        -- source-call locators are admitted only from trusted execution context.
+    @guarantee SharedDestinationActions
+        -- Local dispatch calls the local domain action directly. Remote dispatch
+        -- invokes the same application action at the authenticated destination.
+    @guarantee ExplicitTargetAndNoFallback
+        -- Omitted or exact local selection is local; a remote selection failure
+        -- cannot execute locally or at another destination.
+    @guarantee ClosedBoundedIdentityResponses
+        -- Requests and responses are strict, bounded JSON shapes, and a response
+        -- must identify the exact caller, destination, operation and target.
+    @guarantee BoundedDestinationOptionDiscovery
+        -- Rename option discovery uses its strict request/response forms and
+        -- protocol-specific byte limits before native dispatch.
+    @guarantee ImmutableRenameReplay
+        -- Rename admits only ordinary ProductConversations. Retry preserves operation
+        -- identity and intent; replay returns its historical receipt without applying
+        -- a later name over current state.
+    @guarantee UnsupportedEndpointFailsExplicitly
+        -- Missing peer endpoint is an explicit failure, never a legacy or local
+        -- fallback.
+}
+
+surface NativeCreateConversationResponseSurface {
+    facing peer: TrustedPeer
+    context request: NativeCreateConversationRequest
+    context response: NativeCreateConversationResponse
+    provides:
+        ReceiveNativeCreateConversationResponse(peer, request, response)
+}
+
+surface NativeCreateStatusAction {
+    facing peer: TrustedPeer
+    context request: NativeCreateStatusRequest
+    provides:
+        ReadNativeCreateStatus(peer, request)
+    @guarantee ExactDestinationReadback
+        -- The authenticated destination returns unknown or, only to the acceptance
+        -- owner, one complete snapshot for this request UUID; uncertainty never falls
+        -- back to a local or alternate peer.
+}
+
+surface NativeCreateStatusResponseSurface {
+    facing peer: TrustedPeer
+    context request: NativeCreateStatusRequest
+    context response: NativeCreateStatusResponse
+    provides:
+        ReceiveNativeCreateStatusResponse(peer, request, response)
+}
+
+surface NativeRenameConversationResponseSurface {
+    facing peer: TrustedPeer
+    context request: NativeRenameConversationRequest
+    context response: NativeRenameConversationResponse
+    provides:
+        ReceiveNativeRenameConversationResponse(peer, request, response)
+}
+
+invariant NativeCreateOptionsRequestsAreWireBounded {
+    for r in NativeCreateOptionsRequests:
+        encoded_json_bytes(r) > 0 and encoded_json_bytes(r) <= config.native_create_options_request_max_bytes
+}
+
+invariant NativeCreateOptionsResponsesAreWireBounded {
+    for r in NativeCreateOptionsResponses:
+        encoded_json_bytes(r) > 0 and encoded_json_bytes(r) <= config.native_create_options_response_max_bytes
+}
+
+invariant NativeRenameOptionsRequestsAreWireBounded {
+    for r in NativeRenameOptionsRequests:
+        encoded_json_bytes(r) > 0 and encoded_json_bytes(r) <= config.native_rename_options_request_max_bytes
+}
+
+invariant NativeRenameOptionsResponsesAreWireBounded {
+    for r in NativeRenameOptionsResponses:
+        encoded_json_bytes(r) > 0 and encoded_json_bytes(r) <= config.native_rename_options_response_max_bytes
+}
+
+invariant NativeCreateOptionsRequestIdentityIsClosed {
+    for r in NativeCreateOptionsRequests:
+        r.caller_instance_id != "" and r.destination_instance_id != ""
+        and canonical_uuid(r.correlation_id)
+        and (r.kind = NativeCreateOptionsWithoutCwd or
+            (r.kind = NativeCreateOptionsWithCwd and r.cwd != ""))
+}
+
+invariant NativeCreateOptionsResponseClosesOverRequest {
+    for r in NativeCreateOptionsResponses:
+        (exists q in NativeCreateOptionsRequests where
+            q.correlation_id = r.correlation_id
+            and q.caller_instance_id = r.caller_instance_id
+            and q.destination_instance_id = r.destination_instance_id
+            and ((q.kind = NativeCreateOptionsWithCwd and r.cwd != null)
+                or (q.kind = NativeCreateOptionsWithoutCwd and r.cwd = null)))
+        and r.default_model != "" and r.default_llm_language != ""
+        and (for p in r.projects: p.project_id != "" and p.cwd != "")
+        and (for m in r.models: m.model != "")
+}
+
+invariant NativeCreateModelEffortCapabilitiesAreClosed {
+    for r in NativeCreateOptionsResponses:
+        (for m in r.models:
+            m.supported_efforts.support = NativeEffortUnsupported
+                or m.supported_efforts.support = NativeEffortUnknown
+                or (m.supported_efforts.support = NativeEffortSupported
+                    and m.supported_efforts.levels.count > 0
+                    and m.supported_efforts.levels.unique.count = m.supported_efforts.levels.count
+                    and (m.supported_efforts.native_default.kind = NativeEffortDefaultUnknown
+                        or (m.supported_efforts.native_default.kind = NativeEffortDefaultKnown
+                            and m.supported_efforts.native_default.level in m.supported_efforts.levels)))
+        )
+}
+
+invariant NativeRenameOptionsRequestIdentityIsClosed {
+    for r in NativeRenameOptionsRequests:
+        r.caller_instance_id != "" and r.destination_instance_id != ""
+        and canonical_uuid(r.correlation_id) and r.reference != ""
+}
+
+invariant NativeRenameOptionsResponseClosesOverDetail {
+    for r in NativeRenameOptionsResponses:
+        (exists q in NativeRenameOptionsRequests where
+            q.correlation_id = r.correlation_id
+            and q.caller_instance_id = r.caller_instance_id
+            and q.destination_instance_id = r.destination_instance_id)
+        and r.canonical_route != ""
+        and r.detail.product_conversation_id != ""
+        and r.detail.root_transcript_id != ""
+        and r.detail.name_revision >= 0
+        and (r.detail.can_rename or not contains(r.allowed_actions, rename))
+        and (not r.detail.can_rename or contains(r.allowed_actions, rename))
+}
+
+invariant NativeCreateRequestHasIntentAndCallProvenance {
+    for r in NativeCreateConversationRequests:
+        r.caller_instance_id != "" and r.destination_instance_id != ""
+        and r.request_id != "" and r.cwd != "" and r.objective != ""
+        and r.source.source_product_conversation_id != ""
+        and r.source.source_transcript_id != ""
+        and r.source.source_assistant_message_id != ""
+        and r.source.source_tool_use_id != ""
+}
+
+invariant NativeRenameRequestPinsTargetAndCallProvenance {
+    for r in NativeRenameConversationRequests:
+        r.caller_instance_id != "" and r.destination_instance_id != ""
+        and r.operation_id != "" and r.product_conversation_id != ""
+        and r.expected_root_transcript_id != ""
+        and r.expected_name_revision >= 0 and r.title != ""
+        and r.source.source_product_conversation_id != ""
+        and r.source.source_transcript_id != ""
+        and r.source.source_assistant_message_id != ""
+        and r.source.source_tool_use_id != ""
+}
+
+invariant NativeCreateAcceptanceIdentityIsUnique {
+    for a in NativeCreateAcceptances:
+        count(NativeCreateAcceptance{destination_instance_id: a.destination_instance_id, request_id: a.request_id}) = 1
+}
+
+invariant NativeRenameReceiptIdentityIsUnique {
+    for p in NativeRenameReceipts:
+        count(NativeRenameReceipt{destination_instance_id: p.destination_instance_id, operation_id: p.operation_id}) = 1
+}
+
+invariant NativeCreateRequestsAreWireBounded {
+    for r in NativeCreateConversationRequests:
+        encoded_json_bytes(r) > 0 and encoded_json_bytes(r) <= config.native_create_request_max_bytes
+}
+
+invariant NativeCreateResponsesAreWireBounded {
+    for r in NativeCreateConversationResponses:
+        encoded_json_bytes(r) > 0 and encoded_json_bytes(r) <= config.native_create_response_max_bytes
+}
+
+invariant NativeCreateStatusRequestsAreWireBounded {
+    for r in NativeCreateStatusRequests:
+        encoded_json_bytes(r) > 0 and encoded_json_bytes(r) <= config.native_create_status_request_max_bytes
+}
+
+invariant NativeCreateStatusResponsesAreWireBounded {
+    for r in NativeCreateStatusResponses:
+        encoded_json_bytes(r) > 0 and encoded_json_bytes(r) <= config.native_create_status_response_max_bytes
+}
+
+invariant NativeRenameRequestsAreWireBounded {
+    for r in NativeRenameConversationRequests:
+        encoded_json_bytes(r) > 0 and encoded_json_bytes(r) <= config.native_rename_request_max_bytes
+}
+
+invariant NativeRenameResponsesAreWireBounded {
+    for r in NativeRenameConversationResponses:
+        encoded_json_bytes(r) > 0 and encoded_json_bytes(r) <= config.native_rename_response_max_bytes
+}
+
+invariant NativeCreateAcceptanceRetainsFirstCall {
+    for a in NativeCreateAcceptances:
+        a.product_conversation_id != ""
+        and a.accepted_model != "" and a.accepted_language != ""
+        and a.source_instance_id = a.caller_instance_id
+        and a.source.source_product_conversation_id != ""
+        and a.source.source_transcript_id != ""
+        and a.source.source_assistant_message_id != ""
+        and a.source.source_tool_use_id != ""
+}
+
+invariant NativeCreateResponseClosesOverAcceptance {
+    for r in NativeCreateConversationResponses:
+        r.status = accepted and r.product_conversation_id != ""
+        and (exists q in NativeCreateConversationRequests where
+            q.request_id = r.request_id
+            and q.caller_instance_id = r.caller_instance_id
+            and q.destination_instance_id = r.destination_instance_id)
+        and (exists a in NativeCreateAcceptances where
+            a.request_id = r.request_id
+            and a.product_conversation_id = r.product_conversation_id
+            and a.caller_instance_id = r.caller_instance_id
+            and a.destination_instance_id = r.destination_instance_id)
+}
+
+invariant NativeCreateStatusResponseClosesOverRequest {
+    for r in NativeCreateStatusResponses:
+        (exists q in NativeCreateStatusRequests where
+            q.request_id = r.request_id
+            and q.caller_instance_id = r.caller_instance_id
+            and q.destination_instance_id = r.destination_instance_id)
+        and (r.kind = NativeCreateStatusUnknown or
+            (exists a in NativeCreateAcceptances where
+                a.request_id = r.request_id
+                and a.product_conversation_id = r.product_conversation_id
+                and a.caller_instance_id = r.caller_instance_id
+                and a.destination_instance_id = r.destination_instance_id))
+}
+
+invariant NativeCreateKnownStatusIsComplete {
+    for r in NativeCreateStatusResponses where r.kind = NativeCreateStatusKnown:
+        r.product_conversation_id != ""
+        and r.creation_status != "" and r.provisioning_stage != ""
+        and r.provisioning_stage_updated_at_unix_micros >= 0
+        and (r.publication_kind = none implies
+            r.publication_conversation_id = null and r.canonical_route = null)
+        and (r.publication_kind = available implies
+            r.publication_conversation_id != null and r.canonical_route != null)
+        and (r.publication_kind = historical implies
+            r.publication_conversation_id != null and r.canonical_route = null)
+        and (r.initial_execution = failed implies r.initial_failure_reason != null)
+        and (r.initial_execution != failed implies r.initial_failure_reason = null)
+}
+
+invariant NativeRenameResponseClosesOverRequest {
+    for r in NativeRenameConversationResponses:
+        (exists q in NativeRenameConversationRequests where
+            q.operation_id = r.operation_id
+            and q.product_conversation_id = r.product_conversation_id
+            and q.expected_root_transcript_id = r.root_transcript_id
+            and q.caller_instance_id = r.caller_instance_id
+            and q.destination_instance_id = r.destination_instance_id)
+}
+
+invariant NativeRenameReceiptRetainsFirstCall {
+    for p in NativeRenameReceipts:
+        p.product_conversation_id != "" and p.root_transcript_id != ""
+        and p.title != "" and p.slug_at_commit != ""
+        and p.name_revision_before >= 0 and p.committed_at_unix_micros >= 0
+        and p.source_instance_id = p.caller_instance_id
+        and p.source.source_product_conversation_id != ""
+        and p.source.source_transcript_id != ""
+        and p.source.source_assistant_message_id != ""
+        and p.source.source_tool_use_id != ""
+        and (exists q in NativeRenameConversationRequests where
+            q.destination_instance_id = p.destination_instance_id
+            and q.caller_instance_id = p.caller_instance_id
+            and q.operation_id = p.operation_id
+            and q.product_conversation_id = p.product_conversation_id
+            and q.expected_root_transcript_id = p.root_transcript_id
+            and q.expected_name_revision = p.name_revision_before
+            and normalize_title(q.title) = p.title
+            and q.source = p.source)
+}
+
+invariant NativeRenameAppliedReceiptClosesOverRequest {
+    for r in NativeRenameConversationResponses where r.status = NativeRenameApplied:
+        r.receipt_name_revision_before >= 0
+        and r.receipt_committed_at_unix_micros >= 0
+        and r.receipt_slug_at_commit != ""
+        and (exists q in NativeRenameConversationRequests where
+            q.operation_id = r.operation_id
+            and q.product_conversation_id = r.product_conversation_id
+            and q.expected_root_transcript_id = r.root_transcript_id
+            and q.expected_name_revision = r.receipt_name_revision_before
+            and normalize_title(q.title) = r.receipt_title
+            and q.caller_instance_id = r.receipt_source_instance_id
+            and q.destination_instance_id = r.destination_instance_id
+            and q.source = r.receipt_source)
+        and (exists p in NativeRenameReceipts where
+            p.operation_id = r.operation_id
+            and p.product_conversation_id = r.product_conversation_id
+            and p.root_transcript_id = r.root_transcript_id
+            and p.title = r.receipt_title
+            and p.slug_at_commit = r.receipt_slug_at_commit
+            and p.name_revision_before = r.receipt_name_revision_before
+            and p.committed_at_unix_micros = r.receipt_committed_at_unix_micros
+            and p.source_instance_id = r.receipt_source_instance_id
+            and p.caller_instance_id = r.caller_instance_id
+            and p.destination_instance_id = r.destination_instance_id
+            and p.source = r.receipt_source)
+}
+
+invariant NativeRenameReplayedReceiptClosesOverRequest {
+    for r in NativeRenameConversationResponses where r.status = NativeRenameReplayed:
+        r.receipt_name_revision_before >= 0
+        and r.receipt_committed_at_unix_micros >= 0
+        and r.receipt_slug_at_commit != ""
+        and (exists q in NativeRenameConversationRequests where
+            q.operation_id = r.operation_id
+            and q.product_conversation_id = r.product_conversation_id
+            and q.expected_root_transcript_id = r.root_transcript_id
+            and q.expected_name_revision = r.receipt_name_revision_before
+            and normalize_title(q.title) = r.receipt_title
+            and q.destination_instance_id = r.destination_instance_id
+            and source_owner_equal(q.caller_instance_id, q.source, r.receipt_source_instance_id, r.receipt_source))
+        and (exists p in NativeRenameReceipts where
+            p.operation_id = r.operation_id
+            and p.product_conversation_id = r.product_conversation_id
+            and p.root_transcript_id = r.root_transcript_id
+            and p.title = r.receipt_title
+            and p.slug_at_commit = r.receipt_slug_at_commit
+            and p.name_revision_before = r.receipt_name_revision_before
+            and p.committed_at_unix_micros = r.receipt_committed_at_unix_micros
+            and p.source_instance_id = r.receipt_source_instance_id
+            and p.caller_instance_id = r.caller_instance_id
+            and p.destination_instance_id = r.destination_instance_id
+            and p.source = r.receipt_source)
 }

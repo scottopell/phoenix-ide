@@ -416,6 +416,20 @@ mod conversation_mutex_gate_tests {
 
         assert!(conversation_b.try_lock_owned().is_ok());
     }
+
+    #[tokio::test]
+    async fn remote_goal_apply_gate_serializes_per_reference_only() {
+        let gates = ConversationMutexGates::default();
+        let reference_a = uuid::Uuid::new_v4();
+        let reference_b = uuid::Uuid::new_v4();
+        let first_a = gates.gate_for(&reference_a.to_string()).await;
+        let duplicate_a = gates.gate_for(&reference_a.to_string()).await;
+        let independent_b = gates.gate_for(&reference_b.to_string()).await;
+
+        let _claimed_without_receipt = first_a.lock_owned().await;
+        assert!(duplicate_a.try_lock_owned().is_err());
+        assert!(independent_b.try_lock_owned().is_ok());
+    }
 }
 
 type RuntimeMaterializationResult = Result<ConversationHandle, String>;
@@ -773,6 +787,9 @@ pub struct RuntimeManager {
     /// conversations independent.
     message_acceptance: ConversationMutexGates,
     product_message_admission: ConversationMutexGates,
+    remote_goal_apply: ConversationMutexGates,
+    #[cfg(test)]
+    remote_goal_apply_arrivals: AsyncMutex<HashMap<uuid::Uuid, Arc<Notify>>>,
     /// Serializes the final durable queue snapshot and executor publication
     /// with queue mutations. The database remains authoritative; this gate
     /// only prevents a newly-started executor from observing an older snapshot.
@@ -847,8 +864,6 @@ pub(crate) enum DatabaseTerminalRecovery {
     AlreadyCommitted,
     Committed {
         projection: Box<phoenix_db::workflow::PersistedConversationProjection>,
-        is_sub_agent: bool,
-        worktree_path: Option<std::path::PathBuf>,
     },
 }
 
@@ -2447,6 +2462,28 @@ pub(crate) async fn conversation_retains_work_scope(
     ))
 }
 
+pub(crate) async fn conversation_retains_work_scope_for_reclamation(
+    db: &crate::db::Database,
+    conv: &crate::db::Conversation,
+) -> Result<bool, crate::db::DbError> {
+    match db.message_target_admission(&conv.id).await? {
+        crate::db::MessageTargetAdmission::Aggregate(
+            crate::db::ProductConversationAdmission::Accepted { .. }
+            | crate::db::ProductConversationAdmission::Refused(_),
+        ) => Ok(true),
+        crate::db::MessageTargetAdmission::Aggregate(
+            crate::db::ProductConversationAdmission::History(product_conversation_id),
+        ) => Ok(db
+            .get_active_close_projection_for_product(&product_conversation_id)
+            .await?
+            .is_some()),
+        crate::db::MessageTargetAdmission::StandaloneAvailable
+        | crate::db::MessageTargetAdmission::StandaloneArchived => {
+            Ok(conversation_attachment_retains_work_scope(conv))
+        }
+    }
+}
+
 fn conversation_resource_scope(conv: &crate::db::Conversation) -> Option<ResourceScopeKey> {
     if conv.runtime_role == crate::work_scope::RuntimeRole::Coordinator {
         return Some(ResourceScopeKey::Coordinator);
@@ -2656,6 +2693,9 @@ impl RuntimeManager {
             fatal_runtime_map_barrier: AsyncMutex::new(None),
             message_acceptance: ConversationMutexGates::default(),
             product_message_admission: ConversationMutexGates::default(),
+            remote_goal_apply: ConversationMutexGates::default(),
+            #[cfg(test)]
+            remote_goal_apply_arrivals: AsyncMutex::new(HashMap::new()),
             steering_projection: ConversationMutexGates::default(),
             evicted_broadcasters: RwLock::new(HashMap::new()),
             aggregate_event_tx,
@@ -5486,12 +5526,7 @@ impl RuntimeManager {
         conversation_id: &str,
         recovery: DatabaseTerminalRecovery,
     ) {
-        let DatabaseTerminalRecovery::Committed {
-            projection,
-            is_sub_agent,
-            worktree_path,
-        } = recovery
-        else {
+        let DatabaseTerminalRecovery::Committed { projection } = recovery else {
             return;
         };
         if !projection.state.is_terminal() {
@@ -5520,9 +5555,6 @@ impl RuntimeManager {
             });
             executor::emit_terminal_lifecycle_event(
                 conversation_id,
-                is_sub_agent,
-                &projection.state,
-                worktree_path.as_deref(),
                 Some(&self.fork_cmd_tx),
                 &broadcaster,
             )
@@ -5530,9 +5562,6 @@ impl RuntimeManager {
         } else {
             executor::complete_terminal_lifecycle_without_broadcast(
                 conversation_id,
-                is_sub_agent,
-                &projection.state,
-                worktree_path.as_deref(),
                 Some(&self.fork_cmd_tx),
             )
             .await;
@@ -5567,7 +5596,7 @@ impl RuntimeManager {
                 Ok(child) => child,
                 Err(crate::db::DbError::ConversationNotFound(_)) => continue,
                 Err(error) => {
-                    return Err(DatabaseTerminalRecoveryError::Retryable(error.to_string()))
+                    return Err(DatabaseTerminalRecoveryError::Retryable(error.to_string()));
                 }
             };
             if child.runtime_role == crate::work_scope::RuntimeRole::SubAgent
@@ -5614,12 +5643,6 @@ impl RuntimeManager {
             };
             executor::complete_terminal_lifecycle_without_broadcast(
                 &conversation.id,
-                conversation.parent_conversation_id.is_some(),
-                &conversation.state,
-                conversation
-                    .conv_mode
-                    .worktree_path()
-                    .map(std::path::Path::new),
                 Some(&self.fork_cmd_tx),
             )
             .await;
@@ -5724,9 +5747,6 @@ impl RuntimeManager {
                             }
                             executor::complete_terminal_lifecycle_without_broadcast(
                                 &conversation_id,
-                                false,
-                                &projection.state,
-                                Some(std::path::Path::new(&projection.cwd)),
                                 Some(&self.fork_cmd_tx),
                             )
                             .await;
@@ -5858,11 +5878,6 @@ impl RuntimeManager {
                 ))
             })?;
         let parent_conversation_id = conversation.parent_conversation_id.clone();
-        let is_sub_agent = parent_conversation_id.is_some();
-        let worktree_path = conversation
-            .conv_mode
-            .worktree_path()
-            .map(std::path::PathBuf::from);
         let command = match obligation.terminal {
             phoenix_workflow::TurnTerminal::Completed => phoenix_workflow::TurnCommand::Complete {
                 turn_id: obligation.turn_id,
@@ -5910,8 +5925,6 @@ impl RuntimeManager {
                 }
                 Ok(DatabaseTerminalRecovery::Committed {
                     projection: Box::new(projection),
-                    is_sub_agent,
-                    worktree_path,
                 })
             }
             Err(settlement_error) => {
@@ -5944,8 +5957,6 @@ impl RuntimeManager {
                     phoenix_db::workflow::TerminalProjectionProbe::Current => {
                         Ok(DatabaseTerminalRecovery::Committed {
                             projection: Box::new(projection),
-                            is_sub_agent,
-                            worktree_path,
                         })
                     }
                     phoenix_db::workflow::TerminalProjectionProbe::Superseded => {
@@ -6934,6 +6945,39 @@ impl RuntimeManager {
                 "Runtime evicted; shutdown signal sent, broadcaster preserved for new runtime"
             );
         }
+    }
+
+    pub(crate) async fn lock_remote_goal_apply(
+        &self,
+        action_reference: uuid::Uuid,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = self
+            .remote_goal_apply
+            .gate_for(&action_reference.to_string())
+            .await;
+        #[cfg(test)]
+        if let Some(arrival) = self
+            .remote_goal_apply_arrivals
+            .lock()
+            .await
+            .remove(&action_reference)
+        {
+            arrival.notify_one();
+        }
+        gate.lock_owned().await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn observe_next_remote_goal_apply_gate_arrival(
+        &self,
+        action_reference: uuid::Uuid,
+    ) -> Arc<Notify> {
+        let arrival = Arc::new(Notify::new());
+        self.remote_goal_apply_arrivals
+            .lock()
+            .await
+            .insert(action_reference, arrival.clone());
+        arrival
     }
 
     pub(crate) async fn lock_message_acceptance(
@@ -14943,8 +14987,6 @@ mod scope_liveness_tests {
                     state: ConvState::Idle,
                     state_updated_at: Utc::now(),
                 }),
-                is_sub_agent: false,
-                worktree_path: None,
             },
         )
         .await;
@@ -15312,7 +15354,6 @@ mod scope_liveness_tests {
 
     #[tokio::test]
     async fn startup_resumes_materialized_tool_result_baton_without_browser_kick() {
-        use phoenix_core::domain::db_schema::ToolResult;
         use phoenix_core::domain::llm_types::ContentBlock;
         use phoenix_core::domain::sm_state::{AssistantMessage, ToolCall, ToolInput};
 
@@ -15339,7 +15380,7 @@ mod scope_liveness_tests {
                         ),
                     ),
                     remaining_tools: Vec::new(),
-                    completed_results: Vec::<ToolResult>::new(),
+                    completed_results: vec![],
                     pending_sub_agents: Vec::new(),
                     assistant_message: AssistantMessage::new(
                         "restart-assistant-tool-use".to_string(),
@@ -15462,7 +15503,7 @@ mod scope_liveness_tests {
 
     #[tokio::test]
     async fn newer_queued_input_joins_owed_baton_before_single_dispatch() {
-        use phoenix_core::domain::db_schema::{MessageContent, ToolResult};
+        use phoenix_core::domain::db_schema::MessageContent;
         use phoenix_core::domain::llm_types::ContentBlock;
         use phoenix_core::domain::sm_state::{AssistantMessage, ThinkInput, ToolCall, ToolInput};
 
@@ -15484,7 +15525,7 @@ mod scope_liveness_tests {
                         }),
                     ),
                     remaining_tools: Vec::new(),
-                    completed_results: Vec::<ToolResult>::new(),
+                    completed_results: vec![],
                     pending_sub_agents: Vec::new(),
                     assistant_message: AssistantMessage::new(
                         "older-assistant".to_string(),
@@ -15813,7 +15854,6 @@ mod scope_liveness_tests {
 
     #[tokio::test]
     async fn global_startup_resumes_materialized_tool_result_baton() {
-        use phoenix_core::domain::db_schema::ToolResult;
         use phoenix_core::domain::llm_types::ContentBlock;
         use phoenix_core::domain::sm_state::{AssistantMessage, ToolCall, ToolInput};
 
@@ -15844,7 +15884,7 @@ mod scope_liveness_tests {
                         ),
                     ),
                     remaining_tools: Vec::new(),
-                    completed_results: Vec::<ToolResult>::new(),
+                    completed_results: vec![],
                     pending_sub_agents: Vec::new(),
                     assistant_message: AssistantMessage::new(
                         "global-deploy-assistant".to_string(),

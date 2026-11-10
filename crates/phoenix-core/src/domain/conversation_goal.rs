@@ -1,5 +1,8 @@
 //! Ordinary-conversation goal storage and checkpoint vocabulary.
 
+mod self_management;
+pub use self_management::{PendingSelfGoal, SelfGoalOperation};
+
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::product_conversation::ProductConversationId;
@@ -196,6 +199,50 @@ pub enum GoalUserCommandKind {
     State,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteGoalAgentSource {
+    pub instance_id: super::instance_identity::InstanceId,
+    pub source: GoalAgentSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnrolledRemoteGoalAgentSource {
+    pub instance_id: super::instance_identity::InstanceId,
+    pub enrollment_id: uuid::Uuid,
+    pub source: GoalAgentSource,
+}
+
+impl EnrolledRemoteGoalAgentSource {
+    #[must_use]
+    pub const fn new(
+        instance_id: super::instance_identity::InstanceId,
+        enrollment_id: uuid::Uuid,
+        source: GoalAgentSource,
+    ) -> Self {
+        Self {
+            instance_id,
+            enrollment_id,
+            source,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoalPreparationSource {
+    Local(GoalAgentSource),
+    Remote(RemoteGoalAgentSource),
+}
+
+impl GoalPreparationSource {
+    #[must_use]
+    pub fn source(&self) -> &GoalAgentSource {
+        match self {
+            Self::Local(source) => source,
+            Self::Remote(remote) => &remote.source,
+        }
+    }
+}
+
 /// `UserApi` denotes the trusted input channel, not proof of biological authorship.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GoalActor {
@@ -210,6 +257,7 @@ pub enum GoalActor {
     },
     OwningAgent(GoalAgentSource),
     Coordinator(GoalAgentSource),
+    RemoteCoordinator(EnrolledRemoteGoalAgentSource),
     GeneratedHost {
         action_id: GoalText,
     },
@@ -523,6 +571,7 @@ impl GoalMutation {
                     | GoalActor::UserApi { .. }
                     | GoalActor::UserControl { .. }
                     | GoalActor::Coordinator(_)
+                    | GoalActor::RemoteCoordinator(_)
                     | GoalActor::GeneratedHost { .. } => {
                         return Err(GoalError::ReportBindingRequired);
                     }

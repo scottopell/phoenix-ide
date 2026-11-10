@@ -17,6 +17,12 @@ Controlled-functional build isolation is governed by [ADR-119](119_separate-cont
 
 Creation terminal evidence and image delivery lifetime are governed by [ADR-207](207_creation-receipt-evidence-and-image-payload-lifetime.md), affecting REQ-CCR-013–015.
 
+Federated native create and rename extend the shared-action decision in [ADR-191](191_native-create-and-rename-use-shared-application-actions.md): [ADR-243](243_federated-native-create-and-rename-use-destination-actions.md), affecting REQ-FED-021–024, REQ-GR-024, REQ-CCR-013, and REQ-CID-007.
+
+Historical native locator qualification is governed by [ADR-245](245_historical-native-locators-preserve-bytes-without-fabricating-trust.md), qualifying only ADR-243's historical backfill and retained-provenance assumptions; ADR-243 remains accepted for live actions. Affects REQ-FED-021 and REQ-FED-023.
+
+Canonical migration 158-to-156 reconciliation is governed by [ADR-246](246_admit-exact-canonical-158-before-156-ledger.md), qualifying only ADR-187's post-129 registered-predecessor continuity rule for the exact supported registry transition. Affects REQ-COMP-002, REQ-COMP-020, and REQ-COMP-022.
+
 Codex reset-credit visibility and manual redemption, including resuming the stopped conversation after a redemption from its quota error, are governed by [ADR-208](208_codex-reset-credits-are-manual-and-resume-the-stopped-conversation.md), affecting REQ-CRR-001–010.
 
 Strict local-only selection of Kache v1.2.2 on macOS arm64 is governed by [ADR-225](225_kache-v1-2-2-strict-local-only-selection.md), superseding only ADR-224's selection conclusion; ADR-223 and ADR-224 retain their historical v1.0.0 evidence. Remote caching remains deferred.
@@ -38,6 +44,11 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [247](247_trusted-inline-research-inherits-saved-peer-query-selection.md) | Trusted Coordinator inline research can select saved peers for read-only SQL | Accepted | REQ-RQD-001/010, REQ-FED-001, REQ-GR-007 |
+| [246](246_admit-exact-canonical-158-before-156-ledger.md) | Admit the exact canonical 158-before-156 ledger | Accepted; qualifies ADR-187 post-129 registered-predecessor continuity only | REQ-COMP-002; REQ-COMP-020; REQ-COMP-022 |
+| [245](245_historical-native-locators-preserve-bytes-without-fabricating-trust.md) | Historical native locators preserve bytes without fabricating trust | Accepted; qualifies ADR-243 historical assumptions only | REQ-FED-021; REQ-FED-023 |
+| [243](243_federated-native-create-and-rename-use-destination-actions.md) | Federated native create and rename use destination actions | Accepted | REQ-FED-021–024; REQ-GR-024; REQ-CCR-013; REQ-CID-007 |
+| [242](242_execution-bound-own-goal-creation-and-enable.md) | Execution-bound own Goal creation and explicit continuation enable | Accepted | REQ-SGT-001–008; REQ-GOAL-AC-001–004 |
 | [230](230_simplify-macos-deployment-to-candidate-migration-and-manual-recovery.md) | Simplify macOS deployment to candidate migration and manual recovery | Accepted | REQ-LDD-001–032, REQ-PD-031, REQ-COMP-021, REQ-SDC-001–023, REQ-RU-008 |
 | [208](208_codex-reset-credits-are-manual-and-resume-the-stopped-conversation.md) | Codex reset credits are redeemed manually through a Phoenix proxy, and a redemption from the quota error resumes that conversation | Accepted | REQ-CRR-001–010 |
 | [207](207_creation-receipt-evidence-and-image-payload-lifetime.md) | Retain creation evidence and replay identity, retire delivery images at product deletion | Accepted | REQ-CCR-013, REQ-CCR-014, REQ-CCR-015 |
@@ -410,6 +421,6 @@ Capacity planning across ordinary requests, handoffs and model switches is gover
 
 Generated handoff readability and explicit source authority are governed by [ADR-147](147_readable-generated-handoffs-retain-source-authority.md); automatic initiation remains governed by ADR-054.
 
-Goals schema extraction and refusal of unsupported migration lineages are governed by [187](187_goal-main-migration-identity-reconciliation.md), implementing REQ-COMP-020 without extending deployment compatibility.
+Goals schema extraction and refusal of unsupported migration lineages are governed by [187](187_goal-main-migration-identity-reconciliation.md), implementing REQ-COMP-020 without extending deployment compatibility. [ADR-246](246_admit-exact-canonical-158-before-156-ledger.md) qualifies only its predecessor-continuity rule for the exact canonical 158-high ledger whose sole missing embedded predecessor in the post-129 registered tail is migration 156.
 
 Goal admission requires explicit automatic continuation without locking existing Goal management or the OFF gesture: [192](192_goal-admission-requires-explicit-auto-continue.md), implementing REQ-GOAL-AC-001–004.

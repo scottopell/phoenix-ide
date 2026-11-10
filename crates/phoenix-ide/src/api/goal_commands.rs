@@ -16,7 +16,7 @@ use phoenix_db::conversation_goals::{
 use serde::Deserialize;
 
 use super::{auth::OwnerAuthenticated, handlers::AppError, types::ConflictErrorResponse, AppState};
-pub(crate) use service::GoalCommandService;
+pub(crate) use service::{GoalCommandService, RemoteGoalApplyServiceResult};
 
 mod service;
 #[cfg(test)]

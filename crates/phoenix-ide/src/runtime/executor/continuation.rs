@@ -102,8 +102,15 @@ impl ContinuationHistory {
         messages: &[Message],
         accepted_message_id: Option<&str>,
     ) -> Result<Self, String> {
-        let accepted = accepted_message_id
-            .and_then(|id| messages.iter().find(|message| message.message_id == id));
+        let accepted = match accepted_message_id {
+            Some(id) => Some(
+                messages
+                    .iter()
+                    .find(|message| message.message_id == id)
+                    .ok_or("Accepted continuation handoff is absent from the prompt projection")?,
+            ),
+            None => None,
+        };
         let handoff = if let Some(message_source) = accepted {
             if !matches!(
                 message_source.content,
@@ -469,6 +476,21 @@ mod tests {
         assert_eq!(
             handoff.message.source_message_id.as_deref(),
             Some("accepted")
+        );
+    }
+
+    #[test]
+    fn accepted_seed_missing_from_projection_fails_instead_of_being_dropped() {
+        let Err(error) = ContinuationHistory::from_projection(
+            &[persisted("unrelated", "edited")],
+            Some("accepted"),
+        ) else {
+            panic!("missing accepted handoff should fail");
+        };
+
+        assert_eq!(
+            error,
+            "Accepted continuation handoff is absent from the prompt projection"
         );
     }
 

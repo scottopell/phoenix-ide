@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use crate::continuation_service::{
     ContinuationApplicationService, NativeContinueCompletion, NativeContinueRequest,
 };
-use crate::coordinator_tools::instance::{Route, RoutedTool};
+use crate::coordinator_tools::instance::{Route, RoutedTool, SelfPeerPolicy};
 use crate::runtime::RuntimeManager;
 
 #[derive(Debug)]
@@ -134,6 +134,10 @@ impl RoutedTool for ContinueConversation {
     }
     fn resolution_db(&self) -> &crate::db::Database {
         self.0.db()
+    }
+
+    fn self_peer_policy(&self) -> SelfPeerPolicy {
+        SelfPeerPolicy::Reject
     }
 
     fn schema_without_instance(&self) -> Value {

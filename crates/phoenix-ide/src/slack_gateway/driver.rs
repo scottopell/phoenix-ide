@@ -640,7 +640,7 @@ async fn admit(state: &AppState, c: &Config, request: &SlackRequest) -> Result<(
             {
                 ProductCreationAcceptOutcome::Accepted(j)
                 | ProductCreationAcceptOutcome::Replayed(j) => j,
-                ProductCreationAcceptOutcome::Conflict(_) => {
+                ProductCreationAcceptOutcome::Conflict => {
                     return Err("Slack creation identity conflicts with persisted intent".into())
                 }
             }

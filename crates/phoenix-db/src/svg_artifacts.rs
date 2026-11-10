@@ -305,7 +305,9 @@ mod tests {
     }
 
     fn interrupted_svg_state(staging: &std::path::Path, cancelling: bool) -> crate::ConvState {
-        use crate::{ConvState, ToolResult};
+        use crate::ConvState;
+        use phoenix_core::domain::conversation_goal::ToolRoundResult;
+        use phoenix_core::domain::db_schema::ToolResult;
         use phoenix_core::domain::llm_types::ContentBlock;
         use phoenix_core::domain::sm_state::{
             AssistantMessage, PresentSvgInput, ToolCall, ToolInput,
@@ -325,7 +327,10 @@ mod tests {
             None,
             None,
         );
-        let completed_results = vec![ToolResult::success("done".into(), "Ready".into())];
+        let completed_results = vec![ToolRoundResult::from(ToolResult::success(
+            "done".into(),
+            "Ready".into(),
+        ))];
         if cancelling {
             ConvState::CancellingTool {
                 cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,

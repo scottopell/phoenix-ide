@@ -819,7 +819,7 @@ async fn accepted_retry_rollover_before_receipt_lookup_preserves_receipt_over_bu
         .try_lock_product_message_admission(fixture.owner.as_str())
         .await
         .unwrap();
-    let receipt = command_across_real_rollover(&fixture, &request)
+    let receipt = Box::pin(command_across_real_rollover(&fixture, &request))
         .await
         .unwrap();
     assert_eq!(serde_json::to_value(receipt).unwrap(), expected);
@@ -840,7 +840,7 @@ async fn accepted_retry_rollover_before_receipt_lookup_preserves_receipt_over_bu
 async fn new_command_rollover_before_receipt_lookup_commits_on_live_successor() {
     let fixture = Fixture::new().await;
     let request = create_request(0, "new command after rollover");
-    let receipt = command_across_real_rollover(&fixture, &request)
+    let receipt = Box::pin(command_across_real_rollover(&fixture, &request))
         .await
         .unwrap();
     assert!(matches!(
@@ -873,7 +873,7 @@ async fn new_command_rollover_before_receipt_lookup_retains_durable_busy_refusal
         .try_lock_product_message_admission(fixture.owner.as_str())
         .await
         .unwrap();
-    let receipt = command_across_real_rollover(&fixture, &request)
+    let receipt = Box::pin(command_across_real_rollover(&fixture, &request))
         .await
         .unwrap();
     assert!(matches!(
@@ -1033,20 +1033,319 @@ async fn assert_command_rechecks_authority(path: CommandPublicationPath) {
 
 #[tokio::test]
 async fn retained_command_rechecks_authority_after_lookup_before_publication() {
-    assert_command_rechecks_authority(CommandPublicationPath::Retained).await;
+    Box::pin(assert_command_rechecks_authority(
+        CommandPublicationPath::Retained,
+    ))
+    .await;
 }
 
 #[tokio::test]
 async fn accepted_command_rechecks_authority_after_commit_before_publication() {
-    assert_command_rechecks_authority(CommandPublicationPath::Accepted).await;
+    Box::pin(assert_command_rechecks_authority(
+        CommandPublicationPath::Accepted,
+    ))
+    .await;
 }
 
 #[tokio::test]
 async fn product_busy_command_rechecks_authority_after_receipt_before_publication() {
-    assert_command_rechecks_authority(CommandPublicationPath::ProductBusy).await;
+    Box::pin(assert_command_rechecks_authority(
+        CommandPublicationPath::ProductBusy,
+    ))
+    .await;
 }
 
 #[tokio::test]
 async fn transcript_busy_command_rechecks_authority_after_receipt_before_publication() {
-    assert_command_rechecks_authority(CommandPublicationPath::TranscriptBusy).await;
+    Box::pin(assert_command_rechecks_authority(
+        CommandPublicationPath::TranscriptBusy,
+    ))
+    .await;
+}
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn concurrent_remote_apply_waits_for_classification_and_replays_receipt() {
+    use phoenix_core::domain::{
+        conversation_goal::{
+            GoalAgentSource, GoalExecution, GoalPreparationSource, GoalText, RemoteGoalAgentSource,
+        },
+        instance_identity::{FederationCredentialVerifier, InstanceId},
+    };
+    use phoenix_db::conversation_goals::prepared::{
+        install_remote_goal_claim_pause, GoalPreparationIntent, RemoteGoalClaimPause,
+    };
+
+    let fixture = Fixture::new().await;
+    let db = fixture.state.runtime.db();
+    let caller = InstanceId::new();
+    let verifier = FederationCredentialVerifier::from_bearer(b"concurrent-goal-apply");
+    db.replace_federation_enrollment(caller, &"concurrent Goal peer".parse().unwrap(), &verifier)
+        .await
+        .unwrap();
+    let authority = phoenix_db::FederationSendAuthority::new(caller, verifier);
+    let source = RemoteGoalAgentSource {
+        instance_id: caller,
+        source: GoalAgentSource {
+            product_conversation_id: ProductConversationId::new(),
+            transcript_id: GoalText::parse(uuid::Uuid::new_v4().to_string()).unwrap(),
+            execution: GoalExecution::parse(1, 1).unwrap(),
+            message_id: GoalText::parse("concurrent-goal-message").unwrap(),
+            tool_use_id: GoalText::parse("concurrent-goal-tool").unwrap(),
+        },
+    };
+    let action = db
+        .prepare_remote_coordinator_goal_action(
+            &authority,
+            &source,
+            &fixture.owner,
+            GoalPreparationIntent::Create {
+                objective: GoalText::parse("exactly once remote objective").unwrap(),
+            },
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert_eq!(action.source, GoalPreparationSource::Remote(source.clone()));
+
+    let pause = RemoteGoalClaimPause::new();
+    install_remote_goal_claim_pause(action.reference, pause.clone());
+    let service = super::service::GoalCommandService::new(fixture.state.runtime.clone());
+    let first_service = service.clone();
+    let first_authority = authority.clone();
+    let reference = action.reference;
+    let first = tokio::spawn(async move {
+        first_service
+            .apply_remote(&first_authority, reference)
+            .await
+    });
+    pause.wait_until_claimed().await;
+
+    let (state, receipt_count): (String, i64) = sqlx::query_as(
+        "SELECT apply_state,
+                (SELECT COUNT(*) FROM conversation_goal_coordinator_receipts
+                 WHERE preparation_reference=?1)
+         FROM conversation_goal_preparations WHERE reference=?1",
+    )
+    .bind(reference.as_bytes().as_slice())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(state, "claimed");
+    assert_eq!(receipt_count, 0);
+
+    let gate_arrival = fixture
+        .state
+        .runtime
+        .observe_next_remote_goal_apply_gate_arrival(reference)
+        .await;
+    let second_service = service.clone();
+    let second_authority = authority.clone();
+    let second = tokio::spawn(async move {
+        second_service
+            .apply_remote(&second_authority, reference)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), gate_arrival.notified())
+        .await
+        .expect("duplicate apply should reach the held reference gate");
+    assert!(
+        !second.is_finished(),
+        "duplicate apply completed while the first request held the reference gate"
+    );
+
+    pause.resume();
+    let first_result = tokio::time::timeout(std::time::Duration::from_secs(30), first)
+        .await
+        .expect("first remote apply timed out")
+        .unwrap()
+        .unwrap();
+    let second_result = tokio::time::timeout(std::time::Duration::from_secs(30), second)
+        .await
+        .expect("duplicate remote apply timed out")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_result, second_result);
+
+    let expired_reference = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO conversation_goal_preparations(
+           reference,owner_id,source_kind,enrollment_id,expires_at_us,
+           caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,tool_use_id,
+           operation,expected_version,observed_goal_id,objective,disposition,reason,apply_state)
+         SELECT ?,owner_id,source_kind,enrollment_id,0,
+           caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,'expired-replay-call',
+           operation,expected_version,observed_goal_id,objective,disposition,reason,'claimed'
+         FROM conversation_goal_preparations WHERE reference=?",
+    )
+    .bind(expired_reference.as_bytes().as_slice())
+    .bind(reference.as_bytes().as_slice())
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO conversation_goal_coordinator_receipts(
+           preparation_reference,owner_id,outcome,result_version,recorded_at_us)
+         VALUES (?,?,'rejected_busy',0,?)",
+    )
+    .bind(expired_reference.as_bytes().as_slice())
+    .bind(fixture.owner.as_str())
+    .bind(chrono::Utc::now().timestamp_micros())
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let replay_after_expiry = service
+        .apply_remote(&authority, expired_reference)
+        .await
+        .unwrap();
+    let super::service::RemoteGoalApplyServiceResult::Classified(
+        _,
+        phoenix_db::conversation_goals::user_commands::RemoteGoalApplyOutcome::Receipt(
+            replay_receipt,
+        ),
+    ) = &replay_after_expiry
+    else {
+        panic!("expired preparation with a receipt must replay that receipt");
+    };
+    assert_eq!(replay_receipt.request_id, expired_reference);
+    assert!(matches!(
+        &replay_receipt.result,
+        phoenix_db::conversation_goals::user_commands::GoalUserResult::Rejected {
+            reason: phoenix_db::conversation_goals::user_commands::GoalUserRefusal::Busy,
+            observed_version,
+            ..
+        } if *observed_version == GoalVersion::INITIAL
+    ));
+
+    let history_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_goal_history WHERE owner_id=?1")
+            .bind(fixture.owner.as_str())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let receipt_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_goal_coordinator_receipts
+         WHERE preparation_reference=?1",
+    )
+    .bind(reference.as_bytes().as_slice())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(history_count, 1);
+    assert_eq!(receipt_count, 1);
+    assert!(!fixture.state.runtime.fatal_local_authority_is_latched());
+    assert!(fixture.state.runtime.acquire_local_authority_pass().is_ok());
+}
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn expired_remote_apply_returns_typed_outcome_without_closing_authority() {
+    use phoenix_core::domain::{
+        conversation_goal::{
+            GoalAgentSource, GoalExecution, GoalPreparationSource, GoalText, RemoteGoalAgentSource,
+        },
+        instance_identity::{FederationCredentialVerifier, InstanceId},
+    };
+    use phoenix_db::conversation_goals::{
+        prepared::GoalPreparationIntent, user_commands::RemoteGoalApplyOutcome,
+    };
+
+    let fixture = Fixture::new().await;
+    let db = fixture.state.runtime.db();
+    let caller = InstanceId::new();
+    let verifier = FederationCredentialVerifier::from_bearer(b"expired-goal-apply");
+    db.replace_federation_enrollment(caller, &"expired Goal peer".parse().unwrap(), &verifier)
+        .await
+        .unwrap();
+    let authority = phoenix_db::FederationSendAuthority::new(caller, verifier);
+    let source = RemoteGoalAgentSource {
+        instance_id: caller,
+        source: GoalAgentSource {
+            product_conversation_id: ProductConversationId::new(),
+            transcript_id: GoalText::parse(uuid::Uuid::new_v4().to_string()).unwrap(),
+            execution: GoalExecution::parse(1, 1).unwrap(),
+            message_id: GoalText::parse("expired-goal-message").unwrap(),
+            tool_use_id: GoalText::parse("expired-goal-tool").unwrap(),
+        },
+    };
+    let action = db
+        .prepare_remote_coordinator_goal_action(
+            &authority,
+            &source,
+            &fixture.owner,
+            GoalPreparationIntent::Create {
+                objective: GoalText::parse("must never become the Goal").unwrap(),
+            },
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert_eq!(action.source, GoalPreparationSource::Remote(source));
+    let expired_reference = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO conversation_goal_preparations(
+           reference,owner_id,source_kind,enrollment_id,expires_at_us,
+           caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,tool_use_id,
+           operation,expected_version,observed_goal_id,objective,disposition,reason)
+         SELECT ?,owner_id,source_kind,enrollment_id,0,
+           caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,'expired-service-call',
+           operation,expected_version,observed_goal_id,objective,disposition,reason
+         FROM conversation_goal_preparations WHERE reference=?",
+    )
+    .bind(expired_reference.as_bytes().as_slice())
+    .bind(action.reference.as_bytes().as_slice())
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let expired_action = db
+        .read_remote_coordinator_goal_preparation(&authority, expired_reference)
+        .await
+        .unwrap();
+
+    let history_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_goal_history WHERE owner_id=?")
+            .bind(fixture.owner.as_str())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let service = super::service::GoalCommandService::new(fixture.state.runtime.clone());
+    let super::service::RemoteGoalApplyServiceResult::Classified(returned_action, outcome) =
+        service
+            .apply_remote(&authority, expired_reference)
+            .await
+            .unwrap()
+    else {
+        panic!("known expired preparation must remain classified");
+    };
+
+    assert_eq!(*returned_action, expired_action);
+    assert_eq!(
+        outcome,
+        RemoteGoalApplyOutcome::Expired {
+            action_reference: expired_reference
+        }
+    );
+    let (apply_state, receipts): (String, i64) = sqlx::query_as(
+        "SELECT apply_state,
+                (SELECT COUNT(*) FROM conversation_goal_coordinator_receipts
+                 WHERE preparation_reference=?1)
+         FROM conversation_goal_preparations WHERE reference=?1",
+    )
+    .bind(expired_reference.as_bytes().as_slice())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let history_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_goal_history WHERE owner_id=?")
+            .bind(fixture.owner.as_str())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(apply_state, "prepared");
+    assert_eq!(receipts, 0);
+    assert_eq!(history_after, history_before);
+    assert!(!fixture.state.runtime.fatal_local_authority_is_latched());
+    assert!(fixture.state.runtime.acquire_local_authority_pass().is_ok());
 }

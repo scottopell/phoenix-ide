@@ -525,7 +525,7 @@ impl Database {
                         return Err(commit_error.into());
                     }
                     Some(_) => {
-                        return Err(ControlError::Integrity("control commit receipt differs"))
+                        return Err(ControlError::Integrity("control commit receipt differs"));
                     }
                 }
             }

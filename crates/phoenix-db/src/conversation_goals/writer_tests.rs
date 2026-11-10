@@ -8,6 +8,7 @@ use phoenix_core::domain::conversation_goal::{
 use uuid::Uuid;
 
 mod checkpoint;
+mod self_management;
 
 pub(super) async fn fixture() -> Database {
     Database::open_in_memory()
@@ -37,6 +38,40 @@ pub(super) async fn ordinary(db: &Database, name: &str) -> (String, ProductConve
 
 pub(super) fn at() -> GoalTimestampUs {
     GoalTimestampUs::parse(chrono::Utc::now().timestamp_micros() + 1_000_000).unwrap()
+}
+
+#[tokio::test]
+async fn public_goal_writers_reject_remote_coordinator_attribution() {
+    let db = fixture().await;
+    let (_, owner) = ordinary(&db, "remote-actor-writer-rejection").await;
+    let mut mutation = create(&owner, GoalVersion::INITIAL, "remote-goal", "remote-action");
+    let source = phoenix_core::domain::conversation_goal::GoalAgentSource {
+        product_conversation_id: owner.clone(),
+        transcript_id: GoalText::parse("remote-transcript").unwrap(),
+        execution: phoenix_core::domain::conversation_goal::GoalExecution::parse(1, 1).unwrap(),
+        message_id: GoalText::parse("remote-message").unwrap(),
+        tool_use_id: GoalText::parse("remote-tool").unwrap(),
+    };
+    let actor = GoalActor::RemoteCoordinator(
+        phoenix_core::domain::conversation_goal::EnrolledRemoteGoalAgentSource::new(
+            phoenix_core::domain::instance_identity::InstanceId::new(),
+            Uuid::new_v4(),
+            source,
+        ),
+    );
+    mutation.attribution.requested_by = actor.clone();
+    mutation.attribution.applied_by = actor;
+
+    assert!(matches!(
+        db.accepted_conversation_goal_mutation(&mutation).await,
+        Err(GoalDbError::Invalid(_))
+    ));
+    assert!(matches!(
+        db.apply_conversation_goal(&mutation, "transcript", at())
+            .await,
+        Err(GoalDbError::Invalid(_))
+    ));
+    assert_eq!(counts(&db).await.0, 0);
 }
 
 fn create(
