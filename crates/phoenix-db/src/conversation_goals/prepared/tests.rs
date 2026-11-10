@@ -1679,6 +1679,7 @@ async fn goal_preparation_migration_follows_conversation_tool_migrations() {
             (155, "ordinary_self_goal_admission".into()),
             (156, "remote_coordinator_goals".into()),
             (158, "federated_conversation_actions".into()),
+            (159, "federated_continuation_receipts".into()),
         ]
     );
 }

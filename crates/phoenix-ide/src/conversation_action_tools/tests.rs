@@ -1487,7 +1487,10 @@ async fn native_continue_requires_tool_call_identity_and_refuses_non_coordinator
         .await
         .unwrap();
     let product = native_continue_predecessor(&db, &predecessor.id, "retained summary").await;
-    let tool = continuation::ContinueConversation(runtime.clone());
+    let tool = crate::coordinator_tools::instance::RouteTool::boxed(
+        continuation::ContinueConversation(runtime.clone()),
+    );
+    assert!(!tool.clearable());
     let input = native_continue_input(&product, &predecessor.id);
     let missing_identity = tool
         .run(input.clone(), native_context_without_source_identity(&gc))
@@ -1528,9 +1531,327 @@ async fn native_continue_adapter_is_a_pending_sink_after_local_authority_closes(
 
     let (runtime, _, gc) = native_runtime().await;
     runtime.fence_fatal_local_authority().await;
-    let tool = continuation::ContinueConversation(runtime);
+    let tool = crate::coordinator_tools::instance::RouteTool::boxed(
+        continuation::ContinueConversation(runtime),
+    );
     let future = tool.run(json!({"unexpected":"input"}), native_context(&gc));
     assert!(future.now_or_never().is_none());
+}
+
+#[tokio::test]
+async fn native_continue_local_routes_preserve_exact_legacy_error_output() {
+    let (runtime, _, gc) = native_runtime().await;
+    let tool = crate::coordinator_tools::instance::RouteTool::boxed(
+        continuation::ContinueConversation(runtime),
+    );
+    for instance in [None, Some(Value::Null), Some(json!("local"))] {
+        let mut input = json!({"unexpected":"input"});
+        if let Some(instance) = instance {
+            input["instance"] = instance;
+        }
+        let error =
+            serde_json::from_value::<continuation::ContinueRequest>(json!({"unexpected":"input"}))
+                .unwrap_err()
+                .to_string();
+        let actual = tool.run(input, native_context(&gc)).await;
+        assert!(matches!(actual, ToolOutput::Error { .. }));
+        assert_eq!(
+            actual.output(),
+            json!({"status":"error", "error":error}).to_string()
+        );
+    }
+    for instance in [None, Some(Value::Null), Some(json!("local"))] {
+        let mut input = json!({"product_conversation_id":"product", "predecessor_transcript_id":"predecessor", "summary_message_id":"summary"});
+        if let Some(instance) = instance {
+            input["instance"] = instance;
+        }
+        let actual = tool
+            .run(input, native_context_without_source_identity(&gc))
+            .await;
+        assert_eq!(
+            actual.output(),
+            json!({"status":"error", "error":"Trusted source tool-call identity unavailable"})
+                .to_string()
+        );
+    }
+    let remote_product = ProductConversationId::parse("product-target").unwrap();
+    let remote = tool
+        .run(
+            native_continue_input(&remote_product, "predecessor")
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .chain([("instance".into(), json!("unlisted-peer"))])
+                .collect::<serde_json::Map<String, Value>>()
+                .into(),
+            native_context(&gc),
+        )
+        .await;
+    assert!(matches!(remote, ToolOutput::Error { .. }));
+    assert_eq!(remote.output(), "peer connection not found");
+}
+
+#[tokio::test]
+async fn native_continue_remote_selectors_reject_ambiguous_and_self_peers() {
+    use phoenix_core::domain::instance_identity::{
+        InstanceId, PeerBearerCredential, PeerCaCertificatePem, PeerTlsTrust,
+    };
+
+    let (runtime, db, gc) = native_runtime().await;
+    let own_instance = db.instance_id().await.unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let tls = crate::tls::load_config(&crate::tls::ConfigSource::Auto {
+        dir: temp.path().to_path_buf(),
+        hosts: vec!["localhost".to_string()],
+    })
+    .unwrap();
+    let trust = PeerTlsTrust::PrivateCa {
+        certificate_pem: PeerCaCertificatePem::parse(
+            std::fs::read_to_string(tls.ca_cert_path.unwrap()).unwrap(),
+        )
+        .unwrap(),
+    };
+    let credential = PeerBearerCredential::parse(format!("phx_peer_{}", "a".repeat(43))).unwrap();
+    db.save_federation_peer_connection(
+        own_instance,
+        &"self-peer".parse().unwrap(),
+        &"https://localhost:31001".parse().unwrap(),
+        &credential,
+        &trust,
+    )
+    .await
+    .unwrap();
+    for (peer_instance_id, port, marker) in [
+        (InstanceId::new(), 31_002, "b"),
+        (InstanceId::new(), 31_003, "c"),
+    ] {
+        db.save_federation_peer_connection(
+            peer_instance_id,
+            &"ambiguous-peer".parse().unwrap(),
+            &format!("https://localhost:{port}").parse().unwrap(),
+            &PeerBearerCredential::parse(format!("phx_peer_{}", marker.repeat(43))).unwrap(),
+            &trust,
+        )
+        .await
+        .unwrap();
+    }
+
+    let tool = crate::coordinator_tools::instance::RouteTool::boxed(
+        continuation::ContinueConversation(runtime),
+    );
+    let target = ProductConversationId::parse("product-target").unwrap();
+    for (selector, expected) in [
+        (
+            own_instance.to_string(),
+            "peer selector resolves to this local instance",
+        ),
+        (
+            "self-peer".to_string(),
+            "peer selector resolves to this local instance",
+        ),
+        (
+            "ambiguous-peer".to_string(),
+            "peer display name is ambiguous",
+        ),
+    ] {
+        let mut input = native_continue_input(&target, "predecessor");
+        input
+            .as_object_mut()
+            .unwrap()
+            .insert("instance".to_string(), json!(selector));
+        let output = tool.run(input, native_context(&gc)).await;
+        assert!(
+            !output.is_success(),
+            "unexpected local fallback: {output:?}"
+        );
+        assert!(output.output().contains(expected), "{output:?}");
+    }
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "TLS peer fixture and admission ordering are exercised together"
+)]
+async fn cancelled_remote_continue_through_route_wrapper_keeps_admission_and_authority_until_peer_settles(
+) {
+    use phoenix_core::domain::instance_identity::{
+        InstanceId, PeerBearerCredential, PeerCaCertificatePem, PeerTlsTrust,
+    };
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+
+    let (runtime, db, source) = native_runtime().await;
+    let source_product = db
+        .get_conversation(&source)
+        .await
+        .unwrap()
+        .product_conversation_id;
+    let destination = InstanceId::new();
+    let caller = db.instance_id().await.unwrap();
+    let bearer = PeerBearerCredential::parse(format!("phx_peer_{}", "c".repeat(43))).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut tls = crate::tls::load_config(&crate::tls::ConfigSource::Auto {
+        dir: temp.path().to_path_buf(),
+        hosts: vec!["localhost".to_string()],
+    })
+    .unwrap();
+    tls.server.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let trust = PeerTlsTrust::PrivateCa {
+        certificate_pem: PeerCaCertificatePem::parse(
+            std::fs::read_to_string(tls.ca_cert_path.unwrap()).unwrap(),
+        )
+        .unwrap(),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    db.save_federation_peer_connection(
+        destination,
+        &"saved-peer".parse().unwrap(),
+        &format!(
+            "https://localhost:{}",
+            listener.local_addr().unwrap().port()
+        )
+        .parse()
+        .unwrap(),
+        &bearer,
+        &trust,
+    )
+    .await
+    .unwrap();
+
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+    let (probe_tx, probe_rx) = tokio::sync::oneshot::channel::<()>();
+    let (probe_observed_tx, probe_observed_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let expected_source = source.clone();
+    let expected_product = source_product.to_string();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let stream = tokio_rustls::TlsAcceptor::from(Arc::new(tls.server))
+            .accept(stream)
+            .await
+            .unwrap();
+        let mut stream = tokio::io::BufReader::new(stream);
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            assert_ne!(stream.read_until(b'\n', &mut headers).await.unwrap(), 0);
+        }
+        let headers = String::from_utf8(headers).unwrap();
+        assert!(headers.starts_with("POST /api/federation/peer/continue-conversation HTTP/1.1"));
+        assert!(headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer phx_peer_"));
+        let length: usize = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .and_then(|value| value.trim().parse().ok())
+            })
+            .unwrap();
+        let mut body = vec![0; length];
+        stream.read_exact(&mut body).await.unwrap();
+        let request: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(request["destination_instance_id"], destination.to_string());
+        assert_eq!(request["caller_instance_id"], caller.to_string());
+        assert_eq!(request["product_conversation_id"], "product-target");
+        assert_eq!(
+            request["source"]["product_conversation_id"],
+            expected_product
+        );
+        assert_eq!(request["source"]["transcript_id"], expected_source);
+        assert!(request.get("instance").is_none());
+        assert_eq!(
+            request["source"]["source_call"]["message_id"],
+            "native-message"
+        );
+        assert_eq!(
+            request["source"]["source_call"]["tool_use_id"],
+            "native-call"
+        );
+        received_tx.send(()).unwrap();
+        probe_rx.await.unwrap();
+        probe_observed_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        stream.get_mut().write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+    });
+
+    let tool = crate::coordinator_tools::instance::RouteTool::boxed(
+        continuation::ContinueConversation(runtime.clone()),
+    );
+    let requester = tokio::spawn(async move {
+        tool.run(
+            json!({
+                "instance":"saved-peer",
+                "product_conversation_id":"product-target",
+                "predecessor_transcript_id":"peer-predecessor",
+                "summary_message_id":"peer-summary"
+            }),
+            native_context(&source),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), received_rx)
+        .await
+        .expect("peer request must arrive")
+        .unwrap();
+    requester.abort();
+    assert!(requester.await.unwrap_err().is_cancelled());
+
+    let closing_authority = runtime.acquire_local_authority_pass().unwrap();
+    closing_authority.close("remote_continue_cancellation_test");
+    assert_eq!(runtime.fatal_authority_owners_at_first_close(), Some(3));
+    drop(closing_authority);
+    let admission = runtime.lock_product_message_admission(source_product.as_str());
+    tokio::pin!(admission);
+    assert!(matches!(
+        futures::poll!(admission.as_mut()),
+        std::task::Poll::Pending
+    ));
+
+    probe_tx.send(()).unwrap();
+    probe_observed_rx.await.unwrap();
+    assert_eq!(runtime.fatal_authority_owner_count(), 2);
+    assert!(matches!(
+        futures::poll!(admission.as_mut()),
+        std::task::Poll::Pending
+    ));
+
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), server)
+        .await
+        .expect("peer must settle")
+        .unwrap();
+    let _guard = tokio::time::timeout(std::time::Duration::from_secs(10), admission)
+        .await
+        .expect("source admission resumes after peer settlement");
+    assert_eq!(runtime.fatal_authority_owner_count(), 0);
+}
+
+#[tokio::test]
+async fn native_continue_preclosed_authority_sinks_every_wrapper_failure() {
+    use futures::FutureExt;
+    let (runtime, _, gc) = native_runtime().await;
+    runtime.fence_fatal_local_authority().await;
+    let tool = crate::coordinator_tools::instance::RouteTool::boxed(
+        continuation::ContinueConversation(runtime),
+    );
+    let ordinary = "not-a-coordinator";
+    for (input, context) in [
+        (json!({"instance":42}), native_context(&gc)),
+        (
+            json!({"instance":"local", "unexpected":true}),
+            native_context(&gc),
+        ),
+        (json!({"instance":"missing-peer"}), native_context(&gc)),
+        (
+            json!({"instance":"missing-peer", "unexpected":true}),
+            native_context(&gc),
+        ),
+        (json!({"instance":"local"}), native_context(ordinary)),
+    ] {
+        assert!(tool.run(input, context).now_or_never().is_none());
+    }
 }
 
 #[tokio::test]
@@ -1582,7 +1903,9 @@ async fn native_continue_replays_completed_opening_without_replacing_its_message
         .unwrap()
         .is_none());
 
-    let tool = continuation::ContinueConversation(runtime.clone());
+    let tool = crate::coordinator_tools::instance::RouteTool::boxed(
+        continuation::ContinueConversation(runtime.clone()),
+    );
     let replay = tool
         .run(
             native_continue_input(&product, &predecessor.id),

@@ -784,6 +784,11 @@ pub fn create_router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
         )
         .route(
+            "/api/federation/peer/continue-conversation",
+            post(super::federation::continue_conversation)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .route(
             "/api/federation/peer/read-automatic-continuation",
             post(super::federation::read_automatic_continuation)
                 .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),

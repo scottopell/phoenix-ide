@@ -399,6 +399,7 @@ async fn native_goal_discovery_prepare_apply_read_and_replay_without_dispatch() 
             (155, "ordinary_self_goal_admission".into()),
             (156, "remote_coordinator_goals".into()),
             (158, "federated_conversation_actions".into()),
+            (159, "federated_continuation_receipts".into()),
         ]
     );
     for name in [
@@ -1474,6 +1475,7 @@ async fn production_coordinator_registry_has_exact_instance_selector_contract() 
         "unwatch_conversation",
         "list_watched_conversations",
         "read_goal",
+        "continue_conversation",
         "prepare_goal",
         "apply_goal",
         "create_conversation",

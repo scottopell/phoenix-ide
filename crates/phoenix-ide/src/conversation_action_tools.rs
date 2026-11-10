@@ -33,7 +33,7 @@ pub(crate) async fn tools(
         Ok(()) => Ok(vec![
             RouteTool::boxed(RenameConversation(runtime.clone())),
             RouteTool::boxed(CreateConversation(runtime.clone())),
-            Arc::new(continuation::ContinueConversation(runtime.clone())),
+            RouteTool::boxed(continuation::ContinueConversation(runtime.clone())),
             Arc::new(automatic_continuation::AutomaticContinuationTool::read(
                 runtime.clone(),
             )),

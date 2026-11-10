@@ -263,6 +263,7 @@ fn registered_identity_order_and_exact_bodies() {
         (151, "one_shot_conversation_reminders"),
         (152, "goal_preparation_inflight_source"),
         (153, "close_writer_observations"),
+        (159, "federated_continuation_receipts"),
     ];
     for (version, name) in identities {
         let entries = MIGRATIONS
@@ -290,6 +291,7 @@ fn registered_identity_order_and_exact_bodies() {
         (include_str!("reminders.sql"), 151),
         (include_str!("goal_preparation_inflight_source.sql"), 152),
         (include_str!("close_writer_observations.sql"), 153),
+        (include_str!("federated_continuation_receipts.sql"), 159),
     ] {
         let entries = MIGRATIONS
             .iter()
@@ -368,7 +370,7 @@ async fn rename_receipt_retention_migration_preserves_rows_and_rolls_back_atomic
         .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 11);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 12);
     let foreign_keys: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_foreign_key_list('product_conversation_rename_receipts')",
     )
@@ -399,7 +401,7 @@ async fn registered_slack_origin_decodes_and_replays_after_upgrade() {
 
     let pool = fixture(142, true).await;
     let db = Database::from_pool_for_tests(pool.clone(), String::new());
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 14);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 15);
     let retained = db
         .get_product_creation_job("old-slack")
         .await
@@ -464,7 +466,7 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
             let mut conn = pool.acquire().await.unwrap();
             preserved(&mut conn, &before).await;
             drop(conn);
-            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 7);
+            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 8);
             let mut conn = pool.acquire().await.unwrap();
             let live_images: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_job_images")
@@ -506,6 +508,7 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
                     (155, "ordinary_self_goal_admission"),
                     (156, "remote_coordinator_goals"),
                     (158, "federated_conversation_actions"),
+                    (159, "federated_continuation_receipts"),
                 ]
             );
             drop(conn);
@@ -549,7 +552,7 @@ async fn registered_body_faults_rollback_and_same_connection_retry() {
         let mut conn = pool.acquire().await.unwrap();
         preserved(&mut conn, &before).await;
         drop(conn);
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 7);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 8);
         let mut conn = pool.acquire().await.unwrap();
         clean(&mut conn).await;
     }
@@ -570,7 +573,7 @@ async fn registered_ledger_failure_rolls_back_body_then_reenters() {
         .await
         .unwrap();
     drop(conn);
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 14);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 15);
 }
 
 #[tokio::test]
@@ -629,7 +632,7 @@ async fn image_retirement_ledger_failure_restores_payload_schema_and_retries() {
         .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 8);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 9);
     let restored: Vec<(String, i64, String, String)> = sqlx::query_as(
         "SELECT request_id, ordinal, media_type, data FROM product_creation_job_images ORDER BY request_id, ordinal",
     )
@@ -837,7 +840,14 @@ async fn registered_creation_receipt_retention_preserves_jobs_and_children_atomi
     .unwrap();
     assert_eq!(reservation_token.as_deref(), Some("token東京"));
     drop(conn);
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 9);
+    let pending = u32::try_from(
+        MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > 147)
+            .count(),
+    )
+    .unwrap();
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), pending);
 
     db.delete_conversation(&target.id).await.unwrap();
     let retained_ids: (String, String) = sqlx::query_as("SELECT published_product_id, published_conversation_id FROM product_creation_jobs WHERE request_id='old-user'")

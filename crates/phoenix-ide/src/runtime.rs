@@ -3844,6 +3844,11 @@ impl RuntimeManager {
     }
 
     #[cfg(test)]
+    pub(crate) fn fatal_authority_owner_count(&self) -> usize {
+        self.fatal_local_authority_fence.owner_count()
+    }
+
+    #[cfg(test)]
     pub(crate) async fn run_local_authority_pass<T>(
         &self,
         pass: impl std::future::Future<Output = T>,

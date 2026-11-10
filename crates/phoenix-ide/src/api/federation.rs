@@ -678,7 +678,7 @@ pub(crate) async fn resolve_tool_peer_allow_self(
     selector: &crate::coordinator_tools::instance::RemoteInstanceSelector,
     resolution: crate::coordinator_tools::instance::PeerResolution,
 ) -> Result<ResolvedPeer, FederationClientError> {
-    if matches!(
+    let peer = if matches!(
         resolution,
         crate::coordinator_tools::instance::PeerResolution::WatchUuidIdentity
     ) {
@@ -688,11 +688,17 @@ pub(crate) async fn resolve_tool_peer_allow_self(
                     .federation_peer_connection(id)
                     .await?
                     .ok_or(FederationClientError::PeerNotFound)?;
-                return Ok(ResolvedPeer { connection });
+                ResolvedPeer { connection }
+            } else {
+                resolve_saved_peer(db, selector.as_str()).await?
             }
+        } else {
+            resolve_saved_peer(db, selector.as_str()).await?
         }
-    }
-    resolve_saved_peer(db, selector.as_str()).await
+    } else {
+        resolve_saved_peer(db, selector.as_str()).await?
+    };
+    Ok(peer)
 }
 
 pub(crate) async fn resolve_tool_peer_reject_self(
@@ -1604,6 +1610,356 @@ impl RemoteAutomaticContinuationTarget {
             _ => false,
         }
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteCoordinatorAttestation {
+    product_conversation_id: ProductConversationId,
+    transcript_id: TranscriptConversationId,
+    source_call: RemoteSourceToolCall,
+}
+
+fn remote_continue_turn_key(
+    caller: InstanceId,
+    source_call: &RemoteSourceToolCall,
+) -> phoenix_workflow::ClientTurnKey {
+    use sha2::Digest as _;
+
+    let mut digest = sha2::Sha256::new();
+    digest.update(b"phoenix-remote-continue-v1");
+    digest.update(caller.to_string().as_bytes());
+    for locator in [&source_call.message_id.0, &source_call.tool_use_id.0] {
+        digest.update((locator.len() as u64).to_be_bytes());
+        digest.update(locator.as_bytes());
+    }
+    let encoded = digest
+        .finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut encoded, byte| {
+            use std::fmt::Write as _;
+            write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
+            encoded
+        });
+    phoenix_workflow::ClientTurnKey::new(format!("remote-continue:{encoded}"))
+        .expect("SHA-256 continuation identity is nonempty")
+}
+
+fn remote_continue_request_key(
+    request: &RemoteContinueRequest,
+) -> Option<phoenix_workflow::ClientTurnKey> {
+    let expected =
+        remote_continue_turn_key(request.caller_instance_id, &request.source.source_call);
+    (request.first_message_id == expected.as_str()).then_some(expected)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteContinueRequest {
+    destination_instance_id: InstanceId,
+    caller_instance_id: InstanceId,
+    product_conversation_id: ProductConversationId,
+    predecessor_transcript_id: String,
+    summary_message_id: String,
+    first_message_id: String,
+    source: RemoteCoordinatorAttestation,
+}
+
+impl RemoteContinueRequest {
+    fn continuation_source(&self) -> phoenix_db::FederatedContinuationSource {
+        phoenix_db::FederatedContinuationSource {
+            destination_instance_id: self.destination_instance_id,
+            product_conversation_id: self.source.product_conversation_id.clone(),
+            transcript_id: self.source.transcript_id.clone(),
+            message_id: self.source.source_call.message_id.0.clone(),
+            tool_use_id: self.source.source_call.tool_use_id.0.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RemoteContinueOpeningStatus {
+    Pending,
+    Accepted,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteContinueWireResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slug: Option<String>,
+    status: crate::api::ContinueConversationStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl RemoteContinueWireResult {
+    fn split_response(
+        result: crate::api::ContinueConversationResponse,
+    ) -> (String, RemoteContinueWireResult) {
+        let crate::api::ContinueConversationResponse {
+            conversation_id,
+            slug,
+            status,
+            error,
+        } = result;
+        (
+            conversation_id,
+            RemoteContinueWireResult {
+                slug,
+                status,
+                error,
+            },
+        )
+    }
+
+    fn into_response(self, conversation_id: String) -> crate::api::ContinueConversationResponse {
+        crate::api::ContinueConversationResponse {
+            conversation_id,
+            slug: self.slug,
+            status: self.status,
+            error: self.error,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteContinueResponse {
+    destination_instance_id: InstanceId,
+    caller_instance_id: InstanceId,
+    product_conversation_id: ProductConversationId,
+    predecessor_transcript_id: String,
+    summary_message_id: String,
+    successor_transcript_id: String,
+    opening_message_id: String,
+    opening_status: RemoteContinueOpeningStatus,
+    result: RemoteContinueWireResult,
+}
+
+fn verify_remote_continue(
+    response: RemoteContinueResponse,
+    request: &RemoteContinueRequest,
+) -> Result<crate::api::ContinueConversationResponse, FederationClientError> {
+    if response.destination_instance_id != request.destination_instance_id {
+        return Err(FederationClientError::DestinationMismatch);
+    }
+    if response.caller_instance_id != request.caller_instance_id {
+        return Err(FederationClientError::CallerMismatch);
+    }
+    if response.product_conversation_id != request.product_conversation_id
+        || response.predecessor_transcript_id != request.predecessor_transcript_id
+        || response.summary_message_id != request.summary_message_id
+        || response.successor_transcript_id.trim().is_empty()
+        || !match response.opening_status {
+            RemoteContinueOpeningStatus::Pending => {
+                response.opening_message_id == request.first_message_id
+            }
+            RemoteContinueOpeningStatus::Accepted => {
+                response.opening_message_id == request.first_message_id
+                    || response.opening_message_id
+                        == format!(
+                            "{}:{}",
+                            response.successor_transcript_id, request.first_message_id
+                        )
+            }
+        }
+        || !match response.result.status {
+            crate::api::ContinueConversationStatus::Accepted => response.result.error.is_none(),
+            crate::api::ContinueConversationStatus::DispatchFailed => {
+                response.opening_status == RemoteContinueOpeningStatus::Pending
+                    && response
+                        .result
+                        .error
+                        .as_ref()
+                        .is_some_and(|error| !error.is_empty())
+            }
+            crate::api::ContinueConversationStatus::AlreadyExists => {
+                response.result.error.is_none()
+            }
+        }
+    {
+        return Err(FederationClientError::ProvenanceMismatch(
+            "continuation boundary changed".into(),
+        ));
+    }
+    Ok(response
+        .result
+        .into_response(response.successor_transcript_id))
+}
+
+pub async fn remote_continue_conversation(
+    db: &crate::db::Database,
+    peer: &ResolvedPeer,
+    product_conversation_id: ProductConversationId,
+    predecessor_transcript_id: String,
+    summary_message_id: String,
+    ctx: &phoenix_tools::ToolContext,
+) -> Result<crate::api::ContinueConversationResponse, FederationClientError> {
+    let destination_instance_id = peer.instance_id();
+    let caller_instance_id = db.instance_id().await?;
+    let source_call = ctx.source_tool_call().ok_or_else(|| {
+        FederationClientError::ProvenanceMismatch("trusted source tool call unavailable".into())
+    })?;
+    db.require_current_coordinator_transcript(&ctx.conversation_id)
+        .await?;
+    let source = db.get_conversation(&ctx.conversation_id).await?;
+    let source = RemoteSenderAttestation::from_conversation(source, source_call)
+        .map_err(FederationClientError::ProvenanceMismatch)?;
+    let RemoteSenderAttestation::Coordinator {
+        product_conversation_id: source_product,
+        transcript_id,
+        source_call: Some(source_call),
+    } = source
+    else {
+        return Err(FederationClientError::ProvenanceMismatch(
+            "source is not a Coordinator tool call".into(),
+        ));
+    };
+    let first_message_id = remote_continue_turn_key(caller_instance_id, &source_call).to_string();
+    let request = RemoteContinueRequest {
+        destination_instance_id,
+        caller_instance_id,
+        product_conversation_id,
+        predecessor_transcript_id,
+        summary_message_id,
+        first_message_id,
+        source: RemoteCoordinatorAttestation {
+            product_conversation_id: source_product,
+            transcript_id,
+            source_call,
+        },
+    };
+    let response: RemoteContinueResponse = send_bounded_peer_request(
+        format!(
+            "{}api/federation/peer/continue-conversation",
+            peer.connection.base_url
+        ),
+        peer.connection.bearer_credential.expose(),
+        &peer.connection.tls_trust,
+        &request,
+    )
+    .await?;
+    verify_remote_continue(response, &request)
+}
+
+pub async fn continue_conversation(
+    peer: PeerAuthenticated,
+    State(state): State<AppState>,
+    Json(request): Json<RemoteContinueRequest>,
+) -> Response {
+    continue_conversation_with_authority(
+        &state.runtime,
+        continue_conversation_inner(peer, &state, request),
+    )
+    .await
+}
+
+async fn continue_conversation_with_authority<F>(
+    runtime: &crate::runtime::RuntimeManager,
+    operation: F,
+) -> Response
+where
+    F: std::future::Future<Output = Response>,
+{
+    if runtime.local_authority_is_closed() {
+        return std::future::pending().await;
+    }
+    let response = operation.await;
+    peer_authority_response(runtime, response).await
+}
+
+async fn continue_conversation_inner(
+    peer: PeerAuthenticated,
+    state: &AppState,
+    request: RemoteContinueRequest,
+) -> Response {
+    let Ok(destination) = state.db.instance_id().await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if request.destination_instance_id != destination {
+        return federation_error(StatusCode::CONFLICT, "destination instance mismatch");
+    }
+    if request.caller_instance_id != peer.caller_instance_id {
+        return federation_error(StatusCode::UNAUTHORIZED, "caller instance mismatch");
+    }
+    if request.predecessor_transcript_id.trim().is_empty()
+        || request.summary_message_id.trim().is_empty()
+        || request.predecessor_transcript_id.len() > 1024
+        || request.summary_message_id.len() > 1024
+        || request.first_message_id.len() > 1024
+    {
+        return federation_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid continuation fields",
+        );
+    }
+    let Some(first_message_id) = remote_continue_request_key(&request) else {
+        return federation_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "continuation opening identity does not match source attestation",
+        );
+    };
+    let completion =
+        crate::continuation_service::ContinuationApplicationService::new(state.runtime.clone())
+            .continue_from_federated_coordinator(
+                crate::continuation_service::FederatedNativeContinueRequest {
+                    source: request.continuation_source(),
+                    product_conversation_id: request.product_conversation_id.clone(),
+                    predecessor_transcript_id: request.predecessor_transcript_id.clone(),
+                    summary_message_id: request.summary_message_id.clone(),
+                    first_message_id,
+                },
+                peer.send_authority,
+            )
+            .await;
+    let result = match completion {
+        crate::continuation_service::FederatedNativeContinueCompletion::Established(Ok(result)) => {
+            result
+        }
+        crate::continuation_service::FederatedNativeContinueCompletion::Established(Err(error)) => {
+            let status = if matches!(
+                error,
+                crate::continuation_service::NativeContinueError::Database(
+                    phoenix_db::DbError::FederationSendAuthorityInactive
+                )
+            ) {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::CONFLICT
+            };
+            return federation_error(status, &error.to_string());
+        }
+        crate::continuation_service::FederatedNativeContinueCompletion::LocalAuthorityClosed => {
+            return federation_error(StatusCode::SERVICE_UNAVAILABLE, "local authority closed");
+        }
+    };
+    let (result, opening) = result.into_response_and_opening();
+    let (successor_transcript_id, result) = RemoteContinueWireResult::split_response(result);
+    let (opening_message_id, opening_status) = match opening {
+        crate::continuation_service::FederatedNativeOpeningEvidence::Pending { message_id } => {
+            (message_id, RemoteContinueOpeningStatus::Pending)
+        }
+        crate::continuation_service::FederatedNativeOpeningEvidence::Accepted { message_id } => {
+            (message_id, RemoteContinueOpeningStatus::Accepted)
+        }
+    };
+    if state.runtime.local_authority_is_closed() {
+        return federation_error(StatusCode::SERVICE_UNAVAILABLE, "local authority closed");
+    }
+    Json(RemoteContinueResponse {
+        destination_instance_id: destination,
+        caller_instance_id: request.caller_instance_id,
+        product_conversation_id: request.product_conversation_id,
+        predecessor_transcript_id: request.predecessor_transcript_id,
+        summary_message_id: request.summary_message_id,
+        successor_transcript_id,
+        opening_message_id,
+        opening_status,
+        result,
+    })
+    .into_response()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -5003,6 +5359,329 @@ pub(crate) async fn remote_native_rename(
 mod tests {
     use super::*;
 
+    fn remote_continue_fixture() -> RemoteContinueRequest {
+        let caller_instance_id = InstanceId::new();
+        let source_call = RemoteSourceToolCall {
+            message_id: RemoteSenderLocator::parse("source-message".into()).unwrap(),
+            tool_use_id: RemoteSenderLocator::parse("source-tool-use".into()).unwrap(),
+        };
+        RemoteContinueRequest {
+            destination_instance_id: InstanceId::new(),
+            caller_instance_id,
+            product_conversation_id: ProductConversationId::new(),
+            predecessor_transcript_id: "predecessor".into(),
+            summary_message_id: "summary".into(),
+            first_message_id: remote_continue_turn_key(caller_instance_id, &source_call)
+                .to_string(),
+            source: RemoteCoordinatorAttestation {
+                product_conversation_id: ProductConversationId::new(),
+                transcript_id: TranscriptConversationId::parse("source-transcript").unwrap(),
+                source_call,
+            },
+        }
+    }
+
+    fn remote_continue_response(
+        request: &RemoteContinueRequest,
+        status: crate::api::ContinueConversationStatus,
+        opening_status: RemoteContinueOpeningStatus,
+        opening_message_id: String,
+    ) -> RemoteContinueResponse {
+        RemoteContinueResponse {
+            destination_instance_id: request.destination_instance_id,
+            caller_instance_id: request.caller_instance_id,
+            product_conversation_id: request.product_conversation_id.clone(),
+            predecessor_transcript_id: request.predecessor_transcript_id.clone(),
+            summary_message_id: request.summary_message_id.clone(),
+            successor_transcript_id: "successor".into(),
+            opening_message_id,
+            opening_status,
+            result: RemoteContinueWireResult {
+                slug: None,
+                status,
+                error: None,
+            },
+        }
+    }
+
+    #[test]
+    fn remote_continue_turn_key_is_bounded_deterministic_and_peer_source_separated() {
+        let request = remote_continue_fixture();
+        let caller = request.caller_instance_id;
+        let source_call = &request.source.source_call;
+        let key = remote_continue_turn_key(caller, source_call);
+        assert_eq!(key.as_str(), request.first_message_id);
+        assert!(key.as_str().len() < 1024);
+        assert_ne!(key.as_str(), source_call.tool_use_id.0);
+        assert_eq!(key, remote_continue_turn_key(caller, source_call));
+        assert_ne!(
+            key,
+            remote_continue_turn_key(InstanceId::new(), source_call)
+        );
+        let mut other_call = source_call.clone();
+        other_call.message_id = RemoteSenderLocator::parse("other-message".into()).unwrap();
+        assert_ne!(key, remote_continue_turn_key(caller, &other_call));
+        other_call = source_call.clone();
+        other_call.tool_use_id = RemoteSenderLocator::parse("other-tool".into()).unwrap();
+        assert_ne!(key, remote_continue_turn_key(caller, &other_call));
+    }
+
+    #[test]
+    fn remote_continue_turn_key_matches_sha256_wire_vector() {
+        let caller: InstanceId = "00000000-0000-4000-8000-000000000001".parse().unwrap();
+        let source_call = RemoteSourceToolCall {
+            message_id: RemoteSenderLocator::parse("source-message".into()).unwrap(),
+            tool_use_id: RemoteSenderLocator::parse("source-tool-use".into()).unwrap(),
+        };
+        let key = remote_continue_turn_key(caller, &source_call);
+        assert_eq!(
+            key.as_str(),
+            "remote-continue:4b99fe6ee6e0fe9a04c611e9e55602a4433133e26b322dcd7bc068d80edf9184"
+        );
+        assert_eq!(key.as_str().len(), "remote-continue:".len() + 64);
+    }
+
+    #[test]
+    fn remote_continue_request_identity_must_match_authenticated_source_shape() {
+        let mut request = remote_continue_fixture();
+        assert_eq!(
+            remote_continue_request_key(&request).unwrap().as_str(),
+            request.first_message_id
+        );
+        request.first_message_id = request.source.source_call.tool_use_id.0.clone();
+        assert!(remote_continue_request_key(&request).is_none());
+        request = remote_continue_fixture();
+        request.caller_instance_id = InstanceId::new();
+        assert!(remote_continue_request_key(&request).is_none());
+        request = remote_continue_fixture();
+        request.source.source_call.message_id = RemoteSenderLocator::parse("other".into()).unwrap();
+        assert!(remote_continue_request_key(&request).is_none());
+
+        let mut serialized = serde_json::to_value(remote_continue_fixture()).unwrap();
+        serialized["source"]["source_call"]["tool_use_id"] = serde_json::json!("  ");
+        assert!(serde_json::from_value::<RemoteContinueRequest>(serialized).is_err());
+        let mut serialized = serde_json::to_value(remote_continue_fixture()).unwrap();
+        serialized["source"]["transcript_id"] = serde_json::json!("");
+        assert!(serde_json::from_value::<RemoteContinueRequest>(serialized).is_err());
+        let mut serialized = serde_json::to_value(remote_continue_fixture()).unwrap();
+        serialized["source"]["product_conversation_id"] = serde_json::json!("");
+        assert!(serde_json::from_value::<RemoteContinueRequest>(serialized).is_err());
+        let mut serialized = serde_json::to_value(remote_continue_fixture()).unwrap();
+        serialized["caller_instance_id"] = serde_json::json!("not-an-instance");
+        assert!(serde_json::from_value::<RemoteContinueRequest>(serialized).is_err());
+    }
+
+    #[test]
+    fn remote_continue_response_has_one_successor_id_and_rejects_unknown_fields() {
+        let request = remote_continue_fixture();
+        let response = remote_continue_response(
+            &request,
+            crate::api::ContinueConversationStatus::Accepted,
+            RemoteContinueOpeningStatus::Accepted,
+            request.first_message_id.clone(),
+        );
+        let mut serialized = serde_json::to_value(response).unwrap();
+        assert_eq!(serialized["successor_transcript_id"], "successor");
+        assert!(serialized["result"].get("conversation_id").is_none());
+        serialized["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<RemoteContinueResponse>(serialized).is_err());
+
+        let response = remote_continue_response(
+            &request,
+            crate::api::ContinueConversationStatus::Accepted,
+            RemoteContinueOpeningStatus::Accepted,
+            request.first_message_id.clone(),
+        );
+        let mut serialized = serde_json::to_value(response).unwrap();
+        serialized["result"]["conversation_id"] = serde_json::json!("other-successor");
+        assert!(serde_json::from_value::<RemoteContinueResponse>(serialized).is_err());
+    }
+
+    #[test]
+    fn remote_continue_response_reconstructs_unchanged_local_result() {
+        let request = remote_continue_fixture();
+        let mut response = remote_continue_response(
+            &request,
+            crate::api::ContinueConversationStatus::Accepted,
+            RemoteContinueOpeningStatus::Accepted,
+            request.first_message_id.clone(),
+        );
+        response.result.slug = Some("successor-slug".into());
+
+        let result = verify_remote_continue(response, &request).unwrap();
+        assert_eq!(result.conversation_id, "successor");
+        assert_eq!(result.slug.as_deref(), Some("successor-slug"));
+        assert_eq!(
+            result.status,
+            crate::api::ContinueConversationStatus::Accepted
+        );
+        assert_eq!(result.error, None);
+    }
+
+    #[test]
+    fn remote_continue_response_rejects_wrong_opening_even_when_already_exists() {
+        use crate::api::ContinueConversationStatus as Status;
+        let request = remote_continue_fixture();
+        for status in [Status::Accepted, Status::AlreadyExists] {
+            for opening in [
+                request.first_message_id.clone(),
+                format!("successor:{}", request.first_message_id),
+            ] {
+                let response = remote_continue_response(
+                    &request,
+                    status,
+                    RemoteContinueOpeningStatus::Accepted,
+                    opening,
+                );
+                assert!(verify_remote_continue(response, &request).is_ok());
+            }
+            for opening in [
+                "other".to_string(),
+                format!("wrong-successor:{}", request.first_message_id),
+            ] {
+                let response = remote_continue_response(
+                    &request,
+                    status,
+                    RemoteContinueOpeningStatus::Accepted,
+                    opening,
+                );
+                assert!(matches!(
+                    verify_remote_continue(response, &request),
+                    Err(FederationClientError::ProvenanceMismatch(_))
+                ));
+            }
+        }
+        let pending = remote_continue_response(
+            &request,
+            Status::AlreadyExists,
+            RemoteContinueOpeningStatus::Pending,
+            request.first_message_id.clone(),
+        );
+        assert!(verify_remote_continue(pending, &request).is_ok());
+        let pending = remote_continue_response(
+            &request,
+            Status::AlreadyExists,
+            RemoteContinueOpeningStatus::Pending,
+            format!("successor:{}", request.first_message_id),
+        );
+        assert!(matches!(
+            verify_remote_continue(pending, &request),
+            Err(FederationClientError::ProvenanceMismatch(_))
+        ));
+        let mut response = remote_continue_response(
+            &request,
+            Status::AlreadyExists,
+            RemoteContinueOpeningStatus::Accepted,
+            request.first_message_id.clone(),
+        );
+        response.caller_instance_id = InstanceId::new();
+        assert!(matches!(
+            verify_remote_continue(response, &request),
+            Err(FederationClientError::CallerMismatch)
+        ));
+        let mut response = remote_continue_response(
+            &request,
+            Status::AlreadyExists,
+            RemoteContinueOpeningStatus::Accepted,
+            request.first_message_id.clone(),
+        );
+        response.destination_instance_id = InstanceId::new();
+        assert!(matches!(
+            verify_remote_continue(response, &request),
+            Err(FederationClientError::DestinationMismatch)
+        ));
+        let mut response = remote_continue_response(
+            &request,
+            Status::AlreadyExists,
+            RemoteContinueOpeningStatus::Accepted,
+            request.first_message_id.clone(),
+        );
+        response.successor_transcript_id.clear();
+        assert!(matches!(
+            verify_remote_continue(response, &request),
+            Err(FederationClientError::ProvenanceMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn remote_continue_response_status_and_opening_matrix() {
+        use crate::api::ContinueConversationStatus as Status;
+        use RemoteContinueOpeningStatus as Opening;
+
+        let request = remote_continue_fixture();
+        for status in [Status::Accepted, Status::AlreadyExists] {
+            for (opening, opening_id) in [
+                (Opening::Pending, request.first_message_id.clone()),
+                (
+                    Opening::Accepted,
+                    format!("successor:{}", request.first_message_id),
+                ),
+            ] {
+                let response = remote_continue_response(&request, status, opening, opening_id);
+                assert!(verify_remote_continue(response, &request).is_ok());
+            }
+        }
+
+        let mut failed = remote_continue_response(
+            &request,
+            Status::DispatchFailed,
+            Opening::Pending,
+            request.first_message_id.clone(),
+        );
+        failed.result.error = Some("delivery failed".into());
+        assert!(verify_remote_continue(failed, &request).is_ok());
+
+        for status in [Status::Accepted, Status::AlreadyExists] {
+            let mut response = remote_continue_response(
+                &request,
+                status,
+                Opening::Pending,
+                request.first_message_id.clone(),
+            );
+            response.result.error = Some("unexpected error".into());
+            assert!(matches!(
+                verify_remote_continue(response, &request),
+                Err(FederationClientError::ProvenanceMismatch(_))
+            ));
+        }
+        for (opening, error) in [
+            (Opening::Accepted, Some("delivery failed".to_string())),
+            (Opening::Pending, None),
+            (Opening::Pending, Some(String::new())),
+        ] {
+            let mut response = remote_continue_response(
+                &request,
+                Status::DispatchFailed,
+                opening,
+                request.first_message_id.clone(),
+            );
+            response.result.error = error;
+            assert!(matches!(
+                verify_remote_continue(response, &request),
+                Err(FederationClientError::ProvenanceMismatch(_))
+            ));
+        }
+        for status in [
+            Status::Accepted,
+            Status::AlreadyExists,
+            Status::DispatchFailed,
+        ] {
+            let mut response = remote_continue_response(
+                &request,
+                status,
+                Opening::Pending,
+                "wrong-opening".into(),
+            );
+            if matches!(status, Status::DispatchFailed) {
+                response.result.error = Some("delivery failed".into());
+            }
+            assert!(matches!(
+                verify_remote_continue(response, &request),
+                Err(FederationClientError::ProvenanceMismatch(_))
+            ));
+        }
+    }
+
     mod goal_read;
     #[path = "../native_actions.rs"]
     mod native_actions;
@@ -7235,6 +7914,59 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         assert_response_remains_pending_after_authority_closes(&state.runtime, response).await;
+    }
+
+    #[tokio::test]
+    async fn peer_continue_conversation_never_starts_after_authority_closes() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let runtime = state.runtime.clone();
+        runtime
+            .acquire_local_authority_pass()
+            .unwrap()
+            .close("peer_continue_preclosed_response_test");
+        let operation_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let operation_started_in_future = operation_started.clone();
+        let operation = async move {
+            operation_started_in_future.store(true, std::sync::atomic::Ordering::SeqCst);
+            StatusCode::OK.into_response()
+        };
+
+        let response = continue_conversation_with_authority(&runtime, operation);
+        tokio::pin!(response);
+        assert!(tokio::select! {
+            biased;
+            _ = &mut response => false,
+            () = std::future::ready(()) => true,
+        });
+        assert!(!operation_started.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn peer_continue_conversation_never_responds_when_authority_closes_mid_operation() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let runtime = state.runtime.clone();
+        let owner = runtime.acquire_local_authority_pass().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let operation = async move {
+            started_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            StatusCode::OK.into_response()
+        };
+        let response = continue_conversation_with_authority(&runtime, operation);
+        tokio::pin!(response);
+        tokio::select! {
+            _ = &mut response => panic!("continuation response completed before operation release"),
+            started = started_rx => started.unwrap(),
+        }
+
+        owner.close("peer_continue_mid_operation_response_test");
+        release_tx.send(()).unwrap();
+        assert!(tokio::select! {
+            biased;
+            _ = &mut response => false,
+            () = std::future::ready(()) => true,
+        });
     }
 
     #[tokio::test]
