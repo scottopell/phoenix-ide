@@ -191,6 +191,19 @@ describe('app viewport ownership', () => {
     );
   });
 
+  it('keeps the standalone mobile composer bottom after its inset default while StateBar retains the safe bottom', () => {
+    expect(ruleFor('#input-area')).not.toMatch(/padding-bottom/);
+    const inputRule = appCss.match(/\n#input-area\s*\{([^}]*\}[^}]*\})/s)?.[1];
+    expect(inputRule).toMatch(
+      /padding-bottom:\s*calc\(6px \+ env\(safe-area-inset-bottom,\s*0px\)\);\s*@media\s*\(display-mode:\s*standalone\) and \(width <= 1024px\)\s*\{\s*padding-bottom:\s*6px;/s,
+    );
+    expect(inputRule).not.toMatch(/!important/);
+    const stateBarCss = readFileSync(`${process.cwd()}/src/components/StateBar.css`, 'utf8');
+    expect(stateBarCss).toMatch(
+      /@media\s*\(display-mode:\s*standalone\)\s*\{\s*#state-bar\.statebar-mobile\s*\{[^}]*padding-bottom:\s*env\(safe-area-inset-bottom,\s*0\);/s,
+    );
+  });
+
   it('keeps new-conversation scrolling inside its main area without a nested viewport minimum', () => {
     const pageRule = ruleFor('.new-conv-page');
     expect(pageRule).toMatch(/height:\s*100%;/);

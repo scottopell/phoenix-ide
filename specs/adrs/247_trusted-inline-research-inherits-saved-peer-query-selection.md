@@ -1,4 +1,4 @@
-# ADR-246: Trusted Coordinator inline research can select saved peers for read-only SQL
+# ADR-247: Trusted Coordinator inline research can select saved peers for read-only SQL
 
 - **Status:** Accepted
 - **Date:** 2026-11-09

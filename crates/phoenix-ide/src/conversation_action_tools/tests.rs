@@ -2122,7 +2122,7 @@ async fn native_federated_selection_rejects_self_ambiguity_and_never_falls_back(
             let expected = if selector == "same-name" {
                 "ambiguous"
             } else if selector == "self-peer" || selector == local.to_string() {
-                "request identity does not match selected peer/local instance"
+                "peer selector resolves to this local instance"
             } else {
                 "peer connection not found"
             };

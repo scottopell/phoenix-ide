@@ -270,7 +270,6 @@ body.app-viewport-active #root {
   @media (width <= 1024px) {
     #input-area {
       padding-right: calc(12px + env(safe-area-inset-right, 0));
-      padding-bottom: 6px;
       padding-left: calc(12px + env(safe-area-inset-left, 0));
     }
 
@@ -2321,6 +2320,10 @@ pre:hover .copy-btn {
   background: var(--bg-secondary);
   padding: 6px 12px;
   padding-bottom: calc(6px + env(safe-area-inset-bottom, 0px));
+
+  @media (display-mode: standalone) and (width <= 1024px) {
+    padding-bottom: 6px;
+  }
 }
 
 

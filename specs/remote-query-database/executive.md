@@ -8,7 +8,7 @@ explicitly null, and exact `"local"` selectors use the local service; another
 string selects a saved peer by canonical UUID or unambiguous display name. The
 destination reuses the local `GlobalReadService` policy; successful remote output
 carries the receiver's instance identity and the caller identity established by
-peer admission. Ordinary ProductConversations have local-only SQL; ordinary sub-agents have no `query_database` declaration; the trusted child receives this selector only when its persisted parent is the Coordinator (ADR-246). Authenticated in-process two-instance HTTPS, registry, and persisted-parent runtime dispatch regressions passed in hosted run 42591942769 on exact source `0dcf009356a7ba4a00ae0e6ccf3d3a814535f024`. The latter inspects the actual child LLM request after fresh `RuntimeManager` selection from persisted parent roles; installed-runtime live-peer acceptance remains unverified.
+peer admission. Ordinary ProductConversations have local-only SQL; ordinary sub-agents have no `query_database` declaration; the trusted child receives this selector only when its persisted parent is the Coordinator (ADR-247). Authenticated in-process two-instance HTTPS, registry, and persisted-parent runtime dispatch regressions passed in hosted run 42591942769 on exact source `0dcf009356a7ba4a00ae0e6ccf3d3a814535f024`. The latter inspects the actual child LLM request after fresh `RuntimeManager` selection from persisted parent roles; installed-runtime live-peer acceptance remains unverified.
 This is operator-level forensic access to application data, not a general
 security sandbox or a remote write surface.
 

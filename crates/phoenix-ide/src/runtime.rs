@@ -416,6 +416,20 @@ mod conversation_mutex_gate_tests {
 
         assert!(conversation_b.try_lock_owned().is_ok());
     }
+
+    #[tokio::test]
+    async fn remote_goal_apply_gate_serializes_per_reference_only() {
+        let gates = ConversationMutexGates::default();
+        let reference_a = uuid::Uuid::new_v4();
+        let reference_b = uuid::Uuid::new_v4();
+        let first_a = gates.gate_for(&reference_a.to_string()).await;
+        let duplicate_a = gates.gate_for(&reference_a.to_string()).await;
+        let independent_b = gates.gate_for(&reference_b.to_string()).await;
+
+        let _claimed_without_receipt = first_a.lock_owned().await;
+        assert!(duplicate_a.try_lock_owned().is_err());
+        assert!(independent_b.try_lock_owned().is_ok());
+    }
 }
 
 type RuntimeMaterializationResult = Result<ConversationHandle, String>;
@@ -773,6 +787,9 @@ pub struct RuntimeManager {
     /// conversations independent.
     message_acceptance: ConversationMutexGates,
     product_message_admission: ConversationMutexGates,
+    remote_goal_apply: ConversationMutexGates,
+    #[cfg(test)]
+    remote_goal_apply_arrivals: AsyncMutex<HashMap<uuid::Uuid, Arc<Notify>>>,
     /// Serializes the final durable queue snapshot and executor publication
     /// with queue mutations. The database remains authoritative; this gate
     /// only prevents a newly-started executor from observing an older snapshot.
@@ -2676,6 +2693,9 @@ impl RuntimeManager {
             fatal_runtime_map_barrier: AsyncMutex::new(None),
             message_acceptance: ConversationMutexGates::default(),
             product_message_admission: ConversationMutexGates::default(),
+            remote_goal_apply: ConversationMutexGates::default(),
+            #[cfg(test)]
+            remote_goal_apply_arrivals: AsyncMutex::new(HashMap::new()),
             steering_projection: ConversationMutexGates::default(),
             evicted_broadcasters: RwLock::new(HashMap::new()),
             aggregate_event_tx,
@@ -5571,7 +5591,7 @@ impl RuntimeManager {
                 Ok(child) => child,
                 Err(crate::db::DbError::ConversationNotFound(_)) => continue,
                 Err(error) => {
-                    return Err(DatabaseTerminalRecoveryError::Retryable(error.to_string()))
+                    return Err(DatabaseTerminalRecoveryError::Retryable(error.to_string()));
                 }
             };
             if child.runtime_role == crate::work_scope::RuntimeRole::SubAgent
@@ -6920,6 +6940,39 @@ impl RuntimeManager {
                 "Runtime evicted; shutdown signal sent, broadcaster preserved for new runtime"
             );
         }
+    }
+
+    pub(crate) async fn lock_remote_goal_apply(
+        &self,
+        action_reference: uuid::Uuid,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = self
+            .remote_goal_apply
+            .gate_for(&action_reference.to_string())
+            .await;
+        #[cfg(test)]
+        if let Some(arrival) = self
+            .remote_goal_apply_arrivals
+            .lock()
+            .await
+            .remove(&action_reference)
+        {
+            arrival.notify_one();
+        }
+        gate.lock_owned().await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn observe_next_remote_goal_apply_gate_arrival(
+        &self,
+        action_reference: uuid::Uuid,
+    ) -> Arc<Notify> {
+        let arrival = Arc::new(Notify::new());
+        self.remote_goal_apply_arrivals
+            .lock()
+            .await
+            .insert(action_reference, arrival.clone());
+        arrival
     }
 
     pub(crate) async fn lock_message_acceptance(

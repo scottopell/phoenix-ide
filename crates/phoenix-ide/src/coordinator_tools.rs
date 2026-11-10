@@ -591,6 +591,9 @@ impl instance::RoutedTool for WatchConversation {
     fn resolution_db(&self) -> &crate::db::Database {
         &self.peer_db
     }
+    fn self_peer_policy(&self) -> instance::SelfPeerPolicy {
+        instance::SelfPeerPolicy::Allow
+    }
     async fn run_routed(
         &self,
         input: Value,
@@ -646,6 +649,9 @@ impl instance::RoutedTool for UnwatchConversation {
     }
     fn resolution_db(&self) -> &crate::db::Database {
         &self.peer_db
+    }
+    fn self_peer_policy(&self) -> instance::SelfPeerPolicy {
+        instance::SelfPeerPolicy::Allow
     }
     async fn run_routed(
         &self,
@@ -703,6 +709,9 @@ impl instance::RoutedTool for ListWatchedConversations {
     }
     fn resolution_db(&self) -> &crate::db::Database {
         &self.peer_db
+    }
+    fn self_peer_policy(&self) -> instance::SelfPeerPolicy {
+        instance::SelfPeerPolicy::Allow
     }
     async fn run_routed(
         &self,
@@ -1131,6 +1140,9 @@ impl instance::RoutedTool for FederatedReadConversation {
     fn resolution_db(&self) -> &crate::db::Database {
         &self.remote_db
     }
+    fn self_peer_policy(&self) -> instance::SelfPeerPolicy {
+        instance::SelfPeerPolicy::Allow
+    }
     async fn run_routed(
         &self,
         input: Value,
@@ -1224,6 +1236,9 @@ impl instance::RoutedTool for FederatedQueryDatabase {
     fn resolution_db(&self) -> &crate::db::Database {
         &self.remote_db
     }
+    fn self_peer_policy(&self) -> instance::SelfPeerPolicy {
+        instance::SelfPeerPolicy::Allow
+    }
     async fn run_routed(
         &self,
         input: Value,
@@ -1294,6 +1309,9 @@ impl instance::RoutedTool for ResolveReference {
     }
     fn resolution_db(&self) -> &crate::db::Database {
         &self.remote_db
+    }
+    fn self_peer_policy(&self) -> instance::SelfPeerPolicy {
+        instance::SelfPeerPolicy::Allow
     }
     async fn run_routed(
         &self,
@@ -1527,6 +1545,9 @@ impl instance::RoutedTool for FederatedSendConversationMessage {
     }
     fn resolution_db(&self) -> &crate::db::Database {
         &self.db
+    }
+    fn self_peer_policy(&self) -> instance::SelfPeerPolicy {
+        instance::SelfPeerPolicy::Allow
     }
     async fn run_routed(
         &self,
@@ -3560,8 +3581,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_conversation_message_explicit_unknown_or_self_instance_never_falls_back_locally()
-    {
+    async fn send_conversation_message_unknown_or_unconfigured_remote_never_falls_back_locally() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         state
             .db
@@ -3584,7 +3604,10 @@ mod tests {
             db: state.db.clone(),
         });
         let own_instance = state.db.instance_id().await.unwrap().to_string();
-        for instance in ["missing-peer".to_string(), own_instance] {
+        for (instance, expected_error) in [
+            ("missing-peer".to_string(), "peer connection not found"),
+            (own_instance, "peer connection not found"),
+        ] {
             let output = tool
                 .run(
                     json!({
@@ -3600,7 +3623,7 @@ mod tests {
                 !output.is_success(),
                 "unexpected local fallback: {output:?}"
             );
-            assert!(output.output().contains("peer connection not found"));
+            assert!(output.output().contains(expected_error));
             assert!(state
                 .db
                 .get_messages("local-target")
