@@ -2581,6 +2581,45 @@ async fn native_rename_declares_closed_operation_branches_matching_strict_parser
 }
 
 #[tokio::test]
+async fn malformed_native_rename_errors_are_operation_guided_without_echoing_values() {
+    let (runtime, _, gc) = native_runtime().await;
+    let tool = RouteTool::boxed(RenameConversation(runtime));
+    let sentinel = "rename-non-echo-sentinel-783d";
+    let malformed = [
+        (
+            rename_input(json!({"op":"detail","reference":"fixture","unexpected":sentinel})),
+            "detail requires",
+        ),
+        (
+            rename_input(json!({"op":"read","operation_id":sentinel})),
+            "read requires",
+        ),
+        (
+            rename_input(json!({"op":"rename","operation_id":sentinel})),
+            "rename requires",
+        ),
+        (
+            rename_input(json!({"op":sentinel,"reference":"fixture"})),
+            "op must be",
+        ),
+        (
+            json!({"request":{"op":"detail","reference":"fixture"},"unexpected":sentinel}),
+            "detail requires",
+        ),
+        (
+            json!({"op":"detail","reference":sentinel}),
+            "supply only request",
+        ),
+    ];
+    for (input, guidance) in malformed {
+        let error = tool.run(input, native_context(&gc)).await;
+        assert!(matches!(error, ToolOutput::Error { .. }));
+        assert!(error.output().contains(guidance), "{}", error.output());
+        assert!(!error.output().contains(sentinel), "{}", error.output());
+    }
+}
+
+#[tokio::test]
 async fn native_federated_rename_read_requires_immutable_intent_replay() {
     let (runtime, _, gc) = native_runtime().await;
     let tool = RouteTool::boxed(RenameConversation(runtime));

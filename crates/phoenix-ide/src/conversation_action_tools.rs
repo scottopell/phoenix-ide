@@ -86,12 +86,24 @@ struct RenameEnvelope {
     request: RenameRequest,
 }
 
-fn parse_rename_request(input: Value) -> Result<RenameRequest, String> {
-    serde_json::from_value::<RenameEnvelope>(input)
-        .map(|envelope| envelope.request)
-        .map_err(|error| error.to_string())
+fn rename_request_guidance(request: &Value) -> &'static str {
+    match request.get("op").and_then(Value::as_str) {
+        Some("detail") => "detail requires only op and reference",
+        Some("read") => "read requires only op and operation_id",
+        Some("rename") => "rename requires only op, operation_id, product_conversation_id, expected_root_transcript_id, expected_name_revision, and title",
+        _ => "op must be detail, read, or rename",
+    }
 }
 
+fn parse_rename_request(input: Value) -> Result<RenameRequest, String> {
+    let guidance = input
+        .get("request")
+        .map(rename_request_guidance)
+        .unwrap_or("supply only request with detail {op, reference}, read {op, operation_id}, or rename {op, operation_id, product_conversation_id, expected_root_transcript_id, expected_name_revision, title}");
+    serde_json::from_value::<RenameEnvelope>(input)
+        .map(|envelope| envelope.request)
+        .map_err(|_| format!("Invalid rename_conversation request: {guidance}."))
+}
 fn rename_request_schema() -> Value {
     json!({"type":"object", "additionalProperties":false, "required":["request"], "properties":{
         "request":{"oneOf":[
