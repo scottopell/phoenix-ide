@@ -2,6 +2,7 @@ use super::*;
 use crate::runtime::{deny_gate::CheckedToolCall, ToolExecutor, ToolRegistryExecutor};
 use phoenix_core::domain::{
     db_schema::{InputOrigin, MessageContent},
+    instance_identity::{PeerBearerCredential, PeerTlsTrust},
     llm_types::ContentBlock,
     sm_event::{
         DirectTurnTurnId, PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
@@ -93,7 +94,7 @@ impl Fixture {
         super::super::tests::context(&self.caller).with_direct_turn_id(self.turn_id)
     }
 
-    async fn invoke(&self, name: &str, input: Value) -> ToolOutput {
+    async fn source_context(&self, name: &str, input: Value) -> ToolContext {
         let call_id = uuid::Uuid::new_v4().to_string();
         let message_id = uuid::Uuid::new_v4().to_string();
         self.db
@@ -110,13 +111,15 @@ impl Fixture {
             )
             .await
             .unwrap();
+        self.ctx()
+            .with_tool_use_id(&call_id)
+            .with_svg_assistant_message_id(&message_id)
+    }
+
+    async fn invoke(&self, name: &str, input: Value) -> ToolOutput {
+        let context = self.source_context(name, input.clone()).await;
         self.executor
-            .execute(
-                CheckedToolCall::cleared_for_test(name, input),
-                self.ctx()
-                    .with_tool_use_id(&call_id)
-                    .with_svg_assistant_message_id(&message_id),
-            )
+            .execute(CheckedToolCall::cleared_for_test(name, input), context)
             .await
             .expect("registered native Goal tool")
     }
@@ -164,6 +167,159 @@ impl Fixture {
 fn value(output: &ToolOutput) -> Value {
     assert!(output.is_success(), "{}", output.output());
     serde_json::from_str(output.output()).unwrap()
+}
+
+async fn assert_remote_source_race_refused(operation: Operation, terminalize: bool) {
+    use phoenix_core::domain::instance_identity::{InstanceId, PeerBearerCredential, PeerTlsTrust};
+
+    let f = Fixture::new().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, mut stopped) = tokio::sync::oneshot::channel();
+    let requests = tokio::spawn(async move {
+        let mut dispatched = 0;
+        loop {
+            tokio::select! {
+                _ = &mut stopped => return dispatched,
+                connection = listener.accept() => {
+                    let (stream, _) = connection.unwrap();
+                    dispatched += 1;
+                    drop(stream);
+                }
+            }
+        }
+    });
+    f.runtime
+        .db()
+        .save_federation_peer_connection(
+            InstanceId::new(),
+            &"race-peer".parse().unwrap(),
+            &format!("https://{address}").parse().unwrap(),
+            &PeerBearerCredential::parse(format!("phx_peer_{}", "b".repeat(43))).unwrap(),
+            &PeerTlsTrust::PlatformRoots,
+        )
+        .await
+        .unwrap();
+    let (name, mut input) = match operation {
+        Operation::Prepare => (
+            "prepare_goal",
+            json!({
+                "target":format!("@conv:{}", f.owner.as_str()),
+                "action":{"operation":"create","objective":"Must not dispatch"}
+            }),
+        ),
+        Operation::Apply => ("apply_goal", json!({"action_reference":Uuid::new_v4()})),
+    };
+    input["instance"] = json!("race-peer");
+    let context = f.source_context(name, input.clone()).await;
+    let turn = context.direct_turn_id().unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let service = GoalCommandService::new(Arc::clone(&f.runtime))
+        .with_remote_source_identity_barrier(Arc::clone(&barrier));
+    let tool = crate::coordinator_tools::instance::RouteTool::boxed(GoalTool {
+        service,
+        runtime: Arc::clone(&f.runtime),
+        operation,
+    });
+    let task = tokio::spawn(async move { tool.run(input, context).await });
+    barrier.wait().await;
+    let product = f
+        .runtime
+        .db()
+        .get_conversation(&f.caller)
+        .await
+        .unwrap()
+        .product_conversation_id;
+    let admission = f
+        .runtime
+        .try_lock_product_message_admission(product.as_str())
+        .await
+        .unwrap();
+    if terminalize {
+        sqlx::query("UPDATE durable_turns SET terminal_kind='Cancelled',owns_conversation=0 WHERE turn_id=?")
+            .bind(i64::try_from(turn.0).unwrap()).execute(f.runtime.db().pool()).await.unwrap();
+    } else {
+        sqlx::query("UPDATE workflows SET generation=generation+1 WHERE workflow_id=(SELECT workflow_id FROM durable_turns WHERE turn_id=?)")
+            .bind(i64::try_from(turn.0).unwrap()).execute(f.runtime.db().pool()).await.unwrap();
+    }
+    drop(admission);
+    barrier.wait().await;
+    let output = task.await.unwrap();
+    assert!(!output.is_success());
+    assert!(
+        output
+            .output()
+            .contains("durable Coordinator turn provenance unavailable"),
+        "{}",
+        output.output()
+    );
+    stop.send(()).unwrap();
+    assert_eq!(
+        requests.await.unwrap(),
+        0,
+        "stale source dispatched remotely"
+    );
+    assert!(f
+        .runtime
+        .db()
+        .conversation_goal(&f.owner)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn remote_prepare_revalidates_terminalized_turn_after_identity_lookup() {
+    assert_remote_source_race_refused(Operation::Prepare, true).await;
+}
+
+#[tokio::test]
+async fn remote_apply_revalidates_terminalized_turn_after_identity_lookup() {
+    assert_remote_source_race_refused(Operation::Apply, true).await;
+}
+
+#[tokio::test]
+async fn remote_prepare_revalidates_stale_generation_after_identity_lookup() {
+    assert_remote_source_race_refused(Operation::Prepare, false).await;
+}
+
+#[tokio::test]
+async fn remote_apply_revalidates_stale_generation_after_identity_lookup() {
+    assert_remote_source_race_refused(Operation::Apply, false).await;
+}
+
+#[tokio::test]
+async fn remote_source_requires_exact_tool_call_and_retains_admission() {
+    let f = Fixture::new().await;
+    let context = f.source_context("prepare_goal", json!({})).await;
+    let turn = context.direct_turn_id().unwrap();
+    let call = context.source_tool_call().unwrap();
+    let service = GoalCommandService::new(Arc::clone(&f.runtime));
+    let (admission, source) = service
+        .admit_remote_source(&f.caller, &call, turn, "prepare_goal")
+        .await
+        .unwrap();
+    assert!(f
+        .runtime
+        .try_lock_product_message_admission(source.product_conversation_id.as_str())
+        .await
+        .is_none());
+    drop(admission);
+    let mut wrong_call = call.clone();
+    wrong_call.tool_use_id = "not-the-server-owned-call".into();
+    assert!(service
+        .admit_remote_source(&f.caller, &wrong_call, turn, "prepare_goal")
+        .await
+        .is_err());
+    assert!(service
+        .admit_remote_source(&f.caller, &call, turn, "apply_goal")
+        .await
+        .is_err());
+    assert!(f
+        .runtime
+        .try_lock_product_message_admission(source.product_conversation_id.as_str())
+        .await
+        .is_some());
 }
 
 #[tokio::test]
@@ -241,6 +397,7 @@ async fn native_goal_discovery_prepare_apply_read_and_replay_without_dispatch() 
             (152, "goal_preparation_inflight_source".into()),
             (153, "close_writer_observations".into()),
             (155, "ordinary_self_goal_admission".into()),
+            (156, "remote_coordinator_goals".into()),
             (158, "federated_conversation_actions".into()),
         ]
     );
@@ -1317,6 +1474,8 @@ async fn production_coordinator_registry_has_exact_instance_selector_contract() 
         "unwatch_conversation",
         "list_watched_conversations",
         "read_goal",
+        "prepare_goal",
+        "apply_goal",
         "create_conversation",
         "rename_conversation",
     ];
@@ -1335,6 +1494,8 @@ async fn production_coordinator_registry_has_exact_instance_selector_contract() 
                 | "watch_conversation"
                 | "unwatch_conversation"
                 | "list_watched_conversations"
+                | "prepare_goal"
+                | "apply_goal"
                 | "create_conversation"
                 | "rename_conversation"
         ) {
@@ -1373,6 +1534,100 @@ async fn production_coordinator_registry_has_exact_instance_selector_contract() 
             definition.name
         );
     }
+}
+
+#[tokio::test]
+async fn goal_tools_omit_or_accept_exact_local_instance_and_reject_invalid_remote_without_fallback()
+{
+    let f = Fixture::new().await;
+    let omitted = value(
+        &f.invoke(
+            "prepare_goal",
+            json!({"target":f.target(),"action":{"operation":"create","objective":"route parity"}}),
+        )
+        .await,
+    );
+    let local = value(&f.invoke("prepare_goal", json!({"target":f.target(),"instance":"local","action":{"operation":"create","objective":"route parity"}})).await);
+    assert_eq!(omitted["target"], local["target"]);
+    assert_eq!(omitted["action"], local["action"]);
+    assert_eq!(omitted["expected_version"], local["expected_version"]);
+    assert!(local.get("observed_goal_id").is_some());
+    assert!(local.get("instance_id").is_none());
+    let prepare_description = f
+        .runtime
+        .coordinator_tool_registry(&f.caller, None)
+        .await
+        .unwrap()
+        .definitions()
+        .into_iter()
+        .find(|definition| definition.name == "prepare_goal")
+        .unwrap()
+        .description;
+    assert!(prepare_description.contains("identifies the selected peer"));
+    let before = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM conversation_goal_preparations WHERE owner_id=?",
+    )
+    .bind(f.owner.as_str())
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    for selector in [
+        json!("missing-peer"),
+        json!("Local"),
+        json!(" local "),
+        json!(null),
+        json!(false),
+    ] {
+        let output = f.invoke("prepare_goal", json!({"target":f.target(),"instance":selector,"action":{"operation":"create","objective":"no fallback"}})).await;
+        assert!(!output.is_success());
+    }
+    let local_id = f.db.instance_id().await.unwrap();
+    f.db.save_federation_peer_connection(
+        local_id,
+        &"self-alias".parse().unwrap(),
+        &"https://self.invalid".parse().unwrap(),
+        &PeerBearerCredential::parse(format!("phx_peer_{}", "s".repeat(43))).unwrap(),
+        &PeerTlsTrust::PlatformRoots,
+    )
+    .await
+    .unwrap();
+    let work_before = f.work_counts().await;
+    let receipts_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_goal_coordinator_receipts")
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+    for selector in [local_id.to_string(), "self-alias".to_owned()] {
+        let prepare = f
+            .invoke(
+                "prepare_goal",
+                json!({"target":f.target(),"instance":selector,"action":{"operation":"create","objective":"never routed to self"}}),
+            )
+            .await;
+        assert!(!prepare.is_success(), "{}", prepare.output());
+        let apply = f
+            .invoke(
+                "apply_goal",
+                json!({"instance":selector,"action_reference":Uuid::new_v4()}),
+            )
+            .await;
+        assert!(!apply.is_success(), "{}", apply.output());
+    }
+    let receipts_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_goal_coordinator_receipts")
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(f.work_counts().await, work_before);
+    assert_eq!(receipts_after, receipts_before);
+    let after = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM conversation_goal_preparations WHERE owner_id=?",
+    )
+    .bind(f.owner.as_str())
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(before, after);
 }
 
 #[tokio::test]

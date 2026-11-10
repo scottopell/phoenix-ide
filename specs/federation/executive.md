@@ -2,7 +2,7 @@
 
 ## Summary
 
-Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance conversation read/resolve support, and optional-instance `send_conversation_message`, `read_goal`, Coordinator `query_database`, Coordinator `read_automatic_continuation`/`set_automatic_continuation`, and native ordinary-conversation create/rename routing through destination-owned admission. Omission and exact `"local"` use local services; the preference tools reject explicit `null` even on read, while other read tools treat it as local. Other strings select an exact saved peer without fallback. Ordinary non-Coordinator query registrations remain local-only. Durable remote watches provide destination-owned enrollment, continuation following, accepted-delivery deduplication, restart and bounded-gap recovery, ordered unsubscribe, and revocation-aware closure.
+Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance conversation read/resolve support, and optional-instance `send_conversation_message`, `read_goal`, Coordinator `query_database`, Coordinator Goal prepare/apply, native ordinary-conversation create/rename, and Coordinator `read_automatic_continuation`/`set_automatic_continuation` routing through destination-owned admission. Omission and exact `"local"` use local services; the preference tools reject explicit `null` even on read, while other read tools treat it as local. Other strings select an exact saved peer without fallback. Ordinary non-Coordinator query registrations remain local-only. Durable remote watches provide destination-owned enrollment, continuation following, accepted-delivery deduplication, restart and bounded-gap recovery, ordered unsubscribe, and revocation-aware closure.
 
 ## Requirement status
 
@@ -17,6 +17,7 @@ Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance c
 | REQ-FED-019 | Implemented | Enrollment and peer-connection writes require a validated `PeerDisplayName`; constructor/JSON and HTTP tests pass for blank names and case/whitespace variants of local, including rejection without replacing credentials or connections. |
 | REQ-FED-020 | Implemented; deployment pending | Separate closed remote read/set requests, source Coordinator dispatch gate, authenticated destination transaction, strict preference-only set and response verification passed focused regressions, exact-range review, full repository qualification, and merge-head CI. Production deployment and live cross-host acceptance are not established. No generic settings, trust/enrollment, or combined enable-and-create operation is included. |
 | REQ-FED-021–024 | Implemented; deployment pending | Closed authenticated create/options/status and rename/options requests use destination-owned application actions, durable request/operation identities, strict witness-bound responses, status-only reconciliation after ambiguous create outcomes, replay-safe qualified rename receipts, and local/remote tool-output parity. Historical TEXT locator bytes are preserved losslessly; only live-valid tuples receive source-instance authority, while unqualifiable creation and rename provenance remains explicitly historical and untrusted. Exact-head hosted validation covers the protocol, persistence, migration, replay, authority, UI/spec, and end-to-end lanes. Production deployment and live cross-host acceptance are not established. |
+| REQ-FED-025 | Implemented; qualification pending | Remote Coordinator Goal prepare/apply includes source-boundary presence-aware selection, typed enrollment and source-tool-call provenance, destination Coordinator `ProductConversation` targeting and destination-derived expected version, reference-only federation apply with internal preparation lookup, and one retained enrollment-scoped terminal receipt replayed under current authority gates. Repository qualification, production deployment, and live cross-host acceptance are not established. |
 
 ## Existing foundations
 
@@ -34,9 +35,10 @@ Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance c
 ## Verification still required
 
 - Production rollout and live cross-host acceptance of the automatic-continuation controls remain unverified. Repository qualification and merge-head CI do not establish deployed behavior.
+- Repository qualification, production rollout, and live cross-host acceptance of remote Coordinator Goal prepare/apply remain unverified.
 - Production rollout and live cross-host acceptance of native federated conversation create and rename remain unverified. Repository qualification does not establish deployed behavior.
 - Operational interoperability still requires compatible deployment on participating hosts; this does not reopen the implemented watch lifecycle.
 
 ## Delivery inventory
 
-Goal mutations (including creation), generic settings beyond the typed automatic-continuation preference, Continue, reverse enrollment, live peer changes, and combined enable-and-create are not implemented in this status snapshot. This inventory reports delivered behavior and does not narrow separately authorized scope.
+Local and remote Coordinator Goal tooling and native ordinary-conversation create/rename exist. Goal routing selector presence belongs to the source tool boundary; the federation apply request itself contains only the opaque preparation reference, and lookup is destination-internal. Generic settings beyond the typed automatic-continuation preference, Continue, reverse enrollment, live peer changes, and combined enable-and-create are not delivered under this federation contract. This inventory reports delivered behavior; it does not narrow separately authorized scope.

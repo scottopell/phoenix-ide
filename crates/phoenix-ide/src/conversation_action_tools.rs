@@ -13,7 +13,7 @@ use crate::api::{federation, CreateProductConversationRequest};
 use crate::conversation_actions::{
     self, accept_create, CoordinatorRenameIntent, CreateSource, LocalCoordinatorSource,
 };
-use crate::coordinator_tools::instance::{Route, RouteTool, RoutedTool};
+use crate::coordinator_tools::instance::{Route, RouteTool, RoutedTool, SelfPeerPolicy};
 use crate::db::ProductConversationRenameResult;
 use crate::runtime::RuntimeManager;
 
@@ -195,6 +195,9 @@ impl RoutedTool for RenameConversation {
     }
     fn resolution_db(&self) -> &crate::db::Database {
         self.0.db()
+    }
+    fn self_peer_policy(&self) -> SelfPeerPolicy {
+        SelfPeerPolicy::Reject
     }
     async fn authorize(&self, ctx: &ToolContext) -> Result<(), String> {
         self.0
@@ -547,6 +550,9 @@ impl RoutedTool for CreateConversation {
     }
     fn resolution_db(&self) -> &crate::db::Database {
         self.0.db()
+    }
+    fn self_peer_policy(&self) -> SelfPeerPolicy {
+        SelfPeerPolicy::Reject
     }
     async fn authorize(&self, ctx: &ToolContext) -> Result<(), String> {
         self.0

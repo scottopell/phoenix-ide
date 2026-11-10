@@ -191,13 +191,16 @@ async fn binding_tx(tx: &mut GoalTx<'_>, turn_id: i64) -> Result<Option<GoalExec
 }
 
 async fn read_actor(tx: &mut GoalTx<'_>, actor_id: i64) -> Result<GoalActor> {
-    let row = sqlx::query("SELECT actor_id,owner_id,kind,source_product_id,transcript_id,workflow_id,turn_id,message_id,tool_use_id,host_action_id FROM conversation_goal_actors WHERE actor_id=?")
+    let row = sqlx::query("SELECT a.actor_id,a.owner_id,a.kind,a.enrollment_id,a.source_product_id,a.transcript_id,a.workflow_id,a.turn_id,a.message_id,a.tool_use_id,a.host_action_id,e.caller_instance_id AS source_instance_id FROM conversation_goal_actors a LEFT JOIN federation_enrollments e ON e.id=a.enrollment_id WHERE a.actor_id=?")
         .bind(actor_id)
         .fetch_one(&mut **tx)
         .await?;
     let kind: String = row.try_get("kind")?;
     match kind.as_str() {
         "user_control" => {
+            if row.try_get::<Option<String>, _>("enrollment_id")?.is_some() {
+                return Err(GoalDbError::Integrity("actor enrollment"));
+            }
             let control = sqlx::query("SELECT control_principal_id,control_request_id,control_command FROM conversation_goal_actors WHERE actor_id=?")
                 .bind(actor_id).fetch_one(&mut **tx).await?;
             Ok(GoalActor::UserControl {
@@ -216,14 +219,24 @@ async fn read_actor(tx: &mut GoalTx<'_>, actor_id: i64) -> Result<GoalActor> {
                 },
             })
         }
-        "user_api" => Ok(GoalActor::UserApi {
-            transcript_id: text(row.try_get("transcript_id")?)?,
-            message_id: text(row.try_get("message_id")?)?,
-        }),
-        "generated_host" => Ok(GoalActor::GeneratedHost {
-            action_id: text(row.try_get("host_action_id")?)?,
-        }),
-        "owning_agent" | "coordinator" => {
+        "user_api" => {
+            if row.try_get::<Option<String>, _>("enrollment_id")?.is_some() {
+                return Err(GoalDbError::Integrity("actor enrollment"));
+            }
+            Ok(GoalActor::UserApi {
+                transcript_id: text(row.try_get("transcript_id")?)?,
+                message_id: text(row.try_get("message_id")?)?,
+            })
+        }
+        "generated_host" => {
+            if row.try_get::<Option<String>, _>("enrollment_id")?.is_some() {
+                return Err(GoalDbError::Integrity("actor enrollment"));
+            }
+            Ok(GoalActor::GeneratedHost {
+                action_id: text(row.try_get("host_action_id")?)?,
+            })
+        }
+        "owning_agent" | "coordinator" | "remote_coordinator" => {
             let source = GoalAgentSource {
                 product_conversation_id: product(row.try_get("source_product_id")?)?,
                 transcript_id: text(row.try_get("transcript_id")?)?,
@@ -234,10 +247,33 @@ async fn read_actor(tx: &mut GoalTx<'_>, actor_id: i64) -> Result<GoalActor> {
                 message_id: text(row.try_get("message_id")?)?,
                 tool_use_id: text(row.try_get("tool_use_id")?)?,
             };
-            Ok(if kind == "owning_agent" {
-                GoalActor::OwningAgent(source)
-            } else {
-                GoalActor::Coordinator(source)
+            Ok(match kind.as_str() {
+                "owning_agent" if row.try_get::<Option<String>, _>("enrollment_id")?.is_none() => {
+                    GoalActor::OwningAgent(source)
+                }
+                "coordinator" if row.try_get::<Option<String>, _>("enrollment_id")?.is_none() => {
+                    GoalActor::Coordinator(source)
+                }
+                "remote_coordinator" => {
+                    let enrollment_id = row
+                        .try_get::<Option<String>, _>("enrollment_id")?
+                        .ok_or(GoalDbError::Integrity("actor enrollment"))?
+                        .parse()
+                        .map_err(|_| GoalDbError::Integrity("actor enrollment"))?;
+                    let instance_id = row
+                        .try_get::<Option<String>, _>("source_instance_id")?
+                        .ok_or(GoalDbError::Integrity("actor enrollment"))?
+                        .parse()
+                        .map_err(|_| GoalDbError::Integrity("actor source instance"))?;
+                    GoalActor::RemoteCoordinator(
+                        phoenix_core::domain::conversation_goal::EnrolledRemoteGoalAgentSource::new(
+                            instance_id,
+                            enrollment_id,
+                            source,
+                        ),
+                    )
+                }
+                _ => return Err(GoalDbError::Integrity("actor enrollment")),
             })
         }
         _ => Err(GoalDbError::Integrity("actor kind")),
@@ -314,68 +350,83 @@ async fn insert_actor(
             return Err(GoalDbError::Integrity("source tool call mismatch"));
         }
     }
-    let (kind, source_product, transcript, workflow, turn, message, tool, host) = match actor {
-        GoalActor::UserControl {
-            principal_id,
-            request_id,
-            command,
-        } => {
-            let command = match command {
-                GoalUserCommandKind::Create => "create",
-                GoalUserCommandKind::State => "state",
-            };
-            let existing: Option<i64> = sqlx::query_scalar("SELECT actor_id FROM conversation_goal_actors WHERE kind='user_control' AND owner_id=?1 AND control_principal_id=?2 AND control_request_id=?3 AND control_command=?4 AND control_result_version=?5")
+    let (kind, enrollment, source_product, transcript, workflow, turn, message, tool, host) =
+        match actor {
+            GoalActor::UserControl {
+                principal_id,
+                request_id,
+                command,
+            } => {
+                let command = match command {
+                    GoalUserCommandKind::Create => "create",
+                    GoalUserCommandKind::State => "state",
+                };
+                let existing: Option<i64> = sqlx::query_scalar("SELECT actor_id FROM conversation_goal_actors WHERE kind='user_control' AND owner_id=?1 AND control_principal_id=?2 AND control_request_id=?3 AND control_command=?4 AND control_result_version=?5")
                 .bind(owner.as_str()).bind(principal_id.as_bytes().as_slice())
                 .bind(request_id.as_bytes().as_slice()).bind(command).bind(result_version.get())
                 .fetch_optional(&mut **tx).await?;
-            if let Some(existing) = existing {
-                return Ok(existing);
-            }
-            return Ok(sqlx::query("INSERT INTO conversation_goal_actors (owner_id,kind,control_principal_id,control_request_id,control_command,control_result_version) VALUES (?1,'user_control',?2,?3,?4,?5)")
+                if let Some(existing) = existing {
+                    return Ok(existing);
+                }
+                return Ok(sqlx::query("INSERT INTO conversation_goal_actors (owner_id,kind,control_principal_id,control_request_id,control_command,control_result_version) VALUES (?1,'user_control',?2,?3,?4,?5)")
                 .bind(owner.as_str()).bind(principal_id.as_bytes().as_slice())
                 .bind(request_id.as_bytes().as_slice()).bind(command).bind(result_version.get())
                 .execute(&mut **tx).await?.last_insert_rowid());
-        }
-        GoalActor::UserApi {
-            transcript_id,
-            message_id,
-        } => (
-            "user_api",
-            None,
-            Some(transcript_id.as_str()),
-            None,
-            None,
-            Some(message_id.as_str()),
-            None,
-            None,
-        ),
-        GoalActor::GeneratedHost { action_id } => (
-            "generated_host",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(action_id.as_str()),
-        ),
-        GoalActor::OwningAgent(source) | GoalActor::Coordinator(source) => (
-            if matches!(actor, GoalActor::OwningAgent(_)) {
-                "owning_agent"
-            } else {
-                "coordinator"
-            },
-            Some(source.product_conversation_id.as_str()),
-            Some(source.transcript_id.as_str()),
-            Some(source.execution.workflow_id()),
-            Some(source.execution.turn_id()),
-            Some(source.message_id.as_str()),
-            Some(source.tool_use_id.as_str()),
-            None,
-        ),
-    };
-    Ok(sqlx::query("INSERT INTO conversation_goal_actors (owner_id,kind,source_product_id,transcript_id,workflow_id,turn_id,message_id,tool_use_id,host_action_id) VALUES (?,?,?,?,?,?,?,?,?)")
-        .bind(owner.as_str()).bind(kind).bind(source_product).bind(transcript)
+            }
+            GoalActor::UserApi {
+                transcript_id,
+                message_id,
+            } => (
+                "user_api",
+                None,
+                None,
+                Some(transcript_id.as_str()),
+                None,
+                None,
+                Some(message_id.as_str()),
+                None,
+                None,
+            ),
+            GoalActor::GeneratedHost { action_id } => (
+                "generated_host",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(action_id.as_str()),
+            ),
+            GoalActor::OwningAgent(source) | GoalActor::Coordinator(source) => (
+                if matches!(actor, GoalActor::OwningAgent(_)) {
+                    "owning_agent"
+                } else {
+                    "coordinator"
+                },
+                None,
+                Some(source.product_conversation_id.as_str()),
+                Some(source.transcript_id.as_str()),
+                Some(source.execution.workflow_id()),
+                Some(source.execution.turn_id()),
+                Some(source.message_id.as_str()),
+                Some(source.tool_use_id.as_str()),
+                None,
+            ),
+            GoalActor::RemoteCoordinator(remote) => (
+                "remote_coordinator",
+                Some(remote.enrollment_id.to_string()),
+                Some(remote.source.product_conversation_id.as_str()),
+                Some(remote.source.transcript_id.as_str()),
+                Some(remote.source.execution.workflow_id()),
+                Some(remote.source.execution.turn_id()),
+                Some(remote.source.message_id.as_str()),
+                Some(remote.source.tool_use_id.as_str()),
+                None,
+            ),
+        };
+    Ok(sqlx::query("INSERT INTO conversation_goal_actors (owner_id,kind,enrollment_id,source_product_id,transcript_id,workflow_id,turn_id,message_id,tool_use_id,host_action_id) VALUES (?,?,?,?,?,?,?,?,?,?)")
+        .bind(owner.as_str()).bind(kind).bind(enrollment).bind(source_product).bind(transcript)
         .bind(workflow).bind(turn).bind(message).bind(tool).bind(host)
         .execute(&mut **tx).await?.last_insert_rowid())
 }
@@ -399,6 +450,19 @@ async fn action_is_claimed_tx(tx: &mut GoalTx<'_>, mutation: &GoalMutation) -> R
         &mutation.attribution.requested_by,
         &mutation.attribution.applied_by,
     ] {
+        if let GoalActor::RemoteCoordinator(remote) = actor {
+            let source = &remote.source;
+            let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversation_goal_actors
+                WHERE kind='remote_coordinator' AND enrollment_id=? AND source_product_id=?
+                  AND transcript_id=? AND workflow_id=? AND turn_id=? AND message_id=? AND tool_use_id=?)")
+                .bind(remote.enrollment_id.to_string()).bind(source.product_conversation_id.as_str())
+                .bind(source.transcript_id.as_str()).bind(source.execution.workflow_id())
+                .bind(source.execution.turn_id()).bind(source.message_id.as_str())
+                .bind(source.tool_use_id.as_str()).fetch_one(&mut **tx).await?;
+            if exists {
+                return Ok(true);
+            }
+        }
         if let GoalActor::OwningAgent(source) | GoalActor::Coordinator(source) = actor {
             let exists: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM conversation_goal_actors
@@ -573,6 +637,17 @@ impl Database {
         &self,
         mutation: &GoalMutation,
     ) -> Result<Option<GoalHistoryEntry>> {
+        if matches!(
+            mutation.attribution.requested_by,
+            GoalActor::RemoteCoordinator(_)
+        ) || matches!(
+            mutation.attribution.applied_by,
+            GoalActor::RemoteCoordinator(_)
+        ) {
+            return Err(GoalDbError::Invalid(
+                "remote Goal mutations require a prepared federation authority",
+            ));
+        }
         let mut tx = self.pool().begin().await?;
         let accepted = retry_tx(&mut tx, mutation).await?;
         tx.commit().await?;
@@ -586,6 +661,17 @@ impl Database {
         expected_transcript: &str,
         at: GoalTimestampUs,
     ) -> Result<GoalHistoryEntry> {
+        if matches!(
+            mutation.attribution.requested_by,
+            GoalActor::RemoteCoordinator(_)
+        ) || matches!(
+            mutation.attribution.applied_by,
+            GoalActor::RemoteCoordinator(_)
+        ) {
+            return Err(GoalDbError::Invalid(
+                "remote Goal mutations require a prepared federation authority",
+            ));
+        }
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         if let Some(previous) = retry_tx(&mut tx, mutation).await? {
             tx.commit().await?;
@@ -722,6 +808,15 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .expect("in-memory SQLite pool")
+    }
+
+    async fn create_federation_enrollments_fixture(pool: &sqlx::SqlitePool) {
+        sqlx::query(
+            "CREATE TABLE federation_enrollments (id TEXT PRIMARY KEY, caller_instance_id TEXT)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     async fn migrated_db() -> Database {
@@ -987,7 +1082,8 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE conversation_goal_actors (actor_id INTEGER, owner_id TEXT, kind TEXT, host_action_id TEXT)")
+        create_federation_enrollments_fixture(&pool).await;
+        sqlx::query("CREATE TABLE conversation_goal_actors (actor_id INTEGER, owner_id TEXT, kind TEXT, enrollment_id TEXT, host_action_id TEXT)")
             .execute(&pool)
             .await
             .unwrap();
@@ -999,7 +1095,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO conversation_goal_actors VALUES (1,'owner','generated_host','fixture-action')")
+        sqlx::query("INSERT INTO conversation_goal_actors VALUES (1,'owner','generated_host',NULL,'fixture-action')")
             .execute(&pool)
             .await
             .unwrap();
@@ -1180,6 +1276,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn actor_decoder_rejects_remote_actor_without_enrollment_identity() {
+        let pool = test_pool().await;
+        create_federation_enrollments_fixture(&pool).await;
+        sqlx::query("CREATE TABLE conversation_goal_actors (actor_id INTEGER, owner_id TEXT, kind TEXT, enrollment_id TEXT, source_product_id TEXT, transcript_id TEXT, workflow_id INTEGER, turn_id INTEGER, message_id TEXT, tool_use_id TEXT, host_action_id TEXT, control_principal_id BLOB, control_request_id BLOB, control_command TEXT, control_result_version INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO conversation_goal_actors VALUES (1, 'owner', 'remote_coordinator', NULL, 'product', 'transcript', 1, 1, 'message', 'tool', NULL, NULL, NULL, NULL, NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        assert!(matches!(
+            read_actor(&mut tx, 1).await,
+            Err(GoalDbError::Integrity("actor enrollment"))
+        ));
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn actor_decoder_hydrates_remote_instance_from_existing_enrollment_relation() {
+        let pool = test_pool().await;
+        create_federation_enrollments_fixture(&pool).await;
+        sqlx::query("CREATE TABLE conversation_goal_actors (actor_id INTEGER, owner_id TEXT, kind TEXT, enrollment_id TEXT, source_product_id TEXT, transcript_id TEXT, workflow_id INTEGER, turn_id INTEGER, message_id TEXT, tool_use_id TEXT, host_action_id TEXT, control_principal_id BLOB, control_request_id BLOB, control_command TEXT, control_result_version INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let instance_id = phoenix_core::domain::instance_identity::InstanceId::new();
+        let enrollment_id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO federation_enrollments VALUES (?, ?)")
+            .bind(enrollment_id.to_string())
+            .bind(instance_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO conversation_goal_actors VALUES (1, 'owner', 'remote_coordinator', ?, 'product', 'transcript', 7, 11, 'message', 'tool', NULL, NULL, NULL, NULL, NULL)")
+            .bind(enrollment_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        assert_eq!(
+            read_actor(&mut tx, 1).await.unwrap(),
+            GoalActor::RemoteCoordinator(
+                phoenix_core::domain::conversation_goal::EnrolledRemoteGoalAgentSource::new(
+                    instance_id,
+                    enrollment_id,
+                    GoalAgentSource {
+                        product_conversation_id: ProductConversationId::parse("product").unwrap(),
+                        transcript_id: GoalText::parse("transcript").unwrap(),
+                        execution: GoalExecution::parse(7, 11).unwrap(),
+                        message_id: GoalText::parse("message").unwrap(),
+                        tool_use_id: GoalText::parse("tool").unwrap(),
+                    },
+                ),
+            )
+        );
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn current_and_history_read_absent_and_persisted_facts() {
         let pool = test_pool().await;
         sqlx::query(
@@ -1192,7 +1351,8 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE conversation_goal_actors (actor_id INTEGER, owner_id TEXT, kind TEXT, source_product_id TEXT, transcript_id TEXT, workflow_id INTEGER, turn_id INTEGER, message_id TEXT, tool_use_id TEXT, host_action_id TEXT, control_principal_id BLOB, control_request_id BLOB, control_command TEXT)")
+        create_federation_enrollments_fixture(&pool).await;
+        sqlx::query("CREATE TABLE conversation_goal_actors (actor_id INTEGER, owner_id TEXT, kind TEXT, enrollment_id TEXT, source_product_id TEXT, transcript_id TEXT, workflow_id INTEGER, turn_id INTEGER, message_id TEXT, tool_use_id TEXT, host_action_id TEXT, control_principal_id BLOB, control_request_id BLOB, control_command TEXT)")
             .execute(&pool)
             .await
             .unwrap();
@@ -1209,7 +1369,7 @@ mod tests {
             .execute(&mut *tx)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO conversation_goal_actors VALUES (1, 'owner', 'generated_host', NULL, NULL, NULL, NULL, NULL, NULL, 'host-action', NULL, NULL, NULL)")
+        sqlx::query("INSERT INTO conversation_goal_actors VALUES (1, 'owner', 'generated_host', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'host-action', NULL, NULL, NULL)")
             .execute(&mut *tx)
             .await
             .unwrap();
@@ -1242,7 +1402,8 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE conversation_goal_actors (actor_id INTEGER, owner_id TEXT, kind TEXT, source_product_id TEXT, transcript_id TEXT, workflow_id INTEGER, turn_id INTEGER, message_id TEXT, tool_use_id TEXT, host_action_id TEXT, control_principal_id BLOB, control_request_id BLOB, control_command TEXT)")
+        create_federation_enrollments_fixture(&pool).await;
+        sqlx::query("CREATE TABLE conversation_goal_actors (actor_id INTEGER, owner_id TEXT, kind TEXT, enrollment_id TEXT, source_product_id TEXT, transcript_id TEXT, workflow_id INTEGER, turn_id INTEGER, message_id TEXT, tool_use_id TEXT, host_action_id TEXT, control_principal_id BLOB, control_request_id BLOB, control_command TEXT)")
             .execute(&pool)
             .await
             .unwrap();

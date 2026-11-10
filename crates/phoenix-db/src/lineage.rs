@@ -198,6 +198,14 @@ const TABLE_GROUPS: &[(u32, &[&str])] = &[
     (139, &["conversation_goal_start_materializations"]),
 ];
 
+const REMOTE_COORDINATOR_GOALS_VERSION: u32 = 156;
+const FEDERATED_CONVERSATION_ACTIONS_VERSION: u32 = 158;
+
+fn is_supported_canonical_gap(highest: u32, missing: &[u32]) -> bool {
+    highest == FEDERATED_CONVERSATION_ACTIONS_VERSION
+        && missing == [REMOTE_COORDINATOR_GOALS_VERSION]
+}
+
 pub(crate) async fn preflight(
     pool: &SqlitePool,
     identities: impl Iterator<Item = (u32, &'static str)>,
@@ -263,14 +271,16 @@ pub(crate) async fn preflight(
         Some(_) => return Err(conflict("migration ledger is not a table")),
     }
     let highest = recorded.keys().next_back().copied().unwrap_or(0);
-    if highest >= 130
-        && !canonical
+    if highest >= 130 {
+        let missing: Vec<u32> = canonical
             .range(129..=highest)
-            .all(|(version, _)| recorded.contains_key(version))
-    {
-        return Err(conflict(
-            "partial post-129 ledger has a missing canonical predecessor",
-        ));
+            .filter_map(|(version, _)| (!recorded.contains_key(version)).then_some(*version))
+            .collect();
+        if !missing.is_empty() && !is_supported_canonical_gap(highest, &missing) {
+            return Err(conflict(
+                "partial post-129 ledger has a missing canonical predecessor",
+            ));
+        }
     }
     for &(version, markers) in MARKERS {
         let mut any = false;
@@ -633,6 +643,14 @@ mod tests {
                 .unwrap_or_else(|error| panic!("canonical prefix {through}: {error}"));
             assert_eq!(snapshot(&pool).await, before);
         }
+    }
+
+    #[test]
+    fn only_the_158_before_156_registry_transition_allows_a_canonical_gap() {
+        assert!(is_supported_canonical_gap(158, &[156]));
+        assert!(!is_supported_canonical_gap(158, &[155]));
+        assert!(!is_supported_canonical_gap(158, &[155, 156]));
+        assert!(!is_supported_canonical_gap(159, &[156]));
     }
 
     #[tokio::test]
