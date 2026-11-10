@@ -1,0 +1,68 @@
+{
+  "sourceBase": "7b0de589029bd842dab794599a3a69f77481fa3f",
+  "approvedProductDiffSha256": "f904b8046924c7af5f8a89a852ea60a6ad1e7f9085e540c50ff078477f17c2c4",
+  "reportsSha256": {
+    "before": "71822ec4900ceb9cad2e6a0417040344b1c8c370533fca53e8ff02bb3103fc8a",
+    "after": "39a3a2c14b873385573ff1f74b5d717c9869e82f7af37ad9cffe1cfa5c423300"
+  },
+  "engines": [
+    {
+      "name": "chromium",
+      "version": "149.0.7827.55"
+    },
+    {
+      "name": "webkit",
+      "version": "26.5"
+    }
+  ],
+  "pairedSamples": 36,
+  "changedMiddleBands": 18,
+  "columns": [
+    "engine|stylesheetMode|safeBottom|draftVariant|width|stage|height",
+    "beforeMiddlePx",
+    "afterMiddlePx",
+    "unchangedBelow44PxControls",
+    "beforeTailToInputPx",
+    "afterTailToInputPx",
+    "beforeTailRemainingPx",
+    "afterTailRemainingPx"
+  ],
+  "rows": [
+    ["chromium|browser|0|empty|393|closed|852",6,6,0,26.5,26.5,0,0],
+    ["chromium|browser|0|empty|393|synthetic-layout-reduced|500",6,6,0,26.5,26.5,0,0],
+    ["chromium|browser|0|empty|393|restored|852",6,6,0,26.5,26.5,0,0],
+    ["chromium|browser|34|empty|393|closed|852",40,40,0,26.5,26.5,0,0],
+    ["chromium|browser|34|empty|393|synthetic-layout-reduced|500",40,40,0,26.5,26.5,0,0],
+    ["chromium|browser|34|empty|393|restored|852",40,40,0,26.5,26.5,0,0],
+    ["chromium|standalone|0|empty|393|closed|852",6,6,0,26.5,26.5,0,0],
+    ["chromium|standalone|0|empty|393|synthetic-layout-reduced|500",6,6,0,26.5,26.5,0,0],
+    ["chromium|standalone|0|empty|393|restored|852",6,6,0,26.5,26.5,0,0],
+    ["chromium|standalone|34|empty|393|closed|852",40,6,34,26.5,26.5,0,0],
+    ["chromium|standalone|34|empty|393|synthetic-layout-reduced|500",40,6,34,26.5,26.5,0,0],
+    ["chromium|standalone|34|empty|393|restored|852",40,6,34,26.5,26.5,0,0],
+    ["chromium|standalone|34|three-line|393|closed|852",40,6,34,26.5,26.5,0,0],
+    ["chromium|standalone|34|three-line|393|synthetic-layout-reduced|500",40,6,34,26.5,26.5,0,0],
+    ["chromium|standalone|34|three-line|393|restored|852",40,6,34,26.5,26.5,0,0],
+    ["chromium|standalone|34|narrow-overcap|320|closed|852",40,6,34,26.5,26.5,0,0],
+    ["chromium|standalone|34|narrow-overcap|320|synthetic-layout-reduced|500",40,6,34,26.5,26.5,0,0],
+    ["chromium|standalone|34|narrow-overcap|320|restored|852",40,6,34,26.5,26.5,0,0],
+    ["webkit|browser|0|empty|393|closed|852",6,6,0,26.5,26.5,0,0],
+    ["webkit|browser|0|empty|393|synthetic-layout-reduced|500",6,6,0,25.5,25.5,1,1],
+    ["webkit|browser|0|empty|393|restored|852",6,6,0,26.5,26.5,0,0],
+    ["webkit|browser|34|empty|393|closed|852",40,40,0,26.5,26.5,0,0],
+    ["webkit|browser|34|empty|393|synthetic-layout-reduced|500",40,40,0,25.5,25.5,1,1],
+    ["webkit|browser|34|empty|393|restored|852",40,40,0,26.5,26.5,0,0],
+    ["webkit|standalone|0|empty|393|closed|852",6,6,0,26.5,26.5,0,0],
+    ["webkit|standalone|0|empty|393|synthetic-layout-reduced|500",6,6,0,25.5,25.5,1,1],
+    ["webkit|standalone|0|empty|393|restored|852",6,6,0,26.5,26.5,0,0],
+    ["webkit|standalone|34|empty|393|closed|852",40,6,34,26.5,26.5,0,0],
+    ["webkit|standalone|34|empty|393|synthetic-layout-reduced|500",40,6,34,25.5,25.5,1,1],
+    ["webkit|standalone|34|empty|393|restored|852",40,6,34,26.5,26.5,0,0],
+    ["webkit|standalone|34|three-line|393|closed|852",40,6,34,26.5,26.5,0,0],
+    ["webkit|standalone|34|three-line|393|synthetic-layout-reduced|500",40,6,34,25.5,25.5,1,1],
+    ["webkit|standalone|34|three-line|393|restored|852",40,6,34,26.5,26.5,0,0],
+    ["webkit|standalone|34|narrow-overcap|320|closed|852",40,6,34,26.5,26.5,0,0],
+    ["webkit|standalone|34|narrow-overcap|320|synthetic-layout-reduced|500",40,6,34,25.5,26.5,1,0],
+    ["webkit|standalone|34|narrow-overcap|320|restored|852",40,6,34,26.5,26.5,0,0]
+  ]
+}
