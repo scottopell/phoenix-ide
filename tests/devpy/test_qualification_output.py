@@ -117,20 +117,9 @@ class QualificationOutputTests(unittest.TestCase):
 
     def test_unittest_command_is_once_and_verbose_only_with_diagnostics(self):
         source = ast.parse((ROOT / "dev.py").read_text())
-        check = next(node for node in source.body
-                     if isinstance(node, ast.FunctionDef) and node.name == "cmd_check")
-        block = next(node for node in ast.walk(check) if isinstance(node, ast.If)
-                     and any(isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
-                             and isinstance(stmt.value.func, ast.Name)
-                             and stmt.value.func.id == "run_step" and stmt.value.args
-                             and isinstance(stmt.value.args[0], ast.Constant)
-                             and stmt.value.args[0].value == "dev.py unit tests"
-                             for stmt in node.orelse))
-        start = next(index for index, stmt in enumerate(block.orelse)
-                     if isinstance(stmt, ast.Assign)
-                     and any(isinstance(target, ast.Name) and target.id == "unittest_cmd"
-                             for target in stmt.targets))
-        code = compile(ast.Module(body=block.orelse[start:], type_ignores=[]),
+        check = next(node for node in ast.walk(source)
+                     if isinstance(node, ast.FunctionDef) and node.name == "check_devpy")
+        code = compile(ast.Module(body=check.body, type_ignores=[]),
                        str(ROOT / "dev.py"), "exec")
         for diagnostic in (None, "", str(self.directory)):
             for profile in (None, self.directory / "profile"):
