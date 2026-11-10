@@ -6,7 +6,7 @@ A Coordinator operating one trusted Phoenix instance needs to use supported coor
 
 ## Scope and related contracts
 
-This specification covers optional `instance` selection on `send_conversation_message`, `read_conversation`, `resolve_reference`, `read_goal`, `query_database`, `read_automatic_continuation`, `set_automatic_continuation`, `watch_conversation`, `unwatch_conversation`, and `list_watched_conversations`; typed remote automatic-continuation preference operations; durable remote conversation watches; finite settlement of facts durably staged before a terminal watch gap; native federated ordinary-conversation creation and rename; and remote Coordinator Goal prepare/apply. Settings other than the typed automatic-continuation preference, Continue, and other Goal mutations remain outside this contract.
+This specification covers optional `instance` selection on `send_conversation_message`, `read_conversation`, `resolve_reference`, `read_goal`, `prepare_goal`, `apply_goal`, `query_database`, `read_automatic_continuation`, `set_automatic_continuation`, `watch_conversation`, `unwatch_conversation`, and `list_watched_conversations`; typed remote automatic-continuation preference operations; durable remote conversation watches; finite settlement of facts durably staged before a terminal watch gap; native federated ordinary-conversation creation and rename; and remote Coordinator Goal prepare/apply. Settings other than the typed automatic-continuation preference, Continue, and other Goal mutations remain outside this contract.
 
 Related contracts remain authoritative for their domains:
 
@@ -26,7 +26,7 @@ When `send_conversation_message`, federated `read_conversation`, `resolve_refere
 
 When one of these tools receives another string selector, the system shall select the remote destination through saved-peer UUID or unambiguous display-name resolution. Local recognition and remote peer matching shall use the selector exactly as supplied, without trimming whitespace or folding case. The literal `"local"` shall be reserved for the instance executing the tool.
 
-An explicit `null` selector shall select local routing on the read tools, including Coordinator `query_database`, except that `read_automatic_continuation` shall reject explicit `null`; `send_conversation_message` and `set_automatic_continuation` shall reject explicit `null`. Tools without an optional `instance` parameter shall retain their own input and authority contracts. In particular, non-Coordinator `query_database` registrations shall remain local-only and shall reject an `instance` field.
+An explicit `null` selector shall select local routing on the read tools, including Coordinator `query_database`, except that `read_automatic_continuation` shall reject explicit `null`; `send_conversation_message` and `set_automatic_continuation` shall reject explicit `null`. Tools without an optional `instance` parameter shall retain their own input and authority contracts. In particular, ordinary ProductConversation and ordinary sub-agent `query_database` registrations shall remain local-only and shall reject an `instance` field. Trusted inline research children of the Coordinator inherit only its optional saved-peer read selector; their authority is derived from persisted parent identity, not tool arguments.
 
 **REQ-FED-002 — No destination fallback**
 

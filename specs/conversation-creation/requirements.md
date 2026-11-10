@@ -381,6 +381,10 @@ THE SYSTEM SHALL use the shared durable creation acceptance and reconciliation p
 AND SHALL accept only nonblank objective text, an existing absolute directory, and validated supported model, effort, and language choices
 AND SHALL NOT accept attachments, caller-authored origin metadata, filesystem references, or skill expansion as part of this capability.
 
+THE dedicated creation capability SHALL advertise one required operation request whose branches contain only their own fields: `options` accepts optional `cwd`, `read` requires `request_id`, and `create` requires `request_id`, `cwd`, `objective`, and `start=submit_objective` with optional model, effort, and language selections
+AND SHALL reject unknown and cross-operation fields before durable creation admission
+AND SHALL return operation-specific corrective guidance without echoing supplied objective text or filesystem paths when the request shape is malformed.
+
 WHEN the Coordinator discovers project directory options
 THE SYSTEM SHALL return only existing, normalized directories satisfying creation's directory floor
 AND SHALL apply its result bound and truncation indicator to usable options rather than stale persisted candidates.

@@ -122,7 +122,7 @@ WHILE a restricted planning conversation or a sub-agent of an ordinary conversat
 THE SYSTEM SHALL NOT provide Phoenix-wide history search, global conversation reads, database queries, global reference resolution, or cross-conversation messaging tools
 
 WHEN the Global Coordinator delegates bounded research, analysis, or authorized shell work through `spawn_agents`
-THE SYSTEM SHALL provide trusted inline children with bounded global history search, conversation reads, database queries, reference resolution, read-only file inspection, and the Coordinator's unsandboxed write-capable Bash tool
+THE SYSTEM SHALL provide trusted inline children with bounded global history search, conversation reads, database queries with the Coordinator's explicit saved-peer read selector, reference resolution, read-only file inspection, and the Coordinator's unsandboxed write-capable Bash tool
 AND SHALL require an explicit active WorkScope ID for each file read, resolve its authoritative server directory, and use ordinary numbered read_file offset/limit and path semantics
 AND SHALL require an explicit active WorkScope ID for every Bash run and reuse the Coordinator Bash target resolution, execution, handle-control, and lifecycle bounds
 AND SHALL permit the Coordinator home scope for general shell work and selected ordinary scopes for project work without treating the starting directory as filesystem confinement

@@ -803,12 +803,35 @@ rule RemoteDispatchFails {
 -- identity. Optional instance is omitted or a non-null string, including for
 -- read; invalid shapes fail before selection.
 -- Helpers:
+-- transport_authenticated_enrollment(source, destination) is derived only from the
+-- authenticated connection and exact transport instance identities. It is never
+-- accepted from GoalPrepareRequest or SourceCallProvenance.
+-- goal_prepare_retry_key(provenance) contains only source ProductConversation,
+-- workflow, turn, agent message, and tool-use identity. The exact transcript,
+-- requested ordinary target, destination, and operation are conflict material.
+-- same_goal_prepare(prior, request, destination) compares that conflict material
+-- with the durable first admission after the retry-key lookup.
+-- goal_preparation_for(enrollment, destination, reference) and
+-- goal_terminal_receipt_for(enrollment, destination, reference) are internal exact-
+-- enrollment lookups. Retained rows are not observable through an inactive enrollment.
+-- execute_frozen_goal_write(preparation) performs at most one ordinary Goal-domain
+-- write using only preparation.target, expected_goal_version, and operation.
+-- Its typed durability outcome covers the ordinary Goal admission, frozen-version
+-- check, mutation, and classified receipt as one durable boundary.
 -- local_peer(peer): peer.instance_id is the executing instance's identity.
 -- executing_instance_id(): the executing instance's durable identity.
 -- native_mutation_tool(tool): tool is create_conversation or rename_conversation.
--- explicit_null_selects_local(tool): tool is read_goal, read_conversation or resolve_reference.
+-- selector_null_routes_local(tool): tool is read_goal, read_conversation,
+-- resolve_reference, or query_database.
+-- selector_string_value(selector): the exact case-sensitive string supplied by an
+-- ExplicitStringToolSelector; no whitespace or case normalization occurs.
+-- coordinator_goal_prepare_or_apply(tool): tool is prepare_goal or apply_goal.
+-- goal_preparation_deadline_us(now_us, 15_minutes): the destination's current
+-- microsecond timestamp plus the fixed fifteen-minute Goal preparation lifetime.
+-- destination_goal_version(destination, target): the destination-owned ordinary
+-- target's Goal version at preparation admission.
 -- explicit_null_rejected(tool): tool is send_conversation_message, read_automatic_continuation,
--- set_automatic_continuation, create_conversation or rename_conversation.
+-- set_automatic_continuation, create_conversation, rename_conversation, prepare_goal, or apply_goal.
 -- automatic_continuation_tool(tool): tool is read_automatic_continuation or set_automatic_continuation.
 -- current_coordinator_authorized(): the executing transcript belongs to the current
 -- Coordinator at dispatch.
@@ -993,21 +1016,6 @@ rule ReadRemoteGoal {
 -- Goal prepare/apply rejects explicit null; omission and exact "local" remain local.
 -- A non-local string must resolve to one non-self peer before a selector-free
 -- federation request is formed.
--- transport_authenticated_enrollment(source, destination) is derived only from the
--- authenticated connection and exact transport instance identities. It is never
--- accepted from GoalPrepareRequest or SourceCallProvenance.
--- goal_prepare_retry_key(provenance) contains only source ProductConversation,
--- workflow, turn, agent message, and tool-use identity. The exact transcript,
--- requested ordinary target, destination, and operation are conflict material.
--- same_goal_prepare(prior, request, destination) compares that conflict material
--- with the durable first admission after the retry-key lookup.
--- goal_preparation_for(enrollment, destination, reference) and
--- goal_terminal_receipt_for(enrollment, destination, reference) are internal exact-
--- enrollment lookups. Retained rows are not observable through an inactive enrollment.
--- execute_frozen_goal_write(preparation) performs at most one ordinary Goal-domain
--- write using only preparation.target, expected_goal_version, and operation.
--- Its typed durability outcome covers the ordinary Goal admission, frozen-version
--- check, mutation, and classified receipt as one durable boundary.
 
 rule PrepareRemoteCoordinatorGoal {
     when: PrepareRemoteCoordinatorGoal(source, destination, request)
@@ -2024,7 +2032,7 @@ invariant OmittedSelectionIsLocal {
 }
 
 invariant RemoteSelectionNeverFallsBack {
-    for s in ToolSelections where s.selector.kind = ExplicitStringToolSelector:
+    for s in ToolSelections where s.selector.kind = ExplicitStringToolSelector and selector_string_value(s.selector) != "local":
         s.destination != null or s.failed
     -- Remote failures cannot trigger LocalToolExecution or another destination.
 }
