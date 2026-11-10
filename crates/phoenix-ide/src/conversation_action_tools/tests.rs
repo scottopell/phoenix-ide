@@ -6,7 +6,7 @@ fn create_input(request: Value) -> Value {
 }
 
 fn rename_input(request: Value) -> Value {
-    json!({"request": request})
+    create_input(request)
 }
 
 fn submit() -> Value {
