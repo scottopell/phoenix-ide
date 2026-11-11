@@ -7904,10 +7904,10 @@ mod tests {
             .replace_federation_enrollment(caller, &"peer".parse().unwrap(), &verifier)
             .await
             .unwrap();
-        let cwd = state.runtime.runtime_home().join("native-create-cwd");
-        std::fs::create_dir(&cwd).unwrap();
+        let cwd = tempfile::tempdir_in(state.runtime.runtime_home()).unwrap();
         let peer = test_native_create_peer(caller);
-        let request = test_native_create_request(caller, local, cwd.to_string_lossy().into_owned());
+        let request =
+            test_native_create_request(caller, local, cwd.path().to_string_lossy().into_owned());
         let response = native_create_inner(state.clone(), peer, Ok(Json(request)))
             .await
             .into_response();
