@@ -101,9 +101,9 @@ export function SlackGatewaySettings({ standalone = false }: { standalone?: bool
           <div className="sg-emoji-list">{names.map((name, index) => <div className="sg-emoji-row" key={index}>
             <div className="sg-field"><label htmlFor={fieldId + '-emoji-' + index}>Trigger emoji {index + 1}</label><input id={fieldId + '-emoji-' + index} value={name} onChange={e => updateEmoji(index, e.target.value)} placeholder="phoenix-please-look" maxLength={66} required spellCheck={false} autoCapitalize="none" autoCorrect="off" /></div>
             <code>:{emojiName(name) || 'emoji-name'}:</code>
-            <button type="button" className="btn-secondary" disabled={names.length === 1} aria-label={'Remove trigger emoji ' + (index + 1)} onClick={() => setConfig({ ...config, trigger_emojis: names.filter((_, i) => i !== index) })}>Remove</button>
+            <button type="button" className="btn-secondary" disabled={names.length === 1} aria-label={'Remove trigger emoji ' + (index + 1)} onClick={() => { setConfig({ ...config, trigger_emojis: names.filter((_, i) => i !== index) }); setSaved(false); }}>Remove</button>
           </div>)}</div>
-          <button type="button" className="btn-secondary" disabled={names.length >= 8} onClick={() => setConfig({ ...config, trigger_emojis: [...names, ''] })}>Add trigger emoji</button>
+          <button type="button" className="btn-secondary" disabled={names.length >= 8} onClick={() => { setConfig({ ...config, trigger_emojis: [...names, ''] }); setSaved(false); }}>Add trigger emoji</button>
           <p className="sg-hint">Enter Slack names with or without colons. Upload custom emoji in Slack first. Remove fire to stop using 🔥 as a trigger. 👀 is reserved for acknowledgment.</p>
           <p className="sg-hint">Changing the emoji set restarts initialization. Existing matches and gestures made during initialization become a baseline, without starting work. Wait until Discovery shows healthy before triggering a new request. Accepted work continues.</p>
           <h3 className="sg-list-title">Three workflows</h3>

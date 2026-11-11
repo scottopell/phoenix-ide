@@ -27,6 +27,8 @@ it('saves interchangeable custom emoji names and explains all three workflows', 
   expect(submitted?.trigger_emojis).toEqual(['phoenix-please-look', 'robot_face']);
   expect(screen.getByText('Initializing')).toBeTruthy();
   expect(screen.getByText(/Changing the emoji set restarts initialization/)).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Remove trigger emoji 2' }));
+  expect(screen.queryByText('Settings saved.')).toBeNull();
 });
 
 it('rejects duplicate or reserved names before submitting settings', async () => {
