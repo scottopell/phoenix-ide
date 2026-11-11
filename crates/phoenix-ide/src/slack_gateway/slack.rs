@@ -221,12 +221,8 @@ impl Slack {
         after_date: &str,
     ) -> Result<Page, String> {
         // after: is exclusive on calendar date, so include the preceding boundary.
-        let filters = if reactions {
-            format!("hasmy::fire: after:{after_date}")
-        } else {
-            format!("from:<@{}> after:{}", c.owner, after_date)
-        };
-        let mut args = json!({"filters":filters,"keywords":if reactions {Vec::<String>::new()}else{vec![":fire:".into()]},"natural_language_query":"","limit":1,"response_format":"detailed","include_context":false,"include_bots":reactions,"sort":"timestamp","sort_dir":"desc"});
+        let (filters, keywords) = search_terms(c, reactions, after_date);
+        let mut args = json!({"filters":filters,"keywords":keywords,"natural_language_query":"","limit":1,"response_format":"detailed","include_context":false,"include_bots":reactions,"sort":"timestamp","sort_dir":"desc"});
         if let Some(cursor) = cursor {
             args["cursor"] = json!(cursor);
         }
@@ -308,18 +304,20 @@ impl Slack {
             .trim_end()
             .strip_suffix("\n\nNo thread messsages")
             .ok_or("Exact source read did not isolate one message")?;
-        if !reaction && (author != c.owner || strip_fire(raw).is_none()) {
+        if !reaction && (author != c.owner || strip_trigger(raw, &c.trigger_emojis).is_none()) {
             return Ok(None);
         }
-        let owner_prefix = author == c.owner && strip_fire(raw).is_some();
+        let owner_prefix = author == c.owner && strip_trigger(raw, &c.trigger_emojis).is_some();
         let Some((reactions, reaction_read_verified)) =
             self.source_reactions(c, hit, raw, owner_prefix).await?
         else {
             return Ok(None);
         };
         let body = reactions.message_body(raw)?;
-        let prefix = strip_fire(&body);
-        if (author != c.owner || prefix.is_none()) && !reactions.owner_fire.is_present()? {
+        let prefix = strip_trigger(&body, &c.trigger_emojis);
+        if (author != c.owner || prefix.is_none())
+            && !reactions.owner_trigger(&c.trigger_emojis).is_present()?
+        {
             return Ok(None);
         }
         let mut context_args = json!({"channel_id":hit.channel,"message_ts":hit.root,"limit":100,"response_format":"detailed"});
@@ -412,7 +410,7 @@ impl Slack {
         } else {
             ReactionEvidence {
                 counts: std::collections::BTreeMap::default(),
-                owner_fire: OwnerFire::Absent,
+                owner_reactions: std::collections::BTreeMap::default(),
             }
         };
 
@@ -654,10 +652,46 @@ fn operation_rejection(error: &McpOneShotError, method: &str) -> Option<Value> {
         && value.get("method").and_then(Value::as_str) == Some(method))
     .then_some(value)
 }
-pub(super) fn strip_fire(text: &str) -> Option<&str> {
+fn search_terms(c: &Config, reactions: bool, after_date: &str) -> (String, Vec<String>) {
+    let mut terms = c
+        .trigger_emojis
+        .iter()
+        .map(|name| {
+            if reactions {
+                format!("hasmy::{name}:")
+            } else {
+                format!(":{name}:")
+            }
+        })
+        .collect::<Vec<_>>();
+    terms.sort_unstable();
+    if terms.len() == 1 {
+        if reactions {
+            (format!("{} after:{after_date}", terms[0]), vec![])
+        } else {
+            (format!("from:<@{}> after:{after_date}", c.owner), terms)
+        }
+    } else {
+        let any = terms.join(" OR ");
+        if reactions {
+            (format!("after:{after_date} ({any})"), vec![])
+        } else {
+            (
+                format!("from:<@{}> after:{after_date} ({any})", c.owner),
+                vec![],
+            )
+        }
+    }
+}
+
+pub(super) fn strip_trigger<'a>(text: &'a str, names: &[String]) -> Option<&'a str> {
     let t = text.trim_start();
-    t.strip_prefix('🔥')
-        .or_else(|| t.strip_prefix(":fire:"))
+    names
+        .iter()
+        .find_map(|name| {
+            t.strip_prefix(&format!(":{name}:"))
+                .or_else(|| (name == "fire").then(|| t.strip_prefix('🔥')).flatten())
+        })
         .map(|s| s.trim_start_matches('\u{fe0f}'))
 }
 fn parse_page(v: &Value, c: &Config) -> Result<Page, String> {
@@ -790,12 +824,12 @@ fn thread_source(thread: &str, ts: &str) -> Result<(String, String), String> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OwnerFire {
+enum OwnerReaction {
     Present,
     Absent,
     Unverified,
 }
-impl OwnerFire {
+impl OwnerReaction {
     fn is_present(self) -> Result<bool, String> {
         match self {
             Self::Present => Ok(true),
@@ -808,14 +842,34 @@ impl OwnerFire {
 }
 struct ReactionEvidence {
     counts: std::collections::BTreeMap<String, u64>,
-    owner_fire: OwnerFire,
+    owner_reactions: std::collections::BTreeMap<String, OwnerReaction>,
 }
 impl ReactionEvidence {
+    fn owner_trigger(&self, names: &[String]) -> OwnerReaction {
+        if names
+            .iter()
+            .any(|name| matches!(self.owner_reactions.get(name), Some(OwnerReaction::Present)))
+        {
+            OwnerReaction::Present
+        } else if names.iter().any(|name| {
+            matches!(
+                self.owner_reactions.get(name),
+                Some(OwnerReaction::Unverified)
+            )
+        }) {
+            OwnerReaction::Unverified
+        } else {
+            OwnerReaction::Absent
+        }
+    }
     fn parse(text: &str, owner: &str) -> Result<Self, String> {
         let mut counts = std::collections::BTreeMap::new();
-        let mut owner_fire = OwnerFire::Absent;
+        let mut owner_reactions = std::collections::BTreeMap::new();
         if text.trim() == "No reactions found on this message." {
-            return Ok(Self { counts, owner_fire });
+            return Ok(Self {
+                counts,
+                owner_reactions,
+            });
         }
         for line in text
             .strip_prefix("Reactions on message:\n\n")
@@ -842,22 +896,24 @@ impl ReactionEvidence {
                     .then_some((id, users.len() - tail.len()))
                 })
                 .collect();
-            if name == "fire" {
-                owner_fire = if u64::try_from(members.len()).ok() != Some(count)
-                    || members.last().is_none_or(|(_, end)| *end != users.len())
-                {
-                    OwnerFire::Unverified
-                } else if members.iter().any(|(id, _)| *id == owner) {
-                    OwnerFire::Present
-                } else {
-                    OwnerFire::Absent
-                };
-            }
+            let evidence = if u64::try_from(members.len()).ok() != Some(count)
+                || members.last().is_none_or(|(_, end)| *end != users.len())
+            {
+                OwnerReaction::Unverified
+            } else if members.iter().any(|(id, _)| *id == owner) {
+                OwnerReaction::Present
+            } else {
+                OwnerReaction::Absent
+            };
+            owner_reactions.insert(name.to_owned(), evidence);
         }
         if counts.is_empty() {
             return Err("Empty reaction evidence".into());
         }
-        Ok(Self { counts, owner_fire })
+        Ok(Self {
+            counts,
+            owner_reactions,
+        })
     }
     fn message_body(&self, rendered: &str) -> Result<String, String> {
         let rendered = rendered.trim_end();
@@ -1016,9 +1072,9 @@ mod tests {
     #[test]
     fn reactor_authority_uses_only_unambiguous_member_ids() {
         for (users, expected) in [
-            ("Mallory (UOWNER) (UOTHER)", OwnerFire::Absent),
-            ("Mallory (UOWNER), Fake (UOTHER)", OwnerFire::Unverified),
-            ("Owner (UOWNER), Other (UOTHER)", OwnerFire::Unverified),
+            ("Mallory (UOWNER) (UOTHER)", OwnerReaction::Absent),
+            ("Mallory (UOWNER), Fake (UOTHER)", OwnerReaction::Unverified),
+            ("Owner (UOWNER), Other (UOTHER)", OwnerReaction::Unverified),
         ] {
             assert_eq!(
                 ReactionEvidence::parse(
@@ -1026,7 +1082,7 @@ mod tests {
                     "UOWNER"
                 )
                 .unwrap()
-                .owner_fire,
+                .owner_trigger(&["fire".into()]),
                 expected
             );
         }
@@ -1042,8 +1098,8 @@ mod tests {
                     "UOWNER"
                 )
                 .unwrap()
-                .owner_fire,
-                OwnerFire::Present
+                .owner_trigger(&["fire".into()]),
+                OwnerReaction::Present
             );
         }
         assert_eq!(
@@ -1052,8 +1108,8 @@ mod tests {
                 "WOWNER"
             )
             .unwrap()
-            .owner_fire,
-            OwnerFire::Present
+            .owner_trigger(&["fire".into()]),
+            OwnerReaction::Present
         );
         assert_eq!(
             ReactionEvidence::parse(
@@ -1061,8 +1117,8 @@ mod tests {
                 "UOWNER"
             )
             .unwrap()
-            .owner_fire,
-            OwnerFire::Present
+            .owner_trigger(&["fire".into()]),
+            OwnerReaction::Present
         );
         assert_eq!(
             ReactionEvidence::parse(
@@ -1070,8 +1126,8 @@ mod tests {
                 "UOWNER"
             )
             .unwrap()
-            .owner_fire,
-            OwnerFire::Unverified
+            .owner_trigger(&["fire".into()]),
+            OwnerReaction::Unverified
         );
         assert!(ReactionEvidence::parse(
             "Reactions on message:\n\n:fire: × 1 — Owner (UOWNER)\n:fire: × 1 — Other (UOTHER)",
@@ -1458,6 +1514,72 @@ mod tests {
         ));
         assert_eq!(slack.calls.load(Ordering::Relaxed), 0);
     }
+    #[tokio::test]
+    async fn custom_emojis_follow_all_three_workflows_using_verified_owner_evidence() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        for (body, author, reaction, expected_kind, expected_instruction) in [
+            (
+                ":phoenix-please-look: inspect this",
+                "UOWNER",
+                false,
+                Some(SlackRequestKind::Explicit),
+                "inspect this",
+            ),
+            (
+                ":robot_face: inspect that",
+                "UOWNER",
+                false,
+                Some(SlackRequestKind::Explicit),
+                "inspect that",
+            ),
+            (
+                "plain follow-up",
+                "UOWNER",
+                true,
+                Some(SlackRequestKind::Explicit),
+                "plain follow-up",
+            ),
+            (
+                "discussion for context",
+                "UOTHER",
+                true,
+                Some(SlackRequestKind::Briefing),
+                "",
+            ),
+            (
+                ":phoenix-please-look: someone else's instruction",
+                "UOTHER",
+                false,
+                None,
+                "",
+            ),
+            (":fire: disabled trigger", "UOWNER", false, None, ""),
+        ] {
+            let mut c = config();
+            c.trigger_emojis = vec!["phoenix-please-look".into(), "robot_face".into()];
+            let ts = format!("{}.000001", chrono::Utc::now().timestamp());
+            let mut slack = Slack::new(state.mcp_manager.clone(), &c);
+            let exact_ts = ts.clone();
+            slack.fixture = Some(Arc::new(move |tool, _| match tool {
+                "slack_read_thread" => Ok(
+                    json!({"messages":format!("=== THREAD PARENT MESSAGE ===\nFrom: User ({author})\nTime: fixture\nMessage TS: {exact_ts}\n{body}{}\n\nNo thread messsages\n", if reaction {"\nReactions: robot_face (1)"} else {""}),"pagination_info":"There are no more messages in this thread."}),
+                ),
+                "slack_get_reactions" => Ok(
+                    json!({"result":if reaction {"Reactions on message:\n\n:robot_face: × 1 — Owner (UOWNER)"} else {"No reactions found on this message."}}),
+                ),
+                _ => panic!("Unexpected source tool: {tool}"),
+            }));
+            let page = parse_page(&json!({"results":format!("### Result 1 of 1\nChannel: DM (ID: C123)\nMessage_ts: {ts}\nPermalink: [link](https://example.slack.com/archives/C123/p{})\nText: untrusted search snippet", ts.replace('.', "")),"pagination_info":"End of results"}), &c).unwrap();
+            let observed = slack.source(&c, &page.hits[0], reaction).await.unwrap();
+            assert_eq!(
+                observed.as_ref().map(|v| v.source.kind.clone()),
+                expected_kind
+            );
+            if let Some(observed) = observed {
+                assert_eq!(observed.source.instruction, expected_instruction);
+            }
+        }
+    }
     fn config() -> Config {
         Config {
             enabled: false,
@@ -1467,6 +1589,7 @@ mod tests {
             timezone: "America/New_York".into(),
             phoenix_url: "https://localhost:8031".into(),
             notification_command: None,
+            trigger_emojis: vec!["fire".into()],
         }
     }
     #[test]
@@ -1577,9 +1700,56 @@ mod tests {
     }
     #[test]
     fn prefix_requires_first_content() {
-        assert_eq!(strip_fire("  🔥 ask"), Some(" ask"));
-        assert!(strip_fire("quote 🔥 ask").is_none());
-        assert_eq!(strip_fire(":fire: ask"), Some(" ask"));
+        assert_eq!(strip_trigger("  🔥 ask", &["fire".into()]), Some(" ask"));
+        assert!(strip_trigger("quote 🔥 ask", &["fire".into()]).is_none());
+        assert_eq!(strip_trigger(":fire: ask", &["fire".into()]), Some(" ask"));
+    }
+    #[test]
+    fn configured_emojis_are_or_aliases_and_unconfigured_fire_is_ordinary_text() {
+        let names = vec!["phoenix-please-look".into(), "robot_face".into()];
+        assert_eq!(
+            strip_trigger(" :phoenix-please-look: investigate", &names),
+            Some(" investigate")
+        );
+        assert_eq!(
+            strip_trigger(":robot_face: investigate", &names),
+            Some(" investigate")
+        );
+        assert!(strip_trigger("🔥 investigate", &names).is_none());
+        assert!(strip_trigger(":fire: investigate", &names).is_none());
+        assert!(strip_trigger("quote :robot_face: investigate", &names).is_none());
+        assert!(strip_trigger(":robot_face_other: investigate", &names).is_none());
+        let reactions = ReactionEvidence::parse("Reactions on message:\n\n:phoenix-please-look: × 2 — Unknown\n:robot_face: × 1 — Owner (UOWNER)\n:fire: × 1 — Other (UOTHER)", "UOWNER").unwrap();
+        assert!(reactions.owner_trigger(&names).is_present().unwrap());
+        assert!(reactions
+            .owner_trigger(&["phoenix-please-look".into()])
+            .is_present()
+            .is_err());
+        assert!(!reactions
+            .owner_trigger(&["fire".into()])
+            .is_present()
+            .unwrap());
+        let mut c = config();
+        c.trigger_emojis = names;
+        assert_eq!(
+            search_terms(&c, false, "2026-11-01"),
+            (
+                "from:<@UOWNER> after:2026-11-01 (:phoenix-please-look: OR :robot_face:)".into(),
+                vec![]
+            )
+        );
+        assert_eq!(
+            search_terms(&c, true, "2026-11-01"),
+            (
+                "after:2026-11-01 (hasmy::phoenix-please-look: OR hasmy::robot_face:)".into(),
+                vec![]
+            )
+        );
+        let prefix_terms = search_terms(&c, false, "2026-11-01");
+        let reaction_terms = search_terms(&c, true, "2026-11-01");
+        c.trigger_emojis.reverse();
+        assert_eq!(search_terms(&c, false, "2026-11-01"), prefix_terms);
+        assert_eq!(search_terms(&c, true, "2026-11-01"), reaction_terms);
     }
     #[test]
     fn empty_search_requires_the_exact_connector_sentinel() {

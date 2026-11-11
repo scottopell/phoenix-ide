@@ -10,6 +10,30 @@ const EYES_OUTCOME_UNKNOWN: &str =
 const CLARIFICATION_HANDOFF: &str = "Phoenix needs your input. Continue in Phoenix:";
 const THREAD_ATTEMPT_LIMIT: i64 = 3;
 
+/// REQ-SG-018: canonical Slack names, safe to embed in a search expression.
+pub fn normalize_slack_trigger_emojis(names: &[String]) -> DbResult<Vec<String>> {
+    if names.is_empty() || names.len() > 8 {
+        return Err(DbError::Serialization(
+            "Choose between one and eight trigger emojis".into(),
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    names.iter().map(|name| {
+        let trimmed = name.trim();
+        let name = trimmed.strip_prefix(':').and_then(|v| v.strip_suffix(':')).unwrap_or(trimmed).to_ascii_lowercase();
+        if name.is_empty() || name.len() > 64 || !name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'+')) {
+            return Err(DbError::Serialization("Use Slack emoji names, such as phoenix-please-look, with optional surrounding colons".into()));
+        }
+        if name == "eyes" {
+            return Err(DbError::Serialization("eyes is reserved for Phoenix acknowledgments".into()));
+        }
+        if !seen.insert(name.clone()) {
+            return Err(DbError::Serialization(format!("Duplicate trigger emoji: {name}")));
+        }
+        Ok(name)
+    }).collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SlackRequestKind {
@@ -174,9 +198,49 @@ fn request_row(r: &sqlx::sqlite::SqliteRow) -> Result<SlackRequest, sqlx::Error>
     })
 }
 impl Database {
+    /// Read the single gateway preference and its normalized emoji rows together.
+    pub async fn slack_configuration(&self) -> DbResult<Option<String>> {
+        let mut tx = self.pool().begin().await?;
+        let Some(raw): Option<String> =
+            sqlx::query_scalar("SELECT value FROM app_settings WHERE key='slack_gateway'")
+                .fetch_optional(&mut *tx)
+                .await?
+        else {
+            return Ok(None);
+        };
+        let names: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM slack_gateway_trigger_emojis ORDER BY ordinal")
+                .fetch_all(&mut *tx)
+                .await?;
+        let names = normalize_slack_trigger_emojis(&names)?;
+        let mut value: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|e| DbError::Serialization(e.to_string()))?;
+        value
+            .as_object_mut()
+            .ok_or_else(|| DbError::Serialization("Invalid Slack configuration".into()))?
+            .insert("trigger_emojis".into(), serde_json::json!(names));
+        tx.commit().await?;
+        Ok(Some(value.to_string()))
+    }
+
     pub async fn set_slack_configuration(&self, value: &str) -> DbResult<()> {
-        let config: serde_json::Value =
+        let mut config: serde_json::Value =
             serde_json::from_str(value).map_err(|e| DbError::Serialization(e.to_string()))?;
+        let supplied_names = config
+            .as_object_mut()
+            .and_then(|v| v.remove("trigger_emojis"));
+        let names = supplied_names
+            .map(|v| {
+                let names: Vec<String> =
+                    serde_json::from_value(v).map_err(|e| DbError::Serialization(e.to_string()))?;
+                normalize_slack_trigger_emojis(&names)
+            })
+            .transpose()?;
+        let stored_value = if names.is_some() {
+            config.to_string()
+        } else {
+            value.to_owned()
+        };
         let workspace = config
             .get("workspace")
             .and_then(serde_json::Value::as_str)
@@ -215,9 +279,41 @@ impl Database {
         if outstanding {
             return Err(DbError::Serialization("Cannot change the Slack account while accepted work or return delivery is outstanding; finish that work using its original account first".into()));
         }
+        if let Some(names) = names {
+            let prior_names: Vec<String> = sqlx::query_scalar(
+                "SELECT name FROM slack_gateway_trigger_emojis ORDER BY ordinal",
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+            let changed = names.iter().collect::<std::collections::BTreeSet<_>>()
+                != prior_names
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>();
+            sqlx::query("DELETE FROM slack_gateway_trigger_emojis")
+                .execute(&mut *tx)
+                .await?;
+            for (ordinal, name) in names.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO slack_gateway_trigger_emojis(name,ordinal) VALUES (?1,?2)",
+                )
+                .bind(name)
+                .bind(i64::try_from(ordinal).map_err(|e| DbError::Serialization(e.to_string()))?)
+                .execute(&mut *tx)
+                .await?;
+            }
+            if changed {
+                sqlx::query("DELETE FROM slack_gateway_discovery")
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("DELETE FROM slack_gateway_observations")
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("UPDATE slack_gateway_accounts SET baseline_complete=0,status='initializing',last_error=NULL,last_scan_at_unix_micros=NULL").execute(&mut *tx).await?;
+            }
+        }
         sqlx::query("UPDATE slack_gateway_returns SET state='failed',failure='Private notice skipped because the configured account changed' WHERE destination='private' AND state='pending' AND binding_id IN (SELECT binding_id FROM slack_gateway_bindings WHERE workspace<>?1 OR owner<>?2)")
             .bind(workspace).bind(owner).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO app_settings(key,value) VALUES ('slack_gateway',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(value).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO app_settings(key,value) VALUES ('slack_gateway',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(stored_value).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -878,6 +974,156 @@ async fn reject_slack_request_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn trigger_emoji_changes_rebaseline_without_losing_accepted_work_or_backoff() {
+        let db = Database::open_in_memory().await.unwrap();
+        let s = source("100.000", SlackRequestKind::Explicit);
+        let mut config = serde_json::json!({"workspace":s.workspace,"owner":s.owner,"enabled":true,"timezone":"UTC"});
+        db.set_slack_configuration(&config.to_string())
+            .await
+            .unwrap();
+        let default: serde_json::Value =
+            serde_json::from_str(&db.slack_configuration().await.unwrap().unwrap()).unwrap();
+        assert_eq!(default["trigger_emojis"], serde_json::json!(["fire"]));
+        db.slack_baseline_complete(&s.workspace, &s.owner)
+            .await
+            .unwrap();
+        db.slack_scan_status(&s.workspace, &s.owner, true, "healthy", None)
+            .await
+            .unwrap();
+        db.accept_slack_source(&s, false).await.unwrap();
+        let request = db
+            .slack_requests(&s.workspace, &s.owner)
+            .await
+            .unwrap()
+            .remove(0);
+        sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,created_at_unix_micros) VALUES ('retained',?1,'done','thread','reply',1)").bind(&request.binding_id).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO slack_gateway_return_coverage(return_id,request_id) VALUES ('retained',?1)").bind(&request.request_id).execute(db.pool()).await.unwrap();
+        let retry_at = chrono::Utc::now().timestamp_micros() + 3_600_000_000;
+        sqlx::query("UPDATE slack_gateway_accounts SET retry_at_us=?1")
+            .bind(retry_at)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO slack_gateway_discovery(workspace,owner,kind,after_date,cursor) VALUES (?1,?2,'reaction','2026-11-01','old-cursor')").bind(&s.workspace).bind(&s.owner).execute(db.pool()).await.unwrap();
+        config["trigger_emojis"] = serde_json::json!([":phoenix-please-look:", "robot_face"]);
+        db.set_slack_configuration(&config.to_string())
+            .await
+            .unwrap();
+        let row =
+            sqlx::query("SELECT baseline_complete,status,retry_at_us FROM slack_gateway_accounts")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(!row.get::<bool, _>("baseline_complete"));
+        assert_eq!(row.get::<String, _>("status"), "initializing");
+        assert_eq!(row.get::<i64, _>("retry_at_us"), retry_at);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM slack_gateway_discovery")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0
+        );
+        let retained = db.slack_requests(&s.workspace, &s.owner).await.unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].request_id, request.request_id);
+        assert_eq!(retained[0].input_id, request.input_id);
+        assert_eq!(
+            db.slack_returns(&s.workspace, &s.owner).await.unwrap()[0].state,
+            SlackReturnState::Pending
+        );
+        let read: serde_json::Value =
+            serde_json::from_str(&db.slack_configuration().await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            read["trigger_emojis"],
+            serde_json::json!(["phoenix-please-look", "robot_face"])
+        );
+        let raw: serde_json::Value =
+            serde_json::from_str(&db.get_app_setting("slack_gateway").await.unwrap().unwrap())
+                .unwrap();
+        assert!(raw.get("trigger_emojis").is_none());
+        // A second gesture still addresses the same frozen source identity.
+        db.accept_slack_source(&s, false).await.unwrap();
+        assert_eq!(
+            db.slack_requests(&s.workspace, &s.owner)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        db.slack_scan_status(&s.workspace, &s.owner, true, "healthy", None)
+            .await
+            .unwrap();
+        config["trigger_emojis"] = serde_json::json!(["robot_face", "phoenix-please-look"]);
+        db.set_slack_configuration(&config.to_string())
+            .await
+            .unwrap();
+        assert!(db
+            .slack_baseline_complete(&s.workspace, &s.owner)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn invalid_trigger_lists_leave_configuration_and_baseline_unchanged() {
+        let db = Database::open_in_memory().await.unwrap();
+        let original = serde_json::json!({"workspace":"example.slack.com","owner":"UOWNER","enabled":true,"trigger_emojis":["phoenix-please-look"]});
+        db.set_slack_configuration(&original.to_string())
+            .await
+            .unwrap();
+        db.slack_baseline_complete("example.slack.com", "UOWNER")
+            .await
+            .unwrap();
+        db.slack_scan_status("example.slack.com", "UOWNER", true, "healthy", None)
+            .await
+            .unwrap();
+        let prior = db.slack_configuration().await.unwrap();
+        for names in [
+            serde_json::json!([]),
+            serde_json::json!(["fire", ":FIRE:"]),
+            serde_json::json!(["eyes"]),
+            serde_json::json!(["bad name"]),
+            serde_json::json!(["fire) OR has:link"]),
+            serde_json::json!(null),
+            serde_json::json!(vec!["a"; 9]),
+        ] {
+            let mut invalid = original.clone();
+            invalid["trigger_emojis"] = names;
+            assert!(db
+                .set_slack_configuration(&invalid.to_string())
+                .await
+                .is_err());
+            assert_eq!(db.slack_configuration().await.unwrap(), prior);
+            assert!(db
+                .slack_baseline_complete("example.slack.com", "UOWNER")
+                .await
+                .unwrap());
+        }
+        // Internal callers that omit the new field preserve the selected names.
+        let legacy =
+            serde_json::json!({"workspace":"example.slack.com","owner":"UOWNER","enabled":false});
+        db.set_slack_configuration(&legacy.to_string())
+            .await
+            .unwrap();
+        let read: serde_json::Value =
+            serde_json::from_str(&db.slack_configuration().await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            read["trigger_emojis"],
+            serde_json::json!(["phoenix-please-look"])
+        );
+        for (name, ordinal) in [("eyes", 1), ("bad name", 1), ("robot_face", 8)] {
+            assert!(sqlx::query(
+                "INSERT INTO slack_gateway_trigger_emojis(name,ordinal) VALUES (?1,?2)"
+            )
+            .bind(name)
+            .bind(ordinal)
+            .execute(db.pool())
+            .await
+            .is_err());
+        }
+    }
+
     #[tokio::test]
     async fn timezone_change_cannot_reinterpret_an_unfinished_baseline() {
         let db = Database::open_in_memory().await.unwrap();

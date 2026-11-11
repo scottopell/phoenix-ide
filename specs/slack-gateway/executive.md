@@ -13,6 +13,7 @@ prepare separate private briefings. Thread reuse and exact reply coverage remain
 |---|---|---|
 | REQ-SG-001 | Partial | Implemented; current candidate validation and production limits below. |
 | REQ-SG-002 | Partial | Implemented; current candidate validation and production limits below. |
+| REQ-SG-018: Configure interchangeable trigger emojis | Implemented | 57 gateway tests, 29 Slack DB tests, migration upgrade/reopen, and 21 settings tests pass. Desktop/mobile previews show all three workflows without horizontal overflow. Production activation remains separate. |
 | REQ-SG-003 | Partial | Implemented; current candidate validation and production limits below. |
 | REQ-SG-004 | Partial | Implemented; current candidate validation and production limits below. |
 | REQ-SG-005 | Partial | Implemented; current candidate validation and production limits below. |
@@ -30,6 +31,12 @@ prepare separate private briefings. Thread reuse and exact reply coverage remain
 | REQ-SG-017 | Partial | Implemented; current candidate validation and production limits below. |
 
 ## Simplification
+
+[ADR-248](../adrs/248_slack-emoji-aliases-share-discovery-and-reinitialize-baselines.md)
+keeps two OR-based search streams for configurable emoji names. Changing the
+effective set restarts baseline discovery while preserving accepted work, handled
+identities, and backoff. Reordering the set does not reset it. Settings show each
+workflow's trigger and destination; custom emoji upload remains in Slack.
 
 REQ-SG-017 projects shared MCP connection health separately from stored scan
 status, checks required tools and warns when the last completed scan predates

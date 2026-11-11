@@ -12,6 +12,7 @@ fn config() -> Config {
         timezone: "America/New_York".into(),
         phoenix_url: "https://localhost:8043".into(),
         notification_command: None,
+        trigger_emojis: vec!["fire".into()],
     }
 }
 

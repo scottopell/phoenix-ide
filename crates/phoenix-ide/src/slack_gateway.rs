@@ -19,11 +19,21 @@ pub(crate) struct Config {
     pub workspace: String,
     pub timezone: String,
     pub phoenix_url: String,
+    pub trigger_emojis: Vec<String>,
     /// Owner-configured executable and arguments; notification content uses stdin.
     pub notification_command: Option<Vec<String>>,
 }
 impl Config {
+    fn normalized(mut self) -> Result<Self, String> {
+        self.trigger_emojis = phoenix_db::normalize_slack_trigger_emojis(&self.trigger_emojis)
+            .map_err(|e| e.to_string())?;
+        self.validate()?;
+        Ok(self)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
+        phoenix_db::normalize_slack_trigger_emojis(&self.trigger_emojis)
+            .map_err(|e| e.to_string())?;
         if !(self.owner.starts_with('U') || self.owner.starts_with('W'))
             || !self.owner.chars().all(|c| c.is_ascii_alphanumeric())
         {
@@ -75,7 +85,7 @@ pub(crate) async fn has_explicit_binding(
     sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM slack_gateway_bindings WHERE product_id=?1 AND kind='explicit')").bind(product).fetch_one(db.pool()).await.map_err(|e|e.to_string())
 }
 pub(crate) async fn config(db: &crate::db::Database) -> Result<Option<Config>, String> {
-    db.get_app_setting("slack_gateway")
+    db.slack_configuration()
         .await
         .map_err(|e| e.to_string())?
         .map(|v| serde_json::from_str(&v).map_err(|e| e.to_string()))
