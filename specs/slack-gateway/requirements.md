@@ -18,21 +18,31 @@ Before acknowledgments or replies, actor and workspace evidence SHALL refer to o
 
 WHEN a message or reaction is considered as a trigger, THE SYSTEM SHALL confirm the source and triggering actor through Slack and accept only the configured owner's action. A message from another user, an app-authored message, or a gateway-authored message SHALL NOT count as the owner's instruction merely because its words name Phoenix or its displayed author resembles the owner. For reactions, the triggering actor is the reacting user, independently of the source message's author; an app-authored source MAY supply briefing context but SHALL NOT become an owner-authored explicit instruction.
 
-An incomplete or ambiguous reactor list SHALL remain unverified rather than establish the owner's absence. A reaction-dependent candidate SHALL retain its discovery page for verified retry. A separately verified owner-authored fire prefix SHALL remain sufficient without reaction evidence, independently of the query that found the source.
+An incomplete or ambiguous reactor list SHALL remain unverified rather than establish the owner's absence. A reaction-dependent candidate SHALL retain its discovery page for verified retry. A separately verified owner-authored configured-emoji prefix SHALL remain sufficient without reaction evidence, independently of the query that found the source.
 
 **Rationale:** An unrelated Slack participant must not gain execution authority over the owner's machine and credentials.
 
 ### REQ-SG-002 — Recognize three explicit gestures
 
-WHEN the owner reacts with `:fire:` to another person's message, THE SYSTEM SHALL prepare a private briefing about that message and its discussion.
+WHEN the owner reacts with any configured trigger emoji to another person's message, THE SYSTEM SHALL prepare a private briefing about that message and its discussion.
 
-WHEN the owner posts a message whose first non-whitespace content is the fire emoji or its Slack `:fire:` representation, THE SYSTEM SHALL treat the remaining message as an explicit request. The word `phoenix` SHALL NOT be required for recognition.
+WHEN the owner posts a message whose first non-whitespace content is a configured trigger emoji's Slack `:name:` representation, THE SYSTEM SHALL treat the remaining message as an explicit request. The Unicode fire emoji SHALL also be recognized when `fire` is configured. The word `phoenix` SHALL NOT be required for recognition.
 
-WHEN the owner reacts with `:fire:` to their own eligible message, THE SYSTEM SHALL treat that message as an explicit request without requiring a prefix.
+WHEN the owner reacts with any configured trigger emoji to their own eligible message, THE SYSTEM SHALL treat that message as an explicit request without requiring a prefix.
 
 THE SYSTEM SHALL NOT treat an untriggered follow-up, an ordinary mention of Phoenix, quoted trigger text, or another person's reaction as an invocation. An empty explicit request SHALL receive an explanation rather than inferred work.
 
 **Rationale:** The owner can flag context or submit an instruction using deliberate, recognizable actions without automatic participation in channel chatter.
+
+### REQ-SG-018 — Configure interchangeable trigger emojis
+
+THE SYSTEM SHALL let the owner configure one to eight distinct Slack emoji names, including custom names such as `phoenix-please-look`. Any listed emoji SHALL independently invoke the three workflows in REQ-SG-002; unlisted emojis SHALL NOT invoke them. A fresh installation SHALL use `fire`. The owner SHALL be able to remove `fire` entirely. Empty, duplicate, malformed, and acknowledgment-only `eyes` names SHALL be rejected without changing settings.
+
+THE SYSTEM SHALL list each workflow with its triggering action and destination beside the editable emoji names, using examples derived from those names. Names MAY be entered with surrounding colons. Creating or uploading the emoji in Slack SHALL remain a separate action; listing a name SHALL NOT upload an image.
+
+WHEN the effective emoji set changes, THE SYSTEM SHALL discard incompatible discovery positions and establish a new baseline before admitting new gestures. It SHALL explain that existing matches and gestures during initialization can be absorbed by that baseline. Reordering an equivalent set SHALL NOT reinitialize discovery. Accepted work, handled source identities, reply duties, and provider retry deadlines SHALL be preserved. Adding a second configured emoji to an already handled source SHALL NOT create another request.
+
+**Rationale:** Dedicated custom emojis avoid confusing ordinary social reactions with agent requests, without introducing separate workflows or repeated polling per emoji.
 
 ### REQ-SG-003 — Discover within a four-calendar-day window
 

@@ -12,7 +12,7 @@ pub(crate) async fn put(
     State(s): State<AppState>,
     Json(c): Json<Config>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    c.validate().map_err(AppError::BadRequest)?;
+    let c = c.normalized().map_err(AppError::BadRequest)?;
     // A pass must finish using its retained configuration before a timezone
     // or account update is evaluated against its completed durable progress.
     let _access = s.slack_gateway_access.lock().await;
@@ -72,7 +72,7 @@ pub(crate) async fn inspect(
     State(s): State<AppState>,
     Json(c): Json<Config>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    c.validate().map_err(AppError::BadRequest)?;
+    let c = c.normalized().map_err(AppError::BadRequest)?;
     let mut budget = s.slack_gateway_access.lock().await;
     s.db.slack_baseline_complete(&c.workspace, &c.owner)
         .await
@@ -135,7 +135,7 @@ async fn inspect_reads(
                 }
             }
         }
-        checks.push(serde_json::json!({"query":if reactions {"fire reactions"} else {"owner fire messages"},"first_page_hits":page.hits.len(),"verified_sources":verified,"more_pages":page.cursor.is_some()}));
+        checks.push(serde_json::json!({"query":if reactions {"configured emoji reactions"} else {"owner emoji-prefixed messages"},"first_page_hits":page.hits.len(),"verified_sources":verified,"more_pages":page.cursor.is_some()}));
     }
     Ok(Json(
         serde_json::json!({"owner_verified":true,"checks":checks,"reaction_read_verified":reaction_read_verified,"calls":slack.calls.load(std::sync::atomic::Ordering::Relaxed),"gateway_activated":false}),

@@ -61,6 +61,7 @@ external entity VerifiedObservation {
 entity Gateway {
     workspace: String
     owner: String
+    trigger_emojis: Set<String>
     enabled: Boolean
     baseline_complete: Boolean
     handled_sources: Set<String>

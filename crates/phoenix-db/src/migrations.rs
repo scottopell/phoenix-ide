@@ -823,6 +823,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "federated_continuation_receipts",
         sql: include_str!("migrations/federated_continuation_receipts.sql"),
     },
+    Migration {
+        version: 160,
+        name: "slack_trigger_emojis",
+        sql: include_str!("migrations/slack_trigger_emojis.sql"),
+    },
 ];
 
 const MIGRATION_138: &str = concat!(
@@ -13352,6 +13357,47 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn migration_160_defaults_to_fire_without_reinitializing_existing_discovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("slack-emojis.db");
+        let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+        run_through_for_test(db.pool(), 159).await.unwrap();
+        let config = r#"{"workspace":"example.slack.com","owner":"UOWNER","enabled":true}"#;
+        db.set_app_setting("slack_gateway", config).await.unwrap();
+        sqlx::raw_sql("INSERT INTO slack_gateway_accounts(workspace,owner,baseline_complete,status,last_scan_at_unix_micros,retry_at_us) VALUES ('example.slack.com','UOWNER',1,'healthy',123,456); INSERT INTO slack_gateway_discovery(workspace,owner,kind,after_date,cursor) VALUES ('example.slack.com','UOWNER','reaction','2026-11-01','retained-cursor');").execute(db.pool()).await.unwrap();
+        assert_eq!(run_through_for_test(db.pool(), 160).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(db.pool(), 160).await.unwrap(), 0);
+        let rows: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM slack_gateway_trigger_emojis ORDER BY ordinal")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(rows, ["fire"]);
+        let account: (bool, String, i64, i64) = sqlx::query_as("SELECT baseline_complete,status,last_scan_at_unix_micros,retry_at_us FROM slack_gateway_accounts").fetch_one(db.pool()).await.unwrap();
+        assert_eq!(account, (true, "healthy".into(), 123, 456));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT cursor FROM slack_gateway_discovery")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            "retained-cursor"
+        );
+        assert_eq!(
+            db.get_app_setting("slack_gateway")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(config)
+        );
+        db.pool().close().await;
+        let reopened = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(run_pending_migrations(reopened.pool()).await.unwrap(), 0);
+        let value: serde_json::Value =
+            serde_json::from_str(&reopened.slack_configuration().await.unwrap().unwrap()).unwrap();
+        assert_eq!(value["trigger_emojis"], serde_json::json!(["fire"]));
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn migration_156_preserves_populated_local_goal_ledger_and_schema() {
         let directory = tempfile::tempdir().unwrap();
@@ -20326,6 +20372,7 @@ mod tests {
                 (156, "remote_coordinator_goals"),
                 (158, "federated_conversation_actions"),
                 (159, "federated_continuation_receipts"),
+                (160, "slack_trigger_emojis"),
             ]
         );
         let goal = MIGRATIONS
@@ -20339,7 +20386,7 @@ mod tests {
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 156);
+        assert_eq!(MIGRATIONS.len(), 157);
     }
 
     #[tokio::test]
