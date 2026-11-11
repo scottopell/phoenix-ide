@@ -304,19 +304,19 @@ impl Slack {
             .trim_end()
             .strip_suffix("\n\nNo thread messsages")
             .ok_or("Exact source read did not isolate one message")?;
-        if !reaction && (author != c.owner || strip_trigger(raw, &c.trigger_emojis).is_none()) {
+        if !reaction && (author != c.owner || strip_trigger(raw, &c.trigger_emoji).is_none()) {
             return Ok(None);
         }
-        let owner_prefix = author == c.owner && strip_trigger(raw, &c.trigger_emojis).is_some();
+        let owner_prefix = author == c.owner && strip_trigger(raw, &c.trigger_emoji).is_some();
         let Some((reactions, reaction_read_verified)) =
             self.source_reactions(c, hit, raw, owner_prefix).await?
         else {
             return Ok(None);
         };
         let body = reactions.message_body(raw)?;
-        let prefix = strip_trigger(&body, &c.trigger_emojis);
+        let prefix = strip_trigger(&body, &c.trigger_emoji);
         if (author != c.owner || prefix.is_none())
-            && !reactions.owner_trigger(&c.trigger_emojis).is_present()?
+            && !reactions.owner_trigger(&c.trigger_emoji).is_present()?
         {
             return Ok(None);
         }
@@ -653,47 +653,26 @@ fn operation_rejection(error: &McpOneShotError, method: &str) -> Option<Value> {
     .then_some(value)
 }
 fn search_terms(c: &Config, reactions: bool, after_date: &str) -> (String, Vec<String>) {
-    let mut terms = c
-        .trigger_emojis
-        .iter()
-        .map(|name| {
-            if reactions {
-                format!("hasmy::{name}:")
-            } else {
-                format!(":{name}:")
-            }
-        })
-        .collect::<Vec<_>>();
-    terms.sort_unstable();
-    if terms.len() == 1 {
-        if reactions {
-            (format!("{} after:{after_date}", terms[0]), vec![])
-        } else {
-            (format!("from:<@{}> after:{after_date}", c.owner), terms)
-        }
+    if reactions {
+        (
+            format!("hasmy::{}: after:{after_date}", c.trigger_emoji),
+            vec![],
+        )
     } else {
-        let any = terms.join(" OR ");
-        if reactions {
-            (format!("after:{after_date} ({any})"), vec![])
-        } else {
-            (
-                format!("from:<@{}> after:{after_date} ({any})", c.owner),
-                vec![],
-            )
-        }
+        (
+            format!("from:<@{}> after:{after_date}", c.owner),
+            vec![format!(":{}:", c.trigger_emoji)],
+        )
     }
 }
 
-pub(super) fn strip_trigger<'a>(text: &'a str, names: &[String]) -> Option<&'a str> {
+pub(super) fn strip_trigger<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     let t = text.trim_start();
-    names
-        .iter()
-        .find_map(|name| {
-            t.strip_prefix(&format!(":{name}:"))
-                .or_else(|| (name == "fire").then(|| t.strip_prefix('🔥')).flatten())
-        })
+    t.strip_prefix(&format!(":{name}:"))
+        .or_else(|| (name == "fire").then(|| t.strip_prefix('🔥')).flatten())
         .map(|s| s.trim_start_matches('\u{fe0f}'))
 }
+
 fn parse_page(v: &Value, c: &Config) -> Result<Page, String> {
     let results = field(v, "results")?;
     let paging = field(v, "pagination_info")?;
@@ -845,22 +824,11 @@ struct ReactionEvidence {
     owner_reactions: std::collections::BTreeMap<String, OwnerReaction>,
 }
 impl ReactionEvidence {
-    fn owner_trigger(&self, names: &[String]) -> OwnerReaction {
-        if names
-            .iter()
-            .any(|name| matches!(self.owner_reactions.get(name), Some(OwnerReaction::Present)))
-        {
-            OwnerReaction::Present
-        } else if names.iter().any(|name| {
-            matches!(
-                self.owner_reactions.get(name),
-                Some(OwnerReaction::Unverified)
-            )
-        }) {
-            OwnerReaction::Unverified
-        } else {
-            OwnerReaction::Absent
-        }
+    fn owner_trigger(&self, name: &str) -> OwnerReaction {
+        self.owner_reactions
+            .get(name)
+            .copied()
+            .unwrap_or(OwnerReaction::Absent)
     }
     fn parse(text: &str, owner: &str) -> Result<Self, String> {
         let mut counts = std::collections::BTreeMap::new();
@@ -1082,7 +1050,7 @@ mod tests {
                     "UOWNER"
                 )
                 .unwrap()
-                .owner_trigger(&["fire".into()]),
+                .owner_trigger("fire"),
                 expected
             );
         }
@@ -1098,7 +1066,7 @@ mod tests {
                     "UOWNER"
                 )
                 .unwrap()
-                .owner_trigger(&["fire".into()]),
+                .owner_trigger("fire"),
                 OwnerReaction::Present
             );
         }
@@ -1108,7 +1076,7 @@ mod tests {
                 "WOWNER"
             )
             .unwrap()
-            .owner_trigger(&["fire".into()]),
+            .owner_trigger("fire"),
             OwnerReaction::Present
         );
         assert_eq!(
@@ -1117,7 +1085,7 @@ mod tests {
                 "UOWNER"
             )
             .unwrap()
-            .owner_trigger(&["fire".into()]),
+            .owner_trigger("fire"),
             OwnerReaction::Present
         );
         assert_eq!(
@@ -1126,7 +1094,7 @@ mod tests {
                 "UOWNER"
             )
             .unwrap()
-            .owner_trigger(&["fire".into()]),
+            .owner_trigger("fire"),
             OwnerReaction::Unverified
         );
         assert!(ReactionEvidence::parse(
@@ -1525,13 +1493,7 @@ mod tests {
                 Some(SlackRequestKind::Explicit),
                 "inspect this",
             ),
-            (
-                ":robot_face: inspect that",
-                "UOWNER",
-                false,
-                Some(SlackRequestKind::Explicit),
-                "inspect that",
-            ),
+            (":robot_face: disabled trigger", "UOWNER", false, None, ""),
             (
                 "plain follow-up",
                 "UOWNER",
@@ -1556,16 +1518,16 @@ mod tests {
             (":fire: disabled trigger", "UOWNER", false, None, ""),
         ] {
             let mut c = config();
-            c.trigger_emojis = vec!["phoenix-please-look".into(), "robot_face".into()];
+            c.trigger_emoji = "phoenix-please-look".into();
             let ts = format!("{}.000001", chrono::Utc::now().timestamp());
             let mut slack = Slack::new(state.mcp_manager.clone(), &c);
             let exact_ts = ts.clone();
             slack.fixture = Some(Arc::new(move |tool, _| match tool {
                 "slack_read_thread" => Ok(
-                    json!({"messages":format!("=== THREAD PARENT MESSAGE ===\nFrom: User ({author})\nTime: fixture\nMessage TS: {exact_ts}\n{body}{}\n\nNo thread messsages\n", if reaction {"\nReactions: robot_face (1)"} else {""}),"pagination_info":"There are no more messages in this thread."}),
+                    json!({"messages":format!("=== THREAD PARENT MESSAGE ===\nFrom: User ({author})\nTime: fixture\nMessage TS: {exact_ts}\n{body}{}\n\nNo thread messsages\n", if reaction {"\nReactions: phoenix-please-look (1)"} else {""}),"pagination_info":"There are no more messages in this thread."}),
                 ),
                 "slack_get_reactions" => Ok(
-                    json!({"result":if reaction {"Reactions on message:\n\n:robot_face: × 1 — Owner (UOWNER)"} else {"No reactions found on this message."}}),
+                    json!({"result":if reaction {"Reactions on message:\n\n:phoenix-please-look: × 1 — Owner (UOWNER)"} else {"No reactions found on this message."}}),
                 ),
                 _ => panic!("Unexpected source tool: {tool}"),
             }));
@@ -1589,7 +1551,7 @@ mod tests {
             timezone: "America/New_York".into(),
             phoenix_url: "https://localhost:8031".into(),
             notification_command: None,
-            trigger_emojis: vec!["fire".into()],
+            trigger_emoji: "fire".into(),
         }
     }
     #[test]
@@ -1700,56 +1662,63 @@ mod tests {
     }
     #[test]
     fn prefix_requires_first_content() {
-        assert_eq!(strip_trigger("  🔥 ask", &["fire".into()]), Some(" ask"));
-        assert!(strip_trigger("quote 🔥 ask", &["fire".into()]).is_none());
-        assert_eq!(strip_trigger(":fire: ask", &["fire".into()]), Some(" ask"));
+        assert_eq!(strip_trigger("  🔥 ask", "fire"), Some(" ask"));
+        assert!(strip_trigger("quote 🔥 ask", "fire").is_none());
+        assert_eq!(strip_trigger(":fire: ask", "fire"), Some(" ask"));
     }
     #[test]
-    fn configured_emojis_are_or_aliases_and_unconfigured_fire_is_ordinary_text() {
-        let names = vec!["phoenix-please-look".into(), "robot_face".into()];
+    fn one_custom_emoji_controls_matching_and_both_narrow_queries() {
+        // REQ-SG-018
+        let name = "phoenix-please-look";
         assert_eq!(
-            strip_trigger(" :phoenix-please-look: investigate", &names),
+            strip_trigger(" :phoenix-please-look: investigate", name),
             Some(" investigate")
         );
-        assert_eq!(
-            strip_trigger(":robot_face: investigate", &names),
-            Some(" investigate")
-        );
-        assert!(strip_trigger("🔥 investigate", &names).is_none());
-        assert!(strip_trigger(":fire: investigate", &names).is_none());
-        assert!(strip_trigger("quote :robot_face: investigate", &names).is_none());
-        assert!(strip_trigger(":robot_face_other: investigate", &names).is_none());
-        let reactions = ReactionEvidence::parse("Reactions on message:\n\n:phoenix-please-look: × 2 — Unknown\n:robot_face: × 1 — Owner (UOWNER)\n:fire: × 1 — Other (UOTHER)", "UOWNER").unwrap();
-        assert!(reactions.owner_trigger(&names).is_present().unwrap());
-        assert!(reactions
-            .owner_trigger(&["phoenix-please-look".into()])
-            .is_present()
-            .is_err());
-        assert!(!reactions
-            .owner_trigger(&["fire".into()])
-            .is_present()
-            .unwrap());
+        for text in [
+            "🔥 investigate",
+            ":fire: investigate",
+            ":robot_face: investigate",
+            "quote :phoenix-please-look: investigate",
+            ":phoenix-please-look_other: investigate",
+        ] {
+            assert!(strip_trigger(text, name).is_none());
+        }
+        let reactions = ReactionEvidence::parse("Reactions on message:\n\n:phoenix-please-look: × 1 — Owner (UOWNER)\n:fire: × 1 — Other (UOTHER)", "UOWNER").unwrap();
+        assert!(reactions.owner_trigger(name).is_present().unwrap());
+        assert!(!reactions.owner_trigger("fire").is_present().unwrap());
+        assert!(!reactions.owner_trigger("robot_face").is_present().unwrap());
         let mut c = config();
-        c.trigger_emojis = names;
+        c.trigger_emoji = name.into();
         assert_eq!(
             search_terms(&c, false, "2026-11-01"),
             (
-                "from:<@UOWNER> after:2026-11-01 (:phoenix-please-look: OR :robot_face:)".into(),
-                vec![]
+                "from:<@UOWNER> after:2026-11-01".into(),
+                vec![":phoenix-please-look:".into()]
             )
         );
         assert_eq!(
             search_terms(&c, true, "2026-11-01"),
             (
-                "after:2026-11-01 (hasmy::phoenix-please-look: OR hasmy::robot_face:)".into(),
+                "hasmy::phoenix-please-look: after:2026-11-01".into(),
                 vec![]
             )
         );
-        let prefix_terms = search_terms(&c, false, "2026-11-01");
-        let reaction_terms = search_terms(&c, true, "2026-11-01");
-        c.trigger_emojis.reverse();
-        assert_eq!(search_terms(&c, false, "2026-11-01"), prefix_terms);
-        assert_eq!(search_terms(&c, true, "2026-11-01"), reaction_terms);
+        c.trigger_emoji = "fire".into();
+        assert_eq!(
+            strip_trigger("🔥 investigate", &c.trigger_emoji),
+            Some(" investigate")
+        );
+        assert_eq!(
+            search_terms(&c, false, "2026-11-01"),
+            (
+                "from:<@UOWNER> after:2026-11-01".into(),
+                vec![":fire:".into()]
+            )
+        );
+        assert_eq!(
+            search_terms(&c, true, "2026-11-01"),
+            ("hasmy::fire: after:2026-11-01".into(), vec![])
+        );
     }
     #[test]
     fn empty_search_requires_the_exact_connector_sentinel() {

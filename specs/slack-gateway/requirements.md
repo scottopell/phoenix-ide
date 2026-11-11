@@ -24,25 +24,25 @@ An incomplete or ambiguous reactor list SHALL remain unverified rather than esta
 
 ### REQ-SG-002 — Recognize three explicit gestures
 
-WHEN the owner reacts with any configured trigger emoji to another person's message, THE SYSTEM SHALL prepare a private briefing about that message and its discussion.
+WHEN the owner reacts with the configured trigger emoji to another person's message, THE SYSTEM SHALL prepare a private briefing about that message and its discussion.
 
-WHEN the owner posts a message whose first non-whitespace content is a configured trigger emoji's Slack `:name:` representation, THE SYSTEM SHALL treat the remaining message as an explicit request. The Unicode fire emoji SHALL also be recognized when `fire` is configured. The word `phoenix` SHALL NOT be required for recognition.
+WHEN the owner posts a message whose first non-whitespace content is the configured trigger emoji's Slack `:name:` representation, THE SYSTEM SHALL treat the remaining message as an explicit request. The Unicode fire emoji SHALL also be recognized when `fire` is configured. The word `phoenix` SHALL NOT be required for recognition.
 
-WHEN the owner reacts with any configured trigger emoji to their own eligible message, THE SYSTEM SHALL treat that message as an explicit request without requiring a prefix.
+WHEN the owner reacts with the configured trigger emoji to their own eligible message, THE SYSTEM SHALL treat that message as an explicit request without requiring a prefix.
 
 THE SYSTEM SHALL NOT treat an untriggered follow-up, an ordinary mention of Phoenix, quoted trigger text, or another person's reaction as an invocation. An empty explicit request SHALL receive an explanation rather than inferred work.
 
 **Rationale:** The owner can flag context or submit an instruction using deliberate, recognizable actions without automatic participation in channel chatter.
 
-### REQ-SG-018 — Configure interchangeable trigger emojis
+### REQ-SG-018 — Configure one trigger emoji
 
-THE SYSTEM SHALL let the owner configure one to eight distinct Slack emoji names, including custom names such as `phoenix-please-look`. Any listed emoji SHALL independently invoke the three workflows in REQ-SG-002; unlisted emojis SHALL NOT invoke them. A fresh installation SHALL use `fire`. The owner SHALL be able to remove `fire` entirely. Empty, duplicate, malformed, and acknowledgment-only `eyes` names SHALL be rejected without changing settings.
+THE SYSTEM SHALL let the owner configure exactly one Slack emoji name, including a custom name such as `phoenix-please-look`. That emoji SHALL invoke the three workflows in REQ-SG-002; other emojis SHALL NOT invoke them. A fresh installation SHALL use `fire`. The owner SHALL be able to replace `fire` entirely. Empty, multiple, malformed, and acknowledgment-only `eyes` names SHALL be rejected without changing settings.
 
-THE SYSTEM SHALL list each workflow with its triggering action and destination beside the editable emoji names, using examples derived from those names. Names MAY be entered with surrounding colons. Creating or uploading the emoji in Slack SHALL remain a separate action; listing a name SHALL NOT upload an image.
+THE SYSTEM SHALL list each workflow with its triggering action and destination beside the editable emoji name, using examples derived from that name. The name MAY be entered with surrounding colons. Creating or uploading the emoji in Slack SHALL remain a separate action; configuring a name SHALL NOT upload an image.
 
-WHEN the effective emoji set changes, THE SYSTEM SHALL discard incompatible discovery positions and establish a new baseline before admitting new gestures. It SHALL explain that existing matches and gestures during initialization can be absorbed by that baseline. Reordering an equivalent set SHALL NOT reinitialize discovery. Accepted work, handled source identities, reply duties, and provider retry deadlines SHALL be preserved. Adding a second configured emoji to an already handled source SHALL NOT create another request.
+WHEN the configured emoji changes, THE SYSTEM SHALL discard incompatible discovery positions and establish a new baseline before admitting new gestures. It SHALL explain that existing matches and gestures during initialization can be absorbed by that baseline. Saving the same normalized name SHALL NOT reinitialize discovery. Accepted work, handled source identities, reply duties, and provider retry deadlines SHALL be preserved. An already handled source SHALL NOT create another request after changing the emoji.
 
-**Rationale:** Dedicated custom emojis avoid confusing ordinary social reactions with agent requests, without introducing separate workflows or repeated polling per emoji.
+**Rationale:** A dedicated custom emoji avoids confusing ordinary social reactions with agent requests while keeping discovery to one prefix search and one owner-reaction search.
 
 ### REQ-SG-003 — Discover within a four-calendar-day window
 

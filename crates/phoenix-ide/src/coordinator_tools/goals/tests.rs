@@ -401,6 +401,7 @@ async fn native_goal_discovery_prepare_apply_read_and_replay_without_dispatch() 
             (158, "federated_conversation_actions".into()),
             (159, "federated_continuation_receipts".into()),
             (160, "slack_trigger_emojis".into()),
+            (161, "slack_single_trigger_emoji".into()),
         ]
     );
     for name in [

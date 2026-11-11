@@ -5,7 +5,7 @@ import '../pages/SlackGatewayPage.css';
 
 interface Config {
   enabled: boolean; mcp_server: string; owner: string; workspace: string;
-  timezone: string; phoenix_url: string; trigger_emojis: string[]; notification_command: string[] | null;
+  timezone: string; phoenix_url: string; trigger_emoji: string; notification_command: string[] | null;
 }
 interface GatewayStatus {
   config: Config | null;
@@ -15,7 +15,7 @@ interface GatewayStatus {
   requests: { request_id: string; product_id: string | null; conversation_available: boolean; admitted: boolean; accepted_at_us: number; eyes_confirmed: boolean; eyes_failure: string | null; failure: string | null; source: { source_url: string; kind: string; trigger_kind: 'prefix' | 'reaction'; observed_at_unix_micros: number; message_ts: string } }[];
   returns: { return_id: string; state: string; destination: string; request_ids: string[]; failure: string | null; notification_receipt: string | null }[];
 }
-const initial = (): Config => ({ enabled: false, mcp_server: '', owner: '', workspace: '', timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, phoenix_url: window.location.origin, trigger_emojis: ['fire'], notification_command: null });
+const initial = (): Config => ({ enabled: false, mcp_server: '', owner: '', workspace: '', timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, phoenix_url: window.location.origin, trigger_emoji: 'fire', notification_command: null });
 const emojiName = (name: string) => name.trim().replace(/^:([^:]+):$/, '$1').toLowerCase();
 
 /** Owner-only setup. Saving enabled configuration activates real Slack operations. */
@@ -55,13 +55,11 @@ export function SlackGatewaySettings({ standalone = false }: { standalone?: bool
   async function save() {
     setBusy(true); setError(null);
     try {
-      const names = config.trigger_emojis.map(emojiName);
-      if (names.length < 1 || names.length > 8 || names.some(n => !/^[a-z0-9_+-]{1,64}$/.test(n))) throw Error('Enter one to eight Slack emoji names, such as phoenix-please-look.');
-      if (new Set(names).size !== names.length) throw Error('Each trigger emoji must be different.');
-      if (names.includes('eyes')) throw Error('eyes is reserved for Phoenix acknowledgments.');
-      if (config.notification_command && !config.notification_command[0]?.trim()) throw Error('Enter a notification program, or remove the notification command.');
-      const r = await fetch('/api/slack-gateway', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...config, trigger_emojis: names }) });
-      const s = await r.json(); if (!r.ok) throw Error(s.error ?? 'Could not save gateway'); await updateStatus(s); setConfig(s.config ? { ...initial(), ...s.config } : { ...config, trigger_emojis: names }); setSaved(true);
+      const name = emojiName(config.trigger_emoji);
+      if (!/^[a-z0-9_+-]{1,64}$/.test(name)) throw Error('Enter one Slack emoji name, such as phoenix-please-look.');
+      if (name === 'eyes') throw Error('eyes is reserved for Phoenix acknowledgments.');
+      const r = await fetch('/api/slack-gateway', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...config, trigger_emoji: name }) });
+      const s = await r.json(); if (!r.ok) throw Error(s.error ?? 'Could not save gateway'); await updateStatus(s); setConfig(s.config ? { ...initial(), ...s.config } : { ...config, trigger_emoji: name }); setSaved(true);
     }
     catch (e) { setError(e instanceof Error ? e.message : 'Gateway unavailable'); }
     finally { setBusy(false); }
@@ -84,9 +82,7 @@ export function SlackGatewaySettings({ standalone = false }: { standalone?: bool
   const connectionProblem = status?.config && status.connection === null ? 'Connection unavailable' : connection && !connection.enabled ? 'Connection disabled' : connection?.state === 'unauthorized' ? 'Sign-in required' : connection && connection.state !== 'ready' ? connection.state.replaceAll('_', ' ') : toolProblem;
   const discoveryState = !status?.config ? 'Not configured' : !status.config.enabled ? 'Paused' : connectionProblem ?? (!status.scan?.baseline_complete ? 'Initializing' : (status.scan.status ?? 'Initializing').replaceAll('_', ' '));
   const command = config.notification_command ?? [];
-  const names = config.trigger_emojis;
-  const exampleEmoji = names.map(emojiName).find(Boolean) ?? 'emoji-name';
-  const updateEmoji = (index: number, value: string) => setConfig({ ...config, trigger_emojis: names.map((name, i) => i === index ? value : name) });
+  const exampleEmoji = emojiName(config.trigger_emoji) || 'emoji-name';
   const setCommandPart = (index: number, value: string) => {
     const next = [...command]; next[index] = value;
     setConfig({ ...config, notification_command: next }); setSaved(false);
@@ -97,23 +93,18 @@ export function SlackGatewaySettings({ standalone = false }: { standalone?: bool
       <form onSubmit={e => { e.preventDefault(); void save(); }} onChange={() => setSaved(false)}>
         <fieldset className="sg-form-fields" disabled={busy}>
         <section className="sg-card" aria-labelledby={fieldId + '-triggers-title'}>
-          <div className="sg-card-heading"><div><h2 id={fieldId + '-triggers-title'}>Trigger emojis</h2><p>Any saved emoji works (OR). Use a dedicated custom name to keep social reactions separate.</p></div></div>
-          <div className="sg-emoji-list">{names.map((name, index) => <div className="sg-emoji-row" key={index}>
-            <div className="sg-field"><label htmlFor={fieldId + '-emoji-' + index}>Trigger emoji {index + 1}</label><input id={fieldId + '-emoji-' + index} value={name} onChange={e => updateEmoji(index, e.target.value)} placeholder="phoenix-please-look" maxLength={66} required spellCheck={false} autoCapitalize="none" autoCorrect="off" /></div>
-            <code>:{emojiName(name) || 'emoji-name'}:</code>
-            <button type="button" className="btn-secondary" disabled={names.length === 1} aria-label={'Remove trigger emoji ' + (index + 1)} onClick={() => { setConfig({ ...config, trigger_emojis: names.filter((_, i) => i !== index) }); setSaved(false); }}>Remove</button>
-          </div>)}</div>
-          <button type="button" className="btn-secondary" disabled={names.length >= 8} onClick={() => { setConfig({ ...config, trigger_emojis: [...names, ''] }); setSaved(false); }}>Add trigger emoji</button>
-          <p className="sg-hint">Enter Slack names with or without colons. Upload custom emoji in Slack first. Remove fire to stop using 🔥 as a trigger. 👀 is reserved for acknowledgment.</p>
-          <p className="sg-hint">Changing the emoji set restarts initialization. Existing matches and gestures made during initialization become a baseline, without starting work. Wait until Discovery shows healthy before triggering a new request. Accepted work continues.</p>
+          <div className="sg-card-heading"><div><h2 id={fieldId + '-triggers-title'}>Trigger emoji</h2><p>Choose one emoji for all three workflows. A dedicated custom name keeps social reactions separate.</p></div></div>
+          <div className="sg-fields"><div className="sg-field"><label htmlFor={fieldId + '-emoji'}>Slack emoji name</label><input id={fieldId + '-emoji'} value={config.trigger_emoji} onChange={e => setConfig({ ...config, trigger_emoji: e.target.value })} placeholder="phoenix-please-look" maxLength={66} required spellCheck={false} autoCapitalize="none" autoCorrect="off" /></div></div>
+          <p className="sg-hint">Enter a Slack name with or without colons. Upload custom emoji in Slack first. Choosing a custom emoji replaces 🔥 as the trigger. 👀 is reserved for acknowledgment.</p>
+          <p className="sg-hint">Changing the emoji restarts initialization. Existing matches and gestures made during initialization become a baseline, without starting work. Wait until Discovery shows healthy before triggering a new request. Accepted work continues.</p>
           <h3 className="sg-list-title">Three workflows</h3>
-          <p className="sg-hint">Any emoji in your saved list triggers the same rules. These examples preview your edits; save to apply them.</p>
+          <p className="sg-hint">Your saved emoji triggers these rules. These examples preview your edits; save to apply them.</p>
           <div className="sg-gesture-guide" aria-label="Slack workflows">
-            <div><span aria-hidden="true">↗</span><div><strong>1. Message prefix</strong><p>Start your own message with any configured emoji. Phoenix acts on your request and replies in that Slack thread.</p><code>:{exampleEmoji}: phoenix, investigate this</code></div></div>
-            <div><span aria-hidden="true">↩</span><div><strong>2. React to your own message</strong><p>Add any configured emoji reaction to your own message. Phoenix treats that message as your request and replies in its Slack thread.</p></div></div>
-            <div><span aria-hidden="true">▤</span><div><strong>3. React to someone else’s message</strong><p>Add any configured emoji reaction to another person’s message. Phoenix prepares a private briefing in Phoenix and attempts your configured private notification.</p></div></div>
+            <div><span aria-hidden="true">↗</span><div><strong>1. Message prefix</strong><p>Start your own message with your configured emoji. Phoenix acts on your request and replies in that Slack thread.</p><code>:{exampleEmoji}: phoenix, investigate this</code></div></div>
+            <div><span aria-hidden="true">↩</span><div><strong>2. React to your own message</strong><p>Add your configured emoji reaction to your own message. Phoenix treats that message as your request and replies in its Slack thread.</p></div></div>
+            <div><span aria-hidden="true">▤</span><div><strong>3. React to someone else’s message</strong><p>Add your configured emoji reaction to another person’s message. Phoenix prepares a private briefing in Phoenix and attempts your configured private notification.</p></div></div>
           </div>
-          <p className="sg-hint">👀 means Phoenix durably accepted the request. Acknowledgment is best effort. Plain follow-ups do not trigger work; adding another configured emoji to an already accepted message does not run it again.</p>
+          <p className="sg-hint">👀 means Phoenix durably accepted the request. Acknowledgment is best effort. Plain follow-ups do not trigger work; reacting to an already accepted message does not run it again.</p>
         </section>
         <section className="sg-card" aria-labelledby="sg-discovery-title">
           <div className="sg-card-heading"><div><h2 id="sg-discovery-title">Discovery</h2><p>Triggers begin after initialization. Watches today and the previous three calendar dates.</p></div><span className={'sg-badge ' + (discoveryState === 'healthy' ? 'sg-badge--success' : '')}>{discoveryState}</span></div>
