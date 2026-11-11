@@ -13,7 +13,7 @@ prepare separate private briefings. Thread reuse and exact reply coverage remain
 |---|---|---|
 | REQ-SG-001 | Partial | Implemented; current candidate validation and production limits below. |
 | REQ-SG-002 | Partial | Implemented; current candidate validation and production limits below. |
-| REQ-SG-018: Configure one trigger emoji | In progress | Single-string configuration, narrow queries, and list removal implemented; upgrade and regression checks in progress. |
+| REQ-SG-018: Configure one trigger emoji | Implemented | Single-string configuration, narrow queries, list removal, and preserving upgrade pass focused checks and local adversarial review. Hosted qualification and deployment remain separate. |
 | REQ-SG-003 | Partial | Implemented; current candidate validation and production limits below. |
 | REQ-SG-004 | Partial | Implemented; current candidate validation and production limits below. |
 | REQ-SG-005 | Partial | Implemented; current candidate validation and production limits below. |
@@ -52,7 +52,10 @@ custom-emoji workflows, narrow search terms, baseline changes, and upgrade/reope
 from the published list schema. Upgrade keeps the first saved name, preserves
 single-emoji progress, and discards unsupported multi-emoji query positions.
 Baseline readiness, accepted requests, return coverage, and backoff survive.
-Qualification of this candidate is in progress.
+All 58 gateway tests, 29 Slack database tests, 23 settings tests, and 156 migration
+and migration-dependent tests pass. The selected static/UI checks pass, with
+ast-grep unavailable locally. Local adversarial review found no actionable defects.
+Hosted qualification and production deployment remain separate.
 
 ## Production boundary
 

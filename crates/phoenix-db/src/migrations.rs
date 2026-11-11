@@ -13404,6 +13404,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn migration_161_retains_the_first_emoji_and_durable_work() {
         // REQ-SG-018
         for multiple in [false, true] {
