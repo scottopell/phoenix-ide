@@ -653,7 +653,7 @@ fn operation_rejection(error: &McpOneShotError, method: &str) -> Option<Value> {
     .then_some(value)
 }
 fn search_terms(c: &Config, reactions: bool, after_date: &str) -> (String, Vec<String>) {
-    let terms = c
+    let mut terms = c
         .trigger_emojis
         .iter()
         .map(|name| {
@@ -664,6 +664,7 @@ fn search_terms(c: &Config, reactions: bool, after_date: &str) -> (String, Vec<S
             }
         })
         .collect::<Vec<_>>();
+    terms.sort_unstable();
     if terms.len() == 1 {
         if reactions {
             (format!("{} after:{after_date}", terms[0]), vec![])
@@ -1744,6 +1745,11 @@ mod tests {
                 vec![]
             )
         );
+        let prefix_terms = search_terms(&c, false, "2026-11-01");
+        let reaction_terms = search_terms(&c, true, "2026-11-01");
+        c.trigger_emojis.reverse();
+        assert_eq!(search_terms(&c, false, "2026-11-01"), prefix_terms);
+        assert_eq!(search_terms(&c, true, "2026-11-01"), reaction_terms);
     }
     #[test]
     fn empty_search_requires_the_exact_connector_sentinel() {

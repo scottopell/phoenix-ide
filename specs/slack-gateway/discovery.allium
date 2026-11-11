@@ -92,6 +92,8 @@ contract SlackDiscoveryPort {
     @invariant QueryBoundary
         -- Both searches match any configured trigger name (OR), including custom
         -- Slack names. Multiple emoji matches retain one source identity.
+        -- Reordering an equivalent name set preserves the exact query terms
+        -- paired with retained provider cursors.
         -- Prefix and owner-reaction searches cover the accessible eligible
         -- window. Their search boundary is retained for each ongoing sweep;
         -- source validation still rejects messages that have aged out.
