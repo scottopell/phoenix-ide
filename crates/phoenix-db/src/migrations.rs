@@ -13571,7 +13571,7 @@ mod tests {
         .unwrap();
         assert_eq!(before, vec![158]);
 
-        assert_eq!(run_pending_migrations(pool).await.unwrap(), 2);
+        assert_eq!(run_pending_migrations(pool).await.unwrap(), 3);
 
         let after: Vec<i64> = sqlx::query_scalar(
             "SELECT version FROM _migrations WHERE version >= 156 ORDER BY version",
@@ -13579,7 +13579,7 @@ mod tests {
         .fetch_all(pool)
         .await
         .unwrap();
-        assert_eq!(after, vec![156, 158, 159]);
+        assert_eq!(after, vec![156, 158, 159, 160]);
         sqlx::query("SELECT enrollment_id FROM conversation_goal_actors LIMIT 0")
             .execute(pool)
             .await
@@ -16068,7 +16068,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(run_through_for_test(db.pool(), 152).await.unwrap(), 1);
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 5);
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 6);
         assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
         let ledger: Vec<(i64, String)> = sqlx::query_as(
             "SELECT version, name FROM _migrations WHERE version >= 150 ORDER BY version",
@@ -16087,6 +16087,7 @@ mod tests {
                 (156, "remote_coordinator_goals".into()),
                 (158, "federated_conversation_actions".into()),
                 (159, "federated_continuation_receipts".into()),
+                (160, "slack_trigger_emojis".into()),
             ]
         );
     }
@@ -16096,6 +16097,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (160, "slack_trigger_emojis"),
             (159, "federated_continuation_receipts"),
             (158, "federated_conversation_actions"),
             (156, "remote_coordinator_goals"),
@@ -20402,7 +20404,7 @@ mod tests {
         }
         sqlx::query("UPDATE product_creation_jobs SET status = 'published', published_product_id = 'deleted-product', published_conversation_id = 'deleted-transcript' WHERE request_id = 'orphan-image'")
             .execute(&pool).await.unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 9);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 10);
         let identity: Vec<(String, String)> = sqlx::query_as(
             "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
         ).fetch_all(&pool).await.unwrap();
@@ -20456,7 +20458,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 9);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 10);
         let retained: (String, String, String) = sqlx::query_as(
             "SELECT status, published_product_id, published_conversation_id
              FROM product_creation_jobs WHERE request_id = 'orphan-text'",
