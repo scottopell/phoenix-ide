@@ -174,10 +174,11 @@ impl Database {
              FROM product_conversations product WHERE product.id = ?1
              ON CONFLICT(product_conversation_id) DO UPDATE SET
                  read_through_message_id = excluded.read_through_message_id,
-                 marked_unread = 0"
+                 marked_unread = CASE WHEN ?2 = 1 THEN 0 ELSE marked_unread END"
         ))
-            .bind(product_conversation_id.as_str())
-            .execute(&self.pool)
+        .bind(product_conversation_id.as_str())
+        .bind(clears_mark)
+        .execute(&self.pool)
             .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(
