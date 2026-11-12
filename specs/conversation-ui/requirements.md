@@ -752,12 +752,12 @@ Global aggregate history SHALL NOT acquire ordinary Open/History lifecycle, Clos
 WHEN an ordinary ProductConversation or the Global Coordinator receives agent, tool, error, or system output that the user has not viewed
 THE SYSTEM SHALL show that conversation as unread in the conversation list and on the Global entry
 
-WHILE the user views a conversation in a visible window
+WHILE the user views a conversation in a visible, focused window
 THE SYSTEM SHALL mark it read through its latest message, including messages that arrive while it is being viewed
 
 WHEN the user marks a conversation unread from the list or from the conversation itself
-THE SYSTEM SHALL show it as unread until the user opens it again or marks it read
-AND SHALL NOT clear the mark merely because the conversation remains on screen
+THE SYSTEM SHALL show it as unread on every client until the user opens it again or marks it read
+AND SHALL NOT clear the mark because that or any other client keeps the conversation on screen
 
 WHEN the user marks an unread conversation read from the list
 THE SYSTEM SHALL show it as read without opening it

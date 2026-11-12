@@ -1,21 +1,17 @@
 import './MarkUnreadButton.css';
 import { useEffect, useState } from 'react';
-import { isAutoReadSuppressed, markProductConversationRead, markProductConversationUnread } from '../conversation/readState';
+import { markProductConversationRead, markProductConversationUnread } from '../conversation/readState';
 
-/**
- * Toggle for the conversation being viewed. Viewing marks a conversation
- * read, so the button starts in the "Mark unread" state unless the user
- * already marked it unread during this visit.
- */
+/** Toggle for the conversation being viewed, which opening has just marked read. */
 export function MarkUnreadButton({ productConversationId, className }: {
   productConversationId: string;
   className?: string;
 }) {
-  const [marked, setMarked] = useState(() => isAutoReadSuppressed(productConversationId));
+  const [marked, setMarked] = useState(false);
   const [pending, setPending] = useState(false);
   const [failed, setFailed] = useState(false);
   useEffect(() => {
-    setMarked(isAutoReadSuppressed(productConversationId));
+    setMarked(false);
     setFailed(false);
   }, [productConversationId]);
 

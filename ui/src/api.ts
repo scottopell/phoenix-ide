@@ -102,6 +102,8 @@ export type { ProductConversationListRow } from './generated/ProductConversation
 export type { ProductConversationReadStateView } from './generated/ProductConversationReadStateView';
 export type { CoordinatorListEntryView } from './generated/CoordinatorListEntryView';
 import type { ProductConversationReadStateView as ProductConversationReadStateViewType } from './generated/ProductConversationReadStateView';
+import type { ProductConversationReadAdvanceRequestKind } from './generated/ProductConversationReadAdvanceRequestKind';
+import type { MarkProductConversationReadRequest } from './generated/MarkProductConversationReadRequest';
 export type { ProductConversationSnapshotView } from './generated/ProductConversationSnapshotView';
 export type { ProductConversationHistorySnapshotView } from './generated/ProductConversationHistorySnapshotView';
 import type { ProductConversationHistorySnapshotView } from './generated/ProductConversationHistorySnapshotView';
@@ -2404,8 +2406,16 @@ export const api = {
     if (!resp.ok) throw new Error('Failed to close product conversation');
   },
 
-  async markProductConversationRead(productConversationId: string): Promise<ProductConversationReadStateViewType> {
-    const resp = await fetch(`/api/product-conversations/${encodeURIComponent(productConversationId)}/read`, { method: 'POST' });
+  async markProductConversationRead(
+    productConversationId: string,
+    kind: ProductConversationReadAdvanceRequestKind,
+  ): Promise<ProductConversationReadStateViewType> {
+    const body: MarkProductConversationReadRequest = { kind };
+    const resp = await fetch(`/api/product-conversations/${encodeURIComponent(productConversationId)}/read`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
     if (!resp.ok) throw new Error('Failed to mark conversation read');
     return resp.json();
   },

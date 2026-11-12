@@ -138,6 +138,7 @@ const productConversations: Partial<Record<SidebarScenario['id'], ProductConvers
       latest_transcript_row_id: 'pc-latest-continuation',
       updated_at: isoAgo(3),
       presentation: { kind: 'state', display_name: 'Fixture Product Root', presentation_mode: 'working' },
+      read_state: { state: 'read' },
     },
   ],
 };

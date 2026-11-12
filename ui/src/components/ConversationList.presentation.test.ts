@@ -19,6 +19,7 @@ function row(overrides: Partial<ProductConversationListRow> = {}): ProductConver
     latest_transcript_row_id: 'latest-transcript-uuid',
     updated_at: '2026-10-18T00:00:00Z',
     presentation: { kind: 'state', display_name: 'Current name', presentation_mode: 'idle' },
+    read_state: { state: 'read' },
     ...overrides,
   };
 }

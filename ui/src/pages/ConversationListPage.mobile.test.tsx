@@ -78,6 +78,7 @@ const productConversation = (title = 'Mobile Product'): ProductConversationListR
   latest_transcript_row_id: 'latest-mobile',
   updated_at: '2026-01-01T00:00:00Z',
   presentation: { kind: 'state', display_name: title, presentation_mode: 'idle' },
+  read_state: { state: 'read' },
 });
 
 function touchActivate(element: HTMLElement): void {
@@ -96,6 +97,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     vi.mocked(api.codexLoginPreflight).mockResolvedValue({} as never);
     vi.mocked(api.listProductConversations).mockResolvedValue({
       product_conversations: [productConversation()],
+      coordinator: null,
     });
   });
 
@@ -169,7 +171,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
   });
 
   it.each(['open', 'history'] as const)('restores Actions focus after %s confirmation cancellation', async (state) => {
-    if (state === 'history') vi.mocked(api.listProductConversations).mockResolvedValue({ product_conversations: [{ ...productConversation(), lifecycle: { state: 'history' } }] });
+    if (state === 'history') vi.mocked(api.listProductConversations).mockResolvedValue({ product_conversations: [{ ...productConversation(), lifecycle: { state: 'history' } }], coordinator: null });
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
     if (state === 'history') fireEvent.click(await screen.findByRole('button', { name: 'History 1' }));
     const trigger = await screen.findByRole('button', { name: 'Actions for conversation Mobile Product' });
@@ -193,7 +195,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
       lifecycle: { state: 'history' as const },
       latest_transcript_row_id: 'root-mobile',
     };
-    vi.mocked(api.listProductConversations).mockResolvedValue({ product_conversations: [history] });
+    vi.mocked(api.listProductConversations).mockResolvedValue({ product_conversations: [history], coordinator: null });
     vi.mocked(api.deleteChain).mockResolvedValue({
       success: true,
       outcome: {
@@ -218,7 +220,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
       lifecycle: { state: 'history' as const },
       latest_transcript_row_id: 'successor-mobile',
     };
-    vi.mocked(api.listProductConversations).mockResolvedValue({ product_conversations: [history] });
+    vi.mocked(api.listProductConversations).mockResolvedValue({ product_conversations: [history], coordinator: null });
     vi.mocked(api.deleteChain).mockRejectedValue(new ApiResponseError('gone', 404));
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 
@@ -239,7 +241,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
       latest_transcript_row_id: 'successor-mobile',
     };
     vi.mocked(api.listProductConversations)
-      .mockResolvedValueOnce({ product_conversations: [history] })
+      .mockResolvedValueOnce({ product_conversations: [history], coordinator: null })
       .mockRejectedValueOnce(new Error('refresh failed'));
     vi.mocked(api.deleteChain).mockResolvedValue({
       success: true,
@@ -271,6 +273,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     vi.mocked(api.closeProductConversation).mockResolvedValue(undefined);
     vi.mocked(api.listProductConversations).mockResolvedValue({
       product_conversations: [{ ...productConversation(), latest_transcript_row_id: 'root-mobile' }],
+      coordinator: null,
     });
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 

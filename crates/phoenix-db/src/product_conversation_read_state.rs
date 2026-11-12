@@ -25,6 +25,14 @@ pub enum ProductConversationReadState {
     Unread(ProductConversationUnreadReason),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductConversationReadAdvance {
+    /// The user opened the conversation or chose "mark read".
+    Acknowledge,
+    /// Output arrived while the conversation was on screen.
+    Observe,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductConversationReadStateEntry {
     pub product_conversation_id: ProductConversationId,
@@ -147,12 +155,15 @@ impl Database {
         Ok(entries)
     }
 
-    /// Advance the read cursor to the product's current latest message and
-    /// clear any explicit unread mark.
+    /// Advance the read cursor to the product's current latest message.
+    /// Only [`ProductConversationReadAdvance::Acknowledge`] clears an explicit
+    /// unread mark.
     pub async fn mark_product_conversation_read(
         &self,
         product_conversation_id: &ProductConversationId,
+        advance: ProductConversationReadAdvance,
     ) -> DbResult<()> {
+        let clears_mark = i64::from(advance == ProductConversationReadAdvance::Acknowledge);
         let result = sqlx::query(concat!(
             "INSERT INTO product_conversation_read_state(
                  product_conversation_id, read_through_message_id, marked_unread
@@ -246,7 +257,9 @@ mod tests {
             ProductConversationReadState::Unread(ProductConversationUnreadReason::NewActivity)
         );
 
-        db.mark_product_conversation_read(&product).await.unwrap();
+        db.mark_product_conversation_read(&product, ProductConversationReadAdvance::Acknowledge)
+            .await
+            .unwrap();
         assert_eq!(state_of(&db, &product).await, ProductConversationReadState::Read);
 
         db.mark_product_conversation_unread(&product).await.unwrap();
@@ -255,7 +268,9 @@ mod tests {
             ProductConversationReadState::Unread(ProductConversationUnreadReason::Marked)
         );
 
-        db.mark_product_conversation_read(&product).await.unwrap();
+        db.mark_product_conversation_read(&product, ProductConversationReadAdvance::Acknowledge)
+            .await
+            .unwrap();
         db.add_message(
             "a2",
             &conversation.id,
@@ -272,11 +287,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn passive_observation_keeps_another_clients_unread_mark() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation("observe", "observe", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let product = conversation.product_conversation_id.clone();
+        db.add_message(
+            "a1",
+            &conversation.id,
+            &MessageContent::agent(vec![ContentBlock::text("hello")]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.mark_product_conversation_unread(&product).await.unwrap();
+        db.mark_product_conversation_read(&product, ProductConversationReadAdvance::Observe)
+            .await
+            .unwrap();
+        assert_eq!(
+            state_of(&db, &product).await,
+            ProductConversationReadState::Unread(ProductConversationUnreadReason::Marked)
+        );
+        db.mark_product_conversation_read(&product, ProductConversationReadAdvance::Acknowledge)
+            .await
+            .unwrap();
+        assert_eq!(state_of(&db, &product).await, ProductConversationReadState::Read);
+    }
+
+    #[tokio::test]
+    async fn observation_advances_cursor_without_a_mark() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation("observe-cursor", "observe-cursor", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let product = conversation.product_conversation_id.clone();
+        db.add_message(
+            "a1",
+            &conversation.id,
+            &MessageContent::agent(vec![ContentBlock::text("hello")]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.mark_product_conversation_read(&product, ProductConversationReadAdvance::Observe)
+            .await
+            .unwrap();
+        assert_eq!(state_of(&db, &product).await, ProductConversationReadState::Read);
+    }
+
+    #[tokio::test]
     async fn marking_unknown_product_is_not_found() {
         let db = Database::open_in_memory().await.unwrap();
         let missing = ProductConversationId::parse("missing-product").unwrap();
         assert!(matches!(
-            db.mark_product_conversation_read(&missing).await,
+            db.mark_product_conversation_read(&missing, ProductConversationReadAdvance::Acknowledge)
+                .await,
             Err(DbError::ConversationNotFound(_))
         ));
         assert!(matches!(

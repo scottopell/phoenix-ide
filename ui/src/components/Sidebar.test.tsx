@@ -72,6 +72,7 @@ const makeProductConversation = (id: string, overrides: Partial<ProductConversat
   latest_transcript_row_id: `latest-${id}`,
   updated_at: '2024-01-01T00:00:00Z',
   presentation: { kind: 'state', display_name: overrides.canonical_root?.title ?? `Root ${id}`, presentation_mode: 'idle' },
+  read_state: { state: 'read' },
   ...overrides,
 });
 
@@ -201,11 +202,13 @@ describe('Sidebar — ProductConversation navigation', () => {
       ...row, canonical_route: '/c/generated-name',
       canonical_root: { ...row.canonical_root, title: 'Generated Name', slug: 'generated-name' },
       presentation: { kind: 'state', display_name: 'Generated Name', presentation_mode: 'idle' },
+      read_state: { state: 'read' },
     });
     apiMock.renameProductConversation.mockResolvedValue({
       ...row,
       canonical_root: { ...row.canonical_root, title: 'Renamed Product Title' },
       presentation: { kind: 'state', display_name: 'Renamed Product Title', presentation_mode: 'idle' },
+      read_state: { state: 'read' },
     });
     const listRevisionListener = vi.fn();
     const unsubscribe = subscribeProductConversationListRevision(listRevisionListener);

@@ -178,7 +178,6 @@ function isActionableDisplayState(displayState: ReturnType<typeof getConvDisplay
   return displayState === 'working' || displayState === 'error' || displayState === 'awaiting-approval';
 }
 
-export const SidebarPrBadge = PrBadge;
 
 const ProductConversationListRowView = memo(function ProductConversationListRowView({
   row,

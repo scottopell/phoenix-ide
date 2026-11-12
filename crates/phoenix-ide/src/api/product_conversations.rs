@@ -394,11 +394,12 @@ fn parse_product_conversation_id(reference: &str) -> Result<ProductConversationI
 pub async fn mark_product_conversation_read(
     State(state): State<AppState>,
     Path(reference): Path<String>,
+    Json(request): Json<super::types::MarkProductConversationReadRequest>,
 ) -> Result<Json<ProductConversationReadStateView>, AppError> {
     let id = parse_product_conversation_id(&reference)?;
     state
         .db
-        .mark_product_conversation_read(&id)
+        .mark_product_conversation_read(&id, request.kind.into())
         .await
         .map_err(db_to_app)?;
     Ok(Json(product_read_state(&state, id.as_str()).await?.into()))

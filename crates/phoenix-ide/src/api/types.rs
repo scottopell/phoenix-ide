@@ -389,6 +389,34 @@ pub struct CoordinatorListEntryView {
     pub read_state: ProductConversationReadStateView,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationReadAdvanceRequestKind {
+    /// The user opened the conversation or chose "mark read"; clears an
+    /// explicit unread mark.
+    Acknowledged,
+    /// Output arrived while the conversation was on screen; never clears an
+    /// explicit unread mark.
+    Observed,
+}
+
+#[derive(Debug, Clone, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct MarkProductConversationReadRequest {
+    pub kind: ProductConversationReadAdvanceRequestKind,
+}
+
+impl From<ProductConversationReadAdvanceRequestKind> for phoenix_db::ProductConversationReadAdvance {
+    fn from(kind: ProductConversationReadAdvanceRequestKind) -> Self {
+        match kind {
+            ProductConversationReadAdvanceRequestKind::Acknowledged => Self::Acknowledge,
+            ProductConversationReadAdvanceRequestKind::Observed => Self::Observe,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
 #[serde(tag = "state", rename_all = "snake_case")]
 #[ts(export, export_to = "../../../ui/src/generated/")]

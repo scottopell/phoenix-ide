@@ -76,7 +76,8 @@ pub use product_conversation_rename::{
 mod product_conversation_read;
 mod product_conversation_read_state;
 pub use product_conversation_read_state::{
-    ProductConversationKind, ProductConversationReadState, ProductConversationReadStateEntry,
+    ProductConversationKind, ProductConversationReadAdvance, ProductConversationReadState,
+    ProductConversationReadStateEntry,
     ProductConversationUnreadReason,
 };
 pub mod retrieval;

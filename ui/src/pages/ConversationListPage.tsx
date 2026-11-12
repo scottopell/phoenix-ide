@@ -102,6 +102,7 @@ export function ConversationListPage() {
       .then((response) => {
         if (cancelled) return;
         setProductConversations(response.product_conversations);
+        setCoordinatorUnreadState(coordinatorUnread(response));
         setProductListError(null);
       })
       .catch((err) => {

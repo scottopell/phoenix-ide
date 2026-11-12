@@ -8,6 +8,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, fireEvent, within, act, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import type { Conversation, ProductConversationListRow } from '../api';
+import { api } from '../api';
 import { FocusScopeProvider } from '../hooks/useFocusScope';
 import { ShortcutHelpPanel } from './ShortcutHelpPanel';
 
@@ -232,6 +233,7 @@ const makeProductConversation = (id: string, overrides: Partial<ProductConversat
   latest_transcript_row_id: `latest-${id}`,
   updated_at: '2024-01-01T00:00:00Z',
   presentation: { kind: 'state', display_name: overrides.canonical_root?.title ?? `Root ${id}`, presentation_mode: 'idle' },
+  read_state: { state: 'read' },
   ...overrides,
 });
 
@@ -252,6 +254,7 @@ describe('ProductConversation presentation indicator', () => {
       canonical_root: { transcript_row_id: 'root-row', slug: 'root-slug', title: 'Root Title' },
       latest_transcript_row_id: 'latest-row',
       presentation: { kind: 'state', display_name: 'Awaiting User', presentation_mode: 'needs_action' },
+      read_state: { state: 'read' },
     });
 
     const { container } = render(
@@ -317,9 +320,34 @@ describe('ProductConversation row actions', () => {
     expect(trigger).toHaveFocus();
   });
 
-  it('does not offer empty actions for offline History or mismatched callbacks', () => {
+  it('offers only the read-state action for offline History or mismatched callbacks', () => {
     const view = render(<MemoryRouter><ConversationList {...defaultProps} showArchived archivedProductConversations={[makeProductConversation('empty', { lifecycle: { state: 'history' } })]} onProductConversationRename={vi.fn()} onProductConversationClose={vi.fn()} /></MemoryRouter>);
-    expect(view.queryByRole('button', { name: /^Actions for conversation/ })).toBeNull();
+    fireEvent.click(view.getByRole('button', { name: /^Actions for conversation/ }));
+    const actions = view.getByLabelText(/^Actions for Root empty/);
+    expect(within(actions).getAllByRole('button').map((button) => button.textContent)).toEqual(['Mark as unread']);
+  });
+
+  it('shows unread state inline and toggles it from the row menu', async () => {
+    const markRead = vi.spyOn(api, 'markProductConversationRead').mockResolvedValue({ state: 'read' });
+    const markUnread = vi.spyOn(api, 'markProductConversationUnread').mockResolvedValue({ state: 'unread', reason: 'marked' });
+    const view = render(<MemoryRouter><ConversationList {...defaultProps} productRowsAuthoritative productConversations={[
+      makeProductConversation('fresh', { read_state: { state: 'unread', reason: 'new_activity' } }),
+      makeProductConversation('marked', { read_state: { state: 'unread', reason: 'marked' } }),
+      makeProductConversation('seen'),
+    ]} /></MemoryRouter>);
+    expect(view.getByRole('img', { name: 'New activity' })).toBeTruthy();
+    expect(view.getByRole('img', { name: 'Marked unread' }).className).toContain('conv-item-unread-dot--marked');
+    expect(view.container.querySelectorAll('.product-conversation-list-row.unread')).toHaveLength(2);
+
+    fireEvent.click(view.getByRole('button', { name: 'Actions for conversation Root fresh' }));
+    fireEvent.click(view.getByRole('button', { name: 'Mark as read: Root fresh' }));
+    await waitFor(() => expect(markRead).toHaveBeenCalledWith('fresh', 'acknowledged'));
+
+    fireEvent.click(view.getByRole('button', { name: 'Actions for conversation Root seen' }));
+    fireEvent.click(view.getByRole('button', { name: 'Mark as unread: Root seen' }));
+    await waitFor(() => expect(markUnread).toHaveBeenCalledWith('seen'));
+    markRead.mockRestore();
+    markUnread.mockRestore();
   });
 
   it('dismisses after focus leaves the menu but lets a closed trigger Escape bubble', () => {
@@ -582,11 +610,13 @@ describe('ConversationList — product conversations', () => {
     const open = makeProductConversation('pc-open', {
       canonical_root: { transcript_row_id: 'root-open', slug: 'root-open', title: 'Open Root' },
       presentation: { kind: 'state', display_name: 'Working surface', presentation_mode: 'working' },
+      read_state: { state: 'read' },
     });
     const archived = makeProductConversation('pc-archived', {
       lifecycle: { state: 'history' },
       canonical_root: { transcript_row_id: 'root-archived', slug: 'root-archived', title: 'Archived Root' },
       presentation: { kind: 'state', display_name: 'Retained history', presentation_mode: 'done' },
+      read_state: { state: 'read' },
     });
 
     const { rerender, getByText, container } = render(
@@ -632,6 +662,7 @@ describe('ConversationList — product conversations', () => {
     const blocked = makeProductConversation('pc-blocked', {
       lifecycle: { state: 'open', close_action: { availability: 'unavailable', reason: 'awaiting_task_approval' } },
       presentation: { kind: 'state', display_name: 'Blocked', presentation_mode: 'idle' },
+      read_state: { state: 'read' },
     });
     const available = makeProductConversation('pc-available', {
       lifecycle: { state: 'open', close_action: { availability: 'available' } },

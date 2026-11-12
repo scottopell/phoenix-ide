@@ -35,15 +35,24 @@ order avoids depending on cross-row message ordering or timestamps.
 
 The cursor is recorded at the server's latest message rather than at an id the
 client rendered, because client transcripts omit represented continuation
-openings and so cannot always name the true latest message. Clients only
-request read-marking while the conversation is visible.
+openings and so cannot always name the true latest message.
+
+Several clients may view the same conversation at once, so each read request
+states its cause. `acknowledged` (the user opened the conversation or chose
+"mark read") advances the cursor and clears the explicit mark. `observed`
+(output arrived while the conversation was on screen) advances the cursor but
+never clears the mark, so an idle window on one device cannot undo a mark set
+from another. Clients advance the cursor only while their window is visible
+and focused. Keeping this rule on the server rather than in per-client
+suppression state makes the mark authoritative for every client.
 
 ## Consequences
 
 - **Positive:** read state is shared by every client and survives
   continuation; the Coordinator needs no special case.
 - **Negative:** a message landing between render and the read request is
-  treated as read; a user message from another conversation landing last hides
+  treated as read; a focused window counts as the user looking, so two focused
+  devices both consume new activity; a user message from another conversation landing last hides
   earlier unseen agent output until the agent replies.
 - **Neutral:** the migration seeds every existing ProductConversation as read
   so upgrade does not flood the sidebar.
