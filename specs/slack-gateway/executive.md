@@ -14,6 +14,7 @@ prepare separate private briefings. Thread reuse and exact reply coverage remain
 | REQ-SG-001 | Partial | Implemented; current candidate validation and production limits below. |
 | REQ-SG-002 | Partial | Implemented; current candidate validation and production limits below. |
 | REQ-SG-018: Configure one trigger emoji | Implemented | Single-string configuration, narrow queries, list removal, and preserving upgrade pass focused checks and local adversarial review. Hosted qualification and deployment remain separate. |
+| REQ-SG-019: Capture a discussion privately with Save for later | Specified; not implemented | Controlled Saved membership, paging, and reply identity checks pass through the chat connector. Phoenix-owned transport and runtime qualification remain open. |
 | REQ-SG-003 | Partial | Implemented; current candidate validation and production limits below. |
 | REQ-SG-004 | Partial | Implemented; current candidate validation and production limits below. |
 | REQ-SG-005 | Partial | Implemented; current candidate validation and production limits below. |
@@ -59,6 +60,11 @@ Hosted qualification and production deployment remain separate.
 
 ## Production boundary
 
+Saved capture is a spec-only addition under [ADR-250](../adrs/250_saved-messages-create-private-any-age-captures.md).
+It accepts any source age, initializes independently, and has no source-message
+acknowledgment or thread response. Neither Saved discovery nor this policy has
+been activated in production.
+
 Production runs the canonical public schema, with one custom emoji configured as
 an operational workaround for the OR-filter defect. The single-field API and
 storage simplification require a new candidate deployment. No prototype conversion
@@ -68,3 +74,45 @@ the public repository.
 Discovery remains bounded by the connector's pagination, the four-calendar-date
 window, and the existing call allowance. Removing multi-emoji support fixes the
 unsupported OR query; it does not remove the connector's page limit.
+
+## Saved capture verification and open qualification
+
+Controlled read-only checks observe zero, one, two, then one saved message as the
+owner saves and unsaves test sources. The removed reply remains readable without
+the Saved predicate, excluding access loss as the explanation for its disappearance.
+Two one-result pages produce distinct messages followed by a terminal empty page.
+Own-author and other-author sources are covered; the saved reply retains the right
+parent and supports an exact bounded source-plus-parent read. The connected owner
+matches production, whose current MCP catalog exposes the same search inputs.
+
+No Saved timestamp is returned. No new source messages, reactions, notifications,
+native conversations, production setting changes or application changes were made
+for this verification. Test source IDs and content are not public evidence.
+
+Before activation, qualify reads through the Phoenix-owned MCP connection and
+test any-age eligibility, private outcomes including failure, independent baseline
+and deduplication scopes, restart continuity and the shared call allowance. Exercise
+a collection beyond the connector's page ceiling: the one-result page strategy
+can exhaust that ceiling, and the tiny controlled sample does not prove capacity
+or latency at larger collection sizes. An incomplete scan must be visible and
+cannot finish initialization or update a last-complete marker.
+
+
+Spec-only adversarial review found three issues, now reconciled: membership is
+not discovery evidence, metadata expiry must not impose an age limit or cross
+workflow scopes, and prefix freshness must not bypass pending Saved work. Saved
+admission now requires a verified observation; timing metadata is best effort
+with the existing seven-day expiry, while accepted work and scan state remain
+durable. Removing the catch-up bypass avoids another scheduler-state predicate.
+
+Additional read-only probes show that search time bounds behave at whole-second
+precision. A possible range-based paging continuation must overlap boundary
+seconds and refuse to claim completeness when it cannot advance safely. Local
+algorithm experiments cross a simulated 20-page ceiling with 100 distinct-time
+records and preserve boundary-second overlap; dense equal-timestamp cases remain
+explicitly incomplete. These are model experiments, not live Saved-capacity or
+Phoenix-runtime qualification, and no paging implementation is selected by them.
+
+The second spec-only adversarial pass found no actionable issues after those
+fixes. All 62 Allium files validate without errors; all four selected spec checks
+pass. This qualifies the proposal's consistency, not runtime or production behavior.

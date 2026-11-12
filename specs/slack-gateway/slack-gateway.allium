@@ -15,7 +15,8 @@ use "../conversation_atom/conversation_atom.allium" as native
 
 enum RequestKind { briefing | explicit_request }
 enum RequestState { accepted | admitted | rejected }
-enum AcknowledgmentState { pending | attempting | confirmed | unavailable }
+enum AcknowledgmentState { not_required | pending | attempting | confirmed | unavailable }
+enum TriggerKind { prefix | reaction | saved }
 enum ReturnKind { thread_reply | private_notice }
 enum ReturnState { pending | attempting | submitted | confirmed | known_unsent | uncertain | failed }
 enum BindingState { reserved | ready | failed | closed }
@@ -50,7 +51,7 @@ external entity VerifiedObservation {
     actor: String
     author: String
     kind: RequestKind
-    trigger_kind: prefix | reaction
+    trigger_kind: TriggerKind
     binding_key: String
     instruction: String
     eligible: Boolean
@@ -64,6 +65,8 @@ entity Gateway {
     trigger_emoji: String
     enabled: Boolean
     baseline_complete: Boolean
+    saved_enabled: Boolean
+    saved_baseline_complete: Boolean
     handled_sources: Set<String>
     requests: AcceptedRequest with gateway = this
     returns: ReturnObligation with request.gateway = this
@@ -139,6 +142,12 @@ entity AcceptedRequest {
             and admission.product_id = ConversationBinding{gateway: gateway, key: binding_key}.product_id
     }
 
+    invariant SavedCaptureIsPrivate {
+        observation.trigger_kind = saved implies
+            observation.kind = briefing and instruction_snapshot = ""
+            and acknowledgment = not_required
+    }
+
     invariant ExplicitInstructionAuthorship {
         observation.kind = explicit_request implies observation.author = gateway.owner
     }
@@ -212,8 +221,10 @@ config {
 rule AcceptVerifiedSource {
     when: EligibleSourceObserved(gateway, observation)
     requires: gateway.enabled
-    requires: gateway.baseline_complete
+    requires: (observation.trigger_kind = saved and gateway.saved_enabled and gateway.saved_baseline_complete)
+        or (observation.trigger_kind != saved and gateway.baseline_complete)
     requires: observation.eligible
+    requires: observation.trigger_kind != saved or (observation.kind = briefing and observation.instruction = "")
     requires: observation.workspace = gateway.workspace
     requires: observation.actor = gateway.owner
     requires: observation.kind = briefing or (not observation.app_authored and not observation.gateway_authored)
@@ -225,7 +236,7 @@ rule AcceptVerifiedSource {
         binding_key: observation.binding_key,
         instruction_snapshot: observation.instruction,
         status: accepted,
-        acknowledgment: pending
+        acknowledgment: if observation.trigger_kind = saved: not_required else: pending
         acknowledgment_failure: null
     )
     ensures: ResponseDuty.created(
@@ -237,6 +248,7 @@ rule AcceptVerifiedSource {
 -- REQ-SG-006. Claim once before calling Slack; a crash cannot create a retry.
 rule BeginEyesAttempt {
     when: AttemptEyes(request)
+    requires: request.observation.trigger_kind != saved
     requires: request.acknowledgment = pending
     ensures: request.acknowledgment = attempting
 }
