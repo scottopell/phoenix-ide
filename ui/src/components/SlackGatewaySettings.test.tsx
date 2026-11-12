@@ -4,49 +4,42 @@ import { SlackGatewaySettings } from './SlackGatewaySettings';
 
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
-it('saves interchangeable custom emoji names and explains all three workflows', async () => {
-  const config = { enabled: true, mcp_server: 'slack', owner: 'UOWNER', workspace: 'example.slack.com', timezone: 'UTC', phoenix_url: 'https://phoenix.example', trigger_emojis: ['fire'], notification_command: null };
+it('saves one custom emoji name and explains all three workflows', async () => {
+  const config = { enabled: true, mcp_server: 'slack', owner: 'UOWNER', workspace: 'example.slack.com', timezone: 'UTC', phoenix_url: 'https://phoenix.example', trigger_emoji: 'fire', notification_command: null };
   let submitted: typeof config | undefined;
   vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url: string, options?: RequestInit) => {
     if (options?.method === 'PUT') submitted = JSON.parse(String(options.body));
     return { ok: true, json: async () => ({ config: submitted ?? config, scan: { baseline_complete: !submitted, status: submitted ? 'initializing' : 'healthy' }, requests: [], returns: [] }) };
   }));
   render(<SlackGatewaySettings standalone />);
-  const first = await screen.findByLabelText('Trigger emoji 1');
+  const first = await screen.findByLabelText('Slack emoji name');
   await waitFor(() => expect((first as HTMLInputElement).value).toBe('fire'));
   fireEvent.change(first, { target: { value: ':phoenix-please-look:' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Add trigger emoji' }));
-  fireEvent.change(screen.getByLabelText('Trigger emoji 2'), { target: { value: 'robot_face' } });
-  expect(screen.getByText('Any saved emoji works (OR). Use a dedicated custom name to keep social reactions separate.')).toBeTruthy();
+  expect(screen.queryByRole('button', { name: 'Add trigger emoji' })).toBeNull();
   expect(screen.getByText('1. Message prefix')).toBeTruthy();
   expect(screen.getByText('2. React to your own message')).toBeTruthy();
   expect(screen.getByText('3. React to someone else’s message')).toBeTruthy();
   expect(screen.getByText(':phoenix-please-look: phoenix, investigate this')).toBeTruthy();
   fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
   await screen.findByText('Settings saved.');
-  expect(submitted?.trigger_emojis).toEqual(['phoenix-please-look', 'robot_face']);
+  expect(submitted?.trigger_emoji).toBe('phoenix-please-look');
+  expect(submitted).not.toHaveProperty('trigger_emojis');
   expect(screen.getByText('Initializing')).toBeTruthy();
-  expect(screen.getByText(/Changing the emoji set restarts initialization/)).toBeTruthy();
-  fireEvent.click(screen.getByRole('button', { name: 'Remove trigger emoji 2' }));
+  expect(screen.getByText(/Changing the emoji restarts initialization/)).toBeTruthy();
+  fireEvent.change(first, { target: { value: 'fire' } });
   expect(screen.queryByText('Settings saved.')).toBeNull();
 });
 
-it('rejects duplicate or reserved names before submitting settings', async () => {
-  const config = { enabled: false, mcp_server: 'slack', owner: 'UOWNER', workspace: 'example.slack.com', timezone: 'UTC', phoenix_url: 'https://phoenix.example', trigger_emojis: ['phoenix-please-look', 'robot_face'], notification_command: null };
+it.each(['fire, phoenix-please-look', 'fire phoenix-please-look', 'eyes'])('rejects multiple or reserved names without submitting: %s', async name => {
+  const config = { enabled: false, mcp_server: 'slack', owner: 'UOWNER', workspace: 'example.slack.com', timezone: 'UTC', phoenix_url: 'https://phoenix.example', trigger_emoji: 'phoenix-please-look', notification_command: null };
   const fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ config, requests: [], returns: [] }) });
   vi.stubGlobal('fetch', fetch);
   render(<SlackGatewaySettings standalone />);
-  await waitFor(() => expect((screen.getByLabelText('Trigger emoji 2') as HTMLInputElement).value).toBe('robot_face'));
-  fireEvent.change(screen.getByLabelText('Trigger emoji 2'), { target: { value: ':PHOENIX-PLEASE-LOOK:' } });
+  await waitFor(() => expect((screen.getByLabelText('Slack emoji name') as HTMLInputElement).value).toBe('phoenix-please-look'));
+  fireEvent.change(screen.getByLabelText('Slack emoji name'), { target: { value: name } });
   fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
-  await screen.findByText('Each trigger emoji must be different.');
-  fireEvent.change(screen.getByLabelText('Trigger emoji 2'), { target: { value: 'eyes' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
-  await screen.findByText('eyes is reserved for Phoenix acknowledgments.');
+  await screen.findByText(name === 'eyes' ? 'eyes is reserved for Phoenix acknowledgments.' : 'Enter one Slack emoji name, such as phoenix-please-look.');
   expect(fetch.mock.calls.some(([, options]) => options?.method === 'PUT')).toBe(false);
-  fireEvent.click(screen.getByRole('button', { name: 'Remove trigger emoji 2' }));
-  expect(screen.queryByLabelText('Trigger emoji 2')).toBeNull();
-  expect(screen.getByRole('button', { name: 'Remove trigger emoji 1' }).hasAttribute('disabled')).toBe(true);
 });
 
 it('offers a conversation link only while the status API confirms native route availability', async () => {

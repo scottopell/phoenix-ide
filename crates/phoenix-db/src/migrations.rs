@@ -828,6 +828,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "slack_trigger_emojis",
         sql: include_str!("migrations/slack_trigger_emojis.sql"),
     },
+    Migration {
+        version: 161,
+        name: "slack_single_trigger_emoji",
+        sql: include_str!("migrations/slack_single_trigger_emoji.sql"),
+    },
 ];
 
 const MIGRATION_138: &str = concat!(
@@ -13391,10 +13396,124 @@ mod tests {
         );
         db.pool().close().await;
         let reopened = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(run_pending_migrations(reopened.pool()).await.unwrap(), 1);
         assert_eq!(run_pending_migrations(reopened.pool()).await.unwrap(), 0);
         let value: serde_json::Value =
             serde_json::from_str(&reopened.slack_configuration().await.unwrap().unwrap()).unwrap();
-        assert_eq!(value["trigger_emojis"], serde_json::json!(["fire"]));
+        assert_eq!(value["trigger_emoji"], serde_json::json!("fire"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn migration_161_retains_the_first_emoji_and_durable_work() {
+        // REQ-SG-018
+        for multiple in [false, true] {
+            for ready in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("slack-single.db");
+                let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+                run_through_for_test(db.pool(), 160).await.unwrap();
+                db.set_app_setting(
+                    "slack_gateway",
+                    r#"{"workspace":"example.slack.com","owner":"UOWNER","enabled":true}"#,
+                )
+                .await
+                .unwrap();
+                sqlx::query("UPDATE slack_gateway_trigger_emojis SET name='phoenix-please-look'")
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                if multiple {
+                    sqlx::query(
+                        "INSERT INTO slack_gateway_trigger_emojis(name,ordinal) VALUES ('fire',1)",
+                    )
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                }
+                let source = crate::SlackSource {
+                    workspace: "example.slack.com".into(),
+                    owner: "UOWNER".into(),
+                    channel: "C123".into(),
+                    message_ts: "100.000001".into(),
+                    thread_ts: "100.000001".into(),
+                    source_url: "https://example.slack.com/archives/C123/p100000001".into(),
+                    instruction: "investigate".into(),
+                    context: "quoted".into(),
+                    observed_at_unix_micros: 1,
+                    kind: crate::SlackRequestKind::Explicit,
+                    trigger_kind: crate::SlackTriggerKind::Prefix,
+                };
+                db.accept_slack_source(&source, false).await.unwrap();
+                let requests = db
+                    .slack_requests(&source.workspace, &source.owner)
+                    .await
+                    .unwrap();
+                let request = &requests[0];
+                sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,created_at_unix_micros) VALUES ('retained',?1,'done','thread','reply',1)").bind(&request.binding_id).execute(db.pool()).await.unwrap();
+                sqlx::query("INSERT INTO slack_gateway_return_coverage(return_id,request_id) VALUES ('retained',?1)").bind(&request.request_id).execute(db.pool()).await.unwrap();
+                sqlx::query(
+                    "INSERT INTO slack_gateway_accounts(workspace,owner,baseline_complete,retry_at_us) VALUES ('example.slack.com','UOWNER',?1,456)",
+                )
+                .bind(ready)
+                .execute(db.pool())
+                .await
+                .unwrap();
+                sqlx::query("INSERT INTO slack_gateway_discovery(workspace,owner,kind,after_date,cursor) VALUES ('example.slack.com','UOWNER','reaction','2026-11-01','retained-cursor')").execute(db.pool()).await.unwrap();
+                assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
+                assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
+                let value: serde_json::Value =
+                    serde_json::from_str(&db.slack_configuration().await.unwrap().unwrap())
+                        .unwrap();
+                assert_eq!(value["trigger_emoji"], "phoenix-please-look");
+                assert!(value.get("trigger_emojis").is_none());
+                let account: (bool, i64) = sqlx::query_as(
+                    "SELECT baseline_complete,retry_at_us FROM slack_gateway_accounts",
+                )
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                assert_eq!(account, (ready, 456));
+                assert_eq!(
+                    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM slack_gateway_discovery")
+                        .fetch_one(db.pool())
+                        .await
+                        .unwrap(),
+                    i64::from(!multiple)
+                );
+                assert_eq!(
+                    db.slack_requests(&source.workspace, &source.owner)
+                        .await
+                        .unwrap()[0]
+                        .request_id,
+                    request.request_id
+                );
+                assert_eq!(
+                    db.slack_returns(&source.workspace, &source.owner)
+                        .await
+                        .unwrap()[0]
+                        .request_ids,
+                    vec![request.request_id.clone()]
+                );
+                assert!(db
+                    .slack_source_recorded(
+                        &source.workspace,
+                        &source.owner,
+                        &source.channel,
+                        &source.message_ts
+                    )
+                    .await
+                    .unwrap());
+                assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sqlite_schema WHERE name='slack_gateway_trigger_emojis'").fetch_one(db.pool()).await.unwrap(), 0);
+                db.pool().close().await;
+                let reopened = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+                assert_eq!(run_pending_migrations(reopened.pool()).await.unwrap(), 0);
+                assert_eq!(
+                    reopened.slack_configuration().await.unwrap(),
+                    Some(value.to_string())
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -13571,7 +13690,7 @@ mod tests {
         .unwrap();
         assert_eq!(before, vec![158]);
 
-        assert_eq!(run_pending_migrations(pool).await.unwrap(), 3);
+        assert_eq!(run_pending_migrations(pool).await.unwrap(), 4);
 
         let after: Vec<i64> = sqlx::query_scalar(
             "SELECT version FROM _migrations WHERE version >= 156 ORDER BY version",
@@ -13579,7 +13698,7 @@ mod tests {
         .fetch_all(pool)
         .await
         .unwrap();
-        assert_eq!(after, vec![156, 158, 159, 160]);
+        assert_eq!(after, vec![156, 158, 159, 160, 161]);
         sqlx::query("SELECT enrollment_id FROM conversation_goal_actors LIMIT 0")
             .execute(pool)
             .await
@@ -16068,7 +16187,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(run_through_for_test(db.pool(), 152).await.unwrap(), 1);
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 6);
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 7);
         assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
         let ledger: Vec<(i64, String)> = sqlx::query_as(
             "SELECT version, name FROM _migrations WHERE version >= 150 ORDER BY version",
@@ -16088,6 +16207,7 @@ mod tests {
                 (158, "federated_conversation_actions".into()),
                 (159, "federated_continuation_receipts".into()),
                 (160, "slack_trigger_emojis".into()),
+                (161, "slack_single_trigger_emoji".into()),
             ]
         );
     }
@@ -16097,6 +16217,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (161, "slack_single_trigger_emoji"),
             (160, "slack_trigger_emojis"),
             (159, "federated_continuation_receipts"),
             (158, "federated_conversation_actions"),
@@ -20375,6 +20496,7 @@ mod tests {
                 (158, "federated_conversation_actions"),
                 (159, "federated_continuation_receipts"),
                 (160, "slack_trigger_emojis"),
+                (161, "slack_single_trigger_emoji"),
             ]
         );
         let goal = MIGRATIONS
@@ -20388,7 +20510,7 @@ mod tests {
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 157);
+        assert_eq!(MIGRATIONS.len(), 158);
     }
 
     #[tokio::test]
@@ -20404,7 +20526,7 @@ mod tests {
         }
         sqlx::query("UPDATE product_creation_jobs SET status = 'published', published_product_id = 'deleted-product', published_conversation_id = 'deleted-transcript' WHERE request_id = 'orphan-image'")
             .execute(&pool).await.unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 10);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 11);
         let identity: Vec<(String, String)> = sqlx::query_as(
             "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
         ).fetch_all(&pool).await.unwrap();
@@ -20458,7 +20580,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 10);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 11);
         let retained: (String, String, String) = sqlx::query_as(
             "SELECT status, published_product_id, published_conversation_id
              FROM product_creation_jobs WHERE request_id = 'orphan-text'",

@@ -13,7 +13,7 @@ prepare separate private briefings. Thread reuse and exact reply coverage remain
 |---|---|---|
 | REQ-SG-001 | Partial | Implemented; current candidate validation and production limits below. |
 | REQ-SG-002 | Partial | Implemented; current candidate validation and production limits below. |
-| REQ-SG-018: Configure interchangeable trigger emojis | Implemented | 57 gateway tests, 29 Slack DB tests, migration upgrade/reopen, and 21 settings tests pass. Desktop/mobile previews show all three workflows without horizontal overflow. Production activation remains separate. |
+| REQ-SG-018: Configure one trigger emoji | Implemented | Single-string configuration, narrow queries, list removal, and preserving upgrade pass focused checks and local adversarial review. Hosted qualification and deployment remain separate. |
 | REQ-SG-003 | Partial | Implemented; current candidate validation and production limits below. |
 | REQ-SG-004 | Partial | Implemented; current candidate validation and production limits below. |
 | REQ-SG-005 | Partial | Implemented; current candidate validation and production limits below. |
@@ -30,70 +30,41 @@ prepare separate private briefings. Thread reuse and exact reply coverage remain
 | REQ-SG-016 | Partial | Implemented; current candidate validation and production limits below. |
 | REQ-SG-017 | Partial | Implemented; current candidate validation and production limits below. |
 
-## Simplification
+## Current behavior
 
-[ADR-248](../adrs/248_slack-emoji-aliases-share-discovery-and-reinitialize-baselines.md)
-keeps two OR-based search streams for configurable emoji names. Changing the
-effective set restarts baseline discovery while preserving accepted work, handled
-identities, and backoff. Reordering the set does not reset it. Settings show each
-workflow's trigger and destination; custom emoji upload remains in Slack.
+[ADR-249](../adrs/249_slack-uses-one-configurable-trigger-emoji.md) replaces
+multi-emoji aliases with one configurable Slack name. Prefix and owner-reaction
+queries each use that name directly. Changing the name establishes a new baseline;
+saving the same normalized name preserves progress. Accepted work, source identity,
+thread reuse, and delivery duties remain unchanged.
 
-REQ-SG-017 projects shared MCP connection health separately from stored scan
-status, checks required tools and warns when the last completed scan predates
-the four-calendar-date window. These changes are implemented; local verification
-is recorded in the [MCP implementation matrix](../mcp/executive.md#automatic-http-recovery-implementation).
-Live fault-injection acceptance and production deployment remain open. Slack adds
-no reconnect worker, signal retries, schema conversion or wider discovery window.
-
-ADR-155 replaces independent signal recovery with single-attempt behavior.
-Private commands record submission, rejection or uncertainty without receipt
-inspection or automatic retry. Eyes is claimed once before calling Slack; failure
-or interruption cannot retry it. These signals never block an otherwise settled
-account change. Clarifications contain only a generic Phoenix handoff and link;
-question bodies and options remain native. Thread replies retain durable delivery
-and exact request coverage. They have at most three durably claimed attempts,
-including pre-dispatch failures; definitely-unsent exhaustion records failure and
-queues one private notice. Negative acknowledgment envelopes remain unconfirmed
-when their error detail is missing or malformed.
-
-Deleted runtime code includes receipt inspection, inspection scheduling, private
-retry handling, question-text rendering and question-retirement synchronization.
-Obsolete retry tests are replaced by single-attempt failure/restart regressions.
-ADR-188 removes prototype compatibility. One final `142/slack_gateway_v1`
-schema replaces the unmerged migration chain. Obsolete question associations,
-question snapshots, notification inspection metadata and historical trigger
-provenance are absent. Existing lineage preflight refuses prototype identities
-before mutation. Upstream migration history through 141 is unchanged.
+The settings retain the three workflow explanations: an owner prefix or reaction
+to the owner's message requests a Slack reply; an owner reaction to another
+person's message prepares a private briefing. Plain replies do not trigger work.
+Eyes and private notifications remain single-attempt, best-effort signals.
+Clarifications direct the owner into Phoenix. Accepted work and intentional
+thread replies retain their existing durable recovery.
 
 ## Validation
 
-Creation-receipt retention migration147 changes the deletion expectation in `request_status_links_require_native_publication`: deleting the predecessor retains its published creation receipt and original identities. The test still requires ordinary native routing and Slack product links to resolve a remaining live successor, then requires both request/return links to become unavailable after last-transcript deletion while the same receipt remains. Coordinator creation history remains tied to the original transcript and does not inherit that successor route. Hosted qualification at head `4e0857e662203` (synthetic merge `d7e4e2dd282a6`) exposed the obsolete cascade-deletion assertion; the corrected test and whole owning Slack DB module await new exact-source qualification. Earlier validation below is historical, not PASS for the retention successor.
-
-All 292 Rust migration, lineage, gateway, Goal and replay tests pass on the
-reconciled schema.
-Coverage includes fresh installation, prototype refusal before mutation, native
-attribution, restart admission and delivery, exact request coverage, generic
-clarification handoffs, bounded reply attempts and one-attempt signals.
-
-Eleven UI/static checks pass; seven final static checks also pass after test
-fixture consolidation. The full developer-tool suite and spec-shape checks pass
-with native Bash/OpenSSL and without a shared Cargo target override. Upstream
-migration definitions through 141 are byte-for-byte unchanged.
-
-Integration with main preserves canonical checkpoint transactions and their
-receipt schema. Briefing completion remains atomic and checkpoint replay cannot
-duplicate its private notice. Ten UI/static checks and three final static checks
-pass. Hosted CI and normal automatic review run on the reconciled candidate
-before merge.
+Focused checks cover scalar configuration and invalid/list input, all three
+custom-emoji workflows, narrow search terms, baseline changes, and upgrade/reopen
+from the published list schema. Upgrade keeps the first saved name, preserves
+single-emoji progress, and discards unsupported multi-emoji query positions.
+Baseline readiness, accepted requests, return coverage, and backoff survive.
+All 58 gateway tests, 29 Slack database tests, 23 settings tests, and 156 migration
+and migration-dependent tests pass. The selected static/UI checks pass, with
+ast-grep unavailable locally. Local adversarial review found no actionable defects.
+Hosted qualification and production deployment remain separate.
 
 ## Production boundary
 
-The enabled production pilot is an earlier accepted build. Source IDs, recipient
-routing, credentials, provider adapters and private operational records stay outside
-the public repository. The redesigned settings and later hardening are not claimed
-deployed by pilot evidence.
+Production runs the canonical public schema, with one custom emoji configured as
+an operational workaround for the OR-filter defect. The single-field API and
+storage simplification require a new candidate deployment. No prototype conversion
+is needed. Private configuration, recipients, and operational records stay outside
+the public repository.
 
-The public feature supports only the final schema on canonical Phoenix data.
-The pilot and other unmerged development ledgers require separate offline
-reconciliation and paired rollback qualification. No prototype conversion or new
-production deployment is implied. The protected deployment gate stays intact.
+Discovery remains bounded by the connector's pagination, the four-calendar-date
+window, and the existing call allowance. Removing multi-emoji support fixes the
+unsupported OR query; it does not remove the connector's page limit.

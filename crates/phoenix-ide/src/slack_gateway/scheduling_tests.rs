@@ -12,8 +12,43 @@ fn config() -> Config {
         timezone: "America/New_York".into(),
         phoenix_url: "https://localhost:8043".into(),
         notification_command: None,
-        trigger_emojis: vec!["fire".into()],
+        trigger_emoji: "fire".into(),
     }
+}
+
+#[test]
+fn configuration_requires_one_emoji_string_without_a_list_alias() {
+    // REQ-SG-018
+    let original = serde_json::to_value(config()).unwrap();
+    for value in [
+        serde_json::json!(null),
+        serde_json::json!(["fire"]),
+        serde_json::json!(["fire", "phoenix-please-look"]),
+    ] {
+        let mut invalid = original.clone();
+        invalid["trigger_emoji"] = value;
+        assert!(serde_json::from_value::<Config>(invalid).is_err());
+    }
+    let mut stale = original.clone();
+    stale.as_object_mut().unwrap().remove("trigger_emoji");
+    stale["trigger_emojis"] = serde_json::json!(["fire"]);
+    assert!(serde_json::from_value::<Config>(stale).is_err());
+    for name in [
+        "",
+        "fire, phoenix-please-look",
+        "fire phoenix-please-look",
+        "eyes",
+    ] {
+        let mut invalid = config();
+        invalid.trigger_emoji = name.into();
+        assert!(invalid.normalized().is_err());
+    }
+    let mut valid = config();
+    valid.trigger_emoji = " :PHOENIX-PLEASE-LOOK: ".into();
+    assert_eq!(
+        valid.normalized().unwrap().trigger_emoji,
+        "phoenix-please-look"
+    );
 }
 
 #[test]

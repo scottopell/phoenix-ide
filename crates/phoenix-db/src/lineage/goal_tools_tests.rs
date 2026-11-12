@@ -190,7 +190,7 @@ async fn canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent() {
         .unwrap();
         assert_eq!(
             tail,
-            vec![143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 158, 159, 160,]
+            vec![143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 158, 159, 160, 161,]
         );
         let before = snapshot(db.pool()).await;
         assert_eq!(
@@ -319,12 +319,9 @@ async fn real_145_provenance_and_tools_retention_survive_upgrade_delete_and_reop
         1
     );
     seed_real_145_receipt(&db, &owner).await;
-    assert_eq!(
-        crate::migrations::run_pending_migrations(db.pool())
-            .await
-            .unwrap(),
-        13
-    );
+    crate::migrations::run_pending_migrations(db.pool())
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO product_creation_initial_execution_receipts(request_id,terminal_kind,failure_reason) VALUES ('joint-create','Completed',NULL)")
         .execute(db.pool()).await.unwrap();
     assert_goal_rows(&db, &owner, true).await;

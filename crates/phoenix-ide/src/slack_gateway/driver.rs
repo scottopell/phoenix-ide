@@ -744,7 +744,7 @@ mod tests {
             timezone: "America/New_York".into(),
             phoenix_url: "https://phoenix.example".into(),
             notification_command: None,
-            trigger_emojis: vec!["fire".into()],
+            trigger_emoji: "fire".into(),
         }
     }
     #[tokio::test]
