@@ -1097,6 +1097,43 @@ final class AppModel {
     }
 
     @discardableResult
+    /// Advance the server read cursor for a conversation the user is looking
+    /// at. Best-effort: a missed advance only leaves an unread dot until the
+    /// next view.
+    @discardableResult
+    func advanceRead(productConversationId: String, advance: ProductConversationReadAdvance) async -> Bool {
+        guard ClientOperation.readState.policy == .onlineOnly,
+              let api, connectivity.isOnline else { return false }
+        let startedGeneration = apiGeneration
+        guard let state = try? await api.markProductConversationRead(
+            productConversationId: productConversationId, advance: advance),
+              apiGeneration == startedGeneration
+        else { return false }
+        listStore.setReadState(state, forAggregateId: productConversationId)
+        return true
+    }
+
+    /// Explicit "mark unread to revisit later" / "mark read" from the list.
+    func setUnread(_ unread: Bool, productConversationId: String) async {
+        guard ClientOperation.readState.policy == .onlineOnly,
+              let api, connectivity.isOnline
+        else {
+            lastActionError = "Changing read state needs a connection."
+            return
+        }
+        let startedGeneration = apiGeneration
+        do {
+            let state = unread
+                ? try await api.markProductConversationUnread(productConversationId: productConversationId)
+                : try await api.markProductConversationRead(
+                    productConversationId: productConversationId, advance: .acknowledged)
+            guard apiGeneration == startedGeneration else { return }
+            listStore.setReadState(state, forAggregateId: productConversationId)
+        } catch {
+            lastActionError = (error as? APIError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
     func closeProductConversation(_ conversation: Conversation) async -> Bool {
         _ = confirmationRehydrationGenerations.begin(
             productConversationId: "pending-close-confirmation")

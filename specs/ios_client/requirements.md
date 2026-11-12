@@ -819,3 +819,19 @@ WHEN the user views the native conversation list
 THE SYSTEM SHALL provide a named Ember entry for the Global coordinator, distinct from ordinary conversation rows and lifecycle actions
 AND SHALL preserve the existing `openCoordinator()` duplicate-open guard and cached-offline availability behavior
 AND SHALL expose truthful accessible naming and disabled-state feedback.
+
+---
+
+### REQ-IOS-023: Unread Conversations and Mark Unread
+
+WHEN the native conversation list refreshes
+THE SYSTEM SHALL show the server's read state for each conversation row and for the Ember entry, distinguishing new activity from an explicit unread mark
+
+WHILE the user views a conversation with the app active
+THE SYSTEM SHALL acknowledge it on open and observe new messages as they arrive, using the shared read contract of `specs/conversation-ui/requirements.md` REQ-CONV-027
+
+WHEN the user swipes a conversation row, or long-presses the Ember entry
+THE SYSTEM SHALL offer to mark it unread or read
+
+Read-state changes SHALL be online-only operations. The cached offline list SHALL NOT show read state rather than show a stale one.
+

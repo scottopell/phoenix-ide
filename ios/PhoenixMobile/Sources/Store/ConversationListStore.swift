@@ -11,6 +11,11 @@ final class ConversationListStore {
     private(set) var lastRefreshed: Date?
     var isRefreshing: Bool { refreshToken != nil }
     private(set) var lastError: String?
+    /// Read state per aggregate identity, from the last successful refresh
+    /// plus local optimistic changes. Not persisted: offline rows show no
+    /// unread indicator rather than a stale one.
+    private(set) var readStates: [String: ProductConversationReadState] = [:]
+    private(set) var coordinatorReadState: CoordinatorListEntry?
 
     private static let cacheName = "conversations"
     private static let schemaVersion = 2
@@ -81,7 +86,8 @@ final class ConversationListStore {
         }
         let startedGeneration = generation
         do {
-            let fresh = try await api.listConversations()
+            let page = try await api.listConversationPage()
+            let fresh = page.conversations
             guard generation == startedGeneration else { return }
             externalMutationGeneration += 1
             let missingProvisioningShells = await confirmedMissingProvisioningShells(
@@ -95,6 +101,8 @@ final class ConversationListStore {
                 fresh,
                 preserving: missingProvisioningShells.merging(upsertsDuringRefresh) { _, upsert in upsert },
                 excluding: exclusionsDuringRefresh))
+            readStates = page.readStates
+            coordinatorReadState = page.coordinator
             lastError = nil
         } catch {
             guard generation == startedGeneration else { return }
@@ -416,6 +424,23 @@ final class ConversationListStore {
         aggregateToCachedTranscript = [:]
         lastRefreshed = nil
         lastError = nil
+        readStates = [:]
+        coordinatorReadState = nil
+    }
+
+    func readState(forAggregateId aggregateId: String) -> ProductConversationReadState {
+        if coordinatorReadState?.product_conversation_id == aggregateId {
+            return coordinatorReadState?.read_state ?? .read
+        }
+        return readStates[aggregateId] ?? .read
+    }
+
+    func setReadState(_ state: ProductConversationReadState, forAggregateId aggregateId: String) {
+        if coordinatorReadState?.product_conversation_id == aggregateId {
+            coordinatorReadState?.read_state = state
+        } else {
+            readStates[aggregateId] = state
+        }
     }
 
     private func persistCache() {
