@@ -48,8 +48,10 @@ answered confidently from the UI, that is a missing or incomplete requirement.
 
 WHEN user opens the app
 THE SYSTEM SHALL display a list of active conversations
-AND show conversation slug, working directory, and last update time
 AND order conversations by most recently updated
+
+THE SYSTEM SHALL render each conversation row on a single line containing only its state indicator, title, unread indicator, pull request badges, and actions affordance
+AND SHALL wrap a row onto additional lines only when its pull request badges cannot fit beside a minimally truncated title
 
 WHEN the conversation list is displayed on a mobile-sized viewport
 THE SYSTEM SHALL make the list itself the primary vertically scrollable region
@@ -61,7 +63,7 @@ THE SYSTEM SHALL navigate to that conversation's chat view
 AND preserve the URL for deep linking (`/c/{slug}`)
 
 WHEN a conversation's work scope has a cached pull request
-THE SYSTEM SHALL show its number, state, and feedback status inline on that conversation's row
+THE SYSTEM SHALL show its number, state, and feedback status as a badge on that conversation's row
 
 WHEN the conversation list cannot be refreshed from the server
 THE SYSTEM SHALL keep rendering the last successfully loaded list and indicate that it is cached

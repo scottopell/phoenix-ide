@@ -77,8 +77,6 @@ export function ConversationPanelFixture({ scenario, showToolbar = true }: Props
               </div>
               <div className="sidebar-list">
                 <ConversationList
-                  conversations={conversationPanelFixtureData.conversations}
-                  archivedConversations={conversationPanelFixtureData.archivedConversations}
                   productConversations={conversationPanelProductRows.open}
                   archivedProductConversations={conversationPanelProductRows.history}
                   showArchived={showArchived}

@@ -7,7 +7,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, fireEvent, within, act, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
-import type { Conversation, ProductConversationListRow } from '../api';
+import type { ProductConversationListRow } from '../api';
 import { api } from '../api';
 import { FocusScopeProvider } from '../hooks/useFocusScope';
 import { ShortcutHelpPanel } from './ShortcutHelpPanel';
@@ -59,7 +59,7 @@ describe('ConversationList — pinned header scroll offset', () => {
     try {
       const { container, rerender, unmount } = render(
         <MemoryRouter><div data-app-scroll-owner style={{ scrollPaddingTop: '7px' }}>
-          <ConversationList {...defaultProps} conversations={[]} listDensity="mobile" />
+          <ConversationList {...defaultProps} listDensity="mobile" />
         </div></MemoryRouter>,
       );
       const owner = container.querySelector<HTMLElement>('[data-app-scroll-owner]')!;
@@ -71,12 +71,12 @@ describe('ConversationList — pinned header scroll offset', () => {
       expect(root.style.scrollPaddingTop).toBe('');
 
       rerender(<MemoryRouter><div data-app-scroll-owner style={{ scrollPaddingTop: '7px' }}>
-        <ConversationList {...defaultProps} conversations={[]} listDensity="full" />
+        <ConversationList {...defaultProps} listDensity="full" />
       </div></MemoryRouter>);
       expect(observers[0]!.disconnected).toBe(true);
       expect(owner.style.scrollPaddingTop).toBe('48px');
       rerender(<MemoryRouter><div data-app-scroll-owner style={{ scrollPaddingTop: '7px' }}>
-        <ConversationList {...defaultProps} conversations={[]} sidebarMode listDensity="sidebar" />
+        <ConversationList {...defaultProps} sidebarMode listDensity="sidebar" />
       </div></MemoryRouter>);
       expect(observers.at(-1)!.observed).toContain(header);
       unmount();
@@ -93,7 +93,7 @@ describe('ConversationList — global navigation', () => {
     function Location() { return <span data-testid="location">{useLocation().pathname}</span>; }
     const { getByRole, getByTestId, container } = render(
       <MemoryRouter initialEntries={['/']}>
-        <ConversationList {...defaultProps} conversations={[]} listDensity="mobile" />
+        <ConversationList {...defaultProps} listDensity="mobile" />
         <Location />
       </MemoryRouter>,
     );
@@ -116,7 +116,7 @@ describe('ConversationList — global navigation', () => {
     const { getByRole, queryByRole } = render(
       <MemoryRouter initialEntries={['/']}>
         <Routes>
-          <Route path="/" element={<ConversationList {...defaultProps} conversations={[]} listDensity="mobile" />} />
+          <Route path="/" element={<ConversationList {...defaultProps} listDensity="mobile" />} />
           <Route path="/global" element={<h1>Ember destination</h1>} />
         </Routes>
       </MemoryRouter>,
@@ -129,22 +129,6 @@ describe('ConversationList — global navigation', () => {
 });
 
 
-
-const makeConv = (id: string, slug: string, overrides: Partial<Conversation> = {}): Conversation => ({
-  id,
-  slug,
-  model: 'claude-3-5-sonnet',
-  cwd: '/home/user/project',
-  created_at: '2024-01-01T00:00:00Z',
-  updated_at: '2024-01-01T00:00:00Z',
-  message_count: 5,
-  project_id: 'proj-1',
-  conv_mode_label: 'EXPLORE',
-  browser_session_active: false,
-  terminal_uses_tmux: false,
-  work_scope_key: `conversation:${id}`,
-  ...overrides,
-});
 
 const makeProductConversation = (id: string, overrides: Partial<ProductConversationListRow> = {}): ProductConversationListRow => ({
   product_conversation_id: id,
@@ -185,7 +169,7 @@ describe('ProductConversation presentation indicator', () => {
 
     const { container } = render(
       <MemoryRouter>
-        <ConversationList {...defaultProps} conversations={[]} productConversations={[row]} />
+        <ConversationList {...defaultProps} productConversations={[row]} />
       </MemoryRouter>,
     );
 
@@ -201,7 +185,7 @@ describe('ProductConversation presentation transitions', () => {
     const base = makeProductConversation('transition-row', { presentation: { kind: 'state', display_name: 'Working', presentation_mode: 'working' } });
     const { container, rerender } = render(
       <MemoryRouter>
-        <ConversationList {...defaultProps} conversations={[]} productConversations={[base]} />
+        <ConversationList {...defaultProps} productConversations={[base]} />
       </MemoryRouter>,
     );
     const row = () => container.querySelector('[data-product-conversation-id="transition-row"]') as HTMLElement;
@@ -210,7 +194,7 @@ describe('ProductConversation presentation transitions', () => {
 
     rerender(
       <MemoryRouter>
-        <ConversationList {...defaultProps} conversations={[]} productConversations={[{ ...base, presentation: { kind: 'state', display_name: 'Needs Action', presentation_mode: 'needs_action' } }]} />
+        <ConversationList {...defaultProps} productConversations={[{ ...base, presentation: { kind: 'state', display_name: 'Needs Action', presentation_mode: 'needs_action' } }]} />
       </MemoryRouter>,
     );
     expect(row().querySelectorAll('.conv-state-dot')).toHaveLength(1);
@@ -218,7 +202,7 @@ describe('ProductConversation presentation transitions', () => {
 
     rerender(
       <MemoryRouter>
-        <ConversationList {...defaultProps} conversations={[]} productConversations={[{ ...base, presentation: { kind: 'state', display_name: 'Done', presentation_mode: 'done' } }]} />
+        <ConversationList {...defaultProps} productConversations={[{ ...base, presentation: { kind: 'state', display_name: 'Done', presentation_mode: 'done' } }]} />
       </MemoryRouter>,
     );
     expect(row().querySelectorAll('.conv-state-dot')).toHaveLength(1);
@@ -357,7 +341,6 @@ describe('ProductConversation row actions', () => {
       <MemoryRouter>
         <ConversationList
           {...defaultProps}
-          conversations={[]}
           productConversations={[row]}
           onProductConversationClick={onOpen}
           onProductConversationRename={onRename}
@@ -385,14 +368,13 @@ describe('ProductConversation row actions', () => {
 
 
 const defaultProps = {
-  archivedConversations: [] as Conversation[],
   showArchived: false,
   onToggleArchived: vi.fn(),
   onNewConversation: vi.fn(),
 };
 
 describe('ConversationList — product conversations', () => {
-  it('renders one semantic title with compact inline status, time, and context', () => {
+  it('renders a single-line row: status dot, one title, no metadata line', () => {
     const open = makeProductConversation('pc-open', {
       canonical_root: { transcript_row_id: 'root-open', slug: 'root-open', title: 'Open Root' },
       presentation: { kind: 'state', display_name: 'Working surface', presentation_mode: 'working' },
@@ -418,12 +400,12 @@ describe('ConversationList — product conversations', () => {
 
     const openRow = container.querySelector('[data-product-conversation-id="pc-open"]') as HTMLElement;
     expect(getByText('Working surface')).toBeInTheDocument();
-    expect(openRow).toHaveTextContent('Working');
-    expect(openRow).toHaveTextContent('rel-2024-01-01T00:00:00Z');
-    expect(openRow).toHaveTextContent('root-open');
+    expect(openRow.querySelector('.conv-state-dot')?.getAttribute('title')).toBe('Working');
+    expect(openRow).not.toHaveTextContent('rel-2024-01-01T00:00:00Z');
+    expect(openRow).not.toHaveTextContent('root-open');
     expect(openRow).not.toHaveTextContent('Open Root');
     expect(openRow.querySelectorAll('.conv-item-title')).toHaveLength(1);
-    expect(openRow.querySelectorAll('.conv-item-secondary-row')).toHaveLength(0);
+    expect(openRow.querySelectorAll('.conv-item-meta')).toHaveLength(0);
 
     rerender(
       <MemoryRouter>
@@ -439,7 +421,7 @@ describe('ConversationList — product conversations', () => {
 
     const historyRow = container.querySelector('[data-product-conversation-id="pc-archived"]') as HTMLElement;
     expect(getByText('Retained history')).toBeInTheDocument();
-    expect(historyRow).toHaveTextContent('Completed');
+    expect(historyRow.querySelector('.conv-state-dot')?.getAttribute('title')).toBe('Completed');
     expect(historyRow).not.toHaveTextContent('Archived Root');
   });
 
@@ -459,7 +441,6 @@ describe('ConversationList — product conversations', () => {
       <MemoryRouter>
         <ConversationList
           {...defaultProps}
-          conversations={[]}
           productConversations={[blocked, available]}
           onProductConversationClose={close}
         />
@@ -473,31 +454,6 @@ describe('ConversationList — product conversations', () => {
     fireEvent.click(getByRole('button', { name: 'Actions for conversation Needs action' }));
     fireEvent.click(getByRole('button', { name: 'Close conversation Needs action' }));
     expect(close).toHaveBeenCalledWith(available);
-  });
-
-  it('renders History working directory from archived member rows', () => {
-    const archived = makeProductConversation('pc-archived', {
-      lifecycle: { state: 'history' },
-      latest_transcript_row_id: 'archived-member',
-      canonical_root: { transcript_row_id: 'archived-member', slug: 'archived-root', title: 'Archived Root' },
-    });
-    const archivedMember = makeConv('archived-member', 'archived-root', { archived: true, cwd: '/tmp/archived-work' });
-
-    const { getByText } = render(
-      <MemoryRouter>
-        <ConversationList
-          {...defaultProps}
-          conversations={[]}
-          archivedConversations={[archivedMember]}
-          productConversations={[]}
-          archivedProductConversations={[archived]}
-          listDensity="mobile"
-          showArchived
-        />
-      </MemoryRouter>,
-    );
-
-    expect(getByText('/tmp/archived-work')).toBeInTheDocument();
   });
 
   it('navigates through aggregate canonical routes when no custom click handler is provided', () => {
@@ -528,7 +484,6 @@ describe('ConversationList — footer slot', () => {
       <MemoryRouter>
         <ConversationList
           {...defaultProps}
-          conversations={[makeConv('c1', 'first')]}
           listDensity="mobile"
           footer={<footer data-testid="storage-footer">1 conversation</footer>}
         />
@@ -628,7 +583,7 @@ describe('ConversationList — product row behaviour', () => {
     expect(view.container.querySelectorAll('.sidebar-pr-badge')).toHaveLength(1);
   });
 
-  it('renders a non-interactive cached PR badge inside mobile rows', () => {
+  it('renders a non-interactive cached PR badge on mobile rows', () => {
     const view = render(
       <MemoryRouter>
         <ConversationList {...defaultProps} listDensity="mobile" productConversations={[
@@ -637,7 +592,7 @@ describe('ConversationList — product row behaviour', () => {
       </MemoryRouter>,
     );
     expect(view.queryByRole('link', { name: /PR 42/ })).toBeNull();
-    expect(view.container.querySelector('.conv-item-main .sidebar-pr-badge')).not.toBeNull();
+    expect(view.container.querySelector('.product-conversation-list-row__prs .sidebar-pr-badge')).not.toBeNull();
   });
 });
 

@@ -1,9 +1,8 @@
 import { memo, useState, useEffect, useRef, useMemo, useCallback, useLayoutEffect } from 'react';
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import type { Conversation, CachedPrSummary, ProductConversationListRow } from '../api';
+import type { CachedPrSummary, ProductConversationListRow } from '../api';
 import { prReviewState } from './prReviewState';
-import { formatRelativeTime, formatShortDateTime } from '../utils';
 import { useKeyboardNav } from '../hooks';
 import { useFocusScope } from '../hooks/useFocusScope';
 import {
@@ -16,8 +15,6 @@ import { markProductConversationRead, markProductConversationUnread } from '../c
 
 
 interface ConversationListProps {
-  conversations?: readonly Conversation[];
-  archivedConversations?: readonly Conversation[];
   productConversations?: readonly ProductConversationListRow[];
   archivedProductConversations?: readonly ProductConversationListRow[];
   showArchived: boolean;
@@ -116,7 +113,6 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
   row,
   isActive,
   isKeyboardSelected,
-  effectiveCwd,
   onClick,
   onProductConversationClose,
   onProductConversationDelete,
@@ -135,7 +131,6 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
   row: ProductConversationListRow;
   isActive: boolean;
   isKeyboardSelected: boolean;
-  effectiveCwd?: string | undefined;
   onClick: (row: ProductConversationListRow) => void;
   onProductConversationClose?: (row: ProductConversationListRow) => void;
   onProductConversationDelete?: (row: ProductConversationListRow) => void;
@@ -168,7 +163,7 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
   const canRename = !!onProductConversationRename && row.lifecycle.state === 'open'
     && !(closeAction?.availability === 'unavailable' && closeAction.reason === 'active_close_attempt');
   const canDelete = !!onProductConversationDelete && row.lifecycle.state === 'history';
-  const context = effectiveCwd ?? row.canonical_root.slug ?? null;
+  const prs = row.cached_pr ? [row.cached_pr] : [];
   return (
     <li
       className={classes}
@@ -179,39 +174,27 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
         type="button"
         className="conv-item-main"
         onClick={() => onClick(row)}
-        title={`Open conversation "${displayTitle}"`}
+        title={`Open conversation "${displayTitle}" — ${statusTitle}`}
       >
-        <div className="conv-item-slug">
-          <span className="conv-item-slug-main">
-            <span
-              className={`conv-state-dot ${indicator.dotClass}`}
-              title={statusTitle}
-              role="img"
-              aria-label={indicator.ariaLabel}
-            />
-            <span className="conv-item-title">{displayTitle}</span>
-            {unreadLabel && (
-              <span
-                className={`conv-item-unread-dot${row.read_state.state === 'unread' && row.read_state.reason === 'marked' ? ' conv-item-unread-dot--marked' : ''}`}
-                title={unreadLabel}
-                role="img"
-                aria-label={unreadLabel}
-              />
-            )}
-          </span>
-        </div>
-        <div className="conv-item-meta product-conversation-list-row__meta">
-          <span className="conv-item-secondary-badge">{statusTitle}</span>
-          <span className="conv-item-date" title={formatShortDateTime(row.updated_at)}>
-            {formatRelativeTime(row.updated_at)}
-          </span>
-          {context && <span className="conv-item-cwd" title={context}>{context}</span>}
-          {isMobileList && row.cached_pr && <PrBadge pr={row.cached_pr} interactive={false} />}
-        </div>
+        <span
+          className={`conv-state-dot ${indicator.dotClass}`}
+          title={statusTitle}
+          role="img"
+          aria-label={indicator.ariaLabel}
+        />
+        <span className="conv-item-title">{displayTitle}</span>
+        {unreadLabel && (
+          <span
+            className={`conv-item-unread-dot${row.read_state.state === 'unread' && row.read_state.reason === 'marked' ? ' conv-item-unread-dot--marked' : ''}`}
+            title={unreadLabel}
+            role="img"
+            aria-label={unreadLabel}
+          />
+        )}
       </button>
-      {!isMobileList && row.cached_pr && (
-        <span className="product-conversation-list-row__pr">
-          <PrBadge pr={row.cached_pr} />
+      {prs.length > 0 && (
+        <span className="product-conversation-list-row__prs">
+          {prs.map((pr) => <PrBadge key={pr.number} pr={pr} interactive={!isMobileList} />)}
         </span>
       )}
       <div ref={menuRef} className="conv-item-menu-container product-conversation-actions">
@@ -291,8 +274,6 @@ const TerminalGlyph = () => (
 );
 
 export function ConversationList({
-  conversations = [],
-  archivedConversations = [],
   productConversations = [],
   archivedProductConversations = [],
   showArchived,
@@ -492,11 +473,6 @@ export function ConversationList({
               menuRef={expandedId === row.product_conversation_id ? menuRef : undefined}
               isActive={activeSlug === row.product_conversation_id || activeSlug === row.canonical_root.slug || activeSlug === row.canonical_root.transcript_row_id}
               isKeyboardSelected={selectedId === row.product_conversation_id}
-              effectiveCwd={[...conversations, ...archivedConversations].find((conversation) => (
-                conversation.id === row.latest_transcript_row_id
-                || conversation.id === row.canonical_root.transcript_row_id
-                || conversation.slug === row.canonical_root.slug
-              ))?.cwd}
               onClick={(productRow) => {
                 if (onProductConversationClick) onProductConversationClick(productRow);
                 else navigate(productRow.canonical_route);
