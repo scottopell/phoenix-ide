@@ -363,6 +363,9 @@ struct ConversationRow: View {
             .font(readState == .read ? .body : .body.weight(.semibold))
             .lineLimit(1)
             .truncationMode(.tail)
+            // Ideal width is what ViewThatFits measures: a title may truncate
+            // down to this before the PR badge is pushed to a second line.
+            .frame(idealWidth: 96, alignment: .leading)
         if let reason = readState.unreadReason {
             UnreadDot(reason: reason)
         }
