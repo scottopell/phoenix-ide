@@ -13,6 +13,7 @@ use sqlx::Row;
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
     pub enabled: bool,
+    pub saved_enabled: bool,
     pub mcp_server: String,
     pub owner: String,
     /// Exact Slack permalink host, used to reject other workspaces.
@@ -103,6 +104,10 @@ pub(crate) async fn status(
     };
     let account=sqlx::query("SELECT status,last_scan_at_unix_micros,last_error,baseline_complete,calls_last_pass,pages_last_pass,retry_at_us FROM slack_gateway_accounts WHERE workspace=?1 AND owner=?2").bind(&c.workspace).bind(&c.owner).fetch_optional(db.pool()).await.map_err(|e|e.to_string())?;
     let scan=account.map(|r|serde_json::json!({"status":r.get::<String,_>("status"),"last_scan_at_unix_micros":r.get::<Option<i64>,_>("last_scan_at_unix_micros"),"last_error":r.get::<Option<String>,_>("last_error"),"baseline_complete":r.get::<bool,_>("baseline_complete"),"calls_last_pass":r.get::<i64,_>("calls_last_pass"),"pages_last_pass":r.get::<i64,_>("pages_last_pass"),"retry_at_us":r.get::<Option<i64>,_>("retry_at_us")}));
+    let saved_scan = db
+        .slack_saved_inbox(&c.workspace, &c.owner)
+        .await
+        .map_err(|e| e.to_string())?;
     let connection = manager
         .status()
         .await
@@ -123,12 +128,50 @@ pub(crate) async fn status(
                 })
         });
     Ok(
-        serde_json::json!({"config":c,"scan":scan,"connection":connection,"stale_scan_warning":stale_scan_warning,"requests":db.slack_requests(&c.workspace,&c.owner).await.map_err(|e|e.to_string())?,"returns":db.slack_returns(&c.workspace,&c.owner).await.map_err(|e|e.to_string())?}),
+        serde_json::json!({"config":c,"scan":scan,"saved_scan":saved_scan,"connection":connection,"stale_scan_warning":stale_scan_warning,"requests":db.slack_requests(&c.workspace,&c.owner).await.map_err(|e|e.to_string())?,"returns":db.slack_returns(&c.workspace,&c.owner).await.map_err(|e|e.to_string())?}),
     )
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QueryKind {
+    Prefix,
+    Reaction,
+    Saved,
+}
+impl QueryKind {
+    #[cfg(test)]
+    pub fn emoji(reactions: bool) -> Self {
+        if reactions {
+            Self::Reaction
+        } else {
+            Self::Prefix
+        }
+    }
+    pub fn next(self, saved_enabled: bool) -> Self {
+        match self {
+            Self::Prefix => Self::Reaction,
+            Self::Reaction if saved_enabled => Self::Saved,
+            Self::Reaction | Self::Saved => Self::Prefix,
+        }
+    }
+    pub fn trigger(self) -> phoenix_db::SlackTriggerKind {
+        match self {
+            Self::Prefix => phoenix_db::SlackTriggerKind::Prefix,
+            Self::Reaction => phoenix_db::SlackTriggerKind::Reaction,
+            Self::Saved => phoenix_db::SlackTriggerKind::Saved,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prefix => "prefix",
+            Self::Reaction => "reaction",
+            Self::Saved => "saved",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum Pass {
-    Discovery { reactions_first: bool },
+    Discovery { first: QueryKind },
     Delivery,
 }
 
@@ -189,13 +232,12 @@ pub(crate) fn start(state: crate::api::AppState) {
         let mut recovery = tokio::time::interval(std::time::Duration::from_secs(2));
         recovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let wakeup = state.db.slack_gateway_wakeup();
-        let mut reactions_first = false;
+        let mut next_first = QueryKind::Reaction;
         loop {
             let pass = tokio::select! {
                 biased;
                 _ = timer.tick() => {
-                    reactions_first = !reactions_first;
-                    Pass::Discovery { reactions_first }
+                    Pass::Discovery { first: next_first }
                 },
                 () = wakeup.notified() => Pass::Delivery,
                 _ = recovery.tick() => Pass::Delivery,
@@ -212,6 +254,9 @@ pub(crate) fn start(state: crate::api::AppState) {
                     continue;
                 }
             };
+            if let Pass::Discovery { first } = pass {
+                next_first = first.next(c.saved_enabled);
+            }
             if !recovered {
                 let recovery_result = async {
                     state

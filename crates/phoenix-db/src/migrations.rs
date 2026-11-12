@@ -833,6 +833,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "slack_single_trigger_emoji",
         sql: include_str!("migrations/slack_single_trigger_emoji.sql"),
     },
+    Migration {
+        version: 162,
+        name: "slack_saved_capture",
+        sql: include_str!("migrations/slack_saved_capture.sql"),
+    },
 ];
 
 const MIGRATION_138: &str = concat!(
@@ -12043,6 +12048,7 @@ async fn migration_080_prepare(tx: &mut Transaction<'_, Sqlite>) -> DbResult<boo
 }
 
 mod coordinator_home;
+mod slack_saved_capture;
 
 struct WritableSchemaGuard {
     connection: Option<sqlx::pool::PoolConnection<Sqlite>>,
@@ -12320,12 +12326,12 @@ pub(crate) async fn run_unpublished_tools_d3_for_test(pool: &SqlitePool) -> DbRe
     run_migration_list(pool, &unpublished).await
 }
 
-struct GoalMigrationForeignKeysGuard {
+struct ForeignKeysDisabledConnection {
     connection: sqlx::pool::PoolConnection<Sqlite>,
     armed: bool,
 }
 
-impl Drop for GoalMigrationForeignKeysGuard {
+impl Drop for ForeignKeysDisabledConnection {
     fn drop(&mut self) {
         if self.armed {
             self.connection.close_on_drop();
@@ -12334,7 +12340,7 @@ impl Drop for GoalMigrationForeignKeysGuard {
 }
 
 async fn run_migration_156(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
-    let mut guard = GoalMigrationForeignKeysGuard {
+    let mut guard = ForeignKeysDisabledConnection {
         connection: pool.acquire().await?,
         armed: true,
     };
@@ -12485,6 +12491,12 @@ async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbRe
 
         if migration.version == 156 {
             run_migration_156(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 162 {
+            slack_saved_capture::run(pool, migration).await?;
             applied += 1;
             continue;
         }
@@ -13396,7 +13408,7 @@ mod tests {
         );
         db.pool().close().await;
         let reopened = crate::Database::open(path.to_str().unwrap()).await.unwrap();
-        assert_eq!(run_pending_migrations(reopened.pool()).await.unwrap(), 1);
+        assert_eq!(run_pending_migrations(reopened.pool()).await.unwrap(), 2);
         assert_eq!(run_pending_migrations(reopened.pool()).await.unwrap(), 0);
         let value: serde_json::Value =
             serde_json::from_str(&reopened.slack_configuration().await.unwrap().unwrap()).unwrap();
@@ -13444,7 +13456,7 @@ mod tests {
                     kind: crate::SlackRequestKind::Explicit,
                     trigger_kind: crate::SlackTriggerKind::Prefix,
                 };
-                db.accept_slack_source(&source, false).await.unwrap();
+                sqlx::raw_sql("INSERT INTO slack_gateway_bindings(binding_id,workspace,owner,channel,thread_ts,kind,creation_id) VALUES ('retained-binding','example.slack.com','UOWNER','C123','100.000001','explicit','retained-creation'); INSERT INTO slack_gateway_requests(request_id,workspace,owner,channel,message_ts,thread_ts,kind,instruction,context,source_url,binding_id,accepted_at_unix_micros,input_id,observed_at_unix_micros,trigger_kind) VALUES ('retained-request','example.slack.com','UOWNER','C123','100.000001','100.000001','explicit','investigate','quoted','https://example.slack.com/archives/C123/p100000001','retained-binding',1,'retained-input',1,'prefix');").execute(db.pool()).await.unwrap();
                 let requests = db
                     .slack_requests(&source.workspace, &source.owner)
                     .await
@@ -13460,7 +13472,7 @@ mod tests {
                 .await
                 .unwrap();
                 sqlx::query("INSERT INTO slack_gateway_discovery(workspace,owner,kind,after_date,cursor) VALUES ('example.slack.com','UOWNER','reaction','2026-11-01','retained-cursor')").execute(db.pool()).await.unwrap();
-                assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
+                assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 2);
                 assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
                 let value: serde_json::Value =
                     serde_json::from_str(&db.slack_configuration().await.unwrap().unwrap())
@@ -13500,7 +13512,8 @@ mod tests {
                         &source.workspace,
                         &source.owner,
                         &source.channel,
-                        &source.message_ts
+                        &source.message_ts,
+                        source.trigger_kind,
                     )
                     .await
                     .unwrap());
@@ -13690,7 +13703,7 @@ mod tests {
         .unwrap();
         assert_eq!(before, vec![158]);
 
-        assert_eq!(run_pending_migrations(pool).await.unwrap(), 4);
+        assert_eq!(run_pending_migrations(pool).await.unwrap(), 5);
 
         let after: Vec<i64> = sqlx::query_scalar(
             "SELECT version FROM _migrations WHERE version >= 156 ORDER BY version",
@@ -13698,7 +13711,7 @@ mod tests {
         .fetch_all(pool)
         .await
         .unwrap();
-        assert_eq!(after, vec![156, 158, 159, 160, 161]);
+        assert_eq!(after, vec![156, 158, 159, 160, 161, 162]);
         sqlx::query("SELECT enrollment_id FROM conversation_goal_actors LIMIT 0")
             .execute(pool)
             .await
@@ -16187,7 +16200,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(run_through_for_test(db.pool(), 152).await.unwrap(), 1);
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 7);
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 8);
         assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
         let ledger: Vec<(i64, String)> = sqlx::query_as(
             "SELECT version, name FROM _migrations WHERE version >= 150 ORDER BY version",
@@ -16208,6 +16221,7 @@ mod tests {
                 (159, "federated_continuation_receipts".into()),
                 (160, "slack_trigger_emojis".into()),
                 (161, "slack_single_trigger_emoji".into()),
+                (162, "slack_saved_capture".into()),
             ]
         );
     }
@@ -16217,6 +16231,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (162, "slack_saved_capture"),
             (161, "slack_single_trigger_emoji"),
             (160, "slack_trigger_emojis"),
             (159, "federated_continuation_receipts"),
@@ -20497,6 +20512,7 @@ mod tests {
                 (159, "federated_continuation_receipts"),
                 (160, "slack_trigger_emojis"),
                 (161, "slack_single_trigger_emoji"),
+                (162, "slack_saved_capture"),
             ]
         );
         let goal = MIGRATIONS
@@ -20510,7 +20526,7 @@ mod tests {
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 158);
+        assert_eq!(MIGRATIONS.len(), 159);
     }
 
     #[tokio::test]
@@ -20526,7 +20542,7 @@ mod tests {
         }
         sqlx::query("UPDATE product_creation_jobs SET status = 'published', published_product_id = 'deleted-product', published_conversation_id = 'deleted-transcript' WHERE request_id = 'orphan-image'")
             .execute(&pool).await.unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 11);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 12);
         let identity: Vec<(String, String)> = sqlx::query_as(
             "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
         ).fetch_all(&pool).await.unwrap();
@@ -20580,7 +20596,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 11);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 12);
         let retained: (String, String, String) = sqlx::query_as(
             "SELECT status, published_product_id, published_conversation_id
              FROM product_creation_jobs WHERE request_id = 'orphan-text'",

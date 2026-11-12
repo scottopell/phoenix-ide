@@ -112,22 +112,26 @@ async fn inspect_reads(
         (chrono::Utc::now().with_timezone(&tz).date_naive() - chrono::Days::new(4)).to_string();
     let mut checks = Vec::new();
     let mut reaction_read_verified = false;
-    for reactions in [false, true] {
+    let mut queries = vec![super::QueryKind::Prefix, super::QueryKind::Reaction];
+    if c.saved_enabled {
+        queries.push(super::QueryKind::Saved);
+    }
+    for kind in queries {
         let page = slack
-            .search(c, reactions, None, &after)
+            .search(c, kind, None, &after)
             .await
             .map_err(AppError::BadRequest)?;
         let mut verified = 0;
         for hit in &page.hits {
             if let Some(source) = slack
-                .source(c, hit, reactions)
+                .source(c, hit, kind)
                 .await
                 .map_err(AppError::BadRequest)?
             {
                 verified += 1;
                 if source.reaction_read_verified {
                     reaction_read_verified = true;
-                } else if !reaction_read_verified {
+                } else if kind != super::QueryKind::Saved && !reaction_read_verified {
                     reaction_read_verified = slack
                         .inspect_reaction_access(c, hit)
                         .await
@@ -135,7 +139,7 @@ async fn inspect_reads(
                 }
             }
         }
-        checks.push(serde_json::json!({"query":if reactions {"configured emoji reactions"} else {"owner emoji-prefixed messages"},"first_page_hits":page.hits.len(),"verified_sources":verified,"more_pages":page.cursor.is_some()}));
+        checks.push(serde_json::json!({"query":match kind { super::QueryKind::Prefix => "owner emoji-prefixed messages", super::QueryKind::Reaction => "configured emoji reactions", super::QueryKind::Saved => "Saved messages" },"first_page_hits":page.hits.len(),"verified_sources":verified,"more_pages":page.cursor.is_some()}));
     }
     Ok(Json(
         serde_json::json!({"owner_verified":true,"checks":checks,"reaction_read_verified":reaction_read_verified,"calls":slack.calls.load(std::sync::atomic::Ordering::Relaxed),"gateway_activated":false}),
