@@ -263,8 +263,10 @@ export interface Conversation {
 
 export type PrUnavailableReason = 'gh_missing' | 'not_authenticated' | 'not_git_repo' | 'command_failed';
 export type PrCheckState = 'passing' | 'pending' | 'failing' | 'unknown';
-export type PrDisplayState = 'open' | 'draft' | 'merged' | 'closed';
-export type PrFeedbackStatus = 'open' | 'in_progress' | 'approved';
+export type { PrDisplayState } from './generated/PrDisplayState';
+export type { PrFeedbackStatus } from './generated/PrFeedbackStatus';
+import type { PrDisplayState } from './generated/PrDisplayState';
+import type { PrFeedbackStatus } from './generated/PrFeedbackStatus';
 
 export interface CachedPrSummary {
   number: number;

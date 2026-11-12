@@ -245,6 +245,7 @@ const productConversations: ProductConversationListRow[] = [
     updated_at: liveIsoAgo(3),
     presentation: { kind: 'state', display_name: 'Qualify ProductConversation aggregate actions on a narrow mobile viewport', presentation_mode: 'working' },
     read_state: { state: 'read' },
+    cached_pr: null,
   },
 ];
 
@@ -262,6 +263,7 @@ const archivedProductConversations: ProductConversationListRow[] = [
     updated_at: liveIsoAgo(320),
     presentation: { kind: 'state', display_name: 'Completed aggregate retained in History', presentation_mode: 'done' },
     read_state: { state: 'read' },
+    cached_pr: null,
   },
 ];
 

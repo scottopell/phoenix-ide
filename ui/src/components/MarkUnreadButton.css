@@ -14,13 +14,13 @@
   white-space: nowrap;
 }
 
-.mark-unread-btn:hover:not(:disabled) {
-  color: var(--text-primary);
-}
-
 .mark-unread-btn:disabled {
   opacity: 0.6;
   cursor: default;
+}
+
+.mark-unread-btn:hover:not(:disabled) {
+  color: var(--text-primary);
 }
 
 .mark-unread-btn__dot {

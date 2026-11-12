@@ -139,6 +139,7 @@ const productConversations: Partial<Record<SidebarScenario['id'], ProductConvers
       updated_at: isoAgo(3),
       presentation: { kind: 'state', display_name: 'Fixture Product Root', presentation_mode: 'working' },
       read_state: { state: 'read' },
+      cached_pr: null,
     },
   ],
 };

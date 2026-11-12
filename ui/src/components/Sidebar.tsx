@@ -1,9 +1,14 @@
 import { useState, useCallback, useEffect, useRef, useSyncExternalStore } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { ApiResponseError, ConflictError, api, getConvDisplayState } from '../api';
+import { ApiResponseError, ConflictError, api } from '../api';
 import type { Conversation, ProductConversationListRow } from '../api';
 import { ConversationList } from './ConversationList';
-import { coordinatorUnread, type CoordinatorUnread } from '../conversation/readState';
+import { coordinatorUnread } from '../conversation/readState';
+import {
+  refreshProductConversationList,
+  updateProductConversationRows,
+  useProductConversationList,
+} from '../conversation/productConversationList';
 import { EmberEntry } from './EmberEntry';
 import { productConversationPresentationIndicator, renamedProductConversationLocation } from './ConversationList.presentation';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -27,7 +32,7 @@ import {
 import { beginNewProductConversationIntent } from '../hooks/useCreateConversation';
 
 function projectProductConversationHistory(
-  rows: ProductConversationListRow[],
+  rows: readonly ProductConversationListRow[],
   productConversationId: string,
 ): ProductConversationListRow[] {
   return rows.map((row) => row.product_conversation_id === productConversationId
@@ -37,16 +42,6 @@ function projectProductConversationHistory(
 
 const COLLAPSED_DOT_LIMIT = 9;
 const PRODUCT_REFRESH_COALESCE_MS = 50;
-
-function collapsedDotConversations(conversations: readonly Conversation[], activeSlug: string | null): readonly Conversation[] {
-  if (conversations.length <= COLLAPSED_DOT_LIMIT) return conversations;
-  const visible = conversations.slice(0, COLLAPSED_DOT_LIMIT);
-  if (!activeSlug || visible.some((c) => c.slug === activeSlug)) return visible;
-
-  const active = conversations.find((c) => c.slug === activeSlug);
-  if (!active) return visible;
-  return [...conversations.slice(0, COLLAPSED_DOT_LIMIT - 1), active];
-}
 
 function productRowMatchesRoute(row: ProductConversationListRow, routeIdentity: string | null): boolean {
   return !!routeIdentity && (
@@ -122,19 +117,17 @@ export function Sidebar({
       .catch(() => { /* chip just hides — non-fatal */ });
   }, []);
   const [showArchived, setShowArchived] = useState(false);
-  const [productConversations, setProductConversations] = useState<ProductConversationListRow[]>([]);
-  const [coordinatorUnreadState, setCoordinatorUnreadState] = useState<CoordinatorUnread>(null);
-  const [productConversationsError, setProductConversationsError] = useState<string | null>(null);
-  const [productConversationsRetry, setProductConversationsRetry] = useState(0);
-  const refreshScheduledRef = useRef<number | null>(null);
-  const productConversationRefreshSeqRef = useRef(0);
-  const [activeProductSnapshot, setActiveProductSnapshot] = useState<Awaited<ReturnType<typeof api.getProductConversationSnapshot>> | null>(null);
+  const productList = useProductConversationList();
+  const productConversations = productList.rows;
+  const productConversationsError = productList.error;
+  const coordinatorUnreadState = coordinatorUnread(productList);
   const productConversationListRevision = useSyncExternalStore(
     subscribeProductConversationListRevision,
     getProductConversationListRevision,
     getProductConversationListRevision,
   );
-  const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
+  const refreshScheduledRef = useRef<number | null>(null);
+  const [activeProductSnapshot, setActiveProductSnapshot] = useState<Awaited<ReturnType<typeof api.getProductConversationSnapshot>> | null>(null);
   const [productCloseTarget, setProductCloseTarget] = useState<ProductConversationListRow | null>(null);
   const [productDeleteTarget, setProductDeleteTarget] = useState<ProductConversationListRow | null>(null);
   const productCloseTargetRef = useRef<ProductConversationListRow | null>(null);
@@ -166,33 +159,11 @@ export function Sidebar({
     return () => { unsub(); };
   }, [refetchCodexPreflight]);
 
-  useEffect(() => {
-    let cancelled = false;
-    const requestSeq = productConversationRefreshSeqRef.current + 1;
-    productConversationRefreshSeqRef.current = requestSeq;
-    api.listProductConversations()
-      .then((response) => {
-        if (!cancelled && productConversationRefreshSeqRef.current === requestSeq) {
-          setProductConversations(response.product_conversations);
-          setCoordinatorUnreadState(coordinatorUnread(response));
-          setProductConversationsError(null);
-        }
-      })
-      .catch((error: unknown) => {
-        if (!cancelled && productConversationRefreshSeqRef.current === requestSeq) {
-          setProductConversationsError(error instanceof Error ? error.message : 'Failed to refresh conversations');
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [productConversationListRevision, productConversationsRetry]);
-
   const scheduleProductRefresh = useCallback(() => {
     if (refreshScheduledRef.current !== null) return;
     refreshScheduledRef.current = window.setTimeout(() => {
       refreshScheduledRef.current = null;
-      setProductConversationsRetry((revision) => revision + 1);
+      void refreshProductConversationList();
     }, PRODUCT_REFRESH_COALESCE_MS);
   }, []);
 
@@ -226,7 +197,7 @@ export function Sidebar({
         row.canonical_root.transcript_row_id,
         row.latest_transcript_row_id,
       ]), () => {
-        setProductConversations((current) => current.filter((candidate) => (
+        updateProductConversationRows((current) => current.filter((candidate) => (
           candidate.product_conversation_id !== productId
         )));
       });
@@ -234,7 +205,7 @@ export function Sidebar({
     return () => { unsubscribes.forEach((unsubscribe) => unsubscribe()); };
   }, [productConversations]);
   useEffect(() => subscribeProductConversationClosed((productConversationId) => {
-    setProductConversations((rows) => projectProductConversationHistory(rows, productConversationId));
+    updateProductConversationRows((rows) => projectProductConversationHistory(rows, productConversationId));
   }), []);
   useEffect(() => {
     if (!activeSlug || !(location.pathname.startsWith('/product-conversations/') || location.pathname.startsWith('/c/'))) {
@@ -290,30 +261,6 @@ export function Sidebar({
     navigate('/terminal');
   }, [navigate]);
 
-  const handleConversationClick = useCallback((conv: Conversation) => {
-    navigate(`/c/${conv.slug}`);
-  }, [navigate]);
-
-  const handleArchive = useCallback(async (conv: Conversation) => {
-    try {
-      await api.archiveConversation(conv.id);
-      onConversationCreated();
-    } catch (err) {
-      notifyArchiveCloseConflict(conv.id, err);
-      console.error('Failed to close conversation:', err);
-    }
-  }, [onConversationCreated]);
-
-  const handleDelete = useCallback(async () => {
-    if (!deleteTarget) return;
-    try {
-      await api.deleteConversation(deleteTarget.id);
-      setDeleteTarget(null);
-      onConversationCreated();
-    } catch (err) {
-      console.error('Failed to delete:', err);
-    }
-  }, [deleteTarget, onConversationCreated]);
 
 
   const applyProductName = (renamed: ProductConversationListRow) => {
@@ -323,7 +270,7 @@ export function Sidebar({
       latestLocation.pathname, latestLocation.search, latestLocation.hash, productRenameTarget, renamed,
     );
     if (activeRoute) navigate(activeRoute, { replace: true, state: latestLocation.state });
-    setProductConversations((rows) => rows.map((row) =>
+    updateProductConversationRows((rows) => rows.map((row) =>
       row.product_conversation_id === renamed.product_conversation_id ? renamed : row));
     notifyProductConversationSnapshotChanged(renamed.product_conversation_id);
     notifyProductConversationListMayHaveChanged();
@@ -351,27 +298,6 @@ export function Sidebar({
     }
   };
 
-  const handleSetDeleteTarget = useCallback((conv: Conversation) => {
-    setDeleteTarget(conv);
-  }, []);
-
-  const handleSetRenameTarget = useCallback((conv: Conversation) => {
-    const selection = ++renameSelectionRef.current;
-    setProductRenameError(undefined);
-    const row = productConversations.find((candidate) =>
-      candidate.product_conversation_id === conv.product_conversation_id
-      || candidate.canonical_root.transcript_row_id === conv.id
-      || candidate.latest_transcript_row_id === conv.id);
-    if (row) {
-      setProductRenameTarget(row);
-      return;
-    }
-    void api.getProductConversationSnapshot(conv.product_conversation_id ?? conv.id)
-      .then((snapshot) => { if (selection === renameSelectionRef.current) setProductRenameTarget(snapshot); })
-      .catch((error: unknown) => {
-        if (selection === renameSelectionRef.current) setProductRenameError(error instanceof Error ? error.message : 'Failed to load conversation name');
-      });
-  }, [productConversations]);
 
   const handleSetProductRenameTarget = useCallback((row: ProductConversationListRow) => {
     ++renameSelectionRef.current;
@@ -395,7 +321,7 @@ export function Sidebar({
     setProductCloseSubmittingId(productCloseTarget.product_conversation_id);
     try {
       await api.closeProductConversation(productCloseTarget.product_conversation_id);
-      setProductConversations((rows) => projectProductConversationHistory(
+      updateProductConversationRows((rows) => projectProductConversationHistory(
         rows,
         productCloseTarget.product_conversation_id,
       ));
@@ -403,7 +329,7 @@ export function Sidebar({
       setProductCloseTarget((current) =>
         current?.product_conversation_id === productCloseTarget.product_conversation_id ? null : current);
       onConversationCreated();
-      setProductConversationsRetry((revision) => revision + 1);
+      void refreshProductConversationList();
       notifyProductConversationListMayHaveChanged();
       notifyProductConversationSnapshotChanged(productCloseTarget.product_conversation_id);
       setProductCloseError((current) =>
@@ -413,7 +339,7 @@ export function Sidebar({
     } catch (err) {
       if (notifyArchiveCloseConflict(productCloseTarget.canonical_root.transcript_row_id, err)) {
         if (err instanceof ConflictError && err.detail.error_type === 'close_already_history') {
-          setProductConversations((rows) => projectProductConversationHistory(
+          updateProductConversationRows((rows) => projectProductConversationHistory(
             rows,
             productCloseTarget.product_conversation_id,
           ));
@@ -487,14 +413,7 @@ export function Sidebar({
   const isOnTerminalPage = location.pathname === '/terminal';
   const isOnGlobalPage = location.pathname === '/global' || location.pathname.startsWith('/global/');
   const collapsedProductConversations = collapsedDotProductConversations(openProductConversations, activeProductRouteIdentity);
-  const collapsedConversations = productConversationsError && productConversations.length === 0
-    ? collapsedDotConversations(conversations, activeSlug)
-    : [];
-  const collapsedVisibleCount = collapsedProductConversations.length || collapsedConversations.length;
-  const collapsedTotalCount = collapsedProductConversations.length > 0
-    ? openProductConversations.length
-    : conversations.length;
-  const collapsedOverflowCount = Math.max(0, collapsedTotalCount - collapsedVisibleCount);
+  const collapsedOverflowCount = Math.max(0, openProductConversations.length - collapsedProductConversations.length);
 
   if (collapsed) {
     return (
@@ -543,20 +462,6 @@ export function Sidebar({
                   role="img"
                   aria-label={indicator.ariaLabel}
                 />
-              </button>
-            );
-          })}
-          {collapsedConversations.map(conv => {
-            const displayState = getConvDisplayState(conv);
-            const isActive = matchesRouteSegment(conv, activeSlug);
-            return (
-              <button
-                key={conv.id}
-                className={`sidebar-dot-btn ${isActive ? 'active' : ''}`}
-                onClick={() => handleConversationClick(conv)}
-                title={conv.slug}
-              >
-                <span className={`conv-state-dot ${displayState}`} />
               </button>
             );
           })}
@@ -638,7 +543,7 @@ export function Sidebar({
       {productConversationsError && (
         <div className="sidebar-refresh-error" role="status">
           <span>Showing cached conversations</span>
-          <button type="button" onClick={() => setProductConversationsRetry((revision) => revision + 1)}>Retry</button>
+          <button type="button" onClick={() => void refreshProductConversationList()}>Retry</button>
         </div>
       )}
       <LocalServicesPanel />
@@ -649,14 +554,9 @@ export function Sidebar({
           archivedConversations={archivedConversations}
           productConversations={openProductConversations}
           archivedProductConversations={archivedProductConversations}
-          productRowsAuthoritative={!productConversationsError}
           showArchived={showArchived}
           onToggleArchived={handleToggleArchived}
           onNewConversation={handleNewClick}
-          onArchive={handleArchive}
-          onDelete={handleSetDeleteTarget}
-          {...(!productConversationsError ? { onRename: handleSetRenameTarget } : {})}
-          onConversationClick={handleConversationClick}
           onProductConversationClick={(row) => navigate(row.canonical_route)}
           onProductConversationRename={handleSetProductRenameTarget}
           onProductConversationClose={handleSetProductCloseTarget}
@@ -665,15 +565,6 @@ export function Sidebar({
           sidebarMode
         />
       </div>
-      <ConfirmDialog
-        visible={deleteTarget !== null}
-        title="Delete Conversation"
-        message={`Are you sure you want to delete "${deleteTarget?.slug}"? This cannot be undone.`}
-        confirmText="Delete"
-        danger
-        onConfirm={handleDelete}
-        onCancel={() => setDeleteTarget(null)}
-      />
       <ConfirmDialog
         visible={productCloseTarget !== null}
         title="Close Conversation"

@@ -60,6 +60,12 @@ WHEN user taps a conversation
 THE SYSTEM SHALL navigate to that conversation's chat view
 AND preserve the URL for deep linking (`/c/{slug}`)
 
+WHEN a conversation's work scope has a cached pull request
+THE SYSTEM SHALL show its number, state, and feedback status inline on that conversation's row
+
+WHEN the conversation list cannot be refreshed from the server
+THE SYSTEM SHALL keep rendering the last successfully loaded list and indicate that it is cached
+
 **Rationale:** Users need to find and resume conversations. Deep links enable sharing and bookmarking. On mobile, the list is often used as a rapid switching surface; if scrolling belongs to the wrong container, users cannot reliably reach older conversations or select one without fighting the page.
 
 ---
@@ -327,6 +333,9 @@ THE SYSTEM SHALL use keys namespaced by conversation ID:
 - `phoenix:draft:{conversationId}` - draft message text in input
 - `phoenix:queue:{conversationId}` - array of unsent messages (sending or failed)
 - `phoenix:lastSeq:{conversationId}` - last seen sequence_id for reconnection
+
+WHEN persisting the conversation list for offline rendering
+THE SYSTEM SHALL store the last successful ProductConversation list response under `phoenix:product-conversation-list:v1`
 
 WHEN localStorage is unavailable or full
 THE SYSTEM SHALL degrade gracefully without crashing

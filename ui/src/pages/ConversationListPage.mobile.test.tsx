@@ -79,6 +79,7 @@ const productConversation = (title = 'Mobile Product'): ProductConversationListR
   updated_at: '2026-01-01T00:00:00Z',
   presentation: { kind: 'state', display_name: title, presentation_mode: 'idle' },
   read_state: { state: 'read' },
+  cached_pr: null,
 });
 
 function touchActivate(element: HTMLElement): void {
@@ -153,6 +154,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     touchActivate(await screen.findByRole('button', { name: 'Rename conversation Mobile Product' }));
     const input = screen.getByRole('textbox');
     fireEvent.change(input, { target: { value: 'Renamed on Mobile' } });
+    vi.mocked(api.listProductConversations).mockResolvedValue({ product_conversations: [renamed], coordinator: null });
     touchActivate(screen.getByRole('button', { name: 'Rename' }));
 
     await waitFor(() => expect(api.renameProductConversation).toHaveBeenCalledWith(

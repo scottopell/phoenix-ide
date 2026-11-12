@@ -27,11 +27,12 @@ use super::types::{
     ProductConversationCreationRecoveryResponse, ProductConversationCreationRecoveryRow,
     ProductConversationHandoffView, ProductConversationHistorySnapshotView,
     ProductConversationLifecycleView, ProductConversationListResponse, ProductConversationListRow,
-    ProductConversationPresentationView, ProductConversationReadStateView,
-    ProductConversationSegmentView, ProductConversationSnapshotMetadataView,
-    ProductConversationSnapshotView, ProductConversationSourceRelationView,
-    ProductConversationSourceView, ProductConversationTranscriptRowView,
-    ProductConversationWorkIdentityView, UpdateAutomaticContinuationRequest,
+    ProductConversationPrView, ProductConversationPresentationView,
+    ProductConversationReadStateView, ProductConversationSegmentView,
+    ProductConversationSnapshotMetadataView, ProductConversationSnapshotView,
+    ProductConversationSourceRelationView, ProductConversationSourceView,
+    ProductConversationTranscriptRowView, ProductConversationWorkIdentityView,
+    UpdateAutomaticContinuationRequest,
 };
 use super::AppState;
 use crate::db::{
@@ -134,8 +135,7 @@ pub async fn rename_product_conversation(
         .into_iter()
         .find(|projection| projection.product_conversation_id == product_conversation_id)
         .ok_or_else(|| AppError::NotFound(product_conversation_id.to_string()))?;
-    let read_state = product_read_state(&state, product_conversation_id.as_str()).await?;
-    Ok(Json(list_row(&projection, read_state)))
+    Ok(Json(single_list_row(&state, &projection).await?))
 }
 pub async fn regenerate_product_conversation_name(
     State(state): State<AppState>,
@@ -228,8 +228,7 @@ pub async fn regenerate_product_conversation_name(
         .into_iter()
         .find(|projection| projection.product_conversation_id == owner_id)
         .ok_or_else(|| AppError::NotFound(owner_id.to_string()))?;
-    let read_state = product_read_state(&state, owner_id.as_str()).await?;
-    Ok(Json(list_row(&projection, read_state)))
+    Ok(Json(single_list_row(&state, &projection).await?))
 }
 
 use crate::conversation_actions::{self, normalize_product_conversation_title};
@@ -346,7 +345,10 @@ pub async fn list_product_conversations(
         .map_err(db_to_app)?;
     let coordinator = read_states
         .iter()
-        .find(|entry| entry.kind == phoenix_db::ProductConversationKind::Coordinator)
+        .find(|entry| {
+            entry.kind
+                == phoenix_core::domain::product_conversation::ProductConversationKind::Coordinator
+        })
         .map(|entry| CoordinatorListEntryView {
             product_conversation_id: entry.product_conversation_id.to_string(),
             read_state: entry.read_state.into(),
@@ -356,6 +358,7 @@ pub async fn list_product_conversations(
             .iter()
             .map(|entry| (entry.product_conversation_id.as_str(), entry.read_state))
             .collect();
+    let cached_prs = cached_prs_for_projections(&state, &projections).await?;
     let rows = projections
         .iter()
         .map(|projection| {
@@ -363,13 +366,55 @@ pub async fn list_product_conversations(
                 .get(projection.product_conversation_id.as_str())
                 .copied()
                 .unwrap_or(phoenix_db::ProductConversationReadState::Read);
-            list_row(projection, read_state)
+            let cached_pr = projection
+                .latest_work_scope_id
+                .as_ref()
+                .and_then(|scope| cached_prs.get(&work_scope_key(scope)));
+            list_row(projection, read_state, cached_pr)
         })
         .collect();
     Ok(Json(ProductConversationListResponse {
         product_conversations: rows,
         coordinator,
     }))
+}
+
+fn work_scope_key(scope: &phoenix_core::work_scope::WorkScopeId) -> String {
+    phoenix_core::work_scope::ResourceScopeKey::Work(scope.clone()).stable_key()
+}
+
+async fn cached_prs_for_projections(
+    state: &AppState,
+    projections: &[ProductConversationListProjection],
+) -> Result<std::collections::HashMap<String, ProductConversationPrView>, AppError> {
+    let scopes: Vec<_> = projections
+        .iter()
+        .filter_map(|projection| projection.latest_work_scope_id.clone())
+        .collect();
+    Ok(state
+        .db
+        .primary_work_scope_pr_associations(&scopes)
+        .await
+        .map_err(db_to_app)?
+        .into_iter()
+        .map(|(key, pr)| {
+            let summary = super::handlers::sidebar_cached_pr_summary(&pr);
+            (key, ProductConversationPrView::from(&summary))
+        })
+        .collect())
+}
+
+async fn single_list_row(
+    state: &AppState,
+    projection: &ProductConversationListProjection,
+) -> Result<ProductConversationListRow, AppError> {
+    let read_state = product_read_state(state, projection.product_conversation_id.as_str()).await?;
+    let cached_prs = cached_prs_for_projections(state, std::slice::from_ref(projection)).await?;
+    let cached_pr = projection
+        .latest_work_scope_id
+        .as_ref()
+        .and_then(|scope| cached_prs.get(&work_scope_key(scope)));
+    Ok(list_row(projection, read_state, cached_pr))
 }
 
 async fn product_read_state(
@@ -829,6 +874,7 @@ mod creation_allowed_actions_tests {
 pub(crate) fn list_row(
     projection: &ProductConversationListProjection,
     read_state: phoenix_db::ProductConversationReadState,
+    cached_pr: Option<&ProductConversationPrView>,
 ) -> ProductConversationListRow {
     ProductConversationListRow {
         product_conversation_id: projection.product_conversation_id.to_string(),
@@ -859,6 +905,7 @@ pub(crate) fn list_row(
             &projection.latest_transcript_row_id,
         ),
         read_state: read_state.into(),
+        cached_pr: cached_pr.cloned(),
     }
 }
 
@@ -3493,7 +3540,8 @@ mod tests {
             body,
             serde_json::to_value(list_row(
                 &projection,
-                phoenix_db::ProductConversationReadState::Read
+                phoenix_db::ProductConversationReadState::Read,
+                None
             ))
             .unwrap()
         );

@@ -1,15 +1,9 @@
 use std::collections::HashMap;
 
-use phoenix_core::domain::product_conversation::ProductConversationId;
+use phoenix_core::domain::product_conversation::{ProductConversationId, ProductConversationKind};
 use sqlx::Row;
 
 use crate::{Database, DbError, DbResult};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProductConversationKind {
-    Ordinary,
-    Coordinator,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProductConversationUnreadReason {
@@ -120,15 +114,10 @@ impl Database {
         let mut index: HashMap<String, usize> = HashMap::new();
         for row in rows {
             let id: String = row.try_get("product_conversation_id")?;
-            let kind = match row.try_get::<String, _>("kind")?.as_str() {
-                "ordinary" => ProductConversationKind::Ordinary,
-                "coordinator" => ProductConversationKind::Coordinator,
-                other => {
-                    return Err(DbError::Serialization(format!(
-                        "unknown product conversation kind {other}"
-                    )))
-                }
-            };
+            let kind_text: String = row.try_get("kind")?;
+            let kind = ProductConversationKind::from_db_str(&kind_text).ok_or_else(|| {
+                DbError::Serialization(format!("unknown product conversation kind {kind_text}"))
+            })?;
             let read_through: Option<String> = row.try_get("read_through_message_id")?;
             let marked_unread: i64 = row.try_get("marked_unread")?;
             let latest_id: Option<String> = row.try_get("latest_message_id")?;

@@ -467,6 +467,33 @@ pub struct ProductConversationListRow {
     pub updated_at: String,
     pub presentation: ProductConversationPresentationView,
     pub read_state: ProductConversationReadStateView,
+    pub cached_pr: Option<ProductConversationPrView>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationPrView {
+    pub number: u32,
+    pub title: String,
+    pub url: String,
+    pub display_state: phoenix_core::domain::pr_display_state::PrDisplayState,
+    pub base: String,
+    pub head: String,
+    pub feedback_status: phoenix_core::domain::pr_feedback_status::PrFeedbackStatus,
+}
+
+impl From<&crate::runtime::CachedPrSummary> for ProductConversationPrView {
+    fn from(pr: &crate::runtime::CachedPrSummary) -> Self {
+        Self {
+            number: u32::try_from(pr.number).unwrap_or(u32::MAX),
+            title: pr.title.clone(),
+            url: pr.url.clone(),
+            display_state: pr.display_state.clone(),
+            base: pr.base.clone(),
+            head: pr.head.clone(),
+            feedback_status: pr.feedback_status,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, TS)]

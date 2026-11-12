@@ -1128,7 +1128,7 @@ fn conversation_resource_scope(
     }
 }
 
-fn sidebar_cached_pr_summary(
+pub(crate) fn sidebar_cached_pr_summary(
     pr: &crate::db::WorkScopePrAssociation,
 ) -> crate::runtime::CachedPrSummary {
     crate::runtime::CachedPrSummary {
