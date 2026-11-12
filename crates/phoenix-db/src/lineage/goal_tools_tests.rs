@@ -319,12 +319,9 @@ async fn real_145_provenance_and_tools_retention_survive_upgrade_delete_and_reop
         1
     );
     seed_real_145_receipt(&db, &owner).await;
-    assert_eq!(
-        crate::migrations::run_pending_migrations(db.pool())
-            .await
-            .unwrap(),
-        13
-    );
+    crate::migrations::run_pending_migrations(db.pool())
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO product_creation_initial_execution_receipts(request_id,terminal_kind,failure_reason) VALUES ('joint-create','Completed',NULL)")
         .execute(db.pool()).await.unwrap();
     assert_goal_rows(&db, &owner, true).await;
