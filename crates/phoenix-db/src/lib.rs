@@ -74,6 +74,11 @@ pub use product_conversation_rename::{
     ProductConversationRenameSource,
 };
 mod product_conversation_read;
+mod product_conversation_read_state;
+pub use product_conversation_read_state::{
+    ProductConversationKind, ProductConversationReadState, ProductConversationReadStateEntry,
+    ProductConversationUnreadReason,
+};
 pub mod retrieval;
 mod sqlite_native_statement;
 mod sqlite_telemetry;

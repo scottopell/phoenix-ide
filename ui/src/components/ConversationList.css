@@ -396,3 +396,26 @@
 .product-conversation-actions .conv-item-actions .conv-action-btn:disabled {
   color: var(--text-muted);
 }
+
+/* ----- Unread state ---------------------------------------------------- */
+
+.product-conversation-list-row.unread .conv-item-title {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.conv-item-unread-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  min-width: 7px;
+  margin-left: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--accent-blue);
+}
+
+.conv-item-unread-dot--marked {
+  background: transparent;
+  border: 1.5px solid var(--accent-blue);
+}

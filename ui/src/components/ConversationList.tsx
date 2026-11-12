@@ -24,6 +24,7 @@ import {
 } from './ConversationList.presentation';
 import './ConversationList.css';
 import { EmberEntry } from './EmberEntry';
+import { markProductConversationRead, markProductConversationUnread } from '../conversation/readState';
 
 
 interface ConversationListProps {
@@ -50,6 +51,7 @@ interface ConversationListProps {
   utilityActions?: ReactNode;
   emptyScopeLabel?: string | null;
   footer?: ReactNode;
+  coordinatorUnread?: 'marked' | 'new_activity' | null;
 }
 
 interface ConversationRowProps {
@@ -205,10 +207,15 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
   onProductConversationDelete?: (row: ProductConversationListRow) => void;
   onProductConversationRename?: (row: ProductConversationListRow) => void;
 }) {
+  const unread = row.read_state.state === 'unread';
+  const unreadLabel = row.read_state.state === 'unread'
+    ? (row.read_state.reason === 'marked' ? 'Marked unread' : 'New activity')
+    : null;
   const classes = [
     'conv-item',
     isActive ? 'active' : '',
     isKeyboardSelected ? 'keyboard-selected' : '',
+    unread ? 'unread' : '',
     'product-conversation-list-row',
   ].filter(Boolean).join(' ');
   const displayTitle = productConversationDisplayTitle(row);
@@ -227,7 +234,6 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
   const canRename = !!onProductConversationRename && row.lifecycle.state === 'open'
     && !(closeAction?.availability === 'unavailable' && closeAction.reason === 'active_close_attempt');
   const canDelete = !!onProductConversationDelete && row.lifecycle.state === 'history';
-  const canClose = !!onProductConversationClose && closeAction !== null;
   const context = effectiveCwd ?? row.canonical_root.slug ?? null;
   return (
     <li
@@ -250,6 +256,14 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
               aria-label={indicator.ariaLabel}
             />
             <span className="conv-item-title">{displayTitle}</span>
+            {unreadLabel && (
+              <span
+                className={`conv-item-unread-dot${row.read_state.state === 'unread' && row.read_state.reason === 'marked' ? ' conv-item-unread-dot--marked' : ''}`}
+                title={unreadLabel}
+                role="img"
+                aria-label={unreadLabel}
+              />
+            )}
           </span>
         </div>
         <div className="conv-item-meta product-conversation-list-row__meta">
@@ -260,12 +274,25 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
           {context && <span className="conv-item-cwd" title={context}>{context}</span>}
         </div>
       </button>
-      {(canRename || canDelete || canClose) && (
-        <div ref={menuRef} className="conv-item-menu-container product-conversation-actions">
+      <div ref={menuRef} className="conv-item-menu-container product-conversation-actions">
           <button type="button" className="conv-item-menu-btn conv-action-btn"
             aria-label={`Actions for conversation ${displayTitle}`} aria-expanded={isMenuOpen}
             onClick={(event) => onToggleMenu(event, row.product_conversation_id)}>⋮</button>
           {isMenuOpen && <div className="conv-item-actions" aria-label={`Actions for ${displayTitle}`}>
+          <button
+            type="button"
+            className="conv-action-btn"
+            onClick={(event) => {
+              event.stopPropagation();
+              onCloseMenu();
+              const action = unread ? markProductConversationRead : markProductConversationUnread;
+              void action(row.product_conversation_id).catch(() => { /* list refresh shows the authoritative state */ });
+            }}
+            aria-label={`${unread ? 'Mark as read' : 'Mark as unread'}: ${displayTitle}`}
+            title={unread ? 'Mark as read' : 'Mark as unread to revisit later'}
+          >
+            {unread ? 'Mark as read' : 'Mark as unread'}
+          </button>
           {canRename && onProductConversationRename && (
             <button
               type="button"
@@ -311,8 +338,7 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
             </button>
           )}
           </div>}
-        </div>
-      )}
+      </div>
     </li>
   );
 });
@@ -695,6 +721,7 @@ export function ConversationList({
   utilityActions,
   emptyScopeLabel,
   footer,
+  coordinatorUnread = null,
 }: ConversationListProps) {
   const navigate = useNavigate();
   const { hasActiveScope } = useFocusScope();
@@ -928,7 +955,7 @@ export function ConversationList({
             </button>
           </div>
         </div>
-          <EmberEntry onClick={() => navigate('/global')} />
+          <EmberEntry unread={coordinatorUnread} onClick={() => navigate('/global')} />
           <div className="conversation-list-subnav">
             <button
               className={`archive-toggle-text ${!showArchived ? 'active' : ''}`}

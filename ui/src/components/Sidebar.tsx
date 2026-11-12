@@ -3,6 +3,7 @@ import { useNavigate, useLocation } from 'react-router-dom';
 import { ApiResponseError, ConflictError, api, getConvDisplayState } from '../api';
 import type { Conversation, ProductConversationListRow } from '../api';
 import { ConversationList } from './ConversationList';
+import { coordinatorUnread, type CoordinatorUnread } from '../conversation/readState';
 import { EmberEntry } from './EmberEntry';
 import { productConversationPresentationIndicator, renamedProductConversationLocation } from './ConversationList.presentation';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -122,6 +123,7 @@ export function Sidebar({
   }, []);
   const [showArchived, setShowArchived] = useState(false);
   const [productConversations, setProductConversations] = useState<ProductConversationListRow[]>([]);
+  const [coordinatorUnreadState, setCoordinatorUnreadState] = useState<CoordinatorUnread>(null);
   const [productConversationsError, setProductConversationsError] = useState<string | null>(null);
   const [productConversationsRetry, setProductConversationsRetry] = useState(0);
   const refreshScheduledRef = useRef<number | null>(null);
@@ -172,6 +174,7 @@ export function Sidebar({
       .then((response) => {
         if (!cancelled && productConversationRefreshSeqRef.current === requestSeq) {
           setProductConversations(response.product_conversations);
+          setCoordinatorUnreadState(coordinatorUnread(response));
           setProductConversationsError(null);
         }
       })
@@ -516,7 +519,7 @@ export function Sidebar({
         >
           <TerminalGlyph />
         </button>
-        <EmberEntry compact active={isOnGlobalPage} onClick={() => navigate('/global')} />
+        <EmberEntry compact unread={coordinatorUnreadState} active={isOnGlobalPage} onClick={() => navigate('/global')} />
         <SettingsDropdown
           theme={theme}
           onToggleTheme={toggleTheme}
@@ -611,7 +614,7 @@ export function Sidebar({
           onPreflightInvalidated={refetchCodexPreflight}
         />
       </div>
-      <EmberEntry active={isOnGlobalPage} onClick={() => navigate('/global')} />
+      <EmberEntry unread={coordinatorUnreadState} active={isOnGlobalPage} onClick={() => navigate('/global')} />
       <div className="sidebar-lifecycle-tabs" aria-label="Conversation lifecycle">
         <button
           type="button"
@@ -641,6 +644,7 @@ export function Sidebar({
       <LocalServicesPanel />
       <div className="sidebar-list">
         <ConversationList
+          coordinatorUnread={coordinatorUnreadState}
           conversations={conversations}
           archivedConversations={archivedConversations}
           productConversations={openProductConversations}

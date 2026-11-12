@@ -744,3 +744,23 @@ Aggregate history SHALL expose one `latest_opening` authority sum rather than a 
 A committed live opening observation SHALL settle opening readiness without requiring a successful aggregate refresh. Refresh failure SHALL remain visible without reverting that accepted edge to pending. Delayed pending snapshots SHALL NOT undo an accepted observation for the same edge. A content-update observation SHALL recompute presentation while retaining the accepted edge and message identity. A delayed accepted-opening content update whose durable transcript generation has been superseded SHALL deliver a coherent committed content, generation, and presentation envelope for that same identity in both live and reconnect replay paths. It SHALL retain its event cursor and unrelated owed replay events. Missing or future generations and wrong content at the current generation SHALL NOT borrow newer opening authority. These reconciliation rules SHALL preserve reader anchors, message order, and independent composer authority under REQ-CONV-002 and REQ-CONV-006.
 
 Global aggregate history SHALL NOT acquire ordinary Open/History lifecycle, Close actions, work identity, or ordinary mutation authority. Native Swift navigation is outside this web contract.
+
+---
+
+### REQ-CONV-027: Unread Conversations and Mark Unread
+
+WHEN an ordinary ProductConversation or the Global Coordinator receives agent, tool, error, or system output that the user has not viewed
+THE SYSTEM SHALL show that conversation as unread in the conversation list and on the Global entry
+
+WHILE the user views a conversation in a visible window
+THE SYSTEM SHALL mark it read through its latest message, including messages that arrive while it is being viewed
+
+WHEN the user marks a conversation unread from the list or from the conversation itself
+THE SYSTEM SHALL show it as unread until the user opens it again or marks it read
+AND SHALL NOT clear the mark merely because the conversation remains on screen
+
+WHEN the user marks an unread conversation read from the list
+THE SYSTEM SHALL show it as read without opening it
+
+Read state SHALL be stored by the server per ProductConversation so every client sees the same state and continuation does not reset it. A conversation whose latest message is user-authored SHALL NOT be unread solely because of that message. The list SHALL distinguish an explicit unread mark from new activity.
+

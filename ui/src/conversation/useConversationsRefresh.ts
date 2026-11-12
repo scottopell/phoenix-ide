@@ -267,6 +267,9 @@ export function useConversationsRefreshDriver(): void {
     const interval = window.setInterval(() => {
       if (document.visibilityState === 'visible' && navigator.onLine) {
         void refreshRef.current();
+        // Read state (including the Global conversation's) lives on the
+        // product list, which ordinary snapshot changes alone don't refresh.
+        notifyProductConversationListMayHaveChanged();
       }
     }, POLL_INTERVAL_MS);
     return () => window.clearInterval(interval);

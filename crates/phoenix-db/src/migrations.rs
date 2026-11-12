@@ -828,6 +828,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "slack_trigger_emojis",
         sql: include_str!("migrations/slack_trigger_emojis.sql"),
     },
+    Migration {
+        version: 161,
+        name: "product_conversation_read_state",
+        sql: include_str!("migrations/product_conversation_read_state.sql"),
+    },
 ];
 
 const MIGRATION_138: &str = concat!(
@@ -13355,6 +13360,43 @@ END;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn migration_161_seeds_existing_product_conversations_as_read() {
+        use phoenix_core::domain::llm_types::ContentBlock;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("read-state.db");
+        let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+        run_through_for_test(db.pool(), 160).await.unwrap();
+        let conversation = db
+            .create_conversation("seeded", "seeded", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "seeded-agent",
+            &conversation.id,
+            &crate::MessageContent::agent(vec![ContentBlock::text("done")]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(run_through_for_test(db.pool(), 161).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(db.pool(), 161).await.unwrap(), 0);
+        let cursor: Option<String> = sqlx::query_scalar(
+            "SELECT read_through_message_id FROM product_conversation_read_state
+             WHERE product_conversation_id = ?1",
+        )
+        .bind(conversation.product_conversation_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(cursor.as_deref(), Some("seeded-agent"));
+        let states = db.list_product_conversation_read_states().await.unwrap();
+        assert!(states
+            .iter()
+            .all(|entry| entry.read_state == crate::ProductConversationReadState::Read));
+    }
 
     #[tokio::test]
     async fn migration_160_defaults_to_fire_without_reinitializing_existing_discovery() {

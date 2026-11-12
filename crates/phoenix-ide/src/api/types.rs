@@ -379,6 +379,51 @@ pub struct ConversationSearchResponse {
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ProductConversationListResponse {
     pub product_conversations: Vec<ProductConversationListRow>,
+    pub coordinator: Option<CoordinatorListEntryView>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct CoordinatorListEntryView {
+    pub product_conversation_id: String,
+    pub read_state: ProductConversationReadStateView,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(tag = "state", rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationReadStateView {
+    Read,
+    Unread {
+        reason: ProductConversationUnreadReasonView,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationUnreadReasonView {
+    Marked,
+    NewActivity,
+}
+
+impl From<phoenix_db::ProductConversationReadState> for ProductConversationReadStateView {
+    fn from(state: phoenix_db::ProductConversationReadState) -> Self {
+        use phoenix_db::{ProductConversationReadState, ProductConversationUnreadReason};
+        match state {
+            ProductConversationReadState::Read => Self::Read,
+            ProductConversationReadState::Unread(ProductConversationUnreadReason::Marked) => {
+                Self::Unread {
+                    reason: ProductConversationUnreadReasonView::Marked,
+                }
+            }
+            ProductConversationReadState::Unread(ProductConversationUnreadReason::NewActivity) => {
+                Self::Unread {
+                    reason: ProductConversationUnreadReasonView::NewActivity,
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -391,6 +436,7 @@ pub struct ProductConversationListRow {
     pub latest_transcript_row_id: String,
     pub updated_at: String,
     pub presentation: ProductConversationPresentationView,
+    pub read_state: ProductConversationReadStateView,
 }
 
 #[derive(Debug, Clone, Deserialize, TS)]

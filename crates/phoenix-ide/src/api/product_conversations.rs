@@ -16,7 +16,7 @@ use tracing::Instrument;
 
 use super::handlers::AppError;
 use super::types::{
-    AutomaticContinuationView, ConversationHistoryBoundaryView, ConversationHistorySegmentView,
+    AutomaticContinuationView, CoordinatorListEntryView, ProductConversationReadStateView, ConversationHistoryBoundaryView, ConversationHistorySegmentView,
     CoordinatorConversationSnapshotView, OrdinaryProductConversationLifecycleView,
     ProductConversationChainQaCompatibilityView, ProductConversationCloseActionView,
     ProductConversationCloseInspectionView, ProductConversationCloseLossView,
@@ -134,7 +134,8 @@ pub async fn rename_product_conversation(
         .into_iter()
         .find(|projection| projection.product_conversation_id == product_conversation_id)
         .ok_or_else(|| AppError::NotFound(product_conversation_id.to_string()))?;
-    Ok(Json(list_row(&projection)))
+    let read_state = product_read_state(&state, product_conversation_id.as_str()).await?;
+    Ok(Json(list_row(&projection, read_state)))
 }
 pub async fn regenerate_product_conversation_name(
     State(state): State<AppState>,
@@ -227,7 +228,8 @@ pub async fn regenerate_product_conversation_name(
         .into_iter()
         .find(|projection| projection.product_conversation_id == owner_id)
         .ok_or_else(|| AppError::NotFound(owner_id.to_string()))?;
-    Ok(Json(list_row(&projection)))
+    let read_state = product_read_state(&state, owner_id.as_str()).await?;
+    Ok(Json(list_row(&projection, read_state)))
 }
 
 use crate::conversation_actions::{self, normalize_product_conversation_title};
@@ -332,17 +334,87 @@ pub async fn put_coordinator_automatic_continuation(
 pub async fn list_product_conversations(
     State(state): State<AppState>,
 ) -> Result<Json<ProductConversationListResponse>, AppError> {
-    let rows = state
+    let projections = state
         .db
         .list_ordinary_product_conversation_projections()
         .await
-        .map_err(db_to_app)?
+        .map_err(db_to_app)?;
+    let read_states = state
+        .db
+        .list_product_conversation_read_states()
+        .await
+        .map_err(db_to_app)?;
+    let coordinator = read_states
         .iter()
-        .map(list_row)
+        .find(|entry| entry.kind == phoenix_db::ProductConversationKind::Coordinator)
+        .map(|entry| CoordinatorListEntryView {
+            product_conversation_id: entry.product_conversation_id.to_string(),
+            read_state: entry.read_state.into(),
+        });
+    let by_product: std::collections::HashMap<&str, phoenix_db::ProductConversationReadState> = read_states
+        .iter()
+        .map(|entry| (entry.product_conversation_id.as_str(), entry.read_state))
+        .collect();
+    let rows = projections
+        .iter()
+        .map(|projection| {
+            let read_state = by_product
+                .get(projection.product_conversation_id.as_str())
+                .copied()
+                .unwrap_or(phoenix_db::ProductConversationReadState::Read);
+            list_row(projection, read_state)
+        })
         .collect();
     Ok(Json(ProductConversationListResponse {
         product_conversations: rows,
+        coordinator,
     }))
+}
+
+async fn product_read_state(
+    state: &AppState,
+    product_conversation_id: &str,
+) -> Result<phoenix_db::ProductConversationReadState, AppError> {
+    state
+        .db
+        .list_product_conversation_read_states()
+        .await
+        .map_err(db_to_app)?
+        .into_iter()
+        .find(|entry| entry.product_conversation_id.as_str() == product_conversation_id)
+        .map(|entry| entry.read_state)
+        .ok_or_else(|| AppError::NotFound(product_conversation_id.to_owned()))
+}
+
+fn parse_product_conversation_id(reference: &str) -> Result<ProductConversationId, AppError> {
+    ProductConversationId::parse(reference.to_owned())
+        .map_err(|_| AppError::NotFound(reference.to_owned()))
+}
+
+pub async fn mark_product_conversation_read(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+) -> Result<Json<ProductConversationReadStateView>, AppError> {
+    let id = parse_product_conversation_id(&reference)?;
+    state
+        .db
+        .mark_product_conversation_read(&id)
+        .await
+        .map_err(db_to_app)?;
+    Ok(Json(product_read_state(&state, id.as_str()).await?.into()))
+}
+
+pub async fn mark_product_conversation_unread(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+) -> Result<Json<ProductConversationReadStateView>, AppError> {
+    let id = parse_product_conversation_id(&reference)?;
+    state
+        .db
+        .mark_product_conversation_unread(&id)
+        .await
+        .map_err(db_to_app)?;
+    Ok(Json(product_read_state(&state, id.as_str()).await?.into()))
 }
 
 #[derive(Deserialize)]
@@ -754,6 +826,7 @@ mod creation_allowed_actions_tests {
 
 pub(crate) fn list_row(
     projection: &ProductConversationListProjection,
+    read_state: phoenix_db::ProductConversationReadState,
 ) -> ProductConversationListRow {
     ProductConversationListRow {
         product_conversation_id: projection.product_conversation_id.to_string(),
@@ -783,6 +856,7 @@ pub(crate) fn list_row(
             projection.latest_continued_in_conv_id.is_some(),
             &projection.latest_transcript_row_id,
         ),
+        read_state: read_state.into(),
     }
 }
 
@@ -3413,7 +3487,14 @@ mod tests {
             .into_iter()
             .find(|projection| projection.product_conversation_id == root.product_conversation_id)
             .unwrap();
-        assert_eq!(body, serde_json::to_value(list_row(&projection)).unwrap());
+        assert_eq!(
+            body,
+            serde_json::to_value(list_row(
+                &projection,
+                phoenix_db::ProductConversationReadState::Read
+            ))
+            .unwrap()
+        );
         let revision: i64 =
             sqlx::query_scalar("SELECT name_revision FROM conversations WHERE id = ?1")
                 .bind(&root.id)

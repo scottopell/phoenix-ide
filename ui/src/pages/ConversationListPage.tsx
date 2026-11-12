@@ -11,6 +11,7 @@ import {
 import { NewConversationPage } from './NewConversationPage';
 import { beginNewProductConversationIntent } from '../hooks/useCreateConversation';
 import { ConversationList } from '../components/ConversationList';
+import { coordinatorUnread, type CoordinatorUnread } from '../conversation/readState';
 import { EmberEntry } from '../components/EmberEntry';
 import { renamedProductConversationLocation } from '../components/ConversationList.presentation';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -69,6 +70,7 @@ export function ConversationListPage() {
   const { active: conversations, archived: archivedConversations } = useConversationsList();
   const [showArchived, setShowArchived] = useState(false);
   const [productConversations, setProductConversations] = useState<ProductConversationListRow[]>([]);
+  const [coordinatorUnreadState, setCoordinatorUnreadState] = useState<CoordinatorUnread>(null);
   const [productListError, setProductListError] = useState<string | null>(null);
   const [productListRevision, setProductListRevision] = useState(0);
   const productConversationListRevision = useSyncExternalStore(
@@ -461,7 +463,7 @@ export function ConversationListPage() {
     return (
       <div id="app" className="list-page">
         <div className="conversation-list-pinned-header">
-          <EmberEntry onClick={() => navigate('/global')} />
+          <EmberEntry unread={coordinatorUnreadState} onClick={() => navigate('/global')} />
         </div>
         <main className="init-error" data-app-scroll-owner>
           <h2><AlertTriangle />Storage Error</h2>
@@ -523,7 +525,7 @@ export function ConversationListPage() {
                 <button className="btn-primary" disabled title="Loading conversations">+ New</button>
               </div>
             </div>
-              <EmberEntry active={location.pathname === '/global'} onClick={() => navigate('/global')} />
+              <EmberEntry unread={coordinatorUnreadState} active={location.pathname === '/global'} onClick={() => navigate('/global')} />
             </div>
             <ConversationListSkeleton count={5} />
           </section>
@@ -536,6 +538,7 @@ export function ConversationListPage() {
               </div>
             )}
             <ConversationList
+              coordinatorUnread={coordinatorUnreadState}
               conversations={conversations}
               archivedConversations={archivedConversations}
               productConversations={openProductConversations}

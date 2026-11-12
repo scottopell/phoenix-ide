@@ -1,0 +1,50 @@
+.mark-unread-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background-color 150ms ease, color 150ms ease;
+  white-space: nowrap;
+}
+
+.mark-unread-btn:hover:not(:disabled) {
+  color: var(--text-primary);
+}
+
+.mark-unread-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.mark-unread-btn__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  border: 1.5px solid var(--accent-blue);
+}
+
+.mark-unread-btn--marked {
+  color: var(--accent-blue);
+  border-color: var(--accent-blue);
+}
+
+.mark-unread-btn--marked .mark-unread-btn__dot {
+  background: var(--accent-blue);
+}
+
+.mark-unread-btn__error {
+  color: var(--accent-red);
+}
+
+.global-statebar-read-state {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 8px;
+}
