@@ -77,6 +77,10 @@ fn derive_read_state(
 
 impl Database {
     /// Read state for every product conversation, ordinary and Coordinator.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the query fails or a row is malformed.
     pub async fn list_product_conversation_read_states(
         &self,
     ) -> DbResult<Vec<ProductConversationReadStateEntry>> {
@@ -158,6 +162,11 @@ impl Database {
     /// Advance the read cursor to the product's current latest message.
     /// Only [`ProductConversationReadAdvance::Acknowledge`] clears an explicit
     /// unread mark.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::ConversationNotFound`] for an unknown product, or a
+    /// [`DbError`] if the write fails.
     pub async fn mark_product_conversation_read(
         &self,
         product_conversation_id: &ProductConversationId,
@@ -179,7 +188,7 @@ impl Database {
         .bind(product_conversation_id.as_str())
         .bind(clears_mark)
         .execute(&self.pool)
-            .await?;
+        .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(
                 product_conversation_id.as_str().to_owned(),
@@ -189,6 +198,11 @@ impl Database {
     }
 
     /// Explicitly mark the product unread, keeping its read cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::ConversationNotFound`] for an unknown product, or a
+    /// [`DbError`] if the write fails.
     pub async fn mark_product_conversation_unread(
         &self,
         product_conversation_id: &ProductConversationId,
@@ -237,12 +251,24 @@ mod tests {
             .await
             .unwrap();
         let product = conversation.product_conversation_id.clone();
-        assert_eq!(state_of(&db, &product).await, ProductConversationReadState::Read);
+        assert_eq!(
+            state_of(&db, &product).await,
+            ProductConversationReadState::Read
+        );
 
-        db.add_message("u1", &conversation.id, &MessageContent::user("hi"), None, None)
-            .await
-            .unwrap();
-        assert_eq!(state_of(&db, &product).await, ProductConversationReadState::Read);
+        db.add_message(
+            "u1",
+            &conversation.id,
+            &MessageContent::user("hi"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state_of(&db, &product).await,
+            ProductConversationReadState::Read
+        );
 
         db.add_message(
             "a1",
@@ -261,7 +287,10 @@ mod tests {
         db.mark_product_conversation_read(&product, ProductConversationReadAdvance::Acknowledge)
             .await
             .unwrap();
-        assert_eq!(state_of(&db, &product).await, ProductConversationReadState::Read);
+        assert_eq!(
+            state_of(&db, &product).await,
+            ProductConversationReadState::Read
+        );
 
         db.mark_product_conversation_unread(&product).await.unwrap();
         assert_eq!(
@@ -315,7 +344,10 @@ mod tests {
         db.mark_product_conversation_read(&product, ProductConversationReadAdvance::Acknowledge)
             .await
             .unwrap();
-        assert_eq!(state_of(&db, &product).await, ProductConversationReadState::Read);
+        assert_eq!(
+            state_of(&db, &product).await,
+            ProductConversationReadState::Read
+        );
     }
 
     #[tokio::test]
@@ -338,7 +370,10 @@ mod tests {
         db.mark_product_conversation_read(&product, ProductConversationReadAdvance::Observe)
             .await
             .unwrap();
-        assert_eq!(state_of(&db, &product).await, ProductConversationReadState::Read);
+        assert_eq!(
+            state_of(&db, &product).await,
+            ProductConversationReadState::Read
+        );
     }
 
     #[tokio::test]
@@ -346,8 +381,11 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         let missing = ProductConversationId::parse("missing-product").unwrap();
         assert!(matches!(
-            db.mark_product_conversation_read(&missing, ProductConversationReadAdvance::Acknowledge)
-                .await,
+            db.mark_product_conversation_read(
+                &missing,
+                ProductConversationReadAdvance::Acknowledge
+            )
+            .await,
             Err(DbError::ConversationNotFound(_))
         ));
         assert!(matches!(

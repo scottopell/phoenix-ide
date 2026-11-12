@@ -16,22 +16,22 @@ use tracing::Instrument;
 
 use super::handlers::AppError;
 use super::types::{
-    AutomaticContinuationView, CoordinatorListEntryView, ProductConversationReadStateView, ConversationHistoryBoundaryView, ConversationHistorySegmentView,
-    CoordinatorConversationSnapshotView, OrdinaryProductConversationLifecycleView,
-    ProductConversationChainQaCompatibilityView, ProductConversationCloseActionView,
-    ProductConversationCloseInspectionView, ProductConversationCloseLossView,
-    ProductConversationCloseOutcomeView, ProductConversationClosePhaseView,
-    ProductConversationCloseResidualView, ProductConversationCloseRunStatusView,
-    ProductConversationCloseUnavailableReasonView, ProductConversationCloseView,
-    ProductConversationCreationAllowedActionView, ProductConversationCreationRecoveryResponse,
-    ProductConversationCreationRecoveryRow, ProductConversationHandoffView,
-    ProductConversationHistorySnapshotView, ProductConversationLifecycleView,
-    ProductConversationListResponse, ProductConversationListRow,
-    ProductConversationPresentationView, ProductConversationSegmentView,
-    ProductConversationSnapshotMetadataView, ProductConversationSnapshotView,
-    ProductConversationSourceRelationView, ProductConversationSourceView,
-    ProductConversationTranscriptRowView, ProductConversationWorkIdentityView,
-    UpdateAutomaticContinuationRequest,
+    AutomaticContinuationView, ConversationHistoryBoundaryView, ConversationHistorySegmentView,
+    CoordinatorConversationSnapshotView, CoordinatorListEntryView,
+    OrdinaryProductConversationLifecycleView, ProductConversationChainQaCompatibilityView,
+    ProductConversationCloseActionView, ProductConversationCloseInspectionView,
+    ProductConversationCloseLossView, ProductConversationCloseOutcomeView,
+    ProductConversationClosePhaseView, ProductConversationCloseResidualView,
+    ProductConversationCloseRunStatusView, ProductConversationCloseUnavailableReasonView,
+    ProductConversationCloseView, ProductConversationCreationAllowedActionView,
+    ProductConversationCreationRecoveryResponse, ProductConversationCreationRecoveryRow,
+    ProductConversationHandoffView, ProductConversationHistorySnapshotView,
+    ProductConversationLifecycleView, ProductConversationListResponse, ProductConversationListRow,
+    ProductConversationPresentationView, ProductConversationReadStateView,
+    ProductConversationSegmentView, ProductConversationSnapshotMetadataView,
+    ProductConversationSnapshotView, ProductConversationSourceRelationView,
+    ProductConversationSourceView, ProductConversationTranscriptRowView,
+    ProductConversationWorkIdentityView, UpdateAutomaticContinuationRequest,
 };
 use super::AppState;
 use crate::db::{
@@ -351,10 +351,11 @@ pub async fn list_product_conversations(
             product_conversation_id: entry.product_conversation_id.to_string(),
             read_state: entry.read_state.into(),
         });
-    let by_product: std::collections::HashMap<&str, phoenix_db::ProductConversationReadState> = read_states
-        .iter()
-        .map(|entry| (entry.product_conversation_id.as_str(), entry.read_state))
-        .collect();
+    let by_product: std::collections::HashMap<&str, phoenix_db::ProductConversationReadState> =
+        read_states
+            .iter()
+            .map(|entry| (entry.product_conversation_id.as_str(), entry.read_state))
+            .collect();
     let rows = projections
         .iter()
         .map(|projection| {

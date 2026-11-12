@@ -77,8 +77,7 @@ mod product_conversation_read;
 mod product_conversation_read_state;
 pub use product_conversation_read_state::{
     ProductConversationKind, ProductConversationReadAdvance, ProductConversationReadState,
-    ProductConversationReadStateEntry,
-    ProductConversationUnreadReason,
+    ProductConversationReadStateEntry, ProductConversationUnreadReason,
 };
 pub mod retrieval;
 mod sqlite_native_statement;

@@ -408,7 +408,9 @@ pub struct MarkProductConversationReadRequest {
     pub kind: ProductConversationReadAdvanceRequestKind,
 }
 
-impl From<ProductConversationReadAdvanceRequestKind> for phoenix_db::ProductConversationReadAdvance {
+impl From<ProductConversationReadAdvanceRequestKind>
+    for phoenix_db::ProductConversationReadAdvance
+{
     fn from(kind: ProductConversationReadAdvanceRequestKind) -> Self {
         match kind {
             ProductConversationReadAdvanceRequestKind::Acknowledged => Self::Acknowledge,
