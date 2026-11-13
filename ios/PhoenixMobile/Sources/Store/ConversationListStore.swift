@@ -51,6 +51,13 @@ final class ConversationListStore {
     private var upsertsDuringRefresh: [String: Conversation] = [:]
     /// Aggregate identities removed or archived after the current full refresh began.
     private var exclusionsDuringRefresh: Set<String> = []
+    /// Read-state changes applied after the current full refresh began,
+    /// keyed by aggregate identity; they win over the refresh's older values.
+    private var readStatesDuringRefresh: [String: ProductConversationReadState] = [:]
+    /// Bumped by every local read-state change; an external page fetched
+    /// before a change keeps that aggregate's local value.
+    private var readStateGeneration = 0
+    private var readStateChangedAt: [String: Int] = [:]
 
     init() {
         if let cache = DiskStore.loadVersioned(
@@ -82,6 +89,7 @@ final class ConversationListStore {
                 refreshToken = nil
                 upsertsDuringRefresh.removeAll()
                 exclusionsDuringRefresh.removeAll()
+                readStatesDuringRefresh.removeAll()
             }
         }
         let startedGeneration = generation
@@ -101,8 +109,10 @@ final class ConversationListStore {
                 fresh,
                 preserving: missingProvisioningShells.merging(upsertsDuringRefresh) { _, upsert in upsert },
                 excluding: exclusionsDuringRefresh))
-            readStates = page.readStates
-            coordinatorReadState = page.coordinator
+            adoptAnnotations(from: page)
+            for (aggregateId, state) in readStatesDuringRefresh {
+                setReadState(state, forAggregateId: aggregateId)
+            }
             lastError = nil
         } catch {
             guard generation == startedGeneration else { return }
@@ -275,10 +285,13 @@ final class ConversationListStore {
     /// is in flight; the generation guard semantics match refresh().
     struct ExternalRefreshToken: Equatable {
         fileprivate let generation: Int
+        fileprivate let readStateGeneration: Int
     }
 
     func externalRefreshToken() -> ExternalRefreshToken {
-        ExternalRefreshToken(generation: externalMutationGeneration)
+        ExternalRefreshToken(
+            generation: externalMutationGeneration,
+            readStateGeneration: readStateGeneration)
     }
 
     func canApplyExternal(startedAt token: ExternalRefreshToken) -> Bool {
@@ -289,6 +302,7 @@ final class ConversationListStore {
     func applyExternal(
         _ fresh: [Conversation],
         preserving localRows: [Conversation] = [],
+        annotations page: PhoenixAPI.ConversationListPage? = nil,
         startedAt token: ExternalRefreshToken
     ) -> Bool {
         guard canApplyExternal(startedAt: token) else { return false }
@@ -296,8 +310,24 @@ final class ConversationListStore {
             ($0.aggregateIdentity, $0)
         })
         apply(Self.merging(fresh, preserving: preservedByAggregate))
+        if let page {
+            let localChanges = readStateChangedAt
+                .filter { $0.value > token.readStateGeneration }
+                .map { ($0.key, readState(forAggregateId: $0.key)) }
+            adoptAnnotations(from: page)
+            for (aggregateId, state) in localChanges {
+                setReadState(state, forAggregateId: aggregateId)
+            }
+        }
         lastError = nil
         return true
+    }
+
+    /// Server-derived per-row state (read state) that travels with a list page
+    /// but is not part of the persisted `Conversation` cache.
+    private func adoptAnnotations(from page: PhoenixAPI.ConversationListPage) {
+        readStates = page.readStates
+        coordinatorReadState = page.coordinator
     }
 
     /// Merge a single updated conversation (e.g. after creation or an SSE
@@ -419,6 +449,7 @@ final class ConversationListStore {
         externalMutationGeneration += 1
         upsertsDuringRefresh.removeAll()
         exclusionsDuringRefresh.removeAll()
+        readStatesDuringRefresh.removeAll()
         conversations = []
         transcriptToAggregate = [:]
         aggregateToCachedTranscript = [:]
@@ -426,6 +457,7 @@ final class ConversationListStore {
         lastError = nil
         readStates = [:]
         coordinatorReadState = nil
+        readStateChangedAt = [:]
     }
 
     func readState(forAggregateId aggregateId: String) -> ProductConversationReadState {
@@ -436,6 +468,9 @@ final class ConversationListStore {
     }
 
     func setReadState(_ state: ProductConversationReadState, forAggregateId aggregateId: String) {
+        if isRefreshing { readStatesDuringRefresh[aggregateId] = state }
+        readStateGeneration += 1
+        readStateChangedAt[aggregateId] = readStateGeneration
         if coordinatorReadState?.product_conversation_id == aggregateId {
             coordinatorReadState?.read_state = state
         } else {

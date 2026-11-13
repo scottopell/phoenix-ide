@@ -261,16 +261,18 @@ struct ConversationListView: View {
                     }
                     .accessibilityIdentifier("conversationList.row.\(conversation.aggregateIdentity)")
                     .swipeActions(edge: .leading, allowsFullSwipe: true) {
-                        let unread = model.listStore.readState(forAggregateId: conversation.aggregateIdentity) != .read
-                        Button {
-                            Task { await model.setUnread(!unread, productConversationId: conversation.aggregateIdentity) }
-                        } label: {
-                            unread
-                                ? Label("Read", systemImage: "circle")
-                                : Label("Unread", systemImage: "circle.fill")
+                        if let productConversationId = conversation.product_conversation_id {
+                            let unread = model.listStore.readState(forAggregateId: productConversationId) != .read
+                            Button {
+                                Task { await model.setUnread(!unread, productConversationId: productConversationId) }
+                            } label: {
+                                unread
+                                    ? Label("Read", systemImage: "circle")
+                                    : Label("Unread", systemImage: "circle.fill")
+                            }
+                            .tint(.blue)
+                            .disabled(!model.connectivity.isOnline)
                         }
-                        .tint(.blue)
-                        .disabled(!model.connectivity.isOnline)
                     }
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                         if !isCoordinator && conversation.archived == true {

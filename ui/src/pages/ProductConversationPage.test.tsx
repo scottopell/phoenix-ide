@@ -259,6 +259,7 @@ vi.mock('../api', async () => {
       getProductConversationAutomaticContinuation: vi.fn(),
       updateProductConversationAutomaticContinuation: vi.fn(),
       reportProductConversationOpen: vi.fn().mockResolvedValue(undefined),
+      listProductConversations: vi.fn().mockResolvedValue({ product_conversations: [], coordinator: null }),
       markProductConversationRead: vi.fn().mockResolvedValue({ state: 'read' }),
       markProductConversationUnread: vi.fn().mockResolvedValue({ state: 'unread', reason: 'marked' }),
       getPrStatus: vi.fn(),

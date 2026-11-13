@@ -935,7 +935,8 @@ final class AppModel {
         let startedNudgeGeneration = nudgePreferenceGeneration
         let startedEvidenceGeneration = attentionEvidenceGeneration
         let listToken = listStore.externalRefreshToken()
-        guard let fresh = try? await api.listConversations() else { return false }
+        guard let page = try? await api.listConversationPage() else { return false }
+        let fresh = page.conversations
         let provisioningShells = await listStore.confirmedMissingProvisioningShellRows(
             api: api,
             fresh: fresh)
@@ -947,6 +948,7 @@ final class AppModel {
               listStore.applyExternal(
                 fresh,
                 preserving: provisioningShells,
+                annotations: page,
                 startedAt: listToken)
         else { return false }
         let isCurrent: @MainActor () -> Bool = { [weak self] in
@@ -1912,6 +1914,7 @@ final class AppModel {
 
     private func applyAggregateListForReconciliation(
         _ fresh: [Conversation],
+        annotations page: PhoenixAPI.ConversationListPage? = nil,
         startedAt token: ConversationListStore.ExternalRefreshToken,
         startedGeneration: Int,
         reconciliationId: UUID
@@ -1935,6 +1938,7 @@ final class AppModel {
         return listStore.applyExternal(
             fresh,
             preserving: provisioningShells,
+            annotations: page,
             startedAt: token)
     }
 
@@ -1954,9 +1958,11 @@ final class AppModel {
             attempt: { [weak self] in
                 guard let self else { return nil }
                 let token = self.listStore.externalRefreshToken()
-                let fresh = try await api.listConversations()
+                let page = try await api.listConversationPage()
+                let fresh = page.conversations
                 guard await self.applyAggregateListForReconciliation(
                     fresh,
+                    annotations: page,
                     startedAt: token,
                     startedGeneration: startedGeneration,
                     reconciliationId: reconciliationId)

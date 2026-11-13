@@ -31,15 +31,24 @@ export function useAutoMarkProductConversationRead(
   latestMessageId: string | null | undefined,
 ): void {
   const acknowledgedRef = useRef<string | null>(null);
+  /** Latest message id the cursor was last advanced while viewing. */
+  const advancedThroughRef = useRef<string | null | undefined>(undefined);
+  const latestRef = useRef(latestMessageId);
+  latestRef.current = latestMessageId;
   const timerRef = useRef<number | null>(null);
 
   const advance = useRef((id: string) => {
     if (!userIsLooking()) return;
-    const kind = acknowledgedRef.current === id ? 'observed' : 'acknowledged';
+    const acknowledged = acknowledgedRef.current === id;
+    // Nothing new since the last advance: another request would be a no-op.
+    if (acknowledged && advancedThroughRef.current === latestRef.current) return;
+    const kind = acknowledged ? 'observed' : 'acknowledged';
     acknowledgedRef.current = id;
+    advancedThroughRef.current = latestRef.current;
     void api.markProductConversationRead(id, kind)
       .then(() => notifyProductConversationListMayHaveChanged())
       .catch(() => {
+        advancedThroughRef.current = undefined;
         if (kind === 'acknowledged' && acknowledgedRef.current === id) acknowledgedRef.current = null;
       });
   }).current;
@@ -47,6 +56,7 @@ export function useAutoMarkProductConversationRead(
   useEffect(() => {
     if (!productConversationId) return;
     acknowledgedRef.current = null;
+    advancedThroughRef.current = undefined;
     advance(productConversationId);
     const handleAttention = () => advance(productConversationId);
     document.addEventListener('visibilitychange', handleAttention);

@@ -47,4 +47,19 @@ final class ProductConversationReadStateTests: XCTestCase {
         store.setReadState(.unread(.marked), forAggregateId: "product")
         XCTAssertEqual(store.readState(forAggregateId: "product"), .unread(.marked))
     }
+
+    @MainActor
+    func testExternalPageKeepsReadChangesMadeAfterItWasFetched() {
+        let store = ConversationListStore()
+        store.reset()
+        let token = store.externalRefreshToken()
+        store.setReadState(.unread(.marked), forAggregateId: "changed")
+        let page = PhoenixAPI.ConversationListPage(
+            conversations: [],
+            readStates: ["changed": .read, "other": .unread(.newActivity)],
+            coordinator: nil)
+        XCTAssertTrue(store.applyExternal([], annotations: page, startedAt: token))
+        XCTAssertEqual(store.readState(forAggregateId: "changed"), .unread(.marked))
+        XCTAssertEqual(store.readState(forAggregateId: "other"), .unread(.newActivity))
+    }
 }
