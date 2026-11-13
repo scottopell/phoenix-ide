@@ -61,10 +61,15 @@ struct ConversationListView: View {
                         "Conversation deleted",
                         systemImage: "trash",
                         description: Text("This Product History is no longer available."))
-                } else if let history = model.listStore.conversations.first(where: {
-                    $0.archived == true && $0.aggregateIdentity == conversationId
+                } else if let conversation = model.listStore.conversations.first(where: {
+                    $0.aggregateIdentity == conversationId
+                        && $0.product_conversation_id != nil
+                        && !$0.isCoordinator
                 }) {
-                    ProductHistoryView(productConversationId: history.aggregateIdentity)
+                    ProductConversationDetailView(
+                        productConversationId: conversation.aggregateIdentity,
+                        historyOnly: conversation.archived == true,
+                        fallbackTranscriptRowId: model.navigationConversationId(for: conversation))
                 } else if let session = model.session(for: conversationId) {
                     ConversationView(session: session)
                 } else {
@@ -223,7 +228,8 @@ struct ConversationListView: View {
                 }
                 ForEach(Self.ordinaryRows(from: model.listStore.conversations, coordinatorConversationId: model.coordinatorConversationId), id: \.aggregateIdentity) { conversation in
                     let transcriptRowId = conversation.transcriptRowIdentity
-                    let navigationId = conversation.archived == true
+                    let navigationId = conversation.product_conversation_id != nil
+                        && !conversation.isCoordinator
                         ? conversation.aggregateIdentity
                         : model.navigationConversationId(for: conversation)
                     let isCoordinator = conversation.isCoordinator
@@ -407,11 +413,25 @@ struct ProductHistoryCachePresentation {
 struct ProductHistoryLoadKey: Equatable {
     var productConversationId: String
     var isOnline: Bool
+    var fallbackTranscriptRowId = ""
+    var historyOnly = false
 }
 
-private struct ProductHistoryView: View {
+enum ProductConversationDetailPolicy {
+    static func delegateTranscriptRowId(
+        snapshot: ProductConversationSnapshot,
+        historyOnly: Bool
+    ) -> String? {
+        guard !historyOnly, snapshot.ordinary_lifecycle == .open else { return nil }
+        return snapshot.writable_transcript_row_id ?? snapshot.latest_transcript_row_id
+    }
+}
+
+private struct ProductConversationDetailView: View {
     @Environment(AppModel.self) private var model
     let productConversationId: String
+    let historyOnly: Bool
+    let fallbackTranscriptRowId: String
     @State private var cached: CachedProductHistory?
     @State private var error: ProductHistoryLoadError?
     @State private var onlineRefreshSucceeded = false
@@ -431,16 +451,15 @@ private struct ProductHistoryView: View {
             }
             Group {
                 if let cached {
-                    List(cached.snapshot.segments, id: \.segment_ordinal) { segment in
-                        Section(segment.title ?? segment.slug ?? "Conversation") {
-                            ForEach(segment.messages, id: \.id) { message in
-                                MessageView(message: message)
-                            }
-                            if let handoff = segment.handoff {
-                                ProductHistoryHandoffView(handoff: handoff)
-                            }
-                        }
-                    }
+                    let delegate = delegateSession(for: cached.snapshot)
+                    ProductConversationTranscript(
+                        snapshot: cached.snapshot,
+                        delegate: delegate)
+                        .id(delegate?.conversationId)
+                } else if !historyOnly,
+                          !model.connectivity.isOnline,
+                          let session = model.session(for: fallbackTranscriptRowId) {
+                    ConversationView(session: session)
                 } else if error == .notFound {
                     ContentUnavailableView(
                         "Conversation deleted",
@@ -458,7 +477,9 @@ private struct ProductHistoryView: View {
         }
         .task(id: ProductHistoryLoadKey(
             productConversationId: productConversationId,
-            isOnline: model.connectivity.isOnline)
+            isOnline: model.connectivity.isOnline,
+            fallbackTranscriptRowId: fallbackTranscriptRowId,
+            historyOnly: historyOnly)
         ) {
             if cached == nil {
                 cached = model.cachedProductHistory(productConversationId: productConversationId)
@@ -487,6 +508,14 @@ private struct ProductHistoryView: View {
         }
     }
 
+    private func delegateSession(for snapshot: ProductConversationSnapshot) -> ConversationSession? {
+        guard let transcriptRowId = ProductConversationDetailPolicy.delegateTranscriptRowId(
+            snapshot: snapshot,
+            historyOnly: historyOnly)
+        else { return nil }
+        return model.session(for: transcriptRowId)
+    }
+
     private func cacheAgeNote(at now: Date) -> String? {
         guard let cached,
               ProductHistoryCachePresentation.shouldShowAge(
@@ -499,5 +528,75 @@ private struct ProductHistoryView: View {
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .abbreviated
         return "Cached \(formatter.localizedString(for: fetchedAt, relativeTo: now))"
+    }
+}
+
+
+struct ProductConversationTranscript: View {
+    let snapshot: ProductConversationSnapshot
+    let delegate: ConversationSession?
+    @State private var draft = ""
+
+    var body: some View {
+        VStack(spacing: 0) {
+            List(snapshot.segments, id: \.segment_ordinal) { segment in
+                Section(segment.title ?? segment.slug ?? "Conversation") {
+                    let messages = messages(for: segment)
+                    if messages.isEmpty {
+                        Text("No messages")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        let toolIndex = ConversationSession.toolUseIndex(for: messages)
+                        ForEach(messages) { message in
+                            MessageView(message: message, toolIndex: toolIndex)
+                        }
+                    }
+                    if segment.transcript_row_id == delegate?.conversationId,
+                       let delegate,
+                       !delegate.streamingText.isEmpty {
+                        StreamingBubble(text: delegate.streamingText)
+                    }
+                    if let handoff = segment.handoff {
+                        ProductHistoryHandoffView(handoff: handoff)
+                    }
+                }
+            }
+            .listStyle(.plain)
+            .accessibilityIdentifier("product-conversation-history")
+
+            if let delegate {
+                OutboxSection(
+                    session: delegate,
+                    authoritativeMessageIds: authoritativeMessageIds(for: delegate))
+                StateDetailView(session: delegate)
+                ComposerView(session: delegate, draft: $draft)
+            }
+        }
+        .navigationTitle(snapshot.canonical_root.title ?? "Conversation")
+        .navigationBarTitleDisplayMode(.inline)
+        .alert("Action failed", isPresented: Binding(
+            get: { delegate?.lastErrorToast != nil },
+            set: { if !$0 { delegate?.clearErrorToast() } }
+        )) {
+            Button("OK") { delegate?.clearErrorToast() }
+        } message: {
+            Text(delegate?.lastErrorToast ?? "")
+        }
+        .onAppear { delegate?.start() }
+        .onDisappear { delegate?.closeView() }
+    }
+
+    private func authoritativeMessageIds(for delegate: ConversationSession) -> Set<String> {
+        let snapshotIds = snapshot.segments
+            .first(where: { $0.transcript_row_id == delegate.conversationId })?
+            .messages.map(\.message_id) ?? []
+        return Set(snapshotIds).union(delegate.messages.map(\.message_id))
+    }
+
+    private func messages(for segment: ProductConversationSegment) -> [Message] {
+        guard segment.transcript_row_id == delegate?.conversationId, let delegate else {
+            return segment.messages
+        }
+        return AppModel.composedMessages(snapshot: segment.messages, live: delegate.messages)
     }
 }
