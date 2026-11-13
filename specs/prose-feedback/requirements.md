@@ -435,7 +435,7 @@ Task approval and fork-proposal review SHALL remain purpose-built decision surfa
 WHEN the user selects non-empty rendered text wholly within one finalized assistant message
 AND the conversation has an eligible current message draft
 AND the selection uses a fine pointer or keyboard
-THE SYSTEM SHALL immediately show a single-line reaction pill near the selection
+THE SYSTEM SHALL immediately show an initially single-line reaction pill near the selection
 AND SHALL preserve the selected text and stable source-message identity when the input receives focus
 AND SHALL NOT focus the input merely because text was selected.
 
@@ -448,7 +448,10 @@ AND SHALL NOT open the software keyboard merely because text was selected.
 THE SYSTEM SHALL leave native selection, selection handles, copying, context menus, and scrolling available
 AND SHALL exclude editable fields, tool interfaces, streaming content, and selections spanning messages from reaction entry.
 
-THE SYSTEM SHALL keep the reaction input one line tall with horizontally scrolling overflow and explicit Add to draft and dismiss controls.
+THE SYSTEM SHALL wrap reaction text and grow the input vertically as soon as it exceeds the visible line width
+AND SHALL shrink the input when text is removed
+AND SHALL bound its height to fit the visible viewport, using vertical scrolling for longer reactions
+AND SHALL provide explicit Add to draft and dismiss controls.
 
 WHEN the selected passage leaves the transcript viewport or its row unmounts
 THE SYSTEM SHALL retain an unfinished reaction in a compact dock with a reaction preview and Return to passage action.

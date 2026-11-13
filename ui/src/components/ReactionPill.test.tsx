@@ -119,7 +119,6 @@ describe('reaction pill', () => {
   it('restores the exact passage through DOM remount and returns without focusing the input', async () => {
     const view = render(<Fixture />);
     expect(restoreReactionRange(source)?.toString()).toBe('second');
-    expect(screen.getByRole('textbox')).toHaveAttribute('type', 'text');
     expect(screen.getByRole('textbox')).not.toHaveFocus();
     view.rerender(<Fixture mounted={false} />);
     const dock = await screen.findByRole('button', { name: /Return to passage/ });
@@ -233,7 +232,7 @@ describe('reaction pill', () => {
     expect(scroller.style.getPropertyValue('--reaction-dock-height')).toBe('');
   });
 
-  it('automatically undocks on manual return and preserves the same one-line editor for long text', async () => {
+  it('automatically undocks on manual return and preserves long reaction text', async () => {
     const body = 'A detailed reaction '.repeat(40);
     render(<Fixture body={body} />);
     offscreen = true;
@@ -243,7 +242,6 @@ describe('reaction pill', () => {
     fireEvent.scroll(window);
     const input = await screen.findByRole('textbox');
     expect(input).toHaveValue(body);
-    expect(input.tagName).toBe('INPUT');
     fireEvent.keyDown(input, { key: 'Enter' });
     expect(add).not.toHaveBeenCalled();
     fireEvent.keyDown(input, { key: 'Enter', metaKey: true, isComposing: true });

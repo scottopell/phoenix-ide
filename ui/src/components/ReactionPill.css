@@ -16,19 +16,28 @@
 
 .reaction-pill[hidden] { display: none; }
 
-.reaction-pill input {
+.reaction-pill textarea {
   flex: 1;
+  box-sizing: border-box;
   min-width: 0;
   width: 0;
-  height: 36px;
-  padding: 0 4px;
+  min-height: 36px;
+  max-height: min(240px, 40dvh);
+  padding: 8px 4px;
   border: 0;
   background: transparent;
   color: inherit;
   font: inherit;
+  line-height: 20px;
+  field-sizing: content;
+  resize: none;
+  overflow-x: hidden;
+  overflow-wrap: anywhere;
 }
 
-.reaction-pill input:focus { outline: none; }
+.reaction-pill textarea:placeholder-shown { white-space: pre; }
+
+.reaction-pill textarea:focus { outline: none; }
 
 .reaction-pill:focus-within { border-color: var(--text-secondary); }
 
@@ -90,9 +99,11 @@
 }
 
 @media (any-pointer: coarse), (width <= 768px) {
-  .reaction-pill input {
-    height: 44px;
+  .reaction-pill textarea {
+    min-height: 44px;
+    padding-block: 10px;
     font-size: 16px;
+    line-height: 24px;
   }
 
   .reaction-pill button {

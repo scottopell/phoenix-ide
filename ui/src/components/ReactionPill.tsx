@@ -26,7 +26,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       onSourceReturnStateChange?.(false);
     };
   }, [source, onSourceReturnStateChange]);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     if ((sourceDocked && !touchDocked && available) || discard || hidden) return;
@@ -265,9 +265,9 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
               ) : (
                 <span className="reaction-pill-source" title={available ? source.quote : `${source.quote} · Draft unavailable. Reaction retained.`}>“{source.quote}”{available ? '' : ' · draft unavailable; retained'}</span>
               ))}
-              <input
+              <textarea
                 ref={inputRef}
-                type="text"
+                rows={1}
                 aria-label="Your reaction"
                 placeholder={touchDocked ? 'React to selection…' : 'Your reaction… (Enter to focus)'}
                 title={available ? source.quote : 'Draft unavailable. Your reaction is retained.'}
