@@ -1,4 +1,4 @@
-# ADR-251: Server-side read cursor per ProductConversation
+# ADR-252: Server-side read cursor per ProductConversation
 
 - **Status:** Accepted
 - **Date:** 2026-11-12
