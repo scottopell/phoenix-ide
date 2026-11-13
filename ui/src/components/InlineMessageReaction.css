@@ -1,3 +1,8 @@
+.agent-text-block::highlight(phoenix-pending-annotations) {
+  background-color: rgb(245 180 40 / 32%);
+  color: inherit;
+}
+
 .inline-reaction-notice:not(:empty) {
   position: fixed;
   z-index: 950;

@@ -448,6 +448,10 @@ AND SHALL NOT open the software keyboard merely because text was selected.
 THE SYSTEM SHALL leave native selection, selection handles, copying, context menus, and scrolling available
 AND SHALL exclude editable fields, tool interfaces, streaming content, and selections spanning messages from reaction entry.
 
+WHILE a passage has an open reaction or an annotation in the current message draft
+THE SYSTEM SHALL visibly highlight that exact passage independently of native text-selection focus
+AND SHALL restore the highlight when the source passage mounts after transcript virtualization.
+
 THE SYSTEM SHALL wrap reaction text and grow the input vertically as soon as it exceeds the visible line width
 AND SHALL shrink the input when text is removed
 AND SHALL bound its height to fit the visible viewport, using vertical scrolling for longer reactions
@@ -470,10 +474,26 @@ AND SHALL keep the touch/coarse-pointer dock directly above the current composer
 ### REQ-PF-019: Add Reaction to Draft
 
 WHEN the user activates Add to draft with a non-blank reaction
-THE SYSTEM SHALL append the complete selected quotation, its source identity, and the reaction to the current draft exactly once
+THE SYSTEM SHALL add one annotation card owning the complete selected quotation, its source identity, and the reaction to the current draft exactly once
 AND SHALL preserve existing draft text, including intervening edits and whitespace
-AND SHALL isolate quoted content from surrounding Markdown delimiters
 AND SHALL NOT submit a message, write to the clipboard, or modify the review-note collection.
+
+THE SYSTEM SHALL allow editing an annotation's comment in its composer card while keeping its source passage fixed
+AND SHALL allow returning from the card to the exact source passage through transcript navigation.
+
+WHEN an annotation card is removed
+THE SYSTEM SHALL remove that annotation and its source highlight together without changing unrelated draft text or annotations.
+
+WHEN the user submits the message
+THE SYSTEM SHALL format the submitted annotation cards with their source identities and complete quotations alongside ordinary message text
+AND SHALL isolate quoted content from surrounding Markdown delimiters
+AND SHALL retain the submitted cards and highlights until submission is accepted by the ordinary message-delivery path.
+
+WHEN submission is accepted
+THE SYSTEM SHALL clear only the submitted annotation cards and their highlights, preserving annotations and text added during submission.
+
+WHEN submission fails before message-delivery ownership is accepted
+THE SYSTEM SHALL retain the annotations and highlights and make the comments editable again.
 
 WHEN append succeeds
 THE SYSTEM SHALL dismiss and clear the reaction input and acknowledge the addition accessibly
@@ -506,7 +526,7 @@ THE SYSTEM SHALL offer an inline Keep and Discard confirmation within the pill's
 AND SHALL preserve the pill's position when showing or canceling that confirmation
 AND Escape SHALL resolve that local interaction before any enclosing navigation.
 
-Temporary reactions are session-local; refresh recovery and cross-device synchronization are not guaranteed. Appended text follows the ordinary message draft's persistence contract.
+Temporary reactions and annotation cards are session-local; refresh recovery and cross-device synchronization are not guaranteed. Ordinary draft text follows its own persistence contract.
 
 ### REQ-PF-021: Touch Access to Message Review
 

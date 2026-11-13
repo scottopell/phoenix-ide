@@ -1,5 +1,6 @@
 import { RoutedStore } from './RoutedStore';
 import type { FileAttachment, ImageData } from '../api';
+import { AnnotationDraftStore } from './AnnotationDraftStore';
 
 export interface RejectedSubmission {
   id: string;
@@ -81,6 +82,7 @@ export function draftReducer(atom: DraftAtom, action: DraftAction): DraftAtom {
 }
 
 export class DraftStore extends RoutedStore<string, DraftAtom, DraftAction> {
+  readonly annotations = new AnnotationDraftStore();
   private readonly rejected = new Map<string, readonly RejectedSubmission[]>();
   private readonly recoveries = new Map<string, DraftRecovery>();
   private readonly invalidRevision: DraftRevision = { draft: '' };
@@ -135,6 +137,7 @@ export class DraftStore extends RoutedStore<string, DraftAtom, DraftAction> {
    * separately at the cascade site.
    */
   remove(slug: string): void {
+    this.annotations.remove(slug);
     this.recoveries.delete(slug);
     this.rejected.delete(slug);
     this.removeAtom(slug);

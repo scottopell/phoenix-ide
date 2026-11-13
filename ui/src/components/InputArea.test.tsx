@@ -52,13 +52,14 @@ function RecoveryHarness({ send, scope = 'a', initialDraft = '  @missing.ts\n', 
     onSend={send} onCancel={() => {}} onRetry={() => {}} />;
 }
 
-function ConnectedRecoveryHarness({ store, send, scope = 'a' }: {
+function ConnectedRecoveryHarness({ store, send, scope = 'a', initialFiles = [rejectedFile] }: {
   store: DraftStore;
   send: (text: string, images: ImageData[], files: FileAttachment[]) => Promise<void>;
   scope?: string;
+  initialFiles?: FileAttachment[];
 }) {
   const [images, setImages] = useState<ImageData[]>([]);
-  const [files, setFiles] = useState<FileAttachment[]>([rejectedFile]);
+  const [files, setFiles] = useState<FileAttachment[]>(initialFiles);
   return <DraftContext.Provider value={store}>
     <button onClick={() => setFiles([{ ...rejectedFile, original_name: 'new.txt', stored_path: '/uploads/a/new.txt' }])}>Attach newer file</button>
     <ConnectedInputArea slug={scope} cwd={undefined} scopeKey={scope} convState={idleState}
@@ -70,6 +71,61 @@ function ConnectedRecoveryHarness({ store, send, scope = 'a' }: {
 async function rejectExpansion(pending: ReturnType<typeof deferredSend>) {
   await act(async () => pending.reject(new ExpansionError({ error: 'Missing file', error_type: 'file_not_found', reference: '@missing.ts' })));
 }
+
+describe('editable annotation cards', () => {
+  const source = { messageId: 'answer', sequenceId: 2, occurrenceToken: 'earlier:answer', quote: 'Selected passage' };
+
+  it('submits edited comments and preserves new draft work while that submission completes', async () => {
+    const store = new DraftStore();
+    store.dispatch('a', { type: 'set_draft', text: 'General feedback' });
+    const annotations = store.annotations.forScope('a');
+    annotations.add({ source, body: 'Original comment' });
+    let complete!: () => void;
+    const send = vi.fn(() => new Promise<void>(resolve => { complete = resolve; }));
+    render(<ConnectedRecoveryHarness store={store} send={send} />);
+    fireEvent.change(screen.getByRole('textbox', { name: 'Annotation 1 comment' }), { target: { value: 'Edited in composer' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    expect(send).toHaveBeenCalledWith('General feedback\n\nRegarding message #2 (earlier:answer):\n\n```text\nSelected passage\n```\n\nEdited in composer', [], [rejectedFile], { restoreOnFailure: true });
+    expect(screen.getByRole('textbox', { name: 'Annotation 1 comment' })).toBeDisabled();
+    act(() => {
+      annotations.add({ source, body: 'Next annotation' });
+      store.dispatch('a', { type: 'set_draft', text: 'Next message' });
+    });
+    await act(async () => complete());
+    expect(annotations.getSnapshot().map(item => item.body)).toEqual(['Next annotation']);
+    expect(store.getSnapshot('a').draft).toBe('Next message');
+  });
+
+  it('retains editable cards and restores ordinary text when submission fails', async () => {
+    const store = new DraftStore();
+    store.dispatch('a', { type: 'set_draft', text: 'General feedback' });
+    const annotations = store.annotations.forScope('a');
+    annotations.add({ source, body: 'Retain me' });
+    const pending = deferredSend();
+    render(<ConnectedRecoveryHarness store={store} send={pending.send} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    await act(async () => pending.reject(new Error('Offline during submission')));
+    expect(store.getSnapshot('a').draft).toBe('General feedback');
+    expect(screen.getByRole('textbox', { name: 'Annotation 1 comment' })).toBeEnabled();
+    expect(screen.getByRole('textbox', { name: 'Annotation 1 comment' })).toHaveValue('Retain me');
+    expect(annotations.getSnapshot()[0]!.submission).toBeNull();
+  });
+
+  it('supports annotation-only messages and removal without changing ordinary draft text', async () => {
+    const store = new DraftStore();
+    const annotations = store.annotations.forScope('a');
+    annotations.add({ source, body: 'Only annotation' });
+    const send = vi.fn().mockResolvedValue(undefined);
+    render(<ConnectedRecoveryHarness store={store} send={send} initialFiles={[]} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Remove annotation 1' }));
+    expect(annotations.getSnapshot()).toEqual([]);
+    act(() => annotations.add({ source, body: 'Only annotation' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    await waitFor(() => expect(annotations.getSnapshot()).toEqual([]));
+    expect(send.mock.calls[0]![0]).toContain('Only annotation');
+    expect(store.getSnapshot('a').draft).toBe('');
+  });
+});
 
 describe('InputArea rejected submission ownership', () => {
   it('restores raw text and attachments to an untouched cleared composer', async () => {

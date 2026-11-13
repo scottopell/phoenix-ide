@@ -36,7 +36,9 @@ import {
   findHistoricalUnitIndexByMessageId,
 } from '../conversation/renderUnits';
 import { ConnectedInputArea } from '../components/InputArea';
-import type { ComposerQuickAction, InputAreaHandle } from '../components/InputArea';
+import { useAnnotationDraft } from '../hooks/useDraft';
+import type { AnnotationDraft } from '../conversation/AnnotationDraftStore';
+import type { ComposerQuickAction, ComposerSendOptions, InputAreaHandle } from '../components/InputArea';
 import type { TerminalPanelStatus } from '../components/TerminalPanel';
 import { ExploreOnboardingBanner } from '../components/ExploreOnboardingBanner';
 import { MessageListSkeleton } from '../components/Skeleton';
@@ -190,7 +192,8 @@ export interface EmbeddedConversationProjection {
   onCancelSteering: (localId: string) => void;
   onOpenFile: (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void;
   appendReviewNotesToComposer?: ((formattedNotes: string) => void) | undefined;
-  appendInlineReactionToComposer?: ((text: string) => void) | undefined;
+  annotationDraft: AnnotationDraft;
+  canAnnotate: boolean;
   filePathRootDir: string;
   systemPrompt?: string | undefined;
   modelContextWindow?: number | undefined;
@@ -517,6 +520,7 @@ function ConversationPageContent({
   const isDesktop = useIsDesktop();
 
   const { setDraftIfEmpty: setDraftIfEmptyCb, appendDraft: appendDraftCb } = useDraftActions(slug!);
+  const annotationDraft = useAnnotationDraft(slug!);
 
   // Monotonic focus-request counter. Any time we mutate the draft from
   // outside the textarea (terminal selection, prose-reader notes, retry,
@@ -1277,8 +1281,8 @@ function ConversationPageContent({
       imgs: { data: string; media_type: string }[] = [],
       files: FileAttachment[] = []
     ) => {
-      if (!conversationId) return;
-      if (isArchived) return;
+      if (!conversationId) return false;
+      if (isArchived) return false;
 
       sendingMessagesRef.current.add(localId);
 
@@ -1348,6 +1352,7 @@ function ConversationPageContent({
             status: 'pending',
           });
         }
+        return true;
       } catch (err) {
         if (err instanceof ExpansionError) {
           // Don't mark as failed — InputArea restores the draft and shows
@@ -1362,6 +1367,7 @@ function ConversationPageContent({
         console.error('Failed to send message:', err);
         markFailedRef.current(localId);
         rollbackOptimisticPhase();
+        return false;
       } finally {
         if (
           optimisticPhaseOwner
@@ -1406,17 +1412,21 @@ function ConversationPageContent({
     }
   }, [isConnected, conversationId, isArchived, localPendingMessages]);
 
-  const handleSend = useCallback(async (text: string, attachedImages: ImageData[], attachedFiles: FileAttachment[] = []) => {
-    if (!conversationId || isArchived) return;
+  const handleSend = useCallback(async (text: string, attachedImages: ImageData[], attachedFiles: FileAttachment[] = [], options?: ComposerSendOptions) => {
+    if (!conversationId || isArchived) throw new Error('This conversation cannot receive a message.');
     userActionSeqRef.current += 1;
 
     const msg = enqueue(text, attachedImages, attachedFiles);
 
     if (isConnected) {
       // Await so expansion errors propagate back to InputArea (REQ-IR-007)
-      await sendMessage(msg.localId, text, attachedImages, attachedFiles);
+      const accepted = await sendMessage(msg.localId, text, attachedImages, attachedFiles);
+      if (!accepted && options?.restoreOnFailure) {
+        dismiss(msg.localId);
+        throw new Error('Could not send your annotations. Please try again.');
+      }
     }
-  }, [conversationId, isArchived, enqueue, isConnected, sendMessage]);
+  }, [conversationId, isArchived, enqueue, isConnected, sendMessage, dismiss]);
 
   const handleRetry = useCallback((localId: string) => {
     const msg = queuedMessages.find((m) => m.localId === localId);
@@ -1811,8 +1821,10 @@ function ConversationPageContent({
       onRetryPending: handleRetry,
       onCancelSteering: handleCancelSteering,
       onOpenFile: handleOpenFileFromPatch,
+      annotationDraft,
+      canAnnotate: writableComposerMounted,
       ...(writableComposerMounted
-        ? { appendReviewNotesToComposer: handleSendFocusedNotes, appendInlineReactionToComposer: appendDraftCb }
+        ? { appendReviewNotesToComposer: handleSendFocusedNotes }
         : {}),
       filePathRootDir: conversation?.worktree_path ?? conversation?.cwd ?? '/',
       systemPrompt: atom.systemPrompt ?? undefined,
@@ -1833,6 +1845,7 @@ function ConversationPageContent({
     handleCancelSteering,
     handleOpenFileFromPatch,
     handleSendFocusedNotes,
+    annotationDraft,
     appendDraftCb,
     writableComposerMounted,
     conversation?.worktree_path,
@@ -2268,7 +2281,7 @@ function ConversationPageContent({
             workScopeKey={isArchived ? undefined : conversation.work_scope_key}
             enableMessageSidepanel={canOpenMessageSidepanel}
             enableMessageFullscreen={canOpenMessageSidepanel && isWideDesktop}
-            reactionDestination={writableComposerMounted ? { append: appendDraftCb } : undefined}
+            reactionDestination={{ draft: annotationDraft, writable: writableComposerMounted }}
             conversationId={conversationId}
             slug={slug}
             systemPrompt={atom.systemPrompt ?? undefined}

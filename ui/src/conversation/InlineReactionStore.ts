@@ -2,11 +2,11 @@ import { createContext } from 'react';
 import { RoutedStore } from './RoutedStore';
 
 export interface ReactionSource {
-  messageId: string;
-  sequenceId: number;
-  occurrenceToken?: string | undefined;
-  quote: string;
-  textAnchor?: { start: { fragmentId: string; offset: number }; end: { fragmentId: string; offset: number } };
+  readonly messageId: string;
+  readonly sequenceId: number;
+  readonly occurrenceToken?: string | undefined;
+  readonly quote: string;
+  readonly textAnchor?: { readonly start: { readonly fragmentId: string; readonly offset: number }; readonly end: { readonly fragmentId: string; readonly offset: number } };
 }
 
 export type ReactionPresentation = 'floating' | 'touch-docked';

@@ -1,0 +1,82 @@
+.draft-annotations {
+  display: grid;
+  gap: 8px;
+  max-height: min(320px, 40dvh);
+  overflow-y: auto;
+  padding: 8px 12px;
+}
+
+.draft-annotation {
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-left: 3px solid #dca72b;
+  border-radius: 10px;
+  background: var(--bg-secondary);
+}
+
+.draft-annotation-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.draft-annotation button {
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.draft-annotation-source {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  gap: 6px;
+  padding: 4px 0;
+  text-align: left;
+  font: inherit;
+  font-size: 12px;
+}
+
+.draft-annotation-source span {
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.draft-annotation-source svg { flex-shrink: 0; }
+
+.draft-annotation-remove {
+  display: grid;
+  place-items: center;
+  min-width: 32px;
+  min-height: 32px;
+}
+
+.draft-annotation textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 36px;
+  max-height: 160px;
+  padding: 6px 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  line-height: 1.5;
+  field-sizing: content;
+  overflow-wrap: anywhere;
+  resize: vertical;
+}
+
+.draft-annotation-state { color: var(--text-secondary); }
+
+@media (any-pointer: coarse), (width <= 768px) {
+  .draft-annotation-remove {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .draft-annotation textarea { font-size: 16px; }
+}

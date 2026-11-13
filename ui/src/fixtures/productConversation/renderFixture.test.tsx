@@ -204,8 +204,11 @@ describe('ProductConversationFixture', () => {
       fireEvent.change(reactionInput, { target: { value: reaction } });
       fireEvent.click(screen.getByRole('button', { name: 'Add to draft' }));
     }
-    expect((draft as HTMLTextAreaElement).value).toContain('Let’s keep the first version focused.\n\nRegarding message #2 (reaction-history:reaction-answer-older):');
-    expect((draft as HTMLTextAreaElement).value).toContain('Regarding message #2 (reaction-work:reaction-answer):');
+    expect(draft).toHaveValue('Let’s keep the first version focused.');
+    expect(screen.getByRole('textbox', { name: 'Annotation 1 comment' })).toHaveValue('Preserve this guarantee.');
+    expect(screen.getByRole('textbox', { name: 'Annotation 2 comment' })).toHaveValue('Strong idea; test deterministic state patterns.');
+    fireEvent.change(screen.getByRole('textbox', { name: 'Annotation 1 comment' }), { target: { value: 'Preserve this guarantee, including cancellation.' } });
+    expect(screen.getByRole('textbox', { name: 'Annotation 1 comment' })).toHaveValue('Preserve this guarantee, including cancellation.');
     expect(send).not.toHaveBeenCalled();
     fireEvent.click(screen.getAllByRole('button', { name: 'Open message reviewer' })[0]!);
     const viewer = await screen.findByRole('dialog', { name: 'Message viewer: Agent message #2' });
