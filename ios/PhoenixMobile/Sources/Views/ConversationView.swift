@@ -4,9 +4,13 @@ import SwiftUI
 /// composer. Fully readable offline; sends queue while disconnected.
 struct ConversationView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.scenePhase) private var scenePhase
     let session: ConversationSession
 
     @State private var draft = ""
+    /// ProductConversation already acknowledged during this visit; later
+    /// advances only observe so they never clear an unread mark.
+    @State private var acknowledgedProductId: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -70,6 +74,22 @@ struct ConversationView: View {
         }
         .onAppear { session.start() }
         .onDisappear { session.closeView() }
+        .onChange(of: session.conversation?.product_conversation_id, initial: true) { advanceRead() }
+        .onChange(of: session.messages.last?.message_id) { advanceRead() }
+        .onChange(of: scenePhase) { if scenePhase == .active { advanceRead() } }
+        .onChange(of: model.connectivity.isOnline) { advanceRead() }
+    }
+
+    private func advanceRead() {
+        guard scenePhase == .active,
+              let productId = session.conversation?.product_conversation_id
+        else { return }
+        let advance: ProductConversationReadAdvance =
+            acknowledgedProductId == productId ? .observed : .acknowledged
+        Task {
+            let advanced = await model.advanceRead(productConversationId: productId, advance: advance)
+            if advanced, advance == .acknowledged { acknowledgedProductId = productId }
+        }
     }
 
     var navigationTitle: String {

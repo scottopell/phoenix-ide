@@ -838,6 +838,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "slack_saved_capture",
         sql: include_str!("migrations/slack_saved_capture.sql"),
     },
+    Migration {
+        version: 163,
+        name: "product_conversation_read_state",
+        sql: include_str!("migrations/product_conversation_read_state.sql"),
+    },
 ];
 
 const MIGRATION_138: &str = concat!(
@@ -13374,6 +13379,43 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn migration_163_seeds_existing_product_conversations_as_read() {
+        use phoenix_core::domain::llm_types::ContentBlock;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("read-state.db");
+        let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+        run_through_for_test(db.pool(), 162).await.unwrap();
+        let conversation = db
+            .create_conversation("seeded", "seeded", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "seeded-agent",
+            &conversation.id,
+            &crate::MessageContent::agent(vec![ContentBlock::text("done")]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(run_through_for_test(db.pool(), 163).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(db.pool(), 163).await.unwrap(), 0);
+        let cursor: Option<String> = sqlx::query_scalar(
+            "SELECT read_through_message_id FROM product_conversation_read_state
+             WHERE product_conversation_id = ?1",
+        )
+        .bind(conversation.product_conversation_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(cursor.as_deref(), Some("seeded-agent"));
+        let states = db.list_product_conversation_read_states().await.unwrap();
+        assert!(states
+            .iter()
+            .all(|entry| entry.read_state == crate::ProductConversationReadState::Read));
+    }
+
+    #[tokio::test]
     async fn migration_160_defaults_to_fire_without_reinitializing_existing_discovery() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("slack-emojis.db");
@@ -13408,8 +13450,8 @@ mod tests {
         );
         db.pool().close().await;
         let reopened = crate::Database::open(path.to_str().unwrap()).await.unwrap();
-        assert_eq!(run_pending_migrations(reopened.pool()).await.unwrap(), 2);
-        assert_eq!(run_pending_migrations(reopened.pool()).await.unwrap(), 0);
+        assert_eq!(run_through_for_test(reopened.pool(), 162).await.unwrap(), 2);
+        assert_eq!(run_through_for_test(reopened.pool(), 162).await.unwrap(), 0);
         let value: serde_json::Value =
             serde_json::from_str(&reopened.slack_configuration().await.unwrap().unwrap()).unwrap();
         assert_eq!(value["trigger_emoji"], serde_json::json!("fire"));
@@ -13472,8 +13514,8 @@ mod tests {
                 .await
                 .unwrap();
                 sqlx::query("INSERT INTO slack_gateway_discovery(workspace,owner,kind,after_date,cursor) VALUES ('example.slack.com','UOWNER','reaction','2026-11-01','retained-cursor')").execute(db.pool()).await.unwrap();
-                assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 2);
-                assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
+                assert_eq!(run_through_for_test(db.pool(), 162).await.unwrap(), 2);
+                assert_eq!(run_through_for_test(db.pool(), 162).await.unwrap(), 0);
                 let value: serde_json::Value =
                     serde_json::from_str(&db.slack_configuration().await.unwrap().unwrap())
                         .unwrap();
@@ -13520,7 +13562,7 @@ mod tests {
                 assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sqlite_schema WHERE name='slack_gateway_trigger_emojis'").fetch_one(db.pool()).await.unwrap(), 0);
                 db.pool().close().await;
                 let reopened = crate::Database::open(path.to_str().unwrap()).await.unwrap();
-                assert_eq!(run_pending_migrations(reopened.pool()).await.unwrap(), 0);
+                assert_eq!(run_through_for_test(reopened.pool(), 161).await.unwrap(), 0);
                 assert_eq!(
                     reopened.slack_configuration().await.unwrap(),
                     Some(value.to_string())
@@ -13703,7 +13745,7 @@ mod tests {
         .unwrap();
         assert_eq!(before, vec![158]);
 
-        assert_eq!(run_pending_migrations(pool).await.unwrap(), 5);
+        assert_eq!(run_pending_migrations(pool).await.unwrap(), 6);
 
         let after: Vec<i64> = sqlx::query_scalar(
             "SELECT version FROM _migrations WHERE version >= 156 ORDER BY version",
@@ -13711,7 +13753,7 @@ mod tests {
         .fetch_all(pool)
         .await
         .unwrap();
-        assert_eq!(after, vec![156, 158, 159, 160, 161, 162]);
+        assert_eq!(after, vec![156, 158, 159, 160, 161, 162, 163]);
         sqlx::query("SELECT enrollment_id FROM conversation_goal_actors LIMIT 0")
             .execute(pool)
             .await
@@ -16200,7 +16242,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(run_through_for_test(db.pool(), 152).await.unwrap(), 1);
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 8);
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 9);
         assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
         let ledger: Vec<(i64, String)> = sqlx::query_as(
             "SELECT version, name FROM _migrations WHERE version >= 150 ORDER BY version",
@@ -16222,6 +16264,7 @@ mod tests {
                 (160, "slack_trigger_emojis".into()),
                 (161, "slack_single_trigger_emoji".into()),
                 (162, "slack_saved_capture".into()),
+                (163, "product_conversation_read_state".into()),
             ]
         );
     }
@@ -16231,6 +16274,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (163, "product_conversation_read_state"),
             (162, "slack_saved_capture"),
             (161, "slack_single_trigger_emoji"),
             (160, "slack_trigger_emojis"),
@@ -16279,7 +16323,6 @@ mod tests {
             (115, "federation_enrollments"),
             (114, "persist_instance_identity"),
             (113, "settle_historical_continuation_openings"),
-            (112, "input_source_tool_call"),
         ];
         assert_eq!(
             ledger
@@ -20513,6 +20556,7 @@ mod tests {
                 (160, "slack_trigger_emojis"),
                 (161, "slack_single_trigger_emoji"),
                 (162, "slack_saved_capture"),
+                (163, "product_conversation_read_state"),
             ]
         );
         let goal = MIGRATIONS
@@ -20526,7 +20570,7 @@ mod tests {
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 159);
+        assert_eq!(MIGRATIONS.len(), 160);
     }
 
     #[tokio::test]
@@ -20542,7 +20586,7 @@ mod tests {
         }
         sqlx::query("UPDATE product_creation_jobs SET status = 'published', published_product_id = 'deleted-product', published_conversation_id = 'deleted-transcript' WHERE request_id = 'orphan-image'")
             .execute(&pool).await.unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 12);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 13);
         let identity: Vec<(String, String)> = sqlx::query_as(
             "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
         ).fetch_all(&pool).await.unwrap();
@@ -20596,7 +20640,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 12);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 13);
         let retained: (String, String, String) = sqlx::query_as(
             "SELECT status, published_product_id, published_conversation_id
              FROM product_creation_jobs WHERE request_id = 'orphan-text'",

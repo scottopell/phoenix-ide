@@ -1,8 +1,8 @@
-import { useState, useEffect, useCallback, useLayoutEffect, useRef, useSyncExternalStore } from 'react';
+import { useState, useEffect, useCallback, useLayoutEffect, useRef } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { ApiResponseError, ConflictError, api } from '../api';
 import { refreshModels, subscribeModels } from '../modelsPoller';
-import type { Conversation, CodexLoginPreflight, ProductConversationListRow } from '../api';
+import type { CodexLoginPreflight, ProductConversationListRow } from '../api';
 import { useModels, useAutoAuth, useIsDesktop, useTheme } from '../hooks';
 import {
   useConversationsList,
@@ -11,6 +11,12 @@ import {
 import { NewConversationPage } from './NewConversationPage';
 import { beginNewProductConversationIntent } from '../hooks/useCreateConversation';
 import { ConversationList } from '../components/ConversationList';
+import { coordinatorUnread } from '../conversation/readState';
+import {
+  refreshProductConversationList,
+  updateProductConversationRows,
+  useProductConversationList,
+} from '../conversation/productConversationList';
 import { EmberEntry } from '../components/EmberEntry';
 import { renamedProductConversationLocation } from '../components/ConversationList.presentation';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -32,19 +38,17 @@ import { CredentialHelperPanel } from '../components/CredentialHelperPanel';
 import { SettingsDropdown } from '../components/SettingsDropdown';
 import { effectiveVisibleConversationCount } from './conversationListCount';
 import {
-  getProductConversationListRevision,
   notifyArchiveCloseConflict,
   notifyProductConversationHardDeleted,
   notifyProductConversationListMayHaveChanged,
   notifyProductConversationSnapshotChanged,
-  subscribeProductConversationListRevision,
 } from '../notifications';
 
 const MOBILE_LIST_SCROLL_KEY = 'phoenix:mobile-conversation-list-scroll:v1';
 const MOBILE_ARCHIVED_LIST_SCROLL_KEY = 'phoenix:mobile-archived-list-scroll:v1';
 
 function projectProductConversationHistory(
-  rows: ProductConversationListRow[],
+  rows: readonly ProductConversationListRow[],
   productConversationId: string,
 ): ProductConversationListRow[] {
   return rows.map((row) => row.product_conversation_id === productConversationId
@@ -68,14 +72,10 @@ export function ConversationListPage() {
   const { refresh } = useConversationsRefresh();
   const { active: conversations, archived: archivedConversations } = useConversationsList();
   const [showArchived, setShowArchived] = useState(false);
-  const [productConversations, setProductConversations] = useState<ProductConversationListRow[]>([]);
-  const [productListError, setProductListError] = useState<string | null>(null);
-  const [productListRevision, setProductListRevision] = useState(0);
-  const productConversationListRevision = useSyncExternalStore(
-    subscribeProductConversationListRevision,
-    getProductConversationListRevision,
-    getProductConversationListRevision,
-  );
+  const productList = useProductConversationList();
+  const productConversations = productList.rows;
+  const productListError = productList.error;
+  const coordinatorUnreadState = coordinatorUnread(productList);
   const mainRef = useRef<HTMLElement | null>(null);
   const didRestoreScrollRef = useRef(false);
   const currentScrollKey = showArchived ? MOBILE_ARCHIVED_LIST_SCROLL_KEY : MOBILE_LIST_SCROLL_KEY;
@@ -95,28 +95,11 @@ export function ConversationListPage() {
   currentScrollKeyRef.current = currentScrollKey;
 
   useEffect(() => {
-    let cancelled = false;
-    api.listProductConversations()
-      .then((response) => {
-        if (cancelled) return;
-        setProductConversations(response.product_conversations);
-        setProductListError(null);
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        setProductListError(err instanceof Error ? err.message : 'Failed to fetch product conversations');
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [productConversationListRevision, productListRevision]);
-
-  useEffect(() => {
     if (isDesktop) didRestoreScrollRef.current = false;
   }, [isDesktop]);
 
   // App state for offline/sync status
-  const { isOnline, isReady, initError, pendingOpsCount, queueOperation } = useAppMachine();
+  const { isOnline, isReady, initError, pendingOpsCount } = useAppMachine();
   const { toasts, dismissToast, showWarning, showError } = useToast();
 
   // Loading is derived: we're loading until we have at least one conversation
@@ -144,7 +127,6 @@ export function ConversationListPage() {
     productListError === null;
 
   // Delete confirmation state
-  const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
 
   // Rename state
   const [productCloseTarget, setProductCloseTarget] = useState<ProductConversationListRow | null>(null);
@@ -163,7 +145,7 @@ export function ConversationListPage() {
     deletedConversationIds: string[],
   ) => {
     notifyProductConversationHardDeleted(deletedProductConversationId, deletedConversationIds);
-    setProductConversations((rows) => rows.filter(
+    updateProductConversationRows((rows) => rows.filter(
       (row) => row.product_conversation_id !== deletedProductConversationId,
     ));
     setProductDeleteTarget(null);
@@ -293,9 +275,9 @@ export function ConversationListPage() {
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
   }, [isDesktop, saveScrollPosition]);
 
-  const handleConversationClick = useCallback((conv: Conversation) => {
+  const handleProductConversationClick = useCallback((row: ProductConversationListRow) => {
     saveScrollPosition();
-    navigate(`/c/${conv.slug}`);
+    navigate(row.canonical_route);
   }, [navigate, saveScrollPosition]);
 
   const handleNewConversation = () => {
@@ -303,46 +285,6 @@ export function ConversationListPage() {
     navigate('/new');
   };
 
-  const handleArchive = async (conv: Conversation) => {
-    try {
-      if (isOnline) {
-        await api.archiveConversation(conv.id);
-        await refresh();
-      } else {
-        await queueOperation({
-          type: 'archive',
-          conversationId: conv.id,
-          payload: {},
-          createdAt: new Date(),
-          retryCount: 0,
-          status: 'pending'
-        });
-        // Offline optimistic: the operation is queued, but the row in
-        // the store is still the pre-archive shape until the queue
-        // drains and the next `refresh()` picks up the server-side
-        // change. The UI will show the conversation as still-active
-        // until then; the offline indicator already conveys that the
-        // queue is pending. If we want eager-flip-on-queue we'd dispatch
-        // a `local_conversation_update` against the atom — deferred
-        // because the local mutation would then desync from anything
-        // SSE eventually sends.
-      }
-    } catch (err) {
-      notifyArchiveCloseConflict(conv.id, err);
-      console.error('Failed to close conversation:', err);
-    }
-  };
-
-  const handleDelete = async () => {
-    if (!deleteTarget) return;
-    try {
-      await api.deleteConversation(deleteTarget.id);
-      setDeleteTarget(null);
-      await refresh();
-    } catch (err) {
-      console.error('Failed to delete:', err);
-    }
-  };
 
 
   const applyProductName = (renamed: ProductConversationListRow) => {
@@ -352,7 +294,7 @@ export function ConversationListPage() {
       latestLocation.pathname, latestLocation.search, latestLocation.hash, productRenameTarget, renamed,
     );
     if (activeRoute) navigate(activeRoute, { replace: true, state: latestLocation.state });
-    setProductConversations((rows) => rows.map((row) =>
+    updateProductConversationRows((rows) => rows.map((row) =>
       row.product_conversation_id === renamed.product_conversation_id ? renamed : row));
     notifyProductConversationSnapshotChanged(renamed.product_conversation_id);
     notifyProductConversationListMayHaveChanged();
@@ -385,13 +327,13 @@ export function ConversationListPage() {
     setProductCloseSubmittingId(productCloseTarget.product_conversation_id);
     try {
       await api.closeProductConversation(productCloseTarget.product_conversation_id);
-      setProductConversations((rows) => projectProductConversationHistory(
+      updateProductConversationRows((rows) => projectProductConversationHistory(
         rows,
         productCloseTarget.product_conversation_id,
       ));
       setProductCloseTarget((current) =>
         current?.product_conversation_id === productCloseTarget.product_conversation_id ? null : current);
-      setProductListRevision((revision) => revision + 1);
+      void refreshProductConversationList();
       notifyProductConversationListMayHaveChanged();
       setProductCloseError((current) =>
         current?.productId === productCloseTarget.product_conversation_id ? null : current);
@@ -400,7 +342,7 @@ export function ConversationListPage() {
     } catch (err) {
       if (notifyArchiveCloseConflict(productCloseTarget.canonical_root.transcript_row_id, err)) {
         if (err instanceof ConflictError && err.detail.error_type === 'close_already_history') {
-          setProductConversations((rows) => projectProductConversationHistory(
+          updateProductConversationRows((rows) => projectProductConversationHistory(
             rows,
             productCloseTarget.product_conversation_id,
           ));
@@ -427,27 +369,6 @@ export function ConversationListPage() {
     setShowArchived((prev) => !prev);
   }, [saveScrollPosition]);
 
-  const handleSetDeleteTarget = useCallback((conv: Conversation) => {
-    setDeleteTarget(conv);
-  }, []);
-
-  const handleSetRenameTarget = useCallback((conv: Conversation) => {
-    const selection = ++renameSelectionRef.current;
-    setProductRenameError(undefined);
-    const row = productConversations.find((candidate) =>
-      candidate.product_conversation_id === conv.product_conversation_id
-      || candidate.canonical_root.transcript_row_id === conv.id
-      || candidate.latest_transcript_row_id === conv.id);
-    if (row) {
-      setProductRenameTarget(row);
-      return;
-    }
-    void api.getProductConversationSnapshot(conv.product_conversation_id ?? conv.id)
-      .then((snapshot) => { if (selection === renameSelectionRef.current) setProductRenameTarget(snapshot); })
-      .catch((error: unknown) => {
-        if (selection === renameSelectionRef.current) setProductRenameError(error instanceof Error ? error.message : 'Failed to load conversation name');
-      });
-  }, [productConversations]);
 
 
   // On desktop, the sidebar handles the conversation list.
@@ -461,7 +382,7 @@ export function ConversationListPage() {
     return (
       <div id="app" className="list-page">
         <div className="conversation-list-pinned-header">
-          <EmberEntry onClick={() => navigate('/global')} />
+          <EmberEntry unread={coordinatorUnreadState} onClick={() => navigate('/global')} />
         </div>
         <main className="init-error" data-app-scroll-owner>
           <h2><AlertTriangle />Storage Error</h2>
@@ -523,7 +444,7 @@ export function ConversationListPage() {
                 <button className="btn-primary" disabled title="Loading conversations">+ New</button>
               </div>
             </div>
-              <EmberEntry active={location.pathname === '/global'} onClick={() => navigate('/global')} />
+              <EmberEntry unread={coordinatorUnreadState} active={location.pathname === '/global'} onClick={() => navigate('/global')} />
             </div>
             <ConversationListSkeleton count={5} />
           </section>
@@ -532,23 +453,19 @@ export function ConversationListPage() {
             {productListError && (
               <div role="status" className="coordinator-error">
                 <span>Showing cached conversations — {productListError}</span>
-                <button type="button" onClick={() => setProductListRevision((revision) => revision + 1)}>Retry</button>
+                <button type="button" onClick={() => void refreshProductConversationList()}>Retry</button>
               </div>
             )}
             <ConversationList
+              coordinatorUnread={coordinatorUnreadState}
               conversations={conversations}
               archivedConversations={archivedConversations}
               productConversations={openProductConversations}
               archivedProductConversations={archivedProductConversations}
-              productRowsAuthoritative={!productListError}
               showArchived={showArchived}
               onToggleArchived={handleToggleArchived}
               onNewConversation={handleNewConversation}
-              onArchive={handleArchive}
-              onDelete={handleSetDeleteTarget}
-              {...(!productListError ? { onRename: handleSetRenameTarget } : {})}
-              onConversationClick={handleConversationClick}
-              onProductConversationClick={(row) => navigate(row.canonical_route)}
+              onProductConversationClick={handleProductConversationClick}
               onProductConversationRename={(row) => {
                 renameSelectionRef.current += 1;
                 setProductRenameError(undefined);
@@ -581,15 +498,6 @@ export function ConversationListPage() {
           </>
         )}
       </main>
-      <ConfirmDialog
-        visible={deleteTarget !== null}
-        title="Delete Conversation"
-        message={`Are you sure you want to delete "${deleteTarget?.slug}"? This cannot be undone.`}
-        confirmText="Delete"
-        danger
-        onConfirm={handleDelete}
-        onCancel={() => setDeleteTarget(null)}
-      />
       <ConfirmDialog
         visible={productCloseTarget !== null}
         title="Close Conversation"

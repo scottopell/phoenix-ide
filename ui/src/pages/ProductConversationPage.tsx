@@ -49,6 +49,8 @@ import type { ConversationHistoryBoundaryView } from '../generated/ConversationH
 import type { CoordinatorConversationSnapshotView } from '../generated/CoordinatorConversationSnapshotView';
 import type { ComponentProps } from 'react';
 import './ProductConversationPage.css';
+import { useAutoMarkProductConversationRead } from '../conversation/readState';
+import { MarkUnreadButton } from '../components/MarkUnreadButton';
 import type { ContinuationOpeningView } from '../generated/ContinuationOpeningView';
 import { reconcileOpening, sameOpeningEdge } from '../conversation/opening';
 
@@ -833,6 +835,7 @@ function ProductConversationHeader({
       <h1 className="product-conversation-page__title" title={snapshot.presentation.display_name}>
         {snapshot.presentation.display_name}
       </h1>
+      <MarkUnreadButton productConversationId={productConversationId} className="product-conversation-page__mark-unread" />
       <div className="product-conversation-page__context">
         {source?.status === 'present' && (
           <span className="product-conversation-page__source" data-testid="product-conversation-source">
@@ -996,6 +999,10 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
   const aggregateMessages = useMemo(
     () => snapshot ? deferPendingOpening(makeAggregateMessages(snapshot, liveMessages), snapshot.latest_opening) : [],
     [liveMessages, snapshot],
+  );
+  useAutoMarkProductConversationRead(
+    snapshot?.product_conversation_id,
+    aggregateMessages[aggregateMessages.length - 1]?.message_id,
   );
   const aggregatePendingMessages = useMemo(() => {
     const acknowledgedIds = new Set(aggregateMessages.map((message) => message.message_id));
@@ -1665,7 +1672,17 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
             onStreamAttempt={journey.streamStarted}
             routePrefix={coordinator ? "/global" : "/c"}
             composerQuickAction={globalShell?.composerQuickAction}
-            stateBarExtension={globalShell?.stateBarExtension}
+            stateBarExtension={globalShell?.stateBarExtension ? {
+              ...globalShell.stateBarExtension,
+              details: (
+                <>
+                  <div className="global-statebar-read-state">
+                    <MarkUnreadButton productConversationId={snapshot.product_conversation_id} />
+                  </div>
+                  {globalShell.stateBarExtension.details}
+                </>
+              ),
+            } : undefined}
             onCloseCompleted={() => setSnapshotRetry((retry) => retry + 1)}
           />
         </div>

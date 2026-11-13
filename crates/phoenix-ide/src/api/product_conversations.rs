@@ -17,17 +17,18 @@ use tracing::Instrument;
 use super::handlers::AppError;
 use super::types::{
     AutomaticContinuationView, ConversationHistoryBoundaryView, ConversationHistorySegmentView,
-    CoordinatorConversationSnapshotView, OrdinaryProductConversationLifecycleView,
-    ProductConversationChainQaCompatibilityView, ProductConversationCloseActionView,
-    ProductConversationCloseInspectionView, ProductConversationCloseLossView,
-    ProductConversationCloseOutcomeView, ProductConversationClosePhaseView,
-    ProductConversationCloseResidualView, ProductConversationCloseRunStatusView,
-    ProductConversationCloseUnavailableReasonView, ProductConversationCloseView,
-    ProductConversationCreationAllowedActionView, ProductConversationCreationRecoveryResponse,
-    ProductConversationCreationRecoveryRow, ProductConversationHandoffView,
-    ProductConversationHistorySnapshotView, ProductConversationLifecycleView,
-    ProductConversationListResponse, ProductConversationListRow,
-    ProductConversationPresentationView, ProductConversationSegmentView,
+    CoordinatorConversationSnapshotView, CoordinatorListEntryView,
+    OrdinaryProductConversationLifecycleView, ProductConversationChainQaCompatibilityView,
+    ProductConversationCloseActionView, ProductConversationCloseInspectionView,
+    ProductConversationCloseLossView, ProductConversationCloseOutcomeView,
+    ProductConversationClosePhaseView, ProductConversationCloseResidualView,
+    ProductConversationCloseRunStatusView, ProductConversationCloseUnavailableReasonView,
+    ProductConversationCloseView, ProductConversationCreationAllowedActionView,
+    ProductConversationCreationRecoveryResponse, ProductConversationCreationRecoveryRow,
+    ProductConversationHandoffView, ProductConversationHistorySnapshotView,
+    ProductConversationLifecycleView, ProductConversationListResponse, ProductConversationListRow,
+    ProductConversationPrView, ProductConversationPresentationView,
+    ProductConversationReadStateView, ProductConversationSegmentView,
     ProductConversationSnapshotMetadataView, ProductConversationSnapshotView,
     ProductConversationSourceRelationView, ProductConversationSourceView,
     ProductConversationTranscriptRowView, ProductConversationWorkIdentityView,
@@ -134,7 +135,7 @@ pub async fn rename_product_conversation(
         .into_iter()
         .find(|projection| projection.product_conversation_id == product_conversation_id)
         .ok_or_else(|| AppError::NotFound(product_conversation_id.to_string()))?;
-    Ok(Json(list_row(&projection)))
+    Ok(Json(single_list_row(&state, &projection).await?))
 }
 pub async fn regenerate_product_conversation_name(
     State(state): State<AppState>,
@@ -227,7 +228,7 @@ pub async fn regenerate_product_conversation_name(
         .into_iter()
         .find(|projection| projection.product_conversation_id == owner_id)
         .ok_or_else(|| AppError::NotFound(owner_id.to_string()))?;
-    Ok(Json(list_row(&projection)))
+    Ok(Json(single_list_row(&state, &projection).await?))
 }
 
 use crate::conversation_actions::{self, normalize_product_conversation_title};
@@ -332,17 +333,132 @@ pub async fn put_coordinator_automatic_continuation(
 pub async fn list_product_conversations(
     State(state): State<AppState>,
 ) -> Result<Json<ProductConversationListResponse>, AppError> {
-    let rows = state
+    let projections = state
         .db
         .list_ordinary_product_conversation_projections()
         .await
-        .map_err(db_to_app)?
+        .map_err(db_to_app)?;
+    let read_states = state
+        .db
+        .list_product_conversation_read_states()
+        .await
+        .map_err(db_to_app)?;
+    let coordinator = read_states
         .iter()
-        .map(list_row)
+        .find(|entry| {
+            entry.kind
+                == phoenix_core::domain::product_conversation::ProductConversationKind::Coordinator
+        })
+        .map(|entry| CoordinatorListEntryView {
+            product_conversation_id: entry.product_conversation_id.to_string(),
+            read_state: entry.read_state.into(),
+        });
+    let by_product: std::collections::HashMap<&str, phoenix_db::ProductConversationReadState> =
+        read_states
+            .iter()
+            .map(|entry| (entry.product_conversation_id.as_str(), entry.read_state))
+            .collect();
+    let cached_prs = cached_prs_for_projections(&state, &projections).await?;
+    let rows = projections
+        .iter()
+        .map(|projection| {
+            let read_state = by_product
+                .get(projection.product_conversation_id.as_str())
+                .copied()
+                .unwrap_or(phoenix_db::ProductConversationReadState::Read);
+            let cached_pr = projection
+                .latest_work_scope_id
+                .as_ref()
+                .and_then(|scope| cached_prs.get(&work_scope_key(scope)));
+            list_row(projection, read_state, cached_pr)
+        })
         .collect();
     Ok(Json(ProductConversationListResponse {
         product_conversations: rows,
+        coordinator,
     }))
+}
+
+fn work_scope_key(scope: &phoenix_core::work_scope::WorkScopeId) -> String {
+    phoenix_core::work_scope::ResourceScopeKey::Work(scope.clone()).stable_key()
+}
+
+async fn cached_prs_for_projections(
+    state: &AppState,
+    projections: &[ProductConversationListProjection],
+) -> Result<std::collections::HashMap<String, ProductConversationPrView>, AppError> {
+    let scopes: Vec<_> = projections
+        .iter()
+        .filter_map(|projection| projection.latest_work_scope_id.clone())
+        .collect();
+    Ok(state
+        .db
+        .primary_work_scope_pr_associations(&scopes)
+        .await
+        .map_err(db_to_app)?
+        .into_iter()
+        .filter_map(|(key, pr)| {
+            let summary = super::handlers::sidebar_cached_pr_summary(&pr);
+            ProductConversationPrView::from_summary(&summary).map(|view| (key, view))
+        })
+        .collect())
+}
+
+async fn single_list_row(
+    state: &AppState,
+    projection: &ProductConversationListProjection,
+) -> Result<ProductConversationListRow, AppError> {
+    let read_state = product_read_state(state, &projection.product_conversation_id).await?;
+    let cached_prs = cached_prs_for_projections(state, std::slice::from_ref(projection)).await?;
+    let cached_pr = projection
+        .latest_work_scope_id
+        .as_ref()
+        .and_then(|scope| cached_prs.get(&work_scope_key(scope)));
+    Ok(list_row(projection, read_state, cached_pr))
+}
+
+async fn product_read_state(
+    state: &AppState,
+    product_conversation_id: &ProductConversationId,
+) -> Result<phoenix_db::ProductConversationReadState, AppError> {
+    state
+        .db
+        .product_conversation_read_state(product_conversation_id)
+        .await
+        .map_err(db_to_app)?
+        .ok_or_else(|| AppError::NotFound(product_conversation_id.to_string()))
+}
+
+fn parse_product_conversation_id(reference: &str) -> Result<ProductConversationId, AppError> {
+    ProductConversationId::parse(reference.to_owned())
+        .map_err(|_| AppError::NotFound(reference.to_owned()))
+}
+
+pub async fn mark_product_conversation_read(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+    Json(request): Json<super::types::MarkProductConversationReadRequest>,
+) -> Result<Json<ProductConversationReadStateView>, AppError> {
+    let id = parse_product_conversation_id(&reference)?;
+    state
+        .db
+        .mark_product_conversation_read(&id, request.kind.into())
+        .await
+        .map_err(db_to_app)?;
+    Ok(Json(product_read_state(&state, &id).await?.into()))
+}
+
+pub async fn mark_product_conversation_unread(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+) -> Result<Json<ProductConversationReadStateView>, AppError> {
+    let id = parse_product_conversation_id(&reference)?;
+    state
+        .db
+        .mark_product_conversation_unread(&id)
+        .await
+        .map_err(db_to_app)?;
+    Ok(Json(product_read_state(&state, &id).await?.into()))
 }
 
 #[derive(Deserialize)]
@@ -754,6 +870,8 @@ mod creation_allowed_actions_tests {
 
 pub(crate) fn list_row(
     projection: &ProductConversationListProjection,
+    read_state: phoenix_db::ProductConversationReadState,
+    cached_pr: Option<&ProductConversationPrView>,
 ) -> ProductConversationListRow {
     ProductConversationListRow {
         product_conversation_id: projection.product_conversation_id.to_string(),
@@ -783,6 +901,8 @@ pub(crate) fn list_row(
             projection.latest_continued_in_conv_id.is_some(),
             &projection.latest_transcript_row_id,
         ),
+        read_state: read_state.into(),
+        cached_pr: cached_pr.cloned(),
     }
 }
 
@@ -3413,7 +3533,15 @@ mod tests {
             .into_iter()
             .find(|projection| projection.product_conversation_id == root.product_conversation_id)
             .unwrap();
-        assert_eq!(body, serde_json::to_value(list_row(&projection)).unwrap());
+        assert_eq!(
+            body,
+            serde_json::to_value(list_row(
+                &projection,
+                phoenix_db::ProductConversationReadState::Read,
+                None
+            ))
+            .unwrap()
+        );
         let revision: i64 =
             sqlx::query_scalar("SELECT name_revision FROM conversations WHERE id = ?1")
                 .bind(&root.id)

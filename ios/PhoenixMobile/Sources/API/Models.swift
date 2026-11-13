@@ -89,6 +89,61 @@ struct Conversation: Codable, Identifiable, Equatable, Hashable, Sendable {
 
 struct ProductConversationListResponse: Codable, Equatable, Sendable {
     var product_conversations: [ProductConversationListRow]
+    var coordinator: CoordinatorListEntry?
+}
+
+struct CoordinatorListEntry: Codable, Equatable, Sendable {
+    var product_conversation_id: String
+    var read_state: ProductConversationReadState
+}
+
+enum ProductConversationUnreadReason: String, Codable, Equatable, Sendable {
+    case marked
+    case newActivity = "new_activity"
+}
+
+/// Server-authoritative read state of a ProductConversation (REQ-CONV-027).
+enum ProductConversationReadState: Codable, Equatable, Sendable {
+    case read
+    case unread(ProductConversationUnreadReason)
+
+    private enum CodingKeys: String, CodingKey { case state, reason }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(String.self, forKey: .state) {
+        case "read":
+            self = .read
+        case "unread":
+            self = .unread(try container.decode(ProductConversationUnreadReason.self, forKey: .reason))
+        case let other:
+            throw DecodingError.dataCorruptedError(
+                forKey: .state, in: container, debugDescription: "unknown read state \(other)")
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .read:
+            try container.encode("read", forKey: .state)
+        case .unread(let reason):
+            try container.encode("unread", forKey: .state)
+            try container.encode(reason, forKey: .reason)
+        }
+    }
+
+    var unreadReason: ProductConversationUnreadReason? {
+        if case .unread(let reason) = self { return reason }
+        return nil
+    }
+}
+
+/// Why the client advances the read cursor. Only `acknowledged` clears an
+/// explicit unread mark; `observed` never undoes a mark set elsewhere.
+enum ProductConversationReadAdvance: String, Sendable {
+    case acknowledged
+    case observed
 }
 
 struct ProductConversationListRow: Codable, Equatable, Sendable {
@@ -99,6 +154,7 @@ struct ProductConversationListRow: Codable, Equatable, Sendable {
     var latest_transcript_row_id: String
     var updated_at: String
     var presentation: ProductConversationPresentation
+    var read_state: ProductConversationReadState
 }
 
 struct ProductConversationSnapshot: Codable, Equatable, Sendable {

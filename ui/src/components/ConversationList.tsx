@@ -1,29 +1,18 @@
 import { memo, useState, useEffect, useRef, useMemo, useCallback, useLayoutEffect } from 'react';
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { getConvDisplayState } from '../api';
 import type { Conversation, CachedPrSummary, ProductConversationListRow } from '../api';
 import { prReviewState } from './prReviewState';
 import { formatRelativeTime, formatShortDateTime } from '../utils';
-import {
-  computeChainRoots,
-  groupConversationsForSidebar,
-  type SidebarItem,
-} from '../utils/chains';
-
 import { useKeyboardNav } from '../hooks';
 import { useFocusScope } from '../hooks/useFocusScope';
-import {
-  getConversationDisplayTitle,
-  getConversationProjectLabel,
-  isLowValueIdentifier,
-} from '../utils/conversationIdentity';
 import {
   productConversationDisplayTitle,
   productConversationPresentationIndicator,
 } from './ConversationList.presentation';
 import './ConversationList.css';
 import { EmberEntry } from './EmberEntry';
+import { markProductConversationRead, markProductConversationUnread } from '../conversation/readState';
 
 
 interface ConversationListProps {
@@ -31,14 +20,9 @@ interface ConversationListProps {
   archivedConversations?: readonly Conversation[];
   productConversations?: readonly ProductConversationListRow[];
   archivedProductConversations?: readonly ProductConversationListRow[];
-  productRowsAuthoritative?: boolean;
   showArchived: boolean;
   onToggleArchived: () => void;
   onNewConversation: () => void;
-  onArchive: (conv: Conversation) => void;
-  onDelete: (conv: Conversation) => void;
-  onRename?: (conv: Conversation) => void;
-  onConversationClick?: (conv: Conversation) => void;
   onProductConversationClick?: (productConversation: ProductConversationListRow) => void;
   onProductConversationRename?: (productConversation: ProductConversationListRow) => void;
   onProductConversationClose?: (productConversation: ProductConversationListRow) => void;
@@ -50,27 +34,7 @@ interface ConversationListProps {
   utilityActions?: ReactNode;
   emptyScopeLabel?: string | null;
   footer?: ReactNode;
-}
-
-interface ConversationRowProps {
-  conv: Conversation;
-  isMenuOpen: boolean;
-  isKeyboardSelected: boolean;
-  isActive: boolean;
-  isChainMember: boolean;
-  isChainLatest: boolean;
-  listDensity: 'full' | 'mobile' | 'sidebar';
-  chainIndex: number | undefined;
-  showArchived: boolean;
-  onClick: (conv: Conversation) => void;
-  onToggleMenu: (e: React.MouseEvent, convId: string) => void;
-  onArchive: (conv: Conversation) => void;
-  onDelete: (conv: Conversation) => void;
-  onRename?: (conv: Conversation) => void;
-  onCloseMenu: () => void;
-  /** Forwarded only when this row's menu is open; lets the parent install a
-   *  click-outside listener scoped to the actual DOM node. */
-  menuRef?: React.RefObject<HTMLDivElement> | undefined;
+  coordinatorUnread?: 'marked' | 'new_activity' | null;
 }
 
 function sidebarFeedbackStatusSuffix(pr: CachedPrSummary): string {
@@ -147,36 +111,6 @@ function PrBadge({ pr, interactive = true }: { pr: CachedPrSummary; interactive?
   );
 }
 
-function displayTitleFromConversation(conv: Conversation, fallback = 'Untitled conversation'): string {
-  return getConversationDisplayTitle(conv, fallback);
-}
-
-function displayTitleFromChain(item: Extract<SidebarItem, { kind: 'chain' }>): string {
-  const root = item.members[0];
-  const candidates = [
-    item.displayName,
-    root?.task_title,
-    root?.branch_name,
-    root ? getConversationProjectLabel(root) : null,
-  ];
-  return candidates.find((candidate) => !isLowValueIdentifier(candidate))?.trim() || 'Untitled chain';
-}
-
-function stateLabel(conv: Conversation, displayState: ReturnType<typeof getConvDisplayState>): string {
-  if (conv.state?.type === 'context_exhausted' && conv.presentation_mode === 'needs_action') return 'Context full';
-  if (conv.state?.type === 'awaiting_user_response') return 'Needs reply';
-  if (conv.presentation_mode === 'needs_action' || displayState === 'awaiting-approval') return 'Needs approval';
-  if (displayState === 'working') return 'Working';
-  if (displayState === 'error') return 'Error';
-  if (displayState === 'terminal') return 'Completed';
-  return 'Ready';
-}
-
-function isActionableDisplayState(displayState: ReturnType<typeof getConvDisplayState>): boolean {
-  return displayState === 'working' || displayState === 'error' || displayState === 'awaiting-approval';
-}
-
-export const SidebarPrBadge = PrBadge;
 
 const ProductConversationListRowView = memo(function ProductConversationListRowView({
   row,
@@ -191,7 +125,9 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
   onToggleMenu,
   onCloseMenu,
   menuRef,
+  isMobileList = false,
 }: {
+  isMobileList?: boolean;
   isMenuOpen: boolean;
   onToggleMenu: (event: React.MouseEvent, id: string) => void;
   onCloseMenu: () => void;
@@ -205,10 +141,15 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
   onProductConversationDelete?: (row: ProductConversationListRow) => void;
   onProductConversationRename?: (row: ProductConversationListRow) => void;
 }) {
+  const unread = row.read_state.state === 'unread';
+  const unreadLabel = row.read_state.state === 'unread'
+    ? (row.read_state.reason === 'marked' ? 'Marked unread' : 'New activity')
+    : null;
   const classes = [
     'conv-item',
     isActive ? 'active' : '',
     isKeyboardSelected ? 'keyboard-selected' : '',
+    unread ? 'unread' : '',
     'product-conversation-list-row',
   ].filter(Boolean).join(' ');
   const displayTitle = productConversationDisplayTitle(row);
@@ -227,7 +168,6 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
   const canRename = !!onProductConversationRename && row.lifecycle.state === 'open'
     && !(closeAction?.availability === 'unavailable' && closeAction.reason === 'active_close_attempt');
   const canDelete = !!onProductConversationDelete && row.lifecycle.state === 'history';
-  const canClose = !!onProductConversationClose && closeAction !== null;
   const context = effectiveCwd ?? row.canonical_root.slug ?? null;
   return (
     <li
@@ -250,6 +190,14 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
               aria-label={indicator.ariaLabel}
             />
             <span className="conv-item-title">{displayTitle}</span>
+            {unreadLabel && (
+              <span
+                className={`conv-item-unread-dot${row.read_state.state === 'unread' && row.read_state.reason === 'marked' ? ' conv-item-unread-dot--marked' : ''}`}
+                title={unreadLabel}
+                role="img"
+                aria-label={unreadLabel}
+              />
+            )}
           </span>
         </div>
         <div className="conv-item-meta product-conversation-list-row__meta">
@@ -258,14 +206,33 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
             {formatRelativeTime(row.updated_at)}
           </span>
           {context && <span className="conv-item-cwd" title={context}>{context}</span>}
+          {isMobileList && row.cached_pr && <PrBadge pr={row.cached_pr} interactive={false} />}
         </div>
       </button>
-      {(canRename || canDelete || canClose) && (
-        <div ref={menuRef} className="conv-item-menu-container product-conversation-actions">
+      {!isMobileList && row.cached_pr && (
+        <span className="product-conversation-list-row__pr">
+          <PrBadge pr={row.cached_pr} />
+        </span>
+      )}
+      <div ref={menuRef} className="conv-item-menu-container product-conversation-actions">
           <button type="button" className="conv-item-menu-btn conv-action-btn"
             aria-label={`Actions for conversation ${displayTitle}`} aria-expanded={isMenuOpen}
             onClick={(event) => onToggleMenu(event, row.product_conversation_id)}>⋮</button>
           {isMenuOpen && <div className="conv-item-actions" aria-label={`Actions for ${displayTitle}`}>
+          <button
+            type="button"
+            className="conv-action-btn"
+            onClick={(event) => {
+              event.stopPropagation();
+              onCloseMenu();
+              const action = unread ? markProductConversationRead : markProductConversationUnread;
+              void action(row.product_conversation_id).catch(() => { /* list refresh shows the authoritative state */ });
+            }}
+            aria-label={`${unread ? 'Mark as read' : 'Mark as unread'}: ${displayTitle}`}
+            title={unread ? 'Mark as read' : 'Mark as unread to revisit later'}
+          >
+            {unread ? 'Mark as read' : 'Mark as unread'}
+          </button>
           {canRename && onProductConversationRename && (
             <button
               type="button"
@@ -311,358 +278,10 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
             </button>
           )}
           </div>}
-        </div>
-      )}
-    </li>
-  );
-});
-
-export const ConversationRow = memo(function ConversationRow({
-  conv,
-  isMenuOpen,
-  isKeyboardSelected,
-  isActive,
-  isChainMember,
-  isChainLatest,
-  listDensity,
-  chainIndex,
-  showArchived,
-  onClick,
-  onToggleMenu,
-  onArchive,
-  onDelete,
-  onRename,
-  onCloseMenu,
-  menuRef,
-}: ConversationRowProps) {
-  const displayState = getConvDisplayState(conv);
-  const isCompactCompletedChainMember = (listDensity === 'sidebar' || listDensity === 'mobile')
-    && isChainMember
-    && !isChainLatest
-    && !isActive
-    && displayState === 'terminal';
-  const isMobileList = listDensity === 'mobile';
-  const classes = [
-    'conv-item',
-    isMenuOpen ? 'expanded' : '',
-    isKeyboardSelected ? 'keyboard-selected' : '',
-    isActive ? 'active' : '',
-    isChainMember ? 'conv-item-chain-member' : '',
-    isChainLatest ? 'conv-item-chain-latest' : '',
-    isCompactCompletedChainMember ? 'conv-item-chain-completed' : '',
-  ]
-    .filter(Boolean)
-    .join(' ');
-
-  const cachedPrForBadge = (!isChainMember || isChainLatest) ? conv.cached_pr : undefined;
-
-  const stateTitle = (() => {
-    if (conv.state?.type === 'context_exhausted') {
-      return conv.presentation_mode === 'needs_action' ? 'Context full' : 'Continued';
-    }
-    if (conv.state?.type === 'awaiting_user_response') return 'Needs reply';
-    switch (displayState) {
-      case 'idle': return 'Ready';
-      case 'working': return 'Working';
-      case 'error': return 'Error';
-      case 'terminal': return 'Completed';
-      case 'awaiting-approval': return 'Awaiting approval';
-    }
-  })();
-
-  const contextLabel = getConversationProjectLabel(conv);
-  const displayTitle = displayTitleFromConversation(conv);
-  const shouldShowMobileChainTitle = isMobileList
-    && isChainMember
-    && (isCompactCompletedChainMember || isChainLatest || isActive || isActionableDisplayState(displayState));
-
-  return (
-    <li className={classes} data-id={conv.id}>
-      <div
-        className="conv-item-main"
-        onClick={() => onClick(conv)}
-        title={`Open conversation "${displayTitle}"`}
-      >
-        <div className="conv-item-slug">
-          <span className="conv-item-slug-main">
-            <span
-              className={`conv-state-dot ${displayState}`}
-              title={stateTitle}
-            />
-            {chainIndex !== undefined ? (
-              shouldShowMobileChainTitle ? (
-                <>
-                  <span className="conv-item-slug-pos" title={displayTitle ?? undefined}>
-                    #{chainIndex + 1}
-                  </span>
-                  <span className="conv-item-title">{displayTitle}</span>
-                </>
-              ) : (
-                <span className="conv-item-slug-pos" title={displayTitle ?? undefined}>
-                  #{chainIndex + 1}
-                </span>
-              )
-            ) : (
-              <span className="conv-item-title">{displayTitle}</span>
-            )}
-            {isChainLatest && (
-              <span className="conv-chain-latest-badge" title="Latest in chain — click to continue">
-                latest
-              </span>
-            )}
-            {!isMobileList && conv.conv_mode_label && (
-              <span
-                className="conv-mode-badge"
-                title={
-                  conv.conv_mode_label.toLowerCase() === 'explore'
-                    ? 'Managed mode (read-only exploration)'
-                    : conv.conv_mode_label.toLowerCase() === 'work'
-                      ? 'Managed mode (task branch)'
-                      : conv.conv_mode_label.toLowerCase() === 'direct'
-                        ? 'Full access (Direct mode)'
-                        : conv.conv_mode_label.toLowerCase() === 'branch'
-                          ? 'Branch mode (existing branch)'
-                          : conv.conv_mode_label
-                }
-              >
-                {conv.conv_mode_label}
-              </span>
-            )}
-            {!isMobileList && cachedPrForBadge && <PrBadge pr={cachedPrForBadge} />}
-          </span>
-        </div>
-        <div className="conv-item-meta">
-          <span
-            className="conv-item-time"
-            title={`Created: ${formatShortDateTime(conv.created_at)}\nLast activity: ${formatRelativeTime(conv.updated_at)}`}
-          >
-            {formatShortDateTime(conv.created_at)} → {formatRelativeTime(conv.updated_at)}
-          </span>
-          <span className="conv-item-messages">
-            {conv.message_count} {conv.message_count === 1 ? 'msg' : 'msgs'}
-          </span>
-        </div>
-        <div className="conv-item-meta secondary">
-          {isMobileList && conv.conv_mode_label && (
-            <span className="conv-mode-badge">{conv.conv_mode_label}</span>
-          )}
-          {isMobileList && cachedPrForBadge && <PrBadge pr={cachedPrForBadge} interactive={false} />}
-          {isMobileList && isActionableDisplayState(displayState) && (
-            <span className={`conv-state-chip ${displayState}`}>{stateLabel(conv, displayState)}</span>
-          )}
-          {isMobileList && (
-            <span
-              className="conv-item-time conv-item-time-inline"
-              title={`Created: ${formatShortDateTime(conv.created_at)}\nLast activity: ${formatRelativeTime(conv.updated_at)}`}
-            >
-              {formatRelativeTime(conv.updated_at)}
-            </span>
-          )}
-          {contextLabel && (
-            <span className="conv-project-label">{contextLabel}</span>
-          )}
-          <span className="conv-item-model">{conv.model}</span>
-          <span className="conv-item-cwd">{conv.cwd}</span>
-        </div>
       </div>
-      {!isChainMember && (
-        <div ref={menuRef} className="conv-item-menu-container">
-          <button
-            className="conv-item-menu-btn"
-            onClick={(e) => onToggleMenu(e, conv.id)}
-            title="Actions"
-            aria-label="Conversation actions"
-            aria-haspopup="menu"
-            aria-expanded={isMenuOpen}
-          >
-            ⋮
-          </button>
-          {isMenuOpen && (
-            <div className="conv-item-actions">
-              {onRename && (
-                <button
-                  className="action-btn"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onCloseMenu();
-                    onRename(conv);
-                  }}
-                  title={`Rename conversation "${displayTitle}"`}
-                >
-                  Rename
-                </button>
-              )}
-              {!showArchived && (
-                <button
-                  className="action-btn"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onCloseMenu();
-                    onArchive(conv);
-                  }}
-                  title={`Close conversation "${displayTitle}"`}
-                >
-                  Close
-                </button>
-              )}
-              <button
-                className="action-btn danger"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onCloseMenu();
-                  onDelete(conv);
-                }}
-                title={`Delete conversation "${displayTitle}" (can't be undone)`}
-              >
-                Delete
-              </button>
-            </div>
-          )}
-        </div>
-      )}
     </li>
   );
 });
-
-interface ChainBlockProps {
-  item: Extract<SidebarItem, { kind: 'chain' }>;
-  collapsed: boolean;
-  /** Chain-scoped, not global. The parent passes the expanded/keyboard-selected
-   *  row id only when it belongs to THIS chain, else null — so a global id change
-   *  that lands on a different chain produces referentially-identical props here
-   *  and the `memo` bails out. The member list still gets the precise id it needs
-   *  to highlight one row. */
-  expandedRowId: string | null;
-  keyboardSelectedId: string | null;
-  activeSlug: string | null;
-  listDensity: 'full' | 'mobile' | 'sidebar';
-  showArchived: boolean;
-  onToggleCollapsed: (rootId: string) => void;
-  onRowClick: (conv: Conversation) => void;
-  onRowToggleMenu: (e: React.MouseEvent, convId: string) => void;
-  onArchive: (conv: Conversation) => void;
-  onDelete: (conv: Conversation) => void;
-  onRename?: (conv: Conversation) => void;
-  onCloseRowMenu: () => void;
-  rowMenuRef?: React.RefObject<HTMLDivElement> | undefined;
-}
-
-export const ChainBlock = memo(function ChainBlock({
-  item,
-  collapsed,
-  expandedRowId,
-  keyboardSelectedId,
-  activeSlug,
-  listDensity,
-  showArchived,
-  onToggleCollapsed,
-  onRowClick,
-  onRowToggleMenu,
-  onArchive,
-  onDelete,
-  onRename,
-  onCloseRowMenu,
-  rowMenuRef,
-}: ChainBlockProps) {
-  const navigate = useNavigate();
-  const latestMember = item.members.find((m) => m.id === item.latestMemberId) ?? item.members[item.members.length - 1];
-  const latestIndex = Math.max(0, item.members.findIndex((m) => m.id === latestMember?.id));
-  const latestDisplayState = latestMember ? getConvDisplayState(latestMember) : 'idle';
-  const latestContext = latestMember ? getConversationProjectLabel(latestMember) : null;
-  const chainDisplayTitle = displayTitleFromChain(item);
-  const latestDisplayTitle = latestMember ? displayTitleFromConversation(latestMember) : 'Current transcript';
-  return (
-    <li
-      className={`conv-chain-block ${collapsed ? 'collapsed' : 'expanded'}`}
-      data-chain-root={item.rootId}
-    >
-      <div className="conv-chain-header">
-        <button
-          className="conv-chain-caret"
-          aria-label={collapsed ? 'Expand chain' : 'Collapse chain'}
-          aria-expanded={!collapsed}
-          onClick={(e) => {
-            e.stopPropagation();
-            onToggleCollapsed(item.rootId);
-          }}
-          title={collapsed ? 'Expand chain' : 'Collapse chain'}
-        >
-          <svg
-            width="12"
-            height="12"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            aria-hidden="true"
-            className={`conv-chain-caret-icon ${collapsed ? 'collapsed' : ''}`}
-          >
-            <polyline points="6 9 12 15 18 9" />
-          </svg>
-        </button>
-        <button
-          className="conv-chain-name"
-          onClick={() => navigate(`/chains/${item.rootId}`)}
-          title={`Open transcript history "${chainDisplayTitle}"`}
-        >
-          <span className="conv-chain-name-label">{chainDisplayTitle}</span>
-          <span className="conv-chain-count">
-            {listDensity === 'mobile' ? 'Transcript history' : `Transcript history · ${item.members.length} transcripts`}
-          </span>
-        </button>
-      </div>
-      {collapsed && listDensity === 'mobile' && latestMember && (
-        <button
-          className={`conv-chain-latest-summary ${keyboardSelectedId === latestMember.id ? 'keyboard-selected' : ''}`}
-          data-id={latestMember.id}
-          onClick={() => onRowClick(latestMember)}
-          title={`Open current transcript "${latestDisplayTitle}"`}
-        >
-          <span className={`conv-state-dot ${latestDisplayState}`} title={stateLabel(latestMember, latestDisplayState)} />
-          <span className="conv-chain-summary-main">
-            <span className="conv-chain-summary-title">Latest #{latestIndex + 1}: {latestDisplayTitle}</span>
-            {latestMember.conv_mode_label && <span className="conv-mode-badge">{latestMember.conv_mode_label}</span>}
-            <span className="conv-item-time">{formatRelativeTime(latestMember.updated_at)}</span>
-          </span>
-          <span className="conv-chain-summary-meta">
-            {latestContext && <span className="conv-project-label">{latestContext}</span>}
-            {latestMember.cached_pr && <PrBadge pr={latestMember.cached_pr} interactive={false} />}
-          </span>
-        </button>
-      )}
-      {!collapsed && (
-        <ul className="conv-chain-members">
-          {item.members.map((m, idx) => (
-            <ConversationRow
-              key={m.id}
-              conv={m}
-              isMenuOpen={expandedRowId === m.id}
-              isKeyboardSelected={keyboardSelectedId === m.id}
-              isActive={matchesRouteSegment(m, activeSlug)}
-              isChainMember
-              isChainLatest={m.id === item.latestMemberId}
-              listDensity={listDensity}
-              chainIndex={idx}
-              showArchived={showArchived}
-              onClick={onRowClick}
-              onToggleMenu={onRowToggleMenu}
-              onArchive={onArchive}
-              onDelete={onDelete}
-              {...(onRename ? { onRename } : {})}
-              onCloseMenu={onCloseRowMenu}
-              menuRef={expandedRowId === m.id ? rowMenuRef : undefined}
-            />
-          ))}
-        </ul>
-      )}
-    </li>
-  );
-});
-
-const matchesRouteSegment = (conv: Pick<Conversation, 'id' | 'slug'>, segment: string | null | undefined) =>
-  !!segment && (conv.slug === segment || conv.id === segment);
 
 const TerminalGlyph = () => (
   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -676,14 +295,9 @@ export function ConversationList({
   archivedConversations = [],
   productConversations = [],
   archivedProductConversations = [],
-  productRowsAuthoritative = false,
   showArchived,
   onToggleArchived,
   onNewConversation,
-  onArchive,
-  onDelete,
-  onRename,
-  onConversationClick,
   onProductConversationClick,
   onProductConversationRename,
   onProductConversationClose,
@@ -695,11 +309,11 @@ export function ConversationList({
   utilityActions,
   emptyScopeLabel,
   footer,
+  coordinatorUnread = null,
 }: ConversationListProps) {
   const navigate = useNavigate();
   const { hasActiveScope } = useFocusScope();
   const [expandedId, setExpandedId] = useState<string | null>(null);
-  const [collapsedChains, setCollapsedChains] = useState<Set<string>>(new Set());
   const menuRef = useRef<HTMLDivElement>(null);
   const listRootRef = useRef<HTMLElement>(null);
   const effectiveListDensity = listDensity ?? (sidebarMode ? 'sidebar' : 'full');
@@ -748,84 +362,32 @@ export function ConversationList({
     };
   }, [expandedId, hasActiveScope]);
 
-  const displayList = showArchived ? archivedConversations : conversations;
   const displayProductList = showArchived ? archivedProductConversations : productConversations;
-  const usingProductRows = productRowsAuthoritative || displayProductList.length > 0 || productConversations.length > 0 || archivedProductConversations.length > 0;
 
   useLayoutEffect(() => {
     if (expandedId && !menuRef.current) setExpandedId(null);
-  }, [expandedId, displayList, displayProductList, usingProductRows, onProductConversationRename, onProductConversationClose, onProductConversationDelete]);
+  }, [expandedId, displayProductList, onProductConversationRename, onProductConversationClose, onProductConversationDelete]);
 
-  const groupedItems: SidebarItem[] = useMemo(() => {
-    const roots = computeChainRoots(displayList);
-    return groupConversationsForSidebar(displayList, roots);
-  }, [displayList]);
-
-  const isChainCollapsed = useCallback((item: Extract<SidebarItem, { kind: 'chain' }>) => {
-    const latestMember = item.members.find(m => m.id === item.latestMemberId);
-    const isCompleted = getConvDisplayState(latestMember) === 'terminal';
-    if (effectiveListDensity === 'mobile') {
-      const hasPriorityMember = item.members.some((m) =>
-        matchesRouteSegment(m, activeSlug) || isActionableDisplayState(getConvDisplayState(m))
-      );
-      return hasPriorityMember ? false : !collapsedChains.has(item.rootId);
-    }
-    return isCompleted ? !collapsedChains.has(item.rootId) : collapsedChains.has(item.rootId);
-  }, [activeSlug, collapsedChains, effectiveListDensity]);
-
-  const keyboardItems = useMemo(() => {
-    if (usingProductRows) {
-      return displayProductList.map((row) => ({ id: row.product_conversation_id }));
-    }
-    const out: Conversation[] = [];
-    for (const item of groupedItems) {
-      if (item.kind === 'single') {
-        out.push(item.conversation);
-      } else if (effectiveListDensity === 'mobile' && isChainCollapsed(item)) {
-        const latestMember = item.members.find((m) => m.id === item.latestMemberId);
-        if (latestMember) out.push(latestMember);
-      } else {
-        out.push(...item.members);
-      }
-    }
-    return out;
-  }, [displayProductList, effectiveListDensity, groupedItems, isChainCollapsed, usingProductRows]);
+  const keyboardItems = useMemo(
+    () => displayProductList.map((row) => ({ id: row.product_conversation_id })),
+    [displayProductList],
+  );
 
   const { selectedId } = useKeyboardNav({
     enabled: expandedId === null,
     items: keyboardItems,
-    ...(usingProductRows
-      ? {
-        onSelect: (item: { id: string }) => {
-          const row = displayProductList.find((candidate) => candidate.product_conversation_id === item.id);
-          if (row) onProductConversationClick?.(row);
-          else navigate(`/c/${item.id}`);
-        },
-      }
-      : {}),
+    onSelect: (item: { id: string }) => {
+      const row = displayProductList.find((candidate) => candidate.product_conversation_id === item.id);
+      if (!row) return;
+      if (onProductConversationClick) onProductConversationClick(row);
+      else navigate(row.canonical_route);
+    },
     onNew: onNewConversation,
   });
-
-  const handleClick = useCallback((conv: Conversation) => {
-    if (onConversationClick) {
-      onConversationClick(conv);
-    } else {
-      navigate(`/c/${conv.slug}`);
-    }
-  }, [onConversationClick, navigate]);
 
   const toggleActions = useCallback((e: React.MouseEvent, convId: string) => {
     e.stopPropagation();
     setExpandedId((prev) => (prev === convId ? null : convId));
-  }, []);
-
-  const toggleChainCollapsed = useCallback((rootId: string) => {
-    setCollapsedChains((prev) => {
-      const next = new Set(prev);
-      if (next.has(rootId)) next.delete(rootId);
-      else next.add(rootId);
-      return next;
-    });
   }, []);
 
   useLayoutEffect(() => {
@@ -840,55 +402,19 @@ export function ConversationList({
       || row.canonical_root.transcript_row_id === activeSlug
       || row.canonical_root.slug === activeSlug
     ));
-    if (activeProductRow) {
-      listRootRef.current
-        ?.querySelector<HTMLElement>(`[data-product-conversation-id="${activeProductRow.product_conversation_id}"]`)
-        ?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-      lastRevealedActiveSlugRef.current = activeSlug;
-      return;
-    }
-
-    for (const item of groupedItems) {
-      if (item.kind === 'single') {
-        if (!matchesRouteSegment(item.conversation, activeSlug)) continue;
-        listRootRef.current
-          ?.querySelector<HTMLElement>('.conv-item.active')
-          ?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-        lastRevealedActiveSlugRef.current = activeSlug;
-        return;
-      }
-
-      if (!item.members.some((m) => matchesRouteSegment(m, activeSlug))) continue;
-
-      const latestMember = item.members.find(m => m.id === item.latestMemberId);
-      const isCompleted = getConvDisplayState(latestMember) === 'terminal';
-      const collapsed = effectiveListDensity === 'mobile'
-        ? false
-        : isCompleted ? !collapsedChains.has(item.rootId) : collapsedChains.has(item.rootId);
-      if (collapsed) {
-        setCollapsedChains((prev) => {
-          const next = new Set(prev);
-          if (isCompleted) next.add(item.rootId);
-          else next.delete(item.rootId);
-          return next;
-        });
-        return;
-      }
-
-      listRootRef.current
-        ?.querySelector<HTMLElement>('.conv-item.active')
-        ?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-      lastRevealedActiveSlugRef.current = activeSlug;
-      return;
-    }
-  }, [activeSlug, displayProductList, groupedItems, collapsedChains, effectiveListDensity]);
+    if (!activeProductRow) return;
+    listRootRef.current
+      ?.querySelector<HTMLElement>(`[data-product-conversation-id="${activeProductRow.product_conversation_id}"]`)
+      ?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    lastRevealedActiveSlugRef.current = activeSlug;
+  }, [activeSlug, displayProductList]);
 
   const closeRowMenu = useCallback(() => {
     menuRef.current?.querySelector<HTMLButtonElement>('.conv-item-menu-btn')?.focus();
     setExpandedId(null);
   }, []);
 
-  const isEmpty = usingProductRows ? displayProductList.length === 0 : displayList.length === 0;
+  const isEmpty = displayProductList.length === 0;
 
   return (
     <section ref={listRootRef} id="conversation-list" className={`view active ${isSidebarLayout ? 'sidebar-mode' : ''} ${isMobileList ? 'mobile-list-density' : ''}`}>
@@ -928,21 +454,21 @@ export function ConversationList({
             </button>
           </div>
         </div>
-          <EmberEntry onClick={() => navigate('/global')} />
+          <EmberEntry unread={coordinatorUnread} onClick={() => navigate('/global')} />
           <div className="conversation-list-subnav">
             <button
               className={`archive-toggle-text ${!showArchived ? 'active' : ''}`}
               onClick={() => { if (showArchived) onToggleArchived(); }}
               disabled={!showArchived}
             >
-              {usingProductRows ? 'Open' : 'Active'}
+              Open
             </button>
             <span aria-hidden="true">·</span>
             <button
               className={`archive-toggle-text ${showArchived ? 'active' : ''}`}
               onClick={() => { if (!showArchived) onToggleArchived(); }}
             >
-              History {usingProductRows ? archivedProductConversations.length : archivedConversations.length}
+              History {archivedProductConversations.length}
             </button>
             {authChip && <span className="conversation-list-auth-chip">{authChip}</span>}
           </div>
@@ -952,13 +478,14 @@ export function ConversationList({
       <ul id="conv-list">
         {isEmpty ? (
           <li className="empty-state">
-            <p>{`No ${usingProductRows ? (showArchived ? 'History' : 'Open') : (showArchived ? 'archived' : 'active')} conversations${emptyScopeLabel ? ` in ${emptyScopeLabel}` : ''}`}</p>
+            <p>{`No ${showArchived ? 'History' : 'Open'} conversations${emptyScopeLabel ? ` in ${emptyScopeLabel}` : ''}`}</p>
           </li>
-        ) : usingProductRows ? (
+        ) : (
           displayProductList.map((row) => (
             <ProductConversationListRowView
               key={row.product_conversation_id}
               row={row}
+              isMobileList={isMobileList}
               isMenuOpen={expandedId === row.product_conversation_id}
               onToggleMenu={toggleActions}
               onCloseMenu={closeRowMenu}
@@ -979,66 +506,6 @@ export function ConversationList({
               {...(onProductConversationRename ? { onProductConversationRename } : {})}
             />
           ))
-        ) : (
-          groupedItems.map((item) => {
-            if (item.kind === 'single') {
-              const conv = item.conversation;
-              return (
-                <ConversationRow
-                  key={conv.id}
-                  conv={conv}
-                  isMenuOpen={expandedId === conv.id}
-                  isKeyboardSelected={selectedId === conv.id}
-                  isActive={matchesRouteSegment(conv, activeSlug)}
-                  isChainMember={false}
-                  isChainLatest={false}
-                  listDensity={effectiveListDensity}
-                  chainIndex={undefined}
-                  showArchived={showArchived}
-                  onClick={handleClick}
-                  onToggleMenu={toggleActions}
-                  onArchive={onArchive}
-                  onDelete={onDelete}
-                  {...(onRename ? { onRename } : {})}
-                  onCloseMenu={closeRowMenu}
-                  menuRef={expandedId === conv.id ? menuRef : undefined}
-                />
-              );
-            }
-            const collapsed = isChainCollapsed(item);
-            const chainExpandedRowId =
-              expandedId !== null && item.members.some((m) => m.id === expandedId)
-                ? expandedId
-                : null;
-            const chainKeyboardSelectedId =
-              selectedId != null && item.members.some((m) => m.id === selectedId)
-                ? selectedId
-                : null;
-            const chainActiveSlug =
-              activeSlug != null && item.members.some((m) => matchesRouteSegment(m, activeSlug))
-                ? activeSlug
-                : null;
-            return (
-              <ChainBlock
-                key={`chain:${item.rootId}`}
-                item={item}
-                collapsed={collapsed}
-                expandedRowId={chainExpandedRowId}
-                keyboardSelectedId={chainKeyboardSelectedId}
-                activeSlug={chainActiveSlug}
-                listDensity={effectiveListDensity}
-                showArchived={showArchived}
-                onToggleCollapsed={toggleChainCollapsed}
-                onRowClick={handleClick}
-                onRowToggleMenu={toggleActions}
-                onArchive={onArchive}
-                onDelete={onDelete}
-                {...(onRename ? { onRename } : {})}
-                onCloseRowMenu={closeRowMenu}
-                rowMenuRef={menuRef}
-              />
-            );
-          })
         )}
       </ul>
       {footer && <div className="conversation-list-footer">{footer}</div>}

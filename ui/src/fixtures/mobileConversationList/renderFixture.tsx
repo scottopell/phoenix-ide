@@ -44,15 +44,10 @@ export function MobileConversationListFixtureBody({ scenario }: Props) {
           {...(fixtureData.productConversations === undefined ? {} : {
             productConversations: fixtureData.productConversations,
             archivedProductConversations: fixtureData.archivedProductConversations ?? [],
-            productRowsAuthoritative: true,
           })}
           showArchived={showArchived}
           onToggleArchived={() => setShowArchived((value) => !value)}
           onNewConversation={() => {}}
-          onArchive={() => {}}
-          onDelete={() => {}}
-          onRename={() => {}}
-          onConversationClick={() => {}}
           onProductConversationClick={() => {}}
           onProductConversationRename={() => {}}
           onProductConversationClose={() => {}}

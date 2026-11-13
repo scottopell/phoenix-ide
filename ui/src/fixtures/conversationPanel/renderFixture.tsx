@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { ConversationList } from '../../components/ConversationList';
 import '../../index.css';
-import { conversationPanelFixtureData } from './scenarios';
+import { conversationPanelFixtureData, conversationPanelProductRows } from './scenarios';
 import type { ConversationPanelScenario } from './types';
 
 interface Props {
@@ -79,13 +79,12 @@ export function ConversationPanelFixture({ scenario, showToolbar = true }: Props
                 <ConversationList
                   conversations={conversationPanelFixtureData.conversations}
                   archivedConversations={conversationPanelFixtureData.archivedConversations}
+                  productConversations={conversationPanelProductRows.open}
+                  archivedProductConversations={conversationPanelProductRows.history}
                   showArchived={showArchived}
                   onToggleArchived={() => setShowArchived((value) => !value)}
                   onNewConversation={() => {}}
-                  onArchive={() => {}}
-                  onDelete={() => {}}
-                  onRename={() => {}}
-                  onConversationClick={() => {}}
+                  onProductConversationClick={() => {}}
                   activeSlug={conversationPanelFixtureData.activeSlug}
                   sidebarMode
                 />

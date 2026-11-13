@@ -99,6 +99,11 @@ export type { ProductConversationCloseActionView } from './generated/ProductConv
 export type { ProductConversationCloseUnavailableReasonView } from './generated/ProductConversationCloseUnavailableReasonView';
 export type { ProductConversationListResponse } from './generated/ProductConversationListResponse';
 export type { ProductConversationListRow } from './generated/ProductConversationListRow';
+export type { ProductConversationReadStateView } from './generated/ProductConversationReadStateView';
+export type { CoordinatorListEntryView } from './generated/CoordinatorListEntryView';
+import type { ProductConversationReadStateView as ProductConversationReadStateViewType } from './generated/ProductConversationReadStateView';
+import type { ProductConversationReadAdvanceRequestKind } from './generated/ProductConversationReadAdvanceRequestKind';
+import type { MarkProductConversationReadRequest } from './generated/MarkProductConversationReadRequest';
 export type { ProductConversationSnapshotView } from './generated/ProductConversationSnapshotView';
 export type { ProductConversationHistorySnapshotView } from './generated/ProductConversationHistorySnapshotView';
 import type { ProductConversationHistorySnapshotView } from './generated/ProductConversationHistorySnapshotView';
@@ -258,8 +263,10 @@ export interface Conversation {
 
 export type PrUnavailableReason = 'gh_missing' | 'not_authenticated' | 'not_git_repo' | 'command_failed';
 export type PrCheckState = 'passing' | 'pending' | 'failing' | 'unknown';
-export type PrDisplayState = 'open' | 'draft' | 'merged' | 'closed';
-export type PrFeedbackStatus = 'open' | 'in_progress' | 'approved';
+export type { PrDisplayState } from './generated/PrDisplayState';
+export type { PrFeedbackStatus } from './generated/PrFeedbackStatus';
+import type { PrDisplayState } from './generated/PrDisplayState';
+import type { PrFeedbackStatus } from './generated/PrFeedbackStatus';
 
 export interface CachedPrSummary {
   number: number;
@@ -2399,6 +2406,26 @@ export const api = {
       throw new ConflictError(err as ConflictErrorDetail);
     }
     if (!resp.ok) throw new Error('Failed to close product conversation');
+  },
+
+  async markProductConversationRead(
+    productConversationId: string,
+    kind: ProductConversationReadAdvanceRequestKind,
+  ): Promise<ProductConversationReadStateViewType> {
+    const body: MarkProductConversationReadRequest = { kind };
+    const resp = await fetch(`/api/product-conversations/${encodeURIComponent(productConversationId)}/read`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) throw new Error('Failed to mark conversation read');
+    return resp.json();
+  },
+
+  async markProductConversationUnread(productConversationId: string): Promise<ProductConversationReadStateViewType> {
+    const resp = await fetch(`/api/product-conversations/${encodeURIComponent(productConversationId)}/unread`, { method: 'POST' });
+    if (!resp.ok) throw new Error('Failed to mark conversation unread');
+    return resp.json();
   },
 
   async renameProductConversation(reference: string, title: string): Promise<ProductConversationListRowType> {

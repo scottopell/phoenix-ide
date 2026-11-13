@@ -4,8 +4,9 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, ts_rs::TS, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub enum PrDisplayState {
     Open,
     Draft,

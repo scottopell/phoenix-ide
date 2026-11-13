@@ -342,3 +342,7 @@
     padding-left: env(safe-area-inset-left, 0);
   }
 }
+
+.product-conversation-page__mark-unread {
+  flex: 0 0 auto;
+}

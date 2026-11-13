@@ -267,6 +267,7 @@ fn registered_identity_order_and_exact_bodies() {
         (160, "slack_trigger_emojis"),
         (161, "slack_single_trigger_emoji"),
         (162, "slack_saved_capture"),
+        (163, "product_conversation_read_state"),
     ];
     for (version, name) in identities {
         let entries = MIGRATIONS
@@ -298,6 +299,7 @@ fn registered_identity_order_and_exact_bodies() {
         (include_str!("slack_trigger_emojis.sql"), 160),
         (include_str!("slack_single_trigger_emoji.sql"), 161),
         (include_str!("slack_saved_capture.sql"), 162),
+        (include_str!("product_conversation_read_state.sql"), 163),
     ] {
         let entries = MIGRATIONS
             .iter()
@@ -376,7 +378,7 @@ async fn rename_receipt_retention_migration_preserves_rows_and_rolls_back_atomic
         .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 15);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 16);
     let foreign_keys: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_foreign_key_list('product_conversation_rename_receipts')",
     )
@@ -407,7 +409,7 @@ async fn registered_slack_origin_decodes_and_replays_after_upgrade() {
 
     let pool = fixture(142, true).await;
     let db = Database::from_pool_for_tests(pool.clone(), String::new());
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 18);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 19);
     let retained = db
         .get_product_creation_job("old-slack")
         .await
@@ -472,7 +474,7 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
             let mut conn = pool.acquire().await.unwrap();
             preserved(&mut conn, &before).await;
             drop(conn);
-            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 11);
+            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 12);
             let mut conn = pool.acquire().await.unwrap();
             let live_images: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_job_images")
@@ -518,6 +520,7 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
                     (160, "slack_trigger_emojis"),
                     (161, "slack_single_trigger_emoji"),
                     (162, "slack_saved_capture"),
+                    (163, "product_conversation_read_state"),
                 ]
             );
             drop(conn);
@@ -561,7 +564,7 @@ async fn registered_body_faults_rollback_and_same_connection_retry() {
         let mut conn = pool.acquire().await.unwrap();
         preserved(&mut conn, &before).await;
         drop(conn);
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 11);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 12);
         let mut conn = pool.acquire().await.unwrap();
         clean(&mut conn).await;
     }
@@ -582,7 +585,7 @@ async fn registered_ledger_failure_rolls_back_body_then_reenters() {
         .await
         .unwrap();
     drop(conn);
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 18);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 19);
 }
 
 #[tokio::test]
@@ -641,7 +644,7 @@ async fn image_retirement_ledger_failure_restores_payload_schema_and_retries() {
         .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 12);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 13);
     let restored: Vec<(String, i64, String, String)> = sqlx::query_as(
         "SELECT request_id, ordinal, media_type, data FROM product_creation_job_images ORDER BY request_id, ordinal",
     )

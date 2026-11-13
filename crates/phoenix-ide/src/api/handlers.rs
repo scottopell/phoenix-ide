@@ -164,6 +164,14 @@ pub fn create_router(state: AppState) -> Router {
             axum::routing::patch(rename_product_conversation),
         )
         .route(
+            "/api/product-conversations/:reference/read",
+            post(super::product_conversations::mark_product_conversation_read),
+        )
+        .route(
+            "/api/product-conversations/:reference/unread",
+            post(super::product_conversations::mark_product_conversation_unread),
+        )
+        .route(
             "/api/product-conversations/:reference/regenerate-name",
             post(regenerate_product_conversation_name),
         )
@@ -1120,7 +1128,7 @@ fn conversation_resource_scope(
     }
 }
 
-fn sidebar_cached_pr_summary(
+pub(crate) fn sidebar_cached_pr_summary(
     pr: &crate::db::WorkScopePrAssociation,
 ) -> crate::runtime::CachedPrSummary {
     crate::runtime::CachedPrSummary {

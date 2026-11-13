@@ -62,6 +62,7 @@ pub struct ProductConversationListProjection {
     pub latest_transcript_row_id: String,
     pub latest_state: crate::ConvState,
     pub latest_continued_in_conv_id: Option<String>,
+    pub latest_work_scope_id: Option<phoenix_core::work_scope::WorkScopeId>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -389,6 +390,11 @@ fn list_projection_from_row(
         latest_transcript_row_id: row.try_get("latest_transcript_row_id")?,
         latest_state,
         latest_continued_in_conv_id: row.try_get("latest_continued_in_conv_id")?,
+        latest_work_scope_id: row
+            .try_get::<Option<String>, _>("latest_work_scope_id")?
+            .map(phoenix_core::work_scope::WorkScopeId::parse)
+            .transpose()
+            .map_err(|error| DbError::Serialization(error.to_string()))?,
         updated_at: row
             .try_get::<String, _>("updated_at")?
             .parse::<DateTime<Utc>>()
@@ -711,6 +717,7 @@ impl Database {
                     root.title AS root_title,
                     latest.id AS latest_transcript_row_id, latest.state AS latest_state,
                     latest.continued_in_conv_id AS latest_continued_in_conv_id,
+                    latest.work_scope_id AS latest_work_scope_id,
                     activity.updated_at, activity.has_awaiting_task_approval,
                     activity.has_awaiting_continuation,
                     EXISTS (

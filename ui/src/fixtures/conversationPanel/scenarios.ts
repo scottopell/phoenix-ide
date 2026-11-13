@@ -1,4 +1,4 @@
-import type { Conversation, ConversationState } from '../../api';
+import type { Conversation, ConversationState, ProductConversationListRow } from '../../api';
 import { conversationPanelScenarioDefinitions } from './types';
 import type { ConversationPanelFixtureData, ConversationPanelScenario } from './types';
 
@@ -133,6 +133,36 @@ export const conversationPanelFixtureData: ConversationPanelFixtureData = {
       updated_at: isoAgo(1440),
     }),
   ],
+};
+
+const unreadFixtureIds = new Map<string, ProductConversationListRow['read_state']>([
+  ['work-draft', { state: 'unread', reason: 'new_activity' }],
+  ['approval', { state: 'unread', reason: 'marked' }],
+]);
+
+function productRow(conversation: Conversation): ProductConversationListRow {
+  return {
+    product_conversation_id: `product-${conversation.id}`,
+    canonical_route: `/c/${conversation.slug}`,
+    canonical_root: { transcript_row_id: conversation.id, slug: conversation.slug, title: conversation.task_title ?? null },
+    lifecycle: conversation.archived
+      ? { state: 'history' }
+      : { state: 'open', close_action: { availability: 'available' } },
+    latest_transcript_row_id: conversation.id,
+    updated_at: conversation.updated_at,
+    presentation: conversation.presentation_mode === 'needs_action'
+      ? { kind: 'needs_action', display_name: conversation.task_title ?? conversation.slug }
+      : { kind: 'state', display_name: conversation.task_title ?? conversation.slug, presentation_mode: conversation.presentation_mode ?? 'idle' },
+    read_state: unreadFixtureIds.get(conversation.id) ?? { state: 'read' },
+    cached_pr: conversation.cached_pr
+      ? { ...conversation.cached_pr, feedback_status: conversation.cached_pr.feedback_status ?? 'open' }
+      : null,
+  };
+}
+
+export const conversationPanelProductRows = {
+  open: conversationPanelFixtureData.conversations.map(productRow),
+  history: conversationPanelFixtureData.archivedConversations.map(productRow),
 };
 
 export const conversationPanelScenarios: ConversationPanelScenario[] = conversationPanelScenarioDefinitions.map((scenario) => ({

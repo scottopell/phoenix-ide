@@ -186,7 +186,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     presentation_mode: 'idle',
     context_window_size: 128_000,
   });
-  api.listProductConversations = async () => ({ product_conversations: [] });
+  api.listProductConversations = async () => ({ product_conversations: [], coordinator: null });
   api.getProductConversationAutomaticContinuation = async (id) => ({ aggregate: { kind: 'ordinary', product_conversation_id: id }, auto_continue_on_context_exhaustion: false, admission: null });
   api.getCoordinatorAutomaticContinuation = async () => ({ aggregate: { kind: 'coordinator', product_conversation_id: 'source-product' }, auto_continue_on_context_exhaustion: false, admission: null });
   api.ensureGlobalCoordinator = async () => ({ conversation: scenario.kind === 'coordinator' ? conversation : { ...sourceConversation, id: 'current-global', slug: 'current-global' }, created: false });

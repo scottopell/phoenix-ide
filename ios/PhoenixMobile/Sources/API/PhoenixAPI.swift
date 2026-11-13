@@ -304,10 +304,23 @@ struct PhoenixAPI: Sendable {
         try await get("api/auth/status", as: AuthStatusResponse.self)
     }
 
-    func listConversations() async throws -> [Conversation] {
-        let response = try await listProductConversations()
-        return response.product_conversations.map(productConversationListRowToConversation)
+    struct ConversationListPage: Sendable {
+        var conversations: [Conversation]
+        /// Keyed by ProductConversation aggregate identity.
+        var readStates: [String: ProductConversationReadState]
+        var coordinator: CoordinatorListEntry?
     }
+
+    func listConversationPage() async throws -> ConversationListPage {
+        let response = try await listProductConversations()
+        return ConversationListPage(
+            conversations: response.product_conversations.map(productConversationListRowToConversation),
+            readStates: Dictionary(
+                response.product_conversations.map { ($0.product_conversation_id, $0.read_state) },
+                uniquingKeysWith: { _, latest in latest }),
+            coordinator: response.coordinator)
+    }
+
 
 
     func listProductConversations() async throws -> ProductConversationListResponse {
@@ -424,6 +437,24 @@ struct PhoenixAPI: Sendable {
     func cancel(conversationId: String) async throws -> CancelResponse {
         try await post(
             "api/conversations/\(conversationId)/cancel", body: [:], as: CancelResponse.self)
+    }
+
+    func markProductConversationRead(
+        productConversationId: String, advance: ProductConversationReadAdvance
+    ) async throws -> ProductConversationReadState {
+        try await post(
+            "api/product-conversations/\(productConversationId)/read",
+            body: ["kind": advance.rawValue],
+            as: ProductConversationReadState.self)
+    }
+
+    func markProductConversationUnread(productConversationId: String) async throws
+        -> ProductConversationReadState
+    {
+        try await post(
+            "api/product-conversations/\(productConversationId)/unread",
+            body: [:],
+            as: ProductConversationReadState.self)
     }
 
     func closeProductConversation(reference: String) async throws {

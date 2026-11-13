@@ -60,6 +60,12 @@ WHEN user taps a conversation
 THE SYSTEM SHALL navigate to that conversation's chat view
 AND preserve the URL for deep linking (`/c/{slug}`)
 
+WHEN a conversation's work scope has a cached pull request
+THE SYSTEM SHALL show its number, state, and feedback status inline on that conversation's row
+
+WHEN the conversation list cannot be refreshed from the server
+THE SYSTEM SHALL keep rendering the last successfully loaded list and indicate that it is cached
+
 **Rationale:** Users need to find and resume conversations. Deep links enable sharing and bookmarking. On mobile, the list is often used as a rapid switching surface; if scrolling belongs to the wrong container, users cannot reliably reach older conversations or select one without fighting the page.
 
 ---
@@ -327,6 +333,9 @@ THE SYSTEM SHALL use keys namespaced by conversation ID:
 - `phoenix:draft:{conversationId}` - draft message text in input
 - `phoenix:queue:{conversationId}` - array of unsent messages (sending or failed)
 - `phoenix:lastSeq:{conversationId}` - last seen sequence_id for reconnection
+
+WHEN persisting the conversation list for offline rendering
+THE SYSTEM SHALL store the last successful ProductConversation list response under `phoenix:product-conversation-list:v1`
 
 WHEN localStorage is unavailable or full
 THE SYSTEM SHALL degrade gracefully without crashing
@@ -744,3 +753,23 @@ Aggregate history SHALL expose one `latest_opening` authority sum rather than a 
 A committed live opening observation SHALL settle opening readiness without requiring a successful aggregate refresh. Refresh failure SHALL remain visible without reverting that accepted edge to pending. Delayed pending snapshots SHALL NOT undo an accepted observation for the same edge. A content-update observation SHALL recompute presentation while retaining the accepted edge and message identity. A delayed accepted-opening content update whose durable transcript generation has been superseded SHALL deliver a coherent committed content, generation, and presentation envelope for that same identity in both live and reconnect replay paths. It SHALL retain its event cursor and unrelated owed replay events. Missing or future generations and wrong content at the current generation SHALL NOT borrow newer opening authority. These reconciliation rules SHALL preserve reader anchors, message order, and independent composer authority under REQ-CONV-002 and REQ-CONV-006.
 
 Global aggregate history SHALL NOT acquire ordinary Open/History lifecycle, Close actions, work identity, or ordinary mutation authority. Native Swift navigation is outside this web contract.
+
+---
+
+### REQ-CONV-027: Unread Conversations and Mark Unread
+
+WHEN an ordinary ProductConversation or the Global Coordinator receives agent, tool, error, or system output that the user has not viewed
+THE SYSTEM SHALL show that conversation as unread in the conversation list and on the Global entry
+
+WHILE the user views a conversation in a visible, focused window
+THE SYSTEM SHALL mark it read through its latest message, including messages that arrive while it is being viewed
+
+WHEN the user marks a conversation unread from the list or from the conversation itself
+THE SYSTEM SHALL show it as unread on every client until the user opens it again or marks it read
+AND SHALL NOT clear the mark because that or any other client keeps the conversation on screen
+
+WHEN the user marks an unread conversation read from the list
+THE SYSTEM SHALL show it as read without opening it
+
+Read state SHALL be stored by the server per ProductConversation so every client sees the same state and continuation does not reset it. A conversation whose latest message is user-authored SHALL NOT be unread solely because of that message. The list SHALL distinguish an explicit unread mark from new activity.
+

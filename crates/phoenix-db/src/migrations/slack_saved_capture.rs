@@ -96,7 +96,7 @@ mod tests {
             .await
             .unwrap()
             .remove(0);
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(db.pool(), 162).await.unwrap(), 1);
         let after = db
             .slack_requests("example.slack.com", "UOWNER")
             .await
@@ -166,7 +166,7 @@ mod tests {
         );
         db.pool().close().await;
         let reopened = crate::Database::open(path.to_str().unwrap()).await.unwrap();
-        assert_eq!(run_pending_migrations(reopened.pool()).await.unwrap(), 0);
+        assert_eq!(run_through_for_test(reopened.pool(), 162).await.unwrap(), 0);
         assert_eq!(
             reopened
                 .slack_requests("example.slack.com", "UOWNER")
@@ -205,6 +205,6 @@ mod tests {
             .execute(old.pool())
             .await
             .unwrap();
-        assert_eq!(run_pending_migrations(old.pool()).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(old.pool(), 162).await.unwrap(), 1);
     }
 }
