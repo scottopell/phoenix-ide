@@ -16,7 +16,10 @@ port 61123 or starts a temporary one. It captures fourteen states at desktop
 1440×900 and mobile 390×844, in light and dark themes, using the browser CLI.
 Each story reports readiness after its target state and layout settle.
 Unexpected browser errors and horizontal document overflow fail the capture;
-the failed-send story permits its intentional synthetic rejection.
+the failed-send story permits its intentional synthetic rejection. The writing
+state also checks that a touch source preview sits above a full-width editor,
+then clicks Dismiss and Keep to verify compact confirmation, a stable top
+border/width, and restored text and editor geometry.
 
 The output is ignored by Git:
 

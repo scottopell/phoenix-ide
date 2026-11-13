@@ -441,7 +441,7 @@ AND SHALL NOT focus the input merely because text was selected.
 
 WHEN such an eligible selection is made using touch or a coarse pointer
 THE SYSTEM SHALL instead show the reaction pill as a compact dock above the current composer
-AND SHALL show a short source preview
+AND SHALL show a short source preview above the full-width comment editor
 AND SHALL preserve the exact selected text, source identity, and native range before input focus clears the native selection
 AND SHALL NOT open the software keyboard merely because text was selected.
 
@@ -535,8 +535,9 @@ WHEN the destination is unavailable or append fails
 THE SYSTEM SHALL retain the reaction and explain the unavailable or failed action.
 
 WHEN the user requests dismissal of a typed reaction
-THE SYSTEM SHALL offer an inline Keep and Discard confirmation within the pill's existing size and shape
-AND SHALL preserve the pill's position when showing or canceling that confirmation
+THE SYSTEM SHALL collapse the pill to a compact inline Keep and Discard confirmation
+AND SHALL preserve the pill's width and top border while showing the confirmation
+AND Keep SHALL restore the editor and its text from that top border, subject to visible-viewport bounds
 AND Escape SHALL resolve that local interaction before any enclosing navigation.
 
 Temporary reactions and annotation cards are session-local; refresh recovery and cross-device synchronization are not guaranteed. Ordinary draft text follows its own persistence contract.

@@ -21,6 +21,23 @@ async function browser(...args) {
   return response.result;
 }
 
+async function pillGeometry() {
+  const result = await browser('eval', `(async()=>{
+    await new Promise(requestAnimationFrame);
+    await new Promise(requestAnimationFrame);
+    const pill=document.querySelector('.reaction-pill');
+    const input=pill?.querySelector('textarea');
+    const source=pill?.querySelector('.reaction-pill-source');
+    return pill ? { ...pill.getBoundingClientRect().toJSON(),
+      text:input?.value,
+      inputWidth:input?.getBoundingClientRect().width,
+      sourceAbove:source && input && !input.closest('[hidden]') ? source.getBoundingClientRect().bottom<=input.getBoundingClientRect().top : null
+    } : null;
+  })()`);
+  if (result.data?.kind !== 'json') throw new Error('Missing reaction geometry');
+  return result.data.value;
+}
+
 async function ensureLadle() {
   try { if ((await fetch(base)).ok) return null; } catch { /* Start the local harness below. */ }
   if (process.env.LADLE_URL) throw new Error(`Ladle is unavailable at ${base}`);
@@ -86,6 +103,19 @@ try {
       if (measurement.data?.kind !== 'json') throw new Error('Missing screenshot geometry');
       const metrics = measurement.data.value;
       if (metrics.overflow || metrics.composerHeight <= 0) throw new Error(`Invalid geometry for ${story.id}: ${JSON.stringify(metrics)}`);
+      if (story.id === '03-writing') {
+        const before = await pillGeometry();
+        if (!before || (before.sourceAbove !== null && (!before.sourceAbove || before.inputWidth < before.width - 32))) throw new Error('Source preview squeezed the reaction editor');
+        await browser('click', '[aria-label="Dismiss reaction"]');
+        await browser('wait', '.reaction-pill-confirmation');
+        const confirmation = await pillGeometry();
+        if (!confirmation || confirmation.height > 64 || Math.abs(confirmation.top - before.top) > 1 || Math.abs(confirmation.width - before.width) > 1) throw new Error('Discard confirmation must collapse while retaining its top edge and width');
+        await browser('click', '.reaction-pill-confirmation button:first-of-type');
+        await browser('wait', '.reaction-pill-content:not([hidden]) textarea');
+        const restored = await pillGeometry();
+        if (!restored || restored.text !== before.text || Math.abs(restored.top - before.top) > 1 || Math.abs(restored.height - before.height) > 1) throw new Error('Keep must restore reaction text and geometry');
+        metrics.reaction = { before, confirmation, restored };
+      }
       const logs = await browser('console', '--limit', '100');
       const errors = JSON.parse(logs.text).filter(entry => entry.level === 'error' && !(story.id === '09-failed-send' && entry.text.includes('Failed to send message:')));
       if (errors.length) throw new Error(`Unexpected console errors for ${story.id}: ${JSON.stringify(errors)}`);

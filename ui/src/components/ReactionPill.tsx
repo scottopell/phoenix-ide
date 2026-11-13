@@ -12,7 +12,10 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
   const docked = touchDocked || sourceDocked;
   const hidden = Boolean(activeScope && activeScope !== scopeId);
   const dockActive = touchDocked && !hidden;
-  const [discard, setDiscard] = useState(false);
+  const [discardTop, setDiscardTop] = useState<number | null>(null);
+  const discard = discardTop !== null;
+  const confirmationTop = useRef(discardTop);
+  confirmationTop.current = discardTop;
   const [error, setError] = useState('');
   const returning = useRef(false);
   const returnRequest = useRef<AbortController | null>(null);
@@ -43,13 +46,20 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
     document.addEventListener('keydown', focusFromSelection);
     return () => document.removeEventListener('keydown', focusFromSelection);
   }, [available, bubbleRef, discard, hidden, scopeId, sourceDocked, touchDocked]);
-  const requestClose = () => body ? setDiscard(true) : onClose();
+  const keepReaction = () => {
+    setDiscardTop(null);
+  };
+  const requestClose = () => {
+    if (!body) { onClose(); return; }
+    const pill = bubbleRef.current;
+    if (pill) setDiscardTop(pill.getBoundingClientRect().top);
+  };
   useKeyboardRouterShortcut({
     id: `${scopeId}:escape`, scopeId, key: 'Escape', layer: 'passive-content',
     handler: (event) => {
       event.preventDefault();
       event.stopImmediatePropagation();
-      if (discard) setDiscard(false);
+      if (discard) keepReaction();
       else requestClose();
     },
   });
@@ -176,6 +186,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
         y = rect.bottom + 16;
         if (y + height > visibleBottom - 8) y = rect.top - height - 16;
       }
+      if (confirmationTop.current !== null) y = confirmationTop.current;
       setSourceDocked(!sourceVisible);
       el.style.left = `${Math.max(left + 12, Math.min(x, left + width - pillWidth - 12))}px`;
       el.style.top = `${Math.max(top + 12, Math.min(y, bottom - height - 12))}px`;
@@ -246,11 +257,11 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       {discard && (
         <div className="reaction-pill-confirmation">
           <span className="reaction-pill-label">Discard reaction?</span>
-          <button type="button" onClick={() => setDiscard(false)}>Keep</button>
+          <button type="button" onClick={keepReaction}>Keep</button>
           <button type="button" onClick={onClose}>Discard</button>
         </div>
       )}
-      <div className="reaction-pill-content" style={discard ? { visibility: 'hidden' } : undefined}>
+      <div className="reaction-pill-content" hidden={discard}>
         {sourceDocked && !touchDocked && available ? (
           <button type="button" className="reaction-pill-return" onPointerDown={captureSource} onClick={returnToPassage} disabled={returnPending} title={error || source.quote}>
             <ArrowUpRight size={18} aria-hidden="true" />

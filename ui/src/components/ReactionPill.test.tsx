@@ -550,6 +550,44 @@ describe('reaction pill', () => {
     document.documentElement.style.removeProperty('--safe-area-left');
   });
 
+  it('pins the top edge as discard collapses and Keep restores the editor', async () => {
+    const resizes: Array<() => void> = [];
+    vi.stubGlobal('ResizeObserver', class {
+      constructor(callback: () => void) { resizes.push(callback); }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    });
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: {
+      offsetLeft: 0, offsetTop: 0, width: 390, height: 844,
+      addEventListener: vi.fn(), removeEventListener: vi.fn(),
+    } });
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.id === 'input-area') return new DOMRect(0, 700, 390, 60);
+      if (this.classList.contains('reaction-pill')) return new DOMRect(12, Number.parseFloat(this.style.top) || 0, 366, this.querySelector('.reaction-pill-confirmation') ? 52 : 240);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    render(<Fixture touchDocked />);
+    const pill = screen.getByRole('region', { name: 'Docked reaction' });
+    expect(pill).toHaveStyle({ top: '448px' });
+    const editor = screen.getByRole('textbox');
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss reaction' }));
+    await act(async () => {
+      resizes.forEach(resize => resize());
+      await new Promise(requestAnimationFrame);
+    });
+    expect(pill).toHaveStyle({ top: '448px' });
+    expect(editor.closest('.reaction-pill-content')).toHaveAttribute('hidden');
+    fireEvent.click(screen.getByRole('button', { name: 'Keep' }));
+    await act(async () => {
+      resizes.forEach(resize => resize());
+      await new Promise(requestAnimationFrame);
+    });
+    expect(pill).toHaveStyle({ top: '448px' });
+    expect(screen.getByRole('textbox')).toBe(editor);
+    expect(editor).toHaveValue('Keep this guarantee');
+  });
+
   it('keeps or discards a typed touch-dock reaction without changing its source', () => {
     render(<Fixture touchDocked />);
     expect(screen.getByRole('region', { name: 'Docked reaction' })).toHaveTextContent('“second”');
