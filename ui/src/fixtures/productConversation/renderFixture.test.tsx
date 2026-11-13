@@ -25,6 +25,16 @@ afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 const productConversationCss = readFileSync(`${process.cwd()}/src/pages/ProductConversationPage.css`, 'utf8');
 
 describe('ProductConversationFixture', () => {
+  it('serves the current conversation reminder list without masking unknown API requests', async () => {
+    const restore = installProductConversationFixtureApi(getProductConversationScenario('inline-message-reactions'));
+    try {
+      await expect(api.listReminders('reaction-work')).resolves.toEqual([]);
+      await expect(fetch('/api/unexpected-fixture-request')).rejects.toThrow('Unexpected fixture API request');
+    } finally {
+      restore();
+    }
+  });
+
   it.each(['ordinary-lazy-history', 'global-lazy-history'] as const)('keeps an explicit loaded prompt selection when the %s unloaded-boundary read resolves', async (id) => {
     vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(1000);
     vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ x: 0, y: 0, top: 0, left: 0, right: 960, bottom: 1000, width: 960, height: 1000, toJSON: () => ({}) });

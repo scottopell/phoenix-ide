@@ -230,6 +230,9 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     if (url.endsWith('/api/telemetry/conversation-open') || url.endsWith('/api/telemetry/product-conversation-open')) {
       return new Response(null, { status: 204 });
     }
+    if (url.endsWith(`/api/conversations/${encodeURIComponent(conversation.id)}/reminders`) && (init?.method ?? 'GET') === 'GET') {
+      return Response.json([] satisfies Awaited<ReturnType<typeof api.listReminders>>);
+    }
     if (url.endsWith(`/api/conversations/${conversation.id}/chat`) && init?.method === 'POST') {
       const body = JSON.parse(String(init.body)) as { text?: string };
       sendCount += 1;
