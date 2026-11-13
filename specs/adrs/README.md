@@ -44,6 +44,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [251](251_explicit-loopback-oauth-callback-urls.md) | Explicit loopback OAuth callback URLs reuse the fixed-port listener | Accepted | REQ-MCP-020 |
 | [250](250_saved-messages-create-private-any-age-captures.md) | Saved messages create private captures of any age | Accepted | REQ-SG-001/003–007/017/019 |
 | [249](249_slack-uses-one-configurable-trigger-emoji.md) | Slack uses one configurable trigger emoji | Accepted | REQ-SG-002/004/005/018 |
 | [248](248_slack-emoji-aliases-share-discovery-and-reinitialize-baselines.md) | Slack emoji aliases share discovery and reinitialize baselines | Superseded by ADR-249 | REQ-SG-002/004/005/018 |

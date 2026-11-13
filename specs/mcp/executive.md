@@ -37,6 +37,15 @@ natively, without the `mcp-remote` subprocess bridge.
 | REQ-MCP-019 | Legacy HTTP+SSE Not Natively Supported | Complete | By decision; `legacy_sse_native = false`. Such servers use the `mcp-remote` stdio bridge. |
 | REQ-MCP-020 | OAuth Redirect Origin Resolution | Complete | The redirect base is the canonical external origin: `PHOENIX_EXTERNAL_URL` override, else derived from the TLS host config (`ConfigSource::external_host`, first non-loopback host in order) + scheme + bind port (`resolve_external_origin`). Derived from trusted config, not request headers. A cached DCR client registered with a different `redirect_uri` is re-registered (`acquire_client_registration`; registrations carry the redirect_uri, phoenix-db migration 23). An all-interfaces bind that still resolves to loopback warns at startup and on every `unauthorized` status entry (`auth_redirect_warning`). A pre-configured client pinning a loopback `callbackPort` (its app allowlist Phoenix can't edit) uses an `http://localhost:<port>/callback` redirect and a loopback listener (`bind_loopback_listeners`/`run_loopback_redirect`, `OAuthRuntime::loopback_listeners`) — bound synchronously before the URL is surfaced (bind failure fails the flow), on both IP families, accepting until the flow resolves or 25 minutes expire — that 302-bounces the callback to the real route. An accepted callback with exactly one matching nonce retains thirty seconds for redirect completion without accepting new connections (`oauth_callback_near_deadline_retains_only_a_bounded_nonce_matched_grace`). |
 
+Explicit loopback callbacks support `oauth.callbackUrl` for a preconfigured public
+client, including Snowflake's `http://127.0.0.1:<port>/` shape. The setting is
+mutually exclusive with `callbackPort`, whose `http://localhost:<port>/callback`
+shape remains supported. Both use the same listener and code exchange; literal
+IP callbacks require that address family to bind. ADR-251 records the decision.
+Validation covers malformed and nonlocal URLs, root and custom paths, exact URI
+matching at code exchange, the Slack port shape, and occupied-port failure.
+Live Snowflake sign-in and token renewal remain unverified.
+
 ## Automatic HTTP recovery implementation
 
 ADR-240 is accepted following the owner's simplification decision. Local transport
