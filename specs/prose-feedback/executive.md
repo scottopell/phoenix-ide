@@ -8,6 +8,8 @@ The `ReactionPill` is integrated into ordinary conversation transcripts. It star
 
 ## Requirements Summary
 
+Annotation design iteration has ten direct Ladle stories under `Annotations`, seeded through production stores, source navigation, and send actions. `./dev.py qa annotations` uses `phoenix-browser` to generate forty desktop/mobile, light/dark screenshots and a filtered side-by-side gallery with composer-height measurements. The workflow is documented in `docs/qa/annotations.md`; generated artifacts stay under the ignored `ui/public/qa-artifacts/annotations/` directory.
+
 Discard confirmation stays inside the existing pill bounds. Its editor remains mounted but hidden from interaction while Keep/Discard is shown, preserving the multiline size and restoring the text on Keep. Chromium geometry checks cover unchanged width, height, and position on confirmation and cancellation.
 
 Chromium fixture checks cover automatic wrapping and shrinking, long unbroken text, bounded vertical scrolling, and desktop and 390px layouts, including a growing touch dock above the composer. Appending a wrapped reaction preserves the existing draft and transcript scroll position without sending a message. The fixture serves an empty reminder list so the Reminders panel does not show an unexpected-request error.

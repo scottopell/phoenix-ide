@@ -238,6 +238,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       sendCount += 1;
       record('SendCount', sendCount);
       record('LastSentText', body.text ?? '');
+      if (scenario.sendFailure) return Response.json({ error: 'Fixture send failure' }, { status: 503 });
       return Response.json({ queued: false, already_persisted: true });
     }
     if ((init?.method ?? 'GET') === 'GET' && scenario.initialEntry?.startsWith('/global/')) {
