@@ -1096,7 +1096,6 @@ final class AppModel {
         return true
     }
 
-    @discardableResult
     /// Advance the server read cursor for a conversation the user is looking
     /// at. Best-effort: a missed advance only leaves an unread dot until the
     /// next view.
@@ -1134,6 +1133,7 @@ final class AppModel {
         }
     }
 
+    @discardableResult
     func closeProductConversation(_ conversation: Conversation) async -> Bool {
         _ = confirmationRehydrationGenerations.begin(
             productConversationId: "pending-close-confirmation")
