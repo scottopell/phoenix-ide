@@ -1,6 +1,6 @@
 # ADR-248: Slack emoji aliases share discovery and reinitialize baselines
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR-249
 - **Date:** 2026-11-11
 - **Affects:** REQ-SG-002, REQ-SG-004, REQ-SG-005, REQ-SG-018
 

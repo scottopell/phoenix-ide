@@ -19,20 +19,20 @@ pub(crate) struct Config {
     pub workspace: String,
     pub timezone: String,
     pub phoenix_url: String,
-    pub trigger_emojis: Vec<String>,
+    pub trigger_emoji: String,
     /// Owner-configured executable and arguments; notification content uses stdin.
     pub notification_command: Option<Vec<String>>,
 }
 impl Config {
     fn normalized(mut self) -> Result<Self, String> {
-        self.trigger_emojis = phoenix_db::normalize_slack_trigger_emojis(&self.trigger_emojis)
+        self.trigger_emoji = phoenix_db::normalize_slack_trigger_emoji(&self.trigger_emoji)
             .map_err(|e| e.to_string())?;
         self.validate()?;
         Ok(self)
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        phoenix_db::normalize_slack_trigger_emojis(&self.trigger_emojis)
+        phoenix_db::normalize_slack_trigger_emoji(&self.trigger_emoji)
             .map_err(|e| e.to_string())?;
         if !(self.owner.starts_with('U') || self.owner.starts_with('W'))
             || !self.owner.chars().all(|c| c.is_ascii_alphanumeric())

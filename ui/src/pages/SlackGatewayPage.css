@@ -144,28 +144,6 @@
   font-weight: 600;
 }
 
-.sg-emoji-list {
-  display: grid;
-  gap: 12px;
-  margin-bottom: 14px;
-}
-
-.sg-emoji-row {
-  display: flex;
-  align-items: flex-end;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-:where(.sg-emoji-row) .sg-field {
-  flex: 1 1 220px;
-}
-
-.sg-emoji-row code {
-  padding-bottom: 9px;
-  overflow-wrap: anywhere;
-}
-
 .sg-gesture-guide code {
   display: block;
   margin-top: 8px;

@@ -830,6 +830,11 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 161,
+        name: "slack_single_trigger_emoji",
+        sql: include_str!("migrations/slack_single_trigger_emoji.sql"),
+    },
+    Migration {
+        version: 162,
         name: "product_conversation_read_state",
         sql: include_str!("migrations/product_conversation_read_state.sql"),
     },
@@ -13362,12 +13367,12 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn migration_161_seeds_existing_product_conversations_as_read() {
+    async fn migration_162_seeds_existing_product_conversations_as_read() {
         use phoenix_core::domain::llm_types::ContentBlock;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("read-state.db");
         let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
-        run_through_for_test(db.pool(), 160).await.unwrap();
+        run_through_for_test(db.pool(), 161).await.unwrap();
         let conversation = db
             .create_conversation("seeded", "seeded", "/tmp", true, None, None)
             .await
@@ -13381,8 +13386,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(run_through_for_test(db.pool(), 161).await.unwrap(), 1);
-        assert_eq!(run_through_for_test(db.pool(), 161).await.unwrap(), 0);
+        assert_eq!(run_through_for_test(db.pool(), 162).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(db.pool(), 162).await.unwrap(), 0);
         let cursor: Option<String> = sqlx::query_scalar(
             "SELECT read_through_message_id FROM product_conversation_read_state
              WHERE product_conversation_id = ?1",
@@ -13433,10 +13438,124 @@ mod tests {
         );
         db.pool().close().await;
         let reopened = crate::Database::open(path.to_str().unwrap()).await.unwrap();
-        assert_eq!(run_through_for_test(reopened.pool(), 160).await.unwrap(), 0);
+        assert_eq!(run_through_for_test(reopened.pool(), 161).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(reopened.pool(), 161).await.unwrap(), 0);
         let value: serde_json::Value =
             serde_json::from_str(&reopened.slack_configuration().await.unwrap().unwrap()).unwrap();
-        assert_eq!(value["trigger_emojis"], serde_json::json!(["fire"]));
+        assert_eq!(value["trigger_emoji"], serde_json::json!("fire"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn migration_161_retains_the_first_emoji_and_durable_work() {
+        // REQ-SG-018
+        for multiple in [false, true] {
+            for ready in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("slack-single.db");
+                let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+                run_through_for_test(db.pool(), 160).await.unwrap();
+                db.set_app_setting(
+                    "slack_gateway",
+                    r#"{"workspace":"example.slack.com","owner":"UOWNER","enabled":true}"#,
+                )
+                .await
+                .unwrap();
+                sqlx::query("UPDATE slack_gateway_trigger_emojis SET name='phoenix-please-look'")
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                if multiple {
+                    sqlx::query(
+                        "INSERT INTO slack_gateway_trigger_emojis(name,ordinal) VALUES ('fire',1)",
+                    )
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                }
+                let source = crate::SlackSource {
+                    workspace: "example.slack.com".into(),
+                    owner: "UOWNER".into(),
+                    channel: "C123".into(),
+                    message_ts: "100.000001".into(),
+                    thread_ts: "100.000001".into(),
+                    source_url: "https://example.slack.com/archives/C123/p100000001".into(),
+                    instruction: "investigate".into(),
+                    context: "quoted".into(),
+                    observed_at_unix_micros: 1,
+                    kind: crate::SlackRequestKind::Explicit,
+                    trigger_kind: crate::SlackTriggerKind::Prefix,
+                };
+                db.accept_slack_source(&source, false).await.unwrap();
+                let requests = db
+                    .slack_requests(&source.workspace, &source.owner)
+                    .await
+                    .unwrap();
+                let request = &requests[0];
+                sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,created_at_unix_micros) VALUES ('retained',?1,'done','thread','reply',1)").bind(&request.binding_id).execute(db.pool()).await.unwrap();
+                sqlx::query("INSERT INTO slack_gateway_return_coverage(return_id,request_id) VALUES ('retained',?1)").bind(&request.request_id).execute(db.pool()).await.unwrap();
+                sqlx::query(
+                    "INSERT INTO slack_gateway_accounts(workspace,owner,baseline_complete,retry_at_us) VALUES ('example.slack.com','UOWNER',?1,456)",
+                )
+                .bind(ready)
+                .execute(db.pool())
+                .await
+                .unwrap();
+                sqlx::query("INSERT INTO slack_gateway_discovery(workspace,owner,kind,after_date,cursor) VALUES ('example.slack.com','UOWNER','reaction','2026-11-01','retained-cursor')").execute(db.pool()).await.unwrap();
+                assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
+                assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
+                let value: serde_json::Value =
+                    serde_json::from_str(&db.slack_configuration().await.unwrap().unwrap())
+                        .unwrap();
+                assert_eq!(value["trigger_emoji"], "phoenix-please-look");
+                assert!(value.get("trigger_emojis").is_none());
+                let account: (bool, i64) = sqlx::query_as(
+                    "SELECT baseline_complete,retry_at_us FROM slack_gateway_accounts",
+                )
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                assert_eq!(account, (ready, 456));
+                assert_eq!(
+                    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM slack_gateway_discovery")
+                        .fetch_one(db.pool())
+                        .await
+                        .unwrap(),
+                    i64::from(!multiple)
+                );
+                assert_eq!(
+                    db.slack_requests(&source.workspace, &source.owner)
+                        .await
+                        .unwrap()[0]
+                        .request_id,
+                    request.request_id
+                );
+                assert_eq!(
+                    db.slack_returns(&source.workspace, &source.owner)
+                        .await
+                        .unwrap()[0]
+                        .request_ids,
+                    vec![request.request_id.clone()]
+                );
+                assert!(db
+                    .slack_source_recorded(
+                        &source.workspace,
+                        &source.owner,
+                        &source.channel,
+                        &source.message_ts
+                    )
+                    .await
+                    .unwrap());
+                assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sqlite_schema WHERE name='slack_gateway_trigger_emojis'").fetch_one(db.pool()).await.unwrap(), 0);
+                db.pool().close().await;
+                let reopened = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+                assert_eq!(run_pending_migrations(reopened.pool()).await.unwrap(), 0);
+                assert_eq!(
+                    reopened.slack_configuration().await.unwrap(),
+                    Some(value.to_string())
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -16130,7 +16249,8 @@ mod tests {
                 (158, "federated_conversation_actions".into()),
                 (159, "federated_continuation_receipts".into()),
                 (160, "slack_trigger_emojis".into()),
-                (161, "product_conversation_read_state".into()),
+                (161, "slack_single_trigger_emoji".into()),
+                (162, "product_conversation_read_state".into()),
             ]
         );
     }
@@ -16140,7 +16260,8 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
-            (161, "product_conversation_read_state"),
+            (161, "slack_single_trigger_emoji"),
+            (162, "product_conversation_read_state"),
             (160, "slack_trigger_emojis"),
             (159, "federated_continuation_receipts"),
             (158, "federated_conversation_actions"),
@@ -20418,7 +20539,8 @@ mod tests {
                 (158, "federated_conversation_actions"),
                 (159, "federated_continuation_receipts"),
                 (160, "slack_trigger_emojis"),
-                (161, "product_conversation_read_state"),
+                (161, "slack_single_trigger_emoji"),
+                (162, "product_conversation_read_state"),
             ]
         );
         let goal = MIGRATIONS
