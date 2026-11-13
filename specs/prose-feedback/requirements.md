@@ -478,8 +478,21 @@ THE SYSTEM SHALL add one annotation card owning the complete selected quotation,
 AND SHALL preserve existing draft text, including intervening edits and whitespace
 AND SHALL NOT submit a message, write to the clipboard, or modify the review-note collection.
 
-THE SYSTEM SHALL allow editing an annotation's comment in its composer card while keeping its source passage fixed
-AND SHALL allow returning from the card to the exact source passage through transcript navigation.
+THE SYSTEM SHALL present pending annotations as a compact overlapping stack above the ordinary composer, including when there is only one annotation
+AND SHALL give each annotation a stable number, source excerpt, and comment preview
+AND SHALL preserve creation order and existing numbers across additions, edits, and deletions
+AND SHALL bound the stack height with internal scrolling and expose a selectable strip at least 44 CSS pixels tall for each card.
+
+WHEN the user selects an annotation strip
+THE SYSTEM SHALL open a modal showing the complete source quotation and an editable comment while keeping the source passage fixed
+AND SHALL save comment edits to the draft as they are typed
+AND SHALL provide deletion and return to the exact source passage through transcript navigation.
+
+WHEN the annotation editor is dismissed
+THE SYSTEM SHALL retain comment edits and return keyboard focus to its strip without scrolling the conversation.
+
+WHEN the user deletes an annotation in the editor
+THE SYSTEM SHALL close the editor and return focus to an adjacent annotation strip, or to the ordinary composer when the stack is empty.
 
 WHEN an annotation card is removed
 THE SYSTEM SHALL remove that annotation and its source highlight together without changing unrelated draft text or annotations.

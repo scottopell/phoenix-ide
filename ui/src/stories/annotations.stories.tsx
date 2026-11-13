@@ -25,3 +25,12 @@ export const FailedSend = stateStory('09-failed-send');
 FailedSend.storyName = '09-failed-send';
 export const Sent = stateStory('10-sent');
 Sent.storyName = '10-sent';
+
+export const TwoAnnotations = stateStory('11-two-annotations');
+TwoAnnotations.storyName = '11-two-annotations';
+export const Editing = stateStory('12-editing');
+Editing.storyName = '12-editing';
+export const AfterDelete = stateStory('13-after-delete');
+AfterDelete.storyName = '13-after-delete';
+export const ManyAnnotations = stateStory('14-many-annotations');
+ManyAnnotations.storyName = '14-many-annotations';

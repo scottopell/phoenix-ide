@@ -18,6 +18,19 @@ describe('annotation draft ownership', () => {
     expect(draft.getSnapshot()).toEqual([]);
   });
 
+  it('never reuses a label after deletion, submission, or edits within a draft scope', () => {
+    const draft = new AnnotationDraftStore().forScope('a');
+    draft.add({ source, body: 'First' });
+    draft.remove(draft.getSnapshot()[0]!.id);
+    draft.add({ source, body: 'Second' });
+    draft.edit(draft.getSnapshot()[0]!.id, 'Edited');
+    expect(draft.getSnapshot()[0]!.number).toBe(2);
+    const submission = draft.beginSubmission();
+    draft.finishSubmission(submission, true);
+    draft.add({ source, body: 'Third' });
+    expect(draft.getSnapshot()[0]!.number).toBe(3);
+  });
+
   it('clears only the submitted batch and preserves new annotations and other conversations', () => {
     const store = new AnnotationDraftStore();
     const draft = store.forScope('a');

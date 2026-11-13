@@ -1,6 +1,6 @@
 # ADR-230: Editable annotation cards own pending source highlights
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR-231
 - **Date:** 2026-11-13
 - **Affects:** REQ-PF-018, REQ-PF-019, REQ-PF-020
 

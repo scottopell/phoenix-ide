@@ -9,7 +9,7 @@ import { buildLadleStoryUrl, selectCaptureEntries } from './capture-ladle-surfac
 const exec = promisify(execFile);
 const root = fileURLToPath(new URL('../', import.meta.url));
 const base = process.env.LADLE_URL ?? 'http://127.0.0.1:61123/';
-const out = path.resolve(root, process.env.ANNOTATION_QA_OUT ?? 'public/qa-artifacts/annotations');
+const out = path.resolve(root, process.env.ANNOTATION_QA_OUT ?? 'qa-artifacts/annotations');
 const session = `annotation-design-${process.pid}`;
 const layouts = [{ name: 'desktop', width: 1440, height: 900 }, { name: 'mobile', width: 390, height: 844 }];
 const themes = selectCaptureEntries([{ name: 'light' }, { name: 'dark' }], process.env.ANNOTATION_THEMES, 'name', 'ANNOTATION_THEMES');
@@ -97,6 +97,7 @@ try {
   }
   await writeGallery(stories, captures);
   console.log(`Gallery: ${path.join(out, 'index.html')}`);
+  console.log(`Open in Ladle: ${new URL(`/@fs/${out.replaceAll('\\', '/')}/index.html`, base).href}`);
 } finally {
   await cleanup();
 }

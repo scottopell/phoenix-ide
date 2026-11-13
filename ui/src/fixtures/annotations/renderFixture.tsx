@@ -7,7 +7,7 @@ import { reactionTextOffset, restoreReactionRange } from '../../components/react
 
 export type AnnotationDesignState =
   | '01-empty' | '02-selected' | '03-writing' | '04-discard' | '05-one-annotation'
-  | '06-several-annotations' | '07-long-comment' | '08-sending' | '09-failed-send' | '10-sent';
+  | '06-several-annotations' | '07-long-comment' | '08-sending' | '09-failed-send' | '10-sent' | '11-two-annotations' | '12-editing' | '13-after-delete' | '14-many-annotations';
 
 const shortComment = 'Please cover cancellation in this test.';
 const longComment = 'Please keep the original result and unfinished draft attached to the same conversation. I want to check cancellation before and after completion, and make sure reconnecting never duplicates the result. This needs a concrete test case rather than a timing assumption.';
@@ -67,9 +67,11 @@ function SeedAnnotationState({ state }: { state: AnnotationDesignState }) {
           if (state !== '02-selected') reactions.dispatch('pc-inline-reactions', { type: 'edit', body: longComment });
         } else if (state !== '01-empty') {
           draft.add({ source, body: state === '07-long-comment' ? longComment : shortComment });
-          if (state === '06-several-annotations') {
-            draft.add({ source: sourceFromParagraph(paragraphs[2] ?? paragraph), body: 'Keep this attached to the original conversation.' });
-            draft.add({ source: sourceFromParagraph(paragraphs.at(-1)!), body: 'Add one browser journey for this guarantee.' });
+          if (['06-several-annotations', '11-two-annotations', '12-editing', '13-after-delete', '14-many-annotations'].includes(state)) {
+            draft.add({ source: sourceFromParagraph(paragraphs[2] ?? paragraph), body: state === '12-editing' ? longComment : 'Keep this attached to the original conversation.' });
+            if (state !== '11-two-annotations') draft.add({ source: sourceFromParagraph(paragraphs.at(-1)!), body: 'Add one browser journey for this guarantee.' });
+            if (state === '13-after-delete') draft.remove(draft.getSnapshot()[1]!.id);
+            if (state === '14-many-annotations') for (let index = 4; index <= 8; index++) draft.add({ source, body: `Another concrete check, annotation ${index}.` });
           }
           if (state === '08-sending') {
             draft.beginSubmission();
@@ -108,6 +110,15 @@ function SeedAnnotationState({ state }: { state: AnnotationDesignState }) {
         frame = requestAnimationFrame(settle);
         return;
       }
+      if (state === '12-editing') {
+        if (!actionStarted) {
+          const edit = document.querySelector<HTMLButtonElement>('[aria-label="Edit annotation 2"]');
+          if (!edit) { frame = requestAnimationFrame(settle); return; }
+          actionStarted = true;
+          edit.click();
+        }
+        if (!document.querySelector('.annotation-editor[open]')) { frame = requestAnimationFrame(settle); return; }
+      }
       if (state === '09-failed-send' || state === '10-sent') {
         if (!actionStarted) {
           const send = document.querySelector<HTMLButtonElement>('[aria-label="Send message"]');
@@ -123,7 +134,7 @@ function SeedAnnotationState({ state }: { state: AnnotationDesignState }) {
       if (['02-selected', '03-writing'].includes(state) && !pill) { frame = requestAnimationFrame(settle); return; }
       if (state === '04-discard' && !document.querySelector('.reaction-pill-confirmation')) { frame = requestAnimationFrame(settle); return; }
       if (document.querySelectorAll('.draft-annotation').length !== draft.getSnapshot().length) { frame = requestAnimationFrame(settle); return; }
-      const geometry = JSON.stringify([...document.querySelectorAll('#input-area, .reaction-pill')].map(element => element.getBoundingClientRect().toJSON()));
+      const geometry = JSON.stringify([...document.querySelectorAll('#input-area, .reaction-pill, .annotation-editor .selection-dialog__surface')].map(element => element.getBoundingClientRect().toJSON()));
       if (geometry !== previousGeometry || document.fonts.status !== 'loaded') {
         previousGeometry = geometry;
         frame = requestAnimationFrame(settle);

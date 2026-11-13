@@ -83,10 +83,15 @@ describe('editable annotation cards', () => {
     let complete!: () => void;
     const send = vi.fn(() => new Promise<void>(resolve => { complete = resolve; }));
     render(<ConnectedRecoveryHarness store={store} send={send} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Edit annotation 1' }));
     fireEvent.change(screen.getByRole('textbox', { name: 'Annotation 1 comment' }), { target: { value: 'Edited in composer' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Done' }));
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
     expect(send).toHaveBeenCalledWith('General feedback\n\nRegarding message #2 (earlier:answer):\n\n```text\nSelected passage\n```\n\nEdited in composer', [], [rejectedFile], { restoreOnFailure: true });
+    fireEvent.click(screen.getByRole('button', { name: 'Edit annotation 1' }));
     expect(screen.getByRole('textbox', { name: 'Annotation 1 comment' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Delete annotation' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Done' }));
     act(() => {
       annotations.add({ source, body: 'Next annotation' });
       store.dispatch('a', { type: 'set_draft', text: 'Next message' });
@@ -106,6 +111,7 @@ describe('editable annotation cards', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
     await act(async () => pending.reject(new Error('Offline during submission')));
     expect(store.getSnapshot('a').draft).toBe('General feedback');
+    fireEvent.click(screen.getByRole('button', { name: 'Edit annotation 1' }));
     expect(screen.getByRole('textbox', { name: 'Annotation 1 comment' })).toBeEnabled();
     expect(screen.getByRole('textbox', { name: 'Annotation 1 comment' })).toHaveValue('Retain me');
     expect(annotations.getSnapshot()[0]!.submission).toBeNull();
@@ -117,7 +123,8 @@ describe('editable annotation cards', () => {
     annotations.add({ source, body: 'Only annotation' });
     const send = vi.fn().mockResolvedValue(undefined);
     render(<ConnectedRecoveryHarness store={store} send={send} initialFiles={[]} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Remove annotation 1' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Edit annotation 1' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Delete annotation' }));
     expect(annotations.getSnapshot()).toEqual([]);
     act(() => annotations.add({ source, body: 'Only annotation' }));
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }));

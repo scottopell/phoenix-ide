@@ -3,6 +3,7 @@ import { formatInlineReaction, type ReactionSource } from './InlineReactionStore
 
 export interface DraftAnnotation {
   readonly id: string;
+  readonly number: number;
   readonly source: ReactionSource;
   readonly body: string;
   readonly submission: string | null;
@@ -41,6 +42,7 @@ export class AnnotationDraftStore extends RoutedStore<string, readonly DraftAnno
     const existing = this.drafts.get(key);
     if (existing) return existing;
     let navigate: Navigator | null = null;
+    let nextNumber = 1;
     const current = () => this.drafts.get(key) === draft;
     const requireCurrent = () => {
       if (!current()) throw new Error('This annotation draft is no longer available.');
@@ -53,7 +55,7 @@ export class AnnotationDraftStore extends RoutedStore<string, readonly DraftAnno
       subscribe: listener => this.subscribe(key, listener),
       add: annotation => {
         requireCurrent();
-        update(items => [...items, { source: annotation.source, body: annotation.body, id: crypto.randomUUID(), submission: null }]);
+        update(items => [...items, { source: annotation.source, body: annotation.body, id: crypto.randomUUID(), number: nextNumber++, submission: null }]);
       },
       edit: (id, body) => update(items => items.map(item => item.id === id && item.submission === null ? { ...item, body } : item)),
       remove: id => update(items => items.filter(item => item.id !== id || item.submission !== null)),
