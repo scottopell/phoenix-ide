@@ -44,9 +44,10 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [250](250_saved-messages-create-private-any-age-captures.md) | Saved messages create private captures of any age | Accepted | REQ-SG-001/003–007/017/019 |
 | [249](249_slack-uses-one-configurable-trigger-emoji.md) | Slack uses one configurable trigger emoji | Accepted | REQ-SG-002/004/005/018 |
 | [248](248_slack-emoji-aliases-share-discovery-and-reinitialize-baselines.md) | Slack emoji aliases share discovery and reinitialize baselines | Superseded by ADR-249 | REQ-SG-002/004/005/018 |
-| [250](250_server-side-read-cursor-per-product-conversation.md) | Server-side read cursor per ProductConversation | Accepted | REQ-CONV-027 |
+| [251](251_server-side-read-cursor-per-product-conversation.md) | Server-side read cursor per ProductConversation | Accepted | REQ-CONV-027 |
 | [247](247_trusted-inline-research-inherits-saved-peer-query-selection.md) | Trusted Coordinator inline research can select saved peers for read-only SQL | Accepted | REQ-RQD-001/010, REQ-FED-001, REQ-GR-007 |
 | [246](246_admit-exact-canonical-158-before-156-ledger.md) | Admit the exact canonical 158-before-156 ledger | Accepted; qualifies ADR-187 post-129 registered-predecessor continuity only | REQ-COMP-002; REQ-COMP-020; REQ-COMP-022 |
 | [245](245_historical-native-locators-preserve-bytes-without-fabricating-trust.md) | Historical native locators preserve bytes without fabricating trust | Accepted; qualifies ADR-243 historical assumptions only | REQ-FED-021; REQ-FED-023 |

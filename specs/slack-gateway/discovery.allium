@@ -145,10 +145,10 @@ contract NativeReconciliationPort {
         -- Disabling discovery does not cancel or suppress accepted native work.
 }
 
-enum SearchKind { prefix | reaction }
+enum SearchKind { prefix | reaction | saved }
 enum ServiceKind { discovery | delivery | inspection }
 enum ServicePhase { reconciling | searching | finished }
-enum CallPurpose { owner_identity | search_page | fresh_prefix_page | candidate_read | acknowledgment | thread_reply | inspection_read }
+enum CallPurpose { owner_identity | search_page | saved_page | fresh_prefix_page | candidate_read | acknowledgment | thread_reply | inspection_read }
 enum CallState { in_flight | resolved }
 
 entity DiscoveryController {
@@ -157,7 +157,7 @@ entity DiscoveryController {
     window_started_at: Timestamp
     calls_used: Integer
     retry_not_before: Timestamp?
-    last_completed_scan_at: Timestamp?
+    last_completed_scan_at: Timestamp?  -- Completed emoji sweep only.
     next_first_query: SearchKind
     services: ServiceOpportunity with controller = this
     searches: SearchProgress with controller = this
@@ -187,6 +187,9 @@ entity ServiceOpportunity {
     refresh_completed: Boolean
     catchup_first: Boolean
     catchup_opportunity_taken: Boolean
+    emoji_sweep_completed: Boolean
+    saved_sweep_completed: Boolean
+    saved_page_failed: Boolean
     burst_deadline: Timestamp?
     calls: SlackCall with service = this
     in_flight_calls: calls where state = in_flight
@@ -206,6 +209,10 @@ entity SearchProgress {
     position: String?
     complete: Boolean
     page_evidence: PageEvidence with query = this
+
+    invariant EmojiQueryOnly {
+        kind != saved
+    }
 }
 
 config {
@@ -239,8 +246,10 @@ rule BeginServiceOpportunity {
         next_query: controller.next_first_query, burst_deadline: null,
         refresh_eligible: controller.gateway.baseline_complete and controller.searches.any(q => q.kind = prefix and (q.position != null or q.complete)),
         refresh_attempted: false, refresh_completed: false,
-        catchup_first: controller.next_first_query = reaction,
-        catchup_opportunity_taken: false
+        catchup_first: controller.next_first_query != prefix,
+        catchup_opportunity_taken: false,
+        emoji_sweep_completed: false, saved_sweep_completed: false,
+        saved_page_failed: false
     )
     ensures:
         if kind != inspection:
@@ -270,12 +279,13 @@ rule GrantSlackCall {
         or service.kind = inspection
     )
     requires: purpose = owner_identity or service.owner_verified
-    requires: purpose != fresh_prefix_page
+    requires: purpose not in {fresh_prefix_page, saved_page}
     requires: service.kind != inspection or purpose in {owner_identity, inspection_read}
     requires: purpose != inspection_read or service.kind = inspection
     requires: purpose not in {search_page, candidate_read} or service.phase = searching
     requires: purpose != search_page or (
         service.kind = discovery and service.controller.gateway.enabled
+        and not service.emoji_sweep_completed
         and service.burst_deadline > now
         and service.controller.remaining_calls >= config.maximum_page_calls + config.work_reserve
     )
@@ -300,7 +310,7 @@ rule GrantFreshPrefixCall {
     requires: service.in_flight_calls.count = 0
     requires: not service.controller.backoff_active
     requires: service.burst_deadline > now
-    requires: not service.catchup_first or service.catchup_opportunity_taken or service.controller.searches.all(q => q.complete)
+    requires: not service.catchup_first or service.catchup_opportunity_taken
     requires: service.controller.remaining_calls >= config.maximum_refresh_calls + config.maximum_page_calls + config.work_reserve
     ensures: service.controller.calls_used = service.controller.calls_used + 1
     ensures: service.refresh_attempted = true
@@ -375,6 +385,7 @@ rule StartSweep {
     when: EnsureSearchProgress(service)
     requires: service.phase = searching
     requires: service.controller.searches.count = 0
+    requires: not service.emoji_sweep_completed
     ensures: SearchProgress.created(controller: service.controller, kind: prefix, position: null, complete: false)
     ensures: SearchProgress.created(controller: service.controller, kind: reaction, position: null, complete: false)
 }
@@ -385,6 +396,7 @@ rule ObserveBaselineSource {
     requires: service.controller.gateway.enabled
     requires: not service.controller.gateway.baseline_complete
     requires: observation.eligible
+    requires: observation.trigger_kind != saved
     requires: observation.workspace = service.controller.gateway.workspace
     requires: observation.actor = service.controller.gateway.owner
     requires: observation.source_key not in service.controller.gateway.handled_sources
@@ -396,6 +408,7 @@ rule SubmitReadySource {
     requires: service.phase = searching
     requires: service.controller.gateway.enabled
     requires: service.controller.gateway.baseline_complete
+    requires: observation.trigger_kind != saved
     ensures: lifecycle/EligibleSourceObserved(service.controller.gateway, observation)
 }
 
@@ -416,7 +429,7 @@ rule CheckpointCompletedPage {
         if evidence.query.kind = prefix:
             service.next_query = reaction
         else:
-            service.next_query = prefix
+            service.next_query = if service.controller.gateway.saved_enabled: saved else: prefix
 }
 
 rule CompleteSweep {
@@ -430,7 +443,7 @@ rule CompleteSweep {
     ensures:
         for query in service.controller.searches:
             not exists query
-    ensures: service.phase = finished
+    ensures: service.emoji_sweep_completed = true
 }
 
 rule FinishServiceOpportunity {
@@ -449,6 +462,12 @@ rule PreferReactionNextInterval {
 rule PreferPrefixNextInterval {
     when: DiscoveryIntervalElapsed(controller)
     requires: controller.next_first_query = reaction
+    ensures: controller.next_first_query = if controller.gateway.saved_enabled: saved else: prefix
+}
+
+rule PreferPrefixAfterSavedInterval {
+    when: DiscoveryIntervalElapsed(controller)
+    requires: controller.next_first_query = saved
     ensures: controller.next_first_query = prefix
 }
 
@@ -529,12 +548,13 @@ surface DiscoveryBoundary {
         -- replays uncertain writes nor revives single-attempt notices or eyes.
         -- When the last completed scan predates the current eligible calendar
         -- window, native status warns of potentially missed older triggers.
-        -- No expanded search window or complete outage catch-up is promised.
+        -- The four-date limit applies to emoji discovery. Saved captures have
+        -- no source-age cutoff; neither stream promises an event-log catch-up.
 
     @guarantee SchedulingPolicy
         -- Owner-facing read-access inspection shares serial service, allowance
         -- and persisted provider backoff. Its reads cannot accept triggers,
-        -- change saved query positions or acknowledge requests.
+        -- change retained query positions or acknowledge requests.
         -- Discovery opportunities occur on the configured discovery interval;
         -- accepted work is reconciled before any page opportunity. Ready reply
         -- commits request delivery opportunities; periodic recovery supplies
@@ -544,20 +564,27 @@ surface DiscoveryBoundary {
         -- before beginning its service opportunity.
         -- Delivery opportunities cannot renew unexpired allowance or create
         -- searches. Any opportunity can check and renew an expired window.
-        -- Page opportunities alternate next_query, skipping a completed query;
-        -- the first query alternates between scheduled discovery opportunities.
+        -- Page opportunities rotate prefix, reaction, Saved, skipping completed
+        -- emoji queries and disabled/completed Saved work. Saved progress is owned
+        -- by saved-capture.allium and never counts toward the two emoji queries.
+        -- The first query rotates across enabled streams between intervals.
+        -- No stream can repeatedly take the first slot while others are pending.
         -- Stop between pages at the burst deadline or below the page threshold.
-        -- An in-flight page/call may exceed the soft deadline. A new sweep waits
-        -- for a subsequent discovery opportunity after both queries complete.
+        -- An in-flight page/call may exceed the soft deadline. Each workflow may
+        -- finish at most one sweep per service. Completing both emoji queries
+        -- does not finish a Saved baseline or prevent a Saved page opportunity;
+        -- Saved completion does not finish or restart the emoji sweep.
         -- Once ready, an already advanced/completed prefix query enables one
         -- newest-prefix-page probe per discovery opportunity. Its evidence uses
-        -- the same verification and acceptance boundary as saved pages, but it
+        -- the same verification and acceptance boundary as retained emoji pages, but it
         -- cannot advance saved positions, complete a sweep, or finish a baseline.
-        -- When catchup_first holds, offer the first unfinished saved query a page
-        -- before refreshing; skip refresh if allowance or time is insufficient.
-        -- Otherwise offer refresh first, then resume saved page opportunities.
-        -- Alternate first opportunity between these classes across intervals.
-        -- A failed fresh probe records its error while other saved pages may
+        -- When catchup_first holds, a retained emoji/Saved page must receive
+        -- an opportunity before refreshing. Completing/removing the emoji query
+        -- rows is not a bypass. Skip refresh if no catch-up opportunity was taken
+        -- or if allowance or time is insufficient.
+        -- Otherwise offer refresh first, then resume retained page opportunities.
+        -- Rotate the first opportunity across enabled streams across intervals.
+        -- A failed fresh probe records its error while other retained pages may
         -- progress; throttling still blocks all subsequent Slack calls.
         -- The probe ignores its next cursor. It checks only the newest result;
         -- additional messages and late indexing remain covered by full catch-up.

@@ -1,7 +1,7 @@
 //! One non-overlapping pass; all work admission uses the native service.
 use super::{
     slack::{Page, Slack},
-    Config, Pass,
+    Config, Pass, QueryKind,
 };
 use crate::api::AppState;
 use crate::send_chat_service::{
@@ -48,9 +48,9 @@ pub(super) async fn tick(
         slack.verify_owner(c).await
     };
     let result = reconcile_work(state, c, slack, identity.is_ok()).await;
-    if let Pass::Discovery { reactions_first } = pass {
+    if let Pass::Discovery { first } = pass {
         if discovering && identity.is_ok() {
-            if let Err(error) = discover_ordered(state, c, slack, reactions_first).await {
+            if let Err(error) = discover_ordered(state, c, slack, first).await {
                 state
                     .db
                     .slack_scan_status(
@@ -106,19 +106,22 @@ async fn reconciliation_work(state: &AppState, c: &Config) -> Result<Option<bool
         .slack_returns(&c.workspace, &c.owner)
         .await
         .map_err(err)?;
-    let needs_slack = requests
-        .iter()
-        .any(|r| !r.eyes_confirmed && r.eyes_failure.is_none())
-        || outputs.iter().any(|r| {
-            r.destination == "thread"
-                && matches!(
-                    r.state,
-                    phoenix_db::SlackReturnState::Pending
-                        | phoenix_db::SlackReturnState::KnownUnsent
-                )
-        });
+    let needs_slack = requests.iter().any(|r| {
+        r.source.trigger_kind != phoenix_db::SlackTriggerKind::Saved
+            && !r.eyes_confirmed
+            && r.eyes_failure.is_none()
+    }) || outputs.iter().any(|r| {
+        r.destination == "thread"
+            && matches!(
+                r.state,
+                phoenix_db::SlackReturnState::Pending | phoenix_db::SlackReturnState::KnownUnsent
+            )
+    });
     if requests.iter().all(|r| {
-        (r.admitted || r.failure.is_some()) && (r.eyes_confirmed || r.eyes_failure.is_some())
+        (r.admitted || r.failure.is_some())
+            && (r.source.trigger_kind == phoenix_db::SlackTriggerKind::Saved
+                || r.eyes_confirmed
+                || r.eyes_failure.is_some())
     }) && outputs.iter().all(|r| {
         !matches!(
             r.state,
@@ -131,14 +134,15 @@ async fn reconciliation_work(state: &AppState, c: &Config) -> Result<Option<bool
 }
 #[cfg(test)]
 pub(super) async fn discover(state: &AppState, c: &Config, slack: &Slack) -> Result<(), String> {
-    discover_ordered(state, c, slack, false).await
+    discover_ordered(state, c, slack, QueryKind::Prefix).await
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn discover_ordered(
     state: &AppState,
     c: &Config,
     slack: &Slack,
-    reactions_first: bool,
+    first: QueryKind,
 ) -> Result<(), String> {
     sqlx::query("DELETE FROM slack_gateway_observations WHERE first_observed_at_unix_micros<?1")
         .bind((chrono::Utc::now() - chrono::Duration::days(7)).timestamp_micros())
@@ -150,60 +154,147 @@ pub(super) async fn discover_ordered(
         .slack_baseline_complete(&c.workspace, &c.owner)
         .await
         .map_err(err)?;
+    let saved_baseline = if c.saved_enabled {
+        state
+            .db
+            .slack_saved_begin_scan(&c.workspace, &c.owner)
+            .await
+            .map_err(err)?;
+        state
+            .db
+            .slack_saved_inbox(&c.workspace, &c.owner)
+            .await
+            .map_err(err)?
+            .ok_or("Saved inbox is unavailable")?
+            .baseline_complete
+    } else {
+        false
+    };
     let tz: chrono_tz::Tz = c.timezone.parse().map_err(|_| "Unknown timezone")?;
     let after =
         (chrono::Utc::now().with_timezone(&tz).date_naive() - chrono::Days::new(4)).to_string();
     for kind in ["prefix", "reaction"] {
-        sqlx::query("INSERT INTO slack_gateway_discovery(workspace,owner,kind,after_date) VALUES (?1,?2,?3,?4) ON CONFLICT DO NOTHING").bind(&c.workspace).bind(&c.owner).bind(kind).bind(&after).execute(state.db.pool()).await.map_err(err)?;
+        sqlx::query("INSERT INTO slack_gateway_discovery(workspace,owner,kind,after_date) VALUES (?1,?2,?3,?4) ON CONFLICT DO NOTHING")
+            .bind(&c.workspace).bind(&c.owner).bind(kind).bind(&after).execute(state.db.pool()).await.map_err(err)?;
     }
+    let first = if first == QueryKind::Saved && !c.saved_enabled {
+        QueryKind::Prefix
+    } else {
+        first
+    };
+    let mut order = vec![first, first.next(c.saved_enabled)];
+    if c.saved_enabled {
+        order.push(order[1].next(true));
+    }
+    let mut done = [false, false, !c.saved_enabled];
+    let mut failed = [false; 3];
+    let mut emoji_error = None;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    let refresh_needed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM slack_gateway_discovery WHERE workspace=?1 AND owner=?2 AND kind='prefix' AND (cursor IS NOT NULL OR complete=1))")
+    let refresh_needed: bool = baseline && sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM slack_gateway_discovery WHERE workspace=?1 AND owner=?2 AND kind='prefix' AND (cursor IS NOT NULL OR complete=1))")
         .bind(&c.workspace).bind(&c.owner).fetch_one(state.db.pool()).await.map_err(err)?;
-    let refresh_error = if baseline && refresh_needed {
-        // Alternate which class gets the first opportunity. Slow or failed
-        // fresh reads must not permanently prevent saved scans from progressing.
-        if reactions_first && slack.can_discover() {
-            let progressed = discover_page(state, c, slack, true, baseline).await?;
-            if !progressed && slack.can_discover() && tokio::time::Instant::now() < deadline {
-                discover_page(state, c, slack, false, baseline).await?;
+    let mut refreshed = false;
+    let mut catchup_taken = false;
+    loop {
+        if refresh_needed
+            && !refreshed
+            && (first == QueryKind::Prefix || catchup_taken)
+            && slack.can_refresh()
+            && tokio::time::Instant::now() < deadline
+        {
+            refreshed = true;
+            if let Err(e) = refresh_prefix(state, c, slack, &after).await {
+                emoji_error.get_or_insert(e);
             }
         }
-        if slack.can_refresh() && tokio::time::Instant::now() < deadline {
-            refresh_prefix(state, c, slack, &after).await.err()
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    loop {
         let mut progressed = false;
-        for reactions in [reactions_first, !reactions_first] {
+        for &kind in &order {
+            let index = query_index(kind);
+            if done[index] || failed[index] {
+                continue;
+            }
             if !slack.can_discover() || tokio::time::Instant::now() >= deadline {
                 break;
             }
-            progressed |= discover_page(state, c, slack, reactions, baseline).await?;
+            let calls_before = slack.pages.load(std::sync::atomic::Ordering::Relaxed);
+            match discover_page(
+                state,
+                c,
+                slack,
+                kind,
+                if kind == QueryKind::Saved {
+                    saved_baseline
+                } else {
+                    baseline
+                },
+            )
+            .await
+            {
+                Ok(PageProgress::Complete) => {
+                    done[index] = true;
+                    progressed = true;
+                }
+                Ok(PageProgress::Advanced) => progressed = true,
+                Ok(PageProgress::Retained) => failed[index] = true,
+                Err(e) => {
+                    failed[index] = true;
+                    if kind == QueryKind::Saved {
+                        let restart = e.contains("page_limit_exceeded")
+                            || e.contains("invalid_cursor")
+                            || e.contains("Repeated Saved cursor");
+                        state
+                            .db
+                            .slack_saved_failure(&c.workspace, &c.owner, &e, restart)
+                            .await
+                            .map_err(err)?;
+                    } else {
+                        emoji_error.get_or_insert(e);
+                    }
+                }
+            }
+            catchup_taken |= slack.pages.load(std::sync::atomic::Ordering::Relaxed) > calls_before;
+            if refresh_needed
+                && !refreshed
+                && catchup_taken
+                && slack.can_refresh()
+                && tokio::time::Instant::now() < deadline
+            {
+                refreshed = true;
+                if let Err(e) = refresh_prefix(state, c, slack, &after).await {
+                    emoji_error.get_or_insert(e);
+                }
+            }
         }
-        if !progressed || !slack.can_discover() || tokio::time::Instant::now() >= deadline {
+        if !progressed
+            || done
+                .iter()
+                .zip(failed)
+                .all(|(done, failed)| *done || failed)
+            || !slack.can_discover()
+            || tokio::time::Instant::now() >= deadline
+        {
             break;
         }
     }
-    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM slack_gateway_discovery WHERE workspace=?1 AND owner=?2 AND complete=0").bind(&c.workspace).bind(&c.owner).fetch_one(state.db.pool()).await.map_err(err)?;
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM slack_gateway_discovery WHERE workspace=?1 AND owner=?2 AND complete=0")
+        .bind(&c.workspace).bind(&c.owner).fetch_one(state.db.pool()).await.map_err(err)?;
     let complete = remaining == 0;
+    let status = if emoji_error.is_some() {
+        "failed"
+    } else if complete {
+        "healthy"
+    } else if baseline {
+        "scanning"
+    } else {
+        "initializing"
+    };
     state
         .db
         .slack_scan_status(
             &c.workspace,
             &c.owner,
             complete,
-            if complete {
-                "healthy"
-            } else if baseline {
-                "scanning"
-            } else {
-                "initializing"
-            },
-            None,
+            status,
+            emoji_error.as_deref(),
         )
         .await
         .map_err(err)?;
@@ -215,7 +306,21 @@ pub(super) async fn discover_ordered(
             .await
             .map_err(err)?;
     }
-    refresh_error.map_or(Ok(()), Err)
+    emoji_error.map_or(Ok(()), Err)
+}
+
+fn query_index(kind: QueryKind) -> usize {
+    match kind {
+        QueryKind::Prefix => 0,
+        QueryKind::Reaction => 1,
+        QueryKind::Saved => 2,
+    }
+}
+
+enum PageProgress {
+    Retained,
+    Advanced,
+    Complete,
 }
 
 async fn refresh_prefix(
@@ -224,10 +329,8 @@ async fn refresh_prefix(
     slack: &Slack,
     after: &str,
 ) -> Result<(), String> {
-    let page = slack.search(c, false, None, after).await?;
-    // This bounded head read is not evidence of catch-up completion. Its next
-    // cursor is deliberately not written into either saved query position.
-    accept_page_sources(state, c, slack, &page, false, true).await?;
+    let page = slack.search(c, QueryKind::Prefix, None, after).await?;
+    accept_page_sources(state, c, slack, &page, QueryKind::Prefix, true).await?;
     Ok(())
 }
 
@@ -235,24 +338,47 @@ async fn discover_page(
     state: &AppState,
     c: &Config,
     slack: &Slack,
-    reactions: bool,
+    kind: QueryKind,
     baseline: bool,
-) -> Result<bool, String> {
-    let kind = if reactions { "reaction" } else { "prefix" };
-    let scan = sqlx::query("SELECT cursor,complete,after_date FROM slack_gateway_discovery WHERE workspace=?1 AND owner=?2 AND kind=?3").bind(&c.workspace).bind(&c.owner).bind(kind).fetch_one(state.db.pool()).await.map_err(err)?;
-    if scan.get::<bool, _>("complete") {
-        return Ok(false);
+) -> Result<PageProgress, String> {
+    let (cursor, after) = if kind == QueryKind::Saved {
+        let inbox = state
+            .db
+            .slack_saved_inbox(&c.workspace, &c.owner)
+            .await
+            .map_err(err)?
+            .ok_or("Saved inbox is unavailable")?;
+        (inbox.cursor, String::new())
+    } else {
+        let scan = sqlx::query("SELECT cursor,complete,after_date FROM slack_gateway_discovery WHERE workspace=?1 AND owner=?2 AND kind=?3")
+            .bind(&c.workspace).bind(&c.owner).bind(kind.as_str()).fetch_one(state.db.pool()).await.map_err(err)?;
+        if scan.get::<bool, _>("complete") {
+            return Ok(PageProgress::Complete);
+        }
+        (scan.get("cursor"), scan.get("after_date"))
+    };
+    let page = slack.search(c, kind, cursor.as_deref(), &after).await?;
+    if kind == QueryKind::Saved && page.cursor.is_some() && page.cursor == cursor {
+        return Err("Repeated Saved cursor; discovery remains incomplete".into());
     }
-    let cursor: Option<String> = scan.get("cursor");
-    let after: String = scan.get("after_date");
-    let page = slack
-        .search(c, reactions, cursor.as_deref(), &after)
-        .await?;
-    if !accept_page_sources(state, c, slack, &page, reactions, baseline).await? {
-        return Ok(false);
+    if !accept_page_sources(state, c, slack, &page, kind, baseline).await? {
+        return Ok(PageProgress::Retained);
     }
-    sqlx::query("UPDATE slack_gateway_discovery SET cursor=?4,complete=?5 WHERE workspace=?1 AND owner=?2 AND kind=?3").bind(&c.workspace).bind(&c.owner).bind(kind).bind(&page.cursor).bind(page.cursor.is_none()).execute(state.db.pool()).await.map_err(err)?;
-    Ok(true)
+    if kind == QueryKind::Saved {
+        state
+            .db
+            .slack_saved_checkpoint(&c.workspace, &c.owner, page.cursor.as_deref())
+            .await
+            .map_err(err)?;
+    } else {
+        sqlx::query("UPDATE slack_gateway_discovery SET cursor=?4,complete=?5 WHERE workspace=?1 AND owner=?2 AND kind=?3")
+            .bind(&c.workspace).bind(&c.owner).bind(kind.as_str()).bind(&page.cursor).bind(page.cursor.is_none()).execute(state.db.pool()).await.map_err(err)?;
+    }
+    Ok(if page.cursor.is_none() {
+        PageProgress::Complete
+    } else {
+        PageProgress::Advanced
+    })
 }
 
 async fn accept_page_sources(
@@ -260,21 +386,28 @@ async fn accept_page_sources(
     c: &Config,
     slack: &Slack,
     page: &Page,
-    reactions: bool,
+    kind: QueryKind,
     baseline: bool,
 ) -> Result<bool, String> {
     let mut candidates = Vec::new();
     for hit in &page.hits {
         if state
             .db
-            .slack_source_recorded(&c.workspace, &c.owner, &hit.channel, &hit.ts)
+            .slack_source_recorded(
+                &c.workspace,
+                &c.owner,
+                &hit.channel,
+                &hit.ts,
+                kind.trigger(),
+            )
             .await
             .map_err(err)?
-            || state
-                .db
-                .is_gateway_slack_source(&c.workspace, &c.owner, &hit.channel, &hit.ts, None)
-                .await
-                .map_err(err)?
+            || (kind != QueryKind::Saved
+                && state
+                    .db
+                    .is_gateway_slack_source(&c.workspace, &c.owner, &hit.channel, &hit.ts, None)
+                    .await
+                    .map_err(err)?)
         {
             continue;
         }
@@ -286,28 +419,36 @@ async fn accept_page_sources(
                 &hit.channel,
                 &hit.ts,
                 hit.observed_at_unix_micros,
+                kind.trigger(),
             )
             .await
             .map_err(err)?;
         candidates.push(hit);
     }
     for hit in candidates {
-        if let Some(verified) = slack.source(c, hit, reactions).await? {
-            if state
-                .db
-                .is_gateway_slack_source(
-                    &c.workspace,
-                    &c.owner,
-                    &hit.channel,
-                    &hit.ts,
-                    Some((&verified.author, &verified.body)),
-                )
-                .await
-                .map_err(err)?
+        if let Some(verified) = slack.source(c, hit, kind).await? {
+            if kind != QueryKind::Saved
+                && state
+                    .db
+                    .is_gateway_slack_source(
+                        &c.workspace,
+                        &c.owner,
+                        &hit.channel,
+                        &hit.ts,
+                        Some((&verified.author, &verified.body)),
+                    )
+                    .await
+                    .map_err(err)?
             {
                 state
                     .db
-                    .slack_forget_observation(&c.workspace, &c.owner, &hit.channel, &hit.ts)
+                    .slack_forget_observation(
+                        &c.workspace,
+                        &c.owner,
+                        &hit.channel,
+                        &hit.ts,
+                        kind.trigger(),
+                    )
                     .await
                     .map_err(err)?;
                 continue;
@@ -315,6 +456,7 @@ async fn accept_page_sources(
             let source = verified.source;
             if !super::config(&state.db).await?.is_some_and(|v| {
                 v.enabled
+                    && (kind != QueryKind::Saved || v.saved_enabled)
                     && v.owner == c.owner
                     && v.workspace == c.workspace
                     && v.mcp_server == c.mcp_server
@@ -332,7 +474,13 @@ async fn accept_page_sources(
         } else {
             state
                 .db
-                .slack_forget_observation(&c.workspace, &c.owner, &hit.channel, &hit.ts)
+                .slack_forget_observation(
+                    &c.workspace,
+                    &c.owner,
+                    &hit.channel,
+                    &hit.ts,
+                    kind.trigger(),
+                )
                 .await
                 .map_err(err)?;
         }
@@ -365,7 +513,8 @@ async fn reconcile_work(
         .map_err(err)?;
     dispatch_returns(state, c, slack, identity_verified).await?;
     for request in &requests {
-        if identity_verified
+        if request.source.trigger_kind != phoenix_db::SlackTriggerKind::Saved
+            && identity_verified
             && slack.can_call()
             && !request.eyes_confirmed
             && request.eyes_failure.is_none()
@@ -738,6 +887,7 @@ mod tests {
     fn config() -> Config {
         Config {
             enabled: false,
+            saved_enabled: false,
             mcp_server: "fixture".into(),
             owner: "UFIXTURE".into(),
             workspace: "fixture.slack.com".into(),
@@ -1196,6 +1346,7 @@ mod tests {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         let c = Config {
             enabled: true,
+            saved_enabled: false,
             ..config()
         };
         let mut slack = Slack::new(state.mcp_manager.clone(), &c);
@@ -1218,9 +1369,11 @@ mod tests {
                 .collect(),
             cursor: None,
         };
-        assert!(accept_page_sources(&state, &c, &slack, &page, true, true)
-            .await
-            .is_err());
+        assert!(
+            accept_page_sources(&state, &c, &slack, &page, QueryKind::Reaction, true)
+                .await
+                .is_err()
+        );
         let observed: Vec<(String, i64)> = sqlx::query_as("SELECT message_ts,first_observed_at_unix_micros FROM slack_gateway_observations ORDER BY message_ts").fetch_all(state.db.pool()).await.unwrap();
         assert_eq!(
             observed,

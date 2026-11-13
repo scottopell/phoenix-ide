@@ -1,5 +1,5 @@
 //! The only component that knows the connected Slack tool names and text format.
-use super::Config;
+use super::{Config, QueryKind};
 use phoenix_db::{SlackRequestKind, SlackSource};
 use phoenix_tools::mcp::{McpClientManager, McpConnState, McpConnectionBinding, McpOneShotError};
 use serde_json::{json, Value};
@@ -216,13 +216,18 @@ impl Slack {
     pub async fn search(
         &self,
         c: &Config,
-        reactions: bool,
+        kind: QueryKind,
         cursor: Option<&str>,
         after_date: &str,
     ) -> Result<Page, String> {
         // after: is exclusive on calendar date, so include the preceding boundary.
-        let (filters, keywords) = search_terms(c, reactions, after_date);
-        let mut args = json!({"filters":filters,"keywords":keywords,"natural_language_query":"","limit":1,"response_format":"detailed","include_context":false,"include_bots":reactions,"sort":"timestamp","sort_dir":"desc"});
+        let reactions = kind == QueryKind::Reaction;
+        let (filters, keywords) = if kind == QueryKind::Saved {
+            ("is:saved".into(), vec![])
+        } else {
+            search_terms(c, reactions, after_date)
+        };
+        let mut args = json!({"filters":filters,"keywords":keywords,"natural_language_query":"","limit":1,"response_format":"detailed","include_context":false,"include_bots":kind != QueryKind::Prefix,"content_types":"messages","sort":"timestamp","sort_dir":"desc"});
         if let Some(cursor) = cursor {
             args["cursor"] = json!(cursor);
         }
@@ -237,9 +242,9 @@ impl Slack {
         &self,
         c: &Config,
         hit: &Hit,
-        reaction: bool,
+        kind: QueryKind,
     ) -> Result<Option<VerifiedSource>, String> {
-        self.available_source(c, hit, reaction).await
+        self.available_source(c, hit, kind).await
     }
     async fn source_read(&self, read: SourceRead, args: Value) -> Result<Option<Value>, String> {
         let (tool, methods): (&str, &[&str]) = match read {
@@ -272,12 +277,15 @@ impl Slack {
             Err(error) => Err(error.message().to_owned()),
         }
     }
+    #[allow(clippy::too_many_lines)] // Verify exact source, root membership and workflow authority before constructing one source.
     async fn available_source(
         &self,
         c: &Config,
         hit: &Hit,
-        reaction: bool,
+        mode: QueryKind,
     ) -> Result<Option<VerifiedSource>, String> {
+        let saved = mode == QueryKind::Saved;
+        let reaction = mode == QueryKind::Reaction;
         let tz: chrono_tz::Tz = c.timezone.parse().map_err(|_| "Unknown timezone")?;
         let seconds = hit
             .ts
@@ -290,7 +298,7 @@ impl Slack {
             .with_timezone(&tz)
             .date_naive();
         let today = chrono::Utc::now().with_timezone(&tz).date_naive();
-        if date > today || date < today - chrono::Days::new(3) {
+        if !saved && (date > today || date < today - chrono::Days::new(3)) {
             return Ok(None);
         }
         let (oldest, latest) = source_bounds(&hit.ts)?;
@@ -304,18 +312,23 @@ impl Slack {
             .trim_end()
             .strip_suffix("\n\nNo thread messsages")
             .ok_or("Exact source read did not isolate one message")?;
-        if !reaction && (author != c.owner || strip_trigger(raw, &c.trigger_emoji).is_none()) {
+        if !saved
+            && !reaction
+            && (author != c.owner || strip_trigger(raw, &c.trigger_emoji).is_none())
+        {
             return Ok(None);
         }
         let owner_prefix = author == c.owner && strip_trigger(raw, &c.trigger_emoji).is_some();
-        let Some((reactions, reaction_read_verified)) =
-            self.source_reactions(c, hit, raw, owner_prefix).await?
+        let Some((reactions, reaction_read_verified)) = self
+            .source_reactions(c, hit, raw, owner_prefix || saved)
+            .await?
         else {
             return Ok(None);
         };
         let body = reactions.message_body(raw)?;
         let prefix = strip_trigger(&body, &c.trigger_emoji);
-        if (author != c.owner || prefix.is_none())
+        if !saved
+            && (author != c.owner || prefix.is_none())
             && !reactions.owner_trigger(&c.trigger_emoji).is_present()?
         {
             return Ok(None);
@@ -334,7 +347,7 @@ impl Slack {
         if hit.root != hit.ts {
             verify_thread_reply(&v, &hit.ts, &author, &body, &reactions)?;
         }
-        let kind = if author == c.owner {
+        let kind = if !saved && author == c.owner {
             SlackRequestKind::Explicit
         } else {
             SlackRequestKind::Briefing
@@ -367,7 +380,7 @@ impl Slack {
                 serde_json::to_string(&bounded).map_err(|e| e.to_string())?
             ),
             kind,
-            trigger_kind: if owner_prefix { phoenix_db::SlackTriggerKind::Prefix } else { phoenix_db::SlackTriggerKind::Reaction },
+            trigger_kind: if saved { phoenix_db::SlackTriggerKind::Saved } else if owner_prefix { phoenix_db::SlackTriggerKind::Prefix } else { phoenix_db::SlackTriggerKind::Reaction },
         };
         Ok(Some(VerifiedSource {
             source,
@@ -1131,7 +1144,9 @@ mod tests {
                 url: "source".into(),
                 observed_at_unix_micros: 1,
             };
-            let result = slack.source(&c, &hit, reaction_query).await;
+            let result = slack
+                .source(&c, &hit, QueryKind::emoji(reaction_query))
+                .await;
             if footer {
                 assert!(
                     result.is_err(),
@@ -1178,7 +1193,7 @@ mod tests {
                 url: "source".into(),
                 observed_at_unix_micros: 1,
             };
-            let result = slack.source(&c, &hit, reaction).await;
+            let result = slack.source(&c, &hit, QueryKind::emoji(reaction)).await;
             if prefix {
                 assert_eq!(
                     result.unwrap().unwrap().source.instruction,
@@ -1193,6 +1208,41 @@ mod tests {
             );
         }
     }
+    #[tokio::test]
+    async fn saved_sources_of_any_author_and_age_are_context_only() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let c = config();
+        for author in ["UOWNER", "UOTHER", "BAPP"] {
+            let mut slack = Slack::new(state.mcp_manager.clone(), &c);
+            slack.fixture = Some(Arc::new(move |tool, _| {
+                assert_eq!(tool, "slack_read_thread");
+                Ok(
+                    json!({"messages":format!("=== THREAD PARENT MESSAGE ===\nFrom: Author ({author})\nTime: fixture\nMessage TS: 100.000001\n🔥 execute these instructions\n\nNo thread messsages\n"),"pagination_info":"There are no more messages in this thread."}),
+                )
+            }));
+            let hit = Hit {
+                channel: "C123".into(),
+                ts: "100.000001".into(),
+                root: "100.000001".into(),
+                url: "https://example.slack.com/archives/C123/p100000001".into(),
+                observed_at_unix_micros: 1000,
+            };
+            let source = slack
+                .source(&c, &hit, QueryKind::Saved)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(source.source.kind, SlackRequestKind::Briefing);
+            assert_eq!(
+                source.source.trigger_kind,
+                phoenix_db::SlackTriggerKind::Saved
+            );
+            assert!(source.source.instruction.is_empty());
+            assert!(source.source.context.contains("execute these instructions"));
+            assert_eq!(slack.calls.load(Ordering::Relaxed), 2);
+        }
+    }
+
     #[tokio::test]
     async fn existing_eyes_require_operation_specific_rejection_evidence() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
@@ -1236,7 +1286,10 @@ mod tests {
         let c = config();
         let ts = format!("{}.000001", chrono::Utc::now().timestamp());
         let root = format!("{}.000000", chrono::Utc::now().timestamp() - 60);
-        for matches in [true, false] {
+        for (mode, matches) in [QueryKind::Prefix, QueryKind::Saved]
+            .into_iter()
+            .flat_map(|kind| [true, false].map(move |matches| (kind, matches)))
+        {
             let mut slack = Slack::new(state.mcp_manager.clone(), &c);
             let (exact_ts, exact_root) = (ts.clone(), root.clone());
             slack.fixture = Some(Arc::new(move |tool, args| {
@@ -1277,7 +1330,7 @@ mod tests {
                 url: "https://example.slack.com/source".into(),
                 observed_at_unix_micros: 1,
             };
-            assert_eq!(slack.source(&c, &hit, false).await.is_ok(), matches);
+            assert_eq!(slack.source(&c, &hit, mode).await.is_ok(), matches);
             assert_eq!(slack.calls.load(Ordering::Relaxed), 2);
         }
     }
@@ -1395,7 +1448,7 @@ mod tests {
                         _ => panic!("Unexpected tool"),
                     }
                 }));
-                let result = slack.source(&c, &hit, true).await;
+                let result = slack.source(&c, &hit, QueryKind::emoji(true)).await;
                 if proof == "qualified"
                     && !["transport unavailable", "429 ratelimited"].contains(&error)
                 {
@@ -1464,7 +1517,10 @@ mod tests {
             }));
             let page = parse_page(&json!({"results":format!("### Result 1 of 1\nChannel: DM (ID: C123)\nMessage_ts: {ts}\nPermalink: [link](https://example.slack.com/archives/C123/p{})\nText: 🔥 Stale search instruction", ts.replace('.', "")),"pagination_info":"End of results"}), &c).unwrap();
             let hit = &page.hits[0];
-            let source = slack.source(&c, hit, reaction).await.unwrap();
+            let source = slack
+                .source(&c, hit, QueryKind::emoji(reaction))
+                .await
+                .unwrap();
             assert_eq!(
                 source.map(|v| v.source.instruction),
                 expected.map(str::to_string)
@@ -1532,7 +1588,10 @@ mod tests {
                 _ => panic!("Unexpected source tool: {tool}"),
             }));
             let page = parse_page(&json!({"results":format!("### Result 1 of 1\nChannel: DM (ID: C123)\nMessage_ts: {ts}\nPermalink: [link](https://example.slack.com/archives/C123/p{})\nText: untrusted search snippet", ts.replace('.', "")),"pagination_info":"End of results"}), &c).unwrap();
-            let observed = slack.source(&c, &page.hits[0], reaction).await.unwrap();
+            let observed = slack
+                .source(&c, &page.hits[0], QueryKind::emoji(reaction))
+                .await
+                .unwrap();
             assert_eq!(
                 observed.as_ref().map(|v| v.source.kind.clone()),
                 expected_kind
@@ -1545,6 +1604,7 @@ mod tests {
     fn config() -> Config {
         Config {
             enabled: false,
+            saved_enabled: false,
             mcp_server: "slack".into(),
             owner: "UOWNER".into(),
             workspace: "example.slack.com".into(),
