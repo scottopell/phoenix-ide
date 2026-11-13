@@ -1681,7 +1681,8 @@ async fn goal_preparation_migration_follows_conversation_tool_migrations() {
             (158, "federated_conversation_actions".into()),
             (159, "federated_continuation_receipts".into()),
             (160, "slack_trigger_emojis".into()),
-            (161, "product_conversation_read_state".into()),
+            (161, "slack_single_trigger_emoji".into()),
+            (162, "product_conversation_read_state".into()),
         ]
     );
 }

@@ -265,7 +265,8 @@ fn registered_identity_order_and_exact_bodies() {
         (153, "close_writer_observations"),
         (159, "federated_continuation_receipts"),
         (160, "slack_trigger_emojis"),
-        (161, "product_conversation_read_state"),
+        (161, "slack_single_trigger_emoji"),
+        (162, "product_conversation_read_state"),
     ];
     for (version, name) in identities {
         let entries = MIGRATIONS
@@ -295,7 +296,8 @@ fn registered_identity_order_and_exact_bodies() {
         (include_str!("close_writer_observations.sql"), 153),
         (include_str!("federated_continuation_receipts.sql"), 159),
         (include_str!("slack_trigger_emojis.sql"), 160),
-        (include_str!("product_conversation_read_state.sql"), 161),
+        (include_str!("slack_single_trigger_emoji.sql"), 161),
+        (include_str!("product_conversation_read_state.sql"), 162),
     ] {
         let entries = MIGRATIONS
             .iter()
@@ -514,7 +516,8 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
                     (158, "federated_conversation_actions"),
                     (159, "federated_continuation_receipts"),
                     (160, "slack_trigger_emojis"),
-                    (161, "product_conversation_read_state"),
+                    (161, "slack_single_trigger_emoji"),
+                    (162, "product_conversation_read_state"),
                 ]
             );
             drop(conn);

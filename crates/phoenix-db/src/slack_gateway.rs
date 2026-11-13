@@ -10,28 +10,31 @@ const EYES_OUTCOME_UNKNOWN: &str =
 const CLARIFICATION_HANDOFF: &str = "Phoenix needs your input. Continue in Phoenix:";
 const THREAD_ATTEMPT_LIMIT: i64 = 3;
 
-/// REQ-SG-018: canonical Slack names, safe to embed in a search expression.
-pub fn normalize_slack_trigger_emojis(names: &[String]) -> DbResult<Vec<String>> {
-    if names.is_empty() || names.len() > 8 {
+/// REQ-SG-018: one canonical Slack name, safe to embed in a search expression.
+pub fn normalize_slack_trigger_emoji(name: &str) -> DbResult<String> {
+    let trimmed = name.trim();
+    let name = trimmed
+        .strip_prefix(':')
+        .and_then(|v| v.strip_suffix(':'))
+        .unwrap_or(trimmed)
+        .to_ascii_lowercase();
+    if name.is_empty()
+        || name.len() > 64
+        || !name.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'+')
+        })
+    {
         return Err(DbError::Serialization(
-            "Choose between one and eight trigger emojis".into(),
+            "Use Slack emoji names, such as phoenix-please-look, with optional surrounding colons"
+                .into(),
         ));
     }
-    let mut seen = std::collections::BTreeSet::new();
-    names.iter().map(|name| {
-        let trimmed = name.trim();
-        let name = trimmed.strip_prefix(':').and_then(|v| v.strip_suffix(':')).unwrap_or(trimmed).to_ascii_lowercase();
-        if name.is_empty() || name.len() > 64 || !name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'+')) {
-            return Err(DbError::Serialization("Use Slack emoji names, such as phoenix-please-look, with optional surrounding colons".into()));
-        }
-        if name == "eyes" {
-            return Err(DbError::Serialization("eyes is reserved for Phoenix acknowledgments".into()));
-        }
-        if !seen.insert(name.clone()) {
-            return Err(DbError::Serialization(format!("Duplicate trigger emoji: {name}")));
-        }
-        Ok(name)
-    }).collect()
+    if name == "eyes" {
+        return Err(DbError::Serialization(
+            "eyes is reserved for Phoenix acknowledgments".into(),
+        ));
+    }
+    Ok(name)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -198,7 +201,7 @@ fn request_row(r: &sqlx::sqlite::SqliteRow) -> Result<SlackRequest, sqlx::Error>
     })
 }
 impl Database {
-    /// Read the single gateway preference and its normalized emoji rows together.
+    /// Read the gateway preference and its scalar emoji setting together.
     pub async fn slack_configuration(&self) -> DbResult<Option<String>> {
         let mut tx = self.pool().begin().await?;
         let Some(raw): Option<String> =
@@ -208,17 +211,18 @@ impl Database {
         else {
             return Ok(None);
         };
-        let names: Vec<String> =
-            sqlx::query_scalar("SELECT name FROM slack_gateway_trigger_emojis ORDER BY ordinal")
-                .fetch_all(&mut *tx)
-                .await?;
-        let names = normalize_slack_trigger_emojis(&names)?;
+        let name: String = sqlx::query_scalar(
+            "SELECT value FROM app_settings WHERE key='slack_gateway_trigger_emoji'",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let name = normalize_slack_trigger_emoji(&name)?;
         let mut value: serde_json::Value =
             serde_json::from_str(&raw).map_err(|e| DbError::Serialization(e.to_string()))?;
         value
             .as_object_mut()
             .ok_or_else(|| DbError::Serialization("Invalid Slack configuration".into()))?
-            .insert("trigger_emojis".into(), serde_json::json!(names));
+            .insert("trigger_emoji".into(), serde_json::json!(name));
         tx.commit().await?;
         Ok(Some(value.to_string()))
     }
@@ -226,17 +230,17 @@ impl Database {
     pub async fn set_slack_configuration(&self, value: &str) -> DbResult<()> {
         let mut config: serde_json::Value =
             serde_json::from_str(value).map_err(|e| DbError::Serialization(e.to_string()))?;
-        let supplied_names = config
+        let supplied_name = config
             .as_object_mut()
-            .and_then(|v| v.remove("trigger_emojis"));
-        let names = supplied_names
+            .and_then(|v| v.remove("trigger_emoji"));
+        let name = supplied_name
             .map(|v| {
-                let names: Vec<String> =
+                let name: String =
                     serde_json::from_value(v).map_err(|e| DbError::Serialization(e.to_string()))?;
-                normalize_slack_trigger_emojis(&names)
+                normalize_slack_trigger_emoji(&name)
             })
             .transpose()?;
-        let stored_value = if names.is_some() {
+        let stored_value = if name.is_some() {
             config.to_string()
         } else {
             value.to_owned()
@@ -279,29 +283,17 @@ impl Database {
         if outstanding {
             return Err(DbError::Serialization("Cannot change the Slack account while accepted work or return delivery is outstanding; finish that work using its original account first".into()));
         }
-        if let Some(names) = names {
-            let prior_names: Vec<String> = sqlx::query_scalar(
-                "SELECT name FROM slack_gateway_trigger_emojis ORDER BY ordinal",
+        if let Some(name) = name {
+            let prior_name: String = sqlx::query_scalar(
+                "SELECT value FROM app_settings WHERE key='slack_gateway_trigger_emoji'",
             )
-            .fetch_all(&mut *tx)
+            .fetch_one(&mut *tx)
             .await?;
-            let changed = names.iter().collect::<std::collections::BTreeSet<_>>()
-                != prior_names
-                    .iter()
-                    .collect::<std::collections::BTreeSet<_>>();
-            sqlx::query("DELETE FROM slack_gateway_trigger_emojis")
+            sqlx::query("UPDATE app_settings SET value=?1 WHERE key='slack_gateway_trigger_emoji'")
+                .bind(&name)
                 .execute(&mut *tx)
                 .await?;
-            for (ordinal, name) in names.iter().enumerate() {
-                sqlx::query(
-                    "INSERT INTO slack_gateway_trigger_emojis(name,ordinal) VALUES (?1,?2)",
-                )
-                .bind(name)
-                .bind(i64::try_from(ordinal).map_err(|e| DbError::Serialization(e.to_string()))?)
-                .execute(&mut *tx)
-                .await?;
-            }
-            if changed {
+            if name != prior_name {
                 sqlx::query("DELETE FROM slack_gateway_discovery")
                     .execute(&mut *tx)
                     .await?;
@@ -984,7 +976,7 @@ mod tests {
             .unwrap();
         let default: serde_json::Value =
             serde_json::from_str(&db.slack_configuration().await.unwrap().unwrap()).unwrap();
-        assert_eq!(default["trigger_emojis"], serde_json::json!(["fire"]));
+        assert_eq!(default["trigger_emoji"], serde_json::json!("fire"));
         db.slack_baseline_complete(&s.workspace, &s.owner)
             .await
             .unwrap();
@@ -1006,7 +998,7 @@ mod tests {
             .await
             .unwrap();
         sqlx::query("INSERT INTO slack_gateway_discovery(workspace,owner,kind,after_date,cursor) VALUES (?1,?2,'reaction','2026-11-01','old-cursor')").bind(&s.workspace).bind(&s.owner).execute(db.pool()).await.unwrap();
-        config["trigger_emojis"] = serde_json::json!([":phoenix-please-look:", "robot_face"]);
+        config["trigger_emoji"] = serde_json::json!(":phoenix-please-look:");
         db.set_slack_configuration(&config.to_string())
             .await
             .unwrap();
@@ -1036,13 +1028,13 @@ mod tests {
         let read: serde_json::Value =
             serde_json::from_str(&db.slack_configuration().await.unwrap().unwrap()).unwrap();
         assert_eq!(
-            read["trigger_emojis"],
-            serde_json::json!(["phoenix-please-look", "robot_face"])
+            read["trigger_emoji"],
+            serde_json::json!("phoenix-please-look")
         );
         let raw: serde_json::Value =
             serde_json::from_str(&db.get_app_setting("slack_gateway").await.unwrap().unwrap())
                 .unwrap();
-        assert!(raw.get("trigger_emojis").is_none());
+        assert!(raw.get("trigger_emoji").is_none());
         // A second gesture still addresses the same frozen source identity.
         db.accept_slack_source(&s, false).await.unwrap();
         assert_eq!(
@@ -1055,7 +1047,7 @@ mod tests {
         db.slack_scan_status(&s.workspace, &s.owner, true, "healthy", None)
             .await
             .unwrap();
-        config["trigger_emojis"] = serde_json::json!(["robot_face", "phoenix-please-look"]);
+        config["trigger_emoji"] = serde_json::json!(":PHOENIX-PLEASE-LOOK:");
         db.set_slack_configuration(&config.to_string())
             .await
             .unwrap();
@@ -1066,9 +1058,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_trigger_lists_leave_configuration_and_baseline_unchanged() {
+    async fn invalid_trigger_names_leave_configuration_and_baseline_unchanged() {
         let db = Database::open_in_memory().await.unwrap();
-        let original = serde_json::json!({"workspace":"example.slack.com","owner":"UOWNER","enabled":true,"trigger_emojis":["phoenix-please-look"]});
+        let original = serde_json::json!({"workspace":"example.slack.com","owner":"UOWNER","enabled":true,"trigger_emoji":"phoenix-please-look"});
         db.set_slack_configuration(&original.to_string())
             .await
             .unwrap();
@@ -1079,17 +1071,19 @@ mod tests {
             .await
             .unwrap();
         let prior = db.slack_configuration().await.unwrap();
-        for names in [
+        for name in [
             serde_json::json!([]),
-            serde_json::json!(["fire", ":FIRE:"]),
-            serde_json::json!(["eyes"]),
-            serde_json::json!(["bad name"]),
-            serde_json::json!(["fire) OR has:link"]),
+            serde_json::json!(["fire", "phoenix-please-look"]),
+            serde_json::json!("fire, phoenix-please-look"),
+            serde_json::json!(""),
+            serde_json::json!("eyes"),
+            serde_json::json!("bad name"),
+            serde_json::json!("fire) OR has:link"),
             serde_json::json!(null),
-            serde_json::json!(vec!["a"; 9]),
+            serde_json::json!("a".repeat(65)),
         ] {
             let mut invalid = original.clone();
-            invalid["trigger_emojis"] = names;
+            invalid["trigger_emoji"] = name;
             assert!(db
                 .set_slack_configuration(&invalid.to_string())
                 .await
@@ -1100,28 +1094,22 @@ mod tests {
                 .await
                 .unwrap());
         }
-        // Internal callers that omit the new field preserve the selected names.
-        let legacy =
+        // Internal account updates preserve the independently stored emoji.
+        let account_update =
             serde_json::json!({"workspace":"example.slack.com","owner":"UOWNER","enabled":false});
-        db.set_slack_configuration(&legacy.to_string())
+        db.set_slack_configuration(&account_update.to_string())
             .await
             .unwrap();
         let read: serde_json::Value =
             serde_json::from_str(&db.slack_configuration().await.unwrap().unwrap()).unwrap();
         assert_eq!(
-            read["trigger_emojis"],
-            serde_json::json!(["phoenix-please-look"])
+            read["trigger_emoji"],
+            serde_json::json!("phoenix-please-look")
         );
-        for (name, ordinal) in [("eyes", 1), ("bad name", 1), ("robot_face", 8)] {
-            assert!(sqlx::query(
-                "INSERT INTO slack_gateway_trigger_emojis(name,ordinal) VALUES (?1,?2)"
-            )
-            .bind(name)
-            .bind(ordinal)
-            .execute(db.pool())
+        db.set_app_setting("slack_gateway_trigger_emoji", "invalid name")
             .await
-            .is_err());
-        }
+            .unwrap();
+        assert!(db.slack_configuration().await.is_err());
     }
 
     #[tokio::test]

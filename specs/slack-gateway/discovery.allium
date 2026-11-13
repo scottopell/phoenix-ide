@@ -49,7 +49,7 @@ contract SlackDiscoveryPort {
 
     @invariant VerifiedPageBoundary
         -- Eligibility requires an exact source prefix or verified owner reaction
-        -- matching any name in the gateway's configured trigger_emojis.
+        -- matching the gateway's configured trigger_emoji.
         -- Evidence binds the exact query and position. Every returned candidate
         -- is either already recorded, positively rejected, or represented by a
         -- verified eligible observation. A positively established deleted or
@@ -90,10 +90,9 @@ contract SlackDiscoveryPort {
         -- reply's parent-plus-exact-reply scope and expose pagination/truncation.
 
     @invariant QueryBoundary
-        -- Both searches match any configured trigger name (OR), including custom
-        -- Slack names. Multiple emoji matches retain one source identity.
-        -- Reordering an equivalent name set preserves the exact query terms
-        -- paired with retained provider cursors.
+        -- Both searches use exactly one configured trigger name, including custom
+        -- Slack names. Prefix search uses the owner's filter and one emoji keyword;
+        -- reaction search uses one hasmy emoji filter. Neither sends an OR clause.
         -- Prefix and owner-reaction searches cover the accessible eligible
         -- window. Their search boundary is retained for each ongoing sweep;
         -- source validation still rejects messages that have aged out.
@@ -210,7 +209,6 @@ entity SearchProgress {
 }
 
 config {
-    trigger_emoji_limit: Integer = 8
     call_limit: Integer = 16
     call_window: Duration = 60.seconds
     discovery_interval: Duration = 60.seconds
@@ -356,19 +354,19 @@ rule ClearExpiredProviderBackoff {
 
 -- Both query positions survive a partial burst. Completed queries remain
 -- complete until the whole sweep ends; completion is not a freshness promise.
-rule ChangeTriggerEmojis {
-    when: OwnerSetsTriggerEmojis(controller, names)
+rule ChangeTriggerEmoji {
+    when: OwnerSetsTriggerEmoji(controller, name)
     requires: controller.active_services.count = 0
-    requires: names != controller.gateway.trigger_emojis
-    requires: names.count > 0 and names.count <= config.trigger_emoji_limit
-    ensures: controller.gateway.trigger_emojis = names
+    requires: name != controller.gateway.trigger_emoji
+    requires: name != "" and name != "eyes"
+    ensures: controller.gateway.trigger_emoji = name
     ensures: controller.gateway.baseline_complete = false
     ensures: controller.last_completed_scan_at = null
     ensures:
         for query in controller.searches:
             not exists query
     @guidance
-        -- Reject invalid, duplicate, and eyes names before changing settings.
+        -- Reject invalid or multiple names and eyes before changing settings.
         -- Preserve accepted requests, handled identities, delivery obligations
         -- and retry_not_before. Admission resumes after the new baseline.
 }
@@ -496,7 +494,7 @@ surface DiscoveryBoundary {
         demands NativeReconciliationPort
 
     provides:
-        OwnerSetsTriggerEmojis(controller, names)
+        OwnerSetsTriggerEmoji(controller, name)
         CheckServiceAllowance(controller)
         ServiceRequested(controller, kind)
         AcceptedWorkReconciliationAttempted(service)
