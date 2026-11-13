@@ -6592,7 +6592,7 @@ mod tests {
         let auth = HttpAuth::OAuth(crate::OAuthConfig {
             client: Some(crate::PreconfiguredClient {
                 client_id: "pre-1".to_string(),
-                callback_port: None,
+                callback: None,
             }),
             scopes: vec![
                 "configured.read".to_string(),
@@ -6616,6 +6616,121 @@ mod tests {
             Some("configured.read configured.write"),
             "configured scopes must override the protected-resource fallback"
         );
+    }
+
+    #[tokio::test]
+    async fn loopback_callback_preserves_uri_through_browser_and_code_exchange() {
+        // REQ-MCP-020: exercise config discovery, the real listener, and the
+        // token endpoint for both Slack's port shape and explicit callbacks.
+        for shape in ["slack", "snowflake", "root-slash", "custom-path"] {
+            let server = TestServer::start(vec![]).await;
+            server.push_responses(vec![unauthorized(&server)]);
+            install_oauth_discovery(&server, false);
+            server.route("/token", token_response("at-1", Some("rt-1"), None));
+            let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = reservation.local_addr().unwrap().port();
+            let uri = match shape {
+                "slack" => format!("http://localhost:{port}/callback"),
+                "snowflake" => format!("http://127.0.0.1:{port}"),
+                "root-slash" => format!("http://127.0.0.1:{port}/"),
+                _ => format!("http://127.0.0.1:{port}/custom/callback"),
+            };
+            let mut oauth = serde_json::json!({"clientId": "LOCAL_APPLICATION"});
+            if shape == "slack" {
+                oauth["callbackPort"] = port.into();
+            } else {
+                oauth["callbackUrl"] = uri.clone().into();
+            }
+            let config = serde_json::json!({"type": "http", "url": server.url, "oauth": oauth});
+            let Some(McpServerConfig::Http { auth, .. }) =
+                McpClientManager::classify_config_entry("remote", &config)
+            else {
+                panic!("valid {shape} config");
+            };
+            drop(reservation);
+            let manager = Arc::new(McpClientManager::new());
+            manager.set_oauth_redirect_base(REDIRECT_BASE.into());
+            connect_http_managed(&manager, &server, auth)
+                .await
+                .unwrap_err();
+            let params = query_params(&pending_auth_url(&manager).await.unwrap());
+            assert_eq!(params["redirect_uri"], uri);
+            assert_eq!(params["client_id"], "LOCAL_APPLICATION");
+            assert!(server.recorded_for_path("/register").is_empty());
+
+            let mut browser_url = reqwest::Url::parse(&uri).unwrap();
+            browser_url
+                .query_pairs_mut()
+                .append_pair("code", "code+1")
+                .append_pair("state", &params["state"]);
+            let browser = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
+            let response = browser.get(browser_url).send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+            let location = response
+                .headers()
+                .get("location")
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert!(location.starts_with(CALLBACK));
+            let forwarded = query_params(location);
+            assert_eq!(forwarded["code"], "code+1");
+            assert_eq!(forwarded["state"], params["state"]);
+            server.push_responses(handshake_responses("sess-1"));
+            manager
+                .complete_oauth_authorization(
+                    &forwarded["state"],
+                    &forwarded["code"],
+                    Some(&server.base()),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), manager.await_background_tasks())
+                .await
+                .unwrap();
+            assert_eq!(manager.status().await[0].state, McpConnState::Ready);
+            let requests = server.recorded_for_path("/token");
+            let form = parse_form(&requests[0].1);
+            assert_eq!(form["redirect_uri"], uri);
+            assert_eq!(form["client_id"], "LOCAL_APPLICATION");
+            assert_eq!(form["code"], "code+1");
+            assert!(!form.contains_key("client_secret"));
+            assert!(manager.oauth.loopback_listeners.lock().unwrap().is_empty());
+            server.push_responses(vec![delete_ack()]);
+            manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn callback_url_with_occupied_port_never_publishes_sign_in() {
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = TestServer::start(vec![]).await;
+        server.push_responses(vec![unauthorized(&server)]);
+        install_oauth_discovery(&server, false);
+        let manager = Arc::new(McpClientManager::new());
+        manager.set_oauth_redirect_base(REDIRECT_BASE.into());
+        let auth = HttpAuth::OAuth(crate::OAuthConfig {
+            client: Some(crate::PreconfiguredClient {
+                client_id: "LOCAL_APPLICATION".into(),
+                callback: crate::LoopbackCallback::parse(&format!(
+                    "http://127.0.0.1:{}/",
+                    occupied.local_addr().unwrap().port()
+                )),
+            }),
+            scopes: vec![],
+        });
+        // The IPv6 listener can bind even though this callback's IPv4 address
+        // is occupied: a usable callback must bind its own address family.
+        let result = connect_http_managed(&manager, &server, auth).await;
+        assert!(result
+            .unwrap_err()
+            .contains("cannot bind OAuth callback port"));
+        assert!(pending_auth_url(&manager).await.is_none());
+        assert!(server.recorded_for_path("/token").is_empty());
+        manager.shutdown().await;
     }
 
     #[tokio::test]
@@ -6803,7 +6918,7 @@ mod tests {
             auth: HttpAuth::OAuth(crate::OAuthConfig {
                 client: Some(crate::PreconfiguredClient {
                     client_id: client_id.to_string(),
-                    callback_port: None,
+                    callback: None,
                 }),
                 scopes: Vec::new(),
             }),
