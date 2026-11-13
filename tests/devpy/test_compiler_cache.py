@@ -1930,12 +1930,42 @@ class CompilerCacheTests(unittest.TestCase):
             self.dev._compiler_cache_overrides("sccache", configured),
         )
 
-    def test_only_cargo_owning_steps_receive_check_cache(self):
+    def test_only_compiler_capable_steps_receive_check_cache(self):
         self.assertTrue(self.dev._command_uses_compiler_cache(["cargo", "test"]))
         self.assertTrue(self.dev._command_uses_compiler_cache(["/opt/bin/cargo", "clippy"]))
         self.assertTrue(
             self.dev._command_uses_compiler_cache(["uv", "run", "tests/e2e/run.py"])
         )
+        for suffix in ([], ["-v"]):
+            with self.subTest(devpy="direct", suffix=suffix):
+                self.assertTrue(
+                    self.dev._command_uses_compiler_cache(
+                        [
+                            self.dev.sys.executable,
+                            "-m",
+                            "unittest",
+                            "discover",
+                            "tests/devpy",
+                            *suffix,
+                        ]
+                    )
+                )
+            with self.subTest(devpy="profiled", suffix=suffix):
+                self.assertTrue(
+                    self.dev._command_uses_compiler_cache(
+                        [
+                            self.dev.sys.executable,
+                            str(
+                                self.dev.ROOT
+                                / "scripts"
+                                / "python_unittest_profile.py"
+                            ),
+                            "discover",
+                            "tests/devpy",
+                            *suffix,
+                        ]
+                    )
+                )
         self.assertFalse(self.dev._command_uses_compiler_cache(["uv", "run", "tests.py"]))
         self.assertFalse(self.dev._command_uses_compiler_cache([]))
 

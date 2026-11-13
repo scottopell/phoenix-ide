@@ -167,6 +167,21 @@ class CheckProfileReportTests(unittest.TestCase):
         self.assertEqual(50, item["shared_unattributed_cpu_ms"])
         self.assertTrue(item["children_may_overlap"])
 
+    def test_reconciles_devpy_parent_with_python_test_records(self):
+        report = load_report()
+        rows = [
+            {"source": "processes/devpy-dev.py-unit-tests.json", "cpu_ms": 10,
+             "provenance": "exact_waited_descendants", "concurrent": False},
+            {"source": "python-test-cpu.jsonl", "cpu_ms": 6,
+             "provenance": "exact_waited_descendants", "concurrent": False},
+        ]
+
+        item = next(row for row in report._reconciliation(rows) if row["parent"] == "python")
+
+        self.assertEqual(10, item["parent_cpu_ms"])
+        self.assertEqual(6, item["attributed_child_cpu_ms"])
+        self.assertEqual(4, item["shared_unattributed_cpu_ms"])
+
     def test_sequential_windowed_children_do_not_claim_overlap(self):
         report = load_report()
         rows = [
