@@ -163,7 +163,6 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
   const canRename = !!onProductConversationRename && row.lifecycle.state === 'open'
     && !(closeAction?.availability === 'unavailable' && closeAction.reason === 'active_close_attempt');
   const canDelete = !!onProductConversationDelete && row.lifecycle.state === 'history';
-  const prs = row.cached_pr ? [row.cached_pr] : [];
   return (
     <li
       className={classes}
@@ -192,9 +191,9 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
           />
         )}
       </button>
-      {prs.length > 0 && (
+      {row.cached_pr && (
         <span className="product-conversation-list-row__prs">
-          {prs.map((pr) => <PrBadge key={pr.number} pr={pr} interactive={!isMobileList} />)}
+          <PrBadge pr={row.cached_pr} interactive={!isMobileList} />
         </span>
       )}
       <div ref={menuRef} className="conv-item-menu-container product-conversation-actions">

@@ -482,17 +482,26 @@ pub struct ProductConversationPrView {
     pub feedback_status: phoenix_core::domain::pr_feedback_status::PrFeedbackStatus,
 }
 
-impl From<&crate::runtime::CachedPrSummary> for ProductConversationPrView {
-    fn from(pr: &crate::runtime::CachedPrSummary) -> Self {
-        Self {
-            number: u32::try_from(pr.number).unwrap_or(u32::MAX),
+impl ProductConversationPrView {
+    /// `None` when the PR number cannot be represented on the wire (ts-rs
+    /// maps `u32` to `number`; wider integers become `bigint`).
+    pub(crate) fn from_summary(pr: &crate::runtime::CachedPrSummary) -> Option<Self> {
+        let Ok(number) = u32::try_from(pr.number) else {
+            tracing::debug!(
+                pr_number = pr.number,
+                "dropping cached PR badge: number exceeds u32"
+            );
+            return None;
+        };
+        Some(Self {
+            number,
             title: pr.title.clone(),
             url: pr.url.clone(),
             display_state: pr.display_state.clone(),
             base: pr.base.clone(),
             head: pr.head.clone(),
             feedback_status: pr.feedback_status,
-        }
+        })
     }
 }
 

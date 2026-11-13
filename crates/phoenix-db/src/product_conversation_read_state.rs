@@ -78,11 +78,36 @@ impl Database {
     pub async fn list_product_conversation_read_states(
         &self,
     ) -> DbResult<Vec<ProductConversationReadStateEntry>> {
+        self.product_conversation_read_state_entries(None).await
+    }
+
+    /// Read state of one product conversation, or `None` if it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the query fails or the row is malformed.
+    pub async fn product_conversation_read_state(
+        &self,
+        product_conversation_id: &ProductConversationId,
+    ) -> DbResult<Option<ProductConversationReadState>> {
+        Ok(self
+            .product_conversation_read_state_entries(Some(product_conversation_id.as_str()))
+            .await?
+            .into_iter()
+            .next()
+            .map(|entry| entry.read_state))
+    }
+
+    async fn product_conversation_read_state_entries(
+        &self,
+        only_product: Option<&str>,
+    ) -> DbResult<Vec<ProductConversationReadStateEntry>> {
         let rows = sqlx::query(
             "WITH head AS (
                  SELECT id, product_conversation_id
                  FROM conversations
                  WHERE product_conversation_id IS NOT NULL
+                   AND (?1 IS NULL OR product_conversation_id = ?1)
                    AND parent_conversation_id IS NULL
                    AND runtime_role IN ('user', 'coordinator')
                    AND continued_in_conv_id IS NULL
@@ -105,8 +130,10 @@ impl Database {
              LEFT JOIN messages message ON message.message_id = latest.message_id
              LEFT JOIN product_conversation_read_state state
                ON state.product_conversation_id = product.id
+             WHERE ?1 IS NULL OR product.id = ?1
              ORDER BY product.id, latest.message_id IS NULL",
         )
+        .bind(only_product)
         .fetch_all(&self.pool)
         .await?;
 
@@ -286,6 +313,12 @@ mod tests {
             state_of(&db, &product).await,
             ProductConversationReadState::Unread(ProductConversationUnreadReason::Marked)
         );
+        assert_eq!(
+            db.product_conversation_read_state(&product).await.unwrap(),
+            Some(ProductConversationReadState::Unread(
+                ProductConversationUnreadReason::Marked
+            ))
+        );
 
         db.mark_product_conversation_read(&product, ProductConversationReadAdvance::Acknowledge)
             .await
@@ -381,6 +414,10 @@ mod tests {
             db.mark_product_conversation_unread(&missing).await,
             Err(DbError::ConversationNotFound(_))
         ));
+        assert_eq!(
+            db.product_conversation_read_state(&missing).await.unwrap(),
+            None
+        );
     }
 
     #[test]

@@ -397,9 +397,9 @@ async fn cached_prs_for_projections(
         .await
         .map_err(db_to_app)?
         .into_iter()
-        .map(|(key, pr)| {
+        .filter_map(|(key, pr)| {
             let summary = super::handlers::sidebar_cached_pr_summary(&pr);
-            (key, ProductConversationPrView::from(&summary))
+            ProductConversationPrView::from_summary(&summary).map(|view| (key, view))
         })
         .collect())
 }
@@ -408,7 +408,7 @@ async fn single_list_row(
     state: &AppState,
     projection: &ProductConversationListProjection,
 ) -> Result<ProductConversationListRow, AppError> {
-    let read_state = product_read_state(state, projection.product_conversation_id.as_str()).await?;
+    let read_state = product_read_state(state, &projection.product_conversation_id).await?;
     let cached_prs = cached_prs_for_projections(state, std::slice::from_ref(projection)).await?;
     let cached_pr = projection
         .latest_work_scope_id
@@ -419,17 +419,14 @@ async fn single_list_row(
 
 async fn product_read_state(
     state: &AppState,
-    product_conversation_id: &str,
+    product_conversation_id: &ProductConversationId,
 ) -> Result<phoenix_db::ProductConversationReadState, AppError> {
     state
         .db
-        .list_product_conversation_read_states()
+        .product_conversation_read_state(product_conversation_id)
         .await
         .map_err(db_to_app)?
-        .into_iter()
-        .find(|entry| entry.product_conversation_id.as_str() == product_conversation_id)
-        .map(|entry| entry.read_state)
-        .ok_or_else(|| AppError::NotFound(product_conversation_id.to_owned()))
+        .ok_or_else(|| AppError::NotFound(product_conversation_id.to_string()))
 }
 
 fn parse_product_conversation_id(reference: &str) -> Result<ProductConversationId, AppError> {
@@ -448,7 +445,7 @@ pub async fn mark_product_conversation_read(
         .mark_product_conversation_read(&id, request.kind.into())
         .await
         .map_err(db_to_app)?;
-    Ok(Json(product_read_state(&state, id.as_str()).await?.into()))
+    Ok(Json(product_read_state(&state, &id).await?.into()))
 }
 
 pub async fn mark_product_conversation_unread(
@@ -461,7 +458,7 @@ pub async fn mark_product_conversation_unread(
         .mark_product_conversation_unread(&id)
         .await
         .map_err(db_to_app)?;
-    Ok(Json(product_read_state(&state, id.as_str()).await?.into()))
+    Ok(Json(product_read_state(&state, &id).await?.into()))
 }
 
 #[derive(Deserialize)]

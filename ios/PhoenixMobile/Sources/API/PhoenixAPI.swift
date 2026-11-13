@@ -329,9 +329,6 @@ struct PhoenixAPI: Sendable {
             coordinator: response.coordinator)
     }
 
-    func listConversations() async throws -> [Conversation] {
-        try await listConversationPage().conversations
-    }
 
 
     func listProductConversations() async throws -> ProductConversationListResponse {

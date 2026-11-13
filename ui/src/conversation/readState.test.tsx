@@ -41,6 +41,14 @@ describe('useAutoMarkProductConversationRead', () => {
     expect(api.markProductConversationRead).toHaveBeenCalledWith('product', 'acknowledged');
   });
 
+  it('sends one request on open and none for refocus without new output', async () => {
+    renderHook(() => useAutoMarkProductConversationRead('product', 'm1'));
+    await act(async () => { vi.advanceTimersByTime(500); });
+    act(() => { window.dispatchEvent(new Event('focus')); });
+    expect(api.markProductConversationRead).toHaveBeenCalledTimes(1);
+    expect(api.markProductConversationRead).toHaveBeenCalledWith('product', 'acknowledged');
+  });
+
   it('acknowledges again when a different conversation opens', () => {
     const { rerender } = renderHook(
       ({ id }) => useAutoMarkProductConversationRead(id, 'm1'),
