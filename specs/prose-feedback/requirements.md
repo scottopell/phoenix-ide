@@ -502,7 +502,8 @@ WHEN the destination is unavailable or append fails
 THE SYSTEM SHALL retain the reaction and explain the unavailable or failed action.
 
 WHEN the user requests dismissal of a typed reaction
-THE SYSTEM SHALL offer Keep and Discard in the same compact row
+THE SYSTEM SHALL offer an inline Keep and Discard confirmation within the pill's existing size and shape
+AND SHALL preserve the pill's position when showing or canceling that confirmation
 AND Escape SHALL resolve that local interaction before any enclosing navigation.
 
 Temporary reactions are session-local; refresh recovery and cross-device synchronization are not guaranteed. Appended text follows the ordinary message draft's persistence contract.

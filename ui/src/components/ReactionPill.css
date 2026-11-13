@@ -16,6 +16,23 @@
 
 .reaction-pill[hidden] { display: none; }
 
+.reaction-pill-content,
+.reaction-pill-confirmation {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.reaction-pill-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.reaction-pill-confirmation {
+  position: absolute;
+  inset: 3px 5px 3px 12px;
+}
+
 .reaction-pill textarea {
   flex: 1;
   box-sizing: border-box;
