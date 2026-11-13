@@ -25,7 +25,7 @@ it('saves one custom emoji name and explains all three workflows', async () => {
   expect(submitted?.trigger_emoji).toBe('phoenix-please-look');
   expect(submitted).not.toHaveProperty('trigger_emojis');
   expect(screen.getByText('Initializing')).toBeTruthy();
-  expect(screen.getByText(/Changing the emoji restarts initialization/)).toBeTruthy();
+  expect(screen.getByText(/Changing the emoji restarts emoji initialization/)).toBeTruthy();
   fireEvent.change(first, { target: { value: 'fire' } });
   expect(screen.queryByText('Settings saved.')).toBeNull();
 });
@@ -183,4 +183,38 @@ it.each([[], ['slack_read_user_profile'], ['slack_read_user_profile', 'slack_sea
   await screen.findByText(/Slack connection: Cannot verify required tool schemas/);
   expect(screen.queryByText(/Required tools unavailable/)).toBeNull();
   expect(screen.queryByText('healthy')).toBeNull();
+});
+
+it('keeps Saved capture opt-in and submits it independently of the emoji', async () => {
+  let submitted: Record<string, unknown> | undefined;
+  vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url: string, options?: RequestInit) => {
+    if (options?.method === 'PUT') submitted = JSON.parse(String(options.body));
+    return { ok: true, json: async () => ({ config: submitted ?? null, requests: [], returns: [] }) };
+  }));
+  render(<SlackGatewaySettings standalone />);
+  const toggle = await screen.findByRole('switch', { name: /Capture saved messages privately/ });
+  expect((toggle as HTMLInputElement).checked).toBe(false);
+  fireEvent.click(toggle);
+  fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+  await screen.findByText('Settings saved.');
+  expect(submitted?.['saved_enabled']).toBe(true);
+  expect(submitted?.['trigger_emoji']).toBe('fire');
+  expect(screen.getByText(/Messages of any age, from anyone/)).toBeTruthy();
+  expect(screen.getByText(/It adds no reaction and posts nothing/)).toBeTruthy();
+});
+
+it('shows Saved incompleteness independently and never implies eyes are pending', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({
+    config: { enabled: true, saved_enabled: true },
+    scan: { baseline_complete: true, status: 'healthy' },
+    saved_scan: { baseline_complete: true, scan_in_progress: true, last_error: 'page_limit_exceeded', last_scan_at_unix_micros: 1000000 },
+    requests: [{ request_id: 'saved', product_id: 'product', conversation_available: true, admitted: true, accepted_at_us: 1000, eyes_confirmed: false, eyes_failure: null, failure: null, source: { kind: 'briefing', trigger_kind: 'saved', source_url: 'https://example.slack.com/source', observed_at_unix_micros: 500, message_ts: '1.000001' } }], returns: [],
+  }) }));
+  render(<SlackGatewaySettings standalone />);
+  await screen.findByRole('link', { name: 'Private Saved capture' });
+  expect(screen.getByText('healthy')).toBeTruthy();
+  expect(screen.getByText('Incomplete')).toBeTruthy();
+  expect(screen.getByRole('alert').textContent).toContain('Saved scan incomplete');
+  expect(screen.getByText(/Private · no Slack acknowledgment/)).toBeTruthy();
+  expect(screen.queryByText(/👀 pending/)).toBeNull();
 });
