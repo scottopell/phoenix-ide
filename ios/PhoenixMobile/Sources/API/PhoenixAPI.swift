@@ -308,6 +308,9 @@ struct PhoenixAPI: Sendable {
         var conversations: [Conversation]
         /// Keyed by ProductConversation aggregate identity.
         var readStates: [String: ProductConversationReadState]
+        /// Keyed by ProductConversation aggregate identity; absent when the
+        /// work scope has no cached PR.
+        var cachedPrs: [String: ProductConversationPr]
         var coordinator: CoordinatorListEntry?
     }
 
@@ -317,6 +320,11 @@ struct PhoenixAPI: Sendable {
             conversations: response.product_conversations.map(productConversationListRowToConversation),
             readStates: Dictionary(
                 response.product_conversations.map { ($0.product_conversation_id, $0.read_state) },
+                uniquingKeysWith: { _, latest in latest }),
+            cachedPrs: Dictionary(
+                response.product_conversations.compactMap { row in
+                    row.cached_pr.map { (row.product_conversation_id, $0) }
+                },
                 uniquingKeysWith: { _, latest in latest }),
             coordinator: response.coordinator)
     }

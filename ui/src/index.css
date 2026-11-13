@@ -811,23 +811,6 @@ body.app-viewport-active #root {
   background: var(--border-color);
 }
 
-.conv-item-slug {
-  font-weight: 500;
-  color: var(--text-primary);
-  margin-bottom: 4px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.conv-item-slug-main {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  flex: 1 1 auto;
-}
-
 .conv-item-title {
   flex: 1 1 auto;
   min-width: 48px;
@@ -880,26 +863,6 @@ body.app-viewport-active #root {
 
 .conv-item-meta.secondary {
   margin-top: 2px;
-}
-
-.conv-item-cwd {
-  color: var(--text-muted);
-  font-family: var(--font-mono);
-  font-size: 12px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.product-conversation-list-row__meta {
-  min-width: 0;
-  align-items: center;
-  gap: 6px;
-  white-space: nowrap;
-}
-
-.product-conversation-list-row__meta .conv-item-cwd {
-  min-width: 0;
-  flex: 1 1 auto;
 }
 
 #chat-view.view.active {
@@ -7650,11 +7613,6 @@ html * {
   padding: 4px 6px;
 }
 
-.sidebar-mode .conv-item-slug {
-  font-size: 13px;
-  margin-bottom: 2px;
-}
-
 .sidebar-mode .conv-item-meta {
   font-size: 11px;
 }
@@ -13098,19 +13056,6 @@ button.keyword-search-filepath:hover {
   min-width: 0;
 }
 
-.mobile-list-density .conv-item-slug {
-  display: flex;
-  align-items: center;
-  margin-bottom: 4px;
-  min-width: 0;
-}
-
-.mobile-list-density .conv-item-slug-main {
-  flex-wrap: nowrap;
-  min-width: 0;
-  width: 100%;
-}
-
 .mobile-list-density .conv-item-title {
   flex: 1 1 auto;
   min-width: 0;
@@ -13121,20 +13066,7 @@ button.keyword-search-filepath:hover {
   padding: 2px 7px;
 }
 
-.mobile-list-density .conv-item-slug .sidebar-pr-badge {
-  flex-shrink: 0;
-}
-
-.mobile-list-density .conv-item-main > .conv-item-meta:not(.secondary, .product-conversation-list-row__meta),
-.mobile-list-density .conv-item-cwd {
-  display: none;
-}
-
-.mobile-list-density .product-conversation-list-row__meta {
-  display: flex;
-}
-
-.mobile-list-density .product-conversation-list-row__meta .conv-item-cwd {
+.mobile-list-density .conv-item-main > .conv-item-meta:not(.secondary) {
   display: none;
 }
 

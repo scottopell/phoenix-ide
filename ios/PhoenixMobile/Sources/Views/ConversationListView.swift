@@ -257,7 +257,8 @@ struct ConversationListView: View {
                         ConversationRow(
                             conversation: conversation,
                             isCoordinator: isCoordinator,
-                            readState: model.listStore.readState(forAggregateId: conversation.aggregateIdentity))
+                            readState: model.listStore.readState(forAggregateId: conversation.aggregateIdentity),
+                            cachedPr: model.listStore.cachedPr(forAggregateId: conversation.aggregateIdentity))
                     }
                     .accessibilityIdentifier("conversationList.row.\(conversation.aggregateIdentity)")
                     .swipeActions(edge: .leading, allowsFullSwipe: true) {
@@ -326,48 +327,97 @@ struct ConversationRow: View {
     let conversation: Conversation
     var isCoordinator = false
     var readState: ProductConversationReadState = .read
+    var cachedPr: ProductConversationPr?
 
     var displayTitle: String { isCoordinator ? "Ember" : conversation.displayTitle }
 
+    /// One line: state, title, unread, PR. Only when the PR badge cannot fit
+    /// beside the title does it move to a second line.
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
+        ViewThatFits(in: .horizontal) {
             HStack(spacing: 6) {
-                StateDot(
-                    presentationMode: conversation.presentation_mode,
-                    requiresAction: conversation.requires_action ?? false,
-                    stateType: conversation.stateType)
-                if isCoordinator {
-                    Image(systemName: "globe")
-                        .font(.caption)
-                        .foregroundStyle(.tint)
-                }
-                Text(displayTitle)
-                    .font(readState == .read ? .body : .body.weight(.semibold))
-                    .lineLimit(1)
-                if let reason = readState.unreadReason {
-                    UnreadDot(reason: reason)
-                }
-                Spacer()
-                if let date = conversation.updatedAtDate {
-                    Text(date, format: .relative(presentation: .named))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
+                leading
+                if let cachedPr { PrBadge(pr: cachedPr) }
+                Spacer(minLength: 0)
             }
-            HStack(spacing: 6) {
-                Text(conversation.displaySlug)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                if let branch = conversation.branch_name, !branch.isEmpty {
-                    Label(branch, systemImage: "arrow.triangle.branch")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    leading
+                    Spacer(minLength: 0)
                 }
+                if let cachedPr { PrBadge(pr: cachedPr) }
             }
         }
         .padding(.vertical, 2)
+    }
+
+    @ViewBuilder private var leading: some View {
+        StateDot(
+            presentationMode: conversation.presentation_mode,
+            requiresAction: conversation.requires_action ?? false,
+            stateType: conversation.stateType)
+        if isCoordinator {
+            Image(systemName: "globe")
+                .font(.caption)
+                .foregroundStyle(.tint)
+        }
+        Text(displayTitle)
+            .font(readState == .read ? .body : .body.weight(.semibold))
+            .lineLimit(1)
+            .truncationMode(.tail)
+            // Ideal width is what ViewThatFits measures: a title may truncate
+            // down to this before the PR badge is pushed to a second line.
+            .frame(idealWidth: 96, alignment: .leading)
+        if let reason = readState.unreadReason {
+            UnreadDot(reason: reason)
+        }
+    }
+}
+
+/// Compact cached-PR badge: number plus state for non-open PRs.
+struct PrBadge: View {
+    let pr: ProductConversationPr
+
+    static func label(for pr: ProductConversationPr) -> String {
+        switch pr.display_state {
+        case .open: "#\(pr.number)"
+        case .draft: "#\(pr.number) draft"
+        case .merged: "#\(pr.number) merged"
+        case .closed: "#\(pr.number) closed"
+        }
+    }
+
+    static func accessibilityLabel(for pr: ProductConversationPr) -> String {
+        var parts = ["PR \(pr.number)"]
+        if pr.display_state != .open { parts.append(pr.display_state.rawValue) }
+        switch pr.feedback_status {
+        case .open: break
+        case .inProgress: parts.append("feedback in progress")
+        case .approved: parts.append("feedback approved")
+        }
+        return parts.joined(separator: ", ")
+    }
+
+    private var tint: Color {
+        switch pr.display_state {
+        case .open: .secondary
+        case .draft: .orange
+        case .merged: .purple
+        case .closed: .red
+        }
+    }
+
+    var body: some View {
+        Text(Self.label(for: pr))
+            .font(.caption2.monospacedDigit().weight(.semibold))
+            .lineLimit(1)
+            .fixedSize()
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .foregroundStyle(tint)
+            .background(tint.opacity(0.15), in: Capsule())
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(Self.accessibilityLabel(for: pr))
     }
 }
 

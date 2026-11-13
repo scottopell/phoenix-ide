@@ -39,8 +39,6 @@ export function MobileConversationListFixtureBody({ scenario }: Props) {
     <div id="app" className="list-page mobile-conversation-list-fixture">
       <main id="main-area" data-app-scroll-owner>
         <ConversationList
-          conversations={fixtureData.conversations}
-          archivedConversations={fixtureData.archivedConversations}
           {...(fixtureData.productConversations === undefined ? {} : {
             productConversations: fixtureData.productConversations,
             archivedProductConversations: fixtureData.archivedProductConversations ?? [],

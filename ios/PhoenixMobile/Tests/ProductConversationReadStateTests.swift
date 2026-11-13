@@ -48,6 +48,29 @@ final class ProductConversationReadStateTests: XCTestCase {
         XCTAssertEqual(store.readState(forAggregateId: "product"), .unread(.marked))
     }
 
+    func testDecodesCachedPr() throws {
+        let pr = try decode(
+            ProductConversationPr.self,
+            #"{"number":98,"title":"Merged","url":"https://example.invalid/98","display_state":"merged","base":"main","head":"x","feedback_status":"in_progress"}"#)
+        XCTAssertEqual(pr.number, 98)
+        XCTAssertEqual(pr.display_state, .merged)
+        XCTAssertEqual(pr.feedback_status, .inProgress)
+    }
+
+    func testPrBadgeLabels() {
+        var pr = ProductConversationPr(
+            number: 123, title: "t", url: "u", display_state: .open,
+            base: "main", head: "h", feedback_status: .open)
+        XCTAssertEqual(PrBadge.label(for: pr), "#123")
+        XCTAssertEqual(PrBadge.accessibilityLabel(for: pr), "PR 123")
+        pr.display_state = .merged
+        pr.feedback_status = .approved
+        XCTAssertEqual(PrBadge.label(for: pr), "#123 merged")
+        XCTAssertEqual(PrBadge.accessibilityLabel(for: pr), "PR 123, merged, feedback approved")
+        pr.display_state = .draft
+        XCTAssertEqual(PrBadge.label(for: pr), "#123 draft")
+    }
+
     @MainActor
     func testExternalPageKeepsReadChangesMadeAfterItWasFetched() {
         let store = ConversationListStore()
@@ -57,6 +80,7 @@ final class ProductConversationReadStateTests: XCTestCase {
         let page = PhoenixAPI.ConversationListPage(
             conversations: [],
             readStates: ["changed": .read, "other": .unread(.newActivity)],
+            cachedPrs: [:],
             coordinator: nil)
         XCTAssertTrue(store.applyExternal([], annotations: page, startedAt: token))
         XCTAssertEqual(store.readState(forAggregateId: "changed"), .unread(.marked))

@@ -835,3 +835,16 @@ THE SYSTEM SHALL offer to mark it unread or read
 
 Read-state changes SHALL be online-only operations. The cached offline list SHALL NOT show read state rather than show a stale one.
 
+---
+
+### REQ-IOS-024: Compact Conversation Rows
+
+WHEN the native conversation list renders a conversation
+THE SYSTEM SHALL present its state indicator, title, unread indicator, and cached pull request badge on a single line
+AND SHALL NOT show the slug, branch, or relative date in the row
+
+WHEN the title and pull request badge cannot fit on one line
+THE SYSTEM SHALL truncate the title first and move the badge to a second line rather than hide it
+
+The pull request badge SHALL show the number and, when not open, its state, and SHALL expose the number, state, and review feedback status to accessibility.
+

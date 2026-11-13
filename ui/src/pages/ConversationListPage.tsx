@@ -458,8 +458,6 @@ export function ConversationListPage() {
             )}
             <ConversationList
               coordinatorUnread={coordinatorUnreadState}
-              conversations={conversations}
-              archivedConversations={archivedConversations}
               productConversations={openProductConversations}
               archivedProductConversations={archivedProductConversations}
               showArchived={showArchived}

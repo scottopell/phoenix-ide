@@ -15,6 +15,9 @@ final class ConversationListStore {
     /// plus local optimistic changes. Not persisted: offline rows show no
     /// unread indicator rather than a stale one.
     private(set) var readStates: [String: ProductConversationReadState] = [:]
+    /// Cached PR per aggregate identity from the last successful refresh.
+    /// Not persisted, like `readStates`.
+    private(set) var cachedPrs: [String: ProductConversationPr] = [:]
     private(set) var coordinatorReadState: CoordinatorListEntry?
 
     private static let cacheName = "conversations"
@@ -323,10 +326,11 @@ final class ConversationListStore {
         return true
     }
 
-    /// Server-derived per-row state (read state) that travels with a list page
-    /// but is not part of the persisted `Conversation` cache.
+    /// Server-derived per-row state (read state, cached PR) that travels with
+    /// a list page but is not part of the persisted `Conversation` cache.
     private func adoptAnnotations(from page: PhoenixAPI.ConversationListPage) {
         readStates = page.readStates
+        cachedPrs = page.cachedPrs
         coordinatorReadState = page.coordinator
     }
 
@@ -456,8 +460,13 @@ final class ConversationListStore {
         lastRefreshed = nil
         lastError = nil
         readStates = [:]
+        cachedPrs = [:]
         coordinatorReadState = nil
         readStateChangedAt = [:]
+    }
+
+    func cachedPr(forAggregateId aggregateId: String) -> ProductConversationPr? {
+        cachedPrs[aggregateId]
     }
 
     func readState(forAggregateId aggregateId: String) -> ProductConversationReadState {

@@ -155,6 +155,29 @@ struct ProductConversationListRow: Codable, Equatable, Sendable {
     var updated_at: String
     var presentation: ProductConversationPresentation
     var read_state: ProductConversationReadState
+    var cached_pr: ProductConversationPr?
+}
+
+/// Cached pull request for a ProductConversation's work scope
+/// (wire type ui/src/generated/ProductConversationPrView.ts).
+struct ProductConversationPr: Codable, Equatable, Sendable {
+    enum DisplayState: String, Codable, Equatable, Sendable {
+        case open, draft, merged, closed
+    }
+
+    enum FeedbackStatus: String, Codable, Equatable, Sendable {
+        case open
+        case inProgress = "in_progress"
+        case approved
+    }
+
+    var number: UInt32
+    var title: String
+    var url: String
+    var display_state: DisplayState
+    var base: String
+    var head: String
+    var feedback_status: FeedbackStatus
 }
 
 struct ProductConversationSnapshot: Codable, Equatable, Sendable {
