@@ -57,21 +57,40 @@ impl SlackRequestKind {
 pub enum SlackTriggerKind {
     Prefix,
     Reaction,
+    Saved,
 }
 impl SlackTriggerKind {
+    #[must_use]
+    pub const fn capture_scope(self) -> &'static str {
+        match self {
+            Self::Saved => "saved",
+            Self::Prefix | Self::Reaction => "emoji",
+        }
+    }
     fn as_str(self) -> &'static str {
         match self {
             Self::Prefix => "prefix",
             Self::Reaction => "reaction",
+            Self::Saved => "saved",
         }
     }
     fn decode(value: &str) -> Result<Self, sqlx::Error> {
         match value {
             "prefix" => Ok(Self::Prefix),
             "reaction" => Ok(Self::Reaction),
+            "saved" => Ok(Self::Saved),
             _ => Err(sqlx::Error::Decode("Invalid Slack trigger kind".into())),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SlackSavedInbox {
+    pub baseline_complete: bool,
+    pub cursor: Option<String>,
+    pub scan_in_progress: bool,
+    pub last_scan_at_unix_micros: Option<i64>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,6 +242,17 @@ impl Database {
             .as_object_mut()
             .ok_or_else(|| DbError::Serialization("Invalid Slack configuration".into()))?
             .insert("trigger_emoji".into(), serde_json::json!(name));
+        let saved: String = sqlx::query_scalar(
+            "SELECT value FROM app_settings WHERE key='slack_gateway_saved_enabled'",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let saved: bool =
+            serde_json::from_str(&saved).map_err(|e| DbError::Serialization(e.to_string()))?;
+        value
+            .as_object_mut()
+            .ok_or_else(|| DbError::Serialization("Invalid Slack configuration".into()))?
+            .insert("saved_enabled".into(), serde_json::json!(saved));
         tx.commit().await?;
         Ok(Some(value.to_string()))
     }
@@ -240,7 +270,14 @@ impl Database {
                 normalize_slack_trigger_emoji(&name)
             })
             .transpose()?;
-        let stored_value = if name.is_some() {
+        let supplied_saved = config
+            .as_object_mut()
+            .and_then(|v| v.remove("saved_enabled"));
+        let saved = supplied_saved
+            .map(serde_json::from_value::<bool>)
+            .transpose()
+            .map_err(|e| DbError::Serialization(e.to_string()))?;
+        let stored_value = if name.is_some() || saved.is_some() {
             config.to_string()
         } else {
             value.to_owned()
@@ -297,12 +334,22 @@ impl Database {
                 sqlx::query("DELETE FROM slack_gateway_discovery")
                     .execute(&mut *tx)
                     .await?;
-                sqlx::query("DELETE FROM slack_gateway_observations")
+                sqlx::query("DELETE FROM slack_gateway_observations WHERE capture_scope='emoji'")
                     .execute(&mut *tx)
                     .await?;
                 sqlx::query("UPDATE slack_gateway_accounts SET baseline_complete=0,status='initializing',last_error=NULL,last_scan_at_unix_micros=NULL").execute(&mut *tx).await?;
             }
         }
+        if let Some(saved) = saved {
+            sqlx::query("UPDATE app_settings SET value=?1 WHERE key='slack_gateway_saved_enabled'")
+                .bind(saved.to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query("INSERT INTO slack_gateway_accounts(workspace,owner) VALUES (?1,?2) ON CONFLICT DO NOTHING")
+            .bind(workspace).bind(owner).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO slack_gateway_saved_inboxes(workspace,owner) VALUES (?1,?2) ON CONFLICT DO NOTHING")
+            .bind(workspace).bind(owner).execute(&mut *tx).await?;
         sqlx::query("UPDATE slack_gateway_returns SET state='failed',failure='Private notice skipped because the configured account changed' WHERE destination='private' AND state='pending' AND binding_id IN (SELECT binding_id FROM slack_gateway_bindings WHERE workspace<>?1 OR owner<>?2)")
             .bind(workspace).bind(owner).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO app_settings(key,value) VALUES ('slack_gateway',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(stored_value).execute(&mut *tx).await?;
@@ -314,15 +361,52 @@ impl Database {
     pub fn slack_gateway_wakeup(&self) -> std::sync::Arc<tokio::sync::Notify> {
         self.slack_gateway_wakeup.clone()
     }
+    pub async fn slack_saved_inbox(
+        &self,
+        workspace: &str,
+        owner: &str,
+    ) -> DbResult<Option<SlackSavedInbox>> {
+        Ok(sqlx::query("SELECT baseline_complete,cursor,scan_in_progress,last_scan_at_unix_micros,last_error FROM slack_gateway_saved_inboxes WHERE workspace=?1 AND owner=?2")
+            .bind(workspace).bind(owner).fetch_optional(self.pool()).await?
+            .map(|row| SlackSavedInbox { baseline_complete: row.get("baseline_complete"), cursor: row.get("cursor"), scan_in_progress: row.get("scan_in_progress"), last_scan_at_unix_micros: row.get("last_scan_at_unix_micros"), last_error: row.get("last_error") }))
+    }
+    pub async fn slack_saved_begin_scan(&self, workspace: &str, owner: &str) -> DbResult<()> {
+        self.slack_baseline_complete(workspace, owner).await?;
+        sqlx::query("INSERT INTO slack_gateway_saved_inboxes(workspace,owner,scan_in_progress) VALUES (?1,?2,1) ON CONFLICT(workspace,owner) DO UPDATE SET scan_in_progress=1")
+            .bind(workspace).bind(owner).execute(self.pool()).await?;
+        Ok(())
+    }
+    pub async fn slack_saved_checkpoint(
+        &self,
+        workspace: &str,
+        owner: &str,
+        cursor: Option<&str>,
+    ) -> DbResult<()> {
+        sqlx::query("UPDATE slack_gateway_saved_inboxes SET cursor=?3,scan_in_progress=?4,baseline_complete=MAX(baseline_complete,?5),last_scan_at_unix_micros=CASE WHEN ?5 THEN ?6 ELSE last_scan_at_unix_micros END,last_error=CASE WHEN ?5 THEN NULL ELSE last_error END WHERE workspace=?1 AND owner=?2")
+            .bind(workspace).bind(owner).bind(cursor).bind(cursor.is_some()).bind(cursor.is_none()).bind(chrono::Utc::now().timestamp_micros()).execute(self.pool()).await?;
+        Ok(())
+    }
+    pub async fn slack_saved_failure(
+        &self,
+        workspace: &str,
+        owner: &str,
+        reason: &str,
+        restart_query: bool,
+    ) -> DbResult<()> {
+        sqlx::query("UPDATE slack_gateway_saved_inboxes SET last_error=?3,cursor=CASE WHEN ?4 THEN NULL ELSE cursor END WHERE workspace=?1 AND owner=?2")
+            .bind(workspace).bind(owner).bind(reason).bind(restart_query).execute(self.pool()).await?;
+        Ok(())
+    }
     pub async fn slack_source_recorded(
         &self,
         workspace: &str,
         owner: &str,
         channel: &str,
         ts: &str,
+        trigger: SlackTriggerKind,
     ) -> DbResult<bool> {
-        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM slack_gateway_requests WHERE workspace=?1 AND owner=?2 AND channel=?3 AND message_ts=?4)")
-            .bind(workspace).bind(owner).bind(channel).bind(ts).fetch_one(self.pool()).await?)
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM slack_gateway_requests WHERE workspace=?1 AND owner=?2 AND channel=?3 AND message_ts=?4 AND capture_scope=?5)")
+            .bind(workspace).bind(owner).bind(channel).bind(ts).bind(trigger.capture_scope()).fetch_one(self.pool()).await?)
     }
     pub async fn slack_baseline_complete(&self, workspace: &str, owner: &str) -> DbResult<bool> {
         sqlx::query("INSERT INTO slack_gateway_accounts(workspace,owner) VALUES (?1,?2) ON CONFLICT DO NOTHING").bind(workspace).bind(owner).execute(self.pool()).await?;
@@ -353,9 +437,10 @@ impl Database {
         channel: &str,
         message_ts: &str,
         observed_at: i64,
+        trigger: SlackTriggerKind,
     ) -> DbResult<()> {
-        sqlx::query("INSERT INTO slack_gateway_observations(workspace,owner,channel,message_ts,first_observed_at_unix_micros) VALUES (?1,?2,?3,?4,?5) ON CONFLICT DO NOTHING")
-            .bind(workspace).bind(owner).bind(channel).bind(message_ts).bind(observed_at).execute(self.pool()).await?;
+        sqlx::query("INSERT INTO slack_gateway_observations(workspace,owner,channel,message_ts,first_observed_at_unix_micros,capture_scope) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT DO NOTHING")
+            .bind(workspace).bind(owner).bind(channel).bind(message_ts).bind(observed_at).bind(trigger.capture_scope()).execute(self.pool()).await?;
         Ok(())
     }
     pub async fn slack_forget_observation(
@@ -364,9 +449,10 @@ impl Database {
         owner: &str,
         channel: &str,
         message_ts: &str,
+        trigger: SlackTriggerKind,
     ) -> DbResult<()> {
-        sqlx::query("DELETE FROM slack_gateway_observations WHERE workspace=?1 AND owner=?2 AND channel=?3 AND message_ts=?4")
-            .bind(workspace).bind(owner).bind(channel).bind(message_ts).execute(self.pool()).await?;
+        sqlx::query("DELETE FROM slack_gateway_observations WHERE workspace=?1 AND owner=?2 AND channel=?3 AND message_ts=?4 AND capture_scope=?5")
+            .bind(workspace).bind(owner).bind(channel).bind(message_ts).bind(trigger.capture_scope()).execute(self.pool()).await?;
         Ok(())
     }
     /// Atomically reserve the stable binding and its one immutable source request.
@@ -375,7 +461,26 @@ impl Database {
         source: &SlackSource,
         baseline: bool,
     ) -> DbResult<SlackSourceAcceptance> {
+        if source.trigger_kind == SlackTriggerKind::Saved
+            && (source.kind != SlackRequestKind::Briefing || !source.instruction.is_empty())
+        {
+            return Err(DbError::Serialization(
+                "Saved sources can only authorize a private briefing".into(),
+            ));
+        }
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        if source.trigger_kind == SlackTriggerKind::Saved {
+            let enabled: String = sqlx::query_scalar(
+                "SELECT value FROM app_settings WHERE key='slack_gateway_saved_enabled'",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if enabled != "true" {
+                tx.rollback().await?;
+                return Ok(SlackSourceAcceptance::Inactive);
+            }
+        }
+
         // Settings are read as one aggregate under the acceptance transaction.
         // A concurrent discovery disable cannot cross the durable acceptance point.
         let setting: Option<String> =
@@ -395,7 +500,7 @@ impl Database {
                 return Ok(SlackSourceAcceptance::Inactive);
             }
         }
-        let exists:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM slack_gateway_requests WHERE workspace=?1 AND owner=?2 AND channel=?3 AND message_ts=?4)").bind(&source.workspace).bind(&source.owner).bind(&source.channel).bind(&source.message_ts).fetch_one(&mut *tx).await?;
+        let exists:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM slack_gateway_requests WHERE workspace=?1 AND owner=?2 AND channel=?3 AND message_ts=?4 AND capture_scope=?5)").bind(&source.workspace).bind(&source.owner).bind(&source.channel).bind(&source.message_ts).bind(source.trigger_kind.capture_scope()).fetch_one(&mut *tx).await?;
         if exists {
             tx.rollback().await?;
             return Ok(SlackSourceAcceptance::Recorded);
@@ -411,10 +516,10 @@ impl Database {
             sqlx::query("INSERT INTO slack_gateway_bindings(binding_id,workspace,owner,channel,thread_ts,kind,creation_id) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(binding_id) DO NOTHING")
                 .bind(&binding).bind(&source.workspace).bind(&source.owner).bind(&source.channel).bind(&source.thread_ts).bind(source.kind.as_str()).bind(uuid::Uuid::new_v4().to_string()).execute(&mut *tx).await?;
         }
-        sqlx::query("INSERT INTO slack_gateway_requests(request_id,workspace,owner,channel,message_ts,thread_ts,kind,instruction,source_url,binding_id,accepted_at_unix_micros,input_id,context,observed_at_unix_micros,trigger_kind) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,COALESCE((SELECT first_observed_at_unix_micros FROM slack_gateway_observations WHERE workspace=?2 AND owner=?3 AND channel=?4 AND message_ts=?5),?14),?15)")
-            .bind(&request).bind(&source.workspace).bind(&source.owner).bind(&source.channel).bind(&source.message_ts).bind(&source.thread_ts).bind(if baseline {"baseline"}else{source.kind.as_str()}).bind(&source.instruction).bind(&source.source_url).bind(if baseline {None}else{Some(&binding)}).bind(chrono::Utc::now().timestamp_micros()).bind(uuid::Uuid::new_v4().to_string()).bind(&source.context).bind(source.observed_at_unix_micros).bind(source.trigger_kind.as_str()).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM slack_gateway_observations WHERE workspace=?1 AND owner=?2 AND channel=?3 AND message_ts=?4")
-            .bind(&source.workspace).bind(&source.owner).bind(&source.channel).bind(&source.message_ts).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO slack_gateway_requests(request_id,workspace,owner,channel,message_ts,thread_ts,kind,instruction,source_url,binding_id,accepted_at_unix_micros,input_id,context,observed_at_unix_micros,trigger_kind) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,COALESCE((SELECT first_observed_at_unix_micros FROM slack_gateway_observations WHERE workspace=?2 AND owner=?3 AND channel=?4 AND message_ts=?5 AND capture_scope=?16),?14),?15)")
+            .bind(&request).bind(&source.workspace).bind(&source.owner).bind(&source.channel).bind(&source.message_ts).bind(&source.thread_ts).bind(if baseline {"baseline"}else{source.kind.as_str()}).bind(&source.instruction).bind(&source.source_url).bind(if baseline {None}else{Some(&binding)}).bind(chrono::Utc::now().timestamp_micros()).bind(uuid::Uuid::new_v4().to_string()).bind(&source.context).bind(source.observed_at_unix_micros).bind(source.trigger_kind.as_str()).bind(source.trigger_kind.capture_scope()).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM slack_gateway_observations WHERE workspace=?1 AND owner=?2 AND channel=?3 AND message_ts=?4 AND capture_scope=?5")
+            .bind(&source.workspace).bind(&source.owner).bind(&source.channel).bind(&source.message_ts).bind(source.trigger_kind.capture_scope()).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(SlackSourceAcceptance::Recorded)
     }
@@ -436,11 +541,11 @@ impl Database {
         Ok(())
     }
     pub async fn slack_begin_eyes_attempt(&self, request: &str) -> DbResult<bool> {
-        Ok(sqlx::query("UPDATE slack_gateway_requests SET eyes_failure=?2 WHERE request_id=?1 AND kind<>'baseline' AND eyes_confirmed=0 AND eyes_failure IS NULL")
+        Ok(sqlx::query("UPDATE slack_gateway_requests SET eyes_failure=?2 WHERE request_id=?1 AND kind<>'baseline' AND trigger_kind<>'saved' AND eyes_confirmed=0 AND eyes_failure IS NULL")
             .bind(request).bind(EYES_OUTCOME_UNKNOWN).execute(self.pool()).await?.rows_affected()==1)
     }
     pub async fn slack_eyes_confirmed(&self, request: &str) -> DbResult<()> {
-        sqlx::query("UPDATE slack_gateway_requests SET eyes_failure=NULL,eyes_confirmed=1 WHERE request_id=?1 AND (eyes_failure IS NULL OR eyes_failure=?2)")
+        sqlx::query("UPDATE slack_gateway_requests SET eyes_failure=NULL,eyes_confirmed=1 WHERE request_id=?1 AND trigger_kind<>'saved' AND (eyes_failure IS NULL OR eyes_failure=?2)")
             .bind(request)
             .bind(EYES_OUTCOME_UNKNOWN)
             .execute(self.pool())
@@ -448,7 +553,7 @@ impl Database {
         Ok(())
     }
     pub async fn slack_eyes_unavailable(&self, request: &str, reason: &str) -> DbResult<()> {
-        sqlx::query("UPDATE slack_gateway_requests SET eyes_failure=?2 WHERE request_id=?1 AND eyes_confirmed=0 AND (eyes_failure IS NULL OR eyes_failure=?3)").bind(request).bind(reason).bind(EYES_OUTCOME_UNKNOWN).execute(self.pool()).await?;
+        sqlx::query("UPDATE slack_gateway_requests SET eyes_failure=?2 WHERE request_id=?1 AND trigger_kind<>'saved' AND eyes_confirmed=0 AND (eyes_failure IS NULL OR eyes_failure=?3)").bind(request).bind(reason).bind(EYES_OUTCOME_UNKNOWN).execute(self.pool()).await?;
         Ok(())
     }
     /// One return per native occurrence; coverage is checked and persisted atomically.
@@ -1766,6 +1871,156 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn saved_capture_has_private_independent_durable_identity() {
+        // REQ-SG-019: Emoji baseline cannot suppress Saved; re-saving never replays.
+        let db = Database::open_in_memory().await.unwrap();
+        db.set_slack_configuration(r#"{"enabled":true,"workspace":"example.slack.com","owner":"UOWNER","saved_enabled":true}"#).await.unwrap();
+        let mut saved = source("100.000001", SlackRequestKind::Briefing);
+        db.accept_slack_source(&saved, true).await.unwrap();
+        saved.trigger_kind = SlackTriggerKind::Saved;
+        saved.instruction.clear();
+        db.slack_observe_source(
+            &saved.workspace,
+            &saved.owner,
+            &saved.channel,
+            &saved.message_ts,
+            123,
+            SlackTriggerKind::Saved,
+        )
+        .await
+        .unwrap();
+        db.slack_observe_source(
+            &saved.workspace,
+            &saved.owner,
+            &saved.channel,
+            &saved.message_ts,
+            456,
+            SlackTriggerKind::Prefix,
+        )
+        .await
+        .unwrap();
+        db.accept_slack_source(&saved, false).await.unwrap();
+        let request = db
+            .slack_requests(&saved.workspace, &saved.owner)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(request.source.observed_at_unix_micros, 123);
+        assert_eq!(request.source.kind, SlackRequestKind::Briefing);
+        assert_eq!(request.source.trigger_kind, SlackTriggerKind::Saved);
+        assert!(!db
+            .slack_begin_eyes_attempt(&request.request_id)
+            .await
+            .unwrap());
+        db.slack_eyes_confirmed(&request.request_id).await.unwrap();
+        db.slack_eyes_unavailable(&request.request_id, "unavailable")
+            .await
+            .unwrap();
+        for statement in [
+            "UPDATE slack_gateway_requests SET kind='explicit' WHERE trigger_kind='saved'",
+            "UPDATE slack_gateway_requests SET instruction='execute' WHERE trigger_kind='saved'",
+            "UPDATE slack_gateway_requests SET eyes_confirmed=1 WHERE trigger_kind='saved'",
+        ] {
+            assert!(sqlx::query(statement).execute(db.pool()).await.is_err());
+        }
+        db.set_slack_configuration(r#"{"enabled":false,"workspace":"example.slack.com","owner":"UOWNER","saved_enabled":false}"#).await.unwrap();
+        assert_eq!(
+            db.accept_slack_source(&saved, false).await.unwrap(),
+            SlackSourceAcceptance::Inactive
+        );
+        db.set_slack_configuration(r#"{"enabled":true,"workspace":"example.slack.com","owner":"UOWNER","saved_enabled":true}"#).await.unwrap();
+        db.accept_slack_source(&saved, false).await.unwrap();
+        let retained = db
+            .slack_requests(&saved.workspace, &saved.owner)
+            .await
+            .unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].request_id, request.request_id);
+        assert_eq!(retained[0].input_id, request.input_id);
+        assert!(!retained[0].eyes_confirmed);
+        assert!(retained[0].eyes_failure.is_none());
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT capture_scope FROM slack_gateway_observations")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            "emoji"
+        );
+        saved.kind = SlackRequestKind::Explicit;
+        assert!(db.accept_slack_source(&saved, false).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn saved_readiness_progress_and_errors_survive_settings_and_restart() {
+        // REQ-SG-019: retained state belongs to the workflow, not emoji configuration.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("saved.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        let config = serde_json::json!({"enabled":true,"workspace":"example.slack.com","owner":"UOWNER","saved_enabled":true,"trigger_emoji":"fire"});
+        db.set_slack_configuration(&config.to_string())
+            .await
+            .unwrap();
+        db.slack_saved_begin_scan("example.slack.com", "UOWNER")
+            .await
+            .unwrap();
+        db.slack_saved_checkpoint("example.slack.com", "UOWNER", None)
+            .await
+            .unwrap();
+        let completed = db
+            .slack_saved_inbox("example.slack.com", "UOWNER")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_scan_at_unix_micros;
+        db.slack_saved_begin_scan("example.slack.com", "UOWNER")
+            .await
+            .unwrap();
+        db.slack_saved_checkpoint("example.slack.com", "UOWNER", Some("retained"))
+            .await
+            .unwrap();
+        db.slack_saved_failure("example.slack.com", "UOWNER", "provider limit", false)
+            .await
+            .unwrap();
+        let mut changed = config.clone();
+        changed["trigger_emoji"] = serde_json::json!("look");
+        changed["saved_enabled"] = serde_json::json!(false);
+        db.set_slack_configuration(&changed.to_string())
+            .await
+            .unwrap();
+        db.pool().close().await;
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        db.set_slack_configuration(&config.to_string())
+            .await
+            .unwrap();
+        let inbox = db
+            .slack_saved_inbox("example.slack.com", "UOWNER")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(inbox.baseline_complete && inbox.scan_in_progress);
+        assert_eq!(inbox.cursor.as_deref(), Some("retained"));
+        assert_eq!(inbox.last_scan_at_unix_micros, completed);
+        assert_eq!(inbox.last_error.as_deref(), Some("provider limit"));
+        db.slack_saved_failure("example.slack.com", "UOWNER", "page_limit_exceeded", true)
+            .await
+            .unwrap();
+        let inbox = db
+            .slack_saved_inbox("example.slack.com", "UOWNER")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(inbox.baseline_complete);
+        assert!(inbox.cursor.is_none());
+        assert_eq!(inbox.last_scan_at_unix_micros, completed);
+    }
+
+    #[tokio::test]
     async fn source_identity_retains_first_verified_trigger_provenance() {
         let db = Database::open_in_memory().await.unwrap();
         let mut source = source("100.000001", SlackRequestKind::Explicit);
@@ -2409,6 +2664,7 @@ mod tests {
                 &source.channel,
                 &source.message_ts,
                 at,
+                source.trigger_kind,
             )
             .await
             .unwrap();
@@ -2419,6 +2675,7 @@ mod tests {
             &source.channel,
             &source.message_ts,
             400,
+            source.trigger_kind,
         )
         .await
         .unwrap();
@@ -2427,7 +2684,8 @@ mod tests {
                 &source.workspace,
                 &source.owner,
                 &source.channel,
-                &source.message_ts
+                &source.message_ts,
+                source.trigger_kind,
             )
             .await
             .unwrap());
@@ -2457,7 +2715,8 @@ mod tests {
                 &source.owner,
                 &source.channel,
                 "200.000",
-                -1
+                -1,
+                source.trigger_kind,
             )
             .await
             .is_err());
@@ -2590,14 +2849,24 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn briefing_notices_are_deduplicated_by_occurrence() {
         use phoenix_core::domain::sm_state::{ConvState, QuestionRequestAuthority};
-        for terminal in ["Completed", "Failed", "Deleted"] {
+        for (trigger, terminal) in [SlackTriggerKind::Reaction, SlackTriggerKind::Saved]
+            .into_iter()
+            .flat_map(|trigger| {
+                ["Completed", "Failed", "Cancelled", "Deleted"]
+                    .map(move |terminal| (trigger, terminal))
+            })
+        {
             let db = Database::open_in_memory().await.unwrap();
             let conv = db
                 .create_conversation("brief", "brief", "/tmp", true, None, None)
                 .await
                 .unwrap();
-            let source = source("100.000", SlackRequestKind::Briefing);
-            db.set_slack_configuration(&serde_json::json!({"workspace":source.workspace,"owner":source.owner,"enabled":true}).to_string()).await.unwrap();
+            let mut source = source("100.000", SlackRequestKind::Briefing);
+            source.trigger_kind = trigger;
+            if trigger == SlackTriggerKind::Saved {
+                source.instruction.clear();
+            }
+            db.set_slack_configuration(&serde_json::json!({"workspace":source.workspace,"owner":source.owner,"enabled":true,"saved_enabled":trigger == SlackTriggerKind::Saved}).to_string()).await.unwrap();
             db.accept_slack_source(&source, false).await.unwrap();
             let request = db
                 .slack_requests(&source.workspace, &source.owner)
@@ -2632,6 +2901,7 @@ mod tests {
                 .await
                 .unwrap()
                 .remove(0);
+            assert_eq!(notice.destination, "private");
             assert!(notice.text.contains("needs your input"));
             sqlx::query("UPDATE slack_gateway_returns SET state='failed',failure='fixture notification rejection' WHERE return_id=?1").bind(&notice.return_id).execute(db.pool()).await.unwrap();
             let other_owner =
@@ -3074,7 +3344,8 @@ mod tests {
                 &next.workspace,
                 &next.owner,
                 &next.channel,
-                &next.message_ts
+                &next.message_ts,
+                next.trigger_kind,
             )
             .await
             .unwrap());

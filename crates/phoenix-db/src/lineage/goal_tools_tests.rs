@@ -190,7 +190,7 @@ async fn canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent() {
         .unwrap();
         assert_eq!(
             tail,
-            vec![143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 158, 159, 160, 161,]
+            vec![143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 158, 159, 160, 161, 162,]
         );
         let before = snapshot(db.pool()).await;
         assert_eq!(
