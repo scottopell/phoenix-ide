@@ -24,6 +24,26 @@ afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 const productConversationCss = readFileSync(`${process.cwd()}/src/pages/ProductConversationPage.css`, 'utf8');
 
+function installReactionGeometry() {
+    vi.spyOn(window, 'matchMedia').mockImplementation((query) => ({
+      matches: query === '(any-pointer: coarse)', media: query, onchange: null,
+      addListener: vi.fn(), removeListener: vi.fn(), addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn(),
+    }));
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockImplementation(function (this: HTMLElement) {
+      return this.id === 'messages' ? 800 : 0;
+    });
+    const originalRect = HTMLElement.prototype.getBoundingClientRect;
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.classList.contains('virtual-transcript__row')) return new DOMRect(0, 0, 390, 120);
+      if (this.id === 'messages') return new DOMRect(0, 0, 390, 800);
+      return originalRect.call(this);
+    });
+    Object.defineProperty(Range.prototype, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({ left: 20, top: 100, bottom: 130, right: 250, width: 230, height: 30 }),
+    });
+}
+
 describe('ProductConversationFixture', () => {
   it('serves the current conversation reminder list without masking unknown API requests', async () => {
     const restore = installProductConversationFixtureApi(getProductConversationScenario('inline-message-reactions'));
@@ -160,23 +180,7 @@ describe('ProductConversationFixture', () => {
   });
 
   it('appends two touch-docked source-bound reactions to the actual latest composer without submitting and opens the older reviewer', async () => {
-    vi.spyOn(window, 'matchMedia').mockImplementation((query) => ({
-      matches: query === '(any-pointer: coarse)', media: query, onchange: null,
-      addListener: vi.fn(), removeListener: vi.fn(), addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn(),
-    }));
-    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockImplementation(function (this: HTMLElement) {
-      return this.id === 'messages' ? 800 : 0;
-    });
-    const originalRect = HTMLElement.prototype.getBoundingClientRect;
-    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
-      if (this.classList.contains('virtual-transcript__row')) return new DOMRect(0, 0, 390, 120);
-      if (this.id === 'messages') return new DOMRect(0, 0, 390, 800);
-      return originalRect.call(this);
-    });
-    Object.defineProperty(Range.prototype, 'getBoundingClientRect', {
-      configurable: true,
-      value: () => ({ left: 20, top: 100, bottom: 130, right: 250, width: 230, height: 30 }),
-    });
+    installReactionGeometry();
     const scenario = getProductConversationScenario('inline-message-reactions');
     const { container } = render(<ProductConversationFixture scenario={scenario} />);
     const draft = await screen.findByPlaceholderText('Type a message...');
@@ -217,6 +221,39 @@ describe('ProductConversationFixture', () => {
     expect(viewer).toHaveTextContent('Preserve the user’s draft and every completed tool result.');
     expect(screen.getByRole('button', { name: 'Add note to line 1' })).toBeInTheDocument();
     send.mockRestore();
+    window.getSelection()?.removeAllRanges();
+  }, 15_000);
+
+  it.each(['before-acceptance', 'after-acceptance'] as const)('restores an annotation only if delivery failed %s', async sendFailure => {
+    installReactionGeometry();
+    const scenario = { ...getProductConversationScenario('inline-message-reactions'), sendFailure };
+    const { container } = render(<ProductConversationFixture scenario={scenario} />);
+    const draft = await screen.findByPlaceholderText('Type a message...');
+    await waitFor(() => expect(draft).toHaveValue('Let’s keep the first version focused.'));
+    const paragraph = await waitFor(() => {
+      const element = container.querySelector('[data-inline-reaction-message="reaction-answer"] .agent-text-block p');
+      expect(element).not.toBeNull();
+      return element!;
+    });
+    fireEvent.pointerDown(paragraph, { pointerType: 'touch' });
+    const range = document.createRange();
+    range.selectNodeContents(paragraph);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    fireEvent(document, new Event('selectionchange'));
+    const reaction = await screen.findByRole('textbox', { name: 'Your reaction' });
+    fireEvent.change(reaction, { target: { value: 'Acceptance race regression' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add to draft' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    if (sendFailure === 'after-acceptance') {
+      await waitFor(() => expect(screen.queryByRole('button', { name: 'Edit annotation 1' })).not.toBeInTheDocument());
+      expect(draft).toHaveValue('');
+      expect(screen.queryByText('Could not send your annotations. Please try again.')).not.toBeInTheDocument();
+    } else {
+      await screen.findByText('Could not send your annotations. Please try again.');
+      expect(screen.getByRole('button', { name: 'Edit annotation 1' })).toHaveTextContent('Acceptance race regression');
+      expect(draft).toHaveValue('Let’s keep the first version focused.');
+    }
     window.getSelection()?.removeAllRanges();
   });
 

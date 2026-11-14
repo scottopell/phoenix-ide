@@ -5,6 +5,11 @@ import { RoutedStore } from './RoutedStore';
 import { notifyConversationSnapshotChange, notifyProductConversationListMayHaveChanged } from '../notifications';
 import { parseConversationState } from '../utils';
 
+export interface MessageAcceptanceReceipt {
+  readonly accepted: boolean;
+  dispose(): void;
+}
+
 function cachedPrEqual(a: CachedPrSummary | null | undefined, b: CachedPrSummary | null | undefined): boolean {
   if (a === b) return true;
   if (!a || !b) return false;
@@ -347,6 +352,25 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
    */
   slugForId(convId: string): string | undefined {
     return this.slugByConvId.get(convId);
+  }
+
+  trackMessageAcceptance(scopeKey: string, conversationId: string, localId: string): MessageAcceptanceReceipt {
+    let accepted = false;
+    let unsubscribe = () => {};
+    const matches = (id: string) => id === localId || id === `${conversationId}:${localId}`;
+    const observe = () => {
+      accepted = [scopeKey, this.slugForId(conversationId) ?? conversationId].some(key => {
+        const atom = this.atomByKey(key);
+        return atom?.conversationId === conversationId && (
+          atom.messages.some(message => matches(message.message_id))
+          || atom.steeringMessages.some(message => matches(message.message_id))
+        );
+      });
+      if (accepted) unsubscribe();
+    };
+    unsubscribe = this.subscribeAny(observe);
+    observe();
+    return { get accepted() { return accepted; }, dispose: unsubscribe };
   }
 
   /**

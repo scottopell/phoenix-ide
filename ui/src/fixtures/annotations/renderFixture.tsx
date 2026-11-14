@@ -155,7 +155,8 @@ function SeedAnnotationState({ state }: { state: AnnotationDesignState }) {
 
 export function AnnotationDesignFixture({ state }: { state: AnnotationDesignState }) {
   const scenario = useMemo(() => ({
-    ...makeVirtualizedReactionScenario(), sendFailure: state === '09-failed-send',
+    ...makeVirtualizedReactionScenario(),
+    ...(state === '09-failed-send' ? { sendFailure: 'before-acceptance' as const } : {}),
     ...(state === '08-sending' ? { latestConversationState: { type: 'awaiting_llm' as const } } : {}),
   }), [state]);
   return <ProductConversationFixture scenario={scenario}><SeedAnnotationState state={state} /></ProductConversationFixture>;

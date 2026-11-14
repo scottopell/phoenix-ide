@@ -1085,3 +1085,39 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
     expect(listener).toHaveBeenCalledTimes(2);
   });
 });
+
+
+describe('in-flight send acceptance receipts', () => {
+  it.each(['raw', 'canonical', 'steering'] as const)('latches %s acceptance after history changes or the user navigates away', kind => {
+    const store = new ConversationStore();
+    const payload = transcriptInit('a');
+    store.upsertSnapshot('display-slug', payload.conversation);
+    store.dispatch('a', { type: 'sse_init', payload });
+    expect(store.slugForId('a')).toBe('display-slug');
+    const receipt = store.trackMessageAcceptance('a', 'a', 'submitted');
+    store.dispatch('b', { type: 'sse_init', payload: { ...transcriptInit('b'), messages: [{ ...payload.messages[0]!, conversation_id: 'b', message_id: 'submitted' }] } });
+    expect(receipt.accepted).toBe(false);
+    const id = kind === 'canonical' ? 'a:submitted' : 'submitted';
+    store.dispatch('a', { type: 'sse_init', payload: { ...payload,
+      messages: kind === 'steering' ? [] : [{ ...payload.messages[0]!, message_id: id }],
+      steeringMessages: kind === 'steering' ? [{ message_id: id, text: 'Queued', origin: { kind: 'user_api' }, images: [], files: [] }] : [],
+    } });
+    expect(receipt.accepted).toBe(true);
+    store.remove('a');
+    expect(receipt.accepted).toBe(true);
+    receipt.dispose();
+  });
+
+  it('does not turn queue disposal or a foreign replacement into acceptance', () => {
+    const store = new ConversationStore();
+    store.dispatch('a', { type: 'sse_init', payload: transcriptInit('a') });
+    const receipt = store.trackMessageAcceptance('a', 'a', 'submitted');
+    receipt.dispose();
+    const payload = transcriptInit('a');
+    store.dispatch('a', { type: 'sse_init', payload: { ...payload, messages: [{ ...payload.messages[0]!, message_id: 'a:submitted' }] } });
+    expect(receipt.accepted).toBe(false);
+    const foreign = store.trackMessageAcceptance('a', 'other', 'submitted');
+    expect(foreign.accepted).toBe(false);
+    foreign.dispose();
+  });
+});

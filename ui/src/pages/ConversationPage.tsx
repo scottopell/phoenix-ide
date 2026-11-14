@@ -74,6 +74,7 @@ import { WorkControlBar } from '../components/WorkActions';
 import { ContextExhaustedHandoff } from '../components/ContextExhaustedHandoff';
 import {
   useConversationEventCursorRef,
+  useTrackMessageAcceptance,
   useConversationView,
   useWorkScope,
   useCreateConversationWithStore,
@@ -711,6 +712,7 @@ function ConversationPageContent({
   const { showAuthPanel, setShowAuthPanel } = useAutoAuth(credentialStatus);
 
   const eventCursorRef = useConversationEventCursorRef(slug!);
+  const trackMessageAcceptance = useTrackMessageAcceptance(slug!);
 
   // Message queue management. `queuedMessages` is the raw store; the rendered
   // split between "pending in the message list" and "failed in the input area"
@@ -1284,6 +1286,7 @@ function ConversationPageContent({
       if (!conversationId) return false;
       if (isArchived) return false;
 
+      const receipt = trackMessageAcceptance(conversationId, localId);
       sendingMessagesRef.current.add(localId);
 
       const phaseEventSeqBeforePost = atomRef.current.phaseLastAppliedEventSeq;
@@ -1354,6 +1357,7 @@ function ConversationPageContent({
         }
         return true;
       } catch (err) {
+        if (receipt.accepted) return true;
         if (err instanceof ExpansionError) {
           // Don't mark as failed — InputArea restores the draft and shows
           // an inline error so the user can fix or remove the broken
@@ -1376,10 +1380,11 @@ function ConversationPageContent({
         ) {
           optimisticPhaseOwnerRef.current = null;
         }
+        receipt.dispose();
         sendingMessagesRef.current.delete(localId);
       }
     },
-    [conversationId, isArchived, isOnline, queueOperation, dispatch, markAccepted, markSteeringQueued]
+    [conversationId, isArchived, isOnline, queueOperation, dispatch, markAccepted, markSteeringQueued, trackMessageAcceptance]
   );
 
   const sendMessageRef = useRef(sendMessage);

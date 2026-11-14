@@ -234,10 +234,15 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       return Response.json([] satisfies Awaited<ReturnType<typeof api.listReminders>>);
     }
     if (url.endsWith(`/api/conversations/${conversation.id}/chat`) && init?.method === 'POST') {
-      const body = JSON.parse(String(init.body)) as { text?: string };
+      const body = JSON.parse(String(init.body)) as { text?: string; message_id: string };
       sendCount += 1;
       record('SendCount', sendCount);
       record('LastSentText', body.text ?? '');
+      if (scenario.sendFailure === 'after-acceptance') latestEventSource?.emitMessage({
+        event_presentation: null, message_id: `${conversation.id}:${body.message_id}`, conversation_id: conversation.id,
+        sequence_id: Math.max(0, ...messages.map(message => message.sequence_id)) + 1,
+        message_type: 'user', content: { text: body.text ?? '' }, created_at: new Date().toISOString(),
+      });
       if (scenario.sendFailure) return Response.json({ error: 'Fixture send failure' }, { status: 503 });
       return Response.json({ queued: false, already_persisted: true });
     }
@@ -311,6 +316,11 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       record('EventSourceLastInstance', this.instanceId);
       record('EventSourceLastUrl', url);
       queueMicrotask(() => this.onopen?.(new Event('open')));
+    }
+
+    emitMessage(message: Message): void {
+      const event = new MessageEvent<string>('message', { data: JSON.stringify({ opening: null, sequence_id: 2, message: { ...message, origin: { kind: 'user_api' } } }) });
+      for (const listener of this.listeners.get('message') ?? []) listener(event);
     }
 
     triggerNativeError(): void {
