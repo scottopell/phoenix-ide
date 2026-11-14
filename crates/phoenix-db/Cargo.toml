@@ -41,7 +41,7 @@ schemars = { version = "0.8", features = ["uuid1"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # Row/PK identifiers
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 
 # Random suffix for slug-collision disambiguation
 rand = "0.10"

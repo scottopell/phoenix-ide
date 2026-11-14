@@ -325,6 +325,7 @@ async fn goal_preparation_migration_follows_conversation_tool_migrations() {
             (155, "ordinary_self_goal_admission".into()),
             (156, "native_task_approval_receipts".into()),
             (157, "close_completion_allowances_and_native_retry_fence".into()),
+            (158, "native_close_initial_receipts".into()),
         ]
     );
 }

@@ -817,7 +817,76 @@ const MIGRATIONS: &[Migration] = &[
         name: "close_completion_allowances_and_native_retry_fence",
         sql: MIGRATION_157,
     },
+    Migration {
+        version: 158,
+        name: "native_close_initial_receipts",
+        sql: MIGRATION_158,
+    },
 ];
+
+const MIGRATION_158: &str = r"
+CREATE UNIQUE INDEX close_obligations_attempt_product_unique
+    ON close_obligations(attempt_id, product_conversation_id);
+
+CREATE TABLE native_close_initial_receipts (
+    request_id TEXT NOT NULL PRIMARY KEY
+        CHECK (typeof(request_id) = 'text' AND length(trim(request_id)) > 0),
+    source_transcript_id TEXT NOT NULL
+        CHECK (typeof(source_transcript_id) = 'text' AND length(trim(source_transcript_id)) > 0),
+    source_message_id TEXT NOT NULL
+        CHECK (typeof(source_message_id) = 'text' AND length(trim(source_message_id)) > 0),
+    source_tool_use_id TEXT NOT NULL
+        CHECK (typeof(source_tool_use_id) = 'text' AND length(trim(source_tool_use_id)) > 0),
+    request_fingerprint TEXT NOT NULL
+        CHECK (typeof(request_fingerprint) = 'text' AND length(trim(request_fingerprint)) > 0),
+    product_conversation_id TEXT NOT NULL
+        CHECK (typeof(product_conversation_id) = 'text' AND length(trim(product_conversation_id)) > 0),
+    attempt_id TEXT NOT NULL
+        CHECK (typeof(attempt_id) = 'text' AND length(trim(attempt_id)) > 0),
+    run_ordinal INTEGER NOT NULL CHECK (typeof(run_ordinal) = 'integer' AND run_ordinal = 1),
+    UNIQUE (source_transcript_id, source_message_id, source_tool_use_id),
+    FOREIGN KEY (attempt_id, product_conversation_id)
+        REFERENCES close_obligations(attempt_id, product_conversation_id) ON DELETE CASCADE,
+    FOREIGN KEY (attempt_id, run_ordinal)
+        REFERENCES close_runs(attempt_id, run_ordinal) ON DELETE CASCADE
+);
+
+CREATE TRIGGER native_close_initial_receipts_require_native_parent
+BEFORE INSERT ON native_close_initial_receipts
+WHEN NOT EXISTS (
+    SELECT 1 FROM close_obligations
+    WHERE attempt_id = NEW.attempt_id
+      AND product_conversation_id = NEW.product_conversation_id
+      AND native_managed = 1
+)
+BEGIN
+    SELECT RAISE(ABORT, 'native Close initial receipt requires native-managed obligation');
+END;
+
+CREATE TRIGGER native_close_initial_receipts_immutable
+BEFORE UPDATE ON native_close_initial_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'native Close initial receipt is immutable');
+END;
+
+CREATE TRIGGER native_close_initial_receipts_no_replacement
+BEFORE INSERT ON native_close_initial_receipts
+WHEN EXISTS (SELECT 1 FROM native_close_initial_receipts WHERE request_id = NEW.request_id)
+  OR EXISTS (SELECT 1 FROM native_close_initial_receipts
+             WHERE source_transcript_id = NEW.source_transcript_id
+               AND source_message_id = NEW.source_message_id
+               AND source_tool_use_id = NEW.source_tool_use_id)
+BEGIN
+    SELECT RAISE(ABORT, 'native Close initial receipt cannot be replaced');
+END;
+
+CREATE TRIGGER native_close_initial_receipts_no_direct_delete
+BEFORE DELETE ON native_close_initial_receipts
+WHEN EXISTS (SELECT 1 FROM close_obligations WHERE attempt_id = OLD.attempt_id)
+BEGIN
+    SELECT RAISE(ABORT, 'native Close initial receipt must be retained with its obligation');
+END;
+";
 
 const MIGRATION_157: &str = r"
 ALTER TABLE close_obligations
@@ -15813,7 +15882,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(run_through_for_test(db.pool(), 152).await.unwrap(), 1);
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 4);
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 5);
         assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
         let ledger: Vec<(i64, String)> = sqlx::query_as(
             "SELECT version, name FROM _migrations WHERE version >= 150 ORDER BY version",
@@ -15834,6 +15903,7 @@ mod tests {
                     157,
                     "close_completion_allowances_and_native_retry_fence".into()
                 ),
+                (158, "native_close_initial_receipts".into()),
             ]
         );
     }
@@ -15843,6 +15913,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (158, "native_close_initial_receipts"),
             (157, "close_completion_allowances_and_native_retry_fence"),
             (156, "native_task_approval_receipts"),
             (155, "ordinary_self_goal_admission"),
@@ -20117,6 +20188,7 @@ mod tests {
                 (155, "ordinary_self_goal_admission"),
                 (156, "native_task_approval_receipts"),
                 (157, "close_completion_allowances_and_native_retry_fence"),
+                (158, "native_close_initial_receipts"),
             ]
         );
         let goal = MIGRATIONS
@@ -20130,7 +20202,7 @@ mod tests {
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 155);
+        assert_eq!(MIGRATIONS.len(), 156);
     }
 
     #[tokio::test]
@@ -20146,7 +20218,7 @@ mod tests {
         }
         sqlx::query("UPDATE product_creation_jobs SET status = 'published', published_product_id = 'deleted-product', published_conversation_id = 'deleted-transcript' WHERE request_id = 'orphan-image'")
             .execute(&pool).await.unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 8);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 9);
         let identity: Vec<(String, String)> = sqlx::query_as(
             "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
         ).fetch_all(&pool).await.unwrap();
@@ -20200,7 +20272,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 8);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 9);
         let retained: (String, String, String) = sqlx::query_as(
             "SELECT status, published_product_id, published_conversation_id
              FROM product_creation_jobs WHERE request_id = 'orphan-text'",
@@ -23229,5 +23301,151 @@ mod close_completion_allowance_tests {
             "SELECT COUNT(*) FROM close_completion_retry_allowances WHERE attempt_id = 'rolled-back'",
         ).fetch_one(&pool).await.unwrap();
         assert_eq!(rolled_back_allowances, 0);
+    }
+}
+
+#[cfg(test)]
+mod native_close_initial_receipt_tests {
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::MIGRATION_158;
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One fixture checks the full immutable receipt lifecycle.
+    async fn migration_158_binds_initial_receipts_to_their_exact_obligation_and_run() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE close_obligations (
+                 attempt_id TEXT NOT NULL UNIQUE,
+                 product_conversation_id TEXT NOT NULL,
+                 native_managed INTEGER NOT NULL DEFAULT 0
+                     CHECK (typeof(native_managed) = 'integer' AND native_managed IN (0, 1))
+             );
+             CREATE TABLE close_runs (
+                 attempt_id TEXT NOT NULL REFERENCES close_obligations(attempt_id) ON DELETE CASCADE,
+                 run_ordinal INTEGER NOT NULL,
+                 PRIMARY KEY (attempt_id, run_ordinal)
+             );
+             CREATE TRIGGER close_runs_reject_standalone_delete
+             BEFORE DELETE ON close_runs
+             WHEN EXISTS (SELECT 1 FROM close_obligations WHERE attempt_id = OLD.attempt_id)
+             BEGIN SELECT RAISE(ABORT, 'Close run must be retained with its authority'); END;
+             INSERT INTO close_obligations (attempt_id, product_conversation_id)
+                 VALUES ('attempt-a', 'product-a');
+             INSERT INTO close_obligations (attempt_id, product_conversation_id)
+                 VALUES ('attempt-b', 'product-b');
+             INSERT INTO close_runs VALUES ('attempt-a', 1);
+             INSERT INTO close_runs VALUES ('attempt-b', 1);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_158).execute(&pool).await.unwrap();
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM native_close_initial_receipts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(sqlx::query(
+            "INSERT INTO native_close_initial_receipts
+                 (request_id, source_transcript_id, source_message_id, source_tool_use_id,
+                  request_fingerprint, product_conversation_id, attempt_id, run_ordinal)
+             VALUES ('request-a', 'transcript', 'message', 'tool',
+                     'fingerprint', 'product-a', 'attempt-a', 1)",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        let rejected_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM native_close_initial_receipts WHERE request_id = 'request-a'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rejected_count, 0);
+        // Both parents are now eligible so later negative cases isolate their
+        // requested constraint rather than being masked by the native-parent guard.
+        sqlx::query("UPDATE close_obligations SET native_managed = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO native_close_initial_receipts
+                 (request_id, source_transcript_id, source_message_id, source_tool_use_id,
+                  request_fingerprint, product_conversation_id, attempt_id, run_ordinal)
+             VALUES ('request-a', 'transcript', 'message', 'tool',
+                     'fingerprint', 'product-a', 'attempt-a', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for (product, attempt, ordinal) in [
+            ("product-b", "attempt-a", 1),
+            ("product-a", "attempt-b", 1),
+            ("product-a", "missing", 1),
+            ("product-a", "attempt-a", 2),
+            ("product-b", "attempt-b", 2),
+        ] {
+            assert!(sqlx::query(
+                "INSERT INTO native_close_initial_receipts
+                     (request_id, source_transcript_id, source_message_id, source_tool_use_id,
+                      request_fingerprint, product_conversation_id, attempt_id, run_ordinal)
+                 VALUES ('request-other', 'other-transcript', 'other-message', 'other-tool',
+                         'fingerprint', ?1, ?2, ?3)",
+            )
+            .bind(product)
+            .bind(attempt)
+            .bind(ordinal)
+            .execute(&pool)
+            .await
+            .is_err());
+        }
+        for statement in [
+            "INSERT INTO native_close_initial_receipts VALUES
+                ('   ', 'new-transcript', 'new-message', 'new-tool', 'fingerprint', 'product-b', 'attempt-b', 1)",
+            "INSERT INTO native_close_initial_receipts VALUES
+                ('request-new', 'new-transcript', '  ', 'new-tool', 'fingerprint', 'product-b', 'attempt-b', 1)",
+            "INSERT INTO native_close_initial_receipts VALUES
+                ('request-new', X'00', 'new-message', 'new-tool', 'fingerprint', 'product-b', 'attempt-b', 1)",
+            "UPDATE native_close_initial_receipts SET request_fingerprint = 'changed' WHERE request_id = 'request-a'",
+            "UPDATE native_close_initial_receipts SET attempt_id = 'attempt-b' WHERE request_id = 'request-a'",
+            "DELETE FROM native_close_initial_receipts WHERE request_id = 'request-a'",
+            "INSERT OR REPLACE INTO native_close_initial_receipts VALUES
+                ('request-a', 'new-transcript', 'new-message', 'new-tool', 'changed', 'product-b', 'attempt-b', 1)",
+            "INSERT OR REPLACE INTO native_close_initial_receipts VALUES
+                ('request-new', 'transcript', 'message', 'tool', 'changed', 'product-b', 'attempt-b', 1)",
+            "INSERT INTO native_close_initial_receipts VALUES
+                ('request-new', 'transcript', 'message', 'tool', 'changed', 'product-b', 'attempt-b', 1)",
+        ] {
+            assert!(sqlx::query(statement).execute(&pool).await.is_err(), "{statement}");
+        }
+        let retained: (String, String, String) = sqlx::query_as(
+            "SELECT request_fingerprint, product_conversation_id, attempt_id
+             FROM native_close_initial_receipts WHERE request_id = 'request-a'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            retained,
+            ("fingerprint".into(), "product-a".into(), "attempt-a".into())
+        );
+
+        sqlx::query("DELETE FROM close_obligations WHERE attempt_id = 'attempt-a'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM native_close_initial_receipts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 }

@@ -1586,7 +1586,7 @@ async fn set_close_phase_tx(
     Ok(())
 }
 
-async fn read_topology_tx(
+pub(crate) async fn read_topology_tx(
     tx: &mut Transaction<'_, Sqlite>,
     product_conversation_id: &ProductConversationId,
 ) -> DbResult<Option<CloseFoundationTopology>> {
@@ -2018,13 +2018,23 @@ impl Database {
         expected_latest_transcript_id: &TranscriptConversationId,
         attempt_id: &str,
     ) -> DbResult<CloseObligation> {
-        self.begin_close_foundation_inner(
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+        #[cfg(test)]
+        if let Some(latch) = &self.close_foundation_test_latch {
+            latch.transaction_entered.notify_waiters();
+            latch.release_transaction.notified().await;
+        }
+        let obligation = Self::begin_close_foundation_inner(
+            &mut tx,
             product_conversation_id,
             expected_latest_transcript_id,
             attempt_id,
             false,
         )
-        .await
+        .await?;
+        tx.commit().await?;
+        Ok(obligation)
     }
 
     pub async fn begin_direct_close_foundation(
@@ -2033,23 +2043,6 @@ impl Database {
         expected_latest_transcript_id: &TranscriptConversationId,
         attempt_id: &str,
     ) -> DbResult<CloseObligation> {
-        self.begin_close_foundation_inner(
-            product_conversation_id,
-            expected_latest_transcript_id,
-            attempt_id,
-            true,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_lines)]
-    async fn begin_close_foundation_inner(
-        &self,
-        product_conversation_id: &ProductConversationId,
-        expected_latest_transcript_id: &TranscriptConversationId,
-        attempt_id: &str,
-        require_idle_latest: bool,
-    ) -> DbResult<CloseObligation> {
         let mut conn = self.pool.acquire().await?;
         let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
         #[cfg(test)]
@@ -2057,6 +2050,26 @@ impl Database {
             latch.transaction_entered.notify_waiters();
             latch.release_transaction.notified().await;
         }
+        let obligation = Self::begin_close_foundation_inner(
+            &mut tx,
+            product_conversation_id,
+            expected_latest_transcript_id,
+            attempt_id,
+            true,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(obligation)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn begin_close_foundation_inner(
+        tx: &mut Transaction<'_, Sqlite>,
+        product_conversation_id: &ProductConversationId,
+        expected_latest_transcript_id: &TranscriptConversationId,
+        attempt_id: &str,
+        require_idle_latest: bool,
+    ) -> DbResult<CloseObligation> {
         if let Some(row) = sqlx::query(
             "SELECT attempt_id, product_conversation_id, phase, inspection_generation,
                     inspection_fingerprint, created_at, updated_at, completed_at, close_outcome,
@@ -2064,7 +2077,7 @@ impl Database {
              FROM close_obligations WHERE attempt_id = ?1",
         )
         .bind(attempt_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?
         {
             if row.try_get::<i64, _>("topology_sealed")? != 1 {
@@ -2079,7 +2092,7 @@ impl Database {
                  WHERE attempt_id = ?1 AND member_role IN ('latest', 'root_latest')",
             )
             .bind(attempt_id)
-            .fetch_all(&mut *tx)
+            .fetch_all(&mut **tx)
             .await?;
             if obligation.product_conversation_id() != product_conversation_id {
                 return Err(DbError::CloseFoundationConflict(format!(
@@ -2093,7 +2106,7 @@ impl Database {
                     "attempt {attempt_id} does not capture exactly one latest transcript"
                 )));
             }
-            let topology = read_topology_tx(&mut tx, product_conversation_id)
+            let topology = read_topology_tx(tx, product_conversation_id)
                 .await?
                 .ok_or_else(|| {
                     DbError::CloseFoundationNotFound(product_conversation_id.to_string())
@@ -2109,7 +2122,6 @@ impl Database {
                 )));
             }
 
-            tx.commit().await?;
             return Ok(obligation);
         }
 
@@ -2118,7 +2130,7 @@ impl Database {
              WHERE id = ?1 AND kind = 'ordinary'",
         )
         .bind(product_conversation_id.as_str())
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?;
         if lifecycle.as_deref() == Some("history") {
             return Err(DbError::CloseFoundationConflict(format!(
@@ -2130,9 +2142,9 @@ impl Database {
              WHERE product_conversation_id = ?1 AND archived = 1",
         )
         .bind(product_conversation_id.as_str())
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-        let topology = read_topology_tx(&mut tx, product_conversation_id)
+        let topology = read_topology_tx(tx, product_conversation_id)
             .await?
             .ok_or_else(|| DbError::CloseFoundationNotFound(product_conversation_id.to_string()))?;
         validate_begin_preconditions(&topology, expected_latest_transcript_id.as_str())?;
@@ -2153,7 +2165,7 @@ impl Database {
              WHERE product_conversation_id = ?1 AND (phase <> 'completed' OR close_outcome = 'close_incomplete')",
         )
         .bind(product_conversation_id.as_str())
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?
         {
             let obligation = parse_close_obligation_row(row)?;
@@ -2173,7 +2185,7 @@ impl Database {
              )",
         )
         .bind(product_conversation_id.as_str())
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
         if automatic_continuation_pending != 0 {
             return Err(DbError::CloseFoundationConflict(format!(
@@ -2193,7 +2205,7 @@ impl Database {
         .bind(product_conversation_id.as_str())
         .bind(ClosePhase::AwaitingBlockerResolution.as_str())
         .bind(&now)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
         sqlx::query(
@@ -2206,7 +2218,7 @@ impl Database {
         .bind(attempt_id)
         .bind(captured_at_unix_micros)
         .bind(product_conversation_id.as_str())
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
         for (continuation_ordinal, member) in topology.members.iter().enumerate() {
@@ -2234,7 +2246,7 @@ impl Database {
                     .map(WorkScopeId::as_str),
             )
             .bind(&now)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
 
@@ -2254,7 +2266,7 @@ impl Database {
                  FROM work_scopes WHERE id = ?1",
                 )
                 .bind(scope.as_str())
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut **tx)
                 .await?;
             sqlx::query(
                 "INSERT INTO close_attempt_scopes (
@@ -2268,13 +2280,13 @@ impl Database {
             .bind(captured_worktree.1)
             .bind(captured_worktree.2)
             .bind(&now)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
 
         sqlx::query("UPDATE close_obligations SET topology_sealed = 1 WHERE attempt_id = ?1")
             .bind(attempt_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
 
         let row = sqlx::query(
@@ -2283,10 +2295,9 @@ impl Database {
              FROM close_obligations WHERE attempt_id = ?1",
         )
         .bind(attempt_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
         let obligation = parse_close_obligation_row(row)?;
-        tx.commit().await?;
         Ok(obligation)
     }
 
@@ -11594,6 +11605,59 @@ mod tests {
             .unwrap();
             assert_eq!(native_managed, 0);
         }
+    }
+
+    #[tokio::test]
+    async fn caller_owned_close_creation_rolls_back_capture_topology_run_and_allowance() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "caller-rollback-root").await;
+
+        let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        Database::begin_close_foundation_inner(
+            &mut tx,
+            &product_id("caller-rollback-root"),
+            &transcript_id("caller-rollback-root"),
+            "caller-rollback-attempt",
+            false,
+        )
+        .await
+        .unwrap();
+        tx.rollback().await.unwrap();
+
+        for (table, query) in [
+            ("close_obligations", "SELECT COUNT(*) FROM close_obligations"),
+            (
+                "close_attempt_participants",
+                "SELECT COUNT(*) FROM close_attempt_participants",
+            ),
+            (
+                "close_attempt_members",
+                "SELECT COUNT(*) FROM close_attempt_members",
+            ),
+            (
+                "close_attempt_scopes",
+                "SELECT COUNT(*) FROM close_attempt_scopes",
+            ),
+            ("close_runs", "SELECT COUNT(*) FROM close_runs"),
+            (
+                "close_completion_retry_allowances",
+                "SELECT COUNT(*) FROM close_completion_retry_allowances",
+            ),
+        ] {
+            let count: i64 = sqlx::query_scalar(query)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(count, 0, "unexpected persisted rows in {table}");
+        }
+        let sealed_topology: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_obligations
+             WHERE attempt_id = 'caller-rollback-attempt' AND topology_sealed = 1",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(sealed_topology, 0);
     }
 
     #[tokio::test]
