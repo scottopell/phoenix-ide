@@ -122,6 +122,35 @@ async function captureMobileExpandedSpacing({ page, id, outDir, viewport }) {
     throw new Error('collapse/reopen changed expanded content geometry');
   }
   await page.locator('.compact-tool-selected-detail .compact-tool-detail-collapse').click();
+  await page.locator('[data-tool-id="mobile-next-read"] .compact-tool-card-expand').click();
+  const readEvidence = await page.evaluate(() => {
+    const detail = document.querySelector('.compact-tool-selected-detail');
+    const message = detail.querySelector(':scope > .message');
+    const content = message.querySelector(':scope > .message-content');
+    return {
+      contentGap: content.getBoundingClientRect().top - message.getBoundingClientRect().top,
+      toolbarPresent: message.querySelector('.assistant-message-toolbar') !== null,
+      input: detail.querySelector('.tool-block-input').textContent,
+      output: detail.querySelector('.tool-block-output').textContent,
+      clientWidth: document.documentElement.clientWidth,
+      scrollWidth: document.documentElement.scrollWidth,
+    };
+  });
+  if (readEvidence.toolbarPresent !== baseline
+      || (baseline && viewport.hasTouch ? readEvidence.contentGap < 44 : readEvidence.contentGap > 16)
+      || readEvidence.clientWidth !== readEvidence.scrollWidth
+      || !readEvidence.input.includes('product_conversation_id')
+      || !readEvidence.output.includes('auto_continue_on_context_exhaustion')) {
+    throw new Error(`expanded preference read lost spacing or content: ${JSON.stringify(readEvidence)}`);
+  }
+  await page.locator('.compact-tool-selected-detail').getByRole('button', { name: 'Copy output', exact: true }).click();
+  const copiedRead = JSON.parse(await page.evaluate(() => navigator.clipboard.readText()));
+  if (copiedRead.aggregate.product_conversation_id !== 'fixture-review' || copiedRead.auto_continue_on_context_exhaustion !== false) {
+    throw new Error('expanded preference read copy lost structured fields');
+  }
+  await page.screenshot({ path: path.join(outDir, `${stem}--read.png`), fullPage: true });
+  await writeFile(path.join(outDir, `${stem}--read.geometry.json`), `${JSON.stringify({ viewport, readEvidence, copiedRead }, null, 2)}\n`);
+  await page.locator('.compact-tool-selected-detail .compact-tool-detail-collapse').click();
   await page.locator('[data-tool-id="mobile-query-database"] .compact-tool-card-expand').click();
   const copyOutput = page.locator('.compact-tool-selected-detail').getByRole('button', { name: 'Copy output', exact: true });
   await copyOutput.click();

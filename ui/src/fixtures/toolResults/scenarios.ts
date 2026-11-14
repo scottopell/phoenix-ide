@@ -1,3 +1,4 @@
+import type { AutomaticContinuationView } from '../../generated/AutomaticContinuationView';
 import type { Message, SubAgentResult, ToolResultContent } from '../../api';
 import type { ToolResultsFixtureData, ToolResultsScenario } from './types';
 
@@ -536,6 +537,11 @@ const subagentMessages: Message[] = [
   ]),
 ];
 
+const mobileContinuationPreference = {
+  aggregate: { kind: 'ordinary', product_conversation_id: 'fixture-review' },
+  auto_continue_on_context_exhaustion: false,
+} satisfies Pick<AutomaticContinuationView, 'aggregate' | 'auto_continue_on_context_exhaustion'>;
+
 const mobileSpacingMessages: Message[] = [
   userMessage(1, 'Send the mobile review note and continue automatically.'),
   agentMessage(2, [{
@@ -551,18 +557,18 @@ const mobileSpacingMessages: Message[] = [
   toolMessage(3, 'mobile-send-message', JSON.stringify({ outcome: 'delivered', target: '@conv:fixture-review', conversation_id: 'fixture-review-transcript', message_id: '8f53edc3-0711-46d8-8f3b-004201a2f410' }), { display_data: { duration_ms: 42 } }),
   agentMessage(4, [{
     type: 'tool_use',
-    id: 'mobile-query-database',
-    name: 'query_database',
-    input: { sql: "SELECT conversation_id, state, updated_at FROM conversations WHERE conversation_id = 'fixture-review-transcript' LIMIT 1" },
-  }]),
-  toolMessage(5, 'mobile-query-database', JSON.stringify({ columns: ['conversation_id', 'state', 'updated_at'], rows: [['fixture-review-transcript', 'idle', '2026-02-01T10:03:00Z']] })),
-  agentMessage(6, [{
-    type: 'tool_use',
     id: 'mobile-next-read',
     name: 'read_automatic_continuation',
     input: { target: { kind: 'ordinary', product_conversation_id: 'fixture-review' } },
   }]),
-  toolMessage(7, 'mobile-next-read', JSON.stringify({ aggregate: { kind: 'ordinary', product_conversation_id: 'fixture-review' }, enabled: true, revision: 2, updated_at: '2026-02-01T10:03:00Z' }), { display_data: { duration_ms: 18 } }),
+  toolMessage(5, 'mobile-next-read', JSON.stringify(mobileContinuationPreference), { display_data: { duration_ms: 18 } }),
+  agentMessage(6, [{
+    type: 'tool_use',
+    id: 'mobile-query-database',
+    name: 'query_database',
+    input: { sql: "SELECT conversation_id, state, updated_at FROM conversations WHERE conversation_id = 'fixture-review-transcript' LIMIT 1" },
+  }]),
+  toolMessage(7, 'mobile-query-database', JSON.stringify({ columns: ['conversation_id', 'state', 'updated_at'], rows: [['fixture-review-transcript', 'idle', '2026-02-01T10:03:00Z']] })),
   agentMessage(8, [{ type: 'text', text: 'The review message was sent and its automatic-continuation preference was read.' }]),
 ];
 
