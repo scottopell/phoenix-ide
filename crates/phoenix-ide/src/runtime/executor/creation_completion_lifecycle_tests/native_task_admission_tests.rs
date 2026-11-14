@@ -903,7 +903,14 @@ async fn assert_production_initial_approval_inner(
         InitialApprovalScenario::FileBackedInitialProjectionReplay
             | InitialApprovalScenario::FileBackedInitialProjectionRecovery
     ) {
-        Some(temp.path().join("admission.sqlite"))
+        Some(
+            harness
+                .temp
+                .as_ref()
+                .unwrap()
+                .path()
+                .join("admission.sqlite"),
+        )
     } else {
         None
     };
