@@ -27,7 +27,7 @@ class PhoenixApiGuidanceTests(unittest.TestCase):
         )[0]
 
     def test_question_json_matches_registered_route_and_payload(self):
-        self.assertIn('"/api/conversations/:id/respond", post(respond_to_question)', self.handlers)
+        self.assertIn('"/api/conversations/{id}/respond", post(respond_to_question)', self.handlers)
         self.assertIn("POST /api/conversations/{id}/respond", self.recipe)
         match = re.search(r"```json\s+(.*?)\s+```", self.recipe, re.S)
         self.assertIsNotNone(match)
@@ -141,7 +141,7 @@ class PhoenixApiGuidanceTests(unittest.TestCase):
             "## Respond to a pending structured question", 1
         )[0]
         self.assertEqual(re.findall(r"^(\d)\. ", recipe, re.M), ["1", "2", "3", "4", "5"])
-        self.assertIn('"/api/conversations/:id/chat",', self.handlers)
+        self.assertIn('"/api/conversations/{id}/chat",', self.handlers)
         self.assertIn("post(send_chat).layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES))", self.handlers)
         self.assertIn("POST /api/conversations/{original_transcript_id}/chat", recipe)
         body = json.loads(re.search(r"```json\s+(.*?)\s+```", recipe, re.S).group(1))
