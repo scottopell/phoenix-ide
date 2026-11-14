@@ -23,6 +23,7 @@ const BODY: &str = "# Exact reviewed task\r\n\nKeep these bytes.\n";
 
 struct AdmissionFixture {
     db: Database,
+    db_path: Option<std::path::PathBuf>,
     target: String,
     expected: FrozenPendingTask,
 }
@@ -37,7 +38,18 @@ impl AdmissionFixture {
     }
 
     async fn with_cwd_and_task_file(cwd: &str, task_file: &str) -> Self {
-        let db = Database::open_in_memory().await.unwrap();
+        Self::with_cwd_and_task_file_at(cwd, task_file, None).await
+    }
+
+    async fn with_cwd_and_task_file_at(
+        cwd: &str,
+        task_file: &str,
+        db_path: Option<std::path::PathBuf>,
+    ) -> Self {
+        let db = match &db_path {
+            Some(path) => Database::open(path.to_str().unwrap()).await.unwrap(),
+            None => Database::open_in_memory().await.unwrap(),
+        };
         let target = db
             .create_conversation("actor-target", "actor-target", cwd, true, None, None)
             .await
@@ -104,6 +116,7 @@ impl AdmissionFixture {
         let expected = FrozenPendingTask::from_inspection(inspection).unwrap();
         Self {
             db,
+            db_path,
             target: target.id,
             expected,
         }
@@ -639,6 +652,7 @@ enum InitialApprovalScenario {
     FollowUpReceiptFailure,
     InitialProjectionFailure,
     FollowUpProjectionFailure,
+    FileBackedInitialProjectionReplay,
 }
 
 struct InitialApprovalHarness {
@@ -756,6 +770,15 @@ async fn production_initial_postcommit_projection_failure_retains_receipt_and_fe
 }
 
 #[tokio::test]
+async fn production_file_backed_initial_projection_failure_replays_after_reopen() {
+    Box::pin(assert_production_initial_approval(
+        InitialApprovalScenario::FileBackedInitialProjectionReplay,
+        ReviewedTaskKind::PlainMarkdown,
+    ))
+    .await;
+}
+
+#[tokio::test]
 async fn production_follow_up_postcommit_projection_failure_retains_receipt_and_fences() {
     Box::pin(assert_production_initial_approval(
         InitialApprovalScenario::FollowUpProjectionFailure,
@@ -865,7 +888,12 @@ async fn assert_production_initial_approval_inner(
         std::fs::write(worktree.join("unrelated-staged.txt"), "keep staged").unwrap();
         git(&worktree, &["add", "--", "unrelated-staged.txt"]);
     }
-    let f = AdmissionFixture::with_cwd_and_task_file("/nonexistent", task_file).await;
+    let db_path = if scenario == InitialApprovalScenario::FileBackedInitialProjectionReplay {
+        Some(temp.path().join("admission.sqlite"))
+    } else {
+        None
+    };
+    let f = AdmissionFixture::with_cwd_and_task_file_at("/nonexistent", task_file, db_path).await;
     assert_eq!(
         f.db.goal_control_installation(),
         GoalControlInstallation::Disabled
@@ -964,7 +992,8 @@ async fn assert_production_initial_approval_inner(
         | InitialApprovalScenario::InitialReceiptFailure
         | InitialApprovalScenario::FollowUpReceiptFailure
         | InitialApprovalScenario::InitialProjectionFailure
-        | InitialApprovalScenario::FollowUpProjectionFailure => {
+        | InitialApprovalScenario::FollowUpProjectionFailure
+        | InitialApprovalScenario::FileBackedInitialProjectionReplay => {
             phoenix_llm::ModelRegistry::for_test_with_sonnet(llm.clone())
         }
     };
@@ -982,6 +1011,7 @@ async fn assert_production_initial_approval_inner(
         scenario,
         InitialApprovalScenario::InitialProjectionFailure
             | InitialApprovalScenario::FollowUpProjectionFailure
+            | InitialApprovalScenario::FileBackedInitialProjectionReplay
     ) {
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -1117,6 +1147,50 @@ async fn assert_production_initial_approval_inner(
                 ) => break,
                 Err(error) => panic!("must not lose projection evidence: {error}"),
             }
+        }
+        if scenario == InitialApprovalScenario::FileBackedInitialProjectionReplay {
+            // A fresh manager and independently reopened storage handle must
+            // replay history without materializing an actor or dispatching the
+            // still-owed continuation. Recovery dispatch is a separate proof.
+            manager.begin_process_shutdown();
+            manager.drain_process_shutdown().await;
+            let reopened = Database::open(f.db_path.as_ref().unwrap().to_str().unwrap())
+                .await
+                .unwrap();
+            let (fresh_requests_tx, mut fresh_requests) = tokio::sync::mpsc::unbounded_channel();
+            let fresh_llm = Arc::new(InitialApprovalBarrierLlm {
+                requests: fresh_requests_tx,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let fresh = Arc::new(runtime_manager(
+                reopened.clone(),
+                phoenix_llm::ModelRegistry::for_test_with_sonnet(fresh_llm.clone()),
+                temp.path(),
+            ));
+            // Retain teardown ownership before the first fallible assertion.
+            harness.manager = Some(fresh.clone());
+            assert_eq!(
+                fresh.execute_native_task_approval(command.clone()).await,
+                NativeTaskApprovalOutcome::Committed(receipt.clone())
+            );
+            assert_eq!(
+                native_rollback_snapshot(&reopened, "actor-target").await,
+                committed
+            );
+            let reopened_owed: String = sqlx::query_scalar(
+                "SELECT approval_message_id FROM approval_request_obligations WHERE conversation_id = ?1",
+            )
+            .bind("actor-target")
+            .fetch_one(reopened.pool())
+            .await
+            .unwrap();
+            assert_eq!(reopened_owed, owed_message);
+            assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), committed_head);
+            assert_eq!(fresh_llm.calls.load(Ordering::SeqCst), 0);
+            assert!(matches!(
+                fresh_requests.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
         }
         return;
     }
@@ -1732,7 +1806,8 @@ async fn assert_production_initial_approval_inner(
         | InitialApprovalScenario::InitialReceiptFailure
         | InitialApprovalScenario::FollowUpReceiptFailure
         | InitialApprovalScenario::InitialProjectionFailure
-        | InitialApprovalScenario::FollowUpProjectionFailure => 0,
+        | InitialApprovalScenario::FollowUpProjectionFailure
+        | InitialApprovalScenario::FileBackedInitialProjectionReplay => 0,
     };
     assert_eq!(llm.calls.load(Ordering::SeqCst), expected_calls);
     assert!(requests.try_recv().is_err(), "no additional provider entry");
