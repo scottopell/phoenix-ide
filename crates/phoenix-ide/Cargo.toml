@@ -118,8 +118,8 @@ tracing-appender = { workspace = true }
 # HTTP client: the OTel batch processor exports from its own worker thread,
 # where async hyper/reqwest clients have no Tokio reactor. This avoids OTLP
 # gRPC transport; upstream proto messages still depend on tonic codegen types.
-# Version pinning: published datadog-opentelemetry 0.4 uses opentelemetry 0.31,
-# so tracing-opentelemetry must be 0.32 (not 0.33, which needs otel 0.32).
+# Version pinning: datadog-opentelemetry 0.6 requires opentelemetry =0.33.0,
+# so tracing-opentelemetry must be 0.34 (the release built on otel 0.33).
 datadog-opentelemetry = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true }
 opentelemetry = { workspace = true }
