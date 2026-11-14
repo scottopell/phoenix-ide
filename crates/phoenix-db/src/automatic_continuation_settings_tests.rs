@@ -70,24 +70,16 @@ async fn new_aggregates_are_enabled_but_existing_preferences_survive_reopen_and_
             .unwrap(),
         AutoContinueOnContextExhaustion::Enabled
     );
-    assert_eq!(
-        db.auto_continue_on_context_exhaustion(&coordinator.product_conversation_id)
-            .await
-            .unwrap(),
-        AutoContinueOnContextExhaustion::Disabled
-    );
-    assert_eq!(
-        db.auto_continue_on_context_exhaustion(&legacy_id)
-            .await
-            .unwrap(),
-        AutoContinueOnContextExhaustion::Disabled
-    );
-    assert_eq!(
-        db.auto_continue_on_context_exhaustion(&opted_out.product_conversation_id)
-            .await
-            .unwrap(),
-        AutoContinueOnContextExhaustion::Disabled
-    );
+    for id in [
+        &coordinator.product_conversation_id,
+        &legacy_id,
+        &opted_out.product_conversation_id,
+    ] {
+        assert_eq!(
+            db.auto_continue_on_context_exhaustion(id).await.unwrap(),
+            AutoContinueOnContextExhaustion::Disabled
+        );
+    }
     for transcript in [&ordinary.id, &opted_out.id, &coordinator.id] {
         assert!(db.get_messages(transcript).await.unwrap().is_empty());
         assert!(db
