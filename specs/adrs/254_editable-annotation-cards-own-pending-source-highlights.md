@@ -1,6 +1,6 @@
-# ADR-230: Editable annotation cards own pending source highlights
+# ADR-254: Editable annotation cards own pending source highlights
 
-- **Status:** Superseded by ADR-231
+- **Status:** Superseded by ADR-255
 - **Date:** 2026-11-13
 - **Affects:** REQ-PF-018, REQ-PF-019, REQ-PF-020
 
@@ -25,7 +25,7 @@ An in-flight batch keeps its cards and highlights visible with editing disabled.
 
 Cards and unfinished reactions remain session-local. This iteration does not add refresh recovery, server persistence, cross-device synchronization, or conversion of historical plain-text drafts into cards. The ordinary text draft retains its existing persistence behavior.
 
-This refines ADR-056's append representation and preserves ADR-229's reaction-entry presentation and keyboard behavior. The existing batch reviewer remains independent.
+This refines ADR-056's append representation and preserves ADR-253's reaction-entry presentation and keyboard behavior. The existing batch reviewer remains independent.
 
 ## Consequences
 
@@ -37,5 +37,5 @@ This refines ADR-056's append representation and preserves ADR-229's reaction-en
 
 - [Prose feedback requirements](../prose-feedback/requirements.md)
 - [ADR-056](056_inline-reactions-append-without-taking-selection-focus.md)
-- [ADR-229](229_reaction-pill-grows-with-wrapped-text.md)
+- [ADR-253](253_reaction-pill-grows-with-wrapped-text.md)
 - `AnnotationDraftStore`, `InlineMessageReaction`, `DraftAnnotationCards`, `ConnectedInputArea`

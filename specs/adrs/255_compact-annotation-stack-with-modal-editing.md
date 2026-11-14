@@ -1,4 +1,4 @@
-# ADR-231: Compact annotation stack with modal editing
+# ADR-255: Compact annotation stack with modal editing
 
 - **Status:** Accepted
 - **Date:** 2026-11-13
@@ -6,11 +6,11 @@
 
 ## Context
 
-The user finds the inline editable cards from ADR-230 too tall. Pending annotations need recognizable positions and references without consuming the transcript viewport. Small comment tweaks must remain possible after Add to draft.
+The user finds the inline editable cards from ADR-254 too tall. Pending annotations need recognizable positions and references without consuming the transcript viewport. Small comment tweaks must remain possible after Add to draft.
 
 ## Options considered
 
-1. Keep the inline editable cards from ADR-230. Editing is direct, but the quotations and textareas consume substantial space even when idle.
+1. Keep the inline editable cards from ADR-254. Editing is direct, but the quotations and textareas consume substantial space even when idle.
 2. Collapse annotations behind a count badge. This is compact but hides each annotation's identity and requires an extra selection step.
 3. Expose overlapping card strips and move editing to a modal. The stack retains individual references while keeping the idle composer compact.
 
@@ -20,7 +20,7 @@ Choose overlapping strips immediately above the ordinary composer, including for
 
 Selecting a strip opens the shared modal dialog with the complete quotation, editable comment, Delete annotation, Show in conversation, and Done. Comment edits write directly to the existing annotation record. Done, Escape, and backdrop dismissal retain edits and restore focus to the selected strip without scrolling. Deletion closes the modal and focuses an adjacent strip or the composer. Source navigation closes the modal only after finding the passage; unavailable or failed navigation keeps the comment and an explanation visible.
 
-This supersedes ADR-230's inline editing presentation. Its annotation ownership, immutable source anchors, source highlighting, submission-batch isolation, retired-capability fencing, plain-text send representation, and session-local lifetime remain the decision here. In-flight annotations can be inspected but not edited or deleted; successful submission removes the corresponding modal together with its annotation.
+This supersedes ADR-254's inline editing presentation. Its annotation ownership, immutable source anchors, source highlighting, submission-batch isolation, retired-capability fencing, plain-text send representation, and session-local lifetime remain the decision here. In-flight annotations can be inspected but not edited or deleted; successful submission removes the corresponding modal together with its annotation.
 
 ## Consequences
 
@@ -30,7 +30,7 @@ This supersedes ADR-230's inline editing presentation. Its annotation ownership,
 
 ## References
 
-- [ADR-230](230_editable-annotation-cards-own-pending-source-highlights.md)
+- [ADR-254](254_editable-annotation-cards-own-pending-source-highlights.md)
 - [Prose feedback requirements](../prose-feedback/requirements.md)
 - `AnnotationDraftStore`, `DraftAnnotationCards`, `SelectionDialog`
 - [Annotation design gallery workflow](../../docs/qa/annotations.md)

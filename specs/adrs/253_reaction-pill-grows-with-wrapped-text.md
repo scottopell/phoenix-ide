@@ -1,4 +1,4 @@
-# ADR-229: Reaction pills grow with wrapped text
+# ADR-253: Reaction pills grow with wrapped text
 
 - **Status:** Accepted
 - **Date:** 2026-11-13

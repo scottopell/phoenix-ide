@@ -44,6 +44,9 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [255](255_compact-annotation-stack-with-modal-editing.md) | Compact annotation stack with modal editing | Accepted | REQ-PF-019–020 |
+| [254](254_editable-annotation-cards-own-pending-source-highlights.md) | Editable annotation cards own pending source highlights | Superseded by ADR-255 | REQ-PF-018–020 |
+| [253](253_reaction-pill-grows-with-wrapped-text.md) | Reaction pills grow with wrapped text | Accepted | REQ-PF-018–020, REQ-KB-004 |
 | [252](252_server-side-read-cursor-per-product-conversation.md) | Server-side read cursor per ProductConversation | Accepted | REQ-CONV-027 |
 | [251](251_explicit-loopback-oauth-callback-urls.md) | Explicit loopback OAuth callback URLs reuse the fixed-port listener | Accepted | REQ-MCP-020 |
 | [250](250_saved-messages-create-private-any-age-captures.md) | Saved messages create private captures of any age | Accepted | REQ-SG-001/003–007/017/019 |
@@ -55,9 +58,6 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [243](243_federated-native-create-and-rename-use-destination-actions.md) | Federated native create and rename use destination actions | Accepted | REQ-FED-021–024; REQ-GR-024; REQ-CCR-013; REQ-CID-007 |
 | [242](242_execution-bound-own-goal-creation-and-enable.md) | Execution-bound own Goal creation and explicit continuation enable | Accepted | REQ-SGT-001–008; REQ-GOAL-AC-001–004 |
 | [230](230_simplify-macos-deployment-to-candidate-migration-and-manual-recovery.md) | Simplify macOS deployment to candidate migration and manual recovery | Accepted | REQ-LDD-001–032, REQ-PD-031, REQ-COMP-021, REQ-SDC-001–023, REQ-RU-008 |
-| [231](231_compact-annotation-stack-with-modal-editing.md) | Compact annotation stack with modal editing | Accepted | REQ-PF-019–020 |
-| [230](230_editable-annotation-cards-own-pending-source-highlights.md) | Editable annotation cards own pending source highlights | Superseded by ADR-231 | REQ-PF-018–020 |
-| [229](229_reaction-pill-grows-with-wrapped-text.md) | Reaction pills grow with wrapped text | Accepted | REQ-PF-018–020, REQ-KB-004 |
 | [208](208_codex-reset-credits-are-manual-and-resume-the-stopped-conversation.md) | Codex reset credits are redeemed manually through a Phoenix proxy, and a redemption from the quota error resumes that conversation | Accepted | REQ-CRR-001–010 |
 | [207](207_creation-receipt-evidence-and-image-payload-lifetime.md) | Retain creation evidence and replay identity, retire delivery images at product deletion | Accepted | REQ-CCR-013, REQ-CCR-014, REQ-CCR-015 |
 | [000](000_adopt-spears-v2.md) | Phoenix adopts spEARS v2 for new specification work | Accepted | methodology-level |
