@@ -64,7 +64,6 @@ interface InputAreaProps {
    * doesn't carry one's state into the other.
    */
   scopeKey: string | undefined;
-  /** Transcript receiving uploaded attachments; independent of the stable composer product scope. */},{
   uploadConversationId?: string | undefined;
   convState: ConversationState;
   images: ImageData[];
@@ -217,8 +216,6 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   recorderIdentityRef.current = recorderIdentity;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  // Upload destination can be a transcript distinct from the product scope.
-  // Async ownership remains tied to scopeEpoch below, not this destination.
   const attachmentConversationId = uploadConversationId ?? scopeKey;
   const voiceSupported = isWebSpeechSupported();
   const [quickActionSending, setQuickActionSending] = useState(false);
