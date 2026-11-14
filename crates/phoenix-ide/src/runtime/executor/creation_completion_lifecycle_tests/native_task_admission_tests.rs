@@ -533,32 +533,7 @@ async fn production_manager_cancel_before_native_command_has_no_approval_artifac
         placement: NativeApprovalPlacement::ContinueHere,
         intent: NativeApprovalIntent::ApproveTaskAndRequestContinuation,
     };
-    let input = command.input_value().unwrap();
-    let source_state = ConvState::ToolExecuting {
-        current_tool: ToolCall::new(
-            &source.tool_use_id,
-            ToolInput::Unknown {
-                name: "approve_task".into(),
-                input: input.clone(),
-            },
-        ),
-        remaining_tools: vec![],
-        completed_results: vec![],
-        pending_sub_agents: vec![],
-        assistant_message: crate::state_machine::AssistantMessage::new(
-            source.message_id.clone(),
-            vec![ContentBlock::ToolUse {
-                id: source.tool_use_id.clone(),
-                name: "approve_task".into(),
-                input,
-            }],
-            None,
-            None,
-        ),
-    };
-    f.db.update_conversation_state(&coordinator.id, &source_state)
-        .await
-        .unwrap();
+    install_executing_native_approval_source(&f.db, &command).await;
     let manager = Arc::new(crate::runtime::RuntimeManager::new(
         f.db.clone(),
         Arc::new(ModelRegistry::new_empty()),
@@ -598,6 +573,40 @@ async fn production_manager_cancel_before_native_command_has_no_approval_artifac
     assert!(!manager.local_authority_is_closed());
     assert!(!handle.event_tx.is_closed());
     handle.event_tx.send(Event::Shutdown).await.unwrap();
+}
+
+async fn install_executing_native_approval_source(
+    db: &phoenix_db::Database,
+    command: &phoenix_db::native_task_approval::NativeTaskApprovalCommand,
+) {
+    let source = &command.source;
+    // Source state is built from the exact command later submitted to the manager.
+    let input = command.input_value().unwrap();
+    let source_state = ConvState::ToolExecuting {
+        current_tool: ToolCall::new(
+            &source.tool_use_id,
+            ToolInput::Unknown {
+                name: "approve_task".into(),
+                input: input.clone(),
+            },
+        ),
+        remaining_tools: vec![],
+        completed_results: vec![],
+        pending_sub_agents: vec![],
+        assistant_message: crate::state_machine::AssistantMessage::new(
+            source.message_id.clone(),
+            vec![ContentBlock::ToolUse {
+                id: source.tool_use_id.clone(),
+                name: "approve_task".into(),
+                input,
+            }],
+            None,
+            None,
+        ),
+    };
+    db.update_conversation_state(&command.source_transcript_id, &source_state)
+        .await
+        .unwrap();
 }
 
 async fn assert_cancelled_native_approval_unchanged(f: &AdmissionFixture, before: usize) {

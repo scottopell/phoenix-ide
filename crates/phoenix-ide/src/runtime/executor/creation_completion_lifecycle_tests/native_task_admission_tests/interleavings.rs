@@ -314,7 +314,9 @@ async fn run_initial_source_cancel_interleaving(stage: CancellationStage) {
     match stage {
         CancellationStage::BeforeGit | CancellationStage::BeforeGitAfterRotation => assert_eq!(
             outcome,
-            NativeTaskApprovalOutcome::NotApplied(NativeTaskApprovalRefusal::BeforeGitRefused)
+            NativeTaskApprovalOutcome::NotApplied(
+                NativeTaskApprovalRefusal::SourceOrRequestRefused
+            )
         ),
         CancellationStage::AfterGit => {
             assert_eq!(outcome, NativeTaskApprovalOutcome::Unavailable);

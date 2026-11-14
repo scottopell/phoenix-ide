@@ -340,7 +340,9 @@ fn classify_native_preflight_error(
             NativeTaskApprovalExecutionError::Refused(NativeTaskApprovalRefusal::RequestConflict)
         }
         NativeTaskApprovalError::Database(
-            phoenix_db::DbError::MessageConflict(_) | phoenix_db::DbError::ConversationNotFound(_),
+            phoenix_db::DbError::MessageConflict(_)
+            | phoenix_db::DbError::ConversationNotFound(_)
+            | phoenix_db::DbError::CurrentCoordinatorRequired,
         ) => NativeTaskApprovalExecutionError::Refused(
             NativeTaskApprovalRefusal::SourceOrRequestRefused,
         ),
@@ -412,6 +414,39 @@ async fn check_native_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preflight_distinguishes_stale_coordinator_from_storage_failure() {
+        use phoenix_db::{native_task_approval::NativeTaskApprovalError, DbError};
+
+        let stale = NativeTaskApprovalError::Database(DbError::CurrentCoordinatorRequired);
+        assert_eq!(
+            NativeTaskApprovalOutcome::preflight_error(&stale),
+            NativeTaskApprovalOutcome::NotApplied(
+                NativeTaskApprovalRefusal::SourceOrRequestRefused
+            )
+        );
+        assert!(matches!(
+            classify_native_preflight_error(stale),
+            NativeTaskApprovalExecutionError::Refused(
+                NativeTaskApprovalRefusal::SourceOrRequestRefused
+            )
+        ));
+        for error in [
+            DbError::Sqlx(sqlx::Error::RowNotFound),
+            DbError::Serialization("invalid persisted source".into()),
+        ] {
+            let failure = NativeTaskApprovalError::Database(error);
+            assert_eq!(
+                NativeTaskApprovalOutcome::preflight_error(&failure),
+                NativeTaskApprovalOutcome::Unavailable
+            );
+            assert!(matches!(
+                classify_native_preflight_error(failure),
+                NativeTaskApprovalExecutionError::Database(_)
+            ));
+        }
+    }
 
     #[test]
     fn exact_artifact_or_source_refusal_is_before_effects() {

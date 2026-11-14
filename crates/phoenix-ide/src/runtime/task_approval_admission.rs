@@ -161,7 +161,9 @@ impl NativeTaskApprovalOutcome {
                 Self::NotApplied(NativeTaskApprovalRefusal::RequestConflict)
             }
             NativeTaskApprovalError::Database(
-                DbError::MessageConflict(_) | DbError::ConversationNotFound(_),
+                DbError::MessageConflict(_)
+                | DbError::ConversationNotFound(_)
+                | DbError::CurrentCoordinatorRequired,
             ) => Self::NotApplied(NativeTaskApprovalRefusal::SourceOrRequestRefused),
             NativeTaskApprovalError::Database(_) => Self::Unavailable,
         }

@@ -2393,7 +2393,7 @@ where
 #[derive(Debug)]
 enum FollowUpApprovalError {
     BeforeGit(String),
-    NativePreGit(native_task_approval::NativeTaskApprovalExecutionError),
+    NativePreflight(native_task_approval::NativeTaskApprovalExecutionError),
     PersistenceFailed(String),
     AuthorityLost(String),
 }
@@ -12056,7 +12056,7 @@ where
         let blocking_admission = admitted.reborrow();
         let pre_git = self
             .native_pre_git_check(origin)
-            .map_err(FollowUpApprovalError::NativePreGit)?;
+            .map_err(FollowUpApprovalError::NativePreflight)?;
         let native = origin.is_native();
         let worker =
             crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move || {
@@ -12090,8 +12090,8 @@ where
             FollowUpArtifactError::BeforeGit(error) if !origin.is_native() => {
                 FollowUpApprovalError::BeforeGit(error)
             }
-            FollowUpArtifactError::NativePreGit(error) => {
-                FollowUpApprovalError::NativePreGit(error)
+            FollowUpArtifactError::NativePreflight(error) => {
+                FollowUpApprovalError::NativePreflight(error)
             }
             FollowUpArtifactError::BeforeGit(error) | FollowUpArtifactError::AfterGit(error) => {
                 FollowUpApprovalError::AuthorityLost(error)
@@ -12287,7 +12287,7 @@ where
                     Err(error.into())
                 }
                 Err(FollowUpApprovalError::BeforeGit(error)) => Err(error.into()),
-                Err(FollowUpApprovalError::NativePreGit(error)) => Err(error),
+                Err(FollowUpApprovalError::NativePreflight(error)) => Err(error),
                 Err(FollowUpApprovalError::PersistenceFailed(error)) => {
                     self.recovery_disposition = RuntimeRecoveryDisposition::RecreateFromDatabase;
                     Err(format!(
@@ -12647,7 +12647,7 @@ where
                     "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: fresh task approval crossed the Git authority boundary without reconciliation: {error}"
                 ));
             }
-            Err(FollowUpArtifactError::NativePreGit(error)) => return Err(error.to_string()),
+            Err(FollowUpArtifactError::NativePreflight(error)) => return Err(error.to_string()),
             Err(FollowUpArtifactError::BeforeGit(e)) => {
                 tracing::error!(error = %e, "Fresh task approval artifact verification failed");
                 self.install_live_state(
@@ -12744,7 +12744,7 @@ struct ReviewedTaskHandoffSnapshot {
 #[derive(Debug)]
 enum FollowUpArtifactError {
     BeforeGit(String),
-    NativePreGit(native_task_approval::NativeTaskApprovalExecutionError),
+    NativePreflight(native_task_approval::NativeTaskApprovalExecutionError),
     AfterGit(String),
 }
 
@@ -12752,7 +12752,7 @@ impl std::fmt::Display for FollowUpArtifactError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
             Self::BeforeGit(message) | Self::AfterGit(message) => message,
-            Self::NativePreGit(error) => return write!(formatter, "{error}"),
+            Self::NativePreflight(error) => return write!(formatter, "{error}"),
         };
         formatter.write_str(message)
     }
@@ -12873,7 +12873,7 @@ fn persist_fresh_approved_task_artifact_blocking_with_progress(
     let original_path_was_tracked =
         run_git(cwd, &["ls-files", "--error-unmatch", "--", task_file]).is_ok();
     if let Some(check) = pre_git {
-        check().map_err(FollowUpArtifactError::NativePreGit)?;
+        check().map_err(FollowUpArtifactError::NativePreflight)?;
     }
     let mut snapshot = if native {
         reread_reviewed_task_handoff_snapshot_at_exact_path_native(
@@ -12884,7 +12884,7 @@ fn persist_fresh_approved_task_artifact_blocking_with_progress(
             expected_priority,
             expected_plan,
         )
-        .map_err(FollowUpArtifactError::NativePreGit)?
+        .map_err(FollowUpArtifactError::NativePreflight)?
     } else {
         reread_reviewed_task_handoff_snapshot(
             cwd,
