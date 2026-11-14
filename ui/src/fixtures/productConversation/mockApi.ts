@@ -106,17 +106,18 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   const completeUpload = () => resolveUpload?.([{ original_name: 'notes.txt', media_type: 'text/plain', size_bytes: 4, stored_path: 'notes.txt' }]);
   window.addEventListener('product-conversation-fixture-complete-upload', completeUpload);
 
-  let failNextSnapshot = false;
-  const failSnapshot = () => { failNextSnapshot = true; };
+  let snapshotUnavailable = false;
+  const failSnapshot = () => { snapshotUnavailable = true; };
+  const restoreSnapshot = () => { snapshotUnavailable = false; };
   const checkSnapshotFailure = () => {
-    if (!failNextSnapshot) return;
-    failNextSnapshot = false;
+    if (!snapshotUnavailable) return;
     throw new Error('Fixture continuation snapshot unavailable');
   };
-  window.addEventListener('product-conversation-fixture-fail-next-snapshot', failSnapshot);
+  window.addEventListener('product-conversation-fixture-fail-snapshot', failSnapshot);
+  window.addEventListener('product-conversation-fixture-restore-snapshot', restoreSnapshot);
   api.getProductConversationHistorySnapshot = async (_productConversationId, options = {}) => {
     const requestOptions = options ?? {};
-    if (!requestOptions.before && !requestOptions.after) checkSnapshotFailure();
+    if (!requestOptions.before) checkSnapshotFailure();
     if (scenario.kind === 'coordinator') throw new Error('Global must not request ordinary history');
     if (scenario.sourceSnapshot && _productConversationId !== 'fixture-product-conversation') {
       if (scenario.sourceIsGlobal) throw new Error("Global must not request ordinary snapshot");
@@ -178,7 +179,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   };
 
   api.getCoordinatorHistory = async (reference, options = {}) => {
-    if (!options.before && !options.after) checkSnapshotFailure();
+    if (!options.before) checkSnapshotFailure();
     if (scenario.kind !== 'coordinator') {
       if (scenario.sourceIsGlobal && scenario.sourceSnapshot) return coordinatorSnapshot(scenario.sourceSnapshot);
       throw new Error(`Unexpected Global history reference: ${reference}`);
@@ -550,6 +551,18 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     record('ContinuationUpdateInstance', predecessorSource.id);
   };
   window.addEventListener('product-conversation-fixture-continue', publishContinuation);
+  const publishPhase = (event: Event) => {
+    const phase = (event as CustomEvent<{ type: string; attempt?: number; summary?: string }>).detail;
+    const source = latestEventSource;
+    if (!phase || !source || source.readyState !== FixtureEventSource.OPEN || source.subscriptionCount < 1) return;
+    source.emit('state_change', {
+      sequence_id: source.nextSequenceId(),
+      state: phase,
+      presentation_mode: phase.type,
+      state_updated_at: '2026-07-01T12:00:01Z',
+    });
+  };
+  window.addEventListener('product-conversation-fixture-phase', publishPhase);
   const publishSuccessorMessage = () => {
     if (!scenario.continuationJourney || !continuationPublished) return;
     const successor = [...eventSources].find(source => source.memberId === currentConversation.id && source.readyState === FixtureEventSource.OPEN && source.subscriptionCount > 0);
@@ -574,7 +587,8 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
 
   return () => {
     window.removeEventListener('product-conversation-fixture-hold-older', holdOlderPage);
-    window.removeEventListener('product-conversation-fixture-fail-next-snapshot', failSnapshot);
+    window.removeEventListener('product-conversation-fixture-fail-snapshot', failSnapshot);
+    window.removeEventListener('product-conversation-fixture-restore-snapshot', restoreSnapshot);
     window.removeEventListener('product-conversation-fixture-release-older', releaseOlderPage);
     window.removeEventListener('product-conversation-fixture-hold-successor', holdSuccessor);
     window.removeEventListener('product-conversation-fixture-release-successor', releaseSuccessor);
@@ -589,6 +603,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     window.removeEventListener('product-conversation-fixture-stream-failure', failLatestEventSource);
     window.removeEventListener('product-conversation-fixture-acknowledge-last-send', acknowledgeLastSend);
     window.removeEventListener('product-conversation-fixture-continue', publishContinuation);
+    window.removeEventListener('product-conversation-fixture-phase', publishPhase);
     window.removeEventListener('product-conversation-fixture-successor-message', publishSuccessorMessage);
     api.getPrStatus = originalGetPrStatus;
     api.getProductConversationHistorySnapshot = originalGetProductConversationSnapshot;

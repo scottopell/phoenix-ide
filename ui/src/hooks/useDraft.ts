@@ -67,7 +67,6 @@ function writeDraft(conversationId: string, value: string): void {
 export function clearDraftStorage(conversationId: string): void {
   try {
     localStorage.removeItem(storageKey(conversationId));
-    localStorage.removeItem(storageKey(`product:${conversationId}`));
   } catch (error) {
     console.warn('Error clearing draft from localStorage:', error);
   }

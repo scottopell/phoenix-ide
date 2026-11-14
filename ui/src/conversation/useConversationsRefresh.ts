@@ -300,6 +300,9 @@ export function useConversationsRefreshDriver(): void {
       }
       notifyProductConversationDeleted(detail.conversationId, [...deletedConversationIds]);
       localStorage.removeItem(`phoenix:product-conversation-draft:${detail.conversationId}`);
+      const productDraftScope = `product:${detail.conversationId}`;
+      clearDraftStorage(productDraftScope);
+      draftStore.remove(productDraftScope);
       for (const conversationId of deletedConversationIds) {
         const removedSlugs = store.removeByConversationId(conversationId);
         for (const slug of removedSlugs) {

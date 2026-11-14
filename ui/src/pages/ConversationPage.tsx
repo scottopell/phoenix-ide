@@ -380,7 +380,7 @@ function ConversationPageContent({
     }
   }, [presentationRetentionEnabled, presentationScopeKey, currentConversationReady, authoritativeConversation, retainedPresentation]);
   const retainedConversation = presentationRetentionEnabled
-    && retainedPresentation?.scopeKey === presentationScopeKey ? retainedPresentation.conversation : undefined;
+    && retainedPresentation?.scopeKey === presentationScopeKey ? retainedPresentation?.conversation : undefined;
   const conversation = authoritativeConversation ?? retainedConversation;
   const retainingPresentation = !currentConversationReady && retainedConversation !== undefined;
   const canMutateCurrentConversation = mutationEnabled && currentConversationReady;
@@ -1833,7 +1833,7 @@ function ConversationPageContent({
     && convStateForChildren.type !== 'provisioning'
     && convStateForChildren.type !== 'creation_failed'
     && convStateForChildren.type !== 'creation_cancelled'
-    && convStateForChildren.type !== 'context_exhausted'
+    && (convStateForChildren.type !== 'context_exhausted' || presentationRetentionEnabled)
     && convStateForChildren.type !== 'awaiting_user_response'
     && convStateForChildren.type !== 'awaiting_task_approval'
     && convStateForChildren.type !== 'handed_off'
@@ -1935,7 +1935,7 @@ function ConversationPageContent({
     }
   }, [convStateForChildren.type, conversationId]);
   const handleSendTextOnly = useCallback((text: string) => handleSend(text, []), [handleSend]);
-  const grounding = conversationGroundingContext(conversation, routePrefix === '/global');
+  const grounding = conversationGroundingContext(conversation ?? null, routePrefix === '/global');
   const isCoordinatorHome = grounding.kind === 'coordinator_home';
   const fileRootPath = isArchived || !conversation
     ? null
@@ -2543,6 +2543,7 @@ function ConversationPageContent({
           scopeKey={composerScopeKey ?? conversationId}
           uploadConversationId={conversationId}
           convState={convStateForChildren}
+          retainComposerDuringContinuation={presentationRetentionEnabled}
           images={images}
           setImages={setImages}
           files={files}
@@ -2661,6 +2662,7 @@ function ConversationPageContent({
           scopeKey={composerScopeKey ?? conversationId}
           uploadConversationId={conversationId}
           convState={convStateForChildren}
+          retainComposerDuringContinuation={presentationRetentionEnabled}
           images={images}
           setImages={setImages}
           files={files}

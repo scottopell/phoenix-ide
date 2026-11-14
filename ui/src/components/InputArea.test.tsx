@@ -778,6 +778,45 @@ describe('InputArea cancellation affordance', () => {
     expect(screen.queryByRole('button', { name: /stop|send|queue/i })).not.toBeInTheDocument();
   });
 
+  it('keeps the embedded composer identity while continuation progress and handoff gate actions', () => {
+    const onSend = vi.fn();
+    const commonProps = {
+      cwd: 'conv-continuation',
+      scopeKey: 'conv-continuation',
+      images: [],
+      setImages: () => {},
+      files: [],
+      setFiles: () => {},
+      isOffline: false,
+      failedMessages: [],
+      draft: 'retained follow-up',
+      onDraftChange: () => {},
+      onSend,
+      onCancel: () => {},
+      onRetry: () => {},
+      retainComposerDuringContinuation: true,
+    };
+    const { rerender } = render(<InputArea {...commonProps} convState={idleState} />);
+    const textarea = screen.getByRole('textbox');
+    textarea.focus();
+    for (const convState of [
+      { type: 'awaiting_continuation' as const, attempt: 1 },
+      { type: 'context_exhausted' as const, summary: 'manual handoff' },
+      { type: 'idle' as const },
+    ]) {
+      rerender(<InputArea {...commonProps} convState={convState} />);
+      expect(screen.getByRole('textbox')).toBe(textarea);
+      expect(textarea).toHaveValue('retained follow-up');
+      expect(textarea).toHaveFocus();
+      if (convState.type !== 'idle') {
+        expect(screen.queryByRole('button', { name: 'Send message' })).toBeNull();
+        fireEvent.submit(textarea.closest('form')!);
+        expect(onSend).not.toHaveBeenCalled();
+      }
+    }
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
   it('restores the retained draft after continuation completes', () => {
     const onSend = vi.fn();
     const commonProps = {

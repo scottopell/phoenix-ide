@@ -27,6 +27,10 @@ Hosted [43633805978](https://github.com/scottopell/phoenix-ide/actions/runs/4363
 
 Independent source-only review of `bc92612f1c2b39fdbffd0499188c7b5192513142..a5baa9244db19ac5115a930e11b73bf97f47b615` found a cold-successor null render unmounted the actual textarea, losing mobile focus and the pending-upload send gate. The follow-up retains aggregate-scoped presentation during hydration while separately gating mutations on authoritative successor readiness. A controlled cold-INIT/readback/upload fixture regression is authored, not yet executed. The subscription oracle now specifically measures live **transcript** subscriptions; the separate product-events subscription remains legitimate. The shared capture runner already honors `hasTouch` and `isMobile`; earlier viewport-only concerns were stale.
 
+### Real-phase and deletion review follow-up
+
+Hosted [43635706524](https://github.com/scottopell/phoenix-ide/actions/runs/43635706524) on `b39ad103178b11e025045ec59d7ad9357cf08814` passed visual capture (job 132571996544), but UI qualification failed with nullable-retention/API-option TypeScript errors and fixture timing/oracle failures. Its captures are intermediate evidence, not final-source acceptance. Independent source review additionally found that awaiting-continuation and context-exhausted phases removed the composer before successor adoption, and hard-delete cleanup used transcript IDs for the new aggregate draft scope. Follow-up source repairs retain the embedded composer through those real phases, preserve phase-based send gates, and explicitly clear aggregate drafts by ProductConversation identity; new tests remain unexecuted. The failed-readback fixture now models unavailability until explicit restoration, avoiding a one-shot failure consumed by a concurrent readback.
+
 ## Bounded lifecycle audit
 
 All entries below describe source-present coverage unless an exact hosted result is separately cited.

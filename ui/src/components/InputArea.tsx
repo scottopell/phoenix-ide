@@ -108,6 +108,7 @@ interface InputAreaProps {
   onRetry: (localId: string) => void;
   onDismissError?: (localId: string) => void;
   readOnly?: boolean;
+  retainComposerDuringContinuation?: boolean;
 }
 
 function formatBytes(bytes: number): string {
@@ -175,6 +176,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   onRetry,
   onDismissError,
   readOnly = false,
+  retainComposerDuringContinuation = false,
 }, ref) {
   const agentWorking = isAgentWorking(convState);
   const canCancel = !readOnly && canCancelConversationState(convState);
@@ -814,7 +816,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       )}
 
       {annotationCards}
-      {convState.type === 'awaiting_continuation' ? (
+      {convState.type === 'awaiting_continuation' && (
         <div className="continuation-progress" role="status" aria-live="polite">
           <div className="continuation-progress-header">
             <span>Compacting conversation...</span>
@@ -825,7 +827,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           </div>
           <p className="continuation-progress-text">Phoenix is generating a continuation summary to preserve context for a new conversation.</p>
         </div>
-      ) : (
+      )}
+      {convState.type === 'awaiting_continuation' && !retainComposerDuringContinuation ? null : (
         <form
           className={`input-textarea-wrap${agentWorking ? ' input-textarea-wrap--working' : ''}`}
           onSubmit={(event) => {
