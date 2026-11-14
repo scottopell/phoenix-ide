@@ -215,6 +215,7 @@ impl ContinuationApplicationService {
         }
 
         if !automatic_intent {
+            let expansion_policy = continuation_expansion_policy(intent.opening_authority);
             self.runtime
                 .get_or_create(&successor.id)
                 .await
@@ -229,7 +230,7 @@ impl ContinuationApplicationService {
                         images: Vec::new(),
                         files: Vec::new(),
                         user_agent: intent.user_agent,
-                        expansion_policy: MessageExpansionPolicy::LiteralText,
+                        expansion_policy,
                     })
                     .await
                     .map_err(|error| error.to_string())?;
