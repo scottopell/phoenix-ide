@@ -1173,14 +1173,20 @@ async fn assert_production_initial_approval_inner(
                 .await
                 .unwrap();
             let (fresh_requests_tx, mut fresh_requests) = tokio::sync::mpsc::unbounded_channel();
-            let fresh_llm = Arc::new(InitialApprovalBarrierLlm {
+            let fresh_llm = Arc::new(NativeApprovalLlm {
                 requests: fresh_requests_tx,
                 calls: std::sync::atomic::AtomicUsize::new(0),
             });
-            let fresh = Arc::new(runtime_manager(
+            let fresh = Arc::new(RuntimeManager::new(
                 reopened.clone(),
-                phoenix_llm::ModelRegistry::for_test_with_sonnet(fresh_llm.clone()),
-                temp.path(),
+                Arc::new(phoenix_llm::ModelRegistry::for_test_with_sonnet(
+                    fresh_llm.clone(),
+                )),
+                crate::platform::PlatformCapability::None {
+                    details: "native initial approval reopened fixture".into(),
+                },
+                Arc::new(crate::tools::mcp::McpClientManager::new()),
+                None,
             ));
             // Retain teardown ownership before the first fallible assertion.
             harness.manager = Some(fresh.clone());
@@ -1217,10 +1223,16 @@ async fn assert_production_initial_approval_inner(
                 requests: fresh_requests_tx,
                 calls: std::sync::atomic::AtomicUsize::new(0),
             });
-            let fresh = Arc::new(runtime_manager(
+            let fresh = Arc::new(RuntimeManager::new(
                 reopened.clone(),
-                phoenix_llm::ModelRegistry::for_test_with_sonnet(fresh_llm.clone()),
-                temp.path(),
+                Arc::new(phoenix_llm::ModelRegistry::for_test_with_sonnet(
+                    fresh_llm.clone(),
+                )),
+                crate::platform::PlatformCapability::None {
+                    details: "native initial approval reopened fixture".into(),
+                },
+                Arc::new(crate::tools::mcp::McpClientManager::new()),
+                None,
             ));
             harness.manager = Some(fresh.clone());
             let broadcaster = fresh.conversation_broadcaster("actor-target").await;
