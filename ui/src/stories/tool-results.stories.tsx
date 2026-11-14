@@ -49,3 +49,6 @@ SubagentsFull.storyName = 'subagents-full';
 
 export const SubagentsCompact = storyFor('subagents-compact');
 SubagentsCompact.storyName = 'subagents-compact';
+
+export const MobileExpandedSpacing = storyFor('mobile-spacing-compact');
+MobileExpandedSpacing.storyName = 'mobile-spacing-compact';
