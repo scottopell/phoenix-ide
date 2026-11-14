@@ -2635,7 +2635,7 @@ function ConversationPageContent({
           onAnswered={() => dispatch({ type: 'local_phase_change', phase: { type: 'llm_requesting', attempt: 1 }, expectedConversationId: conversation.id })}
           onDismissed={() => dispatch({ type: 'local_phase_change', phase: { type: 'idle' }, expectedConversationId: conversation.id })}
         />
-      ) : (mutationEnabled || retainingPresentation) && ordinaryComposerEligible ? (
+      ) : (mutationEnabled || (presentationRetentionEnabled && aggregateLifecycleOpen)) && ordinaryComposerEligible ? (
         <>
         {credentialStatus && credentialStatus !== 'not_configured' && credentialStatus !== 'valid' && (
           <Suspense fallback={null}>

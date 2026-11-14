@@ -139,16 +139,13 @@ async fn existing_manual_successor_ignores_reserved_losing_request_identity() {
 
 #[tokio::test]
 async fn automatic_recovery_publishes_link_after_successor_was_reserved() {
-    use phoenix_core::domain::product_conversation::AutoContinueOnContextExhaustion;
+    use phoenix_core::domain::product_conversation::{
+        AutoContinueOnContextExhaustion, AutomaticContinuationPhase,
+    };
     use phoenix_core::domain::sm_state::ContinuationSummaryRequest;
-    use phoenix_db::AutomaticContinuationPhase;
 
     let f = Fixture::new().await;
-    let predecessor =
-        f.db.get_conversation(&f.predecessor)
-            .await
-            .unwrap()
-            .unwrap();
+    let predecessor = f.db.get_conversation(&f.predecessor).await.unwrap();
     f.db.set_auto_continue_on_context_exhaustion(
         &predecessor.product_conversation_id,
         AutoContinueOnContextExhaustion::Enabled,
@@ -230,7 +227,7 @@ async fn automatic_recovery_publishes_link_after_successor_was_reserved() {
 
     let mut links = Vec::new();
     while let Ok(event) = updates.try_recv() {
-        if let crate::runtime::SseEvent::ConversationUpdate(update) = event {
+        if let crate::runtime::SseEvent::ConversationUpdate { update } = event {
             links.extend(update.continued_in_conv_id);
         }
     }

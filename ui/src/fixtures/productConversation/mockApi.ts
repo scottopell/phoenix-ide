@@ -489,7 +489,10 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
             pending_events: [],
             pending_truncated: false,
           };
-          const deliver = () => callback(new MessageEvent('init', { data: JSON.stringify(init) }));
+          const deliver = () => {
+            callback(new MessageEvent('init', { data: JSON.stringify(init) }));
+            if (this.isTranscript) record('LastDeliveredInitMember', this.conversationId);
+          };
           if (holdSuccessorInit && this.conversationId === currentConversation.id && continuationPublished) heldSuccessorInits.push(deliver);
           else deliver();
         });
@@ -517,6 +520,19 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       record('ActiveTranscriptSubscriptions', [...eventSources].filter(source => source.isTranscript && source.subscriptionCount > 0).length);
     }
   }
+  let holdOpening = false;
+  const holdSuccessorOpening = () => { holdOpening = true; };
+  const acceptSuccessorOpening = () => {
+    if (!currentSnapshot || currentSnapshot.latest_opening.status !== 'pending') return;
+    const pending = currentSnapshot.latest_opening;
+    currentSnapshot = { ...currentSnapshot, latest_opening: {
+      status: 'accepted', edge: pending.edge, accepted_message_id: 'fixture-successor-opening',
+      opening_authority: pending.opening_authority, presentation: 'boundary',
+    } };
+    window.dispatchEvent(new Event('focus'));
+  };
+  window.addEventListener('product-conversation-fixture-hold-opening', holdSuccessorOpening);
+  window.addEventListener('product-conversation-fixture-accept-opening', acceptSuccessorOpening);
   const publishContinuation = () => {
     if (!scenario.continuationJourney || continuationPublished || !currentSnapshot) return;
     continuationPublished = true;
@@ -538,9 +554,14 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       canonical_route: scenario.kind === 'coordinator' ? `/global/${successorId}` : `/product-conversations/${currentSnapshot.product_conversation_id}`,
       boundaries: [...currentSnapshot.boundaries, { message_id: boundaryId, represented_successor_opening_message_id: null,
         predecessor_transcript_row_id: predecessorId, successor_transcript_row_id: successorId, segment_ordinal: last.segment_ordinal }],
-      segments: [...currentSnapshot.segments.slice(0, -1), predecessorSegment, successorSegment] };
+      segments: [...currentSnapshot.segments.slice(0, -1), predecessorSegment, successorSegment],
+      latest_opening: holdOpening ? {
+        status: 'pending', client_turn_key: 'fixture-successor-opening', opening_authority: 'generated_predecessor_context',
+        edge: { product_conversation_id: currentSnapshot.product_conversation_id,
+          predecessor_transcript_row_id: predecessorId, successor_transcript_row_id: successorId, continuation_message_id: boundaryId },
+      } : { status: 'none' } };
     predecessorConversation = { ...previous, continued_in_conv_id: successorId };
-    currentConversation = { ...previous, id: successorId, slug: successorId, continued_in_conv_id: null, message_count: 0 };
+    currentConversation = { ...previous, id: successorId, slug: successorId, state: { type: 'idle' }, continued_in_conv_id: null, message_count: 0 };
     route = { id: successorId, slug: successorId };
     currentMessages = [];
     record('ContinuationSnapshotPersisted', successorId);
@@ -603,6 +624,8 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     window.removeEventListener('product-conversation-fixture-stream-failure', failLatestEventSource);
     window.removeEventListener('product-conversation-fixture-acknowledge-last-send', acknowledgeLastSend);
     window.removeEventListener('product-conversation-fixture-continue', publishContinuation);
+    window.removeEventListener('product-conversation-fixture-hold-opening', holdSuccessorOpening);
+    window.removeEventListener('product-conversation-fixture-accept-opening', acceptSuccessorOpening);
     window.removeEventListener('product-conversation-fixture-phase', publishPhase);
     window.removeEventListener('product-conversation-fixture-successor-message', publishSuccessorMessage);
     api.getPrStatus = originalGetPrStatus;

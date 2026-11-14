@@ -83,15 +83,16 @@ describe('ProductConversationFixture', () => {
     expect(document.documentElement.dataset['sourceFixtureLocation']).toBe(route);
   });
 
-  it('keeps the embedded composer mounted while the successor atom is cold and until an upload completes', async () => {
+  it.each(['ordinary', 'coordinator'] as const)('keeps the %s composer through compaction, cold hydration, pending opening and upload completion', async kind => {
     vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(1000);
     vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ x: 0, y: 0, top: 0, left: 0, right: 390, bottom: 844, width: 390, height: 844, toJSON: () => ({}) });
-    render(<ProductConversationFixture scenario={makeMobileContinuationScenario('ordinary')} />);
+    render(<ProductConversationFixture scenario={makeMobileContinuationScenario(kind)} />);
     const textarea = await screen.findByPlaceholderText('Type a message...');
     await waitFor(() => expect(textarea).toBeEnabled());
     fireEvent.change(textarea, { target: { value: 'Keep this embedded draft' } });
     textarea.focus();
     act(() => {
+      window.dispatchEvent(new Event('product-conversation-fixture-hold-opening'));
       window.dispatchEvent(new Event('product-conversation-fixture-hold-successor'));
       window.dispatchEvent(new Event('product-conversation-fixture-hold-successor-readback'));
       window.dispatchEvent(new Event('product-conversation-fixture-hold-upload'));
@@ -101,13 +102,13 @@ describe('ProductConversationFixture', () => {
     });
     await waitFor(() => expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled());
     act(() => window.dispatchEvent(new CustomEvent('product-conversation-fixture-phase', { detail: { type: 'awaiting_continuation', attempt: 1 } })));
-    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Compacting conversation...'));
+    await screen.findByText('Compacting conversation...');
     expect(screen.getByPlaceholderText('Type a message...')).toBe(textarea);
     expect(textarea).toHaveValue('Keep this embedded draft');
     expect(textarea).toHaveFocus();
     expect(screen.queryByRole('button', { name: 'Send message' })).toBeNull();
     act(() => window.dispatchEvent(new CustomEvent('product-conversation-fixture-phase', { detail: { type: 'context_exhausted', summary: 'manual continuation' } })));
-    await waitFor(() => expect(screen.queryByRole('status')).toBeNull());
+    await waitFor(() => expect(screen.queryByText('Compacting conversation...')).toBeNull());
     expect(screen.getByPlaceholderText('Type a message...')).toBe(textarea);
     expect(textarea).toHaveValue('Keep this embedded draft');
     expect(textarea).toHaveFocus();
@@ -121,11 +122,19 @@ describe('ProductConversationFixture', () => {
 
     act(() => window.dispatchEvent(new Event('product-conversation-fixture-release-successor-readback')));
     act(() => window.dispatchEvent(new Event('product-conversation-fixture-release-successor')));
-    await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureActiveTranscriptSubscriptions']).toBe('1'));
+    await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureLastDeliveredInitMember']).toBe('fixture-successor'));
+    expect(document.documentElement.dataset['productConversationFixtureActiveTranscriptSubscriptions']).toBe('1');
     expect(screen.getByPlaceholderText('Type a message...')).toBe(textarea);
     expect(textarea).toHaveValue('Keep this embedded draft');
     expect(textarea).toHaveFocus();
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled());
+    await waitFor(() => expect(textarea).toHaveAttribute('readonly'));
+    fireEvent.submit(textarea.closest('form')!);
+    expect(document.documentElement.dataset['productConversationFixtureSendCount'] ?? '0').toBe('0');
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-accept-opening')));
+    await waitFor(() => expect(textarea).not.toHaveAttribute('readonly'));
+    expect(screen.getByPlaceholderText('Type a message...')).toBe(textarea);
+    expect(textarea).toHaveFocus();
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled();
     act(() => window.dispatchEvent(new Event('product-conversation-fixture-complete-upload')));
     await waitFor(() => expect(screen.getByRole('button', { name: 'Send message' })).toBeEnabled());
     expect(screen.getByPlaceholderText('Type a message...')).toBe(textarea);
