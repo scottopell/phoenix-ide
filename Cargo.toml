@@ -46,6 +46,8 @@ globset = "0.4"
 hex = "0.4"
 httpdate = "1.0.3"
 hyper-util = "0.1"
+# Pin to the unicode-rs IDNA backend; 1.2 switches to ICU4X (+16 crates).
+idna_adapter = "~1.1"
 if-addrs = "0.13"
 ignore = "0.4"
 libc = "0.2"

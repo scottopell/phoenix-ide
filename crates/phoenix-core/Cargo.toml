@@ -29,6 +29,9 @@ libc = { workspace = true }
 nono = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4"] }
 url = { workspace = true }
+# Version pin only (not referenced in code): selects url/idna's unicode-rs
+# backend instead of ICU4X. Full UTS 46 IDNA support either way.
+idna_adapter = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 rustls-pki-types = { workspace = true }
@@ -42,3 +45,6 @@ rcgen = { workspace = true, features = ["pem", "aws_lc_rs"] }
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["idna_adapter"]
