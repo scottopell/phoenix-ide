@@ -49,6 +49,16 @@ function pageHasSettled(root: HTMLElement, scenario: ProductConversationScenario
   if (scenario.initialEntry?.startsWith('/global/')) {
     return root.querySelector('.coordinator-conversation #chat-view .conversation-event-card') !== null;
   }
+  if (scenario.reminderFixture) {
+    const settled = document.documentElement.dataset['productConversationFixtureReminderState'];
+    if (settled !== 'loaded' && settled !== 'failed') return false;
+    if (settled === 'failed' && !root.querySelector('.reminders-fetch-status, .reminders-panel')) return false;
+    if (settled === 'loaded' && scenario.reminderFixture.reminders.length > 0 && !root.querySelector('.reminders-panel')) return false;
+  }
+  if (scenario.aliasFallbackNotFound) {
+    return root.querySelector('.conversation-alias-fallback #app .conversation-column #chat-view') !== null
+      && root.querySelector('#input-area') !== null;
+  }
   const page = root.querySelector('[data-testid="product-conversation-page"]');
   if (!page) return false;
   const hasConversation = page.querySelector('#chat-view') !== null;
@@ -106,6 +116,7 @@ function ProductConversationFixtureBody({ scenario }: Props) {
       ref={rootRef}
       data-product-conversation-fixture={scenario.id}
       {...(ready ? { 'data-product-conversation-fixture-ready': scenario.id } : {})}
+      {...(ready && scenario.reminderFixture ? { 'data-reminders-fixture-ready': scenario.id.slice('reminders-'.length) } : {})}
     >
       <FixtureRouter initialEntry={new URLSearchParams(window.location.search).get('fixtureEntry') ?? (scenario.initialEntry ?? (scenario.kind === 'coordinator' ? `/global/${scenario.snapshot.latest_transcript_row_id}${fixtureHash}` : `/product-conversations/fixture-product-conversation${fixtureHash}`))}>
         <FixtureLocation />
