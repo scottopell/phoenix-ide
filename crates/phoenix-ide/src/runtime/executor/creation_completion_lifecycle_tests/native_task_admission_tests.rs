@@ -653,6 +653,7 @@ enum InitialApprovalScenario {
     InitialProjectionFailure,
     FollowUpProjectionFailure,
     FileBackedInitialProjectionReplay,
+    FileBackedInitialProjectionRecovery,
 }
 
 struct InitialApprovalHarness {
@@ -779,6 +780,15 @@ async fn production_file_backed_initial_projection_failure_replays_after_reopen(
 }
 
 #[tokio::test]
+async fn production_file_backed_initial_projection_recovers_after_reopen() {
+    Box::pin(assert_production_initial_approval(
+        InitialApprovalScenario::FileBackedInitialProjectionRecovery,
+        ReviewedTaskKind::PlainMarkdown,
+    ))
+    .await;
+}
+
+#[tokio::test]
 async fn production_follow_up_postcommit_projection_failure_retains_receipt_and_fences() {
     Box::pin(assert_production_initial_approval(
         InitialApprovalScenario::FollowUpProjectionFailure,
@@ -888,7 +898,11 @@ async fn assert_production_initial_approval_inner(
         std::fs::write(worktree.join("unrelated-staged.txt"), "keep staged").unwrap();
         git(&worktree, &["add", "--", "unrelated-staged.txt"]);
     }
-    let db_path = if scenario == InitialApprovalScenario::FileBackedInitialProjectionReplay {
+    let db_path = if matches!(
+        scenario,
+        InitialApprovalScenario::FileBackedInitialProjectionReplay
+            | InitialApprovalScenario::FileBackedInitialProjectionRecovery
+    ) {
         Some(temp.path().join("admission.sqlite"))
     } else {
         None
@@ -993,7 +1007,8 @@ async fn assert_production_initial_approval_inner(
         | InitialApprovalScenario::FollowUpReceiptFailure
         | InitialApprovalScenario::InitialProjectionFailure
         | InitialApprovalScenario::FollowUpProjectionFailure
-        | InitialApprovalScenario::FileBackedInitialProjectionReplay => {
+        | InitialApprovalScenario::FileBackedInitialProjectionReplay
+        | InitialApprovalScenario::FileBackedInitialProjectionRecovery => {
             phoenix_llm::ModelRegistry::for_test_with_sonnet(llm.clone())
         }
     };
@@ -1012,6 +1027,7 @@ async fn assert_production_initial_approval_inner(
         InitialApprovalScenario::InitialProjectionFailure
             | InitialApprovalScenario::FollowUpProjectionFailure
             | InitialApprovalScenario::FileBackedInitialProjectionReplay
+            | InitialApprovalScenario::FileBackedInitialProjectionRecovery
     ) {
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -1149,8 +1165,7 @@ async fn assert_production_initial_approval_inner(
             }
         }
         if scenario == InitialApprovalScenario::FileBackedInitialProjectionReplay {
-            // A fresh manager and independently reopened storage handle must
-            // replay history without materializing an actor or dispatching the
+            // Replay history without materializing an actor or dispatching the
             // still-owed continuation. Recovery dispatch is a separate proof.
             manager.begin_process_shutdown();
             manager.drain_process_shutdown().await;
@@ -1187,6 +1202,151 @@ async fn assert_production_initial_approval_inner(
             assert_eq!(reopened_owed, owed_message);
             assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), committed_head);
             assert_eq!(fresh_llm.calls.load(Ordering::SeqCst), 0);
+            assert!(matches!(
+                fresh_requests.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+        } else if scenario == InitialApprovalScenario::FileBackedInitialProjectionRecovery {
+            manager.begin_process_shutdown();
+            manager.drain_process_shutdown().await;
+            let reopened = Database::open(f.db_path.as_ref().unwrap().to_str().unwrap())
+                .await
+                .unwrap();
+            let (fresh_requests_tx, mut fresh_requests) = tokio::sync::mpsc::unbounded_channel();
+            let fresh_llm = Arc::new(NativeApprovalLlm {
+                requests: fresh_requests_tx,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let fresh = Arc::new(runtime_manager(
+                reopened.clone(),
+                phoenix_llm::ModelRegistry::for_test_with_sonnet(fresh_llm.clone()),
+                temp.path(),
+            ));
+            harness.manager = Some(fresh.clone());
+            let broadcaster = fresh.conversation_broadcaster("actor-target").await;
+            let mut recovered_events = broadcaster.subscribe();
+            let recovered_handle = fresh.get_or_create(&f.target).await.unwrap();
+            harness.handle = Some(recovered_handle.clone());
+            let request =
+                tokio::time::timeout(std::time::Duration::from_secs(10), fresh_requests.recv())
+                    .await
+                    .expect("recovery must enter the actual provider")
+                    .expect("actual recovered LlmRequest");
+            assert_eq!(fresh_llm.calls.load(Ordering::SeqCst), 1);
+            let approval_context_count = request
+                .messages
+                .iter()
+                .filter(|message| {
+                    message.source_message_id.as_deref()
+                        == Some(receipt.approval_message_id.as_str())
+                })
+                .count();
+            assert_eq!(approval_context_count, 1);
+            let submitted_approval = request
+                .messages
+                .iter()
+                .find(|message| {
+                    message.source_message_id.as_deref()
+                        == Some(receipt.approval_message_id.as_str())
+                })
+                .expect("recovered request includes committed approval context");
+            assert_eq!(submitted_approval.role, phoenix_llm::MessageRole::User);
+            assert!(submitted_approval.content.iter().any(|block| {
+                matches!(block, ContentBlock::Text { text }
+                    if text.contains("Task approved.") && text.contains(BODY))
+            }));
+
+            let mut recovered_reply_id = None;
+            loop {
+                match recovered_events
+                    .recv()
+                    .await
+                    .expect("recovered terminal production SSE signal")
+                {
+                    SseEvent::Message { message, .. }
+                        if matches!(&message.content, MessageContent::Agent(blocks)
+                            if blocks.iter().any(|block| matches!(block,
+                                ContentBlock::Text { text } if text == NATIVE_APPROVAL_REPLY))) =>
+                    {
+                        assert!(recovered_reply_id.replace(message.message_id).is_none());
+                    }
+                    SseEvent::AgentDone { .. } => break,
+                    SseEvent::Init { .. }
+                    | SseEvent::Message { .. }
+                    | SseEvent::MessageUpdated { .. }
+                    | SseEvent::StateChange { .. }
+                    | SseEvent::Token { .. }
+                    | SseEvent::LlmFirstByte { .. }
+                    | SseEvent::LlmAttempt { .. }
+                    | SseEvent::ConversationBecameTerminal { .. }
+                    | SseEvent::ConversationUpdate { .. }
+                    | SseEvent::Error { .. }
+                    | SseEvent::ConversationHardDeleted { .. }
+                    | SseEvent::BrowserSessionState { .. }
+                    | SseEvent::BashToolProgress { .. }
+                    | SseEvent::SteerMessageQueued { .. }
+                    | SseEvent::SteerMessageCancelled { .. }
+                    | SseEvent::RateLimitSnapshot { .. }
+                    | SseEvent::WorkScopeUpdate { .. } => {}
+                }
+            }
+            assert_eq!(
+                reopened
+                    .get_conversation("actor-target")
+                    .await
+                    .unwrap()
+                    .state,
+                ConvState::Idle,
+                "AgentDone follows durable terminal settlement"
+            );
+            let messages = reopened.get_messages("actor-target").await.unwrap();
+            let approval_count = messages
+                .iter()
+                .filter(|message| message.message_id == receipt.approval_message_id)
+                .count();
+            assert_eq!(approval_count, 1);
+            let replies: Vec<_> = messages
+                .iter()
+                .filter(|message| {
+                    matches!(&message.content, MessageContent::Agent(blocks)
+                    if blocks.iter().any(|block| matches!(block,
+                        ContentBlock::Text { text } if text == NATIVE_APPROVAL_REPLY)))
+                })
+                .collect();
+            assert_eq!(replies.len(), 1);
+            assert_eq!(replies[0].message_id, recovered_reply_id.unwrap());
+            let owed: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM approval_request_obligations WHERE conversation_id = ?1",
+            )
+            .bind("actor-target")
+            .fetch_one(reopened.pool())
+            .await
+            .unwrap();
+            assert_eq!(owed, 0, "terminal response consumes approval obligation");
+            assert_eq!(
+                reopened
+                    .inspect_native_task_approval_command(&command)
+                    .await
+                    .unwrap(),
+                NativeTaskApprovalInspection::Replay(receipt.clone())
+            );
+            let receipt_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM native_task_approval_receipts")
+                    .fetch_one(reopened.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(receipt_count, 1);
+            assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), committed_head);
+            assert_eq!(fresh_llm.calls.load(Ordering::SeqCst), 1);
+            assert!(matches!(
+                fresh_requests.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+            assert_eq!(
+                fresh.execute_native_task_approval(command.clone()).await,
+                NativeTaskApprovalOutcome::Committed(receipt.clone())
+            );
+            assert_eq!(fresh_llm.calls.load(Ordering::SeqCst), 1);
             assert!(matches!(
                 fresh_requests.try_recv(),
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty)
@@ -1807,7 +1967,8 @@ async fn assert_production_initial_approval_inner(
         | InitialApprovalScenario::FollowUpReceiptFailure
         | InitialApprovalScenario::InitialProjectionFailure
         | InitialApprovalScenario::FollowUpProjectionFailure
-        | InitialApprovalScenario::FileBackedInitialProjectionReplay => 0,
+        | InitialApprovalScenario::FileBackedInitialProjectionReplay
+        | InitialApprovalScenario::FileBackedInitialProjectionRecovery => 0,
     };
     assert_eq!(llm.calls.load(Ordering::SeqCst), expected_calls);
     assert!(requests.try_recv().is_err(), "no additional provider entry");
