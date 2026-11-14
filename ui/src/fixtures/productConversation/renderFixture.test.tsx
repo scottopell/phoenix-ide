@@ -78,7 +78,14 @@ describe('ProductConversationFixture', () => {
     await screen.findByText('Successor is streaming after the handoff.');
     expect(screen.getByPlaceholderText('Type a message...')).toHaveValue('Unsent mobile draft');
     act(() => window.dispatchEvent(new Event('product-conversation-fixture-stream-failure')));
-    await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureEventSourceInits']).toBe('3'));
+    const failedInstance = Number(document.documentElement.dataset['productConversationFixtureFailedTranscriptInstance']);
+    await waitFor(() => {
+      expect(Number(document.documentElement.dataset['productConversationFixtureLastDeliveredInitInstance'])).toBeGreaterThan(failedInstance);
+      expect(document.documentElement.dataset['productConversationFixtureLastDeliveredInitMember']).toBe('fixture-successor');
+    }, { timeout: 10_000 });
+    expect(document.documentElement.dataset['productConversationFixtureActiveTranscriptSubscriptions']).toBe('1');
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-successor-message')));
+    await screen.findByText('Successor is streaming after reconnect.');
     expect(screen.getAllByText('Successor is streaming after the handoff.')).toHaveLength(1);
     expect(document.documentElement.dataset['sourceFixtureLocation']).toBe(route);
   });
@@ -129,12 +136,12 @@ describe('ProductConversationFixture', () => {
     expect(textarea).toHaveValue('Keep this embedded draft');
     expect(textarea).toHaveFocus();
     expect([textarea.selectionStart, textarea.selectionEnd]).toEqual([5, 9]);
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled());
+    expect(screen.queryByRole('button', { name: 'Send message' })).toBeNull();
     fireEvent.submit(textarea.closest('form')!);
     expect(document.documentElement.dataset['productConversationFixtureSendCount'] ?? '0').toBe('0');
     act(() => window.dispatchEvent(new Event('product-conversation-fixture-complete-upload')));
     await screen.findByText('notes.txt');
-    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: 'Send message' })).toBeNull();
     fireEvent.submit(textarea.closest('form')!);
     expect(document.documentElement.dataset['productConversationFixtureSendCount'] ?? '0').toBe('0');
     act(() => window.dispatchEvent(new Event('product-conversation-fixture-accept-opening')));
@@ -219,9 +226,11 @@ describe('ProductConversationFixture', () => {
     vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(1000);
     vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ x: 0, y: 0, top: 0, left: 0, right: 960, bottom: 1000, width: 960, height: 1000, toJSON: () => ({}) });
     render(<ProductConversationFixture scenario={getProductConversationScenario(id)} />);
-    const sourceLink = await screen.findByRole('link', { name: /transcript ID source-member · source call$/ });
+    const sourceLinks = await screen.findAllByRole('link', { name: /transcript ID source-member · source call$/ });
+    const sourceLink = sourceLinks.find(link => link.closest('#message-received-send'));
+    expect(sourceLink).toBeDefined();
     const exactTranscript = vi.spyOn(api, 'getConversation');
-    fireEvent.click(sourceLink);
+    fireEvent.click(sourceLink!);
     const sourceRoute = id === 'source-call-global' ? '/global' : '/c/source-member';
     await waitFor(() => expect(document.documentElement.dataset['sourceFixtureLocation']).toBe(
       `${sourceRoute}?source_transcript=source-member&source_tool=source-send-call#message-source-assistant`,

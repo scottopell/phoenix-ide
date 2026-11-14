@@ -499,7 +499,10 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
           };
           const deliver = () => {
             callback(new MessageEvent('init', { data: JSON.stringify(init) }));
-            if (this.isTranscript) record('LastDeliveredInitMember', this.conversationId);
+            if (this.isTranscript) {
+              record('LastDeliveredInitMember', this.conversationId);
+              record('LastDeliveredInitInstance', this.instanceId);
+            }
           };
           if (holdSuccessorInit && this.conversationId === currentConversation.id && continuationPublished) heldSuccessorInits.push(deliver);
           else deliver();
@@ -592,24 +595,31 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     });
   };
   window.addEventListener('product-conversation-fixture-phase', publishPhase);
+  let successorMessageCount = 0;
   const publishSuccessorMessage = () => {
     if (!scenario.continuationJourney || !continuationPublished) return;
     const successor = [...eventSources].find(source => source.memberId === currentConversation.id && source.readyState === FixtureEventSource.OPEN && source.subscriptionCount > 0);
     if (!successor) throw new Error('Successor SSE has not opened');
+    successorMessageCount += 1;
     const message: Message = {
-      message_id: 'fixture-successor-message', conversation_id: currentConversation.id,
+      message_id: `fixture-successor-message-${successorMessageCount}`, conversation_id: currentConversation.id,
       sequence_id: successor.nextSequenceId(), message_type: 'agent', origin: { kind: 'unknown_historical' },
-      content: [{ type: 'text', text: 'Successor is streaming after the handoff.' }],
+      content: [{ type: 'text', text: successorMessageCount === 1 ? 'Successor is streaming after the handoff.' : 'Successor is streaming after reconnect.' }],
       display_data: null, usage_data: null, event_presentation: null, created_at: '2026-07-01T12:01:00Z',
     };
-    currentMessages = [message];
+    currentMessages = [...currentMessages, message];
     successor.emit('message', { opening: null, sequence_id: message.sequence_id, message });
     record('SuccessorMessageInstance', successor.id);
   };
   window.addEventListener('product-conversation-fixture-successor-message', publishSuccessorMessage);
 
   globalThis.EventSource = FixtureEventSource as unknown as typeof EventSource;
-  const failLatestEventSource = () => latestEventSource?.triggerNativeError();
+  const failLatestEventSource = () => {
+    const stream = [...eventSources].find(source => source.memberId === currentConversation.id && source.readyState === FixtureEventSource.OPEN && source.subscriptionCount > 0);
+    if (!stream) throw new Error('Current transcript SSE has not opened');
+    record('FailedTranscriptInstance', stream.id);
+    stream.triggerNativeError();
+  };
   const acknowledgeLastSend = () => { if (lastSubmittedMessage) latestEventSource?.emitMessage(lastSubmittedMessage); };
   window.addEventListener('product-conversation-fixture-acknowledge-last-send', acknowledgeLastSend);
   window.addEventListener('product-conversation-fixture-stream-failure', failLatestEventSource);
