@@ -42,9 +42,26 @@
     },
     {
       "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "CloseCompletionOnlyFinalizationReady",
+      "listening_rules": [
+        "CompletionOnlyReadyCannotSilentlyLoseAuthorityOrPositiveProof",
+        "CompletionOnlyRunFinalizesWithoutRedispatchingEffects"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "CloseCompletionOnlyRunAdmitted",
+      "listening_rules": [
+        "LiveCompletionOnlyAdmissionDrivesOneObservation"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
       "trigger": "CloseSafeRetryRequested",
       "listening_rules": [
+        "ExactExplicitRetryDuplicateObservesRetainedSuccessor",
         "ExplicitSafeRetryCreatesFreshRunUnderOriginalCloseAuthority",
+        "GenericRetryIngressCannotAdmitNativeManagedOperation",
         "UnsafeRetryRequiresConcreteProposal"
       ]
     },
@@ -100,6 +117,14 @@
     },
     {
       "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "ExactCloseRetryPlanAdmitted",
+      "listening_rules": [
+        "ExactNativeRetryAuthorityLostBeforeDispatchStopsItsRun",
+        "ExactNativeRetryDispatchesItsPersistedPlan"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
       "trigger": "GraceTurnExhausted",
       "listening_rules": [
         "SubAgentTurnLimitHardStop"
@@ -148,6 +173,13 @@
     },
     {
       "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "NativeCloseAdmissionTransactionLostRace",
+      "listening_rules": [
+        "NativeCloseAdmissionRaceReentersAuthorizedRetainedDecision"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
       "trigger": "OverloadRetryDeadlineExpires",
       "listening_rules": [
         "OverloadRecoveryDeadlineExpires"
@@ -165,6 +197,7 @@
       "trigger": "PhoenixStartupObservedCloseRun",
       "listening_rules": [
         "ReadOnlyObservationConfirmsStoppedConversationShutdown",
+        "StartupDoesNotDispatchRearmOrRefundCompletionRetry",
         "StartupObservesInterruptedCloseWithoutRecovery",
         "StartupReobservesStoppedCloseWithoutDuplicateFailure"
       ]

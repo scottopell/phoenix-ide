@@ -2732,18 +2732,18 @@ rule CloseObligationCanBeCancelledBeforeSettlementStarts {
                 allowance.suppressed = true
         for admission in unfinished_automatic:
             admission.successor.status = stopped
-            let failure = CloseRunFailure.created(run: admission.successor, failed_step: "completion_only", reason: "completion_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
+            let automatic_failure = CloseRunFailure.created(run: admission.successor, failed_step: "completion_only", reason: "completion_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
             for evidence in exact_failed_resource_evidence(admission.successor):
-                CloseResourceFailure.created(failure: failure, resource_identity: evidence.resource_identity, scope_identity: evidence.scope_identity, reason: evidence.reason)
-            CloseFailureGlobalDelivery.created(failure: failure, status: pending)
+                CloseResourceFailure.created(failure: automatic_failure, resource_identity: evidence.resource_identity, scope_identity: evidence.scope_identity, reason: evidence.reason)
+            CloseFailureGlobalDelivery.created(failure: automatic_failure, status: pending)
             AllFurtherCloseEffectAuthorityRevoked(admission.successor)
             CloseFailureRecorded(obligation.product_conversation, obligation.attempt_id, admission.successor.ordinal)
         for admission in unfinished_explicit:
             admission.successor.status = stopped
-            let failure = CloseRunFailure.created(run: admission.successor, failed_step: "exact_retry", reason: "source_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
+            let explicit_failure = CloseRunFailure.created(run: admission.successor, failed_step: "exact_retry", reason: "source_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
             for evidence in exact_failed_resource_evidence(admission.successor):
-                CloseResourceFailure.created(failure: failure, resource_identity: evidence.resource_identity, scope_identity: evidence.scope_identity, reason: evidence.reason)
-            CloseFailureGlobalDelivery.created(failure: failure, status: pending)
+                CloseResourceFailure.created(failure: explicit_failure, resource_identity: evidence.resource_identity, scope_identity: evidence.scope_identity, reason: evidence.reason)
+            CloseFailureGlobalDelivery.created(failure: explicit_failure, status: pending)
             AllFurtherCloseEffectAuthorityRevoked(admission.successor)
             CloseFailureRecorded(obligation.product_conversation, obligation.attempt_id, admission.successor.ordinal)
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = completed
@@ -2771,18 +2771,18 @@ rule CloseObligationQueuesCancellationDuringSettlement {
                 allowance.suppressed = true
         for admission in unfinished_automatic:
             admission.successor.status = stopped
-            let failure = CloseRunFailure.created(run: admission.successor, failed_step: "completion_only", reason: "completion_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
+            let automatic_failure = CloseRunFailure.created(run: admission.successor, failed_step: "completion_only", reason: "completion_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
             for evidence in exact_failed_resource_evidence(admission.successor):
-                CloseResourceFailure.created(failure: failure, resource_identity: evidence.resource_identity, scope_identity: evidence.scope_identity, reason: evidence.reason)
-            CloseFailureGlobalDelivery.created(failure: failure, status: pending)
+                CloseResourceFailure.created(failure: automatic_failure, resource_identity: evidence.resource_identity, scope_identity: evidence.scope_identity, reason: evidence.reason)
+            CloseFailureGlobalDelivery.created(failure: automatic_failure, status: pending)
             AllFurtherCloseEffectAuthorityRevoked(admission.successor)
             CloseFailureRecorded(obligation.product_conversation, obligation.attempt_id, admission.successor.ordinal)
         for admission in unfinished_explicit:
             admission.successor.status = stopped
-            let failure = CloseRunFailure.created(run: admission.successor, failed_step: "exact_retry", reason: "source_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
+            let explicit_failure = CloseRunFailure.created(run: admission.successor, failed_step: "exact_retry", reason: "source_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
             for evidence in exact_failed_resource_evidence(admission.successor):
-                CloseResourceFailure.created(failure: failure, resource_identity: evidence.resource_identity, scope_identity: evidence.scope_identity, reason: evidence.reason)
-            CloseFailureGlobalDelivery.created(failure: failure, status: pending)
+                CloseResourceFailure.created(failure: explicit_failure, resource_identity: evidence.resource_identity, scope_identity: evidence.scope_identity, reason: evidence.reason)
+            CloseFailureGlobalDelivery.created(failure: explicit_failure, status: pending)
             AllFurtherCloseEffectAuthorityRevoked(admission.successor)
             CloseFailureRecorded(obligation.product_conversation, obligation.attempt_id, admission.successor.ordinal)
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = cancel_requested_during_settlement
@@ -2819,18 +2819,18 @@ rule ExactRetainedCloseCancellationDoesNotRearmOrReopenHistory {
                 allowance.suppressed = true
         for admission in unfinished_automatic:
             admission.successor.status = stopped
-            let failure = CloseRunFailure.created(run: admission.successor, failed_step: "completion_only", reason: "completion_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
+            let automatic_failure = CloseRunFailure.created(run: admission.successor, failed_step: "completion_only", reason: "completion_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
             for evidence in exact_failed_resource_evidence(admission.successor):
-                CloseResourceFailure.created(failure: failure, resource_identity: evidence.resource_identity, scope_identity: evidence.scope_identity, reason: evidence.reason)
-            CloseFailureGlobalDelivery.created(failure: failure, status: pending)
+                CloseResourceFailure.created(failure: automatic_failure, resource_identity: evidence.resource_identity, scope_identity: evidence.scope_identity, reason: evidence.reason)
+            CloseFailureGlobalDelivery.created(failure: automatic_failure, status: pending)
             AllFurtherCloseEffectAuthorityRevoked(admission.successor)
             CloseFailureRecorded(obligation.product_conversation, obligation.attempt_id, admission.successor.ordinal)
         for admission in unfinished_explicit:
             admission.successor.status = stopped
-            let failure = CloseRunFailure.created(run: admission.successor, failed_step: "exact_retry", reason: "source_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
+            let explicit_failure = CloseRunFailure.created(run: admission.successor, failed_step: "exact_retry", reason: "source_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
             for evidence in exact_failed_resource_evidence(admission.successor):
-                CloseResourceFailure.created(failure: failure, resource_identity: evidence.resource_identity, scope_identity: evidence.scope_identity, reason: evidence.reason)
-            CloseFailureGlobalDelivery.created(failure: failure, status: pending)
+                CloseResourceFailure.created(failure: explicit_failure, resource_identity: evidence.resource_identity, scope_identity: evidence.scope_identity, reason: evidence.reason)
+            CloseFailureGlobalDelivery.created(failure: explicit_failure, status: pending)
             AllFurtherCloseEffectAuthorityRevoked(admission.successor)
             CloseFailureRecorded(obligation.product_conversation, obligation.attempt_id, admission.successor.ordinal)
     ensures: obligation.phase = completed
@@ -3356,9 +3356,9 @@ rule NativeExplicitRetryAdmitsSuccessorAndReceiptAtomically {
             let admission = CloseExplicitRetryAdmission.created(failed_run: failed_run, successor: successor, plan: persisted_plan, source_identity: source_identity(source), callback_token: live_close_callback_token(source), process_epoch: live_close_process_epoch(source))
             ExactCloseRetryPlanAdmitted(admission)
         else if safety_evidence.plan.kind = CloseVerifiedCompletionPlan:
-            let persisted_plan = CloseVerifiedCompletionPlan.created(failed_run: failed_run, verified_predecessor: safety_evidence.plan.verified_predecessor)
-            let admission = CloseExplicitRetryAdmission.created(failed_run: failed_run, successor: successor, plan: persisted_plan, source_identity: source_identity(source), callback_token: live_close_callback_token(source), process_epoch: live_close_process_epoch(source))
-            ExactCloseRetryPlanAdmitted(admission)
+            let verified_plan = CloseVerifiedCompletionPlan.created(failed_run: failed_run, verified_predecessor: safety_evidence.plan.verified_predecessor)
+            let verified_admission = CloseExplicitRetryAdmission.created(failed_run: failed_run, successor: successor, plan: verified_plan, source_identity: source_identity(source), callback_token: live_close_callback_token(source), process_epoch: live_close_process_epoch(source))
+            ExactCloseRetryPlanAdmitted(verified_admission)
         obligation.native_managed = true
         CloseRequestReceipt.created(request_id: request_id, request_fingerprint: request_fingerprint, source_identity: source_identity(source), obligation: obligation, admitted_run: successor)
         ActualAdmittedCloseRunIdentityReturned(successor)
@@ -3591,18 +3591,18 @@ rule StopPauseOrCancelSuppressesPendingCompletionRetry {
                 allowance.suppressed = true
         for admission in unfinished_automatic:
             admission.successor.status = stopped
-            let failure = CloseRunFailure.created(run: admission.successor, failed_step: "completion_only", reason: "completion_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
+            let automatic_failure = CloseRunFailure.created(run: admission.successor, failed_step: "completion_only", reason: "completion_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
             for evidence in exact_failed_resource_evidence(admission.successor):
-                CloseResourceFailure.created(failure: failure, resource_identity: evidence.resource_identity, scope_identity: evidence.scope_identity, reason: evidence.reason)
-            CloseFailureGlobalDelivery.created(failure: failure, status: pending)
+                CloseResourceFailure.created(failure: automatic_failure, resource_identity: evidence.resource_identity, scope_identity: evidence.scope_identity, reason: evidence.reason)
+            CloseFailureGlobalDelivery.created(failure: automatic_failure, status: pending)
             AllFurtherCloseEffectAuthorityRevoked(admission.successor)
             CloseFailureRecorded(obligation.product_conversation, obligation.attempt_id, admission.successor.ordinal)
         for admission in unfinished_explicit:
             admission.successor.status = stopped
-            let failure = CloseRunFailure.created(run: admission.successor, failed_step: "exact_retry", reason: "source_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
+            let explicit_failure = CloseRunFailure.created(run: admission.successor, failed_step: "exact_retry", reason: "source_fenced", authority_kind: explicitly_suppressed, shutdown: observed_close_shutdown(admission.successor), residual_evidence: observed_close_residuals(admission.successor))
             for evidence in exact_failed_resource_evidence(admission.successor):
-                CloseResourceFailure.created(failure: failure, resource_identity: evidence.resource_identity, scope_identity: evidence.scope_identity, reason: evidence.reason)
-            CloseFailureGlobalDelivery.created(failure: failure, status: pending)
+                CloseResourceFailure.created(failure: explicit_failure, resource_identity: evidence.resource_identity, scope_identity: evidence.scope_identity, reason: evidence.reason)
+            CloseFailureGlobalDelivery.created(failure: explicit_failure, status: pending)
             AllFurtherCloseEffectAuthorityRevoked(admission.successor)
             CloseFailureRecorded(obligation.product_conversation, obligation.attempt_id, admission.successor.ordinal)
 
