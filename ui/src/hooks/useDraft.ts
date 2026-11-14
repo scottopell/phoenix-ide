@@ -162,13 +162,14 @@ export function useDraftLifecycle(slug: string, productScope?: { legacyTranscrip
   const conversationId = productScope ? slug : transcriptId;
   const isProductScope = productScope !== undefined;
   const store = useDraftStore();
+  const lifetime = useMemo(() => store.recovery(slug), [store, slug]);
 
   // Hydrate once per conversationId. `useLayoutEffect` runs after render
   // but before browser paint, so the first frame already reflects the
   // stored draft.
   const hydratedForRef = useRef<string | null>(null);
   useLayoutEffect(() => {
-    if (!conversationId || (productScope && !transcriptId)) return;
+    if (!lifetime.isCurrent() || !conversationId || (productScope && !transcriptId)) return;
     if (hydratedForRef.current === conversationId) return;
     hydratedForRef.current = conversationId;
     if (draft) return;
@@ -178,7 +179,7 @@ export function useDraftLifecycle(slug: string, productScope?: { legacyTranscrip
     if (stored) {
       store.dispatch(slug, { type: 'set_draft', text: stored });
     }
-  }, [conversationId, draft, productScope, slug, store, transcriptId]);
+  }, [conversationId, draft, lifetime, productScope, slug, store, transcriptId]);
 
   // Debounced write-through. On a conversationId change with a pending
   // write for the prior conversation, flush it synchronously before
@@ -187,33 +188,35 @@ export function useDraftLifecycle(slug: string, productScope?: { legacyTranscrip
   const pendingRef = useRef<{
     timer: number | null;
     conversationId: string | null;
-    value: string | null;
-  }>({ timer: null, conversationId: null, value: null });
+    flush: (() => void) | null;
+  }>({ timer: null, conversationId: null, flush: null });
 
   useEffect(() => {
-    if (!conversationId) return;
+    if (!lifetime.isCurrent() || !conversationId) return;
     if (hydratedForRef.current !== conversationId) return;
     const pending = pendingRef.current;
     if (pending.timer !== null) {
       window.clearTimeout(pending.timer);
       if (
         pending.conversationId !== null &&
-        pending.conversationId !== conversationId &&
-        pending.value !== null
+        pending.conversationId !== conversationId
       ) {
-        if (isProductScope) writeProductDraft(pending.conversationId, pending.value);
-        else writeDraft(pending.conversationId, pending.value);
+        pending.flush?.();
       }
     }
     const currentDraft = store.getSnapshot(slug).draft;
     pending.conversationId = conversationId;
-    pending.value = currentDraft;
-    pending.timer = window.setTimeout(() => {
+    const flush = () => {
+      if (!lifetime.isCurrent()) return;
       if (isProductScope) writeProductDraft(conversationId, currentDraft);
       else writeDraft(conversationId, currentDraft);
+    };
+    pending.flush = flush;
+    pending.timer = window.setTimeout(() => {
+      flush();
       pending.timer = null;
     }, DEBOUNCE_MS);
-  }, [conversationId, draft, isProductScope, slug, store]);
+  }, [conversationId, draft, isProductScope, lifetime, slug, store]);
 
   // Flush any pending write on unmount (page close, navigation away).
   useEffect(() => {
@@ -222,13 +225,10 @@ export function useDraftLifecycle(slug: string, productScope?: { legacyTranscrip
       if (pending.timer !== null) {
         window.clearTimeout(pending.timer);
         pending.timer = null;
-        if (pending.conversationId !== null && pending.value !== null) {
-          if (isProductScope) writeProductDraft(pending.conversationId, pending.value);
-          else writeDraft(pending.conversationId, pending.value);
-        }
+        pending.flush?.();
       }
     };
-  }, [isProductScope]);
+  }, []);
 }
 
 /** Hosts {@link useDraftLifecycle} in isolation so the keystroke-frequency
