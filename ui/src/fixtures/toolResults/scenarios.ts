@@ -560,10 +560,10 @@ const mobileSpacingMessages: Message[] = [
     type: 'tool_use',
     id: 'mobile-next-read',
     name: 'read_automatic_continuation',
-    input: { continuation_id: 'fixture-continuation', reason: 'continue after send_conversation_message' },
+    input: { target: { kind: 'ordinary', product_conversation_id: 'fixture-review' } },
   }]),
-  toolMessage(7, 'mobile-next-read', 'Continuation read successfully; no additional user input is required.', { display_data: { duration_ms: 18 } }),
-  agentMessage(8, [{ type: 'text', text: 'Automatic continuation completed. The review message was sent and its follow-up was read.' }]),
+  toolMessage(7, 'mobile-next-read', JSON.stringify({ aggregate: { kind: 'ordinary', product_conversation_id: 'fixture-review' }, enabled: true, revision: 2, updated_at: '2026-02-01T10:03:00Z' }), { display_data: { duration_ms: 18 } }),
+  agentMessage(8, [{ type: 'text', text: 'The review message was sent and its automatic-continuation preference was read.' }]),
 ];
 
 export const toolResultsScenarios = [
