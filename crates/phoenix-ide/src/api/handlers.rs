@@ -10203,6 +10203,7 @@ mod conversation_cwd_validation_tests {
 
     #[tokio::test]
     async fn continuation_attachments_allow_predecessor_and_reject_foreign_paths() {
+        use crate::api::types::FileAttachment;
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("attachments");
         let predecessor = root.join("predecessor");
@@ -10252,6 +10253,7 @@ mod conversation_cwd_validation_tests {
 
     #[tokio::test]
     async fn continuation_attachment_authorization_uses_persisted_chain_prefix() {
+        use crate::api::types::FileAttachment;
         let db = crate::db::Database::open_in_memory().await.unwrap();
         for id in ["root", "unrelated"] {
             db.create_conversation(id, id, "/tmp", true, None, None)
