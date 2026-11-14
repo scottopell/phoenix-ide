@@ -695,7 +695,7 @@ describe('inline tool timers', () => {
     expect(document.querySelectorAll('.compact-tool-owner-copy .message-mobile-copy')).toHaveLength(1);
     expect(document.querySelectorAll('.compact-tool-selected-detail .message-mobile-copy')).toHaveLength(1);
     expect(document.querySelectorAll('.compact-tool-selected-detail .assistant-message-toolbar')).toHaveLength(0);
-    expect(screen.getByRole('button', { name: 'Copy to clipboard' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Copy command' })).toBeInTheDocument();
   });
 
   it('keeps continuation chrome controls on ordinary messages, not inside expanded compact detail', () => {
