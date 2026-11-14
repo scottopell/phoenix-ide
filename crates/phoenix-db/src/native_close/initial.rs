@@ -63,6 +63,7 @@ impl Database {
     }
 }
 
+#[allow(clippy::too_many_lines)] // Source-before-replay and initial capture share one transaction.
 async fn apply_initial_tx(
     tx: &mut Transaction<'_, Sqlite>,
     command: &NativeCloseCommand,
@@ -84,7 +85,9 @@ async fn apply_initial_tx(
         "close_conversation",
         &input,
     )
-    .map_err(|_| DbError::InvalidData("Close requires its current executing source".into()))?;
+    .map_err(|_| {
+        DbError::CloseFoundationPrecondition("Close requires its current executing source".into())
+    })?;
     let ordinary: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM product_conversations WHERE id = ?1 AND kind = 'ordinary')",
     )
@@ -92,7 +95,7 @@ async fn apply_initial_tx(
     .fetch_one(&mut **tx)
     .await?;
     if !ordinary {
-        return Err(DbError::InvalidData(
+        return Err(DbError::CloseFoundationPrecondition(
             "Close requires an ordinary target".into(),
         ));
     }
@@ -116,7 +119,9 @@ async fn apply_initial_tx(
             || fingerprint != command.fingerprint()
             || retained_target != target.as_str()
         {
-            return Err(DbError::InvalidData("Close request identity conflict".into()));
+            return Err(DbError::CloseFoundationConflict(
+                "Close request identity conflict".into(),
+            ));
         }
         return Ok(NativeCloseInitialResult::Replay(NativeCloseReceipt {
             request_id: command.request_id(),
@@ -141,10 +146,12 @@ async fn apply_initial_tx(
     }
     let topology = crate::close_foundation::read_topology_tx(tx, target)
         .await?
-        .ok_or_else(|| DbError::InvalidData("Close target has no retained topology".into()))?;
+        .ok_or_else(|| {
+            DbError::CloseFoundationPrecondition("Close target has no retained topology".into())
+        })?;
     // Allocate only after source, exact replay, existing operation and topology checks.
     let latest = TranscriptConversationId::parse(topology.latest.id)
-        .map_err(|error| DbError::InvalidData(error.to_string()))?;
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
     let attempt_id = Uuid::new_v4().to_string();
     let obligation = Database::begin_close_foundation_inner(
         tx,
@@ -163,7 +170,7 @@ async fn apply_initial_tx(
     .execute(&mut **tx)
     .await?;
     if marked.rows_affected() != 1 {
-        return Err(DbError::InvalidData(
+        return Err(DbError::CloseFoundationPrecondition(
             "Close native operation binding disappeared".into(),
         ));
     }
@@ -197,11 +204,11 @@ fn decode_run_ref(row: &sqlx::sqlite::SqliteRow) -> DbResult<NativeCloseRunRef> 
     let attempt: String = row.try_get("attempt_id")?;
     Ok(NativeCloseRunRef {
         target: ProductConversationId::parse(target)
-            .map_err(|error| DbError::InvalidData(error.to_string()))?,
+            .map_err(|error| DbError::Serialization(error.to_string()))?,
         attempt_id: CloseAttemptId::parse(attempt)
-            .map_err(|error| DbError::InvalidData(error.to_string()))?,
+            .map_err(|error| DbError::Serialization(error.to_string()))?,
         run_ordinal: CloseRunOrdinal::parse(row.try_get("run_ordinal")?)
-            .map_err(|error| DbError::InvalidData(error.to_string()))?,
+            .map_err(|error| DbError::Serialization(error.to_string()))?,
     })
 }
 
