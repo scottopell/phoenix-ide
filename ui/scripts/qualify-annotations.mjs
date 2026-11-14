@@ -46,7 +46,7 @@ try {
         }
         if (state === '10-sent') assert.equal(sample.geometry.cards, 0);
         sample.screenshot = `${state}-${width}-${theme}.png`;
-        await page.screenshot({ path: path.join(out, sample.screenshot) });
+        await page.screenshot({ animations: 'disabled', path: path.join(out, sample.screenshot) });
         if (state === '06-several-annotations') {
           const trigger = page.getByRole('button', { name: 'Edit annotation 2', exact: true });
           await trigger.click();
@@ -57,7 +57,7 @@ try {
           await page.waitForFunction(() => document.activeElement?.getAttribute('aria-label') === 'Edit annotation 2');
           await trigger.click();
           assert.equal(await comment.inputValue(), '<script>not executed</script> & "quoted" synthetic comment');
-          await page.screenshot({ path: path.join(out, `edited-${width}-${theme}.png`) });
+          await page.screenshot({ animations: 'disabled', path: path.join(out, `edited-${width}-${theme}.png`) });
           await page.getByRole('button', { name: 'Delete annotation', exact: true }).click();
           await trigger.waitFor({ state: 'hidden' });
           assert.equal(await page.getByRole('button', { name: 'Edit annotation 1', exact: true }).count(), 1);
@@ -85,7 +85,7 @@ try {
               paragraphs: [...document.querySelectorAll('#messages .agent-text-block p')].map(p => p.textContent),
               messages: document.querySelectorAll('#messages').length,
             }));
-            await page.screenshot({ path: path.join(out, `dom-replacement-failure-${width}-${theme}.png`) });
+            await page.screenshot({ animations: 'disabled', path: path.join(out, `dom-replacement-failure-${width}-${theme}.png`) });
             throw error;
           }
           // When original source text disappears, remove its highlight but retain the full draft.
@@ -94,7 +94,7 @@ try {
           assert.equal(await page.locator('.draft-annotation').count(), 1);
           assert.equal(await page.locator('.draft-annotation').textContent(), originalCard);
           sample.domReplacementAndStaleSource = 'passed';
-          await page.screenshot({ path: path.join(out, `stale-retained-${width}-${theme}.png`) });
+          await page.screenshot({ animations: 'disabled', path: path.join(out, `stale-retained-${width}-${theme}.png`) });
         }
         assert.deepEqual(sample.errors, []);
         page.off('pageerror', onError);
