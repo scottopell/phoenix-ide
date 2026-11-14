@@ -5,6 +5,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, act, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { SubAgentTranscript, SubAgentStatus, AgentMessage, SendConversationMessageView, ToolOnlyAgentTurnGroup, ToolUseBlock, UnwatchResultView, UserMessage, QueuedUserMessage, TerminalToolResultHighlight, WatchingResultView } from './MessageComponents';
+import { readReactionSelection } from './inlineReactionSelection';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { MessageContextMenu, OPEN_MESSAGE_VIEWER_EVENT } from './MessageContextMenu';
 import { StreamingMessageView } from './StreamingMessage';
@@ -694,6 +695,27 @@ describe('inline tool timers', () => {
 
     expect(document.querySelectorAll('.compact-tool-owner-copy .message-mobile-copy')).toHaveLength(1);
     expect(document.querySelectorAll('.compact-tool-selected-detail .message-mobile-copy')).toHaveLength(1);
+    expect(document.querySelectorAll('.compact-tool-selected-detail .assistant-message-toolbar')).toHaveLength(0);
+    expect(screen.getByRole('button', { name: 'Copy command' })).toBeInTheDocument();
+  });
+
+  it('keeps continuation chrome controls on ordinary messages, not inside expanded compact detail', () => {
+    mockDensity = 'compact';
+    const owner = agentMessage('agent-copy-continuation', [
+      { type: 'tool_use', id: 'copy-continuation-read', name: 'read_file', input: { path: 'continuation.md' } },
+    ], 2);
+    const { container } = render(<MemoryRouter><>
+      <AgentMessage message={agentMessage('agent-normal-continuation', [{ type: 'text', text: 'Normal continuation.' }])} toolResults={new Map()} isFirstInTurn={false} />
+      <ToolOnlyAgentTurnGroup members={[
+        { kind: 'agent_turn', key: owner.message_id, agent: owner, toolResultsByUseId: new Map(), isFirstInTurn: false },
+      ]} />
+    </></MemoryRouter>);
+
+    expect(container.querySelector('.assistant-message-toolbar--continuation')).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: 'Copy Phoenix message' })).toHaveLength(2);
+    fireEvent.click(screen.getByRole('button', { name: /read_file:.*expand tool detail/i }));
+    expect(document.querySelectorAll('.compact-tool-selected-detail .assistant-message-toolbar')).toHaveLength(0);
+    expect(document.querySelector('.compact-tool-selected-detail .message-mobile-copy')).toBeInTheDocument();
   });
 
   it('keeps an expanded older compact tool before newer appended tools in DOM chronology', () => {
@@ -734,6 +756,36 @@ describe('inline tool timers', () => {
     expect(document.querySelector('.compact-tool-selected-detail')).toBeNull();
     expect(document.querySelector('.compact-tool-group')).toBe(group);
     expect(document.activeElement).toBe(screen.getByRole('button', { name: /read_file:.*expand tool detail/i }));
+  });
+
+  it('retains prose annotation anchors while excluding expanded tool arguments after empty chrome removal', () => {
+    const tool = agentMessage('agent-selection-tool', [
+      { type: 'tool_use', id: 'selection-read', name: 'read_file', input: { path: 'selection.md' } },
+    ], 2);
+    const prose = agentMessage('agent-selection-prose', [{ type: 'text', text: 'Readable prose stays commentable.' }], 3);
+    render(<MemoryRouter><div id="messages">
+      <AgentMessage message={tool} toolResults={new Map()} onOpenFile={undefined}
+        forceExpandedTools visibleToolUseId="selection-read" suppressMessageCopy isFirstInTurn={false} />
+      <AgentMessage message={prose} toolResults={new Map()} onOpenFile={undefined} isFirstInTurn={false} />
+    </div></MemoryRouter>);
+    const selection = window.getSelection()!;
+    const selectContents = (element: Element) => {
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    };
+    const toolInput = document.querySelector('.tool-block-input')!;
+    expect(toolInput.closest('[data-inline-reaction-message]')).toHaveAttribute('data-inline-reaction-message', tool.message_id);
+    expect(toolInput.closest('.message')?.querySelector('.assistant-message-toolbar')).toBeNull();
+    selectContents(toolInput);
+    expect(readReactionSelection(selection, [tool, prose])).toBeNull();
+    selectContents(document.querySelector('.agent-text-block p')!);
+    const eligible = readReactionSelection(selection, [tool, prose]);
+    expect(eligible?.source.messageId).toBe(prose.message_id);
+    expect(eligible?.source.quote).toBe('Readable prose stays commentable.');
+    expect(eligible?.source.textAnchor?.start.fragmentId).toBeTruthy();
+    selection.removeAllRanges();
   });
 
   it('restores collapse focus inside the owning group when tool use ids recur', () => {

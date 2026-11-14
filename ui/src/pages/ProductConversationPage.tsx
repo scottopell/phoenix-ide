@@ -1624,8 +1624,8 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
           enableMessageSidepanel
           enableMessageFullscreen
           reactionScopeKey={snapshot.product_conversation_id}
-          reactionDestination={liveControlsEnabled && currentLatestProjection?.appendInlineReactionToComposer
-            ? { append: currentLatestProjection.appendInlineReactionToComposer }
+          reactionDestination={currentLatestProjection?.annotationDraft
+            ? { draft: currentLatestProjection.annotationDraft, writable: liveControlsEnabled && currentLatestProjection.canAnnotate }
             : undefined}
           conversationId={snapshot.product_conversation_id}
           slug={latestSlug ?? snapshot.canonical_root.slug ?? snapshot.requested_transcript_row_id}

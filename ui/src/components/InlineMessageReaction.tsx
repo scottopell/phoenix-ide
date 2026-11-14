@@ -1,7 +1,9 @@
 import { useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
 import type { Message } from '../api';
-import { InlineReactionContext, InlineReactionStore, formatInlineReaction, type ReactionSource } from '../conversation/InlineReactionStore';
+import { InlineReactionContext, InlineReactionStore, type ReactionSource } from '../conversation/InlineReactionStore';
+import type { AnnotationDraft } from '../conversation/AnnotationDraftStore';
+import { useAnnotationHighlights } from './useAnnotationHighlights';
 import { useFocusScope } from '../hooks/useFocusScope';
 import { readReactionSelection } from './inlineReactionSelection';
 import { restoreReactionRange } from './reactionRange';
@@ -9,7 +11,8 @@ import { ReactionPill } from './ReactionPill';
 import './InlineMessageReaction.css';
 
 export interface ReactionDraftDestination {
-  append: (text: string) => void;
+  draft: AnnotationDraft;
+  writable: boolean;
 }
 
 interface Props {
@@ -55,6 +58,11 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
   const subscribe = useCallback((listener: () => void) => store.subscribe(scopeKey, listener), [scopeKey, store]);
   const getSnapshot = useCallback(() => store.getSnapshot(scopeKey), [scopeKey, store]);
   const reaction = useSyncExternalStore(subscribe, getSnapshot);
+  useAnnotationHighlights(reaction?.source, destination?.draft);
+  useEffect(() => {
+    if (returnToSource) return destination?.draft.registerNavigator(returnToSource);
+    return undefined;
+  }, [destination?.draft, returnToSource]);
   const bubbleRef = useRef<HTMLDivElement>(null);
   const selectedRange = useRef<Range | null>(null);
   const pillFocusPending = useRef(false);
@@ -83,7 +91,7 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
     }
     const read = () => {
       frame = 0;
-      if (selecting.current || pillFocusPending.current || sourceReturnActive.current || !destination || (activeScope && activeScope !== focusScope)) return;
+      if (selecting.current || pillFocusPending.current || sourceReturnActive.current || !destination?.writable || (activeScope && activeScope !== focusScope)) return;
       const current = store.getSnapshot(scopeKey);
       if (current?.body) {
         if (!gestureActive.current) {
@@ -225,9 +233,9 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
   };
   const add = () => {
     const current = store.getSnapshot(scopeKey);
-    if (!destination || !current?.body.trim()) return;
+    if (!destination?.writable || !current?.body.trim()) return;
     try {
-      destination.append(formatInlineReaction(current));
+      destination.draft.add(current);
       clear();
       setNotice('Added to draft');
     } catch {
@@ -259,7 +267,7 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
           returnToSource={returnToSource}
           scrollTranscriptBy={scrollTranscriptBy}
           body={reaction.body}
-          available={Boolean(destination)}
+          available={Boolean(destination?.writable)}
           onChange={(body) => store.dispatch(scopeKey, { type: 'edit', body })}
           onAdd={add}
           onClose={clear}
