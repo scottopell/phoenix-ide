@@ -52,8 +52,9 @@ function RecoveryHarness({ send, scope = 'a', initialDraft = '  @missing.ts\n', 
     onSend={send} onCancel={() => {}} onRetry={() => {}} />;
 }
 
-function ConnectedRecoveryHarness({ store, send, scope = 'a', initialFiles = [rejectedFile] }: {
+function ConnectedRecoveryHarness({ store, send, scope = 'a', initialFiles = [rejectedFile], quickAction }: {
   store: DraftStore;
+  quickAction?: ComposerQuickAction;
   send: (text: string, images: ImageData[], files: FileAttachment[]) => Promise<void>;
   scope?: string;
   initialFiles?: FileAttachment[];
@@ -62,7 +63,7 @@ function ConnectedRecoveryHarness({ store, send, scope = 'a', initialFiles = [re
   const [files, setFiles] = useState<FileAttachment[]>(initialFiles);
   return <DraftContext.Provider value={store}>
     <button onClick={() => setFiles([{ ...rejectedFile, original_name: 'new.txt', stored_path: '/uploads/a/new.txt' }])}>Attach newer file</button>
-    <ConnectedInputArea slug={scope} cwd={undefined} scopeKey={scope} convState={idleState}
+    <ConnectedInputArea quickAction={quickAction} slug={scope} cwd={undefined} scopeKey={scope} convState={idleState}
       images={images} setImages={setImages} files={files} setFiles={setFiles}
       isOffline={false} failedMessages={[]} onSend={send} onCancel={() => {}} onRetry={() => {}} />
   </DraftContext.Provider>;
@@ -115,6 +116,22 @@ describe('editable annotation cards', () => {
     expect(screen.getByRole('textbox', { name: 'Annotation 1 comment' })).toBeEnabled();
     expect(screen.getByRole('textbox', { name: 'Annotation 1 comment' })).toHaveValue('Retain me');
     expect(annotations.getSnapshot()[0]!.submission).toBeNull();
+  });
+
+  it('sends a quick action without submitting any of the ordinary draft or annotations', async () => {
+    const store = new DraftStore();
+    store.dispatch('a', { type: 'set_draft', text: 'Separate ordinary draft' });
+    const annotations = store.annotations.forScope('a');
+    annotations.add({ source, body: 'Unsent annotation for my separate draft.' });
+    const original = annotations.getSnapshot();
+    const send = vi.fn().mockResolvedValue(undefined);
+    render(<ConnectedRecoveryHarness store={store} send={send} quickAction={{ label: 'Check in & drive', compactLabel: 'Check in', prompt: 'Brief me' }} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Check in & drive' }));
+    await waitFor(() => expect(send).toHaveBeenCalledOnce());
+    expect(send).toHaveBeenCalledWith('Brief me', [], []);
+    expect(store.getSnapshot('a').draft).toBe('Separate ordinary draft');
+    expect(annotations.getSnapshot()).toBe(original);
+    expect(screen.getByRole('button', { name: 'Edit annotation 1' })).toHaveTextContent('Unsent annotation for my separate draft.');
   });
 
   it('supports annotation-only messages and removal without changing ordinary draft text', async () => {
@@ -359,7 +376,7 @@ interface InputAreaTestProps {
   draft?: string;
   onDraftChange?: (text: string) => void;
   onCancel?: () => void;
-  onSend?: (text: string) => void;
+  onSend?: (text: string, images: ImageData[], files: FileAttachment[]) => void;
   focusToken?: number;
   quickAction?: ComposerQuickAction;
 }
@@ -388,7 +405,7 @@ function renderInput({
       draft={draft}
       onDraftChange={onDraftChange}
       {...focusProps}
-      quickAction={quickAction}
+      quickAction={quickAction ? { ...quickAction, send: () => onSend(quickAction.prompt, [], []) } : undefined}
       onSend={onSend}
       onCancel={onCancel}
       onRetry={() => {}}

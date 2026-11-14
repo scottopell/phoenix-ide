@@ -497,6 +497,9 @@ THE SYSTEM SHALL close the editor and return focus to an adjacent annotation str
 WHEN an annotation card is removed
 THE SYSTEM SHALL remove that annotation and its source highlight together without changing unrelated draft text or annotations.
 
+WHEN a composer quick action submits its own prompt
+THE SYSTEM SHALL preserve ordinary draft text and pending annotations.
+
 WHEN the user submits the message
 THE SYSTEM SHALL format the submitted annotation cards with their source identities and complete quotations alongside ordinary message text
 AND SHALL isolate quoted content from surrounding Markdown delimiters

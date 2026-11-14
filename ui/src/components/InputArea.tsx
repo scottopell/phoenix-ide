@@ -96,7 +96,7 @@ interface InputAreaProps {
    */
   focusToken?: number;
   /** Optional action and context displayed directly above the composer. */
-  quickAction?: ComposerQuickAction | undefined;
+  quickAction?: Pick<ComposerQuickAction, 'label' | 'compactLabel'> & { send: () => Promise<void> | void } | undefined;
   /**
    * Called when the user sends a message.
    * May reject with an expansion error (REQ-IR-007) — the component will
@@ -862,7 +862,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                 onClick={async () => {
                   setQuickActionSending(true);
                   try {
-                    await onSend(quickAction.prompt, [], []);
+                    await quickAction.send();
                   } finally {
                     setQuickActionSending(false);
                   }
@@ -917,12 +917,13 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
  * Hosting the subscription in this wrapper keeps the re-render scoped to
  * the composer subtree — sibling components don't see keystroke churn.
  */
-export type ConnectedInputAreaProps = Omit<InputAreaProps, 'draft' | 'onDraftChange' | 'draftRecovery' | 'annotationCards' | 'hasAnnotations'> & {
+export type ConnectedInputAreaProps = Omit<InputAreaProps, 'draft' | 'onDraftChange' | 'draftRecovery' | 'annotationCards' | 'hasAnnotations' | 'quickAction'> & {
   slug: string;
+  quickAction?: ComposerQuickAction | undefined;
 };
 
 export const ConnectedInputArea = forwardRef<InputAreaHandle, ConnectedInputAreaProps>(
-  function ConnectedInputArea({ slug, ...rest }, ref) {
+  function ConnectedInputArea({ slug, quickAction, ...rest }, ref) {
     const draft = useDraftValue(slug);
     const { setDraft } = useDraftActions(slug);
     const draftRecovery = useDraftRecovery(slug);
@@ -940,6 +941,11 @@ export const ConnectedInputArea = forwardRef<InputAreaHandle, ConnectedInputArea
       }
     };
     return <InputArea ref={ref} {...rest} draft={draft} onDraftChange={setDraft} draftRecovery={draftRecovery}
+      quickAction={quickAction ? {
+        label: quickAction.label,
+        compactLabel: quickAction.compactLabel,
+        send: () => rest.onSend(quickAction.prompt, [], []),
+      } : undefined}
       onSend={send} hasAnnotations={annotations.some(annotation => annotation.submission === null)}
       annotationCards={<DraftAnnotationCards draft={annotationDraft} annotations={annotations} disabled={Boolean(rest.readOnly) || !canAcceptChatMessage(rest.convState)} />} />;
   },
