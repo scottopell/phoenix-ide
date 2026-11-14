@@ -12,6 +12,8 @@ Accepted user decisions:
 - "1) use recommendation": one item per independently meaningful concern/commitment, with its next resumption point; no parent/child task hierarchy initially.
 - "2) ember only, focus is less on promises the agents made and more on user requested work, see adhd related prompt suggestion in gh issues"
 - "Agree good suggestion, finish revisiting and refining plan based on this and any other production analysis you want to do": approval of enriching the existing completion event with triggering context, exact ending-response reference and bounded excerpt, following the observed repeated latest-message lookups.
+- "Normal turns and existing wakeups (Recommended)": review saved items during normal Ember turns and existing watch/reminder wakeups; no new periodic review wakeups.
+- "All history, gradually (Recommended)": scan the whole Ember continuation history in bounded batches, prioritizing new messages; no initial date cutoff.
 
 There is ONE existing Ember singleton and ONE tracking list attached to its durable product identity. Remote instances are places referenced work lives, not additional owners of this list.
 
@@ -129,13 +131,13 @@ Apply captures/evidence and coverage atomically under source/cursor/registry rev
 
 Freeze the activation boundary with separate live/backfill frontiers so new messages do not cover historical gaps. Retain historical provenance and uncertain freshness; later cancellation/completion may lie outside an old chunk. Ember checks current/later evidence before acting on historical capture.
 
-## Proposed defaults still requiring explicit review
+## Settled attention and historical coverage
 
-- Saving a bookmark/request retains memory; it does not itself create a new automatic wake policy. Existing watches/reminders remain available for concrete authorized follow-through. The user asked for clarification and has not approved new periodic supervision.
-- Recommended backfill is the whole Ember history in bounded batches, with priority for live messages. A chosen since-date can limit initial discovery, never expire saved items, and must leave older history explicitly unscanned. No cutoff date has been selected.
+- Saving a bookmark/request retains memory. Ember reviews saved items during normal turns and existing watch/reminder wakeups. Saving or scanning does not create periodic supervision, dispatch work or change existing wake timing.
+- Initial backfill covers the whole Ember continuation history gradually in bounded batches, with priority for live messages and explicit incomplete coverage until processed. There is no date cutoff and saved items do not expire based on age. Historical provenance and later-correction checks still apply.
 - Temporal coalescing, subscription filtering and routine-completion suppression are deferred until enriched-event measurements identify remaining cost. Approval of enrichment does not approve those behavior changes.
 
-These are scoped product review points, not reasons to leave the implementation phases unplanned.
+The user selected both recommendations. Remaining model budgets, excerpt tuning and qualification thresholds are implementation gates within this scope, not unresolved choices about periodic review or a historical cutoff.
 
 ## Delivery phases and dependencies
 

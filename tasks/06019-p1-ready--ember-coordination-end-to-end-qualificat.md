@@ -18,6 +18,7 @@ Demonstrate the complete user journey through the real assembled Coordinator sur
 8. Retire roadmap automation with workflow/runs/variable/Issue readback, while retained historical evidence can still be retrieved. Reconcile only confirmed live obligations; no blanket import.
 9. A finishes, a different message starts B, and B responds before A's delayed event reaches Ember. Inspect A's exact settled input, sender and bounded ending response without borrowing B's text. Test tool-only/empty endings, continuation, steering settlement races, unavailable source, edits/deletion, historical absence, unsupported remote evidence and private/shared projections.
 10. Event-heavy history reaches the scanner. Copied worker excerpts can support existing records but cannot create human commissions; pauses and intentional drops survive reconciliation. A completed execution/milestone does not resolve an unfinished user outcome.
+11. Initial discovery enrolls the whole Ember history without a date cutoff, incrementally and behind new-message work. An idle scan can commit captures without starting a foreground turn; the next normal turn or existing watch/reminder wakeup receives the fresh index. No new periodic review wakeup is created.
 
 ## Evidence and harness
 

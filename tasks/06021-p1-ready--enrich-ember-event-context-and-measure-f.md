@@ -14,7 +14,7 @@ Ember can often understand a finished response without first querying the worker
 - Keep original persisted diagnostic/provider text and accepted identity intact. Model-private enrichment is a typed projection; private UI details use the same evidence. Shared/redacted reads must not gain private excerpts, sender identities or source-title lookups through either typed fields or raw diagnostic text.
 - Extend existing event-card details only as needed. Preserve truthful Turn finished label, chronology, grouping, chapter exclusions, navigation/back behavior, live/history/pagination/continuation and accessibility. Reuse task 28007/specs/conversation-events. No separate dashboard.
 - Old, missing or remote-v1 evidence has an honest fallback. Do not fail ordinary delivery or pretend a missing excerpt is empty prose. Remote protocol enrichment is outside this v1 slice and requires separate producer/receiver contract qualification before claiming parity.
-- Preserve delivery frequency, timing and admission semantics. Temporal batching, suppressing routine completions and automatic tracker wake policy remain deferred.
+- Preserve delivery frequency, timing and admission semantics. Temporal batching and suppressing routine completions remain deferred. User selected saved-item review during normal turns and existing wakeups; new periodic tracker wakeups are out of scope.
 
 ## Evidence and evaluation
 

@@ -15,7 +15,7 @@ Ember sees a fresh compact index of what it is tracking on subsequent dispatches
 - Update global-recall requirements/ADRs for the deliberate new memory projection. Preserve the decision to fetch live activity on demand rather than reviving an inferred global activity capsule.
 - Keep /global chat-first. Establish user inspectability via explicit read/list and rendered tool/conversation results. Any bounded list/detail control must name its web/native scope and validation; no new workstream navigation identity or dashboard.
 - Distinguish record existence, last explicit review and scanner coverage. A successful scan does not mean Ember reviewed or completed the obligation. The scanner may add while idle without waking work.
-- Follow Issue #1075's thread-keeping behavior: retain user-requested work and useful question bookmarks, answer the current question first, avoid repeating the list each response, and provide a short refresher/resumption point when the user returns. Topic change alone neither abandons prior work nor commissions a new task. Automatic revisit/wake policy is still under product discussion; do not infer it merely from saving a record.
+- Follow Issue #1075's thread-keeping behavior: retain user-requested work and useful question bookmarks, answer the current question first, avoid repeating the list each response, and provide a short refresher/resumption point when the user returns. Topic change alone neither abandons prior work nor commissions a new task. User selected review during normal turns and existing watch/reminder wakeups. Saving or scanning does not create new periodic review wakeups or dispatch work.
 
 ## Starting points
 
@@ -27,4 +27,4 @@ A record created before continuation is discoverable in the successor's fresh co
 
 Qualify through production context construction and a controlled real continuation journey. Existing four-tool coordinator-drive-eval does not prove this path. Run owning Rust/spec checks and UI/native checks only for actual presentation changes.
 
-Out of scope: scanner inference, new automatic revisit/wake behavior, a workstream dashboard and task hierarchy.
+Out of scope: scanner inference, new periodic review wakeups, a workstream dashboard and task hierarchy.
