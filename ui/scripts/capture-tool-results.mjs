@@ -74,12 +74,13 @@ async function captureMobileExpandedSpacing({ page, id, outDir, viewport }) {
       overflowElements: Array.from(document.querySelectorAll('body *')).filter((el) => { const r = el.getBoundingClientRect(); return r.right > document.documentElement.clientWidth + 1 && r.width > 0; }).slice(-25).map((el) => ({ tag: el.tagName, cls: el.className, text: el.textContent?.slice(0, 120), parent: el.parentElement?.className, right: el.getBoundingClientRect().right, width: el.getBoundingClientRect().width, whiteSpace: getComputedStyle(el).whiteSpace, minWidth: getComputedStyle(el).minWidth })),
     };
   });
-  if (evidence.toolbarPresent) throw new Error('expanded detail still contains a redundant message toolbar');
+  const baseline = process.env.TOOL_RESULTS_BASELINE === '1';
+  if (evidence.toolbarPresent !== baseline) throw new Error(`unexpected expanded toolbar presence: ${evidence.toolbarPresent}`);
   if (!evidence.message || !evidence.content || evidence.content.height <= 0) {
     throw new Error('expanded message and content must have visible geometry');
   }
   const contentGap = evidence.content.top - evidence.message.top;
-  if (contentGap < 0 || contentGap > 16) {
+  if (baseline && viewport.hasTouch ? contentGap < 44 : contentGap < 0 || contentGap > 16) {
     throw new Error(`expanded content exceeds its 14px message inset (2px tolerance): ${contentGap}px`);
   }
   if (!evidence.inputText?.includes('@conv:fixture-review') || !evidence.inputText.includes('message_id')) {

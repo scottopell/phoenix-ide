@@ -23,6 +23,24 @@ jobs:
         working-directory: ui
       - run: pnpm exec playwright install --with-deps chromium
         working-directory: ui
+      - name: Capture same-fixture empty-toolbar control
+        working-directory: ui
+        env:
+          CAPTURE_STORIES: mobile-spacing-compact
+          TOOL_RESULTS_BASELINE: '1'
+          TOOL_RESULTS_QA_OUT: qa-artifacts/tool-results/before
+        run: |
+          cp src/components/MessageComponents.tsx /tmp/MessageComponents.fixed.tsx
+          trap 'cp /tmp/MessageComponents.fixed.tsx src/components/MessageComponents.tsx' EXIT
+          node --input-type=module <<'JS'
+          import { readFileSync, writeFileSync } from 'node:fs';
+          const file = 'src/components/MessageComponents.tsx';
+          const source = readFileSync(file, 'utf8');
+          const predicate = '!(suppressMessageCopy && visibleToolUseId && !isFirstInTurn)';
+          if (source.split(predicate).length !== 2) throw new Error('expected exactly one selected-tool chrome predicate');
+          writeFileSync(file, source.replace(predicate, 'true'));
+          JS
+          PHOENIX_LADLE=1 node scripts/capture-tool-results.mjs
       - name: Capture synthetic expanded tools
         run: PHOENIX_LADLE=1 node scripts/capture-tool-results.mjs
         working-directory: ui
