@@ -11625,7 +11625,10 @@ mod tests {
         tx.rollback().await.unwrap();
 
         for (table, query) in [
-            ("close_obligations", "SELECT COUNT(*) FROM close_obligations"),
+            (
+                "close_obligations",
+                "SELECT COUNT(*) FROM close_obligations",
+            ),
             (
                 "close_attempt_participants",
                 "SELECT COUNT(*) FROM close_attempt_participants",
