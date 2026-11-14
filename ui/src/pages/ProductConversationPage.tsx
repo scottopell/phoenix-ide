@@ -5,6 +5,7 @@ import { decodedRouteReference } from '../transcriptReference';
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import { ChainWorkIdentityBlock } from '../components/ChainWorkIdentityBlock';
 import { AutomaticContinuationControl } from '../components/AutomaticContinuationControl';
+import { PendingContinuationOpening } from '../components/PendingContinuationOpening';
 import { MessageListSkeleton } from '../components/Skeleton';
 import {
   ApiResponseError,
@@ -1576,6 +1577,12 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
       data-testid="product-conversation-page"
       ref={coordinator || inheritedJourney ? undefined : journey.attach}
     >
+      {snapshot.latest_opening.status === 'pending' && <PendingContinuationOpening
+        key={snapshot.latest_opening.edge.continuation_message_id}
+        predecessorId={snapshot.latest_opening.edge.predecessor_transcript_row_id}
+        enabled={isOpen && !closeAdmissionPending}
+        onRecovered={() => setSnapshotRetry(retry => retry + 1)}
+      />}
       {observedContinuationId && !error && (
         <section role="status" aria-label="Continuation readback pending">
           <span>Continuation readback pending.</span>{' '}

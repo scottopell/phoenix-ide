@@ -89,6 +89,12 @@ impl ContinuationApplicationService {
     ) -> Result<crate::api::ContinueConversationResponse, crate::api::handlers::AppError> {
         manual::continue_manual(self, parent_id, req).await
     }
+    pub(crate) async fn retry_pending_opening(
+        &self,
+        parent_id: &str,
+    ) -> Result<crate::api::ContinueConversationResponse, crate::api::handlers::AppError> {
+        manual::retry_pending_opening(self, parent_id).await
+    }
 
     #[must_use]
     pub(crate) fn new(runtime: Arc<RuntimeManager>) -> Self {

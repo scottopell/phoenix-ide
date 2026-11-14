@@ -53,6 +53,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   const originalReconcileAcceptedMessages = api.reconcileAcceptedMessages;
   const originalUploadAttachments = api.uploadAttachments;
   const originalContinueConversation = api.continueConversation;
+  const originalRetryContinuationOpening = api.retryContinuationOpening;
   const originalFetch = globalThis.fetch;
   const OriginalWebSocket = globalThis.WebSocket;
   let snapshotRequestCount = 0;
@@ -274,6 +275,22 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       status: 'steering_queued' as const,
     })),
   });
+  let failOpeningRetry = false;
+  let openingRetryCount = 0;
+  const failNextOpeningRetry = () => { failOpeningRetry = true; };
+  window.addEventListener('product-conversation-fixture-fail-opening-retry', failNextOpeningRetry);
+  api.retryContinuationOpening = async predecessorId => {
+    record('OpeningRetryPredecessor', predecessorId);
+    record('OpeningRetryCount', ++openingRetryCount);
+    if (!currentSnapshot || currentSnapshot.latest_opening.status !== 'pending') throw new Error('No pending opening');
+    if (predecessorId !== currentSnapshot.latest_opening.edge.predecessor_transcript_row_id) throw new Error('Wrong predecessor');
+    if (failOpeningRetry) {
+      failOpeningRetry = false;
+      return { conversation_id: currentConversation.id, status: 'dispatch_failed', error: 'Fixture opening dispatch failed' };
+    }
+    acceptSuccessorOpening();
+    return { conversation_id: currentConversation.id, status: 'accepted' };
+  };
   api.continueConversation = async () => ({
     conversation_id: 'fixture-successor',
     slug: 'fixture-successor',
@@ -540,7 +557,16 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       status: 'accepted', edge: pending.edge, accepted_message_id: 'fixture-successor-opening',
       opening_authority: pending.opening_authority, presentation: 'boundary',
     } };
-    window.dispatchEvent(new Event('focus'));
+    const stream = [...eventSources].find(source => source.memberId === currentConversation.id && source.readyState === FixtureEventSource.OPEN && source.subscriptionCount > 0);
+    if (!stream) throw new Error('Successor SSE has not opened');
+    const openingMessage: Message = {
+      message_id: 'fixture-successor-opening', conversation_id: currentConversation.id,
+      sequence_id: stream.nextSequenceId(), message_type: 'user', origin: { kind: 'unknown_historical' },
+      content: [{ type: 'text', text: 'Saved continuation opening' }],
+      display_data: null, usage_data: null, event_presentation: null, created_at: '2026-07-01T12:00:59Z',
+    };
+    currentMessages = [...currentMessages, openingMessage];
+    stream.emit('message', { opening: currentSnapshot.latest_opening, sequence_id: openingMessage.sequence_id, message: openingMessage });
   };
   window.addEventListener('product-conversation-fixture-hold-opening', holdSuccessorOpening);
   window.addEventListener('product-conversation-fixture-accept-opening', acceptSuccessorOpening);
@@ -671,6 +697,8 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     api.listForkProposals = originalListForkProposals;
     api.reconcileAcceptedMessages = originalReconcileAcceptedMessages;
     api.continueConversation = originalContinueConversation;
+    api.retryContinuationOpening = originalRetryContinuationOpening;
+    window.removeEventListener('product-conversation-fixture-fail-opening-retry', failNextOpeningRetry);
     window.removeEventListener('product-conversation-fixture-release-older', releaseOlderSnapshotResponse);
     globalThis.fetch = originalFetch;
     globalThis.WebSocket = OriginalWebSocket;

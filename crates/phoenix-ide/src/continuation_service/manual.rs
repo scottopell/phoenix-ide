@@ -105,6 +105,89 @@ pub(super) async fn dispatch_continuation_handoff(
     }
 }
 
+pub(super) async fn retry_pending_opening(
+    service: &ContinuationApplicationService,
+    parent_id: &str,
+) -> Result<ContinueConversationResponse, AppError> {
+    let parent = service
+        .runtime
+        .db()
+        .get_conversation(parent_id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let _product_admission = service
+        .runtime
+        .lock_product_message_admission(parent.product_conversation_id.as_str())
+        .await;
+    let admission = service
+        .runtime
+        .mutation_admission(parent_id)
+        .await
+        .map_err(map_admission_db_error)?;
+    let _mutation_admission = admission.lock().await;
+
+    let parent = service
+        .runtime
+        .db()
+        .get_conversation(parent_id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let lifecycle = service
+        .runtime
+        .db()
+        .message_target_admission(parent_id)
+        .await
+        .map_err(map_admission_db_error)?;
+    map_ordinary_mutation_admission(&lifecycle, "continuation opening retry")?;
+
+    let intent = service
+        .runtime
+        .db()
+        .continuation_dispatch_intent(parent_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .ok_or_else(|| {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "No pending continuation opening exists to retry",
+                "continuation_opening_not_pending",
+            )))
+        })?;
+    if intent.parent_conversation_id != parent_id
+        || parent.continued_in_conv_id.as_deref() != Some(intent.successor_conversation_id.as_str())
+    {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Pending continuation opening no longer matches the predecessor's successor",
+            "continuation_opening_not_pending",
+        ))));
+    }
+
+    let successor = service
+        .runtime
+        .db()
+        .get_conversation(&intent.successor_conversation_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let successor_id = successor.id.clone();
+    let runtime = service.runtime.clone();
+    tokio::spawn(async move {
+        if let Err(error) = runtime.get_or_create(&successor_id).await {
+            tracing::warn!(
+                conv_id = %successor_id,
+                error = %error,
+                "failed to spawn runtime for continuation opening retry",
+            );
+        }
+    });
+
+    let (status, error) = dispatch_continuation_handoff(service, intent).await;
+    Ok(ContinueConversationResponse {
+        conversation_id: successor.id,
+        slug: successor.slug,
+        status,
+        error,
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 pub(super) async fn continue_manual(
     service: &ContinuationApplicationService,
@@ -303,9 +386,15 @@ pub(super) async fn continue_manual(
             .map_err(AppError::BadRequest)?;
         if !review.source.fits() {
             let message = match review.source.status {
-                crate::runtime::HandoffCapacityStatus::RequiredOverhead => "Required instructions/tools and full output reservation leave no successor working room. Handoff editing and shortening cannot fix this overhead; explicitly change model or revise required instructions/tools.",
-                crate::runtime::HandoffCapacityStatus::HandoffTooLarge { .. } => "The supplied handoff leaves insufficient successor working room. Review the capacity target, edit the handoff, request one shortening candidate, or explicitly change model.",
-                crate::runtime::HandoffCapacityStatus::Ready { .. } => unreachable!("fit checked above"),
+                crate::runtime::HandoffCapacityStatus::RequiredOverhead => {
+                    "Required instructions/tools and full output reservation leave no successor working room. Handoff editing and shortening cannot fix this overhead; explicitly change model or revise required instructions/tools."
+                }
+                crate::runtime::HandoffCapacityStatus::HandoffTooLarge { .. } => {
+                    "The supplied handoff leaves insufficient successor working room. Review the capacity target, edit the handoff, request one shortening candidate, or explicitly change model."
+                }
+                crate::runtime::HandoffCapacityStatus::Ready { .. } => {
+                    unreachable!("fit checked above")
+                }
             };
             let mut conflict =
                 ConflictErrorResponse::new(message, "continuation_capacity_conflict");

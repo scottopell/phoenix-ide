@@ -323,6 +323,10 @@ pub fn create_router(state: AppState) -> Router {
             "/api/conversations/{id}/continue",
             post(continue_conversation),
         )
+        .route(
+            "/api/conversations/:id/retry-continuation-opening",
+            post(retry_continuation_opening),
+        )
         // Task approval (REQ-BED-028)
         .route("/api/conversations/{id}/approve-task", post(approve_task))
         .route("/api/conversations/{id}/reject-task", post(reject_task))
@@ -6656,6 +6660,15 @@ async fn continue_conversation(
 ) -> Result<Json<ContinueConversationResponse>, AppError> {
     crate::continuation_service::ContinuationApplicationService::new(state.runtime)
         .continue_manual(&id, req)
+        .await
+        .map(Json)
+}
+async fn retry_continuation_opening(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ContinueConversationResponse>, AppError> {
+    crate::continuation_service::ContinuationApplicationService::new(state.runtime)
+        .retry_pending_opening(&id)
         .await
         .map(Json)
 }
@@ -21990,6 +22003,133 @@ mod conversation_route_tests {
     use super::*;
     use crate::api::handlers::hard_delete_cascade_tests::make_test_state;
     use crate::db::{ContinuationContent, ContinueOutcome, ConvState, MessageContent};
+
+    #[tokio::test]
+    async fn retry_continuation_opening_reuses_exact_pending_intent() {
+        use phoenix_workflow::ClientTurnKey;
+
+        let state = make_test_state().await;
+        let parent = state
+            .db
+            .create_conversation("pending-root", "pending-root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_state(
+                &parent.id,
+                &ConvState::ContextExhausted {
+                    summary: "predecessor summary".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let (outcome, pending) = state
+            .db
+            .continue_conversation_with_intent(
+                &parent.id,
+                crate::db::NewContinuationDispatchIntent::user_authorized(
+                    ClientTurnKey::new("stable-opening-message").unwrap(),
+                    "the original accepted handoff".to_string(),
+                    Some("original-client".to_string()),
+                ),
+            )
+            .await
+            .unwrap();
+        let ContinueOutcome::Created(successor) = outcome else {
+            panic!("expected a reserved successor");
+        };
+        let pending = pending.expect("persisted opening intent");
+
+        let response = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/conversations/{}/retry-continuation-opening",
+                        parent.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["conversation_id"], successor.id);
+
+        let still_pending = state
+            .db
+            .continuation_dispatch_intent(&parent.id)
+            .await
+            .unwrap()
+            .expect("unsettled opening remains retryable");
+        assert_eq!(still_pending.message_id, pending.message_id);
+        assert_eq!(still_pending.handoff, pending.handoff);
+        assert_eq!(still_pending.user_agent, pending.user_agent);
+        assert_eq!(still_pending.opening_authority, pending.opening_authority);
+        assert_eq!(
+            still_pending.successor_conversation_id,
+            pending.successor_conversation_id
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_continuation_opening_without_pending_intent_does_not_create_successor() {
+        let state = make_test_state().await;
+        let parent = state
+            .db
+            .create_conversation(
+                "no-pending-root",
+                "no-pending-root",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_state(
+                &parent.id,
+                &ConvState::ContextExhausted {
+                    summary: "predecessor summary".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let response = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/conversations/{}/retry-continuation-opening",
+                        parent.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(state
+            .db
+            .get_conversation(&parent.id)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .is_none());
+        assert!(state
+            .db
+            .continuation_dispatch_intent(&parent.id)
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     #[tokio::test]
     async fn product_conversation_route_resolves_product_id_to_its_canonical_root() {
