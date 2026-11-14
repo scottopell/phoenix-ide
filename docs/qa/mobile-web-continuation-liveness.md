@@ -61,6 +61,12 @@ Hosted [43641563819](https://github.com/scottopell/phoenix-ide/actions/runs/4364
 
 Independent delta review also found that directly dispatching a saved intent bypassed manual continuation's exact terminal/unmaterialized automatic-turn rearm. Both entry points now use one orchestration path; the payload-free retry first requires the existing matching pending intent under continuation/product/mutation locks, then retains the existing failed-automatic retry policy. A real-DB regression is authored for generated intent/authority retention and exactly two topology members. The exact terminal/unmaterialized service-level rearm journey remains an explicit coverage gap; existing lower-level rearm tests and shared code inspection are not a substitute for that journey. Source-only rustfmt and `git diff --check` pass; hosted execution at the corrective head is required.
 
+### Reserved capacity and browser-oracle follow-up
+
+Source review of `bc92612f1c2b39fdbffd0499188c7b5192513142..b2a6cd0923afa11fe540d792b0f70fbc7032789d` identified a saved generated opening retry that could skip native reserved-successor capacity review. Retry now reviews the exact persisted generated opening on the already reserved successor before dispatch/rearm. The real-DB regression with an empty registry requires refusal, no opening message, and retention of the exact saved authority/key/handoff and two-member topology. Hosted execution remains required.
+
+The mobile capture now holds successor hydration, asserts the same native editor plus active focus and nontrivial selection before/after release, and observes a new successor INIT instance and a new post-reconnect message instead of a fixed INIT count. This strengthens the synthetic browser oracle, not physical keyboard coverage. The UI source review's possible failure-phase editor-removal concern was not established: the current ordinary-composer eligibility predicate does not exclude recoverable continuation failure, and InputArea's retention special case excludes only awaiting-continuation when retention is off. Failure/retry phase execution remains a targeted coverage gap rather than a proven defect.
+
 ## Bounded lifecycle audit
 
 All entries below describe source-present coverage unless an exact hosted result is separately cited.

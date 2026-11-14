@@ -10,6 +10,20 @@ async function assertMobileContinuation(page, id, viewport, outDir) {
   const input = page.locator('.product-conversation-page__composer #message-input');
   await input.waitFor();
   await input.fill('Unsent mobile draft');
+  await input.evaluate(element => {
+    window.__continuationComposer = element;
+    element.setSelectionRange(3, 9);
+  });
+  const assertRetainedEditor = async () => {
+    if (!await input.evaluate(element => element === window.__continuationComposer
+      && document.activeElement === element && element.selectionStart === 3 && element.selectionEnd === 9)) {
+      throw new Error('Continuation replaced the editor or lost native focus/selection');
+    }
+  };
+  await page.evaluate(() => {
+    window.dispatchEvent(new Event('product-conversation-fixture-hold-successor'));
+    window.dispatchEvent(new Event('product-conversation-fixture-hold-successor-readback'));
+  });
   const route = await page.locator('html').getAttribute('data-source-fixture-location');
   await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--before.png`, fullPage: true });
   await page.evaluate(() => window.dispatchEvent(new Event('product-conversation-fixture-continue')));
@@ -20,6 +34,13 @@ async function assertMobileContinuation(page, id, viewport, outDir) {
     return parsed.pathname === '/api/conversation-reads/stream'
       && parsed.searchParams.get('reference') === 'fixture-successor';
   });
+  await assertRetainedEditor();
+  await page.evaluate(() => {
+    window.dispatchEvent(new Event('product-conversation-fixture-release-successor-readback'));
+    window.dispatchEvent(new Event('product-conversation-fixture-release-successor'));
+  });
+  await page.waitForFunction(() => document.documentElement.dataset.productConversationFixtureLastDeliveredInitMember === 'fixture-successor');
+  await assertRetainedEditor();
   await page.evaluate(() => window.dispatchEvent(new Event('product-conversation-fixture-successor-message')));
   await page.getByText('Successor is streaming after the handoff.', { exact: true }).waitFor();
   if (await input.inputValue() !== 'Unsent mobile draft') throw new Error('Continuation lost the unsent draft');
@@ -27,10 +48,18 @@ async function assertMobileContinuation(page, id, viewport, outDir) {
   if (await page.getByRole('button', { name: 'Open continuation', exact: true }).count()) throw new Error('Redundant continuation action remains');
   await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--followed.png`, fullPage: true });
   await page.evaluate(() => window.dispatchEvent(new Event('product-conversation-fixture-stream-failure')));
-  await page.waitForFunction(() => document.documentElement.dataset.productConversationFixtureEventSourceInits === '3');
+  await page.waitForFunction(() => {
+    const data = document.documentElement.dataset;
+    return Number(data.productConversationFixtureLastDeliveredInitInstance) > Number(data.productConversationFixtureFailedTranscriptInstance)
+      && data.productConversationFixtureLastDeliveredInitMember === 'fixture-successor'
+      && data.productConversationFixtureActiveTranscriptSubscriptions === '1';
+  });
+  await page.evaluate(() => window.dispatchEvent(new Event('product-conversation-fixture-successor-message')));
+  await page.getByText('Successor is streaming after reconnect.', { exact: true }).waitFor();
   if (await page.getByText('Successor is streaming after the handoff.', { exact: true }).count() !== 1) throw new Error('Reconnect duplicated/lost successor message');
+  await assertRetainedEditor();
   await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--reconnected.png`, fullPage: true });
-  journeys.push(`${id}/${viewport.name}: stable-route real SSE continuation, one subscription, successor message, retained draft and reconnect; synthetic mobile browser only`);
+  journeys.push(`${id}/${viewport.name}: stable-route real SSE continuation, held cold hydration, retained native editor/focus/selection/draft, one subscription and new post-reconnect message; synthetic mobile browser only`);
 }
 
 async function assertSourceCall(page, id, viewport, outDir) {

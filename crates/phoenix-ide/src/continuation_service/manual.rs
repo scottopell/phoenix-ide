@@ -197,6 +197,24 @@ async fn continue_with_operation(
                     "continuation_opening_not_pending",
                 ))));
             }
+            if intent.opening_authority
+                == phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext
+            {
+                let review = service
+                    .runtime
+                    .review_reserved_continuation_opening(intent.clone())
+                    .await
+                    .map_err(AppError::BadRequest)?;
+                if !review.source.fits() {
+                    return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                        &format!(
+                            "Saved handoff exceeds reserved successor capacity: {:?}",
+                            review.source
+                        ),
+                        "context_capacity_conflict",
+                    ))));
+                }
+            }
             crate::api::ContinueConversationRequest {
                 handoff: intent.handoff,
                 source: crate::api::ContinueHandoffSource::Manual,

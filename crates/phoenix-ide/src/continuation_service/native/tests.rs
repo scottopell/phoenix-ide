@@ -247,16 +247,27 @@ async fn automatic_recovery_publishes_link_after_successor_was_reserved() {
 }
 
 #[tokio::test]
-async fn saved_opening_retry_retains_generated_intent_and_successor() {
+async fn saved_opening_retry_requires_capacity_and_retains_generated_intent_and_successor() {
     let f = Fixture::new().await;
     let original = f.reserve().await;
-    let response = f
-        .service()
-        .retry_pending_opening(&f.predecessor)
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        f.service().retry_pending_opening(&f.predecessor),
+    )
+    .await
+    .expect("saved opening capacity review must not reacquire the predecessor mutation lock")
+    .expect_err("unknown successor capacity must withhold the generated opening");
+    assert!(
+        matches!(error, crate::api::handlers::AppError::BadRequest(ref message)
+            if message.contains("unavailable through its selected connection")),
+        "{error:?}"
+    );
+    assert!(f
+        .db
+        .get_messages(&original.successor_conversation_id)
         .await
-        .unwrap();
-    assert_eq!(response.conversation_id, original.successor_conversation_id);
-    assert_eq!(response.status, ContinueConversationStatus::DispatchFailed);
+        .unwrap()
+        .is_empty());
     let retained =
         f.db.continuation_dispatch_intent(&f.predecessor)
             .await
