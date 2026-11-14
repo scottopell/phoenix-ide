@@ -1308,7 +1308,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
       data-inline-reaction-message={message.message_id}
       data-message-occurrence={(message.display_data as { productOccurrenceToken?: string } | null)?.productOccurrenceToken}
     >
-      <AssistantMessageChrome
+      {!(suppressMessageCopy && !isFirstInTurn) && <AssistantMessageChrome
         isFirstInTurn={isFirstInTurn}
         metadata={(
           <AssistantMessageMetadata timestamp={timestamp} formattedTime={formatMessageTime(timestamp)}>
@@ -1321,7 +1321,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
             <MessageCopyButton message={message} title="Copy Phoenix message" />
           </>
         )}
-      />
+      />}
       <div className="message-content">
         {(() => {
           // In compact mode, all of a turn's tool blocks collapse into one

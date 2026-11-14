@@ -694,6 +694,7 @@ describe('inline tool timers', () => {
 
     expect(document.querySelectorAll('.compact-tool-owner-copy .message-mobile-copy')).toHaveLength(1);
     expect(document.querySelectorAll('.compact-tool-selected-detail .message-mobile-copy')).toHaveLength(1);
+    expect(document.querySelectorAll('.compact-tool-selected-detail .assistant-message-toolbar')).toHaveLength(0);
   });
 
   it('keeps an expanded older compact tool before newer appended tools in DOM chronology', () => {

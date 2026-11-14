@@ -51,6 +51,7 @@ async function captureMobileExpandedSpacing({ page, id, outDir, viewport }) {
       '.compact-tool-selected-detail > .compact-tool-owner-copy',
       '.compact-tool-selected-detail > .compact-tool-detail-collapse',
       '.compact-tool-selected-detail > .message',
+      '.compact-tool-selected-detail > .message > .assistant-message-toolbar',
       '.compact-tool-selected-detail > .message > .message-content',
       '.compact-tool-selected-detail > .message > .message-content > *',
       '.compact-tool-selected-detail > .message .tool-block',
@@ -87,9 +88,21 @@ async function captureMobileExpandedSpacing({ page, id, outDir, viewport }) {
       }];
     }));
   });
+  const experimentStyle = await page.addStyleTag({
+    content: '.compact-tool-selected-detail > .message > .assistant-message-toolbar { display: none !important; }',
+  });
+  const toolbarHiddenExperiment = await page.evaluate(() => {
+    const toolbar = document.querySelector('.compact-tool-selected-detail > .message > .assistant-message-toolbar');
+    const content = document.querySelector('.compact-tool-selected-detail > .message > .message-content');
+    const rect = (element) => element instanceof HTMLElement
+      ? { top: Math.round(element.getBoundingClientRect().top + scrollY), height: Math.round(element.getBoundingClientRect().height) }
+      : null;
+    return { toolbar: rect(toolbar), content: rect(content) };
+  });
+  await experimentStyle.evaluate((element) => element.remove());
   const stem = `mobile-spacing-compact--${viewport.name ?? `${viewport.width}x${viewport.height}`}`;
   await page.screenshot({ path: path.join(outDir, `${stem}.png`), fullPage: true });
-  await writeFile(path.join(outDir, `${stem}.geometry.json`), `${JSON.stringify({ viewport, evidence }, null, 2)}\n`);
+  await writeFile(path.join(outDir, `${stem}.geometry.json`), `${JSON.stringify({ viewport, evidence, toolbarHiddenExperiment }, null, 2)}\n`);
   return true;
 }
 
