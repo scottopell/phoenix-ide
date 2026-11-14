@@ -59,7 +59,7 @@ describe('tool results fixture scenarios', () => {
       const data = toolResultsFixtureData(scenario);
       expect(data.slug).toContain(scenario.id);
       expect(data.conversationId).toContain(scenario.id);
-      expect(data.theme).toBe(scenario.theme ?? 'dark');
+      expect(data.theme).toBe('theme' in scenario ? scenario.theme : 'dark');
       expect(data.density).toBe(scenario.density);
       expect(data.pendingMessages).toEqual([]);
       expect(data.messages.length).toBeGreaterThanOrEqual(4);
