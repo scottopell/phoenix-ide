@@ -148,6 +148,19 @@ async function captureMobileExpandedSpacing({ page, id, outDir, viewport }) {
   if (copiedRead.aggregate.product_conversation_id !== 'fixture-review' || copiedRead.auto_continue_on_context_exhaustion !== false) {
     throw new Error('expanded preference read copy lost structured fields');
   }
+  const stack = await page.evaluate(() => {
+    const group = document.querySelector('.compact-tool-group');
+    const origin = group.getBoundingClientRect().top;
+    return Array.from(group.querySelectorAll('.compact-tool-strip, .compact-tool-card, .compact-tool-card-expand, .compact-tool-card-header, .compact-tool-card-summary, .compact-tool-owner-copy, .compact-tool-owner-copy button, .compact-tool-selected-detail, .compact-tool-detail-collapse, .compact-tool-selected-detail > .message, .assistant-message-toolbar, .tool-block, .tool-header, .tool-block-input, .tool-block-output')).map(el => {
+      const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+      return { className: el.className, toolId: el.closest('[data-tool-id]')?.getAttribute('data-tool-id'),
+        top: r.top - origin, bottom: r.bottom - origin, height: r.height, width: r.width,
+        display: s.display, minHeight: s.minHeight, paddingTop: s.paddingTop, paddingBottom: s.paddingBottom,
+        marginTop: s.marginTop, marginBottom: s.marginBottom, gap: s.gap,
+        text: el.matches('.compact-tool-card-summary, .compact-tool-detail-collapse') ? el.textContent : undefined };
+    });
+  });
+  await writeFile(path.join(outDir, `${stem}--stack.geometry.json`), `${JSON.stringify({ viewport, baseline, stack }, null, 2)}\n`);
   await page.screenshot({ path: path.join(outDir, `${stem}--read.png`), fullPage: true });
   await writeFile(path.join(outDir, `${stem}--read.geometry.json`), `${JSON.stringify({ viewport, readEvidence, copiedRead }, null, 2)}\n`);
   await page.locator('.compact-tool-selected-detail .compact-tool-detail-collapse').click();
