@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use super::{
     GoalActor, GoalAgentSource, GoalAttribution, GoalChange, GoalDisposition, GoalId, GoalMutation,
@@ -97,11 +96,8 @@ impl GoalPendingManagement {
     /// Panics if the typed source cannot serialize or fixed hash-based identifiers are invalid.
     #[must_use]
     pub fn mutation(&self) -> GoalMutation {
-        let identity = format!(
-            "{:x}",
-            Sha256::digest(
-                serde_json::to_vec(&self.source).expect("typed management source serializes"),
-            )
+        let identity = crate::domain::sm_event::exact_payload_fingerprint(
+            &serde_json::to_vec(&self.source).expect("typed management source serializes"),
         );
         let action_id =
             GoalText::parse(format!("goal-management:{identity}")).expect("fixed prefix with hash");

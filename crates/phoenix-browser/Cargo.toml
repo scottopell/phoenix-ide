@@ -10,39 +10,39 @@ path = "src/lib.rs"
 
 [dependencies]
 # WorkScope (session keying) and PhoenixRuntimeEnvironment (Chrome cache dir).
-phoenix-core = { path = "../phoenix-core" }
+phoenix-core = { workspace = true }
 
 # Browser automation via Chrome DevTools Protocol.
-async-tungstenite = { version = "0.32", default-features = false, features = ["handshake", "tokio-runtime"] }
-chromiumoxide = { version = "0.9", default-features = false, features = ["fetcher", "rustls", "zip0"] }
+async-tungstenite = { workspace = true, features = ["handshake", "tokio-runtime"] }
+chromiumoxide = { workspace = true, features = ["fetcher", "rustls", "zip0"] }
 
 # Async runtime (CDP event pumps, broadcast channels, locks).
-tokio = { version = "1", features = ["full"] }
+tokio = { workspace = true, features = ["full"] }
 
 # Serialization (console entries, profiling state, screencast events).
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-uuid = { version = "1", features = ["v4"] }
-url = "2"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+url = { workspace = true }
 
 # CDP event-stream combinators (StreamExt) and BoxFuture for the liveness hook.
-futures = "0.3"
+futures = { workspace = true }
 
 # Base64 (screencast frame payloads).
-base64 = "0.22"
+base64 = { workspace = true }
 
 # Hashing (deterministic user-data-dir keying off WorkScope::stable_key).
-sha2 = "0.11"
+sha2 = { workspace = true }
 
 # Typed errors.
-thiserror = "2"
+thiserror = { workspace = true }
 
-tracing = "0.1"
-libc = "0.2"
+tracing = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
-phoenix-core = { path = "../phoenix-core", features = ["test-support"] }
-tempfile = "3"
+phoenix-core = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

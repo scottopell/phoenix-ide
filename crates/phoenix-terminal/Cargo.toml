@@ -18,28 +18,28 @@ test-support = []
 
 [dependencies]
 # Shared domain vocabulary (WorkScope keys the session registry).
-phoenix-core = { path = "../phoenix-core" }
+phoenix-core = { workspace = true }
 
 # Async runtime + PTY readiness (AsyncFd is epoll-backed).
-tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
 
 # Async utilities for the WS<->PTY relay.
-futures = "0.3"
+futures = { workspace = true }
 
 # PTY / process management.
-nix = { version = "0.31", features = ["signal", "process", "term", "fs"] }
-libc = "0.2"
+nix = { workspace = true, features = ["signal", "process", "term", "fs"] }
+libc = { workspace = true }
 
 # OSC 133 parsing for CommandTracker (REQ-TERM-021).
-vte = "0.15"
+vte = { workspace = true }
 
-tracing = "0.1"
-uuid = { version = "1", features = ["v4"] }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
-proptest = "1"
+proptest = { workspace = true }
 # `rt-multi-thread` supports #[tokio::test] and Runtime::new() in this crate's tests.
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true

@@ -4013,6 +4013,7 @@ def collect_doctor_results() -> list[DoctorResult]:
     for name, command, environment in (
         ("cargo-nextest", ["cargo", "nextest", "--version"], rust_environment),
         ("allium", ["allium", "--version"], None),
+        ("cargo-deny", ["cargo", "deny", "--version"], None),
         ("ripgrep", ["rg", "--version"], None),
         ("ast-grep", ["ast-grep", "--version"], None),
     ):
@@ -4202,6 +4203,7 @@ _LANE_DEFS = [
     ("rust", {"RUST"}, "codegen + cargo test"),
     ("cargo-fmt", {"RUST"}, "cargo fmt --check"),
     ("clippy", {"RUST"}, "cargo clippy --all-targets (bounded non-incremental target)"),
+    ("deps", {"RUST"}, "cargo-deny: at most one version of each crate"),
     ("tsc", {"UI"}, "tsc -b --noEmit project typecheck"),
     ("ui-lint", {"UI"}, "eslint + stylelint"),
     ("vitest", {"UI"}, "vitest run"),
@@ -4222,7 +4224,7 @@ _LANE_DESCS = {name: desc for name, _, desc in _LANE_DEFS}
 
 _CI_LANE_GROUPS = {
     "rust": {"rust", "cargo-fmt"},
-    "clippy": {"clippy"},
+    "clippy": {"clippy", "deps"},
     "e2e": {"e2e"},
     "ui": {"tsc", "ui-lint", "vitest", "ast-grep", "allium", "spec-shape", "spec-anchors", "pkglock"},
     "fast": {"task"},
@@ -4253,7 +4255,7 @@ def _categorize_changed_paths(paths) -> set:
             cats.add("SELF")
         if (
             p.startswith("crates/")
-            or p in ("Cargo.toml", "Cargo.lock")
+            or p in ("Cargo.toml", "Cargo.lock", "deny.toml")
             or p.startswith(".cargo/")
             or p.startswith("rust-toolchain")
         ):
@@ -6977,6 +6979,27 @@ def cmd_check(
             ]
         run_step("rust-test-timing", timing_command)
 
+    def check_cargo_deny():
+        """Fail when the dependency graph compiles two versions of one crate.
+
+        Policy and the allowlist of known upstream duplicates live in
+        deny.toml. Locally a missing cargo-deny skips with an install hint;
+        in CI it fails so the gate cannot silently disappear.
+        """
+        import shutil
+        if not shutil.which("cargo-deny"):
+            hint = "install via 'cargo install cargo-deny --locked'"
+            if os.environ.get("CI"):
+                with results_lock:
+                    results.append(("cargo-deny", 1, 0.0, f"cargo-deny not found in CI; {hint}"))
+                return
+            with results_lock:
+                results.append(("cargo-deny", 0, 0.0, ""))
+            skipped_lane_reasons["deps"] = hint
+            reporter.step_skipped("deps", "cargo-deny", hint)
+            return
+        run_step("cargo-deny", ["cargo", "deny", "check", "bans"])
+
     def check_allium():
         """Validate every specs/<name>/<name>.allium parses under v3 grammar.
         `allium analyse` always exits 1 (findings or warnings), so we parse the
@@ -7621,6 +7644,7 @@ def cmd_check(
         ("cargo-fmt", lane_cargo_fmt),
         ("task", lane_task),
         ("ast-grep", check_ast_grep),
+        ("deps", check_cargo_deny),
         ("allium", check_allium),
         ("spec-shape", check_spec_shape),
         ("spec-anchors", check_spec_anchors),
@@ -8449,6 +8473,7 @@ _GRAPH_LANE_STEPS = {
     "rust": ["native bash launcher", "codegen export", "codegen-stale diff", "cargo test (compile)",
              "cargo test (run)"],
     "clippy": ["cargo clippy --all-targets -D warnings"],
+    "deps": ["cargo deny check bans"],
     "tsc": ["tsc -b --noEmit"],
     "ui-lint": ["eslint", "stylelint"],
     "vitest": ["vitest run"],
