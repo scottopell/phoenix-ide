@@ -38,7 +38,7 @@ import {
 import { ConnectedInputArea } from '../components/InputArea';
 import { useAnnotationDraft } from '../hooks/useDraft';
 import type { AnnotationDraft } from '../conversation/AnnotationDraftStore';
-import type { ComposerQuickAction, ComposerSendOptions, InputAreaHandle } from '../components/InputArea';
+import type { ComposerQuickAction, InputAreaHandle } from '../components/InputArea';
 import type { TerminalPanelStatus } from '../components/TerminalPanel';
 import { ExploreOnboardingBanner } from '../components/ExploreOnboardingBanner';
 import { MessageListSkeleton } from '../components/Skeleton';
@@ -74,7 +74,6 @@ import { WorkControlBar } from '../components/WorkActions';
 import { ContextExhaustedHandoff } from '../components/ContextExhaustedHandoff';
 import {
   useConversationEventCursorRef,
-  useTrackMessageAcceptance,
   useConversationView,
   useWorkScope,
   useCreateConversationWithStore,
@@ -712,7 +711,6 @@ function ConversationPageContent({
   const { showAuthPanel, setShowAuthPanel } = useAutoAuth(credentialStatus);
 
   const eventCursorRef = useConversationEventCursorRef(slug!);
-  const trackMessageAcceptance = useTrackMessageAcceptance(slug!);
 
   // Message queue management. `queuedMessages` is the raw store; the rendered
   // split between "pending in the message list" and "failed in the input area"
@@ -1283,10 +1281,9 @@ function ConversationPageContent({
       imgs: { data: string; media_type: string }[] = [],
       files: FileAttachment[] = []
     ) => {
-      if (!conversationId) return false;
-      if (isArchived) return false;
+      if (!conversationId) return;
+      if (isArchived) return;
 
-      const receipt = trackMessageAcceptance(conversationId, localId);
       sendingMessagesRef.current.add(localId);
 
       const phaseEventSeqBeforePost = atomRef.current.phaseLastAppliedEventSeq;
@@ -1355,9 +1352,7 @@ function ConversationPageContent({
             status: 'pending',
           });
         }
-        return true;
       } catch (err) {
-        if (receipt.accepted) return true;
         if (err instanceof ExpansionError) {
           // Don't mark as failed — InputArea restores the draft and shows
           // an inline error so the user can fix or remove the broken
@@ -1371,7 +1366,6 @@ function ConversationPageContent({
         console.error('Failed to send message:', err);
         markFailedRef.current(localId);
         rollbackOptimisticPhase();
-        return false;
       } finally {
         if (
           optimisticPhaseOwner
@@ -1380,11 +1374,10 @@ function ConversationPageContent({
         ) {
           optimisticPhaseOwnerRef.current = null;
         }
-        receipt.dispose();
         sendingMessagesRef.current.delete(localId);
       }
     },
-    [conversationId, isArchived, isOnline, queueOperation, dispatch, markAccepted, markSteeringQueued, trackMessageAcceptance]
+    [conversationId, isArchived, isOnline, queueOperation, dispatch, markAccepted, markSteeringQueued]
   );
 
   const sendMessageRef = useRef(sendMessage);
@@ -1417,7 +1410,7 @@ function ConversationPageContent({
     }
   }, [isConnected, conversationId, isArchived, localPendingMessages]);
 
-  const handleSend = useCallback(async (text: string, attachedImages: ImageData[], attachedFiles: FileAttachment[] = [], options?: ComposerSendOptions) => {
+  const handleSend = useCallback(async (text: string, attachedImages: ImageData[], attachedFiles: FileAttachment[] = []) => {
     if (!conversationId || isArchived) throw new Error('This conversation cannot receive a message.');
     userActionSeqRef.current += 1;
 
@@ -1425,13 +1418,9 @@ function ConversationPageContent({
 
     if (isConnected) {
       // Await so expansion errors propagate back to InputArea (REQ-IR-007)
-      const accepted = await sendMessage(msg.localId, text, attachedImages, attachedFiles);
-      if (!accepted && options?.restoreOnFailure) {
-        dismiss(msg.localId);
-        throw new Error('Could not send your annotations. Please try again.');
-      }
+      await sendMessage(msg.localId, text, attachedImages, attachedFiles);
     }
-  }, [conversationId, isArchived, enqueue, isConnected, sendMessage, dismiss]);
+  }, [conversationId, isArchived, enqueue, isConnected, sendMessage]);
 
   const handleRetry = useCallback((localId: string) => {
     const msg = queuedMessages.find((m) => m.localId === localId);

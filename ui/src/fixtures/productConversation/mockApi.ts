@@ -56,6 +56,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   let eventSourceOpenCount = 0;
   let eventSourceInitCount = 0;
   let latestEventSource: FixtureEventSource | null = null;
+  let lastSubmittedMessage: Message | null = null;
   let releaseOlderSnapshot: (() => void) | null = null;
 
   const record = (name: string, value: number | string) => {
@@ -238,11 +239,13 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       sendCount += 1;
       record('SendCount', sendCount);
       record('LastSentText', body.text ?? '');
-      if (scenario.sendFailure === 'after-acceptance') latestEventSource?.emitMessage({
+      lastSubmittedMessage = {
         event_presentation: null, message_id: `${conversation.id}:${body.message_id}`, conversation_id: conversation.id,
         sequence_id: Math.max(0, ...messages.map(message => message.sequence_id)) + 1,
         message_type: 'user', content: { text: body.text ?? '' }, created_at: new Date().toISOString(),
-      });
+      };
+      if (scenario.sendFailure === 'before-acceptance') return Response.json({ error: 'Fixture expansion rejected', error_type: 'file_not_found', reference: '@missing.ts' }, { status: 422 });
+      if (scenario.sendFailure === 'after-acceptance') latestEventSource?.emitMessage(lastSubmittedMessage);
       if (scenario.sendFailure) return Response.json({ error: 'Fixture send failure' }, { status: 503 });
       return Response.json({ queued: false, already_persisted: true });
     }
@@ -371,6 +374,8 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   }
   globalThis.EventSource = FixtureEventSource as unknown as typeof EventSource;
   const failLatestEventSource = () => latestEventSource?.triggerNativeError();
+  const acknowledgeLastSend = () => { if (lastSubmittedMessage) latestEventSource?.emitMessage(lastSubmittedMessage); };
+  window.addEventListener('product-conversation-fixture-acknowledge-last-send', acknowledgeLastSend);
   window.addEventListener('product-conversation-fixture-stream-failure', failLatestEventSource);
 
   return () => {
@@ -378,6 +383,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     window.removeEventListener('product-conversation-fixture-release-older', releaseOlderPage);
     releaseOlderPage();
     window.removeEventListener('product-conversation-fixture-stream-failure', failLatestEventSource);
+    window.removeEventListener('product-conversation-fixture-acknowledge-last-send', acknowledgeLastSend);
     api.getPrStatus = originalGetPrStatus;
     api.getProductConversationHistorySnapshot = originalGetProductConversationSnapshot;
     api.getProductConversationSnapshot = originalDefaultSnapshot;

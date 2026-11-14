@@ -224,7 +224,7 @@ describe('ProductConversationFixture', () => {
     window.getSelection()?.removeAllRanges();
   }, 15_000);
 
-  it.each(['before-acceptance', 'after-acceptance'] as const)('restores an annotation only if delivery failed %s', async sendFailure => {
+  it.each(['before-acceptance', 'after-acceptance', 'unacknowledged'] as const)('restores an annotation only if delivery failed %s', async sendFailure => {
     installReactionGeometry();
     const scenario = { ...getProductConversationScenario('inline-message-reactions'), sendFailure };
     const { container } = render(<ProductConversationFixture scenario={scenario} />);
@@ -245,12 +245,19 @@ describe('ProductConversationFixture', () => {
     fireEvent.change(reaction, { target: { value: 'Acceptance race regression' } });
     fireEvent.click(screen.getByRole('button', { name: 'Add to draft' }));
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
-    if (sendFailure === 'after-acceptance') {
+    if (sendFailure !== 'before-acceptance') {
       await waitFor(() => expect(screen.queryByRole('button', { name: 'Edit annotation 1' })).not.toBeInTheDocument());
       expect(draft).toHaveValue('');
-      expect(screen.queryByText('Could not send your annotations. Please try again.')).not.toBeInTheDocument();
+      if (sendFailure === 'unacknowledged') {
+        await screen.findByRole('button', { name: 'Retry' });
+        expect(JSON.parse(localStorage.getItem('phoenix:queue:reaction-work')!)).toHaveLength(1);
+        act(() => window.dispatchEvent(new Event('product-conversation-fixture-acknowledge-last-send')));
+      }
+      await waitFor(() => expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument());
+      expect(screen.queryByRole('button', { name: 'Edit annotation 1' })).not.toBeInTheDocument();
+      expect(draft).toHaveValue('');
     } else {
-      await screen.findByText('Could not send your annotations. Please try again.');
+      await screen.findByText('Fixture expansion rejected');
       expect(screen.getByRole('button', { name: 'Edit annotation 1' })).toHaveTextContent('Acceptance race regression');
       expect(draft).toHaveValue('Let’s keep the first version focused.');
     }

@@ -175,11 +175,6 @@ export function useConversationEventCursorRef(slug: string): MutableRefObject<nu
   return ref;
 }
 
-export function useTrackMessageAcceptance(scopeKey: string) {
-  const store = useConversationStore();
-  return useCallback((conversationId: string, localId: string) => store.trackMessageAcceptance(scopeKey, conversationId, localId), [store, scopeKey]);
-}
-
 export function useLastSseEventAt(slug: string): number {
   const store = useConversationStore();
 

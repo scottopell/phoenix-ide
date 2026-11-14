@@ -8,7 +8,6 @@ export {
   useLiveBashProgress,
   useLiveBashProgressForToolIds,
   useConversationEventCursorRef,
-  useTrackMessageAcceptance,
   useLastSseEventAt,
   useLastSseEventAtRef,
   useConversationSnapshot,

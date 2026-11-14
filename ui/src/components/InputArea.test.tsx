@@ -87,7 +87,7 @@ describe('editable annotation cards', () => {
     fireEvent.change(screen.getByRole('textbox', { name: 'Annotation 1 comment' }), { target: { value: 'Edited in composer' } });
     fireEvent.click(screen.getByRole('button', { name: 'Done' }));
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
-    expect(send).toHaveBeenCalledWith('General feedback\n\nRegarding message #2 (earlier:answer):\n\n```text\nSelected passage\n```\n\nEdited in composer', [], [rejectedFile], { restoreOnFailure: true });
+    expect(send).toHaveBeenCalledWith('General feedback\n\nRegarding message #2 (earlier:answer):\n\n```text\nSelected passage\n```\n\nEdited in composer', [], [rejectedFile]);
     fireEvent.click(screen.getByRole('button', { name: 'Edit annotation 1' }));
     expect(screen.getByRole('textbox', { name: 'Annotation 1 comment' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Delete annotation' })).toBeDisabled();
@@ -101,7 +101,7 @@ describe('editable annotation cards', () => {
     expect(store.getSnapshot('a').draft).toBe('Next message');
   });
 
-  it('retains editable cards and restores ordinary text when submission fails', async () => {
+  it('retains editable cards and restores text when delivery admission rejects', async () => {
     const store = new DraftStore();
     store.dispatch('a', { type: 'set_draft', text: 'General feedback' });
     const annotations = store.annotations.forScope('a');
@@ -109,7 +109,7 @@ describe('editable annotation cards', () => {
     const pending = deferredSend();
     render(<ConnectedRecoveryHarness store={store} send={pending.send} />);
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
-    await act(async () => pending.reject(new Error('Offline during submission')));
+    await act(async () => pending.reject(new Error('Destination unavailable')));
     expect(store.getSnapshot('a').draft).toBe('General feedback');
     fireEvent.click(screen.getByRole('button', { name: 'Edit annotation 1' }));
     expect(screen.getByRole('textbox', { name: 'Annotation 1 comment' })).toBeEnabled();

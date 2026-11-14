@@ -505,9 +505,9 @@ AND SHALL retain the submitted cards and highlights until submission is accepted
 WHEN submission is accepted
 THE SYSTEM SHALL clear only the submitted annotation cards and their highlights, preserving annotations and text added during submission.
 
-WHEN authoritative conversation history or its steering queue acknowledges a submitted message
-THE SYSTEM SHALL treat that acknowledgement as acceptance even if the HTTP request later fails
-AND SHALL NOT restore already-accepted annotations as an unsent draft.
+WHEN the ordinary delivery queue accepts ownership of a submitted message
+THE SYSTEM SHALL keep subsequent transport failures and authoritative acknowledgements in that delivery workflow
+AND SHALL NOT create an editable annotation copy of a message still owned by delivery.
 
 WHEN submission fails before message-delivery ownership is accepted
 THE SYSTEM SHALL retain the annotations and highlights and make the comments editable again.

@@ -43,10 +43,6 @@ export interface ComposerQuickAction {
   prompt: string;
 }
 
-export interface ComposerSendOptions {
-  restoreOnFailure: boolean;
-}
-
 const EMPTY_FILES: FileAttachment[] = [];
 
 function sameItems<T>(a: T[], b: T[]): boolean {
@@ -106,7 +102,7 @@ interface InputAreaProps {
    * May reject with an expansion error (REQ-IR-007) — the component will
    * display the error inline without clearing the draft.
    */
-  onSend: (text: string, images: ImageData[], files: FileAttachment[], options?: ComposerSendOptions) => Promise<void> | void;
+  onSend: (text: string, images: ImageData[], files: FileAttachment[]) => Promise<void> | void;
   onCancel: () => void;
   onRetry: (localId: string) => void;
   onDismissError?: (localId: string) => void;
@@ -528,8 +524,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     const clearedRevision = owner.current.revision;
 
     try {
-      if (hasAnnotations) await onSend(text, images, files, { restoreOnFailure: true });
-      else await onSend(text, images, files);
+      await onSend(text, images, files);
     } catch (err) {
       if (err instanceof ExpansionError || hasAnnotations) {
         const rejection = { ...submitted, error: err instanceof ExpansionError ? err.detail.error : err instanceof Error ? err.message : 'Could not send your annotations.' };
@@ -933,10 +928,10 @@ export const ConnectedInputArea = forwardRef<InputAreaHandle, ConnectedInputArea
     const draftRecovery = useDraftRecovery(slug);
     const annotationDraft = useAnnotationDraft(slug);
     const annotations = useSyncExternalStore(annotationDraft.subscribe, annotationDraft.getSnapshot);
-    const send = async (text: string, images: ImageData[], files: FileAttachment[], options?: ComposerSendOptions) => {
-      const submission = options?.restoreOnFailure ? annotationDraft.beginSubmission() : null;
+    const send = async (text: string, images: ImageData[], files: FileAttachment[]) => {
+      const submission = annotationDraft.getSnapshot().some(annotation => annotation.submission === null) ? annotationDraft.beginSubmission() : null;
       try {
-        if (submission) await rest.onSend(formatAnnotatedMessage(text, submission.annotations), images, files, options);
+        if (submission) await rest.onSend(formatAnnotatedMessage(text, submission.annotations), images, files);
         else await rest.onSend(text, images, files);
         if (submission) annotationDraft.finishSubmission(submission, true);
       } catch (error) {
