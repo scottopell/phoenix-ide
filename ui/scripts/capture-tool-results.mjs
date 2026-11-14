@@ -76,7 +76,7 @@ async function captureMobileExpandedSpacing({ page, id, outDir, viewport }) {
   if (!evidence.inputText?.includes('@conv:fixture-review') || !evidence.inputText.includes('message_id')) {
     throw new Error(`expanded send input is missing expected structured fields: ${JSON.stringify(evidence.inputText)}`);
   }
-  if (!evidence.resultText?.includes('delivered') || !evidence.resultText.includes('8f53edc3-0711-46d8-8f3b-004201a2f410')) {
+  if (!evidence.resultText?.includes('Delivered') || !evidence.resultText.includes('8f53edc3-0711-46d8-8f3b-004201a2f410')) {
     throw new Error(`expanded send result is missing its delivery outcome: ${JSON.stringify(evidence.resultText)}`);
   }
   if (!evidence.copyInputPresent || !evidence.queryDatabasePresent || !evidence.continuationPresent) {
