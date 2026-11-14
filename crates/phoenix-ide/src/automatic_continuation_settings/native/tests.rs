@@ -79,7 +79,18 @@ async fn native_preference_application_reads_and_sets_without_provider_dispatch(
     let Completion::Established(Ok(initial)) = initial else {
         panic!("initial native preference read was not established");
     };
-    assert!(!initial.auto_continue_on_context_exhaustion);
+    assert!(initial.auto_continue_on_context_exhaustion);
+    let opted_out = from_coordinator(
+        runtime.clone(),
+        coordinator.clone(),
+        target(),
+        Operation::Set(AutoContinueOnContextExhaustion::Disabled),
+    )
+    .await;
+    let Completion::Established(Ok(opted_out)) = opted_out else {
+        panic!("native opt-out was not established");
+    };
+    assert!(!opted_out.auto_continue_on_context_exhaustion);
     let changed = from_coordinator(
         runtime.clone(),
         coordinator.clone(),
@@ -134,7 +145,7 @@ async fn preclosed_native_setting_has_terminal_completion_and_no_preference_writ
         db.auto_continue_on_context_exhaustion(&coordinator.product_conversation_id)
             .await
             .unwrap(),
-        AutoContinueOnContextExhaustion::Disabled,
+        AutoContinueOnContextExhaustion::Enabled,
     );
 }
 
@@ -207,7 +218,7 @@ async fn authority_closure_while_waiting_refuses_write_and_ordinary_completion()
         db.auto_continue_on_context_exhaustion(&source.product_conversation_id)
             .await
             .unwrap(),
-        AutoContinueOnContextExhaustion::Disabled,
+        AutoContinueOnContextExhaustion::Enabled,
     );
 }
 
@@ -260,7 +271,7 @@ async fn rotation_while_waiting_revalidates_read_and_write_source_at_database_bo
             db.auto_continue_on_context_exhaustion(&source.product_conversation_id)
                 .await
                 .unwrap(),
-            AutoContinueOnContextExhaustion::Disabled,
+            AutoContinueOnContextExhaustion::Enabled,
         );
         assert!(!runtime.local_authority_is_closed());
     }

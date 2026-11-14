@@ -2,6 +2,120 @@ use super::*;
 use phoenix_core::domain::instance_identity::{FederationCredentialVerifier, InstanceId};
 
 #[tokio::test]
+async fn new_aggregates_are_enabled_but_existing_preferences_survive_reopen_and_bootstrap() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("continuation.sqlite");
+    let path = path.to_str().unwrap();
+    let db = Database::open(path).await.unwrap();
+    let ordinary = db
+        .create_conversation("fresh-ordinary", "fresh-ordinary", "/tmp", true, None, None)
+        .await
+        .unwrap();
+    let coordinator = db
+        .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+        .await
+        .unwrap();
+    for id in [
+        &ordinary.product_conversation_id,
+        &coordinator.product_conversation_id,
+    ] {
+        assert_eq!(
+            db.auto_continue_on_context_exhaustion(id).await.unwrap(),
+            AutoContinueOnContextExhaustion::Enabled
+        );
+    }
+    db.set_auto_continue_on_context_exhaustion(
+        &coordinator.product_conversation_id,
+        AutoContinueOnContextExhaustion::Disabled,
+    )
+    .await
+    .unwrap();
+    let legacy_id = ProductConversationId::new();
+    sqlx::query("INSERT INTO product_conversations (id, kind, ordinary_lifecycle) VALUES (?1, 'ordinary', 'open')")
+        .bind(legacy_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.pool().close().await;
+    drop(db);
+
+    let db = Database::open(path).await.unwrap();
+    let again = db
+        .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        again.product_conversation_id,
+        coordinator.product_conversation_id
+    );
+    assert_eq!(
+        db.auto_continue_on_context_exhaustion(&ordinary.product_conversation_id)
+            .await
+            .unwrap(),
+        AutoContinueOnContextExhaustion::Enabled
+    );
+    assert_eq!(
+        db.auto_continue_on_context_exhaustion(&coordinator.product_conversation_id)
+            .await
+            .unwrap(),
+        AutoContinueOnContextExhaustion::Disabled
+    );
+    assert_eq!(
+        db.auto_continue_on_context_exhaustion(&legacy_id)
+            .await
+            .unwrap(),
+        AutoContinueOnContextExhaustion::Disabled
+    );
+    let fresh = db
+        .create_conversation("after-reopen", "after-reopen", "/tmp", true, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.auto_continue_on_context_exhaustion(&fresh.product_conversation_id)
+            .await
+            .unwrap(),
+        AutoContinueOnContextExhaustion::Enabled
+    );
+}
+
+#[tokio::test]
+async fn manual_successor_keeps_explicit_opt_out_on_stable_aggregate() {
+    let db = Database::open_in_memory().await.unwrap();
+    let predecessor = db
+        .create_conversation("opt-out", "opt-out", "/tmp", true, None, None)
+        .await
+        .unwrap();
+    db.set_auto_continue_on_context_exhaustion(
+        &predecessor.product_conversation_id,
+        AutoContinueOnContextExhaustion::Disabled,
+    )
+    .await
+    .unwrap();
+    db.update_conversation_state(
+        &predecessor.id,
+        &phoenix_core::domain::sm_state::ConvState::ContextExhausted {
+            summary: "summary".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let successor = match db.continue_conversation(&predecessor.id).await.unwrap() {
+        crate::ContinueOutcome::Created(successor) => successor,
+        other => panic!("expected manual successor, got {other:?}"),
+    };
+    assert_eq!(
+        successor.product_conversation_id,
+        predecessor.product_conversation_id
+    );
+    assert_eq!(
+        db.auto_continue_on_context_exhaustion(&successor.product_conversation_id)
+            .await
+            .unwrap(),
+        AutoContinueOnContextExhaustion::Disabled
+    );
+}
+
+#[tokio::test]
 async fn federated_settings_recheck_authority_and_preserve_target_and_preference() {
     let db = Database::open_in_memory().await.unwrap();
     let ordinary = db
@@ -24,7 +138,7 @@ async fn federated_settings_recheck_authority_and_preserve_target_and_preference
             .await
             .unwrap()
             .preference,
-        AutoContinueOnContextExhaustion::Disabled
+        AutoContinueOnContextExhaustion::Enabled
     );
     let set = db
         .set_federated_automatic_continuation_settings(
@@ -192,10 +306,7 @@ async fn native_settings_use_current_coordinator_source_and_exact_ordinary_targe
         initial.aggregate,
         ResolvedAutomaticContinuationAggregate::Ordinary(ordinary.product_conversation_id.clone())
     );
-    assert_eq!(
-        initial.preference,
-        AutoContinueOnContextExhaustion::Disabled
-    );
+    assert_eq!(initial.preference, AutoContinueOnContextExhaustion::Enabled);
 
     let set = db
         .set_native_automatic_continuation_settings(
@@ -263,7 +374,7 @@ async fn native_coordinator_target_is_explicit_and_typed() {
     );
     assert_eq!(
         settings.preference,
-        AutoContinueOnContextExhaustion::Disabled
+        AutoContinueOnContextExhaustion::Enabled
     );
     let updated = db
         .set_native_automatic_continuation_settings(
@@ -425,6 +536,12 @@ async fn failed_update_trigger_rolls_back_without_changing_preference() {
         .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
         .await
         .unwrap();
+    db.set_auto_continue_on_context_exhaustion(
+        &coordinator.product_conversation_id,
+        AutoContinueOnContextExhaustion::Disabled,
+    )
+    .await
+    .unwrap();
     sqlx::query(
         "CREATE TRIGGER reject_auto_continue_update BEFORE UPDATE OF auto_continue_on_context_exhaustion ON product_conversations BEGIN SELECT RAISE(ABORT, 'rejected'); END",
     )

@@ -2534,8 +2534,33 @@ mod tests {
             serde_json::from_slice(&to_bytes(initial.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(initial["aggregate"]["kind"], "ordinary");
-        assert_eq!(initial["auto_continue_on_context_exhaustion"], false);
+        assert_eq!(initial["auto_continue_on_context_exhaustion"], true);
         assert!(initial["admission"].is_null());
+
+        let disabled = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(&uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"auto_continue_on_context_exhaustion":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disabled.status(), StatusCode::OK);
+        let disabled: serde_json::Value =
+            serde_json::from_slice(&to_bytes(disabled.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(disabled["auto_continue_on_context_exhaustion"], false);
+        assert!(state
+            .db
+            .automatic_continuation_admission(&root.id)
+            .await
+            .unwrap()
+            .is_none());
 
         let enabled = create_router(state.clone())
             .oneshot(
