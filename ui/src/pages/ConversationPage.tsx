@@ -200,6 +200,7 @@ export interface EmbeddedConversationProjection {
 }
 
 interface EmbeddedConversationHostProps {
+  composerScopeKey?: string | undefined;
   /** Makes the legacy application shell an owned class rather than a globally-unique id. */
   embeddedShell?: boolean;
   suppressCanonicalization?: boolean;
@@ -230,6 +231,7 @@ export function EmbeddedConversationPage({
   composerQuickAction,
   stateBarExtension,
   showTranscript = true,
+  composerScopeKey,
   embeddedShell = false,
   suppressCanonicalization = false,
   mutationEnabled = true,
@@ -262,9 +264,10 @@ export function EmbeddedConversationPage({
           which wraps every conversation route. Mounted above
           ConversationPageContent's viewer early-returns so draft persistence
           survives composer unmounts. */}
-      <DraftLifecycle slug={slug} />
+      <DraftLifecycle slug={composerScopeKey ?? slug} productScope={composerScopeKey ? { legacyTranscriptSlug: slug } : undefined} />
       <ConversationPageContent
         slug={slug}
+        composerScopeKey={composerScopeKey}
         routePrefix={routePrefix}
         composerQuickAction={composerQuickAction}
         stateBarExtension={stateBarExtension}
@@ -301,6 +304,7 @@ function RecoveryBanner({ message, recoveryKind }: { message: string; recoveryKi
 
 function ConversationPageContent({
   slug,
+  composerScopeKey,
   routePrefix,
   composerQuickAction,
   showTranscript,
@@ -317,6 +321,7 @@ function ConversationPageContent({
 }: {
   slug: string;
   routePrefix: '/c' | '/global';
+  composerScopeKey?: string | undefined;
   composerQuickAction?: ComposerQuickAction | undefined;
   stateBarExtension?: StateBarConversationExtension | undefined;
   showTranscript: boolean;
@@ -519,8 +524,8 @@ function ConversationPageContent({
   const inputRef = useRef<InputAreaHandle>(null);
   const isDesktop = useIsDesktop();
 
-  const { setDraftIfEmpty: setDraftIfEmptyCb, appendDraft: appendDraftCb } = useDraftActions(slug!);
-  const annotationDraft = useAnnotationDraft(slug!);
+  const { setDraftIfEmpty: setDraftIfEmptyCb, appendDraft: appendDraftCb } = useDraftActions(composerScopeKey ?? slug!);
+  const annotationDraft = useAnnotationDraft(composerScopeKey ?? slug!);
 
   // Monotonic focus-request counter. Any time we mutate the draft from
   // outside the textarea (terminal selection, prose-reader notes, retry,
@@ -638,6 +643,7 @@ function ConversationPageContent({
   // them and the contract "these are per-slug state" is colocated.
   const seedHydratedRef = useRef<string | null>(null);
   const [lastSlug, setLastSlug] = useState<string | undefined>(slug);
+  const [lastComposerScope, setLastComposerScope] = useState(composerScopeKey ?? slug);
   if (lastSlug !== slug) {
     setLastSlug(slug);
     // useState resets — React batches these into the same render.
@@ -647,8 +653,11 @@ function ConversationPageContent({
     setShowFileBrowser(false);
     setShowMobileTerminal(false);
     setTerminalStatus({ activity: 'disconnected', unreadLines: 0, cwd: '' });
-    setImages([]);
-    setFiles([]);
+    if (lastComposerScope !== (composerScopeKey ?? slug)) {
+      setLastComposerScope(composerScopeKey ?? slug);
+      setImages([]);
+      setFiles([]);
+    }
     setShowTaskApproval(false);
     setApprovalContextWindowUsed(null);
     setShowFirstTaskWelcome(false);
@@ -2496,9 +2505,9 @@ function ConversationPageContent({
         <RenderProfiler id="InputArea">
         <ConnectedInputArea
           ref={inputRef}
-          slug={slug!}
+          slug={composerScopeKey ?? slug!}
           cwd={routePrefix === '/global' ? undefined : conversation.cwd}
-          scopeKey={conversationId}
+          scopeKey={composerScopeKey ?? conversationId}
           convState={convStateForChildren}
           images={images}
           setImages={setImages}
@@ -2554,9 +2563,9 @@ function ConversationPageContent({
           <RenderProfiler id="InputArea">
           <ConnectedInputArea
             ref={inputRef}
-            slug={slug!}
+            slug={composerScopeKey ?? slug!}
             cwd={routePrefix === '/global' ? undefined : conversation.cwd}
-            scopeKey={conversationId}
+            scopeKey={composerScopeKey ?? conversationId}
             convState={convStateForChildren}
             images={images}
             setImages={setImages}
@@ -2612,9 +2621,9 @@ function ConversationPageContent({
         <RenderProfiler id="InputArea">
         <ConnectedInputArea
           ref={inputRef}
-          slug={slug!}
+          slug={composerScopeKey ?? slug!}
           cwd={routePrefix === '/global' ? undefined : conversation.cwd}
-          scopeKey={conversationId}
+          scopeKey={composerScopeKey ?? conversationId}
           convState={convStateForChildren}
           images={images}
           setImages={setImages}

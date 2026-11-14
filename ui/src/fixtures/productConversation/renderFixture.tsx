@@ -47,7 +47,7 @@ function pageHasSettled(root: HTMLElement, scenario: ProductConversationScenario
   if (scenario.state === 'error') {
     return root.textContent?.includes(scenario.snapshotError ?? 'Fixture failed to fetch product conversation snapshot') ?? false;
   }
-  if (scenario.initialEntry?.startsWith('/global/')) {
+  if (scenario.initialEntry?.startsWith('/global/') && !scenario.continuationJourney) {
     return root.querySelector('.coordinator-conversation #chat-view .conversation-event-card') !== null;
   }
   if (scenario.reminderFixture) {
@@ -124,7 +124,7 @@ function ProductConversationFixtureBody({ scenario, children }: Props) {
         <FocusScopeProvider>
           <ConversationProvider>
             {scenario.initialDraft && scenario.snapshot?.latest_transcript_row_id && (
-              <SeedReactionDraft slug={scenario.snapshot.latest_transcript_row_id} text={scenario.initialDraft} />
+              <SeedReactionDraft slug={`product:${scenario.snapshot.product_conversation_id}`} text={scenario.initialDraft} />
             )}
             {children}
             <ConversationReadinessProvider>

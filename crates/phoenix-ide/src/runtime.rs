@@ -7706,13 +7706,13 @@ impl RuntimeManager {
             .cloned()
     }
 
-    pub(crate) async fn publish_continuation_link(
-        &self,
-        predecessor_id: &str,
-        successor_id: &str,
-    ) {
+    pub(crate) async fn publish_continuation_link(&self, predecessor_id: &str, successor_id: &str) {
         let Ok(mut admitted) = self.acquire_local_authority_pass() else {
-            tracing::debug!(predecessor_id, successor_id, "continuation link live publication skipped after authority closed");
+            tracing::debug!(
+                predecessor_id,
+                successor_id,
+                "continuation link live publication skipped after authority closed"
+            );
             return;
         };
         let Some(broadcaster) = self.existing_conversation_broadcaster(predecessor_id).await else {
@@ -7742,7 +7742,11 @@ impl RuntimeManager {
             })
             .is_err()
         {
-            tracing::debug!(predecessor_id, successor_id, "continuation link live publication was rejected");
+            tracing::debug!(
+                predecessor_id,
+                successor_id,
+                "continuation link live publication was rejected"
+            );
         }
     }
 

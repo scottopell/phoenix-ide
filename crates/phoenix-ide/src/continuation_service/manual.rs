@@ -386,8 +386,13 @@ pub(super) async fn continue_manual(
             }
         })?;
 
-    if let ContinueOutcome::Created(successor) | ContinueOutcome::AlreadyContinued(successor) = &outcome {
-        service.runtime.publish_continuation_link(id, &successor.id).await;
+    if let ContinueOutcome::Created(successor) | ContinueOutcome::AlreadyContinued(successor) =
+        &outcome
+    {
+        service
+            .runtime
+            .publish_continuation_link(id, &successor.id)
+            .await;
     }
 
     if let Some(retry_phase) = automatic_retry_phase {

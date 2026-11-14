@@ -19,6 +19,34 @@ function readDraft(conversationId: string): string {
   }
 }
 
+function readProductDraft(scopeKey: string, legacyTranscriptId: string): string {
+  try {
+    const current = localStorage.getItem(storageKey(scopeKey));
+    // An empty stored value is a cleared-draft tombstone: it must take
+    // precedence over a legacy transcript key that could not be removed.
+    if (current !== null) return current;
+    const legacyKey = storageKey(legacyTranscriptId);
+    const legacy = localStorage.getItem(legacyKey);
+    if (legacy === null) return '';
+    localStorage.setItem(storageKey(scopeKey), legacy);
+    localStorage.removeItem(legacyKey);
+    return legacy;
+  } catch (error) {
+    console.warn('Error moving transcript draft to product scope:', error);
+    return '';
+  }
+}
+
+function writeProductDraft(scopeKey: string, value: string): void {
+  try {
+    // Keep an empty value rather than removing the key so a failed legacy-key
+    // cleanup cannot make an explicitly cleared draft reappear on revisit.
+    localStorage.setItem(storageKey(scopeKey), value);
+  } catch (error) {
+    console.warn('Error saving product draft to localStorage:', error);
+  }
+}
+
 function writeDraft(conversationId: string, value: string): void {
   try {
     if (value === '') {
@@ -39,6 +67,7 @@ function writeDraft(conversationId: string, value: string): void {
 export function clearDraftStorage(conversationId: string): void {
   try {
     localStorage.removeItem(storageKey(conversationId));
+    localStorage.removeItem(storageKey(`product:${conversationId}`));
   } catch (error) {
     console.warn('Error clearing draft from localStorage:', error);
   }
@@ -123,9 +152,12 @@ export function useDraftActions(slug: string): DraftActions {
  * Re-renders are confined to the `<DraftLifecycle>` wrapper component,
  * which returns null — zero DOM work.
  */
-export function useDraftLifecycle(slug: string): void {
+export function useDraftLifecycle(slug: string, productScope?: { legacyTranscriptSlug: string } | undefined): void {
   const draft = useDraftValue(slug);
-  const conversationId = useConversationSnapshot(slug)?.id ?? null;
+  const transcriptSlug = productScope?.legacyTranscriptSlug ?? slug;
+  const transcriptId = useConversationSnapshot(transcriptSlug)?.id ?? null;
+  const conversationId = productScope ? slug : transcriptId;
+  const isProductScope = productScope !== undefined;
   const store = useDraftStore();
 
   // Hydrate once per conversationId. `useLayoutEffect` runs after render
@@ -133,15 +165,17 @@ export function useDraftLifecycle(slug: string): void {
   // stored draft.
   const hydratedForRef = useRef<string | null>(null);
   useLayoutEffect(() => {
-    if (!conversationId) return;
+    if (!conversationId || (productScope && !transcriptId)) return;
     if (hydratedForRef.current === conversationId) return;
     hydratedForRef.current = conversationId;
     if (draft) return;
-    const stored = readDraft(conversationId);
+    const stored = productScope
+      ? readProductDraft(conversationId, transcriptId!)
+      : readDraft(conversationId);
     if (stored) {
       store.dispatch(slug, { type: 'set_draft', text: stored });
     }
-  }, [conversationId, draft, slug, store]);
+  }, [conversationId, draft, slug, store, productScope?.legacyTranscriptSlug, transcriptId]);
 
   // Debounced write-through. On a conversationId change with a pending
   // write for the prior conversation, flush it synchronously before
@@ -164,16 +198,18 @@ export function useDraftLifecycle(slug: string): void {
         pending.conversationId !== conversationId &&
         pending.value !== null
       ) {
-        writeDraft(pending.conversationId, pending.value);
+        if (isProductScope) writeProductDraft(pending.conversationId, pending.value);
+        else writeDraft(pending.conversationId, pending.value);
       }
     }
     pending.conversationId = conversationId;
     pending.value = draft;
     pending.timer = window.setTimeout(() => {
-      writeDraft(conversationId, draft);
+      if (isProductScope) writeProductDraft(conversationId, draft);
+      else writeDraft(conversationId, draft);
       pending.timer = null;
     }, DEBOUNCE_MS);
-  }, [conversationId, draft]);
+  }, [conversationId, draft, isProductScope]);
 
   // Flush any pending write on unmount (page close, navigation away).
   useEffect(() => {
@@ -183,7 +219,8 @@ export function useDraftLifecycle(slug: string): void {
         window.clearTimeout(pending.timer);
         pending.timer = null;
         if (pending.conversationId !== null && pending.value !== null) {
-          writeDraft(pending.conversationId, pending.value);
+          if (isProductScope) writeProductDraft(pending.conversationId, pending.value);
+          else writeDraft(pending.conversationId, pending.value);
         }
       }
     };
@@ -192,8 +229,8 @@ export function useDraftLifecycle(slug: string): void {
 
 /** Hosts {@link useDraftLifecycle} in isolation so the keystroke-frequency
  *  draft-value subscription doesn't re-render any sibling subtree. */
-export function DraftLifecycle({ slug }: { slug: string }): null {
-  useDraftLifecycle(slug);
+export function DraftLifecycle({ slug, productScope }: { slug: string; productScope?: { legacyTranscriptSlug: string } | undefined }): null {
+  useDraftLifecycle(slug, productScope);
   return null;
 }
 

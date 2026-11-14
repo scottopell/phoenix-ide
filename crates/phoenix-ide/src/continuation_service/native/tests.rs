@@ -713,10 +713,17 @@ async fn fresh_concurrent_requests_dispatch_one_opening_through_exact_turn_settl
             }
         }
     }
-    assert!(!published_links.is_empty(), "connected predecessor must learn the committed continuation without reconnect");
+    assert!(
+        !published_links.is_empty(),
+        "connected predecessor must learn the committed continuation without reconnect"
+    );
     assert!(published_links.iter().all(|link| link == successor_id));
     assert_eq!(
-        f.db.get_conversation(&f.predecessor).await.unwrap().continued_in_conv_id.as_ref(),
+        f.db.get_conversation(&f.predecessor)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .as_ref(),
         Some(successor_id)
     );
 

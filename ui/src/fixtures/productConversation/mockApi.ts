@@ -115,6 +115,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       await heldOlderPage;
       return older;
     }
+    if (!currentSnapshot) throw new Error(`Scenario ${scenario.id} has no current snapshot`);
     return currentSnapshot;
   };
 
@@ -406,7 +407,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       const listeners = this.listeners.get(type) ?? new Set();
       listeners.add(callback);
       this.listeners.set(type, listeners);
-      record('ActiveEventSourceSubscriptions', [...eventSources].reduce((count, source) => count + source.subscriptionCount, 0));
+      record('ActiveEventSourceSubscriptions', [...eventSources].filter(source => source.subscriptionCount > 0).length);
       if (type === 'init') {
         queueMicrotask(() => {
           if (this.readyState === FixtureEventSource.CLOSED) return;
@@ -444,7 +445,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
 
     removeEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
       this.listeners.get(type)?.delete(listener as (event: MessageEvent<string>) => void);
-      record('ActiveEventSourceSubscriptions', [...eventSources].reduce((count, source) => count + source.subscriptionCount, 0));
+      record('ActiveEventSourceSubscriptions', [...eventSources].filter(source => source.subscriptionCount > 0).length);
     }
 
     close(): void {
@@ -453,7 +454,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       eventSources.delete(this);
       record('EventSourceCloses', Number(document.documentElement.dataset['productConversationFixtureEventSourceCloses'] ?? '0') + 1);
       record('EventSourceLastClosedInstance', this.instanceId);
-      record('ActiveEventSourceSubscriptions', [...eventSources].reduce((count, source) => count + source.subscriptionCount, 0));
+      record('ActiveEventSourceSubscriptions', [...eventSources].filter(source => source.subscriptionCount > 0).length);
     }
   }
   const publishContinuation = () => {
@@ -498,7 +499,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       message_id: 'fixture-successor-message', conversation_id: currentConversation.id,
       sequence_id: 2, message_type: 'agent', origin: { kind: 'unknown_historical' },
       content: [{ type: 'text', text: 'Successor is streaming after the handoff.' }],
-      display_data: null, usage_data: null, created_at: '2026-07-01T12:01:00Z',
+      display_data: null, usage_data: null, event_presentation: null, created_at: '2026-07-01T12:01:00Z',
     };
     currentMessages = [message];
     successor.emit('message', { opening: null, sequence_id: message.sequence_id, message });

@@ -64,16 +64,16 @@ describe('ProductConversationFixture', () => {
     const route = document.documentElement.dataset['sourceFixtureLocation'];
     fireEvent.change(composer, { target: { value: 'Unsent mobile draft' } });
     act(() => window.dispatchEvent(new Event('product-conversation-fixture-continue')));
-    await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureEventSourceLastUrl']).toContain('fixture-continuation-successor'));
+    await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureEventSourceLastUrl']).toContain('fixture-successor'));
     await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureActiveEventSourceSubscriptions']).toBe('1'));
     expect(document.documentElement.dataset['sourceFixtureLocation']).toBe(route);
     expect(screen.queryByRole('button', { name: 'Open continuation' })).toBeNull();
     act(() => window.dispatchEvent(new Event('product-conversation-fixture-successor-message')));
-    await screen.findByText('Successor live message');
+    await screen.findByText('Successor is streaming after the handoff.');
     expect(screen.getByPlaceholderText('Type a message...')).toHaveValue('Unsent mobile draft');
-    act(() => window.dispatchEvent(new Event('product-conversation-fixture-native-error')));
-    await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureEventSourceInitCount']).toBe('3'));
-    expect(screen.getAllByText('Successor live message')).toHaveLength(1);
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-stream-failure')));
+    await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureEventSourceInits']).toBe('3'));
+    expect(screen.getAllByText('Successor is streaming after the handoff.')).toHaveLength(1);
     expect(document.documentElement.dataset['sourceFixtureLocation']).toBe(route);
   });
 

@@ -1679,6 +1679,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
         >
           <EmbeddedConversationPage
             slug={liveTranscriptRowId}
+            composerScopeKey={`product:${snapshot.product_conversation_id}`}
             showTranscript={false}
             embeddedShell
             suppressCanonicalization={true}
