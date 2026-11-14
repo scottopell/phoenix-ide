@@ -310,7 +310,14 @@ describe('ProductConversationFixture', () => {
     await act(async () => { fireEvent.click(returnButton); });
     await waitFor(() => expect(container.querySelector('[data-inline-reaction-message="reaction-answer-older"]')).not.toBeNull());
     await act(async () => { await new Promise<void>(resolve => requestAnimationFrame(() => resolve())); });
-    const input = await screen.findByRole('textbox', { name: 'Your reaction' });
+    const input = await screen.findByRole('textbox', { name: 'Your reaction' }, {
+      // The pill is portaled after the transcript, past where the DOM dump truncates.
+      onTimeout: (error) => {
+        const pill = document.querySelector('.reaction-pill');
+        error.message = `reaction pill at timeout: ${pill?.outerHTML ?? 'not rendered'}\n\n${error.message}`;
+        return error;
+      },
+    });
     expect(input).toHaveValue('Keep this guarantee.');
     expect(input).not.toHaveFocus();
     expect(fetchSnapshot).toHaveBeenCalledWith('fixture-product-conversation', expect.objectContaining({ before: 'reaction-page' }));
