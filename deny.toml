@@ -1,0 +1,70 @@
+# cargo-deny configuration. Run via `./dev.py check` (lane `deps`) or
+# directly with `cargo deny check bans`.
+#
+# Only the `bans` check is configured: its job is to keep the build from
+# compiling more than one version of the same crate.
+
+[graph]
+# The platforms Phoenix ships on. Windows-only crates never compile here.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+# Include optional features (e.g. `datadog-tracing`) so a feature-gated
+# dependency cannot sneak in a duplicate.
+all-features = true
+
+[bans]
+multiple-versions = "deny"
+wildcards = "allow"
+
+# Known duplicates, each pulled in by a dependency we do not control. Every
+# entry names the *older* version(s). When the upstream crate catches up the
+# entry stops matching and cargo-deny reports it as unused — delete it then.
+skip = [
+    # RustCrypto 0.10 -> 0.11 transition. Still on 0.10: sqlx-core,
+    # rust-embed-utils, sigstore-crypto, sha1, datadog-opentelemetry.
+    { crate = "sha2@0.10.9", reason = "RustCrypto 0.10 users: sqlx-core, rust-embed-utils, sigstore, datadog" },
+    { crate = "digest@0.10.7", reason = "RustCrypto 0.10 stack" },
+    { crate = "block-buffer@0.10.4", reason = "RustCrypto 0.10 stack" },
+    { crate = "crypto-common@0.1.7", reason = "RustCrypto 0.10 stack" },
+    { crate = "const-oid@0.9.6", reason = "RustCrypto 0.10 stack" },
+    { crate = "cpufeatures@0.2.17", reason = "RustCrypto 0.10 stack" },
+
+    # rand 0.9 ecosystem: opentelemetry_sdk, proptest, tungstenite.
+    { crate = "rand@0.9.4", reason = "opentelemetry_sdk, proptest, tungstenite" },
+    { crate = "rand_core@0.9.5", reason = "rand 0.9" },
+    { crate = "rand_chacha@0.9.0", reason = "rand 0.9" },
+    { crate = "getrandom@0.3.4", reason = "rand_core 0.9, jobserver" },
+
+    # Optional `datadog-tracing` feature: datadog-opentelemetry 0.4 and its
+    # libdd-* crates lag the rest of the graph.
+    { crate = "rand@0.8.6", reason = "datadog-opentelemetry" },
+    { crate = "rand_core@0.6.4", reason = "datadog-opentelemetry (rand 0.8)" },
+    { crate = "rand_chacha@0.3.1", reason = "datadog-opentelemetry (rand 0.8)" },
+    { crate = "getrandom@0.2.17", reason = "datadog-opentelemetry (libdd-data-pipeline)" },
+    { crate = "thiserror@1.0.69", reason = "datadog-opentelemetry" },
+    { crate = "thiserror-impl@1.0.69", reason = "datadog-opentelemetry" },
+    { crate = "base64@0.21.7", reason = "datadog-opentelemetry" },
+    { crate = "nix@0.29.0", reason = "datadog-opentelemetry (libdd-common)" },
+    { crate = "hashbrown@0.15.5", reason = "datadog-opentelemetry" },
+    { crate = "foldhash@0.1.5", reason = "datadog-opentelemetry (hashbrown 0.15)" },
+
+    # hashbrown 0.16: cached, hashlink (sqlx), lru, regress; indexmap is on 0.17.
+    { crate = "hashbrown@0.16.1", reason = "cached, hashlink, lru, regress" },
+
+    # opentelemetry-http 0.31 is on reqwest 0.12.
+    { crate = "reqwest@0.12.28", reason = "opentelemetry-http / opentelemetry-otlp" },
+    # chromiumoxide 0.9 pins async-tungstenite 0.32 -> tungstenite 0.28.
+    { crate = "tungstenite@0.28.0", reason = "chromiumoxide (async-tungstenite 0.32)" },
+    # cached_proc_macro uses darling 0.20; bon-macros uses 0.23.
+    { crate = "darling@0.20.11", reason = "cached_proc_macro" },
+    { crate = "darling_core@0.20.11", reason = "cached_proc_macro" },
+    { crate = "darling_macro@0.20.11", reason = "cached_proc_macro" },
+    # aws-lc-rs depends on untrusted 0.7; rustls-webpki on 0.9.
+    { crate = "untrusted@0.7.1", reason = "aws-lc-rs" },
+    # insta (dev-dependency) is on similar 2; phoenix-tools uses similar 3.
+    { crate = "similar@2.7.0", reason = "insta (dev-dependency)" },
+]

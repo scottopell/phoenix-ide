@@ -329,8 +329,12 @@ jobs:
         run: |
           git config --global user.email "ci@phoenix-ide.invalid"
           git config --global user.name "Phoenix CI"
-      - name: ./dev.py check (clippy)
-        run: ./dev.py check --lanes clippy
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.18.9
+      - name: ./dev.py check (clippy, deps)
+        run: ./dev.py check --lanes clippy,deps
 
   check-e2e:
     name: check (e2e)

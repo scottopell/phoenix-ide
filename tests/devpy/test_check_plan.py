@@ -778,7 +778,7 @@ class CheckPlanTests(unittest.TestCase):
 def workflow_order(group):
     return {
         "rust": ["rust", "cargo-fmt"],
-        "clippy": ["clippy"],
+        "clippy": ["clippy", "deps"],
         "e2e": ["e2e"],
         "ui": ["tsc", "ui-lint", "vitest", "ast-grep", "allium", "spec-shape", "spec-anchors", "pkglock"],
     }[group]
