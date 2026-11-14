@@ -3,7 +3,7 @@ import { api, ApiResponseError } from '../api';
 import type { Reminder } from '../generated/Reminder';
 import { useReminderRefresh } from './useReminderRefresh';
 import './RemindersPanel.css';
-import { formatReminderTime, normalizeReminderLocalInput, reminderLocalInput } from './reminderTime';
+import { formatReminderTime, normalizeReminderLocalInput, reminderLocalInput, reminderLocalTimeHasUniqueInstant } from './reminderTime';
 
 const STATE_ORDER = { due: 0, scheduled: 1, cancelled: 2 };
 
@@ -42,7 +42,7 @@ function OwnedRemindersPanel({ conversationId, readOnly }: { conversationId: str
       if (pending.kind === 'cancel') return saved.state.kind !== 'cancelled';
       if (saved.revision <= pending.revision || saved.state.kind === 'cancelled'
         || saved.timezone !== pending.timezone || reminderLocalInput(saved) !== normalizeReminderLocalInput(pending.local)) return true;
-      if (!pending.offset) return false;
+      if (!pending.offset) return !reminderLocalTimeHasUniqueInstant(saved);
       return saved.due_at_us !== Date.parse(`${normalizeReminderLocalInput(pending.local)}${pending.offset}`) * 1000;
     })));
   }, []);

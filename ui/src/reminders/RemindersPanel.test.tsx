@@ -181,6 +181,34 @@ describe('reminder visibility and management', () => {
     expect(api.manageReminder).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps a lost offset-less fold rejection unconfirmed after another writer saves the same wall time', async () => {
+    vi.mocked(api.listReminders).mockResolvedValueOnce([reminder()])
+      .mockResolvedValue([reminder({ revision: 2, due_at_us: Date.parse('2030-11-03T06:30:00Z') * 1000 })]);
+    vi.mocked(api.manageReminder).mockRejectedValueOnce(new Error('Network response lost'));
+    render(<RemindersPanel conversationId="owner" />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Reschedule' }));
+    fireEvent.change(screen.getByLabelText('Local date and time'), { target: { value: '2030-11-03T01:30' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save reminder time' }));
+    await screen.findByText(/Nov 3, 2030/);
+    expect(screen.getByRole('alert')).toHaveTextContent('Could not confirm reschedule reminder');
+    expect(api.manageReminder).toHaveBeenCalledWith('owner', 'rem-1', 'reschedule', 1,
+      { kind: 'at', local_datetime: '2030-11-03T01:30:00', timezone: 'America/New_York', utc_offset: null });
+    expect(api.manageReminder).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not confirm an offset-less request from a same-second but different saved instant', async () => {
+    vi.mocked(api.listReminders).mockResolvedValueOnce([reminder()])
+      .mockResolvedValue([reminder({ revision: 2, due_at_us: Date.parse('2030-02-01T15:30:00Z') * 1000 + 123456 })]);
+    vi.mocked(api.manageReminder).mockRejectedValueOnce(new Error('Network response lost'));
+    render(<RemindersPanel conversationId="owner" />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Reschedule' }));
+    fireEvent.change(screen.getByLabelText('Local date and time'), { target: { value: '2030-02-01T10:30' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save reminder time' }));
+    await screen.findByText(/Feb 1, 2030/);
+    expect(screen.getByRole('alert')).toHaveTextContent('Could not confirm reschedule reminder');
+    expect(api.manageReminder).toHaveBeenCalledTimes(1);
+  });
+
   it('matches a saved reschedule against the normalized offset sent to the server', async () => {
     vi.mocked(api.listReminders).mockResolvedValueOnce([reminder()])
       .mockResolvedValue([reminder({ revision: 2, due_at_us: Date.parse('2030-02-01T15:30:00Z') * 1000 })]);

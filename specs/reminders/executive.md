@@ -78,7 +78,9 @@ stale indication. Confirmed mutations hide obsolete state and actions until a
 fresh list arrives. Definite HTTP refusals retain actionable errors. An
 uncertain transport or server response is reported as unconfirmed, never
 replayed; a fresh owner-scoped read clears uncertainty only when it reflects
-the requested state. Omitted or unchanged rows retain the uncertainty.
+the requested state. An offset-less ambiguous local time does not confirm a
+reschedule through wall-time readback alone. Omitted or unchanged rows retain
+the uncertainty.
 Abortable, non-overlapping polling runs at five seconds and on visibility, focus
 and network return. Browser alerts use existing permission/settings/focus policy,
 persisted `notify_reminder` defaulting enabled, a quiet initial baseline and
