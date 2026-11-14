@@ -44,6 +44,9 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [255](255_compact-annotation-stack-with-modal-editing.md) | Compact annotation stack with modal editing | Accepted | REQ-PF-019–020 |
+| [254](254_editable-annotation-cards-own-pending-source-highlights.md) | Editable annotation cards own pending source highlights | Superseded by ADR-255 | REQ-PF-018–020 |
+| [253](253_reaction-pill-grows-with-wrapped-text.md) | Reaction pills grow with wrapped text | Accepted | REQ-PF-018–020, REQ-KB-004 |
 | [252](252_server-side-read-cursor-per-product-conversation.md) | Server-side read cursor per ProductConversation | Accepted | REQ-CONV-027 |
 | [251](251_explicit-loopback-oauth-callback-urls.md) | Explicit loopback OAuth callback URLs reuse the fixed-port listener | Accepted | REQ-MCP-020 |
 | [250](250_saved-messages-create-private-any-age-captures.md) | Saved messages create private captures of any age | Accepted | REQ-SG-001/003–007/017/019 |

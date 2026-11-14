@@ -28,6 +28,7 @@
     "qa:desktop-multi-pr-conversation": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-desktop-multi-pr-conversation.mjs",
     "qa:new-conversation": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-new-conversation.mjs",
     "qa:product-conversation": "PHOENIX_LADLE=1 node scripts/capture-product-conversation.mjs",
+    "qa:annotations": "PHOENIX_LADLE=1 node scripts/capture-annotations.mjs",
     "qa:message-list": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-message-list.mjs",
     "qa:work-actions": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-work-actions.mjs",
     "qa:svg-artifacts": "PHOENIX_LADLE=1 node scripts/capture-svg-artifacts.mjs",
