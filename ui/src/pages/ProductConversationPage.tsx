@@ -1208,6 +1208,8 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
     setSnapshotRetry((retry) => retry + 1);
   }, [snapshot?.product_conversation_id]);
 
+  const observedContinuationId = currentLatestProjection?.conversation?.continued_in_conv_id ?? null;
+
   useEffect(() => {
     const notificationIds = new Set([
       productConversationId,
@@ -1224,19 +1226,32 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
         && (close.phase !== 'completed'
           || close.outcome === 'close_incomplete'
           || close.outcome === 'archived_cleanup_attention');
-      if (source === 'close' || closeNeedsLiveRefresh) setSnapshotRetry((retry) => retry + 1);
+      if (source === 'close' || closeNeedsLiveRefresh || observedContinuationId) {
+        setSnapshotRetry((retry) => retry + 1);
+      }
     };
     const unsubscribes = [...notificationIds].map((id) =>
       subscribeCloseSnapshotChanged(id, refresh));
     return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
-  }, [ordinarySnapshot?.close, productConversationId, snapshot]);
-
-  const observedContinuationId = currentLatestProjection?.conversation?.continued_in_conv_id ?? null;
+  }, [ordinarySnapshot?.close, productConversationId, snapshot, observedContinuationId]);
 
   useEffect(() => {
     if (currentLatestProjection?.conversationId !== snapshot?.latest_transcript_row_id) return;
     if (observedContinuationId) setSnapshotRetry((value) => value + 1);
   }, [currentLatestProjection?.conversationId, observedContinuationId, snapshot?.latest_transcript_row_id]);
+
+  useEffect(() => {
+    if (!observedContinuationId) return;
+    const recover = () => {
+      if (document.visibilityState === 'visible') setSnapshotRetry((retry) => retry + 1);
+    };
+    window.addEventListener('online', recover);
+    document.addEventListener('visibilitychange', recover);
+    return () => {
+      window.removeEventListener('online', recover);
+      document.removeEventListener('visibilitychange', recover);
+    };
+  }, [observedContinuationId]);
 
   useEffect(() => {
     if (!currentLatestProjection?.conversationId || !ordinarySnapshot) return;
@@ -1600,6 +1615,9 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
       {(olderError || error || hashTargetExhausted) && (
         <div className="product-conversation-page__status" role="alert">
           {olderError ?? error ?? 'The linked message is not available in this conversation history.'}
+          {error && !olderError && (
+            <button type="button" onClick={() => setSnapshotRetry((retry) => retry + 1)}>Retry live view</button>
+          )}
         </div>
       )}
       <section className="view active product-conversation-page__transcript" data-testid="product-conversation-transcript">

@@ -169,11 +169,7 @@ impl ContinuationApplicationService {
                 .map_err(|error| error.to_string())?
                 .0
             {
-                ContinueOutcome::Created(successor) | ContinueOutcome::AlreadyContinued(successor) => {
-                    self.runtime
-                        .publish_continuation_link(&admission.predecessor_conversation_id, &successor.id)
-                        .await;
-                }
+                ContinueOutcome::Created(_) | ContinueOutcome::AlreadyContinued(_) => {}
                 ContinueOutcome::ParentNotContextExhausted { state_variant } => {
                     return Err(format!("predecessor state changed to {state_variant}"));
                 }
@@ -199,6 +195,10 @@ impl ContinuationApplicationService {
             .get_conversation(&intent.successor_conversation_id)
             .await
             .map_err(|error| error.to_string())?;
+
+        self.runtime
+            .publish_continuation_link(&admission.predecessor_conversation_id, &successor.id)
+            .await;
 
         if plan.transfer_ownership && automatic_intent {
             self.advance_current(

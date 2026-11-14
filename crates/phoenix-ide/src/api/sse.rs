@@ -1313,8 +1313,9 @@ mod tests {
                 continued_in_conv_id: Some("successor".into()),
             },
         };
-        let value = serde_json::to_value(event).unwrap();
-        assert_eq!(value["update"]["continued_in_conv_id"], "successor");
+        assert_parity(&event);
+        let value = typed_sse_event_to_value(&event);
+        assert_eq!(value["conversation"]["continued_in_conv_id"], "successor");
     }
 
     #[test]

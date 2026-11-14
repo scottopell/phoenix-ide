@@ -871,6 +871,7 @@ jobs:
           node scripts/capture-composer-rejection.mjs
           node scripts/capture-review-reading-position.mjs
           node scripts/capture-reminders.mjs
+          CAPTURE_STORIES=mobile-continuation-ordinary,mobile-continuation-global CAPTURE_VIEWPORT=mobile-light PLAYWRIGHT_INSTALLED_ONLY=1 node scripts/capture-product-conversation.mjs
           if [ -n "${BASE_SHA:-}" ]; then
             cd ..
             stop_server

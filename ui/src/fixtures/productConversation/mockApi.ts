@@ -57,6 +57,11 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   let eventSourceInitCount = 0;
   let latestEventSource: FixtureEventSource | null = null;
   let lastSubmittedMessage: Message | null = null;
+  let currentSnapshot = scenario.snapshot;
+  let currentConversation = latestConversation(scenario);
+  let currentMessages = scenario.alignedLatestMessages
+    ?? (scenario.snapshot?.segments.at(-1)?.messages ?? []) as Message[];
+  let continuationPublished = false;
   let releaseOlderSnapshot: (() => void) | null = null;
 
   const record = (name: string, value: number | string) => {
@@ -110,7 +115,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       await heldOlderPage;
       return older;
     }
-    return scenario.snapshot;
+    return currentSnapshot;
   };
 
   api.getProductConversationSnapshot = async (reference, options = {}) => {
@@ -144,7 +149,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     if (![scenario.snapshot.product_conversation_id, ...scenario.snapshot.segments.map(segment => segment.transcript_row_id)].includes(reference)) throw new Error(`Unknown Global member: ${reference}`);
     snapshotRequestCount += 1;
     record('SnapshotRequests', snapshotRequestCount);
-    if (!options.before) return scenario.snapshot;
+    if (!options.before) return currentSnapshot as typeof scenario.snapshot;
     const older = scenario.olderPages?.[options.before];
     if (!older) throw new Error(`Unknown Global cursor: ${options.before}`);
     record('OlderSnapshotRequests', Number(document.documentElement.dataset['productConversationFixtureOlderSnapshotRequests'] ?? '0') + 1);
@@ -172,10 +177,9 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     work_change: { kind: 'clean' as const },
   });
 
-  const conversation = latestConversation(scenario);
-  const route = { id: conversation.id, slug: conversation.slug };
-  const messages = scenario.alignedLatestMessages
-    ?? (scenario.sourceSnapshot ? [] : scenario.snapshot?.segments.at(-1)?.messages ?? []) as Message[];
+  const conversation = currentConversation;
+  let predecessorConversation: Conversation | null = null;
+  let route = { id: conversation.id, slug: conversation.slug };
 
   const sourceId = scenario.sourceSnapshot?.segments[0]?.transcript_row_id;
   const sourceConversation = { ...conversation, id: sourceId ?? conversation.id, slug: sourceId ?? conversation.slug };
@@ -183,9 +187,10 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   api.getConversationRoute = async (id) => id === sourceId ? { id, slug: id } : route;
   api.getConversationRouteBySlug = async (id) => id === sourceId ? { id, slug: id } : route;
   api.getConversation = async (id) => ({
-    conversation: id === sourceId ? sourceConversation : scenario.snapshot?.segments.some(segment => segment.transcript_row_id === id)
-      ? { ...conversation, id, slug: id } : conversation,
-    messages: id === sourceId ? sourceMessages : (scenario.snapshot?.segments.find(segment => segment.transcript_row_id === id)?.messages as Message[] | undefined) ?? messages,
+    conversation: id === sourceId ? sourceConversation : id === predecessorConversation?.id ? predecessorConversation
+      : currentSnapshot?.segments.some(segment => segment.transcript_row_id === id)
+        ? { ...currentConversation, id, slug: id } : currentConversation,
+    messages: id === sourceId ? sourceMessages : (currentSnapshot?.segments.find(segment => segment.transcript_row_id === id)?.messages as Message[] | undefined) ?? currentMessages,
     agent_working: false,
     presentation_mode: 'idle',
     context_window_size: 128_000,
@@ -194,7 +199,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   api.getProductConversationAutomaticContinuation = async (id) => ({ aggregate: { kind: 'ordinary', product_conversation_id: id }, auto_continue_on_context_exhaustion: false, admission: null });
   api.getCoordinatorAutomaticContinuation = async () => ({ aggregate: { kind: 'coordinator', product_conversation_id: 'source-product' }, auto_continue_on_context_exhaustion: false, admission: null });
   api.ensureGlobalCoordinator = async () => ({ conversation: scenario.kind === 'coordinator' ? conversation : { ...sourceConversation, id: 'current-global', slug: 'current-global' }, created: false });
-  api.resolveCoordinatorRoute = async (id) => ({ coordinator_id: scenario.kind === 'coordinator' && scenario.snapshot.segments.some(segment => segment.transcript_row_id === id) ? scenario.snapshot.product_conversation_id : scenario.sourceIsGlobal && (id === sourceId || id === 'current-global') ? scenario.sourceSnapshot?.product_conversation_id ?? null : scenario.initialEntry === `/global/${id}` ? id : null });
+  api.resolveCoordinatorRoute = async (id) => ({ coordinator_id: scenario.kind === 'coordinator' && currentSnapshot?.segments.some(segment => segment.transcript_row_id === id) ? scenario.snapshot.product_conversation_id : scenario.sourceIsGlobal && (id === sourceId || id === 'current-global') ? scenario.sourceSnapshot?.product_conversation_id ?? null : scenario.initialEntry === `/global/${id}` ? id : null });
   api.listConversations = async () => [];
   api.listArchivedConversations = async () => [];
   api.listModels = async () => ({
@@ -353,6 +358,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   globalThis.WebSocket = FixtureWebSocket as unknown as typeof WebSocket;
 
   const OriginalEventSource = globalThis.EventSource;
+  const eventSources = new Set<FixtureEventSource>();
   class FixtureEventSource {
     static readonly CONNECTING = 0;
     static readonly OPEN = 1;
@@ -366,11 +372,16 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     private readonly listeners = new Map<string, Set<(event: MessageEvent<string>) => void>>();
     private readonly instanceId: number;
     private readonly isSource: boolean;
+    private readonly conversationId: string;
+    get id(): number { return this.instanceId; }
+    get memberId(): string { return this.conversationId; }
 
     constructor(url: string) {
       this.isSource = Boolean(sourceId && url.includes(sourceId));
+      this.conversationId = new URL(url, location.href).searchParams.get('reference') ?? '';
       eventSourceOpenCount += 1;
       this.instanceId = eventSourceOpenCount;
+      eventSources.add(this);
       latestEventSource = this; // eslint-disable-line @typescript-eslint/no-this-alias
       record('EventSourceOpens', eventSourceOpenCount);
       record('EventSourceLastInstance', this.instanceId);
@@ -395,6 +406,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       const listeners = this.listeners.get(type) ?? new Set();
       listeners.add(callback);
       this.listeners.set(type, listeners);
+      record('ActiveEventSourceSubscriptions', [...eventSources].reduce((count, source) => count + source.subscriptionCount, 0));
       if (type === 'init') {
         queueMicrotask(() => {
           if (this.readyState === FixtureEventSource.CLOSED) return;
@@ -403,10 +415,10 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
           record('EventSourceLastInitializedInstance', this.instanceId);
           const init = { opening: null,
             sequence_id: 1,
-            conversation: this.isSource ? sourceConversation : conversation,
+            conversation: this.isSource ? sourceConversation : this.conversationId === predecessorConversation?.id ? predecessorConversation : currentConversation,
             transcript_generation: 1,
             transcript_coverage: 'complete',
-            messages: this.isSource ? sourceMessages : messages,
+            messages: this.isSource ? sourceMessages : this.conversationId === currentConversation.id ? currentMessages : (currentSnapshot?.segments.find(segment => segment.transcript_row_id === this.conversationId)?.messages ?? []),
             steering_messages: scenario.steeringMessages ?? [],
             agent_working: false,
             last_sequence_id: 1,
@@ -423,12 +435,77 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       }
     }
 
-    removeEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
-      this.listeners.get(type)?.delete(listener as (event: MessageEvent<string>) => void);
+    get subscriptionCount(): number { return [...this.listeners.values()].reduce((count, listeners) => count + listeners.size, 0); }
+
+    emit(type: string, data: unknown): void {
+      const event = new MessageEvent(type, { data: JSON.stringify(data) });
+      for (const listener of this.listeners.get(type) ?? []) listener(event);
     }
 
-    close(): void { this.readyState = FixtureEventSource.CLOSED; }
+    removeEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
+      this.listeners.get(type)?.delete(listener as (event: MessageEvent<string>) => void);
+      record('ActiveEventSourceSubscriptions', [...eventSources].reduce((count, source) => count + source.subscriptionCount, 0));
+    }
+
+    close(): void {
+      if (this.readyState === FixtureEventSource.CLOSED) return;
+      this.readyState = FixtureEventSource.CLOSED;
+      eventSources.delete(this);
+      record('EventSourceCloses', Number(document.documentElement.dataset['productConversationFixtureEventSourceCloses'] ?? '0') + 1);
+      record('EventSourceLastClosedInstance', this.instanceId);
+      record('ActiveEventSourceSubscriptions', [...eventSources].reduce((count, source) => count + source.subscriptionCount, 0));
+    }
   }
+  const publishContinuation = () => {
+    if (!scenario.continuationJourney || continuationPublished || !currentSnapshot) return;
+    continuationPublished = true;
+    const previous = currentConversation;
+    const predecessorId = previous.id;
+    const successorId = 'fixture-successor';
+    const last = currentSnapshot.segments.at(-1);
+    if (!last) throw new Error('Continuation fixture requires an existing transcript member');
+    const boundaryId = 'fixture-continuation-boundary';
+    const summary = 'The mobile investigation continues in the next transcript member.';
+    const predecessorSegment = { ...last, messages: [...last.messages, {
+      ...last.messages.at(-1)!, message_id: boundaryId, conversation_id: predecessorId,
+      sequence_id: Math.max(...last.messages.map(message => message.sequence_id), 1) + 1,
+      message_type: 'continuation' as const, content: { summary },
+    }] };
+    const successorSegment = { ...last, segment_ordinal: last.segment_ordinal + 1, transcript_row_id: successorId, slug: successorId,
+      title: 'Continued work', messages: [] };
+    currentSnapshot = { ...currentSnapshot, latest_transcript_row_id: successorId, writable_transcript_row_id: successorId,
+      canonical_route: scenario.kind === 'coordinator' ? `/global/${successorId}` : `/product-conversations/${currentSnapshot.product_conversation_id}`,
+      boundaries: [...currentSnapshot.boundaries, { message_id: boundaryId, represented_successor_opening_message_id: null,
+        predecessor_transcript_row_id: predecessorId, successor_transcript_row_id: successorId, segment_ordinal: last.segment_ordinal }],
+      segments: [...currentSnapshot.segments.slice(0, -1), predecessorSegment, successorSegment] };
+    predecessorConversation = { ...previous, continued_in_conv_id: successorId };
+    currentConversation = { ...previous, id: successorId, slug: successorId, continued_in_conv_id: null, message_count: 0 };
+    route = { id: successorId, slug: successorId };
+    currentMessages = [];
+    record('ContinuationSnapshotPersisted', successorId);
+    record('ContinuationOldSubscription', latestEventSource?.id ?? 0);
+    const predecessorSource = [...eventSources].find(source => source.memberId === predecessorId && source.subscriptionCount > 0);
+    if (!predecessorSource) throw new Error('Predecessor SSE is not subscribed');
+    predecessorSource.emit('conversation_update', { sequence_id: 2, conversation: { id: predecessorId, continued_in_conv_id: successorId } });
+    record('ContinuationUpdateInstance', predecessorSource.id);
+  };
+  window.addEventListener('product-conversation-fixture-continue', publishContinuation);
+  const publishSuccessorMessage = () => {
+    if (!scenario.continuationJourney || !continuationPublished) return;
+    const successor = [...eventSources].find(source => source.memberId === currentConversation.id && source.readyState === FixtureEventSource.OPEN && source.subscriptionCount > 0);
+    if (!successor) throw new Error('Successor SSE has not opened');
+    const message: Message = {
+      message_id: 'fixture-successor-message', conversation_id: currentConversation.id,
+      sequence_id: 2, message_type: 'agent', origin: { kind: 'unknown_historical' },
+      content: [{ type: 'text', text: 'Successor is streaming after the handoff.' }],
+      display_data: null, usage_data: null, created_at: '2026-07-01T12:01:00Z',
+    };
+    currentMessages = [message];
+    successor.emit('message', { opening: null, sequence_id: message.sequence_id, message });
+    record('SuccessorMessageInstance', successor.id);
+  };
+  window.addEventListener('product-conversation-fixture-successor-message', publishSuccessorMessage);
+
   globalThis.EventSource = FixtureEventSource as unknown as typeof EventSource;
   const failLatestEventSource = () => latestEventSource?.triggerNativeError();
   const acknowledgeLastSend = () => { if (lastSubmittedMessage) latestEventSource?.emitMessage(lastSubmittedMessage); };
@@ -441,6 +518,8 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     releaseOlderPage();
     window.removeEventListener('product-conversation-fixture-stream-failure', failLatestEventSource);
     window.removeEventListener('product-conversation-fixture-acknowledge-last-send', acknowledgeLastSend);
+    window.removeEventListener('product-conversation-fixture-continue', publishContinuation);
+    window.removeEventListener('product-conversation-fixture-successor-message', publishSuccessorMessage);
     api.getPrStatus = originalGetPrStatus;
     api.getProductConversationHistorySnapshot = originalGetProductConversationSnapshot;
     api.getProductConversationSnapshot = originalDefaultSnapshot;

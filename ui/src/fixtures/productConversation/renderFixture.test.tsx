@@ -4,7 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { api } from '../../api';
 import { InlineReactionStore } from '../../conversation/InlineReactionStore';
 import { ProductConversationFixture } from './renderFixture';
-import { getProductConversationScenario } from './scenarios';
+import { getProductConversationScenario, makeMobileContinuationScenario } from './scenarios';
 import { makeCompactEventsScenario } from './eventCards';
 import { installProductConversationFixtureApi } from './mockApi';
 
@@ -53,6 +53,28 @@ describe('ProductConversationFixture', () => {
     } finally {
       restore();
     }
+  });
+
+  it.each(['ordinary', 'coordinator'] as const)('follows a published %s continuation through the real stream and resumes after disconnect', async (kind) => {
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(1000);
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ x: 0, y: 0, top: 0, left: 0, right: 390, bottom: 844, width: 390, height: 844, toJSON: () => ({}) });
+    render(<ProductConversationFixture scenario={makeMobileContinuationScenario(kind)} />);
+    const composer = await screen.findByPlaceholderText('Type a message...');
+    await waitFor(() => expect(composer).toBeEnabled());
+    const route = document.documentElement.dataset['sourceFixtureLocation'];
+    fireEvent.change(composer, { target: { value: 'Unsent mobile draft' } });
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-continue')));
+    await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureEventSourceLastUrl']).toContain('fixture-continuation-successor'));
+    await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureActiveEventSourceSubscriptions']).toBe('1'));
+    expect(document.documentElement.dataset['sourceFixtureLocation']).toBe(route);
+    expect(screen.queryByRole('button', { name: 'Open continuation' })).toBeNull();
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-successor-message')));
+    await screen.findByText('Successor live message');
+    expect(screen.getByPlaceholderText('Type a message...')).toHaveValue('Unsent mobile draft');
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-native-error')));
+    await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureEventSourceInitCount']).toBe('3'));
+    expect(screen.getAllByText('Successor live message')).toHaveLength(1);
+    expect(document.documentElement.dataset['sourceFixtureLocation']).toBe(route);
   });
 
   it.each(['ordinary-lazy-history', 'global-lazy-history'] as const)('keeps an explicit loaded prompt selection when the %s unloaded-boundary read resolves', async (id) => {
