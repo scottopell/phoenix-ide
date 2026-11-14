@@ -10,6 +10,7 @@ Ember sees a fresh compact index of what it is tracking on subsequent dispatches
 
 - Add a bounded server-rendered tracking projection at the existing fresh Coordinator-context construction boundary. Include registry revision, active count, entries/read pointers and explicit partial-list/pagination information.
 - Keep full notes/evidence behind bounded native reads. Never present a prefix as the complete or fully reviewed list. Define ordering and overflow behavior; no invented priority scores.
+- Carry phase 5's mandatory review-needed state through list/detail/fresh context. New evidence since explicit review invalidates the saved next step; present it as unreviewed historical note, never a ready action. Require trusted source reconciliation before using it for follow-through. Overflow reports omitted and review-needed counts with bounded read pointers; omitted entries or an older context index cannot establish current readiness. Reconcile only the selected item, without blocking unrelated work or introducing a review scheduler.
 - Use stable singleton ownership through continuation topology. Exact source citations remain pinned; a current conversation link resolves its actual successor.
 - Treat notes and extracted source as untrusted stored data. Do not promote prose into Authority or reported live state. Clearly separate a saved bookmark/request and supporting agent report from permission to act.
 - Update global-recall requirements/ADRs for the deliberate new memory projection. Preserve the decision to fetch live activity on demand rather than reviving an inferred global activity capsule.
@@ -24,6 +25,8 @@ runtime/executor.rs Coordinator prompt construction near build_coordinator_syste
 ## Done when
 
 A record created before continuation is discoverable in the successor's fresh context without relying on the handoff summary; retirement/revisions survive restart; overflow is explicit; exact historical evidence and current conversation navigation remain distinct. Test malicious note text, absent evidence, ordinary/child context exclusion, empty registry and over-budget index.
+
+Missed-pause journey: store “resume deployment,” append the later user's pause as evidence, continue Ember and attempt to use the old step. Fresh index/detail and overflow paths must expose reconciliation required; the stale step cannot appear ready. Trusted revision-checked reconciliation preserves the pause, and no scanner operation can clear it or supply permission.
 
 Qualify through production context construction and a controlled real continuation journey. Existing four-tool coordinator-drive-eval does not prove this path. Run owning Rust/spec checks and UI/native checks only for actual presentation changes.
 

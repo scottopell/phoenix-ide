@@ -4,7 +4,15 @@ Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). Re
 
 ## Outcome
 
-Ember has an accurate, production-derived capability map and coherent instructions for composing its existing tools. Freeze the new event-evidence and tracking/scanner boundaries before adding stateful behavior.
+Ember has an accurate, production-derived capability map and coherent instructions for composing its existing tools. Keep shared terminology consistent, with feature-local contracts accepted before the behavior they govern. This task is not a whole-program design freeze.
+
+## Feature-local prerequisites
+
+- Event capture/projection needs only its relevant baseline and occurrence/retention/privacy/capture/follow-up-read contract. Accepting that subset unblocks phases 3–4 even while tracking/scanner work in this task remains unfinished.
+- Tracking persistence needs its record/native-tool/reconciliation contract before phase 5 implementation; event and scanner details do not gate it.
+- Scanner frontier, generation invalidation, application identity, route and budget decisions belong to phase 7 and must be settled before scanner activation. They do not block event or direct-tracking delivery.
+
+The owning feature task specifies and qualifies its contract. This shared task keeps the map and guidance aligned without duplicating normative authorities or adding another phase.
 
 ## Work
 
@@ -13,11 +21,11 @@ Ember has an accurate, production-derived capability map and coherent instructio
 - Generate definitions through RuntimeManager::coordinator_tool_registry, including configured spawn options, language variants and optional authenticated catalog. The measured installed surface had 27 tools including skill, with 41,923 description/schema characters, not tokens. Capture schemas/descriptions/deferred flags and byte/word metrics; do not hand-author a second authoritative tool list.
 - Correct verified guidance drift: creation is installed despite ToolRegistry's stale comment; watch descriptions must include supported nonterminal waits.
 - Make native-first/public-API-fallback guidance and identity handoffs explicit. Preserve stable product targets versus exact transcript/message/predecessor/summary/run/revision/reference meanings and deliberate local/peer differences.
-- Draft tracking requirements/executive and an ADR for singleton-owned memory, retired records, normalized references, explicit source coverage, fresh context retrieval, no new work scheduler and feature-scoped forward recovery. Record the user's roadmap deprecation separately; phase 2 owns its removal.
+- Align tracking terminology with phase 5's requirements/executive and ADR for singleton-owned memory, retired records, normalized references, review-needed evidence, fresh context retrieval and feature-scoped forward recovery. Phase 5 owns its record/native-tool contract; phase 7 owns precise coverage semantics. Record the user's roadmap deprecation separately; phase 2 owns its removal.
 - Specify occurrence-bound completion evidence and its retention/projection contract for [phase 3](./06020-p1-ready--bind-watch-events-to-ending-response-evi.md). Reuse the terminal obligation's exact response carrier; distinguish execution generation from source-content version. Existing historical/remote facts need honest absent-capability states. Preserve original diagnostics, private/shared boundaries and current event timing. [Phase 4](./06021-p1-ready--enrich-ember-event-context-and-measure-f.md) qualifies the bounded excerpt and compact model projection; do not build another send alert or summary model.
 - Freeze capture versus rendering limits before capture implementation: initial evaluation uses 1,024 UTF-8 bytes for both. Persist capture provenance; a later higher rendering limit cannot recover uncaptured content from changed source. Before trials, declare attribution/authority gates, targeted retrieval reduction and allowed total-context/latency regressions in control cases.
-- User-selected scanner scope is Ember's own continuation chain ONLY. Capture user-requested work and meaningful conversational bookmarks; assistant context is supporting evidence, not a worker-promise inventory. Read Issue #1075: preserve the stopping point/question and make returning easy without turning curiosity into a task. Use one item per meaningful concern/commitment and no hierarchy. User selected all-history backfill in bounded batches, prioritizing new messages, with no date cutoff. Saved items are reviewed during normal turns and existing watch/reminder wakeups; no new periodic review. Specify a frozen activation boundary and separate live/backfill frontiers; do not let tail scanning mark a historical gap covered. Establish exact host-owned application/batch identity independently of model semantic/evidence matching. Retained evidence is not a promise that the model reproduces an extraction key. Worker/remote transcripts are excluded from scanner discovery.
-- Resolve exact API replay/revision behavior and scanner route/cost limits from evidence before activation. Avoid adding per-item priority/deadlines/assignments by default.
+- Record the settled scanner scope in the shared map: Ember's own continuation chain ONLY, user-requested work and meaningful bookmarks, all-history bounded backfill prioritizing new messages, and no new periodic review wakeups. Read Issue #1075. Phase 7 owns the live/backfill frontier, generation invalidation, application identity and route/budget contracts; resolve them there before activation. Worker/remote transcripts remain excluded.
+- Each feature freezes its own exact API replay/revision behavior before implementing its mutations. Avoid adding per-item priority/deadlines/assignments by default.
 - Keep query_database as a supported narrow evidence path. Event-follow-up latest-message reads are the first measured journey to improve. Reconcile existing search-performance and native Close owners before commissioning additional work; no universal discovery wrapper is required.
 
 ## Schema derisking constraint
@@ -32,6 +40,6 @@ Existing task 20005 owns instance-routing architecture; task 28007 owns compact 
 
 ## Done when
 
-Full runtime inventory is reproducible; examples compose actual emitted identities for local read/send/watch, selected-peer query/read/watch, exact generated continuation and operation-specific peer reconciliation. Existing valid inputs and their effects remain unchanged in this slice. Provider schema constraints remain covered. New contracts distinguish exact event evidence, captured memory, authorization, coverage and execution. Relevant spec/registry/provider tests and the supported dev.py lanes pass; live acceptance is reported separately.
+Full runtime inventory is reproducible; examples compose actual emitted identities for local read/send/watch, selected-peer query/read/watch, exact generated continuation and operation-specific peer reconciliation. Existing valid inputs and their effects remain unchanged in this slice. Provider schema constraints remain covered. Shared guidance distinguishes exact event evidence, captured memory, authorization, coverage and execution, with contracts owned and gated by their respective feature slices. Relevant spec/registry/provider tests and the supported dev.py lanes pass; live acceptance is reported separately. This task's aggregate completion is not a prerequisite for accepting the event-specific subset.
 
 Out of scope: rebuilding delivered schemas or federation, broad tool consolidation, event runtime implementation, tracking persistence and scanner inference.

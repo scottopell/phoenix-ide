@@ -85,11 +85,14 @@ Persist a typed completion-evidence record atomically with the existing outbox o
 - Exact settled-input locator and typed origin/sender facts where known. Do not claim one input was the sole cause if others were co-consumed.
 - Exact ending-response locator, with captured prose versus tool-only/empty/no-carrier/historical-unavailable cases.
 - A bounded verbatim occurrence-time excerpt with explicit truncation and source-version provenance.
+- A versioned full-response canonical-content digest for guarded follow-up reads, not a hash of only the captured prefix.
 - Normalized fields/ordered child rows for addressable evidence, not a JSON collection or a second full transcript.
 
 source_generation is an execution-occurrence generation, not a transcript-edit fence. Bind content/version provenance explicitly. A later edit, deletion, continuation or newer response must never replace the captured evidence with different text. Define the bounded historical-quotation retention contract, including recipient history and source deletion, in requirements/ADR; do not introduce a generic source-retention guarantee.
 
 Old events receive an honest historical-not-captured state, not a guessed backfill. Preserve original persisted diagnostic/provider text and already accepted identities. No new send/queued-delivery notification, model-written summary, work scheduler, suppression or wake-timing change.
+
+Exact message identity does not freeze its content. Emit an occurrence-bound evidence reference that preserves the expected full-response digest through the existing read surface and every page. Validate and read from one consistent snapshot; a changed/deleted source yields explicit changed/historical-unavailable evidence rather than an edited occurrence-time tail. Current-source navigation/text remains separately labelled. This narrow composition needs neither full historical-response storage nor a universal retrieval wrapper.
 
 Tool-only endings have an exact history pointer and honest lack of prose. Do not build outgoing-report fragment extraction by default; consider it only if evaluation demonstrates need and exact execution attribution is available.
 
@@ -113,6 +116,8 @@ Typed references/evidence are ordered child rows. Distinguish instance-qualified
 
 Expose one compact bounded tracking capability for list/read/record/update/retire/reopen through one application service. Trusted invocation identity and revision checks apply; scanner uses the same service. Retained retirement reasons remain visible to later scans. Explicit Ember decisions may reopen on new evidence; the scanner cannot reopen/retire, overwrite Ember's prose, or turn its interpretation into authority.
 
+New evidence since explicit review invalidates the saved resumption step. Derive review-needed from ordered evidence and a trusted reviewed watermark, without a second mutable flag or model restriction classifier. Scanner-created items start unreviewed. List/detail/context returns a review-required variant instead of presenting stale prose as a ready next step; overflow exposes omitted/review-needed counts and read pointers. Trusted Ember reconciliation reads new source evidence and clears the signal only under matching revisions, preserving pauses. Scanner cannot clear it or lift a restriction; reviewed never implies permission.
+
 At every Coordinator dispatch, including after continuation, provide a fresh bounded active index independent of the generated summary: registry revision, count, entries/pointers and explicit overflow/pagination. Full notes/evidence use bounded reads. Keep /global chat-first; use existing conversation/tool surfaces, with any added bounded inspector's web/native scope explicit.
 
 Paused work stays visible with its restriction and resumption condition; completed milestones must not hide unresolved user outcomes. Preserve user corrections and dropped investigative threads so scanning does not revive them.
@@ -126,6 +131,8 @@ Pass explicit origin, quotation and question-answer structure. Subscription even
 Use one tool-free, bounded, low-priority inference runner. A durable checkpoint plus startup discovery recovers missed post-commit kicks; do not await inference on foreground input admission. Use an explicit eligible cheap route, input/output/time/retry/backfill budgets and visible coverage/failure. The existing cheap selector's default-model fallback cannot silently choose expensive work.
 
 Snapshots bind transcript generation, message/fragment position and registry revision. Append does not bump transcript_generation; edits/recovery do. Oversized messages need a generation/digest-bound fragment position or explicit unprocessed state. A complete valid empty result may advance its exact range; failed/partial/truncated/invalid output may not.
+
+Committed coverage is also generation-bound. The same runner discovers generation changes without a new tail, including after restart or a missed kick. Conservatively mark that transcript's old coverage stale and reset its new-generation positions to the beginning with a new frozen live boundary, retaining all saved items/evidence/retirements. Rescan incrementally; do not silently carry forward an old completed frontier. Generation/range identifies batch application; unchanged exact source evidence for the same identified item is not appended again, while changed content is a new observation requiring reconciliation. No second scheduler or foreground review wakeup is added.
 
 Apply captures/evidence and coverage atomically under source/cursor/registry revision checks. Dismissal/edit conflicts commit neither stale additions nor coverage. Model calls may repeat after interruption; committed range application must not repeat. Host-owned batch/application identity is separate from model semantic matching. Two commitments in one message stay representable; changed wording may still produce duplicates for Ember to dismiss.
 
@@ -152,7 +159,7 @@ The user selected both recommendations. Remaining model budgets, excerpt tuning 
 | 7 | Cheap origin-aware scanner | [06018](./06018-p1-ready--ember-cheap-transcript-safety-net.md) |
 | 8 | Final cross-feature acceptance/cutover | [06019](./06019-p1-ready--ember-coordination-end-to-end-qualificat.md) |
 
-Dependencies: 1→3→4 is the first behavior path; 1→5→6→7 is the memory path. Phase 2 is independently shippable and must not wait for scanner activation. Phase 8 combines delivered slices. Each slice qualifies its own behavior before integration; event measurements do not wait for the scanner.
+Dependencies are feature-local: the event-relevant baseline/contract in phase 1 unblocks 3→4; the tracking-relevant subset unblocks 5→6→7. Neither requires all of phase 1 to finish. Phase 3 owns its occurrence/retention/privacy/capture contract, phase 5 its record/native-tool/reconciliation contract, and phase 7 its frontier/invalidation/application/model-budget contract before activation. Scanner design cannot block events or direct tracking. Phase 2 is independently shippable; phase 8 combines delivered slices. Each slice qualifies before integration; event measurements do not wait for the scanner.
 
 Use logical PRs with the mandatory phase tasks visible. Ready filenames denote planned work, not satisfaction of dependencies or delivery.
 
@@ -168,13 +175,19 @@ No bulk import or dual writing. Carry forward only currently confirmed obligatio
 
 Required event scenarios: A ends, B responds before A delivery; exact steering/interaction race; tool-only/empty ending; oversized Unicode and explicit truncation; source edit/delete; historical absent carrier; private/shared projections; peer legacy capability; replay/reopen; failure/wait/cancellation/mandatory cleanup and unwatch/continuation invariants.
 
+Follow-up evidence tests include an oversized response whose uncaptured conclusion changes and an edit between read pages. No changed tail or current surrounding context may acquire an occurrence-time label.
+
 Required memory scenarios: user detour and return; explicit request versus bookmark; quoted correction and structured answer; pause preserved until lift; milestone done while user outcome remains; intentionally dropped investigation; two items in one message; retirement/inference race; changed wording duplicate; partial output; unavailable cheap route; same-transcript live tail during backfill.
+
+Also require missed pause → evidence append → continuation → stale-step attempt, including overflow and revision-raced reconciliation. After completed coverage through sequence 100, edit message 5 with no append, miss the kick and restart: invalidate/reset and finish bounded rescanning, distinguish new content from exact retries, and avoid duplicate exact evidence. Contention attempts stay bounded and recover after contention stops.
 
 Reuse the existing current routing work, task 28007's event presentation and its owner, and the existing search-performance investigation. Reconcile native Close work with its current owner instead of declaring every specialized tool permanent or launching another Close project.
 
 The initial 18 disposable SQLite checks cover transaction/coverage sketches and a semantic-duplicate counterexample, not production Rust/model correctness. Existing coordinator-drive-eval has four fake tools/canned SQL/archived prompts and cannot qualify the complete path. Use production constructors and sanitized disposable runtime fixtures, with model/cost trials separate from deterministic tests.
 
 Three independent review lenses (product, reliability and agent usability) informed this plan; final review tightened settlement ordering, capture/render bounds and promotion criteria. Preserve the existing conversation identity/lifecycle program (task 92009). Use Allium where scanner snapshot/apply/coverage or settlement concurrency warrants a precise lifecycle; ordinary CRUD does not independently require it. Real-model scanner evaluation uses independently reviewed expected captures, not the model's own recall grade.
+
+The [incoming adversarial plan review](https://github.com/scottopell/phoenix-ide/pull/1082#pullrequestreview-5907499356) is incorporated in the existing slices: feature-local gates (1/3/5/7), version-checked event follow-up (3/4), mandatory reconciliation after evidence append (5/6/7), and post-coverage generation invalidation (7). These are planning contracts and required acceptance cases, not claims of runtime implementation or deployed qualification.
 
 Select checks through ./dev.py check-plan. Run task validation and relevant spec/Rust/fmt/clippy/codegen/UI/native lanes for actual changes; honor existing host resource owners. Forward same-database recovery, historical quotation retention, excerpt budgets and remote capability are feature-scoped contracts; no downgrade, live DB replacement, cross-version or perfect-recall promise is implied.
 
