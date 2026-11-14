@@ -47,6 +47,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   const originalGetWorkScopeInventory = api.getWorkScopeInventory;
   const originalListForkProposals = api.listForkProposals;
   const originalReconcileAcceptedMessages = api.reconcileAcceptedMessages;
+  const originalUploadAttachments = api.uploadAttachments;
   const originalContinueConversation = api.continueConversation;
   const originalFetch = globalThis.fetch;
   const OriginalWebSocket = globalThis.WebSocket;
@@ -80,6 +81,30 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   };
   window.addEventListener('product-conversation-fixture-hold-older', holdOlderPage);
   window.addEventListener('product-conversation-fixture-release-older', releaseOlderPage);
+  let holdSuccessorInit = false;
+  const heldSuccessorInits: Array<() => void> = [];
+  const holdSuccessor = () => { holdSuccessorInit = true; };
+  const releaseSuccessor = () => {
+    holdSuccessorInit = false;
+    for (const release of heldSuccessorInits.splice(0)) release();
+  };
+  window.addEventListener('product-conversation-fixture-hold-successor', holdSuccessor);
+  window.addEventListener('product-conversation-fixture-release-successor', releaseSuccessor);
+  let holdSuccessorReadback = false;
+  let releaseSuccessorReadback: (() => void) | null = null;
+  const holdSuccessorConversationRead = () => { holdSuccessorReadback = true; };
+  const releaseSuccessorConversationRead = () => { holdSuccessorReadback = false; releaseSuccessorReadback?.(); releaseSuccessorReadback = null; };
+  window.addEventListener('product-conversation-fixture-hold-successor-readback', holdSuccessorConversationRead);
+  window.addEventListener('product-conversation-fixture-release-successor-readback', releaseSuccessorConversationRead);
+  let resolveUpload: ((files: Awaited<ReturnType<typeof api.uploadAttachments>>) => void) | null = null;
+  let holdUpload = false;
+  const holdFixtureUpload = () => { holdUpload = true; };
+  api.uploadAttachments = async (conversationId, files) => holdUpload
+    ? await new Promise(resolve => { resolveUpload = resolve; })
+    : originalUploadAttachments(conversationId, files);
+  window.addEventListener('product-conversation-fixture-hold-upload', holdFixtureUpload);
+  const completeUpload = () => resolveUpload?.([{ original_name: 'notes.txt', media_type: 'text/plain', size_bytes: 4, stored_path: 'notes.txt' }]);
+  window.addEventListener('product-conversation-fixture-complete-upload', completeUpload);
 
   let failNextSnapshot = false;
   const failSnapshot = () => { failNextSnapshot = true; };
@@ -198,15 +223,20 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   const sourceMessages = (scenario.sourceSnapshot?.segments[0]?.messages ?? []) as Message[];
   api.getConversationRoute = async (id) => id === sourceId ? { id, slug: id } : route;
   api.getConversationRouteBySlug = async (id) => id === sourceId ? { id, slug: id } : route;
-  api.getConversation = async (id) => ({
-    conversation: id === sourceId ? sourceConversation : id === predecessorConversation?.id ? predecessorConversation
-      : currentSnapshot?.segments.some(segment => segment.transcript_row_id === id)
-        ? { ...currentConversation, id, slug: id } : currentConversation,
-    messages: id === sourceId ? sourceMessages : (currentSnapshot?.segments.find(segment => segment.transcript_row_id === id)?.messages as Message[] | undefined) ?? currentMessages,
-    agent_working: false,
-    presentation_mode: 'idle',
-    context_window_size: 128_000,
-  });
+  api.getConversation = async (id) => {
+    if (holdSuccessorReadback && id === currentConversation.id) {
+      await new Promise<void>(resolve => { releaseSuccessorReadback = resolve; });
+    }
+    return {
+      conversation: id === sourceId ? sourceConversation : id === predecessorConversation?.id ? predecessorConversation
+        : currentSnapshot?.segments.some(segment => segment.transcript_row_id === id)
+          ? { ...currentConversation, id, slug: id } : currentConversation,
+      messages: id === sourceId ? sourceMessages : (currentSnapshot?.segments.find(segment => segment.transcript_row_id === id)?.messages as Message[] | undefined) ?? currentMessages,
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 128_000,
+    };
+  };
   api.listProductConversations = async () => ({ product_conversations: [], coordinator: null });
   api.getProductConversationAutomaticContinuation = async (id) => ({ aggregate: { kind: 'ordinary', product_conversation_id: id }, auto_continue_on_context_exhaustion: false, admission: null });
   api.getCoordinatorAutomaticContinuation = async () => ({ aggregate: { kind: 'coordinator', product_conversation_id: 'source-product' }, auto_continue_on_context_exhaustion: false, admission: null });
@@ -385,6 +415,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     private readonly listeners = new Map<string, Set<(event: MessageEvent<string>) => void>>();
     private readonly instanceId: number;
     private readonly isSource: boolean;
+    private readonly isTranscript: boolean;
     private readonly conversationId: string;
     get id(): number { return this.instanceId; }
     get memberId(): string { return this.conversationId; }
@@ -396,7 +427,11 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
 
     constructor(url: string) {
       this.isSource = Boolean(sourceId && url.includes(sourceId));
-      this.conversationId = new URL(url, location.href).searchParams.get('reference') ?? '';
+      const parsed = new URL(url, location.href);
+      this.isTranscript = parsed.pathname === '/api/conversation-reads/stream'
+        || /^\/api\/conversations\/[^/]+\/stream$/.test(parsed.pathname);
+      this.conversationId = parsed.searchParams.get('reference')
+        ?? parsed.pathname.match(/^\/api\/conversations\/([^/]+)\/stream$/)?.[1] ?? '';
       eventSourceOpenCount += 1;
       this.instanceId = eventSourceOpenCount;
       eventSources.add(this);
@@ -426,7 +461,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       const listeners = this.listeners.get(type) ?? new Set();
       listeners.add(callback);
       this.listeners.set(type, listeners);
-      record('ActiveEventSourceSubscriptions', [...eventSources].filter(source => source.subscriptionCount > 0).length);
+      record('ActiveTranscriptSubscriptions', [...eventSources].filter(source => source.isTranscript && source.subscriptionCount > 0).length);
       if (type === 'init') {
         queueMicrotask(() => {
           if (this.readyState === FixtureEventSource.CLOSED) return;
@@ -453,7 +488,9 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
             pending_events: [],
             pending_truncated: false,
           };
-          callback(new MessageEvent('init', { data: JSON.stringify(init) }));
+          const deliver = () => callback(new MessageEvent('init', { data: JSON.stringify(init) }));
+          if (holdSuccessorInit && this.conversationId === currentConversation.id && continuationPublished) heldSuccessorInits.push(deliver);
+          else deliver();
         });
       }
     }
@@ -467,7 +504,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
 
     removeEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
       this.listeners.get(type)?.delete(listener as (event: MessageEvent<string>) => void);
-      record('ActiveEventSourceSubscriptions', [...eventSources].filter(source => source.subscriptionCount > 0).length);
+      record('ActiveTranscriptSubscriptions', [...eventSources].filter(source => source.isTranscript && source.subscriptionCount > 0).length);
     }
 
     close(): void {
@@ -476,7 +513,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       eventSources.delete(this);
       record('EventSourceCloses', Number(document.documentElement.dataset['productConversationFixtureEventSourceCloses'] ?? '0') + 1);
       record('EventSourceLastClosedInstance', this.instanceId);
-      record('ActiveEventSourceSubscriptions', [...eventSources].filter(source => source.subscriptionCount > 0).length);
+      record('ActiveTranscriptSubscriptions', [...eventSources].filter(source => source.isTranscript && source.subscriptionCount > 0).length);
     }
   }
   const publishContinuation = () => {
@@ -539,6 +576,15 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     window.removeEventListener('product-conversation-fixture-hold-older', holdOlderPage);
     window.removeEventListener('product-conversation-fixture-fail-next-snapshot', failSnapshot);
     window.removeEventListener('product-conversation-fixture-release-older', releaseOlderPage);
+    window.removeEventListener('product-conversation-fixture-hold-successor', holdSuccessor);
+    window.removeEventListener('product-conversation-fixture-release-successor', releaseSuccessor);
+    releaseSuccessor();
+    window.removeEventListener('product-conversation-fixture-hold-successor-readback', holdSuccessorConversationRead);
+    window.removeEventListener('product-conversation-fixture-release-successor-readback', releaseSuccessorConversationRead);
+    releaseSuccessorConversationRead();
+    window.removeEventListener('product-conversation-fixture-complete-upload', completeUpload);
+    window.removeEventListener('product-conversation-fixture-hold-upload', holdFixtureUpload);
+    api.uploadAttachments = originalUploadAttachments;
     releaseOlderPage();
     window.removeEventListener('product-conversation-fixture-stream-failure', failLatestEventSource);
     window.removeEventListener('product-conversation-fixture-acknowledge-last-send', acknowledgeLastSend);

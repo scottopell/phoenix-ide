@@ -1056,9 +1056,10 @@ describe('bash tool rendering', () => {
 describe('InputArea continuation upload ownership', () => {
   function UploadComposer({ scope, transcript }: { scope: string; transcript: string }) {
     const [files, setFiles] = useState<FileAttachment[]>([]);
+    const [draft, setDraft] = useState('');
     return <InputArea cwd={undefined} scopeKey={scope} uploadConversationId={transcript}
       convState={idleState} images={[]} setImages={() => {}} files={files} setFiles={setFiles}
-      isOffline={false} failedMessages={[]} draft="" onDraftChange={() => {}}
+      isOffline={false} failedMessages={[]} draft={draft} onDraftChange={setDraft}
       onSend={() => {}} onCancel={() => {}} onRetry={() => {}} />;
   }
 
@@ -1072,7 +1073,15 @@ describe('InputArea continuation upload ownership', () => {
       dataTransfer: { types: ['Files'], files: [new File(['x'], 'notes.txt')] },
     });
     expect(upload).toHaveBeenLastCalledWith('a', expect.any(Array));
+    const textarea = screen.getByRole('textbox');
+    fireEvent.change(textarea, { target: { value: 'keep this draft' } });
+    textarea.focus();
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled();
     view.rerender(<UploadComposer scope="product:p" transcript="b" />);
+    expect(screen.getByRole('textbox')).toBe(textarea);
+    expect(document.activeElement).toBe(textarea);
+    expect(textarea).toHaveValue('keep this draft');
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled();
     await act(async () => { resolve([rejectedFile]); });
     expect(screen.getByText('notes.txt')).toBeInTheDocument();
     fireEvent.drop(document.getElementById('input-area')!, {

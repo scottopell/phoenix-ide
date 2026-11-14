@@ -10254,6 +10254,18 @@ mod conversation_cwd_validation_tests {
     #[tokio::test]
     async fn continuation_attachment_authorization_uses_persisted_chain_prefix() {
         use crate::api::types::FileAttachment;
+        async fn make_attachment(root: &std::path::Path, id: &str) -> FileAttachment {
+            let directory = root.join(id);
+            tokio::fs::create_dir_all(&directory).await.unwrap();
+            let path = directory.join("file.txt");
+            tokio::fs::write(&path, b"hello").await.unwrap();
+            FileAttachment {
+                original_name: "file.txt".to_string(),
+                stored_path: path.display().to_string(),
+                media_type: "text/plain".to_string(),
+                size_bytes: 5,
+            }
+        }
         let db = crate::db::Database::open_in_memory().await.unwrap();
         for id in ["root", "unrelated"] {
             db.create_conversation(id, id, "/tmp", true, None, None)
@@ -10286,18 +10298,6 @@ mod conversation_cwd_validation_tests {
         };
 
         let root = tempfile::tempdir().unwrap();
-        async fn make_attachment(root: &std::path::Path, id: &str) -> FileAttachment {
-            let directory = root.join(id);
-            tokio::fs::create_dir_all(&directory).await.unwrap();
-            let path = directory.join("file.txt");
-            tokio::fs::write(&path, b"hello").await.unwrap();
-            FileAttachment {
-                original_name: "file.txt".to_string(),
-                stored_path: path.display().to_string(),
-                media_type: "text/plain".to_string(),
-                size_bytes: 5,
-            }
-        }
         let root_file = make_attachment(root.path(), "root").await;
         let latest_file = make_attachment(root.path(), &latest_id).await;
         let unrelated_file = make_attachment(root.path(), "unrelated").await;

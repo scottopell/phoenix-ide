@@ -355,24 +355,55 @@ function ConversationPageContent({
 
   // Derived from atom
   const conversationId = atom.conversationId ?? undefined;
-  const conversation = atom.conversation;
+  const authoritativeConversation = atom.conversation;
+  const [retainedPresentation, setRetainedPresentation] = useState<{
+    scopeKey: string;
+    conversation: Conversation;
+  } | null>(null);
+  const presentationRetentionEnabled = !showTranscript && composerScopeKey !== undefined;
+  const presentationScopeKey = composerScopeKey;
+  const currentConversationReady = !!authoritativeConversation
+    && authoritativeConversation.id === conversationId;
+  useEffect(() => {
+    if (!presentationRetentionEnabled || !presentationScopeKey) {
+      setRetainedPresentation(null);
+      return;
+    }
+    if (currentConversationReady && authoritativeConversation
+      && retainedPresentation?.scopeKey !== presentationScopeKey) {
+      setRetainedPresentation({ scopeKey: presentationScopeKey, conversation: authoritativeConversation });
+    } else if (currentConversationReady && authoritativeConversation
+      && retainedPresentation?.conversation.id !== authoritativeConversation.id) {
+      setRetainedPresentation({ scopeKey: presentationScopeKey, conversation: authoritativeConversation });
+    } else if (retainedPresentation && retainedPresentation.scopeKey !== presentationScopeKey) {
+      setRetainedPresentation(null);
+    }
+  }, [presentationRetentionEnabled, presentationScopeKey, currentConversationReady, authoritativeConversation, retainedPresentation]);
+  const retainedConversation = presentationRetentionEnabled
+    && retainedPresentation?.scopeKey === presentationScopeKey ? retainedPresentation.conversation : undefined;
+  const conversation = authoritativeConversation ?? retainedConversation;
+  const retainingPresentation = !currentConversationReady && retainedConversation !== undefined;
+  const canMutateCurrentConversation = mutationEnabled && currentConversationReady;
+  const composerReadOnly = !canMutateCurrentConversation;
   const [resolvedRouteConversationId, setResolvedRouteConversationId] = useState<string | null>(null);
   const [archiveStatusConfirmedConversationId, setArchiveStatusConfirmedConversationId] = useState<string | null>(null);
   const archiveStatusConfirmed =
     conversationId !== undefined && archiveStatusConfirmedConversationId === conversationId;
   const serverArchived = conversation?.archived === true;
-  const isArchived = aggregateLifecycleOpen === undefined
-    ? serverArchived || !archiveStatusConfirmed
-    : !aggregateLifecycleOpen;
+  const isArchived = retainingPresentation
+    ? serverArchived
+    : aggregateLifecycleOpen === undefined
+      ? serverArchived || !archiveStatusConfirmed
+      : !aggregateLifecycleOpen;
   const terminallyUnavailable = aggregateLifecycleOpen === undefined
     ? serverArchived
     : !aggregateLifecycleOpen;
-  const confirmedLive = !!conversationId && (
+  const confirmedLive = currentConversationReady && !!conversationId && (
     aggregateLifecycleOpen === undefined
       ? archiveStatusConfirmed && !serverArchived
       : aggregateLifecycleOpen
   );
-  const readOnly = !mutationEnabled;
+  const readOnly = !canMutateCurrentConversation;
   const prStatusHandle = useConversationPrStatus({
     conversationId: confirmedLive ? conversationId : undefined,
     convModeLabel: conversation?.conv_mode_label,
@@ -1420,7 +1451,7 @@ function ConversationPageContent({
   }, [isConnected, conversationId, isArchived, localPendingMessages]);
 
   const handleSend = useCallback(async (text: string, attachedImages: ImageData[], attachedFiles: FileAttachment[] = []) => {
-    if (!conversationId || isArchived) throw new Error('This conversation cannot receive a message.');
+    if (readOnly || !conversationId || isArchived) throw new Error('This conversation cannot receive a message.');
     userActionSeqRef.current += 1;
 
     const msg = enqueue(text, attachedImages, attachedFiles);
@@ -1429,7 +1460,7 @@ function ConversationPageContent({
       // Await so expansion errors propagate back to InputArea (REQ-IR-007)
       await sendMessage(msg.localId, text, attachedImages, attachedFiles);
     }
-  }, [conversationId, isArchived, enqueue, isConnected, sendMessage]);
+  }, [conversationId, isArchived, readOnly, enqueue, isConnected, sendMessage]);
 
   const handleRetry = useCallback((localId: string) => {
     const msg = queuedMessages.find((m) => m.localId === localId);
@@ -1456,7 +1487,7 @@ function ConversationPageContent({
   }, [conversationId, atom.phase, readOnly, isArchived]);
 
   const handleCancelSteering = useCallback(async (localId: string) => {
-    if (!conversationId) return;
+    if (readOnly || !conversationId) return;
     try {
       await api.cancelSteeringMessage(conversationId, localId);
       dispatch({
@@ -1468,7 +1499,7 @@ function ConversationPageContent({
     } catch (err) {
       console.error('Failed to cancel steering message:', err);
     }
-  }, [conversationId, dismiss, dispatch]);
+  }, [conversationId, readOnly, dismiss, dispatch]);
 
   const openConversationById = useCallback(async (
     targetConversationId: string,
@@ -1545,7 +1576,7 @@ function ConversationPageContent({
     effort?: import('../api').ModelEffort | null,
     serviceTier?: 'standard' | 'fast',
   ) => {
-    if (!conversationId || isArchived || !canChangeModelInState(atom.phase)) return;
+    if (readOnly || !conversationId || isArchived || !canChangeModelInState(atom.phase)) return;
 
     try {
       await api.upgradeModel(conversationId, newModelId, effort, serviceTier);
@@ -1568,7 +1599,7 @@ function ConversationPageContent({
       console.error('Failed to upgrade model:', err);
       throw err;
     }
-  }, [conversationId, isArchived, atom.phase, atom.conversation?.service_tier, availableModels, showInfo, dispatch]);
+  }, [conversationId, isArchived, readOnly, atom.phase, atom.conversation?.service_tier, availableModels, showInfo, dispatch]);
 
   // REQ-TERM-020 / REQ-SEED-001: "Let Phoenix set this up for me" handler.
   // TerminalPanel builds the prompt text and hands it off; this owns the API
@@ -1580,7 +1611,7 @@ function ConversationPageContent({
   // `seed-draft:<id>` in localStorage so the user can review and hit Send.
   const handleAssistShellSetup = useCallback(
     async (promptText: string, seedLabel: string, homeDir: string) => {
-      if (!conversation?.id) return;
+      if (readOnly || !conversation?.id) return;
       const messageId = generateUUID();
       const clientConversationId = generateUUID();
       try {
@@ -1612,11 +1643,11 @@ function ConversationPageContent({
       );
       navigate(routeForConversation(newConv));
     },
-    [conversation, availableModels, defaultModel, navigate, createConversationWithStore],
+    [conversation, readOnly, availableModels, defaultModel, navigate, createConversationWithStore],
   );
 
   const handleApproveTask = async (handoff: 'continue_in_current_conversation' | 'start_fresh_work_conversation') => {
-    if (!conversationId || isArchived) return;
+    if (readOnly || !conversationId || isArchived) return;
     dispatch({ type: 'clear_error' });
     try {
       const result = await api.approveTask(conversationId, handoff);
@@ -1629,7 +1660,7 @@ function ConversationPageContent({
   };
 
   const handleRejectTask = async () => {
-    if (!conversationId || isArchived) return;
+    if (readOnly || !conversationId || isArchived) return;
     try {
       await api.rejectTask(conversationId);
     } catch (err) {
@@ -1638,7 +1669,7 @@ function ConversationPageContent({
   };
 
   const handleTaskFeedback = async (annotations: string) => {
-    if (!conversationId || isArchived) return;
+    if (readOnly || !conversationId || isArchived) return;
     try {
       await api.sendTaskFeedback(conversationId, annotations);
     } catch (err) {
@@ -1807,7 +1838,7 @@ function ConversationPageContent({
     && convStateForChildren.type !== 'awaiting_task_approval'
     && convStateForChildren.type !== 'handed_off'
     && convStateForChildren.type !== 'terminal';
-  const writableComposerMounted = mutationEnabled
+  const writableComposerMounted = canMutateCurrentConversation
     && ordinaryComposerEligible
     && (convStateForChildren.type !== 'error'
       || (convStateForChildren.error?.can_user_resume ?? false));
@@ -1817,7 +1848,7 @@ function ConversationPageContent({
     onProjectionChange({
       slug,
       ...(conversationId ? { conversationId } : {}),
-      conversation: conversation ?? null,
+      conversation: authoritativeConversation ?? null,
       pendingMessages,
       isArchived,
       serverArchived,
@@ -1840,6 +1871,7 @@ function ConversationPageContent({
     onProjectionChange,
     slug,
     conversationId,
+    authoritativeConversation,
     conversation,
     pendingMessages,
     isArchived,
@@ -2481,12 +2513,12 @@ function ConversationPageContent({
         </div>
       )}
       {!isArchived && !isCoordinatorHome && <WorkControlBar
-        mutationEnabled={mutationEnabled}
+        mutationEnabled={canMutateCurrentConversation}
         conversationId={conversation.id}
         convModeLabel={conversation.conv_mode_label}
         phaseType={convStateForChildren.type}
         continuedInConvId={conversation.continued_in_conv_id}
-        {...(mutationEnabled && ordinaryComposerEligible ? { onSendMessage: handleSendTextOnly } : {})}
+        {...(canMutateCurrentConversation && ordinaryComposerEligible ? { onSendMessage: handleSendTextOnly } : {})}
         showError={showError}
         prStatusHandle={prStatusHandle}
         {...(onCloseCompleted ? { onCloseCompleted } : {})}
@@ -2561,7 +2593,7 @@ function ConversationPageContent({
             banner's quick "retry/continue" so the user is not forced into the
             canned "continue" turn. Gated on can_user_resume to match the
             banner: a non-resumable error stays a dead end. */}
-        {(convStateForChildren.error?.can_user_resume ?? false) && !isArchived && mutationEnabled && (
+        {(convStateForChildren.error?.can_user_resume ?? false) && !isArchived && canMutateCurrentConversation && (
           <RenderProfiler id="InputArea">
           <ConnectedInputArea
             ref={inputRef}
@@ -2583,7 +2615,7 @@ function ConversationPageContent({
             onCancel={handleCancel}
             onRetry={handleRetry}
           onDismissError={dismiss}
-          readOnly={readOnly}
+          readOnly={composerReadOnly}
         />
 
           </RenderProfiler>
@@ -2602,7 +2634,7 @@ function ConversationPageContent({
           onAnswered={() => dispatch({ type: 'local_phase_change', phase: { type: 'llm_requesting', attempt: 1 }, expectedConversationId: conversation.id })}
           onDismissed={() => dispatch({ type: 'local_phase_change', phase: { type: 'idle' }, expectedConversationId: conversation.id })}
         />
-      ) : mutationEnabled && ordinaryComposerEligible ? (
+      ) : (mutationEnabled || retainingPresentation) && ordinaryComposerEligible ? (
         <>
         {credentialStatus && credentialStatus !== 'not_configured' && credentialStatus !== 'valid' && (
           <Suspense fallback={null}>
@@ -2642,6 +2674,7 @@ function ConversationPageContent({
           onCancel={handleCancel}
           onRetry={handleRetry}
           onDismissError={dismiss}
+          readOnly={composerReadOnly}
         />
         </RenderProfiler>
         </>

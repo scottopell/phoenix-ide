@@ -15,7 +15,7 @@ async function assertMobileContinuation(page, id, viewport, outDir) {
   await page.evaluate(() => window.dispatchEvent(new Event('product-conversation-fixture-continue')));
   await page.waitForFunction(() => {
     const streamUrl = document.documentElement.dataset.productConversationFixtureEventSourceLastUrl;
-    if (!streamUrl || document.documentElement.dataset.productConversationFixtureActiveEventSourceSubscriptions !== '1') return false;
+    if (!streamUrl || document.documentElement.dataset.productConversationFixtureActiveTranscriptSubscriptions !== '1') return false;
     const parsed = new URL(streamUrl, window.location.href);
     return parsed.pathname === '/api/conversation-reads/stream'
       && parsed.searchParams.get('reference') === 'fixture-successor';

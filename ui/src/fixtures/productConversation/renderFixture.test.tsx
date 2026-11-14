@@ -71,7 +71,7 @@ describe('ProductConversationFixture', () => {
       expect(parsed.pathname).toBe('/api/conversation-reads/stream');
       expect(parsed.searchParams.get('reference')).toBe('fixture-successor');
     });
-    await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureActiveEventSourceSubscriptions']).toBe('1'));
+    await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureActiveTranscriptSubscriptions']).toBe('1'));
     expect(document.documentElement.dataset['sourceFixtureLocation']).toBe(route);
     expect(screen.queryByRole('button', { name: 'Open continuation' })).toBeNull();
     act(() => window.dispatchEvent(new Event('product-conversation-fixture-successor-message')));
@@ -81,6 +81,43 @@ describe('ProductConversationFixture', () => {
     await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureEventSourceInits']).toBe('3'));
     expect(screen.getAllByText('Successor is streaming after the handoff.')).toHaveLength(1);
     expect(document.documentElement.dataset['sourceFixtureLocation']).toBe(route);
+  });
+
+  it('keeps the embedded composer mounted while the successor atom is cold and until an upload completes', async () => {
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(1000);
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ x: 0, y: 0, top: 0, left: 0, right: 390, bottom: 844, width: 390, height: 844, toJSON: () => ({}) });
+    render(<ProductConversationFixture scenario={makeMobileContinuationScenario('ordinary')} />);
+    const textarea = await screen.findByPlaceholderText('Type a message...');
+    await waitFor(() => expect(textarea).toBeEnabled());
+    fireEvent.change(textarea, { target: { value: 'Keep this embedded draft' } });
+    textarea.focus();
+    act(() => {
+      window.dispatchEvent(new Event('product-conversation-fixture-hold-successor'));
+      window.dispatchEvent(new Event('product-conversation-fixture-hold-successor-readback'));
+      window.dispatchEvent(new Event('product-conversation-fixture-hold-upload'));
+      fireEvent.drop(document.getElementById('input-area')!, {
+        dataTransfer: { types: ['Files'], files: [new File(['text'], 'notes.txt', { type: 'text/plain' })] },
+      });
+    });
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled());
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-continue')));
+    await waitFor(() => expect(new URL(document.documentElement.dataset['productConversationFixtureEventSourceLastUrl']!, window.location.href).searchParams.get('reference')).toBe('fixture-successor'));
+    expect(screen.getByPlaceholderText('Type a message...')).toBe(textarea);
+    expect(textarea).toHaveValue('Keep this embedded draft');
+    expect(textarea).toHaveFocus();
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled();
+
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-release-successor-readback')));
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-release-successor')));
+    await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureActiveTranscriptSubscriptions']).toBe('1'));
+    expect(screen.getByPlaceholderText('Type a message...')).toBe(textarea);
+    expect(textarea).toHaveValue('Keep this embedded draft');
+    expect(textarea).toHaveFocus();
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled();
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-complete-upload')));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Send message' })).toBeEnabled());
+    expect(screen.getByPlaceholderText('Type a message...')).toBe(textarea);
+    expect(textarea).toHaveValue('Keep this embedded draft');
   });
 
   it.each(['ordinary', 'coordinator'] as const)('retains the %s composer after failed continuation readback and retries without reload', async kind => {

@@ -21,6 +21,12 @@ The product page refreshes authoritative product/Global state from the observed 
 - The workflow contains an isolated mutation witness: remove native link publication, require the pending-opening regression to fail, restore source, and rerun. **Authored wiring alone is not failing-before/passing-after evidence.** The outcome must be read from the hosted build job.
 - Mobile captures are wired for both ordinary and Global synthetic product surfaces. Screenshot existence, visual inspection, and exact-source run success must be recorded separately; no physical mobile/PWA keyboard claim follows from emulation.
 
+### Follow-up qualification at `a5baa9244db19ac5115a930e11b73bf97f47b615`
+
+Hosted [43633805978](https://github.com/scottopell/phoenix-ide/actions/runs/43633805978) passed the Rust build and its missing-notification mutation witness (job 132566232736, step “Qualify missing continuation notification witness”). This is executed failing-with-publication-removed / passing-with-source-restored evidence, not proof of the full mobile journey. UI qualification and visual capture failed: refresh errors were rendered twice, hook dependencies failed lint, and the subscription oracle counted the independent product-events stream alongside the transcript stream. Clippy rejected a test helper placed after statements. Repairs need a new exact-head run.
+
+Independent source-only review of `bc92612f1c2b39fdbffd0499188c7b5192513142..a5baa9244db19ac5115a930e11b73bf97f47b615` found a cold-successor null render unmounted the actual textarea, losing mobile focus and the pending-upload send gate. The follow-up retains aggregate-scoped presentation during hydration while separately gating mutations on authoritative successor readiness. A controlled cold-INIT/readback/upload fixture regression is authored, not yet executed. The subscription oracle now specifically measures live **transcript** subscriptions; the separate product-events subscription remains legitimate. The shared capture runner already honors `hasTouch` and `isMobile`; earlier viewport-only concerns were stale.
+
 ## Bounded lifecycle audit
 
 All entries below describe source-present coverage unless an exact hosted result is separately cited.

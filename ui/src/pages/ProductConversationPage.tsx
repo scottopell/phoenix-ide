@@ -1576,9 +1576,9 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
       data-testid="product-conversation-page"
       ref={coordinator || inheritedJourney ? undefined : journey.attach}
     >
-      {(error || observedContinuationId) && (
-        <section role={error ? 'alert' : 'status'} aria-label={error ? 'Live view refresh failed' : 'Continuation readback pending'}>
-          <span>{error ?? 'Continuation readback pending.'}</span>{' '}
+      {observedContinuationId && !error && (
+        <section role="status" aria-label="Continuation readback pending">
+          <span>Continuation readback pending.</span>{' '}
           <button type="button" onClick={() => setSnapshotRetry(retry => retry + 1)}>Retry live view</button>
         </section>
       )}
@@ -1619,9 +1619,13 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
         <div className="error-message" role="alert">Original source transcript unavailable.</div>
       )}
       {(olderError || error || hashTargetExhausted) && (
-        <div className="product-conversation-page__status" role="alert">
+        <div
+          className="product-conversation-page__status"
+          role="alert"
+          aria-label={error ? 'Live view refresh failed' : undefined}
+        >
           {olderError ?? error ?? 'The linked message is not available in this conversation history.'}
-          {error && !olderError && (
+          {error && (
             <button type="button" onClick={() => setSnapshotRetry((retry) => retry + 1)}>Retry live view</button>
           )}
         </div>

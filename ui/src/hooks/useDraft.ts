@@ -175,7 +175,7 @@ export function useDraftLifecycle(slug: string, productScope?: { legacyTranscrip
     if (stored) {
       store.dispatch(slug, { type: 'set_draft', text: stored });
     }
-  }, [conversationId, draft, slug, store, productScope?.legacyTranscriptSlug, transcriptId]);
+  }, [conversationId, draft, productScope, slug, store, transcriptId]);
 
   // Debounced write-through. On a conversationId change with a pending
   // write for the prior conversation, flush it synchronously before
@@ -225,7 +225,7 @@ export function useDraftLifecycle(slug: string, productScope?: { legacyTranscrip
         }
       }
     };
-  }, []);
+  }, [isProductScope]);
 }
 
 /** Hosts {@link useDraftLifecycle} in isolation so the keystroke-frequency
