@@ -1,0 +1,1 @@
+Reproduce and reduce excessive vertical whitespace in expanded tool-only agent turns on a 393px mobile viewport. Add a synthetic fixture and hosted screenshot/geometry capture, identify the spacing source from rendered evidence, then make a scoped responsive fix with regression coverage while preserving tool content, controls, accessibility, wrapping, and desktop behavior.

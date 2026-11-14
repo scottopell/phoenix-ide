@@ -1,3 +1,5 @@
+import { writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import { runSurfaceCapture } from './capture-ladle-surface.mjs';
 
 async function verifyCompactGrid({ page, id, viewport }) {
@@ -35,13 +37,54 @@ async function verifyCompactGrid({ page, id, viewport }) {
   return false;
 }
 
+async function captureMobileExpandedSpacing({ page, id, outDir, viewport }) {
+  if (id !== 'mobile-spacing-compact') return false;
+  const sendCard = page.locator('[data-tool-id="mobile-send-message"] .compact-tool-card-expand');
+  await sendCard.waitFor({ state: 'visible' });
+  await sendCard.click();
+  await page.getByRole('button', { name: 'Collapse expanded tool detail' }).waitFor({ state: 'visible' });
+  const evidence = await page.evaluate(() => {
+    const selectors = [
+      '.compact-tool-group',
+      '.compact-tool-group .message-content',
+      '.compact-tool-selected-detail',
+      '.compact-tool-selected-detail > .message',
+      '.tool-block-input',
+      '.tool-block-output',
+      '[data-tool-id="mobile-next-read"]',
+      '.compact-tool-detail-collapse',
+    ];
+    return Object.fromEntries(selectors.map((selector) => {
+      const element = document.querySelector(selector);
+      if (!(element instanceof HTMLElement)) return [selector, null];
+      const rect = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return [selector, {
+        top: Math.round(rect.top + scrollY),
+        bottom: Math.round(rect.bottom + scrollY),
+        height: Math.round(rect.height),
+        marginTop: style.marginTop,
+        marginBottom: style.marginBottom,
+        paddingTop: style.paddingTop,
+        paddingBottom: style.paddingBottom,
+        lineHeight: style.lineHeight,
+        display: style.display,
+      }];
+    }));
+  });
+  const stem = `mobile-spacing-compact--${viewport.name ?? `${viewport.width}x${viewport.height}`}`;
+  await page.screenshot({ path: path.join(outDir, `${stem}.png`), fullPage: true });
+  await writeFile(path.join(outDir, `${stem}.geometry.json`), `${JSON.stringify({ viewport, evidence }, null, 2)}\n`);
+  return true;
+}
+
 runSurfaceCapture({
   surface: 'tool-results',
   readyAttribute: 'data-tool-results-fixture-ready',
   outDir: process.env.TOOL_RESULTS_QA_OUT ?? 'qa-artifacts/tool-results',
-  captureStory: verifyCompactGrid,
+  captureStory: async (context) => (await captureMobileExpandedSpacing(context)) || verifyCompactGrid(context),
   viewportMatrix: [
     { name: 'desktop', width: 1280, height: 900 },
-    { name: 'mobile', width: 390, height: 844 },
+    { name: 'mobile', width: 393, height: 852, hasTouch: true, isMobile: true },
   ],
 });

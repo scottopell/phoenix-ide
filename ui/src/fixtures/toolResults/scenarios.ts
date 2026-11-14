@@ -536,6 +536,29 @@ const subagentMessages: Message[] = [
   ]),
 ];
 
+const mobileSpacingMessages: Message[] = [
+  userMessage(1, 'Send the mobile review note and continue automatically.'),
+  agentMessage(2, [{
+    type: 'tool_use',
+    id: 'mobile-send-message',
+    name: 'send_conversation_message',
+    input: {
+      conversation_id: 'fixture-review',
+      text: 'Please review the expanded mobile tool activity. This intentionally long but plausible message exercises wrapping, copy controls, and the complete expanded tool detail without fixture-only spacing.',
+      source: 'automatic_continuation',
+    },
+  }]),
+  toolMessage(3, 'mobile-send-message', JSON.stringify({ status: 'sent', recipient: 'review conversation', message_id: 'fixture-message-0042', detail: 'The review note was delivered and the next read_automatic_continuation step remains available.' }), { display_data: { duration_ms: 42 } }),
+  agentMessage(4, [{
+    type: 'tool_use',
+    id: 'mobile-next-read',
+    name: 'read_automatic_continuation',
+    input: { continuation_id: 'fixture-continuation', reason: 'continue after send_conversation_message' },
+  }]),
+  toolMessage(5, 'mobile-next-read', 'Continuation read successfully; no additional user input is required.', { display_data: { duration_ms: 18 } }),
+  agentMessage(6, [{ type: 'text', text: 'Automatic continuation completed. The review message was sent and its follow-up was read.' }]),
+];
+
 export const toolResultsScenarios = [
   { id: 'shell-full', title: 'Shell — full', description: 'Transcript shell with lifecycle states, browser action summaries, and fallback rendering in full density.', density: 'full', family: 'shell' },
   { id: 'shell-compact', title: 'Shell — compact', description: 'The same transcript shell rendered with compact density.', density: 'compact', family: 'shell' },
@@ -551,6 +574,7 @@ export const toolResultsScenarios = [
   { id: 'grid-compact', title: 'Consecutive tool calls — compact grid', description: 'Consecutive one-tool agent messages share a responsive compact grid while bash spans the row.', density: 'compact', family: 'grid' },
   { id: 'subagents-full', title: 'Sub-agent summary — full', description: 'Persistent spawn_agents summary block in full density.', density: 'full', family: 'subagents' },
   { id: 'subagents-compact', title: 'Sub-agent summary — compact', description: 'Persistent spawn_agents summary block in compact density.', density: 'compact', family: 'subagents' },
+  { id: 'mobile-spacing-compact', title: 'Mobile expanded tool spacing', description: 'A realistic send_conversation_message, paired result, and automatic continuation for mobile expanded-detail geometry.', density: 'compact', family: 'mobile-spacing', theme: 'light' },
 ] as const satisfies readonly ToolResultsScenario[];
 
 export type ToolResultsScenarioId = (typeof toolResultsScenarios)[number]['id'];
@@ -569,13 +593,14 @@ const messagesByFamily = {
   profiling: profilingMessages,
   grid: gridMessages,
   subagents: subagentMessages,
+  'mobile-spacing': mobileSpacingMessages,
 } as const satisfies Record<ToolResultsScenario['family'], Message[]>;
 
 export function toolResultsFixtureData(scenario: ToolResultsScenario): ToolResultsFixtureData {
   return {
     conversationId: `${CONVERSATION_ID}-${scenario.id}`,
     slug: `${CONVERSATION_ID}-${scenario.id}`,
-    theme: THEME,
+    theme: scenario.theme ?? THEME,
     density: scenario.density,
     filePathRootDir: FILE_ROOT,
     workScopeKey: WORK_SCOPE_KEY,

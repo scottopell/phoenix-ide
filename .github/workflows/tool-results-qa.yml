@@ -1,0 +1,36 @@
+name: Tool results rendered QA
+on:
+  pull_request:
+    paths:
+      - 'ui/**'
+      - '.github/workflows/tool-results-qa.yml'
+permissions:
+  contents: read
+jobs:
+  tool-results:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 26
+      - run: corepack enable
+      - run: corepack prepare pnpm@11.0.8 --activate
+      - run: pnpm install --frozen-lockfile
+        working-directory: ui
+      - run: pnpm exec playwright install --with-deps chromium
+        working-directory: ui
+      - name: Capture synthetic expanded tools
+        run: PHOENIX_LADLE=1 node scripts/capture-tool-results.mjs
+        working-directory: ui
+        env:
+          CAPTURE_STORIES: mobile-spacing-compact
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: tool-results-rendered-qa
+          path: ui/qa-artifacts/tool-results/
+          if-no-files-found: error
