@@ -675,7 +675,8 @@ job (REQ-CONV-007).
 
 WHEN the user views a stable ordinary ProductConversation or the stable Global Coordinator aggregate
 THE SYSTEM SHALL expose one aggregate-scoped automatic context continuation control
-AND SHALL show it OFF unless that exact aggregate has been explicitly enabled
+AND SHALL show that aggregate's saved preference, including ON initialized for a new aggregate and OFF retained for an existing preference or explicit opt-out
+AND SHALL allow explicit opt-out without treating a loading or failed read as an established ON preference
 AND SHALL explain that the control applies only to future entries into context exhausted state
 AND SHALL NOT imply that enabling it starts, wakes, or resumes a row that is already context exhausted
 AND SHALL NOT imply that disabling it cancels already-admitted continuation work
