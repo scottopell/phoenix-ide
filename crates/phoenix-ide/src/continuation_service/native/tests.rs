@@ -138,6 +138,109 @@ async fn existing_manual_successor_ignores_reserved_losing_request_identity() {
 }
 
 #[tokio::test]
+async fn automatic_recovery_publishes_link_after_successor_was_reserved() {
+    use phoenix_core::domain::product_conversation::AutoContinueOnContextExhaustion;
+    use phoenix_core::domain::sm_state::ContinuationSummaryRequest;
+    use phoenix_db::AutomaticContinuationPhase;
+
+    let f = Fixture::new().await;
+    let predecessor =
+        f.db.get_conversation(&f.predecessor)
+            .await
+            .unwrap()
+            .unwrap();
+    f.db.set_auto_continue_on_context_exhaustion(
+        &predecessor.product_conversation_id,
+        AutoContinueOnContextExhaustion::Enabled,
+    )
+    .await
+    .unwrap();
+    let operation_id = "recovered-reservation-summary";
+    f.db.update_conversation_state(
+        &f.predecessor,
+        &ConvState::AwaitingContinuation {
+            request: ContinuationSummaryRequest {
+                operation_id: operation_id.into(),
+                rejected_tool_calls: Vec::new(),
+                attempt: 1,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let mut summary =
+        f.db.get_messages(&f.predecessor)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+    summary.message_id = "recovered-reservation-summary-message".into();
+    summary.sequence_id += 1;
+    assert_eq!(
+        f.db.commit_continuation(
+            &f.predecessor,
+            operation_id,
+            &summary,
+            &ConvState::ContextExhausted {
+                summary: SUMMARY.into()
+            },
+            summary.created_at,
+        )
+        .await
+        .unwrap(),
+        phoenix_db::ContinuationCommitOutcome::Applied
+    );
+    let admission =
+        f.db.automatic_continuation_admission(&f.predecessor)
+            .await
+            .unwrap()
+            .unwrap();
+    let (_, intent) =
+        f.db.continue_conversation_with_intent(
+            &f.predecessor,
+            phoenix_db::NewContinuationDispatchIntent {
+                message_id: admission.first_message_id,
+                handoff: SUMMARY.into(),
+                user_agent: None,
+                opening_authority: admission.opening_authority,
+            },
+        )
+        .await
+        .unwrap();
+    let successor_id = intent.unwrap().successor_conversation_id;
+    f.db.advance_automatic_continuation(
+        &f.predecessor,
+        AutomaticContinuationPhase::SuccessorReserved,
+    )
+    .await
+    .unwrap();
+    let recovered =
+        f.db.automatic_continuation_admission(&f.predecessor)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        recovered.phase,
+        AutomaticContinuationPhase::SuccessorReserved
+    );
+    f.runtime.get_or_create(&f.predecessor).await.unwrap();
+    let mut updates = f.runtime.subscribe(&f.predecessor).await.unwrap();
+
+    f.service().drive_admission(&recovered).await.unwrap();
+
+    let mut links = Vec::new();
+    while let Ok(event) = updates.try_recv() {
+        if let crate::runtime::SseEvent::ConversationUpdate(update) = event {
+            links.extend(update.continued_in_conv_id);
+        }
+    }
+    assert!(
+        links.contains(&successor_id),
+        "recovered reservation must notify predecessor subscribers"
+    );
+}
+
+#[tokio::test]
 async fn existing_pending_reserved_continuation_intent_retains_its_opening_authority() {
     let f = Fixture::new().await;
     let key = "reminder:historical-opening";
