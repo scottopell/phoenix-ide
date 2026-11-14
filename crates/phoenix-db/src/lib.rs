@@ -58,8 +58,8 @@ pub use automatic_continuation_settings::{
     AutomaticContinuationSettings, AutomaticContinuationTarget,
     ResolvedAutomaticContinuationAggregate,
 };
-mod native_continuation;
 pub mod native_close;
+mod native_continuation;
 pub use native_continuation::{
     CoordinatorContinuationOpening, CurrentCoordinatorContinuationRequest,
 };

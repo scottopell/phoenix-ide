@@ -140,9 +140,9 @@ async fn apply_initial_tx(
     .fetch_optional(&mut **tx)
     .await?
     {
-        return Ok(NativeCloseInitialResult::ExistingOperationNeedsExactReference(
-            decode_run_ref(&row)?,
-        ));
+        return Ok(
+            NativeCloseInitialResult::ExistingOperationNeedsExactReference(decode_run_ref(&row)?),
+        );
     }
     let topology = crate::close_foundation::read_topology_tx(tx, target)
         .await?
@@ -153,14 +153,8 @@ async fn apply_initial_tx(
     let latest = TranscriptConversationId::parse(topology.latest.id)
         .map_err(|error| DbError::Serialization(error.to_string()))?;
     let attempt_id = Uuid::new_v4().to_string();
-    let obligation = Database::begin_close_foundation_inner(
-        tx,
-        target,
-        &latest,
-        &attempt_id,
-        false,
-    )
-    .await?;
+    let obligation =
+        Database::begin_close_foundation_inner(tx, target, &latest, &attempt_id, false).await?;
     let marked = sqlx::query(
         "UPDATE close_obligations SET native_managed = 1
          WHERE attempt_id = ?1 AND product_conversation_id = ?2",
@@ -189,14 +183,16 @@ async fn apply_initial_tx(
     .bind(obligation.attempt_id().as_str())
     .execute(&mut **tx)
     .await?;
-    Ok(NativeCloseInitialResult::NewlyAdmitted(NativeCloseReceipt {
-        request_id: command.request_id(),
-        admitted: NativeCloseRunRef {
-            target: target.clone(),
-            attempt_id: obligation.attempt_id().clone(),
-            run_ordinal: CloseRunOrdinal::INITIAL,
+    Ok(NativeCloseInitialResult::NewlyAdmitted(
+        NativeCloseReceipt {
+            request_id: command.request_id(),
+            admitted: NativeCloseRunRef {
+                target: target.clone(),
+                attempt_id: obligation.attempt_id().clone(),
+                run_ordinal: CloseRunOrdinal::INITIAL,
+            },
         },
-    }))
+    ))
 }
 
 fn decode_run_ref(row: &sqlx::sqlite::SqliteRow) -> DbResult<NativeCloseRunRef> {

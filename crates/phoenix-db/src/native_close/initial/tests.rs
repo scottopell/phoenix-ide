@@ -118,10 +118,7 @@ async fn count(db: &Database, table: &str) -> i64 {
         "close_attempt_participants" => "SELECT COUNT(*) FROM close_attempt_participants",
         _ => panic!("unexpected table"),
     };
-    sqlx::query_scalar(sql)
-        .fetch_one(db.pool())
-        .await
-        .unwrap()
+    sqlx::query_scalar(sql).fetch_one(db.pool()).await.unwrap()
 }
 
 async fn assert_one_operation(f: &Fixture, receipt: &NativeCloseReceipt) {
@@ -164,9 +161,7 @@ async fn assert_one_operation(f: &Fixture, receipt: &NativeCloseReceipt) {
 async fn live_coordinator_exact_source_admits_and_replays_without_refilling_allowance() {
     let f = Fixture::new().await;
     let command = f.command(f.source.clone(), &f.target);
-    let NativeCloseInitialResult::NewlyAdmitted(receipt) =
-        f.apply(&command).await.unwrap()
-    else {
+    let NativeCloseInitialResult::NewlyAdmitted(receipt) = f.apply(&command).await.unwrap() else {
         panic!("expected a new operation")
     };
     assert_eq!(receipt.request_id, command.request_id());
@@ -182,14 +177,11 @@ async fn live_coordinator_exact_source_admits_and_replays_without_refilling_allo
 async fn exact_receipt_replay_keeps_run_one_after_operation_progress() {
     let f = Fixture::new().await;
     let command = f.command(f.source.clone(), &f.target);
-    let NativeCloseInitialResult::NewlyAdmitted(receipt) =
-        f.apply(&command).await.unwrap()
-    else {
+    let NativeCloseInitialResult::NewlyAdmitted(receipt) = f.apply(&command).await.unwrap() else {
         panic!("expected a new operation")
     };
 
-    f.db
-        .begin_close_idle_settlement(receipt.admitted.attempt_id.as_str())
+    f.db.begin_close_idle_settlement(receipt.admitted.attempt_id.as_str())
         .await
         .unwrap();
 
@@ -204,9 +196,7 @@ async fn exact_receipt_replay_keeps_run_one_after_operation_progress() {
 async fn same_source_changed_target_conflicts_instead_of_starting_second_operation() {
     let f = Fixture::new().await;
     let original = f.command(f.source.clone(), &f.target);
-    let NativeCloseInitialResult::NewlyAdmitted(receipt) =
-        f.apply(&original).await.unwrap()
-    else {
+    let NativeCloseInitialResult::NewlyAdmitted(receipt) = f.apply(&original).await.unwrap() else {
         panic!("expected a new operation")
     };
     let other = Fixture::create_target(&f.db, "second-target").await;
@@ -216,7 +206,7 @@ async fn same_source_changed_target_conflicts_instead_of_starting_second_operati
     assert_ne!(original.fingerprint(), changed.fingerprint());
     assert!(matches!(
         f.apply(&changed).await,
-        Err(DbError::InvalidData(message)) if message.contains("request identity conflict")
+        Err(DbError::CloseFoundationConflict(message)) if message.contains("request identity conflict")
     ));
     assert_one_operation(&f, &receipt).await;
 }
@@ -226,8 +216,7 @@ async fn idle_or_replaced_coordinator_refuses_even_exact_historical_replay() {
     for replaced in [false, true] {
         let f = Fixture::new().await;
         let command = f.command(f.source.clone(), &f.target);
-        let NativeCloseInitialResult::NewlyAdmitted(receipt) =
-            f.apply(&command).await.unwrap()
+        let NativeCloseInitialResult::NewlyAdmitted(receipt) = f.apply(&command).await.unwrap()
         else {
             panic!("expected a new operation")
         };
@@ -242,13 +231,12 @@ async fn idle_or_replaced_coordinator_refuses_even_exact_historical_replay() {
                 Err(DbError::CurrentCoordinatorRequired)
             ));
         } else {
-            f.db
-                .update_conversation_state(&f.coordinator, &ConvState::Idle)
+            f.db.update_conversation_state(&f.coordinator, &ConvState::Idle)
                 .await
                 .unwrap();
             assert!(matches!(
                 f.apply(&command).await,
-                Err(DbError::InvalidData(_))
+                Err(DbError::CloseFoundationPrecondition(_))
             ));
         }
         assert_one_operation(&f, &receipt).await;
@@ -259,9 +247,7 @@ async fn idle_or_replaced_coordinator_refuses_even_exact_historical_replay() {
 async fn new_source_tuple_must_reference_retained_operation_without_new_allowance() {
     let f = Fixture::new().await;
     let original = f.command(f.source.clone(), &f.target);
-    let NativeCloseInitialResult::NewlyAdmitted(receipt) =
-        f.apply(&original).await.unwrap()
-    else {
+    let NativeCloseInitialResult::NewlyAdmitted(receipt) = f.apply(&original).await.unwrap() else {
         panic!("expected a new operation")
     };
     let second_source = SourceToolCall {
@@ -273,9 +259,7 @@ async fn new_source_tuple_must_reference_retained_operation_without_new_allowanc
     assert_ne!(second.request_id(), original.request_id());
     assert_eq!(
         f.apply(&second).await.unwrap(),
-        NativeCloseInitialResult::ExistingOperationNeedsExactReference(
-            receipt.admitted.clone()
-        )
+        NativeCloseInitialResult::ExistingOperationNeedsExactReference(receipt.admitted.clone())
     );
     assert_one_operation(&f, &receipt).await;
 }

@@ -23442,10 +23442,11 @@ mod native_close_initial_receipt_tests {
             .execute(&pool)
             .await
             .unwrap();
-        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM native_close_initial_receipts")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM native_close_initial_receipts")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(remaining, 0);
     }
 }
