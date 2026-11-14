@@ -29,3 +29,5 @@ No bulk import and no dual-write period. Reconcile still-live obligations select
 ## Done when
 
 No executable updater path or active posting instruction remains; workflows/CI reference no removed scripts; REQ IDs/history remain retrievable; live workflow/config/Issue readback proves cutoff; only confirmed current obligations are carried forward. Use git diff --check, task validation, workflow checks and scoped reference search. Rust/UI builds are unnecessary solely for this retirement.
+
+Out of scope: deleting historical evidence, blanket roadmap import, dual writing and waiting for the scanner to stop stale automation.

@@ -1,0 +1,41 @@
+# Ember phase 4: useful, bounded event context and qualification
+
+Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). Depends on [phase 3 exact evidence](./06020-p1-ready--bind-watch-events-to-ending-response-evi.md) and [phase 1 baseline](./06014-p1-ready--ember-tool-contract-and-consistency-base.md). This slice brings captured evidence into the existing completion event; it precedes tracker/scanner delivery in the recommended shipping order.
+
+## Outcome
+
+Ember can often understand a finished response without first querying the worker's latest messages. The human can inspect who prompted that turn and the response it actually finished. No second message-sent alert is introduced.
+
+## Projection
+
+- Read the occurrence-bound evidence captured by phase 3. Never query latest message at prompt rendering or delayed notification delivery.
+- Include compact settled-input origin/sender context, exact ending-response reference, bounded verbatim prose and explicit truncation/absence state. Initial capture and render caps are both 1,024 UTF-8 bytes of response prose, clipped on Unicode boundaries; tune only from recorded quality/total-context evidence before activation. Render at most the captured bytes, retaining capture-limit/version and omissions. A later higher capture cap applies to new occurrences; older events stay explicitly truncated without mutable-source rehydration. Triggering-message body is not copied by default.
+- Keep the factual InputOrigin marker once. Avoid repeating event UUID and verbose labels in model context while retaining every original fact or an explicit typed evidence locator. Copied worker text is untrusted evidence, never user commission/Authority.
+- Keep original persisted diagnostic/provider text and accepted identity intact. Model-private enrichment is a typed projection; private UI details use the same evidence. Shared/redacted reads must not gain private excerpts, sender identities or source-title lookups through either typed fields or raw diagnostic text.
+- Extend existing event-card details only as needed. Preserve truthful Turn finished label, chronology, grouping, chapter exclusions, navigation/back behavior, live/history/pagination/continuation and accessibility. Reuse task 28007/specs/conversation-events. No separate dashboard.
+- Old, missing or remote-v1 evidence has an honest fallback. Do not fail ordinary delivery or pretend a missing excerpt is empty prose. Remote protocol enrichment is outside this v1 slice and requires separate producer/receiver contract qualification before claiming parity.
+- Preserve delivery frequency, timing and admission semantics. Temporal batching, suppressing routine completions and automatic tracker wake policy remain deferred.
+
+## Evidence and evaluation
+
+Production observation, fixed Oct 15–Nov 14 window: 6,849/7,985 event-to-next-input windows first reached for SQL; 6,978 included message-reading SQL. Of 120 evenly-spaced message queries, 118 requested latest messages and 102 literally named the notified source. These are descriptive temporal windows, not proof every lookup was caused by its event.
+
+Compare three isolated variants with identical model/effort/endpoint/tools/prompts/corpus/budgets:
+
+A current deployed packet; B exact evidence + bounded excerpt/trigger; C B plus compact labels.
+
+Measure requests/tool calls before correct next decision, total model-visible packet/tool-result context, source-message reads avoided, truncation-driven follow-up reads, latency, authority/paused-work correctness and outcome attribution. Report request caching/replay and tokenizer assumptions. Packet length alone and lower SQL counts alone are not success.
+
+Declare the promotion rule before trials: no attribution/authority failures in the required corpus, a demonstrated reduction in targeted latest-message retrieval, and explicit allowed total-context/latency regressions in control cases (including tool-only and no-useful-excerpt endings). Set numeric quality/cost/latency tolerances before running the comparison rather than choosing them from favorable results. If gates fail, keep the evidence and revise; do not activate or claim an improvement merely because a report exists.
+
+Use sanitized synthetic cases for ordinary useful prose, source emits B before A delivery, continuation, another conversation as sender, multiple admitted inputs, oversized Unicode, tool-only completion, missing source, failed/cancelled execution, question/approval waits, paused/dismissed work, execution completed but user outcome unresolved, and explicit unsupported remote evidence.
+
+## Starting files
+
+coordinator_watch_delivery.rs; runtime/executor.rs::render_messages; coordinator_watches/presentation.rs; API wire/message projections; ui/src/components/ConversationEventCard.tsx and tests; model/provider serialization; specs/global-recall and conversation-events. Use ./dev.py codegen for typed wire changes and scope native impact explicitly. Existing coordinator-drive-eval's four fake tools cannot qualify this path.
+
+## Done when
+
+The exact source/absence/truncation contract survives model and private/shared UI paths, required checks pass, and a bounded full-runtime comparison meets the predeclared promotion rule and reports total follow-up work. Retain honest gates if real-model or deployed acceptance is unexercised. No raw production messages, IDs, credentials or database artifacts go into test fixtures or public PR evidence.
+
+Out of scope: notification filtering/coalescing, another send alert, new automatic wakes, remote protocol enrichment, tracking/scanner implementation and a new event dashboard.

@@ -1,6 +1,6 @@
-# Ember phase 3: durable tracking store and native tool
+# Ember phase 5: durable tracking store and native tool
 
-Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). Depends on phase 1's contract. No scanner/model calls in this slice.
+Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). Depends on [phase 1](./06014-p1-ready--ember-tool-contract-and-consistency-base.md). This is the parallel memory path; event phases 3–4 are not storage dependencies. No scanner/model calls in this slice.
 
 ## Outcome
 
@@ -27,3 +27,5 @@ crates/phoenix-core/src/domain; crates/phoenix-db/src/{lib.rs,migrations}; coord
 Migration/schema tests; invalid/null retirement; typed reference constraints; two distinct commitments cited from one source message; repeated operation versus changed intent; concurrent edits/conflicts; local-authority commit classification; missing source/removed peer; data reopen. Test captured text as evidence, never user permission. Ordinary/child registries do not acquire mutation capability.
 
 Recreate the parent plan's disposable SQL invariants in production tests; its ignored scratch prototype is not implementation. Done when committed records/retirement survive supported same-database restart and exact evidence stays intact, with precise bounded receipts and no dispatch/Goal/Authority side effects.
+
+Out of scope: fresh context/UI projection, scanner inference, new wake policy and completion-event implementation.
