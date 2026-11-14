@@ -251,7 +251,7 @@ Property tests live in `**/proptests.rs` files. Run with `cargo test proptests`.
 ./dev.py prod stop               # Stop service
 ```
 
-Builds static ~9MB binary with embedded UI. Runs on port 8031, database at `~/.phoenix-ide/prod.db`.
+Builds a static `--release` binary with the UI embedded (debug symbols kept unless stripped); the size-optimized `release-min` download is ~50MB. Runs on port 8031, database at `~/.phoenix-ide/prod.db`.
 
 ---
 
