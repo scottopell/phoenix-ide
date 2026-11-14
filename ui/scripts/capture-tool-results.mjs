@@ -46,6 +46,16 @@ async function captureMobileExpandedSpacing({ page, id, outDir, viewport }) {
   const evidence = await page.evaluate(() => {
     const selectors = [
       '.compact-tool-group',
+      '.compact-tool-group > .message-header',
+      '.compact-tool-group > .message-content',
+      '.compact-tool-selected-detail > .compact-tool-owner-copy',
+      '.compact-tool-selected-detail > .compact-tool-detail-collapse',
+      '.compact-tool-selected-detail > .message',
+      '.compact-tool-selected-detail > .message > .message-content',
+      '.compact-tool-selected-detail > .message > .message-content > *',
+      '.compact-tool-selected-detail > .message .tool-block',
+      '.compact-tool-selected-detail > .message .tool-block-header',
+      '.compact-tool-group',
       '.compact-tool-group .message-content',
       '.compact-tool-selected-detail',
       '.compact-tool-selected-detail > .message',
@@ -69,6 +79,11 @@ async function captureMobileExpandedSpacing({ page, id, outDir, viewport }) {
         paddingBottom: style.paddingBottom,
         lineHeight: style.lineHeight,
         display: style.display,
+        gap: style.gap,
+        flexDirection: style.flexDirection,
+        tagName: element.tagName,
+        className: element.className,
+        text: element.children.length === 0 ? element.textContent?.trim().slice(0, 80) : undefined,
       }];
     }));
   });
