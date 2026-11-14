@@ -95,7 +95,10 @@ async function captureMobileExpandedSpacing({ page, id, outDir, viewport }) {
   if (evidence.documentScrollWidth !== evidence.documentClientWidth) {
     throw new Error(`expanded detail created page overflow: ${JSON.stringify(evidence)}`);
   }
-  await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+  const clipboardPermissions = page.context().browser().browserType().name() === 'webkit'
+    ? ['clipboard-read']
+    : ['clipboard-read', 'clipboard-write'];
+  await page.context().grantPermissions(clipboardPermissions);
   await page.locator('.compact-tool-selected-detail [data-tool-id="mobile-send-message"] .tool-block-input button').click();
   const copiedInput = await page.evaluate(() => navigator.clipboard.readText());
   if (!copiedInput.includes('@conv:fixture-review') || !copiedInput.includes('8f53edc3-0711-46d8-8f3b-004201a2f410')) {
