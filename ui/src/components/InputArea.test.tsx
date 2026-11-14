@@ -1053,6 +1053,52 @@ describe('bash tool rendering', () => {
     expect(screen.queryByRole('button', { name: /peek/i })).not.toBeInTheDocument();
   });
 });
+describe('InputArea continuation upload ownership', () => {
+  function UploadComposer({ scope, transcript }: { scope: string; transcript: string }) {
+    const [files, setFiles] = useState<FileAttachment[]>([]);
+    return <InputArea cwd={undefined} scopeKey={scope} uploadConversationId={transcript}
+      convState={idleState} images={[]} setImages={() => {}} files={files} setFiles={setFiles}
+      isOffline={false} failedMessages={[]} draft="" onDraftChange={() => {}}
+      onSend={() => {}} onCancel={() => {}} onRetry={() => {}} />;
+  }
+
+  it('retains a pending upload across continuation and routes the next upload to the successor', async () => {
+    let resolve!: (files: FileAttachment[]) => void;
+    const upload = vi.spyOn(api, 'uploadAttachments')
+      .mockImplementationOnce(() => new Promise<FileAttachment[]>(done => { resolve = done; }))
+      .mockResolvedValueOnce([{ ...rejectedFile, original_name: 'next.txt' }]);
+    const view = render(<UploadComposer scope="product:p" transcript="a" />);
+    fireEvent.drop(document.getElementById('input-area')!, {
+      dataTransfer: { types: ['Files'], files: [new File(['x'], 'notes.txt')] },
+    });
+    expect(upload).toHaveBeenLastCalledWith('a', expect.any(Array));
+    view.rerender(<UploadComposer scope="product:p" transcript="b" />);
+    await act(async () => { resolve([rejectedFile]); });
+    expect(screen.getByText('notes.txt')).toBeInTheDocument();
+    fireEvent.drop(document.getElementById('input-area')!, {
+      dataTransfer: { types: ['Files'], files: [new File(['x'], 'next.txt')] },
+    });
+    await screen.findByText('next.txt');
+    expect(upload).toHaveBeenLastCalledWith('b', expect.any(Array));
+    upload.mockRestore();
+  });
+
+  it('discards a pending upload after navigation to a different product', async () => {
+    let resolve!: (files: FileAttachment[]) => void;
+    const upload = vi.spyOn(api, 'uploadAttachments').mockImplementationOnce(
+      () => new Promise<FileAttachment[]>(done => { resolve = done; }));
+    const view = render(<UploadComposer scope="product:p" transcript="a" />);
+    fireEvent.drop(document.getElementById('input-area')!, {
+      dataTransfer: { types: ['Files'], files: [new File(['x'], 'notes.txt')] },
+    });
+    view.rerender(<UploadComposer scope="product:q" transcript="c" />);
+    await act(async () => { resolve([rejectedFile]); });
+    expect(screen.queryByText('notes.txt')).not.toBeInTheDocument();
+    expect(screen.queryByText('Uploading attachments...')).not.toBeInTheDocument();
+    upload.mockRestore();
+  });
+});
+
 describe('InputArea file-tree drag-and-drop', () => {
   const FILE_TREE_DRAG_TYPE = 'application/x-phoenix-file-path';
 

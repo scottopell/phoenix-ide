@@ -2509,6 +2509,7 @@ function ConversationPageContent({
           slug={composerScopeKey ?? slug!}
           cwd={routePrefix === '/global' ? undefined : conversation.cwd}
           scopeKey={composerScopeKey ?? conversationId}
+          uploadConversationId={conversationId}
           convState={convStateForChildren}
           images={images}
           setImages={setImages}
@@ -2567,6 +2568,7 @@ function ConversationPageContent({
             slug={composerScopeKey ?? slug!}
             cwd={routePrefix === '/global' ? undefined : conversation.cwd}
             scopeKey={composerScopeKey ?? conversationId}
+            uploadConversationId={conversationId}
             convState={convStateForChildren}
             images={images}
             setImages={setImages}
@@ -2625,6 +2627,7 @@ function ConversationPageContent({
           slug={composerScopeKey ?? slug!}
           cwd={routePrefix === '/global' ? undefined : conversation.cwd}
           scopeKey={composerScopeKey ?? conversationId}
+          uploadConversationId={conversationId}
           convState={convStateForChildren}
           images={images}
           setImages={setImages}

@@ -1944,9 +1944,39 @@ pub(crate) async fn validate_submitted_attachments(
     validate_submitted_attachments_at_root(&attachment_root(), conversation_id, files).await
 }
 
+pub(crate) async fn validate_continuation_attachments(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    files: &[crate::api::types::FileAttachment],
+) -> Result<Vec<phoenix_core::domain::db_schema::FileAttachment>, AppError> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root_id = db
+        .chain_root_of(conversation_id)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("Conversation does not exist".to_string()))?;
+    let members = db.chain_members_forward(&root_id).await?;
+    let current = members
+        .iter()
+        .position(|member| member == conversation_id)
+        .ok_or_else(|| {
+            AppError::BadRequest("Conversation is not in its continuation chain".to_string())
+        })?;
+    validate_submitted_attachments_at_roots(&attachment_root(), &members[..=current], files).await
+}
+
 async fn validate_submitted_attachments_at_root(
     root: &std::path::Path,
     conversation_id: &str,
+    files: &[crate::api::types::FileAttachment],
+) -> Result<Vec<phoenix_core::domain::db_schema::FileAttachment>, AppError> {
+    validate_submitted_attachments_at_roots(root, &[conversation_id.to_string()], files).await
+}
+
+async fn validate_submitted_attachments_at_roots(
+    root: &std::path::Path,
+    conversation_ids: &[String],
     files: &[crate::api::types::FileAttachment],
 ) -> Result<Vec<phoenix_core::domain::db_schema::FileAttachment>, AppError> {
     if files.is_empty() {
@@ -1957,10 +1987,23 @@ async fn validate_submitted_attachments_at_root(
             "A message can include at most {MAX_ATTACHMENTS_PER_MESSAGE} files"
         )));
     }
-    let expected_dir = root.join(conversation_id);
-    let canonical_expected_dir = tokio::fs::canonicalize(&expected_dir)
-        .await
-        .map_err(|_| AppError::BadRequest("Attachment directory does not exist".to_string()))?;
+    let mut canonical_dirs = Vec::new();
+    for id in conversation_ids {
+        match tokio::fs::canonicalize(root.join(id)).await {
+            Ok(dir) => canonical_dirs.push(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(AppError::Internal(format!(
+                    "Cannot read attachment directory: {error}"
+                )))
+            }
+        }
+    }
+    if canonical_dirs.is_empty() {
+        return Err(AppError::BadRequest(
+            "Attachment directory does not exist".to_string(),
+        ));
+    }
     let mut total_bytes = 0usize;
     let mut validated = Vec::with_capacity(files.len());
     for file in files {
@@ -1977,7 +2020,10 @@ async fn validate_submitted_attachments_at_root(
         let canonical_path = tokio::fs::canonicalize(&path).await.map_err(|_| {
             AppError::BadRequest(format!("Attachment '{}' is missing", file.original_name))
         })?;
-        if !canonical_path.starts_with(&canonical_expected_dir) {
+        if !canonical_dirs
+            .iter()
+            .any(|dir| canonical_path.starts_with(dir))
+        {
             return Err(AppError::BadRequest(format!(
                 "Attachment '{}' does not belong to this conversation",
                 file.original_name
@@ -10140,6 +10186,62 @@ mod conversation_cwd_validation_tests {
                 if message.contains("fatal local authority loss")
         ));
         assert!(state.db.list_conversations().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn continuation_attachments_allow_predecessor_and_reject_foreign_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("attachments");
+        let predecessor = root.join("predecessor");
+        let unrelated = root.join("unrelated");
+        tokio::fs::create_dir_all(&predecessor).await.unwrap();
+        tokio::fs::create_dir_all(&unrelated).await.unwrap();
+        let old_path = predecessor.join("notes.txt");
+        let foreign_path = unrelated.join("foreign.txt");
+        tokio::fs::write(&old_path, b"hello").await.unwrap();
+        tokio::fs::write(&foreign_path, b"hello").await.unwrap();
+        let file = FileAttachment {
+            original_name: "notes.txt".to_string(),
+            stored_path: old_path.display().to_string(),
+            media_type: "text/plain".to_string(),
+            size_bytes: 5,
+        };
+        let members = vec!["predecessor".to_string(), "successor".to_string()];
+        let accepted =
+            validate_submitted_attachments_at_roots(&root, &members, std::slice::from_ref(&file))
+                .await
+                .unwrap();
+        assert_eq!(
+            accepted[0].stored_path,
+            tokio::fs::canonicalize(&old_path)
+                .await
+                .unwrap()
+                .display()
+                .to_string()
+        );
+        let foreign = FileAttachment {
+            stored_path: foreign_path.display().to_string(),
+            ..file
+        };
+        assert!(matches!(
+            validate_submitted_attachments_at_roots(&root, &members, &[foreign]).await,
+            Err(AppError::BadRequest(message)) if message.contains("does not belong")
+        ));
+        #[cfg(unix)]
+        {
+            let escape = predecessor.join("escape.txt");
+            std::os::unix::fs::symlink(&foreign_path, &escape).unwrap();
+            let escaped = FileAttachment {
+                original_name: "escape.txt".to_string(),
+                stored_path: escape.display().to_string(),
+                media_type: "text/plain".to_string(),
+                size_bytes: 5,
+            };
+            assert!(matches!(
+                validate_submitted_attachments_at_roots(&root, &members, &[escaped]).await,
+                Err(AppError::BadRequest(message)) if message.contains("does not belong")
+            ));
+        }
     }
 
     #[tokio::test]

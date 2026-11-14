@@ -64,6 +64,8 @@ interface InputAreaProps {
    * doesn't carry one's state into the other.
    */
   scopeKey: string | undefined;
+  /** Transcript receiving uploaded attachments; independent of the stable composer product scope. */},{
+  uploadConversationId?: string | undefined;
   convState: ConversationState;
   images: ImageData[];
   setImages: (images: ImageData[]) => void;
@@ -153,6 +155,7 @@ function canAcceptChatMessage(state: ConversationState): boolean {
 export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function InputArea({
   cwd,
   scopeKey,
+  uploadConversationId,
   convState,
   images,
   setImages: onImagesChange,
@@ -214,11 +217,9 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   recorderIdentityRef.current = recorderIdentity;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  // `scopeKey` is the conversation id for this (always in-conversation) composer;
-  // attachment uploads target it, and this ref lets an in-flight upload detect a
-  // conversation switch and discard its late response.
-  const scopeKeyRef = useRef(scopeKey);
-  scopeKeyRef.current = scopeKey;
+  // Upload destination can be a transcript distinct from the product scope.
+  // Async ownership remains tied to scopeEpoch below, not this destination.
+  const attachmentConversationId = uploadConversationId ?? scopeKey;
   const voiceSupported = isWebSpeechSupported();
   const [quickActionSending, setQuickActionSending] = useState(false);
 
@@ -275,7 +276,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
   // File-attachment drag/drop state.
   const [isDragOver, setIsDragOver] = useState(false);
-  const [isUploadingFiles, setIsUploadingFiles] = useState(false);
+  const [isUploadingFiles, setIsUploadingFiles] = useScopedState(scopeKey, false);
   owner.current.uploading = isUploadingFiles;
 
   // External draft insertions (file-tree context menu, drag-and-drop) bypass
@@ -355,12 +356,12 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       setExpansionError('Wait for the current attachment upload to finish before adding more files.');
       return;
     }
-    if (!scopeKey) {
+    if (!attachmentConversationId) {
       setExpansionError('Open a conversation before attaching files.');
       return;
     }
-
-    const uploadConversationId = scopeKey;
+    const uploadTarget = attachmentConversationId;
+    const uploadScopeEpoch = scopeEpoch;
 
     const unsupportedImage = dropped.find(file => file.type.startsWith('image/') && !SUPPORTED_IMAGE_TYPES.includes(file.type));
     if (unsupportedImage) {
@@ -392,13 +393,14 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     setIsUploadingFiles(true);
     setExpansionError(null);
     try {
-      const uploaded = await api.uploadAttachments(uploadConversationId, genericFiles);
-      if (scopeKeyRef.current !== uploadConversationId) return;
+      const uploaded = await api.uploadAttachments(uploadTarget, genericFiles);
+      if (owner.current.epoch !== uploadScopeEpoch) return;
       setFiles(prev => [...prev, ...uploaded]);
     } catch (err) {
+      if (owner.current.epoch !== uploadScopeEpoch) return;
       setExpansionError(err instanceof Error ? err.message : 'Failed to upload attachments');
     } finally {
-      setIsUploadingFiles(false);
+      if (owner.current.epoch === uploadScopeEpoch) setIsUploadingFiles(false);
     }
   };
 
