@@ -2,6 +2,8 @@
 
 Synthetic, public component evidence for PR #1081. The original private user screenshot was inspected through the authenticated message API but is **not** included here.
 
+See the [original-screenshot acceptance reconciliation](acceptance-reconciliation.md) for **every remaining blank/control region**, full stacked-tool before/after captures, and merged-main/commenting verification. The whole summary-to-expanded-tool span is 180.953→136.953px on touch layouts; the 58→14px figures below describe only the nested message inset.
+
 ## Failure and bounded correction
 
 An expanded compact-tool selection embeds a non-first `AgentMessage` with message-copy controls suppressed. Its otherwise-empty continuation toolbar still occupied 44 CSS pixels on touch layouts. The selected-detail renderer now omits that empty toolbar; ordinary continuation toolbars and first-message metadata are unchanged. Existing owner-copy rows, copy buttons, collapse controls, tool arguments and results are retained. This removes one demonstrated redundant gap, not every region of whitespace or every mobile padding issue.
