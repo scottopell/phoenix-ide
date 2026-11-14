@@ -441,8 +441,8 @@ class DevWorkflowArtifactTests(unittest.TestCase):
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
         self.assertIn("sudo apt-get install -y musl-tools", workflow)
         self.assertIn(
-            "cargo check --target x86_64-unknown-linux-musl "
-            "--features phoenix_ide/datadog-tracing",
+            "cargo clippy --target x86_64-unknown-linux-musl "
+            "--features phoenix_ide/datadog-tracing -- -D warnings",
             workflow,
         )
 

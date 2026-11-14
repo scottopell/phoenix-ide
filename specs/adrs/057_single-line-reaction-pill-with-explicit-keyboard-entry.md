@@ -1,6 +1,6 @@
 # ADR-057: Single-line reaction pill with explicit keyboard entry
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR-253
 - **Date:** 2026-09-19
 - **Affects:** REQ-PF-018, REQ-PF-019, REQ-PF-020, REQ-KB-004
 

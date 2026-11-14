@@ -1,3 +1,4 @@
+import type { AutomaticContinuationView } from '../../generated/AutomaticContinuationView';
 import type { Message, SubAgentResult, ToolResultContent } from '../../api';
 import type { ToolResultsFixtureData, ToolResultsScenario } from './types';
 
@@ -536,6 +537,41 @@ const subagentMessages: Message[] = [
   ]),
 ];
 
+const mobileContinuationPreference = {
+  aggregate: { kind: 'ordinary', product_conversation_id: 'fixture-review' },
+  auto_continue_on_context_exhaustion: false,
+} satisfies Pick<AutomaticContinuationView, 'aggregate' | 'auto_continue_on_context_exhaustion'>;
+
+const mobileSpacingMessages: Message[] = [
+  userMessage(1, 'Send the mobile review note and continue automatically.'),
+  agentMessage(2, [{
+    type: 'tool_use',
+    id: 'mobile-send-message',
+    name: 'send_conversation_message',
+    input: {
+      target: '@conv:fixture-review',
+      message: 'Please review the expanded mobile tool activity. This intentionally long but plausible message exercises wrapping, copy controls, and the complete expanded tool detail without fixture-only spacing.',
+      message_id: '8f53edc3-0711-46d8-8f3b-004201a2f410',
+    },
+  }]),
+  toolMessage(3, 'mobile-send-message', JSON.stringify({ outcome: 'delivered', target: '@conv:fixture-review', conversation_id: 'fixture-review-transcript', message_id: '8f53edc3-0711-46d8-8f3b-004201a2f410' }), { display_data: { duration_ms: 42 } }),
+  agentMessage(4, [{
+    type: 'tool_use',
+    id: 'mobile-next-read',
+    name: 'read_automatic_continuation',
+    input: { target: { kind: 'ordinary', product_conversation_id: 'fixture-review' } },
+  }]),
+  toolMessage(5, 'mobile-next-read', JSON.stringify(mobileContinuationPreference), { display_data: { duration_ms: 18 } }),
+  agentMessage(6, [{
+    type: 'tool_use',
+    id: 'mobile-query-database',
+    name: 'query_database',
+    input: { sql: "SELECT conversation_id, state, updated_at FROM conversations WHERE conversation_id = 'fixture-review-transcript' LIMIT 1" },
+  }]),
+  toolMessage(7, 'mobile-query-database', JSON.stringify({ columns: ['conversation_id', 'state', 'updated_at'], rows: [['fixture-review-transcript', 'idle', '2026-02-01T10:03:00Z']] })),
+  agentMessage(8, [{ type: 'text', text: 'The review message was sent and its automatic-continuation preference was read.' }]),
+];
+
 export const toolResultsScenarios = [
   { id: 'shell-full', title: 'Shell — full', description: 'Transcript shell with lifecycle states, browser action summaries, and fallback rendering in full density.', density: 'full', family: 'shell' },
   { id: 'shell-compact', title: 'Shell — compact', description: 'The same transcript shell rendered with compact density.', density: 'compact', family: 'shell' },
@@ -551,6 +587,7 @@ export const toolResultsScenarios = [
   { id: 'grid-compact', title: 'Consecutive tool calls — compact grid', description: 'Consecutive one-tool agent messages share a responsive compact grid while bash spans the row.', density: 'compact', family: 'grid' },
   { id: 'subagents-full', title: 'Sub-agent summary — full', description: 'Persistent spawn_agents summary block in full density.', density: 'full', family: 'subagents' },
   { id: 'subagents-compact', title: 'Sub-agent summary — compact', description: 'Persistent spawn_agents summary block in compact density.', density: 'compact', family: 'subagents' },
+  { id: 'mobile-spacing-compact', title: 'Mobile expanded tool spacing', description: 'A realistic send_conversation_message, paired result, and automatic continuation for mobile expanded-detail geometry.', density: 'compact', family: 'mobile-spacing', theme: 'light' },
 ] as const satisfies readonly ToolResultsScenario[];
 
 export type ToolResultsScenarioId = (typeof toolResultsScenarios)[number]['id'];
@@ -569,13 +606,14 @@ const messagesByFamily = {
   profiling: profilingMessages,
   grid: gridMessages,
   subagents: subagentMessages,
+  'mobile-spacing': mobileSpacingMessages,
 } as const satisfies Record<ToolResultsScenario['family'], Message[]>;
 
 export function toolResultsFixtureData(scenario: ToolResultsScenario): ToolResultsFixtureData {
   return {
     conversationId: `${CONVERSATION_ID}-${scenario.id}`,
     slug: `${CONVERSATION_ID}-${scenario.id}`,
-    theme: THEME,
+    theme: scenario.theme ?? THEME,
     density: scenario.density,
     filePathRootDir: FILE_ROOT,
     workScopeKey: WORK_SCOPE_KEY,

@@ -435,20 +435,27 @@ Task approval and fork-proposal review SHALL remain purpose-built decision surfa
 WHEN the user selects non-empty rendered text wholly within one finalized assistant message
 AND the conversation has an eligible current message draft
 AND the selection uses a fine pointer or keyboard
-THE SYSTEM SHALL immediately show a single-line reaction pill near the selection
+THE SYSTEM SHALL immediately show an initially single-line reaction pill near the selection
 AND SHALL preserve the selected text and stable source-message identity when the input receives focus
 AND SHALL NOT focus the input merely because text was selected.
 
 WHEN such an eligible selection is made using touch or a coarse pointer
 THE SYSTEM SHALL instead show the reaction pill as a compact dock above the current composer
-AND SHALL show a short source preview
+AND SHALL show a short source preview above the full-width comment editor
 AND SHALL preserve the exact selected text, source identity, and native range before input focus clears the native selection
 AND SHALL NOT open the software keyboard merely because text was selected.
 
 THE SYSTEM SHALL leave native selection, selection handles, copying, context menus, and scrolling available
 AND SHALL exclude editable fields, tool interfaces, streaming content, and selections spanning messages from reaction entry.
 
-THE SYSTEM SHALL keep the reaction input one line tall with horizontally scrolling overflow and explicit Add to draft and dismiss controls.
+WHILE a passage has an open reaction or an annotation in the current message draft
+THE SYSTEM SHALL visibly highlight that exact passage independently of native text-selection focus
+AND SHALL restore the highlight when the source passage mounts after transcript virtualization.
+
+THE SYSTEM SHALL wrap reaction text and grow the input vertically as soon as it exceeds the visible line width
+AND SHALL shrink the input when text is removed
+AND SHALL bound its height to fit the visible viewport, using vertical scrolling for longer reactions
+AND SHALL provide explicit Add to draft and dismiss controls.
 
 WHEN the selected passage leaves the transcript viewport or its row unmounts
 THE SYSTEM SHALL retain an unfinished reaction in a compact dock with a reaction preview and Return to passage action.
@@ -467,10 +474,46 @@ AND SHALL keep the touch/coarse-pointer dock directly above the current composer
 ### REQ-PF-019: Add Reaction to Draft
 
 WHEN the user activates Add to draft with a non-blank reaction
-THE SYSTEM SHALL append the complete selected quotation, its source identity, and the reaction to the current draft exactly once
+THE SYSTEM SHALL add one annotation card owning the complete selected quotation, its source identity, and the reaction to the current draft exactly once
 AND SHALL preserve existing draft text, including intervening edits and whitespace
-AND SHALL isolate quoted content from surrounding Markdown delimiters
 AND SHALL NOT submit a message, write to the clipboard, or modify the review-note collection.
+
+THE SYSTEM SHALL present pending annotations as a compact overlapping stack above the ordinary composer, including when there is only one annotation
+AND SHALL give each annotation a stable number, source excerpt, and comment preview
+AND SHALL preserve creation order and existing numbers across additions, edits, and deletions
+AND SHALL bound the stack height with internal scrolling and expose a selectable strip at least 44 CSS pixels tall for each card.
+
+WHEN the user selects an annotation strip
+THE SYSTEM SHALL open a modal showing the complete source quotation and an editable comment while keeping the source passage fixed
+AND SHALL save comment edits to the draft as they are typed
+AND SHALL provide deletion and return to the exact source passage through transcript navigation.
+
+WHEN the annotation editor is dismissed
+THE SYSTEM SHALL retain comment edits and return keyboard focus to its strip without scrolling the conversation.
+
+WHEN the user deletes an annotation in the editor
+THE SYSTEM SHALL close the editor and return focus to an adjacent annotation strip, or to the ordinary composer when the stack is empty.
+
+WHEN an annotation card is removed
+THE SYSTEM SHALL remove that annotation and its source highlight together without changing unrelated draft text or annotations.
+
+WHEN a composer quick action submits its own prompt
+THE SYSTEM SHALL preserve ordinary draft text and pending annotations.
+
+WHEN the user submits the message
+THE SYSTEM SHALL format the submitted annotation cards with their source identities and complete quotations alongside ordinary message text
+AND SHALL isolate quoted content from surrounding Markdown delimiters
+AND SHALL retain the submitted cards and highlights until submission is accepted by the ordinary message-delivery path.
+
+WHEN submission is accepted
+THE SYSTEM SHALL clear only the submitted annotation cards and their highlights, preserving annotations and text added during submission.
+
+WHEN the ordinary delivery queue accepts ownership of a submitted message
+THE SYSTEM SHALL keep subsequent transport failures and authoritative acknowledgements in that delivery workflow
+AND SHALL NOT create an editable annotation copy of a message still owned by delivery.
+
+WHEN submission fails before message-delivery ownership is accepted
+THE SYSTEM SHALL retain the annotations and highlights and make the comments editable again.
 
 WHEN append succeeds
 THE SYSTEM SHALL dismiss and clear the reaction input and acknowledge the addition accessibly
@@ -499,10 +542,12 @@ WHEN the destination is unavailable or append fails
 THE SYSTEM SHALL retain the reaction and explain the unavailable or failed action.
 
 WHEN the user requests dismissal of a typed reaction
-THE SYSTEM SHALL offer Keep and Discard in the same compact row
+THE SYSTEM SHALL collapse the pill to a compact inline Keep and Discard confirmation
+AND SHALL preserve the pill's width and top border while showing the confirmation
+AND Keep SHALL restore the editor and its text from that top border, subject to visible-viewport bounds
 AND Escape SHALL resolve that local interaction before any enclosing navigation.
 
-Temporary reactions are session-local; refresh recovery and cross-device synchronization are not guaranteed. Appended text follows the ordinary message draft's persistence contract.
+Temporary reactions and annotation cards are session-local; refresh recovery and cross-device synchronization are not guaranteed. Ordinary draft text follows its own persistence contract.
 
 ### REQ-PF-021: Touch Access to Message Review
 

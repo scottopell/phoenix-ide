@@ -122,7 +122,7 @@ WHILE a restricted planning conversation or a sub-agent of an ordinary conversat
 THE SYSTEM SHALL NOT provide Phoenix-wide history search, global conversation reads, database queries, global reference resolution, or cross-conversation messaging tools
 
 WHEN the Global Coordinator delegates bounded research, analysis, or authorized shell work through `spawn_agents`
-THE SYSTEM SHALL provide trusted inline children with bounded global history search, conversation reads, database queries, reference resolution, read-only file inspection, and the Coordinator's unsandboxed write-capable Bash tool
+THE SYSTEM SHALL provide trusted inline children with bounded global history search, conversation reads, database queries with the Coordinator's explicit saved-peer read selector, reference resolution, read-only file inspection, and the Coordinator's unsandboxed write-capable Bash tool
 AND SHALL require an explicit active WorkScope ID for each file read, resolve its authoritative server directory, and use ordinary numbered read_file offset/limit and path semantics
 AND SHALL require an explicit active WorkScope ID for every Bash run and reuse the Coordinator Bash target resolution, execution, handle-control, and lifecycle bounds
 AND SHALL permit the Coordinator home scope for general shell work and selected ordinary scopes for project work without treating the starting directory as filesystem confinement
@@ -569,10 +569,10 @@ THE operator SHALL stop the runtime and explicitly remove its database and retai
 
 ### REQ-GR-019: Continue an Exact Generated Ordinary Handoff
 
-WHEN the current authenticated Global Coordinator invokes native `continue_conversation`
+WHEN the current authenticated Global Coordinator invokes native `continue_conversation` locally or selects an optional instance under [Federation REQ-FED-026–027](../federation/requirements.md): omission, explicit JSON `null`, or exact `"local"` retains the local operation; unknown or ambiguous peers and self-selection fail; remote execution never falls back to local or another peer
 THE SYSTEM SHALL require an exact ordinary ProductConversation ID, exact exhausted predecessor transcript ID and exact persisted system-generated summary message ID
 AND SHALL derive source transcript and tool-call identity from trusted execution context rather than agent input
-AND SHALL recheck current Coordinator authority in the reservation transaction, including completed-opening replay
+AND SHALL recheck current Coordinator authority in the local reservation transaction, including completed-opening replay; for a selected peer the source SHALL revalidate current Coordinator authority at remote dispatch while the authenticated destination SHALL trust that source attestation and transactionally recheck current Federation send authority, including replay
 AND SHALL refuse self-rotation, ordinary-conversation sources, predecessor Coordinator sources and sub-agents.
 
 THE SYSTEM SHALL require the predecessor to be a published user-initiated member of that ordinary conversation in ContextExhausted with the referenced current generated summary
@@ -583,7 +583,7 @@ AND SHALL create the first-message identity on the server rather than accept lit
 WHEN a durable continuation reservation already exists for that exact handoff
 THE SYSTEM SHALL reuse its successor and winning opening identity
 AND SHALL review a pending opening against that exact successor's current capacity without replacing its retained intent on refusal
-AND SHALL return a completed opening's retained acceptance without requiring provider capacity or dispatching another opening.
+AND SHALL return an accepted opening's retained acceptance without requiring provider capacity or dispatching another opening. A successful remote `Accepted` dispatch receipt MAY precede durable materialization of the first opening: its pending identity SHALL be the exact caller/source-derived request key; materialization SHALL yield an accepted opening identity equal to that key or `successor:key` for the reserved successor. The receipt SHALL NOT itself assert durable acceptance.
 
 WHEN local persistence authority becomes unclassified during reservation or opening acceptance
 THE SYSTEM SHALL close local runtime authority before releasing its admitted operation

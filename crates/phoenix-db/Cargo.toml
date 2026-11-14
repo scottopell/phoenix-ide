@@ -18,44 +18,44 @@ path = "src/lib.rs"
 test-support = []
 
 [build-dependencies]
-phoenix-core = { path = "../phoenix-core" }
+phoenix-core = { workspace = true }
 
 [dependencies]
 # Shared domain vocabulary (persisted schema types, ConvState, ContentBlock,
 # LlmLanguage, Priority, the task-approval handoff parcel, …).
-phoenix-core = { path = "../phoenix-core" }
-phoenix-workflow = { path = "../phoenix-workflow" }
-phoenix-svg = { path = "../phoenix-svg" }
+phoenix-core = { workspace = true }
+phoenix-workflow = { workspace = true }
+phoenix-svg = { workspace = true }
 
 # Database
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
-sqlx-core = { version = "0.9", default-features = false }
-libsqlite3-sys = { version = "0.37", features = ["bundled"] }
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
+sqlx-core = { workspace = true }
+libsqlite3-sys = { workspace = true, features = ["bundled"] }
 
 # Serialization (JSON-in-TEXT columns + derives on persisted row types)
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-schemars = { version = "0.8", features = ["uuid1"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+schemars = { workspace = true, features = ["uuid1"] }
 
 # Timestamps
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { workspace = true, features = ["serde"] }
 
 # Row/PK identifiers
-uuid = { version = "1", features = ["v4"] }
+uuid = { workspace = true, features = ["v4"] }
 
 # Random suffix for slug-collision disambiguation
-rand = "0.10"
+rand = { workspace = true }
 
 # Error types
-thiserror = "2"
+thiserror = { workspace = true }
 
-tracing = "0.1"
-libc = "0.2"
-sha2 = "0.11"
+tracing = { workspace = true }
+libc = { workspace = true }
+sha2 = { workspace = true }
 
 # Async trait objects for the MessageRetriever seam (Arc<dyn MessageRetriever>).
-async-trait = "0.1"
-tokio = { version = "1", features = ["time", "sync", "macros"] }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["time", "sync", "macros"] }
 
 [dev-dependencies]
 # Re-declared with test-support so phoenix-core's #[cfg(test)] domain
@@ -63,14 +63,14 @@ tokio = { version = "1", features = ["time", "sync", "macros"] }
 # tests are built in isolation (`cargo test -p phoenix-db`), not only when
 # workspace feature unification happens to pull the feature in via phoenix-ide.
 # Dev-only: production `cargo build` never enables it.
-phoenix-core = { path = "../phoenix-core", features = ["test-support"] }
-phoenix-state-machine = { path = "../phoenix-state-machine" }
+phoenix-core = { workspace = true, features = ["test-support"] }
+phoenix-state-machine = { workspace = true }
 
 # `#[tokio::test]` runtime for the async persistence tests.
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
-tempfile = "3"
-phoenix-tls = { path = "../phoenix-tls" }
-tracing-subscriber = "0.3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tempfile = { workspace = true }
+phoenix-tls = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

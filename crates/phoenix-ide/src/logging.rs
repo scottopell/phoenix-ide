@@ -648,6 +648,8 @@ fn datadog_auto_exporter_from_env(
     }
 }
 
+// The Err arm exists only in builds without datadog-tracing.
+#[cfg_attr(feature = "datadog-tracing", allow(clippy::unnecessary_wraps))]
 fn datadog_exporter() -> std::io::Result<TraceExporter> {
     #[cfg(feature = "datadog-tracing")]
     {

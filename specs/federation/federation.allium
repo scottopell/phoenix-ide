@@ -134,6 +134,9 @@ enum ToolKind {
     | resolve_reference
     | read_automatic_continuation
     | set_automatic_continuation
+    | continue_conversation
+    | prepare_goal
+    | apply_goal
     | create_conversation
     | rename_conversation
 }
@@ -241,10 +244,82 @@ entity AutomaticContinuationResult {
     auto_continue_on_context_exhaustion: Boolean
 }
 
+-- REQ-FED-026–027. Continue accepts only the generated ordinary handoff
+-- boundary; source identity and retry identity come from trusted execution.
+entity ContinueSelector {
+    kind: OmittedContinueSelector | LocalContinueSelector | NullContinueSelector | PeerContinueSelector
+}
+
+variant OmittedContinueSelector : ContinueSelector {}
+
+variant LocalContinueSelector : ContinueSelector {}
+
+variant NullContinueSelector : ContinueSelector {}
+
+variant PeerContinueSelector : ContinueSelector {
+    instance: String
+}
+
+-- Flattened semantic projection of the closed destination wire request. Every
+-- field is mandatory; the source-side selector and destination-computed digest
+-- are not wire fields.
+entity RemoteContinueRequest {
+    caller_instance_id: String
+    destination_instance_id: String
+    source_product_conversation_id: String
+    source_transcript_id: String
+    source_message_id: String
+    source_tool_use_id: String
+    first_message_id: String
+    product_conversation_id: String
+    predecessor_transcript_id: String
+    summary_message_id: String
+}
+
+enum ContinueOpeningState {
+    pending
+    | accepted
+}
+
+enum ContinueDispatchReceipt {
+    accepted
+    | already_exists
+    | dispatch_failed
+}
+
+entity RemoteContinueReservation {
+    caller_instance_id: String
+    retry_identity: String
+    product_conversation_id: String
+    predecessor_transcript_id: String
+    generated_summary_message_id: String
+    payload_digest: String
+    successor_transcript_id: String
+    opening_identity: String
+    state: ContinueOpeningState
+    accepted_opening_id: String?
+}
+
+-- Flattened semantic projection of the closed destination wire response. The
+-- successor transcript is represented once at the response boundary; the
+-- nested Continue result contributes receipt and error.
+entity RemoteContinueResult {
+    caller_instance_id: String
+    destination_instance_id: String
+    product_conversation_id: String
+    predecessor_transcript_id: String
+    summary_message_id: String
+    successor_transcript_id: String
+    opening_message_id: String
+    opening_status: ContinueOpeningState
+    receipt: ContinueDispatchReceipt
+    error: String?
+}
+
+
 entity ToolSelection {
     tool: ToolKind
-    instance_supplied: Boolean
-    instance: String?
+    selector: ToolSelectorInput
     destination: Peer?
     failed: Boolean
 }
@@ -267,6 +342,131 @@ entity GoalRead {
     timeout: Duration
     resolved_transcript_id: String
     result: String
+}
+
+entity ToolSelectorInput {
+    kind: OmittedToolSelector | ExplicitNullToolSelector | ExplicitStringToolSelector
+}
+
+variant OmittedToolSelector : ToolSelectorInput {}
+
+variant ExplicitNullToolSelector : ToolSelectorInput {}
+
+variant ExplicitStringToolSelector : ToolSelectorInput {
+    value: String
+}
+
+entity AuthenticatedEnrollment {
+    instance_id: String
+    enrollment_id: String
+}
+
+entity SourceCallProvenance {
+    source_product_conversation: bedrock/ProductConversation
+    exact_transcript_id: String
+    workflow_id: String
+    turn_id: String
+    message_id: String
+    tool_use_id: String
+}
+
+entity GoalPrepareRetryKey {
+    source_product_conversation: bedrock/ProductConversation
+    workflow_id: String
+    turn_id: String
+    message_id: String
+    tool_use_id: String
+}
+
+entity RemoteGoalPreparation {
+    reference: String
+    authenticated_enrollment: AuthenticatedEnrollment
+    destination_instance_id: String
+    retry_key: GoalPrepareRetryKey
+    source_call: SourceCallProvenance
+    target: bedrock/ProductConversation
+    expected_goal_version: Integer
+    expires_at_us: Integer
+    operation: String
+    state: GoalPreparationState
+
+    transitions state {
+        prepared -> claimed
+    }
+}
+
+entity GoalPrepareResult {
+    reference: String
+    expires_at_us: Integer
+}
+
+enum GoalPreparationState {
+    prepared
+    | claimed
+}
+
+entity FrozenGoalWriteOutcome {
+    kind: AppliedFrozenGoalWrite | RejectedFrozenGoalWrite | UnclassifiedFrozenGoalWrite
+}
+
+variant AppliedFrozenGoalWrite : FrozenGoalWriteOutcome {
+    result: String
+}
+
+variant RejectedFrozenGoalWrite : FrozenGoalWriteOutcome {
+    reason: String
+}
+
+variant UnclassifiedFrozenGoalWrite : FrozenGoalWriteOutcome {}
+
+entity RemoteGoalWriteAttempt {
+    preparation: RemoteGoalPreparation
+    outcome: FrozenGoalWriteOutcome
+}
+
+entity GoalTerminalReceipt {
+    authenticated_enrollment: AuthenticatedEnrollment
+    destination_instance_id: String
+    reference: String
+    outcome: GoalTerminalOutcome
+}
+
+entity GoalTerminalOutcome {
+    kind: AppliedGoalReceipt | RejectedGoalReceipt
+}
+
+variant AppliedGoalReceipt : GoalTerminalOutcome {
+    result: String
+}
+
+variant RejectedGoalReceipt : GoalTerminalOutcome {
+    reason: String
+}
+
+entity GoalPrepareRequest {
+    source_call: SourceCallProvenance
+    target: bedrock/ProductConversation
+    coordinator_goal_operation: String
+}
+
+entity GoalApplyRequest {
+    reference: String
+}
+
+entity GoalApplyResult {
+    reference: String
+    destination_instance_id: String
+    result: String
+}
+
+entity GoalApplyRejection {
+    reference: String
+    reason: String
+}
+
+entity GoalApplyUnclassified {
+    reference: String
+    retry_closed: Boolean
 }
 
 entity RemoteSubscription {
@@ -376,6 +576,7 @@ config {
     max_disconnected_age: Duration
     terminal_prefix_authorization_attempts: Integer = 3
     federation_request_timeout: Duration = 5.seconds
+    goal_preparation_lifetime: Duration = 15.minutes
     terminal_evidence_lifetime: Duration = 30.days
     native_create_options_request_max_bytes: Integer = 4096
     native_create_options_response_max_bytes: Integer = 262144
@@ -393,7 +594,7 @@ config {
 -- or fails. The exact string "local" is reserved before peer resolution; it is
 -- case-sensitive and is not trimmed. Peer-name creation and replacement reject
 -- the reserved name local under REQ-FED-019 in requirements.md.
--- ToolSelection preserves selector presence separately from its nullable value.
+-- ToolSelection.selector retains the caller's omitted, explicit-null, or string form.
 -- A selected peer must be authenticated and destination identity-verified before dispatch.
 -- destination_send and destination_read_goal use the destination's ordinary
 -- domain admission and read services, respectively; they are not new tools.
@@ -408,55 +609,56 @@ config {
 -- without gaps or duplicates.
 
 rule SelectLocalTool {
-    when: SelectTool(tool, instance_supplied, instance)
-    requires: (instance_supplied and instance = "local") or
-              (instance = null and (not instance_supplied or explicit_null_selects_local(tool)))
-    ensures: ToolSelection.created(tool: tool, instance_supplied: instance_supplied, instance: null, destination: null, failed: false)
+    when: SelectTool(tool, selector)
+    requires: selector.kind = OmittedToolSelector or selector.kind = ExplicitStringToolSelector and selector_string_value(selector) = "local" or selector.kind = ExplicitNullToolSelector and selector_null_routes_local(tool)
+    ensures: ToolSelection.created(tool: tool, selector: selector, destination: null, failed: false)
+}
+
+rule RejectInvalidGoalSelector {
+    when: SelectTool(tool, selector)
+    requires: coordinator_goal_prepare_or_apply(tool)
+    requires: selector.kind = ExplicitNullToolSelector
+    ensures: SelectionError(tool, "instance must be omitted or a string")
 }
 
 rule ExplicitNullRejectedToolSelectionFails {
-    when: SelectTool(tool, instance_supplied, instance)
-    requires: instance_supplied and instance = null
+    when: SelectTool(tool, selector)
+    requires: selector.kind = ExplicitNullToolSelector
     requires: explicit_null_rejected(tool)
-    ensures: ToolSelection.created(tool: tool, instance_supplied: true, instance: null, destination: null, failed: true)
-    ensures: SelectionError(tool, instance)
-}
-
-rule ContradictoryInstancePresenceFailsBeforeSelection {
-    when: SelectTool(tool, instance_supplied, instance)
-    requires: not instance_supplied and instance != null
-    ensures: SelectionError(tool, instance)
+    ensures: ToolSelection.created(tool: tool, selector: selector, destination: null, failed: true)
+    ensures: SelectionError(tool, "instance must be omitted or a string")
 }
 
 rule SelectRemoteTool {
-    when: SelectTool(tool, instance_supplied, instance)
-    requires: instance_supplied and instance != null and instance != "local"
-    requires: exists saved_peer(instance)
-    requires: not (native_mutation_tool(tool) and local_peer(saved_peer(instance)))
-    ensures: ToolSelection.created(tool: tool, instance_supplied: true, instance: instance, destination: saved_peer(instance), failed: false)
+    when: SelectTool(tool, selector)
+    requires: selector.kind = ExplicitStringToolSelector and selector_string_value(selector) != "local"
+    requires: exists saved_peer(selector_string_value(selector))
+    requires: not (native_mutation_tool(tool) and local_peer(saved_peer(selector_string_value(selector))))
+    ensures: ToolSelection.created(tool: tool, selector: selector, destination: saved_peer(selector_string_value(selector)), failed: false)
 }
 
 rule NativeMutationSelfSelectionFails {
-    when: SelectTool(tool, instance_supplied, instance)
-    requires: instance_supplied and instance != null and instance != "local"
+    when: SelectTool(tool, selector)
+    requires: selector.kind = ExplicitStringToolSelector and selector_string_value(selector) != "local"
     requires: native_mutation_tool(tool)
-    requires: exists saved_peer(instance)
-    requires: local_peer(saved_peer(instance))
-    ensures: ToolSelection.created(tool: tool, instance_supplied: true, instance: instance, destination: null, failed: true)
-    ensures: SelectionError(tool, instance)
+    requires: exists saved_peer(selector_string_value(selector))
+    requires: local_peer(saved_peer(selector_string_value(selector)))
+    ensures: ToolSelection.created(tool: tool, selector: selector, destination: null, failed: true)
+    ensures: SelectionError(tool, selector_string_value(selector))
 }
 
 rule RemoteSelectionFails {
-    when: SelectTool(tool, instance_supplied, instance)
-    requires: instance_supplied and instance != null and instance != "local"
-    requires: not exists saved_peer(instance)
-    ensures: ToolSelection.created(tool: tool, instance_supplied: true, instance: instance, destination: null, failed: true)
-    ensures: SelectionError(tool, instance)
+    when: SelectTool(tool, selector)
+    requires: selector.kind = ExplicitStringToolSelector and selector_string_value(selector) != "local"
+    requires: not exists saved_peer(selector_string_value(selector))
+    ensures: ToolSelection.created(tool: tool, selector: selector, destination: null, failed: true)
+    ensures: SelectionError(tool, selector_string_value(selector))
 }
 
 rule LocalToolDispatch {
     when: DispatchTool(selection)
-    requires: selection.instance = null
+    requires: selection.tool != continue_conversation
+    requires: selection.destination = null
     requires: not selection.failed
     requires: not native_mutation_tool(selection.tool)
     ensures: LocalToolExecution(selection.tool)
@@ -464,19 +666,38 @@ rule LocalToolDispatch {
 
 rule RemoteToolDispatch {
     when: DispatchTool(selection)
-    requires: selection.instance != null
+    requires: selection.tool != continue_conversation
     requires: selection.destination != null
     requires: not selection.failed
     requires: selection.destination.trusted
     requires: not automatic_continuation_tool(selection.tool)
+    requires: not coordinator_goal_prepare_or_apply(selection.tool)
     requires: not native_mutation_tool(selection.tool)
+    ensures: RemoteToolExecution(selection.tool, selection.destination)
+}
+
+rule RejectSelfCoordinatorGoalSelection {
+    when: DispatchTool(selection)
+    requires: selection.destination != null and not selection.failed
+    requires: coordinator_goal_prepare_or_apply(selection.tool)
+    requires: local_peer(selection.destination)
+    ensures: SelectionError(selection.tool, selector_string_value(selection.selector))
+    -- No federation request, local Goal operation, or alternate-peer dispatch.
+}
+
+rule DispatchRemoteCoordinatorGoal {
+    when: DispatchTool(selection)
+    requires: selection.destination != null and not selection.failed
+    requires: selection.destination.trusted
+    requires: coordinator_goal_prepare_or_apply(selection.tool)
+    requires: not local_peer(selection.destination)
     ensures: RemoteToolExecution(selection.tool, selection.destination)
 }
 
 rule DispatchLocalNativeCreateOptions {
     when: DispatchNativeCreateOptions(selection, request)
     requires: selection.tool = create_conversation
-    requires: selection.instance = null and not selection.failed
+    requires: selection.destination = null and not selection.failed
     requires: request.caller_instance_id = executing_instance_id()
     requires: request.destination_instance_id = executing_instance_id()
     requires: current_coordinator_authorized()
@@ -486,7 +707,7 @@ rule DispatchLocalNativeCreateOptions {
 rule DispatchLocalNativeRenameOptions {
     when: DispatchNativeRenameOptions(selection, request)
     requires: selection.tool = rename_conversation
-    requires: selection.instance = null and not selection.failed
+    requires: selection.destination = null and not selection.failed
     requires: request.caller_instance_id = executing_instance_id()
     requires: request.destination_instance_id = executing_instance_id()
     requires: current_coordinator_authorized()
@@ -495,28 +716,28 @@ rule DispatchLocalNativeRenameOptions {
 
 rule RejectNativeCreateOptionsSelfSelection {
     when: DispatchNativeCreateOptions(selection, request)
-    requires: selection.instance != null and selection.destination != null
+    requires: selection.destination != null
     requires: local_peer(selection.destination)
     ensures: NativeCreateOptionsFailedWithoutFallback(request)
 }
 
 rule RejectNativeRenameOptionsSelfSelection {
     when: DispatchNativeRenameOptions(selection, request)
-    requires: selection.instance != null and selection.destination != null
+    requires: selection.destination != null
     requires: local_peer(selection.destination)
     ensures: NativeRenameOptionsFailedWithoutFallback(request)
 }
 
 rule RejectUntrustedNativeCreateOptionsDestination {
     when: DispatchNativeCreateOptions(selection, request)
-    requires: selection.instance != null and selection.destination != null
+    requires: selection.destination != null
     requires: not selection.destination.trusted
     ensures: NativeCreateOptionsFailedWithoutFallback(request)
 }
 
 rule RejectUntrustedNativeRenameOptionsDestination {
     when: DispatchNativeRenameOptions(selection, request)
-    requires: selection.instance != null and selection.destination != null
+    requires: selection.destination != null
     requires: not selection.destination.trusted
     ensures: NativeRenameOptionsFailedWithoutFallback(request)
 }
@@ -524,7 +745,7 @@ rule RejectUntrustedNativeRenameOptionsDestination {
 rule DispatchRemoteNativeCreateOptions {
     when: DispatchNativeCreateOptions(selection, request)
     requires: selection.tool = create_conversation
-    requires: selection.instance != null and not selection.failed
+    requires: selection.destination != null and not selection.failed
     requires: selection.destination != null and selection.destination.trusted
     requires: not local_peer(selection.destination)
     requires: request.caller_instance_id = executing_instance_id()
@@ -536,7 +757,7 @@ rule DispatchRemoteNativeCreateOptions {
 rule DispatchRemoteNativeRenameOptions {
     when: DispatchNativeRenameOptions(selection, request)
     requires: selection.tool = rename_conversation
-    requires: selection.instance != null and not selection.failed
+    requires: selection.destination != null and not selection.failed
     requires: selection.destination != null and selection.destination.trusted
     requires: not local_peer(selection.destination)
     requires: request.caller_instance_id = executing_instance_id()
@@ -548,7 +769,7 @@ rule DispatchRemoteNativeRenameOptions {
 rule DispatchLocalNativeCreate {
     when: DispatchNativeCreate(selection, request)
     requires: selection.tool = create_conversation
-    requires: selection.instance = null and not selection.failed
+    requires: selection.destination = null and not selection.failed
     requires: request.caller_instance_id = executing_instance_id()
     requires: request.destination_instance_id = executing_instance_id()
     requires: current_coordinator_authorized()
@@ -559,7 +780,7 @@ rule DispatchLocalNativeCreate {
 rule DispatchLocalNativeRename {
     when: DispatchNativeRename(selection, request)
     requires: selection.tool = rename_conversation
-    requires: selection.instance = null and not selection.failed
+    requires: selection.destination = null and not selection.failed
     requires: request.caller_instance_id = executing_instance_id()
     requires: request.destination_instance_id = executing_instance_id()
     requires: current_coordinator_authorized()
@@ -570,7 +791,7 @@ rule DispatchLocalNativeRename {
 rule DispatchRemoteNativeCreate {
     when: DispatchNativeCreate(selection, request)
     requires: selection.tool = create_conversation
-    requires: selection.instance != null and not selection.failed
+    requires: selection.destination != null and not selection.failed
     requires: selection.destination != null and selection.destination.trusted
     requires: not local_peer(selection.destination)
     requires: request.caller_instance_id = executing_instance_id()
@@ -583,7 +804,7 @@ rule DispatchRemoteNativeCreate {
 rule DispatchRemoteNativeRename {
     when: DispatchNativeRename(selection, request)
     requires: selection.tool = rename_conversation
-    requires: selection.instance != null and not selection.failed
+    requires: selection.destination != null and not selection.failed
     requires: selection.destination != null and selection.destination.trusted
     requires: not local_peer(selection.destination)
     requires: request.caller_instance_id = executing_instance_id()
@@ -595,14 +816,14 @@ rule DispatchRemoteNativeRename {
 
 rule UntrustedNativeCreateDestinationFails {
     when: DispatchNativeCreate(selection, request)
-    requires: selection.instance != null and not selection.failed
+    requires: selection.destination != null and not selection.failed
     requires: selection.destination != null and not selection.destination.trusted
     ensures: NativeCreateFailedWithoutFallback(request)
 }
 
 rule UntrustedNativeRenameDestinationFails {
     when: DispatchNativeRename(selection, request)
-    requires: selection.instance != null and not selection.failed
+    requires: selection.destination != null and not selection.failed
     requires: selection.destination != null and not selection.destination.trusted
     ensures: NativeRenameFailedWithoutFallback(request)
 }
@@ -615,7 +836,7 @@ rule RemoteNativeCreateFailureIsTerminal {
 rule ReconcileUncertainNativeCreateAtExactDestination {
     when: RemoteNativeCreateOutcomeUncertain(selection, create_request, status_request)
     requires: selection.tool = create_conversation
-    requires: selection.instance != null and not selection.failed
+    requires: selection.destination != null and not selection.failed
     requires: selection.destination != null and selection.destination.trusted
     requires: not local_peer(selection.destination)
     requires: status_request.request_id = create_request.request_id
@@ -639,17 +860,16 @@ rule RemoteNativeRenameFailureIsTerminal {
 
 rule UntrustedDestinationFails {
     when: DispatchTool(selection)
-    requires: selection.instance != null
     requires: selection.destination != null
     requires: not selection.destination.trusted
-    ensures: RemoteToolError(selection.tool, selection.instance)
+    ensures: RemoteToolError(selection.tool, selector_string_value(selection.selector))
     -- No local execution or substitution of a different peer.
 }
 
 rule RemoteDispatchFails {
     when: RemoteExecutionFailed(selection)
-    requires: selection.instance != null
-    ensures: RemoteToolError(selection.tool, selection.instance)
+    requires: selection.destination != null
+    ensures: RemoteToolError(selection.tool, selector_string_value(selection.selector))
     -- No LocalToolExecution and no dispatch to another peer.
 }
 
@@ -659,12 +879,35 @@ rule RemoteDispatchFails {
 -- identity. Optional instance is omitted or a non-null string, including for
 -- read; invalid shapes fail before selection.
 -- Helpers:
+-- transport_authenticated_enrollment(source, destination) is derived only from the
+-- authenticated connection and exact transport instance identities. It is never
+-- accepted from GoalPrepareRequest or SourceCallProvenance.
+-- goal_prepare_retry_key(provenance) contains only source ProductConversation,
+-- workflow, turn, agent message, and tool-use identity. The exact transcript,
+-- requested ordinary target, destination, and operation are conflict material.
+-- same_goal_prepare(prior, request, destination) compares that conflict material
+-- with the durable first admission after the retry-key lookup.
+-- goal_preparation_for(enrollment, destination, reference) and
+-- goal_terminal_receipt_for(enrollment, destination, reference) are internal exact-
+-- enrollment lookups. Retained rows are not observable through an inactive enrollment.
+-- execute_frozen_goal_write(preparation) performs at most one ordinary Goal-domain
+-- write using only preparation.target, expected_goal_version, and operation.
+-- Its typed durability outcome covers the ordinary Goal admission, frozen-version
+-- check, mutation, and classified receipt as one durable boundary.
 -- local_peer(peer): peer.instance_id is the executing instance's identity.
 -- executing_instance_id(): the executing instance's durable identity.
 -- native_mutation_tool(tool): tool is create_conversation or rename_conversation.
--- explicit_null_selects_local(tool): tool is read_goal, read_conversation or resolve_reference.
+-- selector_null_routes_local(tool): tool is read_goal, read_conversation,
+-- resolve_reference, or query_database.
+-- selector_string_value(selector): the exact case-sensitive string supplied by an
+-- ExplicitStringToolSelector; no whitespace or case normalization occurs.
+-- coordinator_goal_prepare_or_apply(tool): tool is prepare_goal or apply_goal.
+-- goal_preparation_deadline_us(now_us, 15_minutes): the destination's current
+-- microsecond timestamp plus the fixed fifteen-minute Goal preparation lifetime.
+-- destination_goal_version(destination, target): the destination-owned ordinary
+-- target's Goal version at preparation admission.
 -- explicit_null_rejected(tool): tool is send_conversation_message, read_automatic_continuation,
--- set_automatic_continuation, create_conversation or rename_conversation.
+-- set_automatic_continuation, create_conversation, rename_conversation, prepare_goal, or apply_goal.
 -- automatic_continuation_tool(tool): tool is read_automatic_continuation or set_automatic_continuation.
 -- current_coordinator_authorized(): the executing transcript belongs to the current
 -- Coordinator at dispatch.
@@ -724,15 +967,15 @@ rule RemoteDispatchFails {
 -- for its Coordinator singleton; a set also matches the Boolean.
 rule RejectSelfAutomaticContinuationSelection {
     when: DispatchAutomaticContinuation(selection, request)
-    requires: selection.instance != null and not selection.failed
+    requires: selection.destination != null and not selection.failed
     requires: selection.destination != null and local_peer(selection.destination)
-    ensures: SelectionError(selection.tool, selection.instance)
+    ensures: SelectionError(selection.tool, selector_string_value(selection.selector))
     -- No remote request, local execution or alternate-peer dispatch.
 }
 
 rule DispatchRemoteAutomaticContinuation {
     when: DispatchAutomaticContinuation(selection, request)
-    requires: selection.instance != null and not selection.failed
+    requires: selection.destination != null and not selection.failed
     requires: selection.destination != null and selection.destination.trusted
     requires: not local_peer(selection.destination)
     requires: source_current(request)
@@ -775,6 +1018,133 @@ rule RejectMismatchedRemoteAutomaticContinuationResponse {
     ensures: PreferenceResultRejected(request)
     -- No local execution or alternate-peer dispatch.
 }
+
+-- REQ-FED-026: omission, explicit JSON null and exact "local" route locally
+-- before SelectTool normalizes local selection.
+-- Helpers:
+-- valid_continue_selector(selection, request): selection contains an
+-- OmittedContinueSelector, NullContinueSelector or LocalContinueSelector
+-- for local routing, or a PeerContinueSelector with an exact saved peer
+-- for remote routing; ambiguous/unknown peer and selected self-peer are invalid.
+-- The selector is consumed before dispatch and is not sent to the destination.
+-- source_continue_current(request): the authenticated executing source is the
+-- current Coordinator, its source ProductConversation/transcript/message/tool-use
+-- IDs are trusted context, and its aggregate admission gate remains held
+-- throughout remote dispatch.
+-- continue_retry_derived(request): request.first_message_id is a bounded identity
+-- derived from authenticated caller instance, source message ID and source
+-- tool-use ID, never agent input.
+-- continue_destination_authorized(peer, request): peer is authenticated and
+-- equals caller, destination identity equals this instance, the enrolled peer's
+-- source attestation is trusted, and current Federation send authority is
+-- checked transactionally with exact ordinary generated-handoff reservation
+-- or accepted-opening replay (including revocation/replacement).
+-- exact_generated_handoff(request): REQ-GR-019's published user-initiated
+-- ordinary ProductConversation predecessor is ContextExhausted and its exact
+-- current persisted system-generated summary matches the request.
+-- destination_successor(request): the single reserved REQ-GR-019 successor.
+-- destination_continue_payload_digest(request): the destination-computed digest
+-- over the authenticated source attestation, exact destination boundary and
+-- destination-persisted summary content; callers do not supply this digest.
+-- derived_opening_identity(request): the winning pending opening identity is
+-- the exact request key (request.first_message_id), derived from caller and the
+-- trusted source message/tool-use pair and retained by the destination.
+-- destination_accepted_opening(reservation): the exact accepted first opening
+-- in the reserved successor under REQ-GR-019, never supplied by the caller.
+-- other_retry_identity(reservation): any retry identity distinct from this
+-- reservation identity, scoped to its ProductConversation and predecessor.
+-- same_continue_payload(request, prior): caller, retry identity, exact
+-- conversation/predecessor/summary boundary and the destination-computed
+-- payload digest all match.
+-- continue_response_matches(peer, request, result): authenticated selected
+-- destination binds caller, destination, exact boundary, the single canonical
+-- successor identity and destination-retained, source-derived opening. The
+-- source reconstructs the unchanged local Continue result conversation_id from
+-- result.successor_transcript_id. Pending opening_message_id equals
+-- request.first_message_id. Once accepted, it is the request key or
+-- successor:key for that reserved successor. Receipt, error and durable opening
+-- status must each be consistent with their own evidence. Unknown request,
+-- response and nested-result fields are rejected, including any second successor
+-- identity nested inside the result.
+rule DispatchLocalContinue {
+    when: DispatchContinue(selection, request)
+    requires: valid_continue_selector(selection, request)
+    requires: selection.instance = null
+    ensures: LocalContinueUnderGlobalRecall(request)
+}
+
+rule DispatchRemoteContinue {
+    when: DispatchContinue(selection, request)
+    requires: valid_continue_selector(selection, request)
+    requires: selection.instance != null and selection.destination != null
+    requires: selection.destination.trusted
+    requires: source_continue_current(request)
+    requires: continue_retry_derived(request)
+    ensures: RemoteContinueRequestSent(selection.destination, request)
+}
+
+rule RejectInvalidContinueSelection {
+    when: DispatchContinue(selection, request)
+    requires: not valid_continue_selector(selection, request)
+    ensures: ContinueSelectionError(request)
+    -- Neither local execution nor another peer is substituted.
+}
+
+rule ReserveRemoteContinue {
+    when: ReceiveRemoteContinue(peer, request)
+    requires: continue_destination_authorized(peer, request)
+    requires: exact_generated_handoff(request)
+    requires: continue_retry_derived(request)
+    requires: not exists RemoteContinueReservation{caller_instance_id: request.caller_instance_id, retry_identity: request.first_message_id}
+    requires: not exists RemoteContinueReservation{product_conversation_id: request.product_conversation_id, predecessor_transcript_id: request.predecessor_transcript_id}
+    ensures: RemoteContinueReservation.created(caller_instance_id: request.caller_instance_id, retry_identity: request.first_message_id, product_conversation_id: request.product_conversation_id, predecessor_transcript_id: request.predecessor_transcript_id, generated_summary_message_id: request.summary_message_id, payload_digest: destination_continue_payload_digest(request), successor_transcript_id: destination_successor(request), opening_identity: derived_opening_identity(request), state: pending, accepted_opening_id: null)
+    @guidance
+        -- Reserve under the same transaction as current send-authority and
+        -- exact handoff checks. Opening follows REQ-GR-019 capacity and
+        -- generated-predecessor-context rules; no user text or Goal mutation.
+}
+
+rule ReplayRemoteContinue {
+    when: ReceiveRemoteContinue(peer, request)
+    let prior = RemoteContinueReservation{caller_instance_id: request.caller_instance_id, retry_identity: request.first_message_id}
+    requires: exists prior
+    requires: continue_destination_authorized(peer, request)
+    requires: same_continue_payload(request, prior)
+    ensures: RetainedContinueResultReturned(prior)
+    -- Pending replay reviews current successor capacity without replacing the
+    -- retained opening identity; accepted replay returns accepted opening
+    -- without another capacity check or dispatch, even after lost ack.
+}
+
+rule RejectConflictingRemoteContinue {
+    when: ReceiveRemoteContinue(peer, request)
+    let prior = RemoteContinueReservation{caller_instance_id: request.caller_instance_id, retry_identity: request.first_message_id}
+    requires: continue_destination_authorized(peer, request)
+    requires: exists prior and not same_continue_payload(request, prior)
+    ensures: ContinueConflict(request)
+}
+
+rule RejectChangedContinueIdentity {
+    when: ReceiveRemoteContinue(peer, request)
+    let prior = RemoteContinueReservation{product_conversation_id: request.product_conversation_id, predecessor_transcript_id: request.predecessor_transcript_id}
+    requires: continue_destination_authorized(peer, request)
+    requires: exists prior and prior.retry_identity != request.first_message_id
+    ensures: ContinueConflict(request)
+}
+
+rule VerifyRemoteContinueResult {
+    when: ReceiveRemoteContinueResult(peer, request, result)
+    requires: continue_response_matches(peer, request, result)
+    ensures: ContinueResultAccepted(result)
+}
+
+rule RejectInvalidRemoteContinueResult {
+    when: ReceiveRemoteContinueResult(peer, request, result)
+    requires: not continue_response_matches(peer, request, result)
+    ensures: ContinueResultRejected(request)
+    -- No fallback or fabricated accepted opening.
+}
+
 
 rule AdmitRemoteMessage {
     when: SendRemoteMessage(source, message_id, target, content, provenance)
@@ -843,6 +1213,197 @@ rule ReadRemoteGoal {
     @guidance
         -- Resolve the stable conversation, wait for the requested version, and
         -- apply the destination local read_goal timeout and result semantics.
+}
+
+-- REQ-FED-025. Source routing retains omitted, explicit-null, and string selectors.
+-- Goal prepare/apply rejects explicit null; omission and exact "local" remain local.
+-- A non-local string must resolve to one non-self peer before a selector-free
+-- federation request is formed.
+
+rule PrepareRemoteCoordinatorGoal {
+    when: PrepareRemoteCoordinatorGoal(source, destination, request)
+    let deadline = goal_preparation_deadline_us(now_us, 15_minutes)
+    let expected_version = destination_goal_version(destination, request.target)
+    let reference = opaque_enrollment_scoped_reference(source, destination)
+    let authenticated_enrollment = transport_authenticated_enrollment(source, destination)
+    let retry_key = goal_prepare_retry_key(request.source_call)
+    requires: source.trusted and destination.trusted
+    requires: current_goal_prepare_authority(source, request.source_call)
+    requires: source_aggregate_admission_held_through_remote_call(source, request.source_call)
+    requires: destination_enrollment_authorized(authenticated_enrollment, destination)
+    requires: authenticated_enrollment.instance_id = source.instance_id
+    requires: authenticated_enrollment.enrollment_id != ""
+    requires: exact_transport_destination(destination)
+    requires: request.source_call.source_product_conversation.kind = coordinator
+    requires: source_exact_transcript(request.source_call.source_product_conversation, request.source_call.exact_transcript_id)
+    requires: request.source_call.exact_transcript_id != ""
+    requires: request.source_call.workflow_id != ""
+    requires: request.source_call.turn_id != ""
+    requires: request.source_call.message_id != ""
+    requires: request.source_call.tool_use_id != ""
+    requires: request.target.kind = ordinary
+    requires: destination_owns_product_conversation(destination, request.target)
+    requires: not exists RemoteGoalPreparation{authenticated_enrollment: authenticated_enrollment, retry_key: retry_key}
+    ensures: RemoteGoalPreparation.created(
+        reference: reference,
+        authenticated_enrollment: authenticated_enrollment,
+        destination_instance_id: destination.instance_id,
+        retry_key: retry_key,
+        source_call: request.source_call,
+        target: request.target,
+        expected_goal_version: expected_version,
+        expires_at_us: deadline,
+        operation: request.coordinator_goal_operation,
+        state: prepared
+    )
+    ensures: GoalPrepareResult.created(reference: reference, expires_at_us: deadline)
+    @guidance
+        -- Persist the exact ordinary target, its destination-derived version, the
+        -- complete operation, provenance, enrollment scope, and original deadline.
+}
+
+rule ReplayRemoteGoalPrepare {
+    when: PrepareRemoteCoordinatorGoal(source, destination, request)
+    let authenticated_enrollment = transport_authenticated_enrollment(source, destination)
+    let retry_key = goal_prepare_retry_key(request.source_call)
+    let prior = RemoteGoalPreparation{authenticated_enrollment: authenticated_enrollment, retry_key: retry_key}
+    requires: source.trusted and destination.trusted
+    requires: current_goal_prepare_authority(source, request.source_call)
+    requires: source_aggregate_admission_held_through_remote_call(source, request.source_call)
+    requires: destination_enrollment_authorized(authenticated_enrollment, destination)
+    requires: exists prior
+    requires: same_goal_prepare(prior, request, destination)
+    ensures: GoalPrepareResult.created(reference: prior.reference, expires_at_us: prior.expires_at_us)
+    -- Replay retains the first deadline even after expiry and performs no mutation.
+}
+
+rule RejectConflictingRemoteGoalPrepare {
+    when: PrepareRemoteCoordinatorGoal(source, destination, request)
+    let authenticated_enrollment = transport_authenticated_enrollment(source, destination)
+    let retry_key = goal_prepare_retry_key(request.source_call)
+    let prior = RemoteGoalPreparation{authenticated_enrollment: authenticated_enrollment, retry_key: retry_key}
+    requires: source.trusted and destination.trusted
+    requires: current_goal_prepare_authority(source, request.source_call)
+    requires: source_aggregate_admission_held_through_remote_call(source, request.source_call)
+    requires: destination_enrollment_authorized(authenticated_enrollment, destination)
+    requires: exists prior
+    requires: not same_goal_prepare(prior, request, destination)
+    ensures: GoalPrepareConflict(request.source_call.tool_use_id)
+    -- Transcript, target, destination, provenance, or operation drift cannot replace prior admission.
+}
+
+rule ReplayTerminalRemoteGoalReceipt {
+    when: ApplyRemoteCoordinatorGoal(source, destination, request)
+    let authenticated_enrollment = transport_authenticated_enrollment(source, destination)
+    let preparation = goal_preparation_for(authenticated_enrollment, destination.instance_id, request.reference)
+    let receipt = goal_terminal_receipt_for(authenticated_enrollment, destination.instance_id, request.reference)
+    requires: source.trusted and destination.trusted
+    requires: current_goal_apply_authority(source)
+    requires: source_goal_admission_held(source)
+    requires: destination_enrollment_authorized(authenticated_enrollment, destination)
+    requires: preparation.authenticated_enrollment = authenticated_enrollment
+    requires: preparation.destination_instance_id = destination.instance_id
+    requires: exists receipt
+    requires: receipt.authenticated_enrollment = authenticated_enrollment
+    requires: receipt.destination_instance_id = destination.instance_id
+    requires: receipt.reference = request.reference
+    ensures: replay_goal_terminal_receipt(receipt)
+    -- Receipt lookup and replay precede expiry, version, and claim-state evaluation.
+}
+
+rule RejectExpiredRemoteGoalPreparation {
+    when: ApplyRemoteCoordinatorGoal(source, destination, request)
+    let authenticated_enrollment = transport_authenticated_enrollment(source, destination)
+    let preparation = goal_preparation_for(authenticated_enrollment, destination.instance_id, request.reference)
+    requires: source.trusted and destination.trusted
+    requires: current_goal_apply_authority(source)
+    requires: source_goal_admission_held(source)
+    requires: destination_enrollment_authorized(authenticated_enrollment, destination)
+    requires: preparation.state = prepared
+    requires: now_us >= preparation.expires_at_us
+    ensures: GoalApplyRejection.created(reference: request.reference, reason: "expired")
+    ensures: preparation.state = prepared
+    ensures: not exists GoalTerminalReceipt{authenticated_enrollment: authenticated_enrollment, destination_instance_id: destination.instance_id, reference: request.reference}
+    -- Expiry is checked before claim and performs no Goal write.
+}
+
+rule ClaimRemoteCoordinatorGoalForWrite {
+    when: ApplyRemoteCoordinatorGoal(source, destination, request)
+    let authenticated_enrollment = transport_authenticated_enrollment(source, destination)
+    let preparation = goal_preparation_for(authenticated_enrollment, destination.instance_id, request.reference)
+    requires: source.trusted and destination.trusted
+    requires: current_goal_apply_authority(source)
+    requires: source_goal_admission_held(source)
+    requires: destination_enrollment_authorized(authenticated_enrollment, destination)
+    requires: preparation.authenticated_enrollment = authenticated_enrollment
+    requires: preparation.destination_instance_id = destination.instance_id
+    requires: preparation.state = prepared
+    requires: now_us < preparation.expires_at_us
+    ensures: preparation.state = claimed
+    ensures: ExecuteFrozenRemoteGoalWrite(preparation, request)
+    @guidance
+        -- Commit prepared -> claimed durably before issuing the one frozen Goal write.
+        -- The write uses only preparation.target, expected_goal_version, and operation.
+}
+
+rule ExecuteFrozenRemoteGoalWriteOnce {
+    when: ExecuteFrozenRemoteGoalWrite(preparation, request)
+    let outcome = execute_frozen_goal_write(preparation)
+    requires: preparation.state = claimed
+    requires: not exists RemoteGoalWriteAttempt{preparation: preparation}
+    ensures: RemoteGoalWriteAttempt.created(preparation: preparation, outcome: outcome)
+    ensures: outcome.kind = AppliedFrozenGoalWrite implies GoalTerminalReceipt.created(authenticated_enrollment: preparation.authenticated_enrollment, destination_instance_id: preparation.destination_instance_id, reference: preparation.reference, outcome: AppliedGoalReceipt.created(result: applied_frozen_goal_result(outcome)))
+    ensures: outcome.kind = AppliedFrozenGoalWrite implies GoalApplyResult.created(reference: request.reference, destination_instance_id: preparation.destination_instance_id, result: applied_frozen_goal_result(outcome))
+    ensures: outcome.kind = RejectedFrozenGoalWrite implies GoalTerminalReceipt.created(authenticated_enrollment: preparation.authenticated_enrollment, destination_instance_id: preparation.destination_instance_id, reference: preparation.reference, outcome: RejectedGoalReceipt.created(reason: rejected_frozen_goal_reason(outcome)))
+    ensures: outcome.kind = RejectedFrozenGoalWrite implies GoalApplyRejection.created(reference: request.reference, reason: rejected_frozen_goal_reason(outcome))
+    ensures: outcome.kind = UnclassifiedFrozenGoalWrite implies GoalApplyUnclassified.created(reference: request.reference, retry_closed: true)
+    ensures: outcome.kind = UnclassifiedFrozenGoalWrite implies not exists GoalTerminalReceipt{authenticated_enrollment: preparation.authenticated_enrollment, destination_instance_id: preparation.destination_instance_id, reference: preparation.reference}
+    ensures: outcome.kind = UnclassifiedFrozenGoalWrite implies not exists GoalApplyResult where GoalApplyResult.reference = preparation.reference
+    @guidance
+        -- Commit ordinary Goal admission, the frozen-version check, any mutation,
+        -- and the classified receipt in one destination transaction before replying.
+        -- A claimed reference without a receipt represents an unclassified durable
+        -- boundary, not a classified write awaiting a separate settlement step.
+}
+
+rule RetryClaimedRemoteGoalWithoutReceipt {
+    when: ApplyRemoteCoordinatorGoal(source, destination, request)
+    let authenticated_enrollment = transport_authenticated_enrollment(source, destination)
+    let preparation = goal_preparation_for(authenticated_enrollment, destination.instance_id, request.reference)
+    requires: source.trusted and destination.trusted
+    requires: current_goal_apply_authority(source)
+    requires: source_goal_admission_held(source)
+    requires: destination_enrollment_authorized(authenticated_enrollment, destination)
+    requires: preparation.state = claimed
+    requires: not exists GoalTerminalReceipt{authenticated_enrollment: authenticated_enrollment, destination_instance_id: destination.instance_id, reference: request.reference}
+    ensures: GoalApplyUnclassified.created(reference: request.reference, retry_closed: true)
+    ensures: remote_goal_write_attempt_count(preparation) <= 1
+    -- No ExecuteFrozenRemoteGoalWrite is emitted, so the retry cannot perform a second write.
+}
+
+rule RejectUnknownRemoteGoalReference {
+    when: ApplyRemoteCoordinatorGoal(source, destination, request)
+    let authenticated_enrollment = transport_authenticated_enrollment(source, destination)
+    requires: source.trusted and destination.trusted
+    requires: current_goal_apply_authority(source)
+    requires: source_goal_admission_held(source)
+    requires: destination_enrollment_authorized(authenticated_enrollment, destination)
+    requires: not exists RemoteGoalPreparation{authenticated_enrollment: authenticated_enrollment, destination_instance_id: destination.instance_id, reference: request.reference}
+    ensures: GoalApplyRejection.created(reference: request.reference, reason: "unknown")
+}
+
+rule DenyPrepareForRevokedOrReplacedEnrollment {
+    when: PrepareRemoteCoordinatorGoal(source, destination, request)
+    requires: revoked_or_replaced_transport_enrollment(source, destination)
+    ensures: GoalEnrollmentDenied(prepare_goal)
+    -- Do not inspect or disclose retained preparation or receipt rows.
+}
+
+rule DenyApplyForRevokedOrReplacedEnrollment {
+    when: ApplyRemoteCoordinatorGoal(source, destination, request)
+    requires: revoked_or_replaced_transport_enrollment(source, destination)
+    ensures: GoalEnrollmentDenied(apply_goal)
+    -- The supplied reference is neither looked up nor classified as known or unknown.
 }
 
 rule CreateRemoteSubscription {
@@ -1668,15 +2229,49 @@ invariant TerminalEvidenceDoesNotExpandReplay {
     -- event and never makes failed_gap eligible for normal ordered pulling.
 }
 
+-- REQ-FED-026–027: durable reservations, not retry-cache age, own the
+-- handoff's winning opening and cannot be replaced by a different call.
+rule CompleteRemoteContinueOpening {
+    when: CompleteRemoteContinueOpening(reservation, accepted_opening_id)
+    requires: reservation.state = pending
+    requires: accepted_opening_id = destination_accepted_opening(reservation)
+    ensures: reservation.state = accepted
+    ensures: reservation.accepted_opening_id = accepted_opening_id
+}
+
+invariant RemoteContinueOpeningMatchesState {
+    for reservation in RemoteContinueReservations:
+        reservation.state = accepted or reservation.accepted_opening_id = null
+        reservation.state = pending or reservation.accepted_opening_id != null
+        reservation.opening_identity = reservation.retry_identity
+        reservation.state = pending or reservation.accepted_opening_id = reservation.retry_identity or reservation.accepted_opening_id = reservation.successor_transcript_id + ":" + reservation.retry_identity
+}
+
+invariant RemoteContinueReservationOwnsBoundary {
+    for reservation in RemoteContinueReservations:
+        not exists RemoteContinueReservation{product_conversation_id: reservation.product_conversation_id, predecessor_transcript_id: reservation.predecessor_transcript_id, retry_identity: other_retry_identity(reservation)}
+}
+
 invariant OmittedSelectionIsLocal {
-    for s in ToolSelections where not s.instance_supplied:
-        s.instance = null and s.destination = null and not s.failed
+    for s in ToolSelections where s.selector.kind = OmittedToolSelector:
+        s.destination = null and not s.failed
 }
 
 invariant RemoteSelectionNeverFallsBack {
-    for s in ToolSelections where s.instance != null:
+    for s in ToolSelections where s.selector.kind = ExplicitStringToolSelector and selector_string_value(s.selector) != "local":
         s.destination != null or s.failed
     -- Remote failures cannot trigger LocalToolExecution or another destination.
+}
+
+invariant FrozenRemoteGoalWriteAtMostOnce {
+    for preparation in RemoteGoalPreparations:
+        remote_goal_write_attempt_count(preparation) <= 1
+}
+
+invariant ClassifiedRemoteGoalWriteHasAtomicReceipt {
+    for attempt in RemoteGoalWriteAttempts:
+        attempt.outcome.kind = AppliedFrozenGoalWrite implies exists GoalTerminalReceipt{authenticated_enrollment: attempt.preparation.authenticated_enrollment, destination_instance_id: attempt.preparation.destination_instance_id, reference: attempt.preparation.reference, outcome: AppliedGoalReceipt{result: applied_frozen_goal_result(attempt.outcome)}}
+        attempt.outcome.kind = RejectedFrozenGoalWrite implies exists GoalTerminalReceipt{authenticated_enrollment: attempt.preparation.authenticated_enrollment, destination_instance_id: attempt.preparation.destination_instance_id, reference: attempt.preparation.reference, outcome: RejectedGoalReceipt{reason: rejected_frozen_goal_reason(attempt.outcome)}}
 }
 
 invariant WatchCursorAndBacklogStayConsistent {
@@ -1708,14 +2303,28 @@ actor TrustedPeer {
 
 surface FederationToolSurface {
     facing peer: TrustedPeer
+    context continue_request: RemoteContinueRequest
+    context goal_prepare: GoalPrepareRequest
+    context goal_apply: GoalApplyRequest
     provides:
         SendRemoteMessage(peer, message_id, target, content, provenance)
         ReadRemoteGoal(peer, target, requested_version, timeout)
         ReadRemotePreference(peer, request)
         SetRemotePreference(peer, request)
+        ReceiveRemoteContinue(peer, continue_request)
+        PrepareRemoteCoordinatorGoal(peer, destination, goal_prepare)
+        ApplyRemoteCoordinatorGoal(peer, destination, goal_apply)
     @guarantee DomainParity
         -- Destination domain services enforce the same admission, stable
         -- conversation resolution, version wait, timeout, and result semantics.
+}
+
+surface ContinueResponseSurface {
+    facing peer: TrustedPeer
+    context request: RemoteContinueRequest
+    context result: RemoteContinueResult
+    provides:
+        ReceiveRemoteContinueResult(peer, request, result)
 }
 
 surface AutomaticContinuationResponseSurface {

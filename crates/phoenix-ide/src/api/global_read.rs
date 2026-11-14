@@ -78,6 +78,16 @@ where
     Option::<T>::deserialize(deserializer)
 }
 
+pub(crate) fn deserialize_present_non_null<'de, D, T>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 pub(crate) const MAX_CONVERSATION_READ_CURSOR: usize = 1_000_000;
 pub(super) const OVERSIZED_REMOTE_MESSAGE_MARKER: &str =
     "(message content omitted: remote materialization limit exceeded)";
@@ -309,6 +319,7 @@ impl PreviousTranscriptsBinding {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum PreviousTranscriptsRequest {
     List {
+        #[serde(default, deserialize_with = "deserialize_present_non_null")]
         cursor: Option<String>,
     },
     Search {
@@ -316,6 +327,7 @@ pub(crate) enum PreviousTranscriptsRequest {
     },
     Read {
         transcript_ref: String,
+        #[serde(default, deserialize_with = "deserialize_present_non_null")]
         cursor: Option<String>,
     },
 }

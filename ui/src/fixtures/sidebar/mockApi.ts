@@ -35,7 +35,7 @@ export function installSidebarFixtureApi(data: SidebarFixtureData, scenarioId: k
     llm_configured: false,
     credential_status: 'not_configured',
   });
-  api.listProductConversations = async () => ({ product_conversations: data.productConversations?.[scenarioId] ?? [] });
+  api.listProductConversations = async () => ({ product_conversations: data.productConversations?.[scenarioId] ?? [], coordinator: null });
   api.renameProductConversation = async (reference: string, title: string) => {
     const row = data.productConversations?.[scenarioId]?.find((candidate) => candidate.product_conversation_id === reference);
     if (!row) throw new Error(`Unknown product conversation fixture: ${reference}`);

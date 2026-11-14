@@ -614,14 +614,28 @@ THE SYSTEM SHALL NOT derive the redirect origin from request-controlled headers
 (`Host`, `Forwarded`), so a forged header cannot redirect an authorization code
 to an attacker-chosen destination.
 
-WHERE a pre-configured client supplies a fixed loopback callback port (its
-pre-registered authorization app allows only `http://localhost:<port>/callback`
-and cannot register Phoenix's own callback route), THE SYSTEM SHALL use that
-loopback redirect URI for the flow and bind a listener on that port that bounces
-each received callback to its real callback route. THE SYSTEM SHALL bind the
-listener before surfacing the authorization URL and fail the flow if the port
-cannot be bound, so a sign-in URL is never published when its callback could not
-be received. The listener SHALL bind loopback only (both IP families), accept
+WHERE a pre-configured public client supplies `oauth.callbackPort`, THE SYSTEM
+SHALL use `http://localhost:<port>/callback` as its loopback redirect URI.
+
+WHERE a pre-configured public client supplies `oauth.callbackUrl`, THE SYSTEM
+SHALL use that exact URI as its loopback redirect URI. The URI SHALL use HTTP,
+name `localhost`, `127.0.0.1`, or `[::1]`, and resolve to a nonzero port. It SHALL
+contain no credentials, query, fragment, whitespace, control characters, or
+backslashes.
+The path MAY be `/` or an application-specific callback path.
+
+THE SYSTEM SHALL reject a server entry that supplies both callback settings,
+an invalid callback URL, or a callback URL without a nonempty public client ID.
+It SHALL NOT silently substitute another callback for an invalid setting.
+
+WHERE a client supplies a loopback callback, THE SYSTEM SHALL use that exact
+redirect URI in both authorization and code exchange and bind a listener on
+its port that bounces each received callback to its real callback route.
+THE SYSTEM SHALL bind the
+listener before surfacing the authorization URL and fail the flow if the callback
+address cannot be bound, so a sign-in URL is never published when its callback
+could not be received. Listeners SHALL bind loopback only: both IP families for
+`localhost`, and the specified address family for an IP literal. They SHALL accept
 callbacks until the flow resolves or the 25-minute local sign-in window expires
 (a failed exchange leaves the flow retryable within that window).
 A callback accepted before that deadline with exactly one matching state nonce
@@ -649,7 +663,7 @@ defend -- they bind the callback to its flow and its authorization server, not
 its destination -- so the origin is taken from trusted configuration instead.
 An authorization server whose registered redirect allowlist Phoenix cannot edit
 (a shared pre-registered app) forces the redirect to a value already on that
-list -- a fixed loopback port with a `/callback` path -- which Phoenix cannot
+list -- a loopback host, port, and path -- which Phoenix cannot
 serve from its own bound port; the ephemeral loopback listener receives that
 callback on the same machine and bounces it to the real route, so the flow
 completes without a second token store or a proxy process. Loopback binding

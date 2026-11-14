@@ -9,11 +9,12 @@ use phoenix_tools::{Tool, ToolContext, ToolOutput};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
+use crate::api::global_read::deserialize_present_non_null;
 use crate::api::{federation, CreateProductConversationRequest};
 use crate::conversation_actions::{
     self, accept_create, CoordinatorRenameIntent, CreateSource, LocalCoordinatorSource,
 };
-use crate::coordinator_tools::instance::{Route, RouteTool, RoutedTool};
+use crate::coordinator_tools::instance::{Route, RouteTool, RoutedTool, SelfPeerPolicy};
 use crate::db::ProductConversationRenameResult;
 use crate::runtime::RuntimeManager;
 
@@ -32,7 +33,7 @@ pub(crate) async fn tools(
         Ok(()) => Ok(vec![
             RouteTool::boxed(RenameConversation(runtime.clone())),
             RouteTool::boxed(CreateConversation(runtime.clone())),
-            Arc::new(continuation::ContinueConversation(runtime.clone())),
+            RouteTool::boxed(continuation::ContinueConversation(runtime.clone())),
             Arc::new(automatic_continuation::AutomaticContinuationTool::read(
                 runtime.clone(),
             )),
@@ -79,6 +80,51 @@ enum RenameRequest {
     },
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenameEnvelope {
+    request: RenameRequest,
+}
+
+fn rename_request_guidance(request: &Value) -> &'static str {
+    match request.get("op").and_then(Value::as_str) {
+        Some("detail") => "detail requires only op and reference",
+        Some("read") => "read requires only op and operation_id",
+        Some("rename") => "rename requires only op, operation_id, product_conversation_id, expected_root_transcript_id, expected_name_revision, and title",
+        _ => "op must be detail, read, or rename",
+    }
+}
+
+fn parse_rename_request(input: Value) -> Result<RenameRequest, String> {
+    let guidance = input
+        .get("request")
+        .map(rename_request_guidance)
+        .unwrap_or("supply only request with detail {op, reference}, read {op, operation_id}, or rename {op, operation_id, product_conversation_id, expected_root_transcript_id, expected_name_revision, title}");
+    serde_json::from_value::<RenameEnvelope>(input)
+        .map(|envelope| envelope.request)
+        .map_err(|_| format!("Invalid rename_conversation request: {guidance}."))
+}
+fn rename_request_schema() -> Value {
+    json!({"type":"object", "additionalProperties":false, "required":["request"], "properties":{
+        "request":{"oneOf":[
+            {"type":"object","additionalProperties":false,"required":["op","reference"],"properties":{
+                "op":{"const":"detail"},
+                "reference":{"type":"string","description":"Product id or slug.","minLength":1}
+            }},
+            {"type":"object","additionalProperties":false,"required":["op","operation_id"],"properties":{
+                "op":{"const":"read"},"operation_id":operation_schema()
+            }},
+            {"type":"object","additionalProperties":false,"required":["op","operation_id","product_conversation_id","expected_root_transcript_id","expected_name_revision","title"],"properties":{
+                "op":{"const":"rename"},"operation_id":operation_schema(),
+                "product_conversation_id":{"type":"string","description":"Immutable product id returned by detail, never a slug or transcript.","minLength":1},
+                "expected_root_transcript_id":{"type":"string","description":"Returned by detail.","minLength":1},
+                "expected_name_revision":{"type":"integer","description":"Returned by detail.","minimum":0},
+                "title":{"type":"string","minLength":1,"maxLength":200}
+            }}
+        ]}
+    }})
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum CreateStart {
@@ -89,6 +135,7 @@ enum CreateStart {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum CreateRequest {
     Options {
+        #[serde(default, deserialize_with = "deserialize_present_non_null")]
         cwd: Option<String>,
     },
     Read {
@@ -99,8 +146,11 @@ enum CreateRequest {
         cwd: String,
         objective: String,
         start: CreateStart,
+        #[serde(default, deserialize_with = "deserialize_present_non_null")]
         model: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_present_non_null")]
         effort: Option<ModelEffort>,
+        #[serde(default, deserialize_with = "deserialize_present_non_null")]
         llm_language: Option<LlmLanguage>,
     },
 }
@@ -166,8 +216,7 @@ fn operation_schema() -> Value {
 #[async_trait]
 impl RoutedTool for RenameConversation {
     fn validate_before_peer_lookup(&self, input: &Value) -> Result<(), String> {
-        let request: RenameRequest =
-            serde_json::from_value(input.clone()).map_err(|error| error.to_string())?;
+        let request = parse_rename_request(input.clone())?;
         if matches!(request, RenameRequest::Read { .. }) {
             return Err("Remote rename receipt read by operation_id alone is unsupported. If the outcome is uncertain, retry op=rename with the same operation_id, destination instance, product_conversation_id, expected_root_transcript_id, expected_name_revision, title, and source ProductConversation/transcript. A later assistant-message/tool-use locator is allowed for that same source owner; the original receipt remains authoritative. Never mint a replacement operation.".into());
         }
@@ -177,24 +226,19 @@ impl RoutedTool for RenameConversation {
         "rename_conversation"
     }
     fn description(&self) -> String {
-        "Current Global Coordinator only. Detail resolves a reference to immutable product/root identity and naming revision; use those exact values for rename. A rename updates the title (1-200 characters) and allocated slug, never the immutable product/work identity. Choose a new operation UUID for each intentional rename. Remote read by operation_id alone is unsupported; if rename outcome is uncertain, retry op=rename with the same operation UUID, destination instance, product/root/revision/title, and source ProductConversation/transcript. A later assistant-message/tool-use locator is allowed for that same source owner, and the original receipt remains authoritative. Never mint a replacement operation to recover uncertainty. Durable replay reports the historical receipt, not current title/lifecycle.".into()
+        "Current Global Coordinator only. Supply exactly one operation in request. Detail resolves a reference to immutable product/root identity and naming revision; use those exact values for rename. A rename updates the title (1-200 characters) and allocated slug, never the immutable product/work identity. Choose a new operation UUID for each intentional rename. Remote read by operation_id alone is unsupported; if rename outcome is uncertain, retry op=rename with the same operation UUID, destination instance, product/root/revision/title, and source ProductConversation/transcript. A later assistant-message/tool-use locator is allowed for that same source owner, and the original receipt remains authoritative. Never mint a replacement operation to recover uncertainty. Durable replay reports the historical receipt, not current title/lifecycle.".into()
     }
     fn schema_without_instance(&self) -> Value {
-        json!({"type":"object", "additionalProperties":false, "required":["op"], "properties":{
-            "op":{"type":"string","enum":["detail","read","rename"]},
-            "reference":{"type":"string","description":"Required for detail; product id or slug.","minLength":1},
-            "operation_id":operation_schema(),
-            "product_conversation_id":{"type":"string","description":"Required for rename; immutable product id returned by detail, never a slug or transcript.","minLength":1},
-            "expected_root_transcript_id":{"type":"string","description":"Required for rename; returned by detail.","minLength":1},
-            "expected_name_revision":{"type":"integer","description":"Required for rename; returned by detail.","minimum":0},
-            "title":{"type":"string","description":"Required for rename.","minLength":1,"maxLength":200}
-        }})
+        rename_request_schema()
     }
     fn clearable(&self) -> bool {
         false
     }
     fn resolution_db(&self) -> &crate::db::Database {
         self.0.db()
+    }
+    fn self_peer_policy(&self) -> SelfPeerPolicy {
+        SelfPeerPolicy::Reject
     }
     async fn authorize(&self, ctx: &ToolContext) -> Result<(), String> {
         self.0
@@ -415,8 +459,7 @@ impl RenameConversation {
         peer: &federation::ResolvedPeer,
         ctx: ToolContext,
     ) -> Result<Value, String> {
-        let request: RenameRequest =
-            serde_json::from_value(input).map_err(|error| error.to_string())?;
+        let request = parse_rename_request(input)?;
         self.authorize(&ctx).await?;
         let _dispatch_authority = remote_dispatch_authority(self.0.clone(), ctx.clone()).await?;
         let caller_instance_id = self
@@ -469,7 +512,7 @@ impl RenameConversation {
             .require_current_coordinator_transcript(&ctx.conversation_id)
             .await
             .map_err(|e| e.to_string())?;
-        let request: RenameRequest = serde_json::from_value(input).map_err(|e| e.to_string())?;
+        let request = parse_rename_request(input)?;
         match request {
             RenameRequest::Detail { reference } => {
                 let reference = rename_detail_reference(&reference)?;
@@ -522,24 +565,31 @@ impl RenameConversation {
 #[async_trait]
 impl RoutedTool for CreateConversation {
     fn validate_before_peer_lookup(&self, input: &Value) -> Result<(), String> {
-        serde_json::from_value::<CreateRequest>(input.clone())
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        parse_create_request(input).map(|_| ())
     }
     fn name(&self) -> &'static str {
         "create_conversation"
     }
     fn description(&self) -> String {
-        "Current Global Coordinator only. Explicitly create AND submit a nonblank text objective using start=submit_objective via the durable creation pipeline; dormant create is unsupported. Options discovers bounded project paths, normalized cwd, and available model/effort choices. Submit only an exact normalized absolute cwd. Objective text is literal agent content, never a user commission or slash command. Omit model/language to freeze current defaults on first acceptance; retry omission reuses those choices, while explicit different choices conflict. Omitted effort means native execution semantics, distinct from an explicit level. Choose a caller-owned request UUID before submission; read/retry that UUID after uncertainty (no duplicate or changed-intent retry). Accepted is not ready: read request_id on the same instance for canonical pending/ready/failure status. Remote options and cwd are destination-scoped; never substitute source-local paths or defaults. No WorkScope attachment, artifact reference, cancellation, or retry-delivery operation is offered.".into()
+        "Current Global Coordinator only. Supply a single request object with op=options, read, or create and only that operation's fields. Explicitly create AND submit a nonblank text objective using start=submit_objective via the durable creation pipeline; dormant create is unsupported. Options discovers bounded project paths, normalized cwd, and available model/effort choices. Submit only an exact normalized absolute cwd. Objective text is literal agent content, never a user commission or slash command. Omit model/language to freeze current defaults on first acceptance; retry omission reuses those choices, while explicit different choices conflict. Omitted effort means native execution semantics, distinct from an explicit level. Choose a caller-owned request UUID before submission; read/retry that UUID after uncertainty (no duplicate or changed-intent retry). Accepted is not ready: read request_id on the same instance for canonical pending/ready/failure status. Remote options and cwd are destination-scoped; never substitute source-local paths or defaults. No WorkScope attachment, artifact reference, cancellation, or retry-delivery operation is offered.".into()
     }
     fn schema_without_instance(&self) -> Value {
-        json!({"type":"object", "additionalProperties":false,"required":["op"],"properties":{
-            "op":{"type":"string","enum":["options","read","create"]},"request_id":operation_schema(),
-            "cwd":{"type":"string","description":"Optional path for options to normalize; required exact normalized absolute cwd for create.","minLength":1},
-            "objective":{"type":"string","description":"Required nonblank literal objective for create.","minLength":1},
-            "start":{"type":"string","enum":["submit_objective"],"description":"Required for create; explicitly submits the objective and may start execution."},
-            "model":{"type":"string"},"effort":{"type":"string","enum":["none","minimal","low","medium","high","xhigh","max"]},
-            "llm_language":{"type":"string","enum":["phoenix-native","caveman"]}
+        let cwd = json!({"type":"string","minLength":1});
+        json!({"type":"object","additionalProperties":false,"required":["request"],"properties":{
+            "request":{"oneOf":[
+                {"type":"object","additionalProperties":false,"required":["op"],"properties":{
+                    "op":{"const":"options"},"cwd":cwd}},
+                {"type":"object","additionalProperties":false,"required":["op","request_id"],"properties":{
+                    "op":{"const":"read"},"request_id":operation_schema()}},
+                {"type":"object","additionalProperties":false,"required":["op","request_id","cwd","objective","start"],"properties":{
+                    "op":{"const":"create"},"request_id":operation_schema(),"cwd":cwd,
+                    "objective":{"type":"string","minLength":1,"description":"Nonblank literal objective; never a user commission or slash command."},
+                    "start":{"const":"submit_objective"},"model":{"type":"string"},
+                    "effort":{"type":"string","enum":["none","minimal","low","medium","high","xhigh","max"]},
+                    "llm_language":{"type":"string","enum":["phoenix-native","caveman"]}
+                }}
+            ]}
+
         }})
     }
     fn clearable(&self) -> bool {
@@ -547,6 +597,9 @@ impl RoutedTool for CreateConversation {
     }
     fn resolution_db(&self) -> &crate::db::Database {
         self.0.db()
+    }
+    fn self_peer_policy(&self) -> SelfPeerPolicy {
+        SelfPeerPolicy::Reject
     }
     async fn authorize(&self, ctx: &ToolContext) -> Result<(), String> {
         self.0
@@ -790,6 +843,36 @@ async fn native_creation_acceptance_receipt(
     ))
 }
 
+fn create_request_guidance(request: &Value) -> &'static str {
+    match request.get("op").and_then(Value::as_str) {
+        Some("options") => "options accepts only op and optional cwd",
+        Some("read") => "read requires op and request_id",
+        Some("create") => "create requires op, request_id, cwd, objective, and start=submit_objective; optional model, effort, llm_language",
+        _ => "op must be options, read, or create",
+    }
+}
+
+fn parse_create_request(input: &Value) -> Result<CreateRequest, String> {
+    let Some(root) = input.as_object() else {
+        return Err("Invalid create_conversation call: supply only request with options {op, cwd?}, read {op, request_id}, or create {op, request_id, cwd, objective, start, model?, effort?, llm_language?}.".into());
+    };
+    let Some(request_input) = root.get("request") else {
+        return Err("Invalid create_conversation call: supply only request with options {op, cwd?}, read {op, request_id}, or create {op, request_id, cwd, objective, start, model?, effort?, llm_language?}.".into());
+    };
+    if root.len() != 1 {
+        return Err(format!(
+            "Invalid create_conversation call: supply only request; {}.",
+            create_request_guidance(request_input)
+        ));
+    }
+    serde_json::from_value(request_input.clone()).map_err(|_| {
+        format!(
+            "Invalid create_conversation request: {}.",
+            create_request_guidance(request_input)
+        )
+    })
+}
+
 impl CreateConversation {
     async fn run_remote(
         &self,
@@ -797,8 +880,7 @@ impl CreateConversation {
         peer: &federation::ResolvedPeer,
         ctx: ToolContext,
     ) -> Result<Value, String> {
-        let request: CreateRequest =
-            serde_json::from_value(input).map_err(|error| error.to_string())?;
+        let request = parse_create_request(&input)?;
         self.authorize(&ctx).await?;
         let _dispatch_authority = remote_dispatch_authority(self.0.clone(), ctx.clone()).await?;
         let caller_instance_id = self
@@ -917,7 +999,8 @@ impl CreateConversation {
             .require_current_coordinator_transcript(&ctx.conversation_id)
             .await
             .map_err(|e| e.to_string())?;
-        let request: CreateRequest = serde_json::from_value(input).map_err(|e| e.to_string())?;
+
+        let request = parse_create_request(&input)?;
         match request {
             CreateRequest::Options { cwd } => {
                 let cwd = match cwd {

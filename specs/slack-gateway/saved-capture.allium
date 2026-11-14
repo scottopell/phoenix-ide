@@ -1,0 +1,226 @@
+-- allium: 3
+-- Scope: private Saved-message capture without a source-age cutoff.
+-- Includes: separate initialization, retained scan progress, and shared allowance.
+-- Excludes: native execution and provider-specific pagination algorithms.
+-- Traceability: REQ-SG-001/005/006/007/009/011/017/019.
+
+use "./slack-gateway.allium" as lifecycle
+use "./discovery.allium" as discovery
+
+external entity SavedPageEvidence {
+    inbox: SavedInbox
+    search_call: discovery/SlackCall
+    position_read: String?
+    next_position: String?
+    observations: Set<lifecycle/VerifiedObservation>
+}
+
+enum SavedScanState { idle | scanning | incomplete }
+
+contract SavedCapturePort {
+    read_page: (inbox: SavedInbox, position: String?) -> SavedPageEvidence
+
+    @invariant ExactSavedObservation
+        -- Saved membership comes from is:saved search on the verified owner's
+        -- fixed serving connection. Neither source authorship nor message text
+        -- establishes membership. Ordinary thread reads expose no Saved flag.
+        -- Search uses no author restriction or source-age bound. Source-message
+        -- timestamps are not save timestamps. Files and standalone task notes
+        -- are outside this port. A reply retains its exact timestamp and root.
+        -- Exact source and root membership are verified before acceptance;
+        -- opaque errors, incomplete reads and malformed identity retain the page.
+        -- All observations have trigger_kind=saved, kind=briefing, instruction="".
+        -- Source keys include a Saved capture scope separate from emoji keys.
+        -- A capture binding is request-specific, even for an owner's own message.
+        -- A deliberately saved app/gateway-authored message may supply context;
+        -- the Saved gesture, not that message's author, establishes owner intent.
+        -- Quoted discussion never authorizes executing its embedded instructions.
+        -- Recorded Saved sources are skipped before additional source reads.
+
+    @invariant CompletePageEvidence
+        -- Evidence binds the exact query, serving identity and retained position.
+        -- Each candidate is already handled in the Saved scope, positively
+        -- rejected, or represented by an eligible observation. Failed acceptance
+        -- or partial verification cannot advance the page. Observation timestamps
+        -- belong to the Saved scope. They survive ordinary retries until
+        -- acceptance/rejection or seven-day telemetry expiry. Expiry cannot
+        -- change Saved eligibility, cursor position, handled identity or work.
+        -- next_position=null means verified provider end-of-pagination. Empty or
+        -- failed responses without that proof cannot finish a scan. A connector
+        -- page ceiling is an error, never an empty collection or successful end.
+        -- Accepted work is durable independently of the current Saved collection.
+}
+
+entity SavedInbox {
+    controller: discovery/DiscoveryController
+    scan_state: SavedScanState
+    position: String?
+    last_completed_scan_at: Timestamp?
+    last_error: String?
+}
+
+rule ConfigureSavedCapture {
+    when: OwnerSetsSavedEnabled(controller, enabled)
+    requires: controller.active_services.count = 0
+    ensures: controller.gateway.saved_enabled = enabled
+    ensures:
+        if not SavedInbox.exists(controller: controller):
+            SavedInbox.created(controller: controller, scan_state: idle,
+                position: null, last_completed_scan_at: null, last_error: null)
+    @guidance
+        -- A new account starts with saved_enabled=false and
+        -- saved_baseline_complete=false. Toggling preserves retained Saved
+        -- readiness and progress. It does not reset the emoji baseline/cursors,
+        -- and emoji-setting changes do not reset Saved readiness or progress.
+}
+
+rule StartSavedSweep {
+    when: EnsureSavedProgress(service, inbox)
+    requires: service.kind = discovery
+    requires: service.phase = searching
+    requires: inbox.controller = service.controller
+    requires: service.controller.gateway.enabled
+    requires: service.controller.gateway.saved_enabled
+    requires: not service.saved_sweep_completed
+    requires: not service.saved_page_failed
+    requires: inbox.scan_state = idle
+    ensures: inbox.scan_state = scanning
+    ensures: inbox.position = null
+}
+
+rule GrantSavedPageCall {
+    when: RequestSavedPage(service, inbox)
+    requires: service.kind = discovery
+    requires: service.phase = searching
+    requires: service.owner_verified
+    requires: service.controller.gateway.enabled
+    requires: service.controller.gateway.saved_enabled
+    requires: service.next_query = saved
+    requires: inbox.controller = service.controller
+    requires: inbox.scan_state in {scanning, incomplete}
+    requires: not service.saved_sweep_completed
+    requires: not service.saved_page_failed
+    requires: service.in_flight_calls.count = 0
+    requires: not service.controller.backoff_active
+    requires: service.burst_deadline > now
+    requires: service.controller.remaining_calls >= discovery/config.maximum_page_calls + discovery/config.work_reserve
+    ensures: service.controller.calls_used = service.controller.calls_used + 1
+    ensures: discovery/SlackCall.created(service: service, purpose: saved_page, state: in_flight)
+    ensures: service.catchup_opportunity_taken = true
+}
+
+rule BaselineSavedSource {
+    when: SavedCandidateVerified(service, inbox, observation)
+    requires: service.phase = searching
+    requires: inbox.controller = service.controller
+    requires: inbox.scan_state in {scanning, incomplete}
+    requires: service.owner_verified
+    requires: service.controller.gateway.enabled
+    requires: service.controller.gateway.saved_enabled
+    requires: not service.controller.gateway.saved_baseline_complete
+    requires: observation.eligible
+    requires: observation.trigger_kind = saved
+    requires: observation.workspace = service.controller.gateway.workspace
+    requires: observation.actor = service.controller.gateway.owner
+    requires: observation.source_key not in service.controller.gateway.handled_sources
+    ensures: service.controller.gateway.handled_sources = service.controller.gateway.handled_sources + {observation.source_key}
+}
+
+rule SubmitSavedCapture {
+    when: SavedCandidateVerified(service, inbox, observation)
+    requires: service.phase = searching
+    requires: inbox.controller = service.controller
+    requires: inbox.scan_state in {scanning, incomplete}
+    requires: service.owner_verified
+    requires: observation.trigger_kind = saved
+    requires: service.controller.gateway.saved_baseline_complete
+    ensures: lifecycle/EligibleSourceObserved(service.controller.gateway, observation)
+}
+
+rule CheckpointSavedPage {
+    when: SavedPageProcessed(service, evidence)
+    let inbox = evidence.inbox
+    requires: service.phase = searching
+    requires: inbox.controller = service.controller
+    requires: inbox.scan_state in {scanning, incomplete}
+    requires: evidence.search_call.service = service
+    requires: evidence.search_call.purpose = saved_page
+    requires: evidence.search_call.state = resolved
+    requires: service.in_flight_calls.count = 0
+    requires: not service.saved_page_failed
+    requires: not service.saved_sweep_completed
+    requires: evidence.position_read = inbox.position
+    requires: evidence.observations.all(o => o.source_key in service.controller.gateway.handled_sources)
+    ensures: inbox.position = evidence.next_position
+    ensures: service.next_query = prefix
+    ensures:
+        if evidence.next_position = null:
+            service.controller.gateway.saved_baseline_complete = true
+            inbox.scan_state = idle
+            inbox.last_completed_scan_at = now
+            inbox.last_error = null
+            service.saved_sweep_completed = true
+        else:
+            inbox.scan_state = scanning
+}
+
+rule RetainSavedFailure {
+    when: SavedPageFailed(service, inbox, reason, restart_query)
+    requires: service.phase = searching
+    requires: inbox.controller = service.controller
+    requires: service.next_query = saved
+    requires: not service.saved_sweep_completed
+    requires: service.in_flight_calls.count = 0
+    ensures: inbox.scan_state = incomplete
+    ensures: inbox.last_error = reason
+    ensures: service.saved_page_failed = true
+    ensures: service.next_query = prefix
+    ensures:
+        if restart_query:
+            inbox.position = null
+    @guidance
+        -- Retry only on a later ordinary service opportunity. Rejected/invalid
+        -- cursors, including a connector page ceiling, can restart the Saved
+        -- query from its head while preserving handled identities and readiness.
+        -- Retain the incomplete warning until a full sweep completes. A restart
+        -- is not proof of progress past the provider ceiling. No automatic
+        -- unsaving, extra polling allowance, or separate retry worker is added.
+}
+
+invariant OneInboxPerController {
+    for inbox in SavedInboxes:
+        (SavedInboxes where controller = inbox.controller).count = 1
+}
+
+surface SavedCaptureBoundary {
+    facing inbox: SavedInbox
+
+    contracts:
+        demands SavedCapturePort
+
+    provides:
+        OwnerSetsSavedEnabled(controller, enabled)
+        EnsureSavedProgress(service, inbox)
+        RequestSavedPage(service, inbox)
+        SavedCandidateVerified(service, inbox, observation)
+        SavedPageProcessed(service, evidence)
+        SavedPageFailed(service, inbox, reason, restart_query)
+
+    @guarantee PrivateAndDurable
+        -- No source-message write is caused by a Saved capture: acknowledgment
+        -- is not_required, and result, question, rejection and failure duties are
+        -- private. Native work, admission, notifications and permissions use the
+        -- lifecycle's ordinary contracts. Unsaving never cancels accepted work.
+
+    @guarantee BoundedWholeCollectionScan
+        -- One serial discovery service and the controller's existing allowance,
+        -- backoff, burst deadline and accepted-work reserve govern Saved reads.
+        -- Saved gets a fair page opportunity alongside emoji queries, including
+        -- when the emoji sweep completes or one workflow's baseline is incomplete.
+        -- Partial Saved pages resume without an emoji age filter. Completion of
+        -- either workflow is not completion of the other. Readiness is distinct
+        -- from freshness; ongoing errors remain visible even after initialization.
+        -- A completed scan proves only that pagination ended in the provider's
+        -- changing current-state search, not that all later/removed saves were
+        -- observed. No save-time timestamp or fixed discovery deadline is assumed.
+}

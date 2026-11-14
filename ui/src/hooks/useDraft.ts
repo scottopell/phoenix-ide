@@ -52,6 +52,11 @@ function useDraftStore() {
   return store;
 }
 
+export function useAnnotationDraft(slug: string) {
+  const store = useDraftStore();
+  return useMemo(() => store.annotations.forScope(slug), [store, slug]);
+}
+
 /**
  * Subscribe to the draft text only. Re-renders the calling component on
  * draft changes and nothing else. Consumers of the conversation atom —

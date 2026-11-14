@@ -12,100 +12,99 @@ path = "src/lib.rs"
 test-support = []
 
 [dependencies]
-phoenix-svg = { path = "../phoenix-svg" }
+phoenix-svg = { workspace = true }
 # Shared domain vocabulary (llm_types, bash_types, tool_wire), the narrow
 # LlmSelector/CompletionService capability traits, WorkScope, and TaskSource.
-phoenix-core = { path = "../phoenix-core" }
+phoenix-core = { workspace = true }
 
 # Terminal-core (ActiveTerminals, ShellIntegrationStatus) for the
 # terminal-command tools.
-phoenix-terminal = { path = "../phoenix-terminal" }
+phoenix-terminal = { workspace = true }
 
 # Skill discovery + invocation for the `skill` tool.
-phoenix-skills = { path = "../phoenix-skills" }
+phoenix-skills = { workspace = true }
 
 # Named-agent discovery for the `spawn_agents` agent_type enum.
-phoenix-agents = { path = "../phoenix-agents" }
+phoenix-agents = { workspace = true }
 
 # Bash command display simplification (cd-prefix stripping for UI).
-phoenix-bash-display = { path = "../phoenix-bash-display" }
+phoenix-bash-display = { workspace = true }
 
 # MCP client engine (protocol, transports, OAuth, McpClientManager). The thin
 # `Tool`-trait wrapper over it lives in `src/mcp.rs`.
-phoenix-mcp = { path = "../phoenix-mcp" }
+phoenix-mcp = { workspace = true }
 
 # Headless-browser engine (chromiumoxide/CDP driver, session manager,
 # screencast broker). The browser_* tool impls here wrap this engine.
-phoenix-browser = { path = "../phoenix-browser" }
+phoenix-browser = { workspace = true }
 
 # Async tool trait.
-async-trait = "0.1"
+async-trait = { workspace = true }
 
 # Async runtime (process spawning, PTY, locks, cancellation).
-tokio = { version = "1", features = ["fs", "io-util", "process", "rt", "sync", "time", "macros"] }
-tokio-util = "0.7"
-futures = "0.3"
+tokio = { workspace = true, features = ["fs", "io-util", "process", "rt", "sync", "time", "macros"] }
+tokio-util = { workspace = true }
+futures = { workspace = true }
 
 # Serialization (tool inputs/outputs are JSON).
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 
 # Wall-clock timestamps for the work-scope inventory projection
 # (Handle.started_at: SystemTime -> DateTime<Utc> on the wire).
-chrono = { version = "0.4", features = ["serde"] }
-chrono-tz = "0.10"
+chrono = { workspace = true, features = ["serde"] }
+chrono-tz = { workspace = true }
 
 # Chrome DevTools Protocol types used by the browser tool glue (CDP param
 # structs passed to the engine's page handle). The engine itself lives in
 # phoenix-browser.
-chromiumoxide = { version = "0.9", default-features = false, features = ["fetcher", "rustls", "zip0"] }
+chromiumoxide = { workspace = true, features = ["fetcher", "rustls", "zip0"] }
 
 # Static-analysis bash parser for bash_check.
-brush-parser = "0.4"
+brush-parser = { workspace = true }
 
 # Gitignore-aware directory walking + glob/regex matching for search.
-ignore = "0.4"
-globset = "0.4"
-regex = "1"
+ignore = { workspace = true }
+globset = { workspace = true }
+regex = { workspace = true }
 
 # Diff generation for patch.
-similar = "3"
+similar = { workspace = true }
 
 # Confusable/homoglyph detection.
-unicode-security = "0.1.2"
+unicode-security = { workspace = true }
 
 # Base64 (image payloads, screencast frames).
-base64 = "0.22"
+base64 = { workspace = true }
 
 # Hashing (deterministic socket/session keying).
-sha2 = "0.11"
-hex = "0.4"
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 # UUIDs for browser scratch-file paths.
-uuid = { version = "1", features = ["v4"] }
+uuid = { workspace = true, features = ["v4"] }
 
 # Locating tmux on PATH at registry init.
-which = "8"
+which = { workspace = true }
 
 # Process-group / signal management for bash.
-libc = "0.2"
-fs2 = "0.4"
-nono = { version = "0.53", default-features = false }
-taskmd-core = ">=1.3,<2"
+libc = { workspace = true }
+fs2 = { workspace = true }
+nono = { workspace = true }
 
 # Typed errors.
-thiserror = "2"
+thiserror = { workspace = true }
 
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [dev-dependencies]
-proptest = "1"
-tempfile = "3"
-futures = "0.3"
+proptest = { workspace = true }
+tempfile = { workspace = true }
+futures = { workspace = true }
 # test-util enables tokio::time::{pause, advance} and #[tokio::test(start_paused)]
 # for deterministic timer tests (e.g. the bash reader idle-flush timeout).
-tokio = { version = "1", features = ["fs", "io-util", "net", "process", "rt", "rt-multi-thread", "sync", "time", "macros", "test-util"] }
+tokio = { workspace = true, features = ["fs", "io-util", "net", "process", "rt", "rt-multi-thread", "sync", "time", "macros", "test-util"] }
 
 [lints]
 workspace = true
