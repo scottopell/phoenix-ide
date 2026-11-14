@@ -101,15 +101,9 @@ async function captureMobileExpandedSpacing({ page, id, outDir, viewport }) {
     throw new Error(`copy input action did not copy the structured tool input: ${copiedInput}`);
   }
 
-  await page.locator('.compact-tool-selected-detail .tool-block-result button').first().click();
-  const copiedResult = await page.evaluate(() => navigator.clipboard.readText());
-  if (!copiedResult.includes('delivered') || !copiedResult.includes('8f53edc3-0711-46d8-8f3b-004201a2f410')) {
-    throw new Error(`copy result did not preserve the delivery outcome: ${copiedResult}`);
-  }
-
   const stem = `mobile-spacing-compact--${viewport.name ?? `${viewport.width}x${viewport.height}`}`;
   await page.screenshot({ path: path.join(outDir, `${stem}.png`), fullPage: true });
-  await writeFile(path.join(outDir, `${stem}.geometry.json`), `${JSON.stringify({ viewport, evidence, copiedInput, copiedResult }, null, 2)}\n`);
+  await writeFile(path.join(outDir, `${stem}.geometry.json`), `${JSON.stringify({ viewport, evidence, copiedInput }, null, 2)}\n`);
   await collapse.click();
   if (await page.locator('.compact-tool-selected-detail').count() !== 0) {
     throw new Error('collapse control did not restore compact details');
@@ -122,6 +116,14 @@ async function captureMobileExpandedSpacing({ page, id, outDir, viewport }) {
   const reopened = await page.locator('.compact-tool-selected-detail .message-content').boundingBox();
   if (!reopened || Math.abs(reopened.height - evidence.content.height) > 1) {
     throw new Error('collapse/reopen changed expanded content geometry');
+  }
+  await page.locator('.compact-tool-selected-detail .compact-tool-detail-collapse').click();
+  await page.locator('[data-tool-id="mobile-query-database"] .compact-tool-card-expand').click();
+  const copyOutput = page.locator('.compact-tool-selected-detail').getByRole('button', { name: 'Copy output', exact: true });
+  await copyOutput.click();
+  const copiedOutput = await page.evaluate(() => navigator.clipboard.readText());
+  if (!copiedOutput.includes('fixture-review-transcript') || !copiedOutput.includes('idle')) {
+    throw new Error(`generic result copy lost its full output: ${copiedOutput}`);
   }
   await page.locator('.compact-tool-selected-detail .compact-tool-detail-collapse').click();
   return true;
