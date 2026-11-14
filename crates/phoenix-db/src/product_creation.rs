@@ -1607,7 +1607,7 @@ impl Database {
             Ok(None) => {
                 return LocalAuthorityResult::DurableFactEstablished(Err(DbError::Serialization(
                     "accepted product creation job missing".to_string(),
-                )))
+                )));
             }
             Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error)),
         };
@@ -9521,6 +9521,17 @@ mod product_creation_tests {
             .unwrap();
         assert_eq!(owner.0, product_id.as_str());
         assert_eq!(owner.1, scope.as_str());
+        assert_eq!(
+            db.auto_continue_on_context_exhaustion(&product_id)
+                .await
+                .unwrap(),
+            crate::AutoContinueOnContextExhaustion::Enabled
+        );
+        assert!(db
+            .automatic_continuation_admission("conv-owner")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

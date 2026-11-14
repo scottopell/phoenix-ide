@@ -64,6 +64,12 @@ async fn uncertain_registered_setting_closes_authority_and_stops_https_superviso
         .await
         .unwrap()
         .product_conversation_id;
+    db.set_auto_continue_on_context_exhaustion(
+        &source_aggregate,
+        AutoContinueOnContextExhaustion::Disabled,
+    )
+    .await
+    .unwrap();
     assert!(!manager.local_authority_is_closed());
     assert_eq!(manager.fatal_local_authority_fence.owner_count(), 0);
     assert_eq!(

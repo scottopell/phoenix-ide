@@ -229,7 +229,7 @@ enum CloseOutcome { archived | cancelled }
 entity ProductConversation {
     kind: ordinary | coordinator
     lifecycle: open | history when kind = ordinary
-    auto_continue_on_context_exhaustion: Boolean = false
+    auto_continue_on_context_exhaustion: Boolean = true
 
     -- Every durable conversation row has one aggregate membership. Parent rows
     -- form the user-visible transcript topology; subordinate execution rows are

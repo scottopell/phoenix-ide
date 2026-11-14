@@ -123,7 +123,7 @@ async fn settings_schema_and_real_preference_round_trip() {
             .run_inner(json!({"target":target}), native_context(&source))
             .await
             .unwrap();
-        assert_eq!(initial["auto_continue_on_context_exhaustion"], false);
+        assert_eq!(initial["auto_continue_on_context_exhaustion"], true);
         assert_eq!(initial["aggregate"]["kind"], kind);
         assert_eq!(initial["aggregate"]["product_conversation_id"], id.as_str());
         assert!(initial.get("latest_admission").is_none());
@@ -174,6 +174,12 @@ async fn remote_selector_errors_never_write_local_preference() {
         .unwrap();
     let target =
         json!({"kind":"ordinary", "product_conversation_id":ordinary.product_conversation_id});
+    db.set_auto_continue_on_context_exhaustion(
+        &ordinary.product_conversation_id,
+        AutoContinueOnContextExhaustion::Disabled,
+    )
+    .await
+    .unwrap();
     for instance in ["unknown-peer", "LOCAL"] {
         assert!(tool.run_inner(json!({"instance":instance, "target":target, "auto_continue_on_context_exhaustion":true}), native_context(&source)).await.is_err());
         assert_eq!(
@@ -334,7 +340,7 @@ async fn settings_require_trusted_source_and_refuse_ordinary_sources_without_wri
         .unwrap();
     let input = json!({
         "target":{"kind":"ordinary", "product_conversation_id":ordinary.product_conversation_id},
-        "auto_continue_on_context_exhaustion":true
+        "auto_continue_on_context_exhaustion":false
     });
     let read = AutomaticContinuationTool::read(runtime.clone());
     assert!(read
@@ -366,7 +372,7 @@ async fn settings_require_trusted_source_and_refuse_ordinary_sources_without_wri
         db.auto_continue_on_context_exhaustion(&ordinary.product_conversation_id)
             .await
             .unwrap(),
-        AutoContinueOnContextExhaustion::Disabled,
+        AutoContinueOnContextExhaustion::Enabled,
     );
     assert!(!runtime.local_authority_is_closed());
 }
@@ -402,7 +408,7 @@ async fn preclosed_setting_adapter_produces_no_ordinary_tool_output() {
     let tool = AutomaticContinuationTool::set(runtime);
     let future = tool.run(
         json!({
-            "target":{"kind":"coordinator"}, "auto_continue_on_context_exhaustion":true
+            "target":{"kind":"coordinator"}, "auto_continue_on_context_exhaustion":false
         }),
         native_context(&source),
     );
@@ -498,7 +504,7 @@ async fn registry_excludes_ordinary_subagent_and_rotated_coordinator_sources() {
     let refused = set
         .run(
             json!({
-                "target":{"kind":"coordinator"}, "auto_continue_on_context_exhaustion":true,
+                "target":{"kind":"coordinator"}, "auto_continue_on_context_exhaustion":false,
             }),
             native_context(&source),
         )
@@ -515,7 +521,7 @@ async fn registry_excludes_ordinary_subagent_and_rotated_coordinator_sources() {
         db.auto_continue_on_context_exhaustion(&successor.product_conversation_id)
             .await
             .unwrap(),
-        AutoContinueOnContextExhaustion::Disabled,
+        AutoContinueOnContextExhaustion::Enabled,
     );
     let new_registry = crate::conversation_action_tools::tools(runtime.clone(), &successor.id)
         .await

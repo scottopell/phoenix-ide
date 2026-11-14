@@ -44,6 +44,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [256](256_new-conversations-default-to-automatic-context-continuation.md) | New conversations default to automatic context continuation | Accepted; partially supersedes 054 | REQ-BED-021, REQ-API-029, REQ-CONV-024 |
 | [255](255_compact-annotation-stack-with-modal-editing.md) | Compact annotation stack with modal editing | Accepted | REQ-PF-019–020 |
 | [254](254_editable-annotation-cards-own-pending-source-highlights.md) | Editable annotation cards own pending source highlights | Superseded by ADR-255 | REQ-PF-018–020 |
 | [253](253_reaction-pill-grows-with-wrapped-text.md) | Reaction pills grow with wrapped text | Accepted | REQ-PF-018–020, REQ-KB-004 |
@@ -325,7 +326,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying projects task-file shapes, proposal classification, or managed approval behavior across taskmd and plain markdown briefs | 023 |
 | Specifying continuation summary retry, restart recovery, or exactly-once commit | 025 |
 | Specifying provider prompt persistence authority, bounded transcript projection, or continuation prompt freezing | 045, then 025 and 031 |
-| Specifying opt-in automatic continuation consent, admission, or generated-context authority | 054, then 025, 031, 045, and 046 |
+| Specifying automatic continuation defaults, consent, admission, or generated-context authority | 256 for new-aggregate defaults; 054, then 025, 031, 045, and 046 for admission and authority |
 | Specifying iOS grounding, server-backed file browsing, prose reading, or anchored comments | 030, then 029, 028, and 026 for draft authority, reader sessions, the companion boundary, ProductConversation, and WorkScope ownership |
 | Specifying ordinary-parent predecessor recall, planning-parent recall eligibility, or continuation recall orientation | 051, then 027, 031, and 045 |
 

@@ -6732,7 +6732,7 @@ mod tests {
         let response: RemoteAutomaticContinuationResponse = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(response.destination_instance_id, destination);
         assert_eq!(response.caller_instance_id, caller);
-        assert!(!response.preference.auto_continue_on_context_exhaustion);
+        assert!(response.preference.auto_continue_on_context_exhaustion);
         assert_eq!(
             response.preference.aggregate,
             crate::api::AutomaticContinuationAggregateView::Ordinary {
@@ -6767,6 +6767,31 @@ mod tests {
                 .status(),
             StatusCode::UNPROCESSABLE_ENTITY
         );
+        let mut opt_out = body.clone();
+        opt_out["auto_continue_on_context_exhaustion"] = serde_json::json!(false);
+        let opted_out = app
+            .clone()
+            .oneshot(send(set_path, opt_out, Some(&bearer)))
+            .await
+            .unwrap();
+        assert_eq!(opted_out.status(), StatusCode::OK);
+        let read = app
+            .clone()
+            .oneshot(send(read_path, body.clone(), Some(&bearer)))
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(read.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response: RemoteAutomaticContinuationResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(!response.preference.auto_continue_on_context_exhaustion);
+        assert!(state
+            .db
+            .automatic_continuation_admission(&ordinary.id)
+            .await
+            .unwrap()
+            .is_none());
+
         let mut setting = body.clone();
         setting["auto_continue_on_context_exhaustion"] = serde_json::json!(true);
         let mut wrong = setting.clone();
