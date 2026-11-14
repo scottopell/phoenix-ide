@@ -25,15 +25,15 @@ mod tests;
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route(
-            "/api/product-conversations/:reference/goal",
+            "/api/product-conversations/{reference}/goal",
             get(current).post(create),
         )
         .route(
-            "/api/product-conversations/:reference/goal/history",
+            "/api/product-conversations/{reference}/goal/history",
             get(history),
         )
         .route(
-            "/api/product-conversations/:reference/goal/state",
+            "/api/product-conversations/{reference}/goal/state",
             post(state),
         )
 }

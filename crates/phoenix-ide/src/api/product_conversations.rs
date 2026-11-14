@@ -260,11 +260,11 @@ struct AggregateSegmentCeiling {
 pub fn automatic_continuation_routes() -> Router<AppState> {
     Router::new()
         .route(
-            "/api/global/coordinator/history/:reference",
+            "/api/global/coordinator/history/{reference}",
             get(get_coordinator_history),
         )
         .route(
-            "/api/product-conversations/:reference/automatic-continuation",
+            "/api/product-conversations/{reference}/automatic-continuation",
             get(get_product_conversation_automatic_continuation)
                 .put(put_product_conversation_automatic_continuation),
         )

@@ -65,7 +65,7 @@ async fn handle_socket(socket: WebSocket, conversation_id: String, state: AppSta
             "browser-view: no session yet; closing with status"
         );
         let _ = ws_sender
-            .send(Message::Binary(status_frame("no-session")))
+            .send(Message::Binary(status_frame("no-session").into()))
             .await;
         let _ = ws_sender.send(Message::Close(None)).await;
         return;
@@ -87,7 +87,7 @@ async fn handle_socket(socket: WebSocket, conversation_id: String, state: AppSta
                 "browser-view: attach_viewer failed"
             );
             let _ = ws_sender
-                .send(Message::Binary(status_frame(&format!("error: {e}"))))
+                .send(Message::Binary(status_frame(&format!("error: {e}")).into()))
                 .await;
             let _ = ws_sender.send(Message::Close(None)).await;
             return;
@@ -103,7 +103,7 @@ async fn handle_socket(socket: WebSocket, conversation_id: String, state: AppSta
     // Send a 'started' status frame so the client knows the screencast is
     // live (separate from the no-session and error cases).
     if ws_sender
-        .send(Message::Binary(status_frame("started")))
+        .send(Message::Binary(status_frame("started").into()))
         .await
         .is_err()
     {
@@ -113,7 +113,7 @@ async fn handle_socket(socket: WebSocket, conversation_id: String, state: AppSta
     // Catch up the new viewer with the URL we already know about.
     if let Some(url) = initial_url {
         if ws_sender
-            .send(Message::Binary(url_frame(&url)))
+            .send(Message::Binary(url_frame(&url).into()))
             .await
             .is_err()
         {
@@ -144,12 +144,12 @@ async fn handle_socket(socket: WebSocket, conversation_id: String, state: AppSta
             event = rx.recv() => {
                 match event {
                     Ok(ScreencastEvent::Frame { jpeg }) => {
-                        if ws_sender.send(Message::Binary(frame_payload(&jpeg))).await.is_err() {
+                        if ws_sender.send(Message::Binary(frame_payload(&jpeg).into())).await.is_err() {
                             break;
                         }
                     }
                     Ok(ScreencastEvent::Url(url)) => {
-                        if ws_sender.send(Message::Binary(url_frame(&url))).await.is_err() {
+                        if ws_sender.send(Message::Binary(url_frame(&url).into())).await.is_err() {
                             break;
                         }
                     }
@@ -161,7 +161,7 @@ async fn handle_socket(socket: WebSocket, conversation_id: String, state: AppSta
                     }
                     Err(RecvError::Closed) => {
                         tracing::debug!(conv_id = %conversation_id, "browser-view: broker closed");
-                        let _ = ws_sender.send(Message::Binary(status_frame("ended"))).await;
+                        let _ = ws_sender.send(Message::Binary(status_frame("ended").into())).await;
                         let _ = ws_sender.send(Message::Close(None)).await;
                         break;
                     }

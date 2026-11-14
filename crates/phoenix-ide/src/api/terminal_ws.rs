@@ -244,8 +244,9 @@ async fn handle_socket(
 
     // Adapt WS sender: Sink<Message> → Sink<Vec<u8>> by wrapping in Message::Binary.
     // Pin the With adaptor so it implements Unpin.
-    let ws_out =
-        Box::pin(ws_sender.with(|v: Vec<u8>| async { Ok::<_, axum::Error>(Message::Binary(v)) }));
+    let ws_out = Box::pin(
+        ws_sender.with(|v: Vec<u8>| async { Ok::<_, axum::Error>(Message::Binary(v.into())) }),
+    );
 
     // Adapt WS receiver: filter to binary frames only, unwrap payloads.
     // Non-binary frames (Close, Text, Ping/Pong, errors) terminate the stream.
@@ -254,7 +255,7 @@ async fn handle_socket(
         .take_while(|msg| std::future::ready(!matches!(msg, Ok(Message::Close(_)) | Err(_))))
         .filter_map(|msg| async {
             match msg {
-                Ok(Message::Binary(data)) => Some(data),
+                Ok(Message::Binary(data)) => Some(Vec::from(data)),
                 _ => None,
             }
         })
@@ -367,7 +368,7 @@ async fn acquire_handle(
     // created after the WorkScope gate is sealed.
     if terminals.reserve_spawn(scope).is_err() {
         let _ = ws_sender
-            .send(Message::Text("error: terminal unavailable".to_string()))
+            .send(Message::Text("error: terminal unavailable".into()))
             .await;
         return None;
     }
@@ -420,7 +421,7 @@ async fn acquire_handle(
         let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGKILL);
         let _ = tokio::task::spawn_blocking(move || waitpid(child_pid, None)).await;
         let _ = ws_sender
-            .send(Message::Text("error: terminal unavailable".to_string()))
+            .send(Message::Text("error: terminal unavailable".into()))
             .await;
         None
     }

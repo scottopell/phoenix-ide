@@ -26,7 +26,7 @@ phoenix-terminal = { path = "../phoenix-terminal" }
 tokio = { version = "1", features = ["full"] }
 
 # Web framework
-axum = { version = "0.7", features = ["macros", "ws", "multipart"] }
+axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
 hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "service", "tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-pki-types = "1"

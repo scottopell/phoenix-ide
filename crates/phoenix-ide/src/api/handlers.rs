@@ -107,14 +107,14 @@ async fn trajectory_export_handler(
 /// "http.stream", which the `OTel` layer in `logging.rs` drops from export; the
 /// stdout/file access log keeps them.
 const STREAMING_ROUTES: &[&str] = &[
-    "/api/conversations/:id/stream",
+    "/api/conversations/{id}/stream",
     "/api/conversation-reads/stream",
-    "/api/chains/:rootId/stream",
+    "/api/chains/{rootId}/stream",
     "/api/product-conversations/events",
-    "/api/share/:token/events",
-    "/api/conversations/:id/terminal",
+    "/api/share/{token}/events",
+    "/api/conversations/{id}/terminal",
     "/api/terminal/global",
-    "/api/conversations/:id/browser-view",
+    "/api/conversations/{id}/browser-view",
 ];
 
 const MAX_REMOTE_QUERY_REQUEST_BODY_BYTES: usize = 100 * 1024;
@@ -137,9 +137,9 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::api::product_conversations::automatic_continuation_routes())
         .merge(super::goal_commands::routes())
         .merge(exact_reads::routes())
-        .route("/assets/*path", get(serve_static))
+        .route("/assets/{*path}", get(serve_static))
         // Preview: serves files from absolute paths so relative references work
-        .route("/preview/*filepath", get(serve_preview_file))
+        .route("/preview/{*filepath}", get(serve_preview_file))
         // Conversation listing (REQ-API-001)
         .route("/api/conversations", get(list_conversations))
         .route("/api/conversations/search", get(search_conversations))
@@ -156,31 +156,31 @@ pub fn create_router(state: AppState) -> Router {
             get(list_product_conversation_creations),
         )
         .route(
-            "/api/product-conversations/:reference",
+            "/api/product-conversations/{reference}",
             get(get_product_conversation),
         )
         .route(
-            "/api/product-conversations/:reference/title",
+            "/api/product-conversations/{reference}/title",
             axum::routing::patch(rename_product_conversation),
         )
         .route(
-            "/api/product-conversations/:reference/read",
+            "/api/product-conversations/{reference}/read",
             post(super::product_conversations::mark_product_conversation_read),
         )
         .route(
-            "/api/product-conversations/:reference/unread",
+            "/api/product-conversations/{reference}/unread",
             post(super::product_conversations::mark_product_conversation_unread),
         )
         .route(
-            "/api/product-conversations/:reference/regenerate-name",
+            "/api/product-conversations/{reference}/regenerate-name",
             post(regenerate_product_conversation_name),
         )
         .route(
-            "/api/product-conversations/:reference/close",
+            "/api/product-conversations/{reference}/close",
             axum::routing::post(close_product_conversation),
         )
         .route(
-            "/api/product-conversations/:reference/route",
+            "/api/product-conversations/{reference}/route",
             get(get_product_conversation_route),
         )
         .route(
@@ -188,7 +188,7 @@ pub fn create_router(state: AppState) -> Router {
             get(get_existing_coordinator).post(ensure_coordinator),
         )
         .route(
-            "/api/global/coordinator/route/:conversation",
+            "/api/global/coordinator/route/{conversation}",
             get(resolve_coordinator_route),
         )
         .route("/api/global/resolve", post(global_read::resolve_reference))
@@ -199,15 +199,15 @@ pub fn create_router(state: AppState) -> Router {
         // Conversation creation (REQ-API-002)
         .route("/api/conversations/new", post(create_conversation))
         .route(
-            "/api/conversations/:id/svg-artifacts/:artifact_id",
+            "/api/conversations/{id}/svg-artifacts/{artifact_id}",
             get(super::svg_artifacts::image),
         )
         .route(
-            "/api/conversations/:id/svg-artifacts/:artifact_id/source",
+            "/api/conversations/{id}/svg-artifacts/{artifact_id}/source",
             get(super::svg_artifacts::source),
         )
         .route(
-            "/api/conversations/:id/svg-artifacts/:artifact_id/download",
+            "/api/conversations/{id}/svg-artifacts/{artifact_id}/download",
             get(super::svg_artifacts::download),
         )
         .route(
@@ -217,15 +217,15 @@ pub fn create_router(state: AppState) -> Router {
             )),
         )
         .route(
-            "/api/product-conversations/creation/:request_id/cancel",
+            "/api/product-conversations/creation/{request_id}/cancel",
             post(cancel_product_conversation_creation),
         )
         .route(
-            "/api/product-conversations/creation/:request_id/retry-delivery",
+            "/api/product-conversations/creation/{request_id}/retry-delivery",
             post(retry_product_conversation_delivery),
         )
         .route(
-            "/api/product-conversations/creation/:request_id",
+            "/api/product-conversations/creation/{request_id}",
             get(get_product_conversation_creation).delete(delete_product_conversation_creation),
         )
         .route(
@@ -238,35 +238,35 @@ pub fn create_router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
         )
         // Conversation retrieval (REQ-API-003)
-        .route("/api/conversations/:id", get(get_conversation))
+        .route("/api/conversations/{id}", get(get_conversation))
         .route(
-            "/api/conversations/:id/browser-session",
+            "/api/conversations/{id}/browser-session",
             delete(stop_conversation_browser_session),
         )
-        .route("/api/conversations/:id/slug", get(get_conversation_slug))
-        .route("/api/conversations/:id/route", get(get_conversation_route))
+        .route("/api/conversations/{id}/slug", get(get_conversation_slug))
+        .route("/api/conversations/{id}/route", get(get_conversation_route))
         .route(
-            "/api/conversations/:id/messages/latest",
+            "/api/conversations/{id}/messages/latest",
             get(get_conversation_messages_latest),
         )
         .route(
-            "/api/conversations/:id/messages/reconcile",
+            "/api/conversations/{id}/messages/reconcile",
             post(reconcile_accepted_messages),
         )
         .route(
-            "/api/conversations/:id/messages",
+            "/api/conversations/{id}/messages",
             get(get_conversation_messages),
         )
         .route(
-            "/api/conversations/:id/messages/range",
+            "/api/conversations/{id}/messages/range",
             get(get_conversation_message_range),
         )
         .route(
-            "/api/conversations/:id/messages/around/:sequence",
+            "/api/conversations/{id}/messages/around/{sequence}",
             get(get_conversation_messages_around),
         )
         // SSE streaming (REQ-API-005)
-        .route("/api/conversations/:id/stream", get(stream_conversation))
+        .route("/api/conversations/{id}/stream", get(stream_conversation))
         .route(
             "/api/telemetry/conversation-view",
             post(super::view_journey::report).layer(axum::extract::DefaultBodyLimit::max(8192)),
@@ -280,108 +280,114 @@ pub fn create_router(state: AppState) -> Router {
             post(report_product_conversation_open),
         )
         // Terminal WebSocket (REQ-TERM-001 through REQ-TERM-014)
-        .route("/api/conversations/:id/terminal", get(terminal_ws_handler))
+        .route("/api/conversations/{id}/terminal", get(terminal_ws_handler))
         // Global terminal WebSocket — singleton scope, unbound to any
         // conversation (REQ-TERM-WS-001). Surfaced on /new.
         .route("/api/terminal/global", get(terminal_ws_global_handler))
         // Live browser view WebSocket (REQ-BT-018)
         .route(
-            "/api/conversations/:id/browser-view",
+            "/api/conversations/{id}/browser-view",
             get(browser_view_ws_handler),
         )
         // User actions (REQ-API-004)
         .route(
-            "/api/conversations/:id/chat",
+            "/api/conversations/{id}/chat",
             post(send_chat).layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
         )
         .route(
-            "/api/conversations/:id/attachments",
+            "/api/conversations/{id}/attachments",
             post(upload_conversation_attachments)
                 .layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
         )
-        .route("/api/conversations/:id/cancel", post(cancel_conversation))
+        .route("/api/conversations/{id}/cancel", post(cancel_conversation))
         // Steering queue management (task 01001)
         .route(
-            "/api/conversations/:id/steering-queue/:message_id",
+            "/api/conversations/{id}/steering-queue/{message_id}",
             delete(cancel_steering_message),
         )
         .route(
-            "/api/conversations/:id/trigger-continuation",
+            "/api/conversations/{id}/trigger-continuation",
             post(trigger_continuation),
         )
         .route(
-            "/api/conversations/:id/handoff-review",
+            "/api/conversations/{id}/handoff-review",
             post(review_continuation_handoff),
         )
         .route(
-            "/api/conversations/:id/handoff-candidates",
+            "/api/conversations/{id}/handoff-candidates",
             get(list_continuation_handoff_candidates),
         )
         // Context continuation worktree transfer (REQ-BED-030)
         .route(
-            "/api/conversations/:id/continue",
+            "/api/conversations/{id}/continue",
             post(continue_conversation),
         )
         // Task approval (REQ-BED-028)
-        .route("/api/conversations/:id/approve-task", post(approve_task))
-        .route("/api/conversations/:id/reject-task", post(reject_task))
-        .route("/api/conversations/:id/task-feedback", post(task_feedback))
+        .route("/api/conversations/{id}/approve-task", post(approve_task))
+        .route("/api/conversations/{id}/reject-task", post(reject_task))
+        .route("/api/conversations/{id}/task-feedback", post(task_feedback))
         // Fork proposal resolution (REQ-PROJ-034 / 037)
-        .route("/api/conversations/:id/proposals", get(list_fork_proposals))
         .route(
-            "/api/conversations/:id/proposals/:proposal_id/approve",
+            "/api/conversations/{id}/proposals",
+            get(list_fork_proposals),
+        )
+        .route(
+            "/api/conversations/{id}/proposals/{proposal_id}/approve",
             post(approve_fork_proposal),
         )
         .route(
-            "/api/conversations/:id/proposals/:proposal_id/dismiss",
+            "/api/conversations/{id}/proposals/{proposal_id}/dismiss",
             post(dismiss_fork_proposal),
         )
         .route(
-            "/api/conversations/:id/proposals/:proposal_id/request-changes",
+            "/api/conversations/{id}/proposals/{proposal_id}/request-changes",
             post(request_changes_on_fork_proposal),
         )
         // User question response (REQ-AUQ-003)
-        .route("/api/conversations/:id/respond", post(respond_to_question))
+        .route("/api/conversations/{id}/respond", post(respond_to_question))
         .route(
-            "/api/conversations/:id/dismiss-question",
+            "/api/conversations/{id}/dismiss-question",
             post(dismiss_question),
         )
         // Error dismissal: Error -> Idle (server-authoritative)
-        .route("/api/conversations/:id/dismiss-error", post(dismiss_error))
+        .route("/api/conversations/{id}/dismiss-error", post(dismiss_error))
         // Task abandon (REQ-PROJ-010)
-        .route("/api/conversations/:id/abandon-task", post(abandon_task))
+        .route("/api/conversations/{id}/abandon-task", post(abandon_task))
         // Mark as merged (REQ-PROJ-026)
-        .route("/api/conversations/:id/mark-merged", post(mark_merged))
+        .route("/api/conversations/{id}/mark-merged", post(mark_merged))
         .route(
-            "/api/conversations/:id/close/confirm-stop-work",
+            "/api/conversations/{id}/close/confirm-stop-work",
             post(confirm_close_stop_work),
         )
         .route(
-            "/api/conversations/:id/close/confirm-loss-retirement",
+            "/api/conversations/{id}/close/confirm-loss-retirement",
             post(confirm_close_loss_retirement),
         )
         .route(
-            "/api/conversations/:id/close/cancel-before-retirement",
+            "/api/conversations/{id}/close/cancel-before-retirement",
             post(cancel_close_before_retirement),
         )
         .route(
-            "/api/conversations/:id/close/retry-retirement",
+            "/api/conversations/{id}/close/retry-retirement",
             post(retry_close_retirement),
         )
         // Lifecycle (REQ-API-006). Archive and delete are both terminal
         // transitions that run the resource-cleanup cascade (REQ-BED-032);
         // archive preserves the row, delete removes it. There is no
         // unarchive — archive is not reversible.
-        .route("/api/conversations/:id/archive", post(archive_conversation))
-        .route("/api/conversations/:id/delete", post(delete_conversation))
+        .route(
+            "/api/conversations/{id}/archive",
+            post(archive_conversation),
+        )
+        .route("/api/conversations/{id}/delete", post(delete_conversation))
         // Token usage (Phase 4)
         .route(
-            "/api/conversations/:id/usage",
+            "/api/conversations/{id}/usage",
             get(get_conversation_usage_handler),
         )
         // System prompt inspection
         .route(
-            "/api/conversations/:id/system-prompt",
+            "/api/conversations/{id}/system-prompt",
             get(get_system_prompt),
         )
         // One-shot shell-command suggestion. Stateless: a single LLM
@@ -389,9 +395,9 @@ pub fn create_router(state: AppState) -> Router {
         // terminal renders results as click-to-run affordances.
         .route("/api/suggest", post(suggest_handler))
         // Slug resolution (REQ-API-007)
-        .route("/api/conversations/by-slug/:slug", get(get_by_slug))
+        .route("/api/conversations/by-slug/{slug}", get(get_by_slug))
         .route(
-            "/api/conversations/by-slug/:slug/route",
+            "/api/conversations/by-slug/{slug}/route",
             get(get_by_slug_route),
         )
         // Phoenix Chains v1 (REQ-CHN-003 / 004 / 005 / 007)
@@ -399,20 +405,20 @@ pub fn create_router(state: AppState) -> Router {
         // bash/tmux/browser registries). `:scope_key` is a
         // `ResourceScopeKey::stable_key()` value.
         .route(
-            "/api/work-scope/:scope_key/inventory",
+            "/api/work-scope/{scope_key}/inventory",
             get(get_work_scope_inventory),
         )
-        .route("/api/work-scope/:scope_key/load", get(get_work_scope_load))
+        .route("/api/work-scope/{scope_key}/load", get(get_work_scope_load))
         .route("/api/work-scopes/load", get(get_all_work_scope_load))
         .route(
-            "/api/work-scope/:scope_key/browser-session",
+            "/api/work-scope/{scope_key}/browser-session",
             delete(stop_work_scope_browser_session),
         )
         // Process inspector: per-handle drill-down (identity/state, output
         // delta, live resource sample). `:scope_key` is a
         // `ResourceScopeKey::stable_key()`; `:handle_id` names a bash handle in that
         // scope. See `specs/process-inspector/` REQ-PINSP-005.
-        .route("/api/bash/:handle_id/inspect", get(inspect_bash_handle))
+        .route("/api/bash/{handle_id}/inspect", get(inspect_bash_handle))
         .route(
             "/api/coordinator/bash/live",
             get(list_live_coordinator_bash_handles),
@@ -422,15 +428,15 @@ pub fn create_router(state: AppState) -> Router {
             get(list_active_coordinator_watches),
         )
         .route(
-            "/api/coordinator/bash/:handle_id/stop",
+            "/api/coordinator/bash/{handle_id}/stop",
             post(stop_live_coordinator_bash_handle),
         )
-        .route("/api/chains/:rootId", get(get_chain))
-        .route("/api/chains/:rootId/qa", post(submit_chain_question))
-        .route("/api/chains/:rootId/stream", get(stream_chain))
-        .route("/api/chains/:rootId/archive", post(archive_chain_handler))
+        .route("/api/chains/{rootId}", get(get_chain))
+        .route("/api/chains/{rootId}/qa", post(submit_chain_question))
+        .route("/api/chains/{rootId}/stream", get(stream_chain))
+        .route("/api/chains/{rootId}/archive", post(archive_chain_handler))
         .route(
-            "/api/chains/:rootId",
+            "/api/chains/{rootId}",
             axum::routing::delete(delete_chain_handler),
         )
         // Directory browser (REQ-API-008)
@@ -441,11 +447,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/files/read", get(read_file))
         .route("/api/files/reveal", post(super::local_reveal::reveal_path))
         .route(
-            "/api/conversations/:id/files/search",
+            "/api/conversations/{id}/files/search",
             get(search_conversation_files),
         )
         .route(
-            "/api/conversations/:id/code/search",
+            "/api/conversations/{id}/code/search",
             get(search_conversation_code),
         )
         // Directory-scoped file search for the new-conversation composer,
@@ -454,16 +460,19 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/files/search", get(search_project_files))
         // Skill discovery for autocomplete (REQ-IR-005)
         .route(
-            "/api/conversations/:id/skills",
+            "/api/conversations/{id}/skills",
             get(list_conversation_skills),
         )
         // Directory-scoped skill discovery for the new-conversation composer
         // (REQ-IR-005).
         .route("/api/skills", get(list_project_skills))
         // Task listing
-        .route("/api/conversations/:id/tasks", get(list_conversation_tasks))
         .route(
-            "/api/conversations/:id/tasks/count",
+            "/api/conversations/{id}/tasks",
+            get(list_conversation_tasks),
+        )
+        .route(
+            "/api/conversations/{id}/tasks/count",
             get(get_conversation_task_count),
         )
         // Projects (REQ-PROJ-014)
@@ -477,33 +486,33 @@ pub fn create_router(state: AppState) -> Router {
             post(invalidate_credential),
         )
         .route(
-            "/api/conversations/:id/upgrade-model",
+            "/api/conversations/{id}/upgrade-model",
             post(upgrade_conversation_model),
         )
         // Per-conversation worktree diff and PR state
-        .route("/api/conversations/:id/diff", get(get_conversation_diff))
+        .route("/api/conversations/{id}/diff", get(get_conversation_diff))
         .route(
-            "/api/conversations/:id/git-status",
+            "/api/conversations/{id}/git-status",
             get(get_conversation_git_status),
         )
         .route(
-            "/api/conversations/:id/active-pr/diff",
+            "/api/conversations/{id}/active-pr/diff",
             get(get_active_pr_diff),
         )
         .route(
-            "/api/conversations/:id/pr-status",
+            "/api/conversations/{id}/pr-status",
             get(get_conversation_pr_status),
         )
         .route(
-            "/api/conversations/:id/associated-pr/pin",
+            "/api/conversations/{id}/associated-pr/pin",
             post(pin_associated_pr),
         )
         .route(
-            "/api/conversations/:id/associated-pr/resume-inference",
+            "/api/conversations/{id}/associated-pr/resume-inference",
             post(resume_associated_pr_inference),
         )
         .route(
-            "/api/conversations/:id/pr-auto-fix-context",
+            "/api/conversations/{id}/pr-auto-fix-context",
             post(create_pr_auto_fix_context),
         )
         // Project task files available before a conversation exists
@@ -522,7 +531,7 @@ pub fn create_router(state: AppState) -> Router {
             get(crate::slack_gateway::http::get).put(crate::slack_gateway::http::put),
         )
         .route(
-            "/api/slack-gateway/requests/:id/source",
+            "/api/slack-gateway/requests/{id}/source",
             get(crate::slack_gateway::http::source),
         )
         .route(
@@ -535,19 +544,19 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/mcp/status", get(mcp_status))
         .route("/api/mcp/reload", post(reload_mcp))
-        .route("/api/mcp/servers/:name/disable", post(disable_mcp_server))
-        .route("/api/mcp/servers/:name/enable", post(enable_mcp_server))
+        .route("/api/mcp/servers/{name}/disable", post(disable_mcp_server))
+        .route("/api/mcp/servers/{name}/enable", post(enable_mcp_server))
         .route("/api/mcp/oauth/callback", get(mcp_oauth_callback))
         .route(
-            "/api/conversations/:id/reminders",
+            "/api/conversations/{id}/reminders",
             get(super::reminders::list),
         )
         .route(
-            "/api/conversations/:id/reminders/:reminder_id/cancel",
+            "/api/conversations/{id}/reminders/{reminder_id}/cancel",
             post(super::reminders::cancel),
         )
         .route(
-            "/api/conversations/:id/reminders/:reminder_id/reschedule",
+            "/api/conversations/{id}/reminders/{reminder_id}/reschedule",
             post(super::reminders::reschedule),
         )
         .route("/api/reminders/due", get(super::reminders::due_feed))
@@ -605,11 +614,11 @@ pub fn create_router(state: AppState) -> Router {
         // Usage analytics (read-only)
         .route("/api/usage", get(super::usage::usage_overview))
         .route(
-            "/api/analytics/conversation/:id/trajectory-export",
+            "/api/analytics/conversation/{id}/trajectory-export",
             get(trajectory_export_handler),
         )
         .route(
-            "/api/usage/conversation/:id",
+            "/api/usage/conversation/{id}",
             get(super::usage::usage_conversation_detail),
         )
         // Auth endpoints (REQ-AUTH-002, REQ-AUTH-003)
@@ -650,7 +659,7 @@ pub fn create_router(state: AppState) -> Router {
             post(super::federation::import_peer_connection),
         )
         .route(
-            "/api/federation/enrollments/:caller_instance_id/revoke",
+            "/api/federation/enrollments/{caller_instance_id}/revoke",
             post(super::federation::revoke_enrollment),
         )
         // Codex / ChatGPT OAuth login (task 27104). PKCE+loopback and OpenAI's
@@ -675,15 +684,15 @@ pub fn create_router(state: AppState) -> Router {
             post(super::codex_login::pkce_start),
         )
         .route(
-            "/api/codex/login/pkce/:id/manual",
+            "/api/codex/login/pkce/{id}/manual",
             post(super::codex_login::pkce_manual),
         )
         .route(
-            "/api/codex/login/pkce/:id/status",
+            "/api/codex/login/pkce/{id}/status",
             get(super::codex_login::pkce_status),
         )
         .route(
-            "/api/codex/login/pkce/:id/cancel",
+            "/api/codex/login/pkce/{id}/cancel",
             post(super::codex_login::pkce_cancel),
         )
         .route(
@@ -691,11 +700,11 @@ pub fn create_router(state: AppState) -> Router {
             post(super::codex_login::device_start),
         )
         .route(
-            "/api/codex/login/device/:id/status",
+            "/api/codex/login/device/{id}/status",
             get(super::codex_login::device_status),
         )
         .route(
-            "/api/codex/login/device/:id/cancel",
+            "/api/codex/login/device/{id}/cancel",
             post(super::codex_login::device_cancel),
         )
         .route(
@@ -703,23 +712,23 @@ pub fn create_router(state: AppState) -> Router {
             post(super::codex_login::signout),
         )
         // Share mode (REQ-AUTH-004 through REQ-AUTH-008)
-        .route("/share/c/:slug", get(create_or_redirect_share))
-        .route("/s/:token", get(serve_share_page))
+        .route("/share/c/{slug}", get(create_or_redirect_share))
+        .route("/s/{token}", get(serve_share_page))
         .route(
-            "/api/share/:token/conversation",
+            "/api/share/{token}/conversation",
             get(get_shared_conversation),
         )
-        .route("/api/share/:token/events", get(shared_sse_stream))
+        .route("/api/share/{token}/events", get(shared_sse_stream))
         .route(
-            "/api/share/:token/svg-artifacts/:artifact_id",
+            "/api/share/{token}/svg-artifacts/{artifact_id}",
             get(super::share_svg_artifacts::image),
         )
         .route(
-            "/api/share/:token/svg-artifacts/:artifact_id/source",
+            "/api/share/{token}/svg-artifacts/{artifact_id}/source",
             get(super::share_svg_artifacts::source),
         )
         .route(
-            "/api/share/:token/svg-artifacts/:artifact_id/download",
+            "/api/share/{token}/svg-artifacts/{artifact_id}/download",
             get(super::share_svg_artifacts::download),
         );
 

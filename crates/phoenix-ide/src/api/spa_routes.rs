@@ -24,7 +24,7 @@ pub enum SpaRoute {
     /// A fixed path with no parameters (e.g. `/new`). Matched by equality.
     Exact(&'static str),
     /// A parameterised route. `pattern` is the axum path pattern used for
-    /// registration (e.g. `/c/:slug`); `prefix` is the literal leading segment
+    /// registration (e.g. `/c/{slug}`); `prefix` is the literal leading segment
     /// used for runtime matching against a concrete request path (e.g. `/c/`).
     Param {
         prefix: &'static str,
@@ -64,22 +64,22 @@ pub const SPA_ROUTES: &[SpaRoute] = &[
     SpaRoute::Exact("/global"),
     SpaRoute::Param {
         prefix: "/global/",
-        pattern: "/global/:slug",
+        pattern: "/global/{slug}",
     },
     SpaRoute::Exact("/settings/llm-language"),
     SpaRoute::Exact("/settings/slack"),
     SpaRoute::Exact("/codex/login"),
     SpaRoute::Param {
         prefix: "/c/",
-        pattern: "/c/:slug",
+        pattern: "/c/{slug}",
     },
     SpaRoute::Param {
         prefix: "/product-conversations/",
-        pattern: "/product-conversations/:productConversationId",
+        pattern: "/product-conversations/{productConversationId}",
     },
     SpaRoute::Param {
         prefix: "/chains/",
-        pattern: "/chains/:rootConvId",
+        pattern: "/chains/{rootConvId}",
     },
 ];
 
@@ -135,10 +135,10 @@ mod tests {
         assert_eq!(
             SpaRoute::Param {
                 prefix: "/c/",
-                pattern: "/c/:slug",
+                pattern: "/c/{slug}",
             }
             .pattern(),
-            "/c/:slug"
+            "/c/{slug}"
         );
     }
 }
