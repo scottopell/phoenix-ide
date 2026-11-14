@@ -6013,6 +6013,88 @@ def _rust_check_commands(
     return compile_cmd, test_cmd, codegen_cmd
 
 
+# Lists the current build's artifacts without compiling (runs after a full
+# compile, so everything is fresh).
+_PRUNE_LISTING_CMD = ["cargo", "test", "--no-run", "--message-format=json-render-diagnostics"]
+_CARGO_ARTIFACT_KEY = re.compile(r"^(?:lib)?(?P<stem>[A-Za-z0-9_]+)-(?P<hash>[0-9a-f]{16})(?:\..+)?$")
+
+
+def _artifact_key(name: str) -> tuple[str, str] | None:
+    m = _CARGO_ARTIFACT_KEY.match(name)
+    return (m["stem"], m["hash"]) if m else None
+
+
+def _workspace_artifacts_from_cargo_json(lines, root: Path) -> list[Path]:
+    """Paths of workspace-package artifacts in `cargo --message-format=json` output."""
+    paths: list[Path] = []
+    for line in lines:
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(msg, dict) or msg.get("reason") != "compiler-artifact":
+            continue
+        manifest = msg.get("manifest_path")
+        if not isinstance(manifest, str) or not Path(manifest).is_relative_to(root):
+            continue
+        for name in [*(msg.get("filenames") or []), msg.get("executable")]:
+            if isinstance(name, str) and name:
+                paths.append(Path(name))
+    return paths
+
+
+def _prune_stale_workspace_artifacts(current: list[Path], older_than: float) -> tuple[int, int]:
+    """Delete workspace executables in a deps dir that `current` (complete
+    builds' outputs) no longer produces: same crate stem, different hash.
+
+    Only executables (test harnesses, bins) are removed; they are the
+    300-500 MB statically linked files that pile up as dependency or feature
+    changes move hashes, and cargo never deletes them. Libraries are left
+    alone because other build configurations (`./dev.py up`, the launcher
+    build) resolve features differently and still use theirs. Kept:
+    hard-linked files (cargo uplifts each name's latest binary into the
+    profile dir), and files touched at or after `older_than`, so a concurrent
+    build sharing the target dir cannot lose what it just wrote. A `.d` file
+    goes once nothing else with its hash remains.
+    Returns (files removed, bytes freed).
+    """
+    keep: dict[Path, set[tuple[str, str]]] = {}
+    for path in current:
+        key = _artifact_key(path.name)
+        if key and path.parent.name == "deps":
+            keep.setdefault(path.parent, set()).add(key)
+    removed = freed = 0
+
+    def delete(path: Path, size: int) -> None:
+        nonlocal removed, freed
+        path.unlink(missing_ok=True)
+        removed += 1
+        freed += size
+
+    for deps_dir, keys in keep.items():
+        stems = {stem for stem, _ in keys}
+        dep_files: list[tuple[Path, tuple[str, str], os.stat_result]] = []
+        for path in deps_dir.iterdir():
+            key = _artifact_key(path.name)
+            if key is None or key[0] not in stems or key in keys:
+                continue
+            try:
+                st = path.lstat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(st.st_mode) or st.st_mtime >= older_than:
+                continue
+            if path.suffix == ".d":
+                dep_files.append((path, key, st))
+            elif "." not in path.name and st.st_mode & stat.S_IXUSR and st.st_nlink == 1:
+                delete(path, st.st_size)
+        remaining = {_artifact_key(p.name) for p in deps_dir.iterdir() if p.suffix != ".d"}
+        for path, key, st in dep_files:
+            if key not in remaining:
+                delete(path, st.st_size)
+    return removed, freed
+
+
 class RustPhase(enum.Enum):
     """One slice of the rust lane when CI splits it across runners.
 
@@ -6786,13 +6868,33 @@ def cmd_check(
                       env_extra={**launcher_env, "TS_RS_EXPORT_DIR": str(codegen_export_base)})
         if rc == 0:
             codegen_stale_step()
-        run_step("cargo test compile", compile_cmd, env_extra=launcher_env)
+        compile_started = time.time()
+        if run_step("cargo test compile", compile_cmd, env_extra=launcher_env) == 0 and not compile_p:
+            prune_stale_test_artifacts(compile_started, launcher_env)
         run_step("cargo test", test_cmd, env_extra=launcher_env, timeout=CARGO_TEST_TIMEOUT)
+
+    def prune_stale_test_artifacts(compile_started, launcher_env):
+        # Full-workspace compiles only: a crate-scoped compile resolves
+        # features differently, so pruning against it would delete artifacts
+        # the next full run needs.
+        lines: list[str] = []
+        rc = run_step("prune stale test artifacts", _PRUNE_LISTING_CMD,
+                      env_extra=launcher_env, output_observer=lines.append)
+        current = _workspace_artifacts_from_cargo_json(lines, ROOT)
+        if rc != 0 or not current:
+            return
+        current += _workspace_artifacts_from_cargo_json(launcher_build_output, ROOT)
+        removed, freed = _prune_stale_workspace_artifacts(current, compile_started)
+        if removed:
+            reporter.info(f"pruned {removed} stale workspace test executables ({freed / 1e9:.1f} GB)")
+
+    launcher_build_output: list[str] = []
 
     def build_native_bash_launcher():
         executables = []
 
         def observe_artifact(line):
+            launcher_build_output.append(line)
             try:
                 artifact = json.loads(line)
             except json.JSONDecodeError:
@@ -8478,7 +8580,7 @@ def _build_pipeline_model(with_timings: bool = False):
 # in node tooltips. Kept beside _LANE_DEFS conceptually — update both together.
 _GRAPH_LANE_STEPS = {
     "rust": ["native bash launcher", "codegen export", "codegen-stale diff", "cargo test (compile)",
-             "cargo test (run)"],
+             "prune stale test artifacts", "cargo test (run)"],
     "clippy": ["cargo clippy --all-targets -D warnings"],
     "deps": ["cargo deny check bans"],
     "tsc": ["tsc -b --noEmit"],
