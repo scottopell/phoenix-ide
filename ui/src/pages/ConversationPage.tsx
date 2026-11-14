@@ -1445,7 +1445,7 @@ function ConversationPageContent({
   }, [queuedMessages, dismiss, appendDraftCb, setFiles, requestComposerFocus]);
 
   const handleCancel = useCallback(async () => {
-    if (!conversationId || !canCancelConversationState(atom.phase)) return;
+    if (readOnly || isArchived || !conversationId || !canCancelConversationState(atom.phase)) return;
     if (isCancellingState(atom.phase)) return;
 
     try {
@@ -1453,7 +1453,7 @@ function ConversationPageContent({
     } catch (err) {
       console.error('Failed to cancel:', err);
     }
-  }, [conversationId, atom.phase]);
+  }, [conversationId, atom.phase, readOnly, isArchived]);
 
   const handleCancelSteering = useCallback(async (localId: string) => {
     if (!conversationId) return;
@@ -1531,14 +1531,14 @@ function ConversationPageContent({
   );
 
   const handleTriggerContinuation = useCallback(async () => {
-    if (!conversationId || isArchived) return;
+    if (!conversationId || isArchived || readOnly) return;
 
     try {
       await api.triggerContinuation(conversationId);
     } catch (err) {
       showError(err instanceof Error ? err.message : 'Failed to trigger continuation');
     }
-  }, [conversationId, isArchived, showError]);
+  }, [conversationId, isArchived, readOnly, showError]);
 
   const handleUpgradeModel = useCallback(async (
     newModelId: string,
@@ -1997,7 +1997,7 @@ function ConversationPageContent({
   }, [handleCloseMobileTerminal, showMobileTerminal]);
 
   const openExistingContinuation = useCallback(async () => {
-    if (!conversation?.id || convStateForChildren.type !== 'context_exhausted') return;
+    if (readOnly || isArchived || !conversation?.id || convStateForChildren.type !== 'context_exhausted') return;
     const ownerGeneration = conversationRouteOwnerRef.current.generation;
     const res = await api.continueConversation(conversation.id, {
       handoff: convStateForChildren.summary,
@@ -2010,9 +2010,10 @@ function ConversationPageContent({
     }
     showInfo('Returning to your existing continuation');
     navigate(`${routePrefix}/${res.conversation_id}`);
-  }, [conversation?.id, convStateForChildren, navigate, routePrefix, showInfo]);
+  }, [conversation?.id, convStateForChildren, navigate, routePrefix, showInfo, readOnly, isArchived]);
 
   const handleContextExhaustedContinue = useCallback(async (handoff: string, source: ContinueHandoffSource) => {
+    if (readOnly || isArchived) throw new Error('Conversation is read-only.');
     if (!conversation?.id) throw new Error('Conversation is unavailable.');
     const ownerGeneration = conversationRouteOwnerRef.current.generation;
     const res = await api.continueConversation(conversation.id, {
@@ -2031,7 +2032,7 @@ function ConversationPageContent({
     }
     navigate(`${routePrefix}/${res.conversation_id}`);
     return res.status;
-  }, [conversation?.id, navigate, routePrefix, showError, showInfo]);
+  }, [conversation?.id, navigate, routePrefix, showError, showInfo, readOnly, isArchived]);
 
   if (error) {
     return (
@@ -2418,7 +2419,7 @@ function ConversationPageContent({
               <button
                 type="button"
                 className="context-exhausted-continue"
-                disabled={isArchived}
+                disabled={readOnly || isArchived}
                 onClick={() => void handleTriggerContinuation()}
               >
                 Retry summary
@@ -2441,7 +2442,7 @@ function ConversationPageContent({
           parentId={conversation.id}
           generatedHandoff={convStateForChildren.type === 'context_exhausted' ? convStateForChildren.summary : ''}
           continuedInConvId={conversation.continued_in_conv_id}
-          disabled={isArchived}
+          disabled={readOnly || isArchived}
           onOpenExisting={async () => {
             try {
               await openExistingContinuation();
@@ -2490,7 +2491,7 @@ function ConversationPageContent({
         prStatusHandle={prStatusHandle}
         {...(onCloseCompleted ? { onCloseCompleted } : {})}
       />}
-      {convStateForChildren.type === 'awaiting_recovery' && isArchived ? (
+      {convStateForChildren.type === 'awaiting_recovery' && (isArchived || readOnly) ? (
         <RecoveryBanner message={convStateForChildren.message} recoveryKind={convStateForChildren.recovery_kind} />
       ) : convStateForChildren.type === 'awaiting_recovery' ? (
         <>

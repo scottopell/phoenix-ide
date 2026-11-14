@@ -7696,8 +7696,9 @@ impl RuntimeManager {
         &self,
         conversation_id: &str,
     ) -> Option<SseBroadcaster> {
-        if let Some(handle) = self.try_get_handle(conversation_id).await {
-            return Some(handle.broadcast_tx);
+        let runtimes = self.runtimes.read().await;
+        if let Some(handle) = runtimes.get(conversation_id) {
+            return Some(handle.broadcast_tx.clone());
         }
         self.evicted_broadcasters
             .read()
@@ -14471,6 +14472,14 @@ mod scope_liveness_tests {
         let mut receiver = first.subscribe();
         let second = mgr.conversation_broadcaster("invalid-cwd-shell").await;
 
+        mgr.publish_continuation_link("invalid-cwd-shell", "successor")
+            .await;
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            SseEvent::ConversationUpdate { update, .. }
+                if update.continued_in_conv_id.as_deref() == Some("successor")
+        ));
+
         let idle = ConvState::Idle;
         second
             .send_seq(|seq| SseEvent::StateChange {
@@ -14487,6 +14496,23 @@ mod scope_liveness_tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn existing_broadcaster_lookup_holds_materialization_fence() {
+        let mgr = test_manager().await;
+        let first = mgr.conversation_broadcaster("lookup-fence").await;
+        let reservations = mgr.evicted_broadcasters.write().await;
+        let lookup = mgr.existing_conversation_broadcaster("lookup-fence");
+        tokio::pin!(lookup);
+        tokio::select! {
+            biased;
+            _ = &mut lookup => panic!("lookup must wait for reservations"),
+            () = std::future::ready(()) => {}
+        }
+        assert!(mgr.runtimes.try_write().is_err());
+        drop(reservations);
+        assert!(first.same_channel(&lookup.await.unwrap()));
     }
 
     #[tokio::test]

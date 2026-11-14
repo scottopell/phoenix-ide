@@ -507,6 +507,8 @@ async fn completed_generated_opening_replays_without_a_provider_or_new_successor
 async fn pending_replay_requires_current_successor_capacity_and_retains_winning_intent() {
     let f = Fixture::new().await;
     let intent = f.reserve().await;
+    f.runtime.get_or_create(&f.predecessor).await.unwrap();
+    let mut predecessor_events = f.runtime.subscribe(&f.predecessor).await.unwrap();
     let error = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         f.service()
@@ -535,6 +537,20 @@ async fn pending_replay_requires_current_successor_capacity_and_retains_winning_
         pending.opening_authority,
         ContinuationOpeningAuthority::GeneratedPredecessorContext
     );
+    let mut links = Vec::new();
+    while let Ok(event) = predecessor_events.try_recv() {
+        if let SseEvent::ConversationUpdate { update, .. } = event
+            && let Some(id) = update.continued_in_conv_id
+        {
+            links.push(id);
+        }
+    }
+    assert_eq!(links, vec![intent.successor_conversation_id.clone()]);
+    assert!(f
+        .db
+        .has_pending_continuation_opening(&intent.successor_conversation_id)
+        .await
+        .unwrap());
     assert!(pending.user_agent.is_none());
     assert!(f
         .db
