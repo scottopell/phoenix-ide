@@ -64,3 +64,18 @@ Existing local native Cargo/rustc/full-build hold remains. Read-only `df` showed
 ## Explicit non-goals
 
 Native task approval/Close executor ownership, PR1076 author/reviewer work, aggregate SSE/root-ledger redesign, unrelated lifecycle architecture, production reproduction by manipulating real conversations, physical-device/Accessibility permissions, local resource-heavy qualification without admission, and deployment/release.
+
+## Qualification checkpoint
+
+Draft PR: https://github.com/scottopell/phoenix-ide/pull/1080. Implementation includes committed-link publication/recovery, stable aggregate follow/composer ownership, retired draft-writer fencing, explicit transcript upload targets, persisted-prefix attachment authorization, and payload-free saved-opening retry through shared lifecycle/rearm orchestration with generated reserved-capacity review. Main dependency migration was integrated at `6316b31a06e8768c25e25565e0c8c844b2f521c7`.
+
+**Not merge-ready.** No merge/deploy/restart performed. The detailed executed-versus-authored ledger is `docs/qa/mobile-web-continuation-liveness.md`; earlier green lanes do not qualify later corrections. Independent reviews found and corrected the undefined close gate, missing automatic retry rearm path, reserved-capacity bypass, cold-hydration upload scope fallback, route syntax integration error, and newly authored test API/type errors. Latest narrow upload review's excess-property finding is corrected at `a8011ab8752c0d7ff83f1840a714fea7cc521c6c`; its production prop migration had no additional source finding.
+
+Remaining gates:
+- Exact final-source hosted CI, including publication mutation witness and the native automatic reserved-recovery regression.
+- Final ordinary/Coordinator mobile captures inspected (before/followed/reconnected), with same native editor/focus/selection and new post-reconnect message assertions.
+- Final source-review packet with explicit coverage and no unresolved actionable findings.
+- Exact terminal/unmaterialized failed-automatic service-level retry remains an explicit coverage gap; shared-path inspection and lower-level rearm tests are not claimed as that executed journey.
+- Physical iOS/PWA keyboard/OS Accessibility coverage remains deferred. Historical RC5/deployed identity reports are not fresh independent production verification.
+
+The local build/test/browser/server/install resource hold remains respected. Hosted normal PR CI is the qualification path; no duplicate manual dispatch.
