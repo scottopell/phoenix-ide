@@ -30,6 +30,7 @@ function FixtureAlias() { const { slug } = useParams(); return <ProductConversat
 
 interface Props {
   scenario: ProductConversationScenario;
+  children?: ReactNode;
 }
 
 function SeedReactionDraft({ slug, text }: { slug: string; text: string }) {
@@ -60,7 +61,7 @@ function pageHasSettled(root: HTMLElement, scenario: ProductConversationScenario
     && page.querySelector('.product-conversation-page__composer .embedded-conversation-shell') !== null;
 }
 
-function ProductConversationFixtureBody({ scenario }: Props) {
+function ProductConversationFixtureBody({ scenario, children }: Props) {
   useDocumentViewportOwnership(true);
   const rootRef = useRef<HTMLElement>(null);
   const [ready, setReady] = useState(false);
@@ -114,6 +115,7 @@ function ProductConversationFixtureBody({ scenario }: Props) {
             {scenario.initialDraft && scenario.snapshot?.latest_transcript_row_id && (
               <SeedReactionDraft slug={scenario.snapshot.latest_transcript_row_id} text={scenario.initialDraft} />
             )}
+            {children}
             <ConversationReadinessProvider>
               <ChainProvider>
                 <ViewerSlotProvider scopeKey="fixture-product-conversation" browserSessionActive={false}>
@@ -136,7 +138,7 @@ function ProductConversationFixtureBody({ scenario }: Props) {
   );
 }
 
-export function ProductConversationFixture({ scenario }: Props) {
+export function ProductConversationFixture({ scenario, children }: Props) {
   const [installed, setInstalled] = useState(false);
 
   useEffect(() => {
@@ -152,5 +154,5 @@ export function ProductConversationFixture({ scenario }: Props) {
   }, [scenario]);
 
   if (!installed) return null;
-  return <ProductConversationFixtureBody scenario={scenario} />;
+  return <ProductConversationFixtureBody scenario={scenario}>{children}</ProductConversationFixtureBody>;
 }

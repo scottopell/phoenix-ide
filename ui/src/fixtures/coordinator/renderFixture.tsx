@@ -114,7 +114,7 @@ function FixtureConversation({ scenario }: { scenario: CoordinatorScenario }) {
               convModeLabel="Explore"
               draft={draft}
               onDraftChange={setDraft}
-              quickAction={COORDINATOR_QUICK_ACTION}
+              quickAction={{ ...COORDINATOR_QUICK_ACTION, send: () => {} }}
               onSend={() => {}}
               onCancel={() => {}}
               onRetry={() => {}}

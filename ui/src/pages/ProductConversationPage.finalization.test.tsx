@@ -7,6 +7,7 @@ import type { EmbeddedConversationProjection } from './ConversationPage';
 import type { PendingUserMessage } from '../hooks/useMessageQueue';
 import { ConversationContext } from '../conversation/ConversationContext';
 import { ConversationStore } from '../conversation/ConversationStore';
+import { AnnotationDraftStore } from '../conversation/AnnotationDraftStore';
 import { ConversationReadinessProvider } from '../contexts/ConversationReadinessContext';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
 import { FileExplorerProvider } from '../components/FileExplorer';
@@ -199,6 +200,7 @@ describe('ProductConversationPage atom-owned ordinary finalization', () => {
       slug: latestRow, conversationId: latestRow, conversation: store.getSnapshot(latestRow).conversation,
       pendingMessages, isArchived: false, serverArchived: false,
       onRetryPending: vi.fn(), onCancelSteering: vi.fn(), onOpenFile: vi.fn(), filePathRootDir: '/',
+      annotationDraft: new AnnotationDraftStore().forScope(latestRow), canAnnotate: true,
     };
     await open();
     await waitFor(() => expect(document.querySelector(`[data-owned-unit="${localId}"]`)).toHaveTextContent('PENDING_SEND_MARKER'));

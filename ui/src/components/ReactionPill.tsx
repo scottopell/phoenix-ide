@@ -12,7 +12,10 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
   const docked = touchDocked || sourceDocked;
   const hidden = Boolean(activeScope && activeScope !== scopeId);
   const dockActive = touchDocked && !hidden;
-  const [discard, setDiscard] = useState(false);
+  const [discardTop, setDiscardTop] = useState<number | null>(null);
+  const discard = discardTop !== null;
+  const confirmationTop = useRef(discardTop);
+  confirmationTop.current = discardTop;
   const [error, setError] = useState('');
   const returning = useRef(false);
   const returnRequest = useRef<AbortController | null>(null);
@@ -26,7 +29,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       onSourceReturnStateChange?.(false);
     };
   }, [source, onSourceReturnStateChange]);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     if ((sourceDocked && !touchDocked && available) || discard || hidden) return;
@@ -43,13 +46,20 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
     document.addEventListener('keydown', focusFromSelection);
     return () => document.removeEventListener('keydown', focusFromSelection);
   }, [available, bubbleRef, discard, hidden, scopeId, sourceDocked, touchDocked]);
-  const requestClose = () => body ? setDiscard(true) : onClose();
+  const keepReaction = () => {
+    setDiscardTop(null);
+  };
+  const requestClose = () => {
+    if (!body) { onClose(); return; }
+    const pill = bubbleRef.current;
+    if (pill) setDiscardTop(pill.getBoundingClientRect().top);
+  };
   useKeyboardRouterShortcut({
     id: `${scopeId}:escape`, scopeId, key: 'Escape', layer: 'passive-content',
     handler: (event) => {
       event.preventDefault();
       event.stopImmediatePropagation();
-      if (discard) setDiscard(false);
+      if (discard) keepReaction();
       else requestClose();
     },
   });
@@ -176,6 +186,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
         y = rect.bottom + 16;
         if (y + height > visibleBottom - 8) y = rect.top - height - 16;
       }
+      if (confirmationTop.current !== null) y = confirmationTop.current;
       setSourceDocked(!sourceVisible);
       el.style.left = `${Math.max(left + 12, Math.min(x, left + width - pillWidth - 12))}px`;
       el.style.top = `${Math.max(top + 12, Math.min(y, bottom - height - 12))}px`;
@@ -243,54 +254,53 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
 
   return (
     <div ref={bubbleRef} className="reaction-pill" role="region" aria-label={docked ? 'Docked reaction' : 'React to selected text'} hidden={hidden}>
-      {discard ? (
-        <>
+      {discard && (
+        <div className="reaction-pill-confirmation">
           <span className="reaction-pill-label">Discard reaction?</span>
-          <button type="button" onClick={() => setDiscard(false)}>Keep</button>
+          <button type="button" onClick={keepReaction}>Keep</button>
           <button type="button" onClick={onClose}>Discard</button>
-        </>
-      ) : (
-        <>
-          {sourceDocked && !touchDocked && available ? (
-            <button type="button" className="reaction-pill-return" onPointerDown={captureSource} onClick={returnToPassage} disabled={returnPending} title={error || source.quote}>
-              <ArrowUpRight size={18} aria-hidden="true" />
-              <span>{returnPending ? 'Returning to passage…' : error || `Return to passage · ${body || source.quote}`}</span>
-            </button>
-          ) : (
-            <>
-              {(touchDocked || !available) && (sourceDocked ? (
-                <button type="button" className="reaction-pill-source" aria-label={`Return to passage: ${source.quote}`} title="Return to passage" onPointerDown={captureSource} onClick={returnToPassage} disabled={returnPending}>
-                  {returnPending ? 'Returning…' : error || `“${source.quote}”${available ? '' : ' · draft unavailable; retained'}`}
-                </button>
-              ) : (
-                <span className="reaction-pill-source" title={available ? source.quote : `${source.quote} · Draft unavailable. Reaction retained.`}>“{source.quote}”{available ? '' : ' · draft unavailable; retained'}</span>
-              ))}
-              <input
-                ref={inputRef}
-                type="text"
-                aria-label="Your reaction"
-                placeholder={touchDocked ? 'React to selection…' : 'Your reaction… (Enter to focus)'}
-                title={available ? source.quote : 'Draft unavailable. Your reaction is retained.'}
-                value={body}
-                onPointerDown={captureSource}
-                onChange={(event) => onChange(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.nativeEvent.isComposing || event.keyCode === 229) return;
-                  if (event.key === 'Enter') {
-                    event.stopPropagation();
-                    event.preventDefault();
-                    if ((event.metaKey || event.ctrlKey) && available && body.trim() && !event.nativeEvent.isComposing) onAdd();
-                  }
-                }}
-              />
-              <button type="button" aria-label="Add to draft" title={available ? 'Add to draft (Cmd/Ctrl+Enter)' : 'Draft unavailable. Your reaction is retained.'} disabled={!available || !body.trim()} onClick={onAdd}>
-                <ListPlus size={20} aria-hidden="true" />
-              </button>
-            </>
-          )}
-          <button type="button" aria-label="Dismiss reaction" title="Dismiss reaction" onClick={requestClose}><X size={16} aria-hidden="true" /></button>
-        </>
+        </div>
       )}
+      <div className="reaction-pill-content" hidden={discard}>
+        {sourceDocked && !touchDocked && available ? (
+          <button type="button" className="reaction-pill-return" onPointerDown={captureSource} onClick={returnToPassage} disabled={returnPending} title={error || source.quote}>
+            <ArrowUpRight size={18} aria-hidden="true" />
+            <span>{returnPending ? 'Returning to passage…' : error || `Return to passage · ${body || source.quote}`}</span>
+          </button>
+        ) : (
+          <>
+            {(touchDocked || !available) && (sourceDocked ? (
+              <button type="button" className="reaction-pill-source" aria-label={`Return to passage: ${source.quote}`} title="Return to passage" onPointerDown={captureSource} onClick={returnToPassage} disabled={returnPending}>
+                {returnPending ? 'Returning…' : error || `“${source.quote}”${available ? '' : ' · draft unavailable; retained'}`}
+              </button>
+            ) : (
+              <span className="reaction-pill-source" title={available ? source.quote : `${source.quote} · Draft unavailable. Reaction retained.`}>“{source.quote}”{available ? '' : ' · draft unavailable; retained'}</span>
+            ))}
+            <textarea
+              ref={inputRef}
+              rows={1}
+              aria-label="Your reaction"
+              placeholder={touchDocked ? 'React to selection…' : 'Your reaction… (Enter to focus)'}
+              title={available ? source.quote : 'Draft unavailable. Your reaction is retained.'}
+              value={body}
+              onPointerDown={captureSource}
+              onChange={(event) => onChange(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+                if (event.key === 'Enter') {
+                  event.stopPropagation();
+                  event.preventDefault();
+                  if ((event.metaKey || event.ctrlKey) && available && body.trim() && !event.nativeEvent.isComposing) onAdd();
+                }
+              }}
+            />
+            <button type="button" aria-label="Add to draft" title={available ? 'Add to draft (Cmd/Ctrl+Enter)' : 'Draft unavailable. Your reaction is retained.'} disabled={!available || !body.trim()} onClick={onAdd}>
+              <ListPlus size={20} aria-hidden="true" />
+            </button>
+          </>
+        )}
+        <button type="button" aria-label="Dismiss reaction" title="Dismiss reaction" onClick={requestClose}><X size={16} aria-hidden="true" /></button>
+      </div>
       {(error || !available) && <span className="reaction-pill-sr" role="status">{error || 'Draft unavailable. Your reaction is retained.'}</span>}
     </div>
   );

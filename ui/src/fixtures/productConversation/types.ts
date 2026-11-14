@@ -88,6 +88,7 @@ interface ScenarioCommon {
   sourceSnapshot?: ProductConversationSnapshotView;
   sourceIsGlobal?: boolean;
   initialDraft?: string;
+  sendFailure?: 'before-acceptance' | 'after-acceptance' | 'unacknowledged';
   id: ProductConversationScenarioId;
   title: string;
   viewport: 'desktop' | 'mobile';

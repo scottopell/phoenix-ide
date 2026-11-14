@@ -24,7 +24,37 @@ afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 const productConversationCss = readFileSync(`${process.cwd()}/src/pages/ProductConversationPage.css`, 'utf8');
 
+function installReactionGeometry() {
+    vi.spyOn(window, 'matchMedia').mockImplementation((query) => ({
+      matches: query === '(any-pointer: coarse)', media: query, onchange: null,
+      addListener: vi.fn(), removeListener: vi.fn(), addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn(),
+    }));
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockImplementation(function (this: HTMLElement) {
+      return this.id === 'messages' ? 800 : 0;
+    });
+    const originalRect = HTMLElement.prototype.getBoundingClientRect;
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.classList.contains('virtual-transcript__row')) return new DOMRect(0, 0, 390, 120);
+      if (this.id === 'messages') return new DOMRect(0, 0, 390, 800);
+      return originalRect.call(this);
+    });
+    Object.defineProperty(Range.prototype, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({ left: 20, top: 100, bottom: 130, right: 250, width: 230, height: 30 }),
+    });
+}
+
 describe('ProductConversationFixture', () => {
+  it('serves the current conversation reminder list without masking unknown API requests', async () => {
+    const restore = installProductConversationFixtureApi(getProductConversationScenario('inline-message-reactions'));
+    try {
+      await expect(api.listReminders('reaction-work')).resolves.toEqual([]);
+      await expect(fetch('/api/unexpected-fixture-request')).rejects.toThrow('Unexpected fixture API request');
+    } finally {
+      restore();
+    }
+  });
+
   it.each(['ordinary-lazy-history', 'global-lazy-history'] as const)('keeps an explicit loaded prompt selection when the %s unloaded-boundary read resolves', async (id) => {
     vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(1000);
     vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ x: 0, y: 0, top: 0, left: 0, right: 960, bottom: 1000, width: 960, height: 1000, toJSON: () => ({}) });
@@ -150,23 +180,7 @@ describe('ProductConversationFixture', () => {
   });
 
   it('appends two touch-docked source-bound reactions to the actual latest composer without submitting and opens the older reviewer', async () => {
-    vi.spyOn(window, 'matchMedia').mockImplementation((query) => ({
-      matches: query === '(any-pointer: coarse)', media: query, onchange: null,
-      addListener: vi.fn(), removeListener: vi.fn(), addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn(),
-    }));
-    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockImplementation(function (this: HTMLElement) {
-      return this.id === 'messages' ? 800 : 0;
-    });
-    const originalRect = HTMLElement.prototype.getBoundingClientRect;
-    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
-      if (this.classList.contains('virtual-transcript__row')) return new DOMRect(0, 0, 390, 120);
-      if (this.id === 'messages') return new DOMRect(0, 0, 390, 800);
-      return originalRect.call(this);
-    });
-    Object.defineProperty(Range.prototype, 'getBoundingClientRect', {
-      configurable: true,
-      value: () => ({ left: 20, top: 100, bottom: 130, right: 250, width: 230, height: 30 }),
-    });
+    installReactionGeometry();
     const scenario = getProductConversationScenario('inline-message-reactions');
     const { container } = render(<ProductConversationFixture scenario={scenario} />);
     const draft = await screen.findByPlaceholderText('Type a message...');
@@ -194,14 +208,59 @@ describe('ProductConversationFixture', () => {
       fireEvent.change(reactionInput, { target: { value: reaction } });
       fireEvent.click(screen.getByRole('button', { name: 'Add to draft' }));
     }
-    expect((draft as HTMLTextAreaElement).value).toContain('Let’s keep the first version focused.\n\nRegarding message #2 (reaction-history:reaction-answer-older):');
-    expect((draft as HTMLTextAreaElement).value).toContain('Regarding message #2 (reaction-work:reaction-answer):');
+    expect(draft).toHaveValue('Let’s keep the first version focused.');
+    expect(screen.getByRole('button', { name: 'Edit annotation 2' })).toHaveTextContent('Strong idea; test deterministic state patterns.');
+    fireEvent.click(screen.getByRole('button', { name: 'Edit annotation 1' }));
+    expect(screen.getByRole('textbox', { name: 'Annotation 1 comment' })).toHaveValue('Preserve this guarantee.');
+    fireEvent.change(screen.getByRole('textbox', { name: 'Annotation 1 comment' }), { target: { value: 'Preserve this guarantee, including cancellation.' } });
+    expect(screen.getByRole('textbox', { name: 'Annotation 1 comment' })).toHaveValue('Preserve this guarantee, including cancellation.');
     expect(send).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Done' }));
     fireEvent.click(screen.getAllByRole('button', { name: 'Open message reviewer' })[0]!);
     const viewer = await screen.findByRole('dialog', { name: 'Message viewer: Agent message #2' });
     expect(viewer).toHaveTextContent('Preserve the user’s draft and every completed tool result.');
     expect(screen.getByRole('button', { name: 'Add note to line 1' })).toBeInTheDocument();
     send.mockRestore();
+    window.getSelection()?.removeAllRanges();
+  }, 15_000);
+
+  it.each(['before-acceptance', 'after-acceptance', 'unacknowledged'] as const)('restores an annotation only if delivery failed %s', async sendFailure => {
+    installReactionGeometry();
+    const scenario = { ...getProductConversationScenario('inline-message-reactions'), sendFailure };
+    const { container } = render(<ProductConversationFixture scenario={scenario} />);
+    const draft = await screen.findByPlaceholderText('Type a message...');
+    await waitFor(() => expect(draft).toHaveValue('Let’s keep the first version focused.'));
+    const paragraph = await waitFor(() => {
+      const element = container.querySelector('[data-inline-reaction-message="reaction-answer"] .agent-text-block p');
+      expect(element).not.toBeNull();
+      return element!;
+    });
+    fireEvent.pointerDown(paragraph, { pointerType: 'touch' });
+    const range = document.createRange();
+    range.selectNodeContents(paragraph);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    fireEvent(document, new Event('selectionchange'));
+    const reaction = await screen.findByRole('textbox', { name: 'Your reaction' });
+    fireEvent.change(reaction, { target: { value: 'Acceptance race regression' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add to draft' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    if (sendFailure !== 'before-acceptance') {
+      await waitFor(() => expect(screen.queryByRole('button', { name: 'Edit annotation 1' })).not.toBeInTheDocument());
+      expect(draft).toHaveValue('');
+      if (sendFailure === 'unacknowledged') {
+        await screen.findByRole('button', { name: 'Retry' });
+        expect(JSON.parse(localStorage.getItem('phoenix:queue:reaction-work')!)).toHaveLength(1);
+        act(() => window.dispatchEvent(new Event('product-conversation-fixture-acknowledge-last-send')));
+      }
+      await waitFor(() => expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument());
+      expect(screen.queryByRole('button', { name: 'Edit annotation 1' })).not.toBeInTheDocument();
+      expect(draft).toHaveValue('');
+    } else {
+      await screen.findByText('Fixture expansion rejected');
+      expect(screen.getByRole('button', { name: 'Edit annotation 1' })).toHaveTextContent('Acceptance race regression');
+      expect(draft).toHaveValue('Let’s keep the first version focused.');
+    }
     window.getSelection()?.removeAllRanges();
   });
 
