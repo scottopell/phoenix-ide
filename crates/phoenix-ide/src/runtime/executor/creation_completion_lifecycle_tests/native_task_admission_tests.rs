@@ -1149,8 +1149,12 @@ async fn restore_p2b_schema_fault(
                 "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'work_scope_environments'",
             ).fetch_optional(db.pool()).await?;
             if present.is_none() {
-                // Exact DDL captured from this private fixture before DROP VIEW.
-                sqlx::query(definition).execute(db.pool()).await?;
+                // Exact DDL captured from this private fixture before DROP VIEW,
+                // never tool/user SQL. sqlx 0.9 requires this explicit safety
+                // boundary for a non-static query (it copies the borrowed text).
+                sqlx::query(sqlx::AssertSqlSafe(definition))
+                    .execute(db.pool())
+                    .await?;
             }
             let restored: String = sqlx::query_scalar(
                 "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'work_scope_environments'",

@@ -13052,9 +13052,9 @@ fn reread_reviewed_task_handoff_snapshot_at_exact_path_native(
         expected_plan,
     )
     .map_err(|error| match error {
-        ReviewedTaskHandoffReadError::Semantic(_) => {
-            Refused(native_task_approval::NativeTaskApprovalRefusal::PendingChanged)
-        }
+        ReviewedTaskHandoffReadError::Semantic(_) => Refused(
+            crate::runtime::task_approval_admission::NativeTaskApprovalRefusal::PendingChanged,
+        ),
         ReviewedTaskHandoffReadError::Unavailable(message) => Unclassified(message),
     })
 }
