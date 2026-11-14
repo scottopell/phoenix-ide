@@ -20,6 +20,7 @@ async function verifyCompactGrid({ page, id, viewport }) {
       wideWidth: wideRect.width,
       documentClientWidth: document.documentElement.clientWidth,
       documentScrollWidth: document.documentElement.scrollWidth,
+      overflowElements: Array.from(document.querySelectorAll('body *')).filter((el) => { const r = el.getBoundingClientRect(); return r.right > document.documentElement.clientWidth + 1 && r.width > 0; }).slice(-25).map((el) => ({ tag: el.tagName, cls: el.className, right: el.getBoundingClientRect().right, width: el.getBoundingClientRect().width, whiteSpace: getComputedStyle(el).whiteSpace, minWidth: getComputedStyle(el).minWidth })),
     };
   });
   if (geometry.documentScrollWidth !== geometry.documentClientWidth) {
@@ -70,6 +71,7 @@ async function captureMobileExpandedSpacing({ page, id, outDir, viewport }) {
       continuationPresent: continuation !== null,
       documentClientWidth: document.documentElement.clientWidth,
       documentScrollWidth: document.documentElement.scrollWidth,
+      overflowElements: Array.from(document.querySelectorAll('body *')).filter((el) => { const r = el.getBoundingClientRect(); return r.right > document.documentElement.clientWidth + 1 && r.width > 0; }).slice(-25).map((el) => ({ tag: el.tagName, cls: el.className, right: el.getBoundingClientRect().right, width: el.getBoundingClientRect().width, whiteSpace: getComputedStyle(el).whiteSpace, minWidth: getComputedStyle(el).minWidth })),
     };
   });
   if (evidence.toolbarPresent) throw new Error('expanded detail still contains a redundant message toolbar');
