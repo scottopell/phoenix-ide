@@ -203,8 +203,13 @@ class CheckPlanTests(unittest.TestCase):
                                  "--message-format=json-render-diagnostics"]]
                     returncodes = [launcher_rc]
                     if launcher_rc == 0:
-                        commands += [codegen_cmd, compile_cmd, test_cmd]
-                        returncodes += [codegen_rc, compile_rc, test_rc]
+                        commands += [codegen_cmd, compile_cmd]
+                        returncodes += [codegen_rc, compile_rc]
+                        if compile_rc == 0:
+                            commands.append(self.dev._PRUNE_LISTING_CMD)
+                            returncodes.append(0)
+                        commands.append(test_cmd)
+                        returncodes.append(test_rc)
                     launched = []
                     target_setting = (None if label == "default target" else
                                       str(root / "absolute-target") if label == "absolute target" else
@@ -292,7 +297,10 @@ class CheckPlanTests(unittest.TestCase):
                         steps.append(("codegen", codegen_rc))
                         if codegen_rc == 0:
                             steps.append(("codegen-stale", int(stale)))
-                        steps += [("cargo test compile", compile_rc), ("cargo test", test_rc)]
+                        steps.append(("cargo test compile", compile_rc))
+                        if compile_rc == 0:
+                            steps.append(("prune stale test artifacts", 0))
+                        steps.append(("cargo test", test_rc))
                     self.assertEqual(
                         [name for name, _rc in steps],
                         [call.args[1] for call in reporter.step_start.call_args_list],
@@ -519,7 +527,7 @@ class CheckPlanTests(unittest.TestCase):
     def test_rust_graph_steps_match_lane_order(self):
         self.assertEqual(
             ["native bash launcher", "codegen export", "codegen-stale diff",
-             "cargo test (compile)", "cargo test (run)"],
+             "cargo test (compile)", "prune stale test artifacts", "cargo test (run)"],
             self.dev._GRAPH_LANE_STEPS["rust"],
         )
 
@@ -759,7 +767,7 @@ class CheckPlanTests(unittest.TestCase):
 
     def test_linux_musl_smoke_runs_once_in_rust_ci_group(self):
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
-        self.assertEqual(1, workflow.count("cargo check --target x86_64-unknown-linux-musl"))
+        self.assertEqual(1, workflow.count("cargo clippy --target x86_64-unknown-linux-musl"))
         self.assertIn("sudo apt-get install -y musl-tools", workflow)
         self.assertIn("target: x86_64-unknown-linux-musl", workflow)
         graph_steps = self.dev._GRAPH_LANE_STEPS["rust"]
@@ -778,7 +786,7 @@ class CheckPlanTests(unittest.TestCase):
 def workflow_order(group):
     return {
         "rust": ["rust", "cargo-fmt"],
-        "clippy": ["clippy"],
+        "clippy": ["clippy", "deps"],
         "e2e": ["e2e"],
         "ui": ["tsc", "ui-lint", "vitest", "ast-grep", "allium", "spec-shape", "spec-anchors", "pkglock"],
     }[group]
@@ -927,6 +935,66 @@ class CargoTestTimeoutTests(unittest.TestCase):
             with self.subTest(raw=raw), self._with_file(None):
                 with self.assertRaisesRegex(SystemExit, "positive integer"):
                     self.dev._cargo_test_timeout_secs({self.dev.CARGO_TEST_TIMEOUT_ENV: raw})
+
+
+class PruneStaleWorkspaceArtifactsTests(unittest.TestCase):
+    def setUp(self):
+        self.dev = load_devpy()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.deps = Path(self.tmp.name) / "debug" / "deps"
+        self.deps.mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def touch(self, name, *, age=100.0, size=10, executable=False):
+        path = self.deps / name
+        path.write_bytes(b"x" * size)
+        if executable:
+            path.chmod(0o755)
+        stamp = 1_000_000.0 - age
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def test_removes_superseded_executables_and_keeps_everything_else(self):
+        old_exe = self.touch("phoenix_ide-1111111111111111", size=500, executable=True)
+        old_exe_d = self.touch("phoenix_ide-1111111111111111.d")
+        old_rlib = self.touch("libphoenix_ide-2222222222222222.rlib", size=300)
+        old_rlib_d = self.touch("phoenix_ide-2222222222222222.d")
+        cur_exe = self.touch("phoenix_ide-aaaaaaaaaaaaaaaa", executable=True)
+        cur_d = self.touch("phoenix_ide-aaaaaaaaaaaaaaaa.d")
+        uplifted = self.touch("phoenix_ide-5555555555555555", executable=True)
+        os.link(uplifted, self.deps.parent / "phoenix_ide")
+        other_crate = self.touch("tokio-3333333333333333", executable=True)
+        fresh = self.touch("phoenix_ide-4444444444444444", age=-5, executable=True)
+
+        removed, freed = self.dev._prune_stale_workspace_artifacts(
+            [cur_exe], older_than=1_000_000.0,
+        )
+
+        self.assertEqual((2, 510), (removed, freed))
+        for gone in (old_exe, old_exe_d):
+            self.assertFalse(gone.exists(), gone.name)
+        for kept in (old_rlib, old_rlib_d, cur_exe, cur_d, uplifted, other_crate, fresh):
+            self.assertTrue(kept.exists(), kept.name)
+
+    def test_cargo_json_selects_only_workspace_artifacts(self):
+        root = Path(self.tmp.name)
+        lines = [
+            "   Compiling phoenix_ide v0.1.0",
+            json.dumps({"reason": "compiler-artifact",
+                        "manifest_path": str(root / "crates/a/Cargo.toml"),
+                        "filenames": [str(self.deps / "liba-aaaaaaaaaaaaaaaa.rlib")],
+                        "executable": str(self.deps / "a-bbbbbbbbbbbbbbbb")}),
+            json.dumps({"reason": "compiler-artifact",
+                        "manifest_path": "/registry/tokio/Cargo.toml",
+                        "filenames": [str(self.deps / "libtokio-cccccccccccccccc.rlib")],
+                        "executable": None}),
+        ]
+        self.assertEqual(
+            [self.deps / "liba-aaaaaaaaaaaaaaaa.rlib", self.deps / "a-bbbbbbbbbbbbbbbb"],
+            self.dev._workspace_artifacts_from_cargo_json(lines, root),
+        )
 
 
 if __name__ == "__main__":

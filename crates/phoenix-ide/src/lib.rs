@@ -1053,7 +1053,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             .allow_headers(Any)
     };
 
-    let compression = CompressionLayer::new().gzip(true).br(true);
+    let compression = CompressionLayer::new().gzip(true);
 
     // Clear-to-ready sweep: once a usage-limit window elapses, return the
     // errored conversation to Idle so it is usable again without a manual

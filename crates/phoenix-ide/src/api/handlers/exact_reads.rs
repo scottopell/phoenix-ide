@@ -43,7 +43,7 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/api/conversation-reads/messages", post(messages))
         .route("/api/conversation-reads/messages/range", post(range))
         .route(
-            "/api/conversation-reads/messages/around/:sequence",
+            "/api/conversation-reads/messages/around/{sequence}",
             post(around),
         )
         .route(

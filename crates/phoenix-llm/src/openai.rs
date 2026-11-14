@@ -4508,7 +4508,7 @@ mod tests {
                             "code": "websocket_connection_limit_reached",
                             "message": "connection lifetime exhausted"
                         }
-                    }).to_string())).await.unwrap();
+                    }).to_string().into())).await.unwrap();
                     continue;
                 }
                 if marker.contains("shared-deadline-fallback") && connection > 0 {
@@ -4518,7 +4518,7 @@ mod tests {
                                 "type": "response.reasoning_summary_text.delta",
                                 "delta": "ws-reasoning"
                             })
-                            .to_string(),
+                            .to_string().into(),
                         ))
                         .await
                         .unwrap();
@@ -4528,7 +4528,7 @@ mod tests {
                     socket
                         .send(AxumWsMessage::Text(
                             serde_json::json!({"type":"response.output_text.delta","delta":"speculative"})
-                                .to_string(),
+                                .to_string().into(),
                         ))
                         .await
                         .unwrap();
@@ -4542,7 +4542,7 @@ mod tests {
                 if marker.contains("rate-error") {
                     socket.send(AxumWsMessage::Text(serde_json::json!({
                         "type":"error", "code":"rate_limit_exceeded", "message":"slow down"
-                    }).to_string())).await.unwrap();
+                    }).to_string().into())).await.unwrap();
                     continue;
                 }
                 if marker.contains("rate-snapshot") {
@@ -4551,20 +4551,20 @@ mod tests {
                         "rate_limits":{"plan_type":"plus","resets_at":null,"limit_id":"codex","limit_name":null,
                         "primary":{"used_percent":42.0,"window_minutes":60,"resets_at":1_700_000_000},
                         "secondary":null,"credits":null,"promo_message":null}
-                    }).to_string())).await.unwrap();
+                    }).to_string().into())).await.unwrap();
                 }
                 if marker.contains("many-deltas") {
                     for i in 0..1_300 {
                         socket.send(AxumWsMessage::Text(serde_json::json!({
                             "type":"response.output_text.delta", "delta":format!("{i},")
-                        }).to_string())).await.unwrap();
+                        }).to_string().into())).await.unwrap();
                     }
                 }
                 if marker.contains("terminal") {
                     socket
                         .send(AxumWsMessage::Text(
                             serde_json::json!({"type":"error","code":"context_length_exceeded","message":"too long"})
-                                .to_string(),
+                                .to_string().into(),
                         ))
                         .await
                         .unwrap();
@@ -4581,7 +4581,7 @@ mod tests {
                     }
                     socket.send(AxumWsMessage::Text(serde_json::json!({
                         "type":"response.completed", "response":response
-                    }).to_string())).await.unwrap();
+                    }).to_string().into())).await.unwrap();
                     continue;
                 }
                 if marker.contains("unsupported-output") {
@@ -4595,18 +4595,18 @@ mod tests {
                                 {"type":"message","role":"assistant","content":[{"type":"output_text","text":answer}]}
                             ]
                         }
-                    }).to_string())).await.unwrap();
+                    }).to_string().into())).await.unwrap();
                     continue;
                 }
                 if marker.contains("item-done-only") {
                     socket.send(AxumWsMessage::Text(serde_json::json!({
                         "type":"response.output_item.done",
                         "item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":answer}]}
-                    }).to_string())).await.unwrap();
+                    }).to_string().into())).await.unwrap();
                     socket.send(AxumWsMessage::Text(serde_json::json!({
                         "type":"response.completed",
                         "response":{"id":format!("resp-{n}"),"usage":{"input_tokens":10,"output_tokens":1}}
-                    }).to_string())).await.unwrap();
+                    }).to_string().into())).await.unwrap();
                     continue;
                 }
                 socket
@@ -4619,7 +4619,7 @@ mod tests {
                                 "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":answer}]}]
                             }
                         })
-                        .to_string(),
+                        .to_string().into(),
                     ))
                     .await
                     .unwrap();

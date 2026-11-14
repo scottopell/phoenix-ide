@@ -272,9 +272,9 @@ jobs:
       - name: Install musl compiler
         timeout-minutes: 5
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: Check production feature on musl
+      - name: Clippy production feature on musl
         timeout-minutes: 20
-        run: cargo check --target x86_64-unknown-linux-musl --features phoenix_ide/datadog-tracing
+        run: cargo clippy --target x86_64-unknown-linux-musl --features phoenix_ide/datadog-tracing -- -D warnings
 
   check-rust:
     name: check (rust)
@@ -329,8 +329,12 @@ jobs:
         run: |
           git config --global user.email "ci@phoenix-ide.invalid"
           git config --global user.name "Phoenix CI"
-      - name: ./dev.py check (clippy)
-        run: ./dev.py check --lanes clippy
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.18.9
+      - name: ./dev.py check (clippy, deps)
+        run: ./dev.py check --lanes clippy,deps
 
   check-e2e:
     name: check (e2e)
