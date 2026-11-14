@@ -13,6 +13,11 @@
 --   - one stop-on-first-failure retirement run, observation-only startup,
 --     and explicit fresh safe retry under original Close authority;
 --   - PR-state guidance that may encourage Close but never blocks it.
+--   - one source-bound, idempotent `close_conversation` request and a single
+--     exact-proof completion-only successor exception to explicit safe retry.
+-- Unified operation identity, retained replay, durable retry budget/suppression,
+-- and the completion-only admission evidence are specified normatively by
+-- REQ-WL-002f and ADR-245; startup remains observation-only.
 --
 -- Excludes:
 --   - root lifecycle legality, close-obligation orchestration, and ProductConversation
@@ -169,6 +174,12 @@ external entity RestartRepairEvidenceAdoption {
 ------------------------------------------------------------
 -- Rules
 ------------------------------------------------------------
+
+-- REQ-WL-002f narrowly qualifies one fresh completion-only successor when
+-- exact retained proof shows all originally planned effects durably succeeded
+-- and no resource/destructive effects remain. It does not resume the stopped
+-- run, replenish the per-operation budget, or authorize startup dispatch.
+-- All other resource/destructive retries remain explicit and freshly proven.
 
 rule ChatOnlyCloseSkipsWorktreeInspection {
     when: RetirementInspectionRequested(product_conversation, attempt_id, run_ordinal)
@@ -413,7 +424,9 @@ rule DistinctOpenAggregateOrIdentityConflictPreventsDestructiveRetirement {
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
     requires: blocked_by_distinct_open_product_or_identity_conflict(product_conversation)
-    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal)
+    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal,
+        authority_kind: resource_failure,
+        resource_failures: exact_retirement_failure_evidence(product_conversation, attempt_id, run_ordinal))
 
     @guidance
         -- Continuation rows and subordinate execution conversations inside the same
@@ -429,7 +442,9 @@ rule AmbiguousPrivateDirectoryIdentityPreservesSafeLeftover {
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
     requires: phoenix_private_retirement_directory_identity_is_ambiguous(product_conversation, attempt_id, run_ordinal)
     ensures: safe_retirement_leftover_is_preserved(product_conversation, attempt_id, run_ordinal)
-    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal)
+    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal,
+        authority_kind: resource_failure,
+        resource_failures: exact_retirement_failure_evidence(product_conversation, attempt_id, run_ordinal))
 
     @guidance
         -- Normal Close authority comes from the sealed WorkScope gate plus a random,
@@ -559,7 +574,9 @@ rule ResourceRetirementFailureProducesResidualRepairState {
             detail: residual_repair_detail_for_attempt(product_conversation, scope_binding.scope)
         }
     )
-    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal)
+    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal,
+        authority_kind: resource_failure,
+        resource_failures: exact_retirement_failure_evidence(product_conversation, attempt_id, run_ordinal))
 
     @guidance
         -- Failure is typed and residual: report the exact remaining resource and
@@ -575,7 +592,9 @@ rule ExplicitRunLeavesUnprovenProcessEpochResourcesUntouched {
         retirement_requested
     }
     requires: process_epoch_resource_has_no_live_retirement_permit(product_conversation, attempt_id, run_ordinal)
-    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal)
+    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal,
+        authority_kind: source_authority_lost,
+        resource_failures: exact_retirement_failure_evidence(product_conversation, attempt_id, run_ordinal))
 
     @guidance
         -- Bash, PTY, browser, and equivalent ordinary execution resources are owned
@@ -587,7 +606,9 @@ rule ExplicitRunRequiresExactTmuxIdentity {
     when: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
     requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: pending_tmux_identity_is_ambiguous(product_conversation, attempt_id, run_ordinal)
-    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal)
+    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal,
+        authority_kind: resource_failure,
+        resource_failures: exact_retirement_failure_evidence(product_conversation, attempt_id, run_ordinal))
 
     @guidance
         -- Tmux is the intentionally persistent runtime resource. Its sealed socket
@@ -654,7 +675,9 @@ rule RestartRepairConflictRoutesTypedRepair {
         or not same_repository_and_worktree_identity(repair_evidence, product_conversation, attempt_id, run_ordinal, scope_binding.scope)
         or replacement_worktree_appeared_since_restart_observation(repair_evidence, scope_binding.scope)
         or not exact_active_retirement_attempt(product_conversation, attempt_id, run_ordinal, scope_binding.scope)
-    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal)
+    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal,
+        authority_kind: resource_failure,
+        resource_failures: exact_retirement_failure_evidence(product_conversation, attempt_id, run_ordinal))
 
     @guidance
         -- A later Close attempt may bind fresh retained restart evidence for the
@@ -676,7 +699,9 @@ rule AlreadyAbsentWorktreeNeedsIdentityEvidence {
     requires: worktree_already_absent(product_conversation, scope_binding.scope)
     requires: not exists RetirementAbsenceEvidence{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: scope_binding.scope}, product_conversation: product_conversation, scope: scope_binding.scope, resource_kind: worktree, resource_identity: absent_worktree_identity(product_conversation, scope_binding.scope)}
     requires: not exists RestartRepairEvidenceAdoption{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: scope_binding.scope}}
-    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal)
+    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal,
+        authority_kind: resource_failure,
+        resource_failures: exact_retirement_failure_evidence(product_conversation, attempt_id, run_ordinal))
 
     @guidance
         -- An already-absent worktree is accepted only when retained identity and
@@ -709,15 +734,27 @@ rule AlreadyAbsentWorktreeWithExactAttemptEvidenceIsAccepted {
 }
 
 
+-- exact_retirement_failure_evidence returns Set<bedrock/CloseResourceFailureEvidence>
+-- from the owning step's structured failure decision, not from residual strings:
+-- failed scope/resource retirement, identity/ownership validation, missing exact
+-- absence/reconstructibility evidence, or missing live process-epoch permission.
+-- Each row names the sealed expected resource identity and exact scope plus the
+-- failed precondition/outcome; ambiguity never guesses the live object's identity.
+-- Every resource_failure producer in this spec supplies its nonempty exact affected set.
+-- A missing process permit is source_authority_lost and still retains the exact
+-- affected resource rows. Pure observation/interruption with no failed resource
+-- decision is handled by bedrock with an intentional empty set, not by this bridge.
+-- Step outcome, normalized children, stopped primary and mandatory outbox are one
+-- owning failure transaction; these events cannot defer child insertion to a worker.
 -- REQ-WL-002b / REQ-WL-004: every retirement failure enters the same
 -- run-stopping and mandatory-Global-delivery boundary owned by bedrock.
 rule RetirementFailureStopsBeforeAnyFurtherStep {
-    when: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal)
+    when: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal, authority_kind, resource_failures)
     let run = bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}
     requires: run.status = running
     ensures: CloseRunFailed(product_conversation, attempt_id, run_ordinal,
-        failed_step: failed_retirement_step(run), reason: failed_retirement_reason(run),
-        shutdown: observed_retirement_shutdown(run), residual_evidence: exact_retirement_residuals(run))
+        failed_step: failed_retirement_step(run), reason: failed_retirement_reason(run), authority_kind: authority_kind,
+        shutdown: observed_retirement_shutdown(run), residual_evidence: exact_retirement_residuals(run), resource_failures: resource_failures)
 
     @guidance
         -- Stop/failure persistence is the step's commit boundary, not a delayed
@@ -730,7 +767,9 @@ rule UnprovenReconstructibilityPreservesWorktree {
     requires: pending_step_deletes_worktree(product_conversation, attempt_id, run_ordinal)
     requires: not fresh_reconstructible_or_explicit_discard_authority(product_conversation, attempt_id, run_ordinal)
     ensures: WorktreePreserved(product_conversation, attempt_id, run_ordinal)
-    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal)
+    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal,
+        authority_kind: resource_failure,
+        resource_failures: exact_retirement_failure_evidence(product_conversation, attempt_id, run_ordinal))
     ensures: ConcreteCloseRepairProposalRequired(product_conversation, attempt_id)
 }
 
@@ -756,6 +795,13 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 --       Selects at most one exact remaining step across the original-authority
 --       target set, in deterministic order, only while the matching run is running.
 --       The next step cannot dispatch until the prior step's outcome commits.
+--       WorkScope retirement is an independent final step for each exact original
+--       scope, after its pending resource effects and fresh no-live-owner/resource
+--       proof under the sealed gate. Worktree retirement never implies scope success.
+--       Native retry uses bedrock's immutable retire_work_scope planned row and
+--       exact outcome, not this generic selector as an alternative dispatch path.
+--       A scope-only native plan must not repeat tmux/worktree successes; missing
+--       process-epoch permits remain fail-closed and never reconstructed by retry.
 --
 --   retirement_step_failed(product_conversation, attempt_id, run_ordinal) -> Boolean
 --       True only for the exact selected step's failed outcome in this running run.
