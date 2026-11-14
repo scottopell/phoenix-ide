@@ -20,18 +20,20 @@ export function useAnnotationHighlights(active: ReactionSource | undefined, draf
     registry.set(NAME, highlight);
     let frame = 0;
     const paint = () => {
+      frame = 0;
       highlight.clear();
       for (const source of [...annotations.map(annotation => annotation.source), ...(active ? [active] : [])]) {
         const range = restoreReactionRange(source);
         if (range) highlight.add(range);
       }
     };
+    // Coalesce rather than debounce: a change during a pending frame is covered by
+    // that frame, and paint() clears `frame` first, so later changes schedule anew.
     const observer = new MutationObserver(() => {
-      cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(paint);
+      if (!frame) frame = requestAnimationFrame(paint);
     });
-    const transcript = document.getElementById('messages');
-    if (transcript) observer.observe(transcript, { childList: true, subtree: true, characterData: true });
+    // document.body, not #messages: a remounted transcript must not escape observation.
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
     paint();
     return () => {
       cancelAnimationFrame(frame);
