@@ -1596,12 +1596,14 @@ async fn assert_production_initial_approval_inner(
             let mut events = events;
             loop {
                 match events.try_recv() {
-                    Ok(SseEvent::StateChange {
-                        state: ConvState::LlmRequesting { .. },
-                        ..
-                    })
-                    | Ok(SseEvent::ConversationUpdate { .. })
-                    | Ok(SseEvent::Message { .. }) => panic!(
+                    Ok(
+                        SseEvent::StateChange {
+                            state: ConvState::LlmRequesting { .. },
+                            ..
+                        }
+                        | SseEvent::ConversationUpdate { .. }
+                        | SseEvent::Message { .. },
+                    ) => panic!(
                         "mismatched HEAD must not publish approval state, metadata or context"
                     ),
                     Ok(_) => {}
