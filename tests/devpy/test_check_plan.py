@@ -759,7 +759,7 @@ class CheckPlanTests(unittest.TestCase):
 
     def test_linux_musl_smoke_runs_once_in_rust_ci_group(self):
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
-        self.assertEqual(1, workflow.count("cargo check --target x86_64-unknown-linux-musl"))
+        self.assertEqual(1, workflow.count("cargo clippy --target x86_64-unknown-linux-musl"))
         self.assertIn("sudo apt-get install -y musl-tools", workflow)
         self.assertIn("target: x86_64-unknown-linux-musl", workflow)
         graph_steps = self.dev._GRAPH_LANE_STEPS["rust"]

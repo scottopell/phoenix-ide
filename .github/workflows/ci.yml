@@ -272,9 +272,9 @@ jobs:
       - name: Install musl compiler
         timeout-minutes: 5
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: Check production feature on musl
+      - name: Clippy production feature on musl
         timeout-minutes: 20
-        run: cargo check --target x86_64-unknown-linux-musl --features phoenix_ide/datadog-tracing
+        run: cargo clippy --target x86_64-unknown-linux-musl --features phoenix_ide/datadog-tracing -- -D warnings
 
   check-rust:
     name: check (rust)
