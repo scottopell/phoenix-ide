@@ -1576,9 +1576,9 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
       data-testid="product-conversation-page"
       ref={coordinator || inheritedJourney ? undefined : journey.attach}
     >
-      {error && (
-        <section role="alert" aria-label="Live view refresh failed">
-          <span>{error}</span>{' '}
+      {(error || observedContinuationId) && (
+        <section role={error ? 'alert' : 'status'} aria-label={error ? 'Live view refresh failed' : 'Continuation readback pending'}>
+          <span>{error ?? 'Continuation readback pending.'}</span>{' '}
           <button type="button" onClick={() => setSnapshotRetry(retry => retry + 1)}>Retry live view</button>
         </section>
       )}

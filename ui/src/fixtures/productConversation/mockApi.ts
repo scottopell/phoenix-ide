@@ -81,8 +81,17 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   window.addEventListener('product-conversation-fixture-hold-older', holdOlderPage);
   window.addEventListener('product-conversation-fixture-release-older', releaseOlderPage);
 
+  let failNextSnapshot = false;
+  const failSnapshot = () => { failNextSnapshot = true; };
+  const checkSnapshotFailure = () => {
+    if (!failNextSnapshot) return;
+    failNextSnapshot = false;
+    throw new Error('Fixture continuation snapshot unavailable');
+  };
+  window.addEventListener('product-conversation-fixture-fail-next-snapshot', failSnapshot);
   api.getProductConversationHistorySnapshot = async (_productConversationId, options = {}) => {
     const requestOptions = options ?? {};
+    if (!requestOptions.before && !requestOptions.after) checkSnapshotFailure();
     if (scenario.kind === 'coordinator') throw new Error('Global must not request ordinary history');
     if (scenario.sourceSnapshot && _productConversationId !== 'fixture-product-conversation') {
       if (scenario.sourceIsGlobal) throw new Error("Global must not request ordinary snapshot");
@@ -144,6 +153,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   };
 
   api.getCoordinatorHistory = async (reference, options = {}) => {
+    if (!options.before && !options.after) checkSnapshotFailure();
     if (scenario.kind !== 'coordinator') {
       if (scenario.sourceIsGlobal && scenario.sourceSnapshot) return coordinatorSnapshot(scenario.sourceSnapshot);
       throw new Error(`Unexpected Global history reference: ${reference}`);
@@ -527,6 +537,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
 
   return () => {
     window.removeEventListener('product-conversation-fixture-hold-older', holdOlderPage);
+    window.removeEventListener('product-conversation-fixture-fail-next-snapshot', failSnapshot);
     window.removeEventListener('product-conversation-fixture-release-older', releaseOlderPage);
     releaseOlderPage();
     window.removeEventListener('product-conversation-fixture-stream-failure', failLatestEventSource);

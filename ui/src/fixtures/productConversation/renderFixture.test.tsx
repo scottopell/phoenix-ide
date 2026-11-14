@@ -83,6 +83,31 @@ describe('ProductConversationFixture', () => {
     expect(document.documentElement.dataset['sourceFixtureLocation']).toBe(route);
   });
 
+  it.each(['ordinary', 'coordinator'] as const)('retains the %s composer after failed continuation readback and retries without reload', async kind => {
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(1000);
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ x: 0, y: 0, top: 0, left: 0, right: 390, bottom: 844, width: 390, height: 844, toJSON: () => ({}) });
+    render(<ProductConversationFixture scenario={makeMobileContinuationScenario(kind)} />);
+    const composer = await screen.findByPlaceholderText('Type a message...');
+    await waitFor(() => expect(composer).toBeEnabled());
+    fireEvent.change(composer, { target: { value: 'Retained after readback failure' } });
+    composer.focus();
+    act(() => {
+      window.dispatchEvent(new Event('product-conversation-fixture-fail-next-snapshot'));
+      window.dispatchEvent(new Event('product-conversation-fixture-continue'));
+    });
+    expect(await screen.findByRole('alert', { name: 'Live view refresh failed' })).toHaveTextContent('Fixture continuation snapshot unavailable');
+    expect(screen.getByPlaceholderText('Type a message...')).toBe(composer);
+    expect(composer).toHaveValue('Retained after readback failure');
+    expect(composer).toHaveFocus();
+    fireEvent.click(screen.getByRole('button', { name: 'Retry live view' }));
+    await waitFor(() => {
+      const url = document.documentElement.dataset['productConversationFixtureEventSourceLastUrl'];
+      expect(new URL(url!, window.location.href).searchParams.get('reference')).toBe('fixture-successor');
+    });
+    expect(screen.getByPlaceholderText('Type a message...')).toHaveValue('Retained after readback failure');
+    expect(screen.queryByRole('alert', { name: 'Live view refresh failed' })).toBeNull();
+  });
+
   it.each(['ordinary-lazy-history', 'global-lazy-history'] as const)('keeps an explicit loaded prompt selection when the %s unloaded-boundary read resolves', async (id) => {
     vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(1000);
     vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ x: 0, y: 0, top: 0, left: 0, right: 960, bottom: 1000, width: 960, height: 1000, toJSON: () => ({}) });
