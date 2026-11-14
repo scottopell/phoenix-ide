@@ -74,10 +74,20 @@ try {
             window.annotationReviewOldNodes = ranges.flatMap(range => [range.startContainer, range.endContainer]);
             document.querySelectorAll('#messages .agent-text-block p').forEach(p => p.replaceChildren(...[...p.childNodes].map(node => node.cloneNode(true))));
           });
-          await page.waitForFunction(quotes => {
-            const ranges = [...(CSS.highlights.get('phoenix-pending-annotations') ?? [])];
-            return JSON.stringify(ranges.map(range => range.toString())) === JSON.stringify(quotes) && ranges.every(range => range.startContainer.isConnected && range.endContainer.isConnected && !window.annotationReviewOldNodes.includes(range.startContainer) && !window.annotationReviewOldNodes.includes(range.endContainer));
-          }, expected);
+          try {
+            await page.waitForFunction(quotes => {
+              const ranges = [...(CSS.highlights.get('phoenix-pending-annotations') ?? [])];
+              return JSON.stringify(ranges.map(range => range.toString())) === JSON.stringify(quotes) && ranges.every(range => range.startContainer.isConnected && range.endContainer.isConnected && !window.annotationReviewOldNodes.includes(range.startContainer) && !window.annotationReviewOldNodes.includes(range.endContainer));
+            }, expected);
+          } catch (error) {
+            sample.domReplacementFailure = await page.evaluate(() => ({
+              ranges: [...(CSS.highlights.get('phoenix-pending-annotations') ?? [])].map(range => ({ text: range.toString(), start: range.startContainer.nodeName, end: range.endContainer.nodeName, connected: range.startContainer.isConnected, startOld: window.annotationReviewOldNodes.includes(range.startContainer), endOld: window.annotationReviewOldNodes.includes(range.endContainer) })),
+              paragraphs: [...document.querySelectorAll('#messages .agent-text-block p')].map(p => p.textContent),
+              messages: document.querySelectorAll('#messages').length,
+            }));
+            await page.screenshot({ path: path.join(out, `dom-replacement-failure-${width}-${theme}.png`) });
+            throw error;
+          }
           // When original source text disappears, remove its highlight but retain the full draft.
           await page.evaluate(() => document.querySelectorAll('#messages .agent-text-block p').forEach(p => { p.textContent = 'Changed source text; original passage no longer exists.'; }));
           await page.waitForFunction(() => CSS.highlights.get('phoenix-pending-annotations')?.size === 0);
