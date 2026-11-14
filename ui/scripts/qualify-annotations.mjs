@@ -33,6 +33,10 @@ try {
         }));
         assert.ok(sample.geometry.scrollWidth <= width, JSON.stringify(sample.geometry));
         assert.ok(sample.geometry.composer.height > 0);
+        if (['05-one-annotation', '06-several-annotations', '07-long-comment', '08-sending', '09-failed-send', '11-two-annotations', '12-editing', '13-after-delete', '14-many-annotations'].includes(state)) {
+          assert.equal(sample.geometry.highlights, sample.geometry.cards, `source linkage: ${state}`);
+          assert.ok(sample.geometry.quotes.every(quote => quote.length > 0));
+        }
         if (state === '10-sent') assert.equal(sample.geometry.cards, 0);
         sample.screenshot = `${state}-${width}-${theme}.png`;
         await page.screenshot({ path: path.join(out, sample.screenshot) });
@@ -43,7 +47,7 @@ try {
           await comment.fill('<script>not executed</script> & "quoted" synthetic comment');
           await page.keyboard.press('Escape');
           await comment.waitFor({ state: 'hidden' });
-          await assert.equal(await trigger.evaluate(el => el === document.activeElement), true);
+          assert.equal(await trigger.evaluate(el => el === document.activeElement), true);
           await trigger.click();
           assert.equal(await comment.inputValue(), '<script>not executed</script> & "quoted" synthetic comment');
           await page.screenshot({ path: path.join(out, `edited-${width}-${theme}.png`) });
@@ -53,6 +57,18 @@ try {
           assert.equal(await page.getByRole('button', { name: 'Edit annotation 3', exact: true }).count(), 1);
           assert.equal(await page.getByRole('button', { name: 'Edit annotation 3', exact: true }).evaluate(el => el === document.activeElement), true);
           sample.editDeleteFocus = 'passed';
+        }
+        if (state === '05-one-annotation') {
+          const expected = sample.geometry.quotes;
+          // Replace actual source text nodes without changing their value: ranges must be rebuilt.
+          await page.evaluate(() => document.querySelectorAll('#messages .agent-text-block p').forEach(p => p.replaceChildren(...[...p.childNodes].map(node => node.cloneNode(true)))));
+          await page.waitForFunction(quotes => JSON.stringify([...(CSS.highlights.get('phoenix-pending-annotations') ?? [])].map(range => range.toString())) === JSON.stringify(quotes), expected);
+          // A stale anchor must not relocate to a different passage or discard its draft.
+          await page.evaluate(() => document.querySelectorAll('#messages .agent-text-block p').forEach(p => { p.textContent = 'Changed source text; original passage no longer exists.'; }));
+          await page.waitForFunction(() => CSS.highlights.get('phoenix-pending-annotations')?.size === 0);
+          assert.equal(await page.locator('.draft-annotation').count(), 1);
+          sample.rerenderAndStaleAnchor = 'passed';
+          await page.screenshot({ path: path.join(out, `stale-retained-${width}-${theme}.png`) });
         }
         assert.deepEqual(sample.errors, []);
         page.off('pageerror', onError);
