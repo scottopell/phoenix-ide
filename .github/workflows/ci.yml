@@ -860,6 +860,7 @@ jobs:
           node scripts/capture-subagent-task-details.mjs
           node scripts/capture-composer-rejection.mjs
           node scripts/capture-review-reading-position.mjs
+          node scripts/qualify-annotations.mjs
 
       - uses: actions/upload-artifact@v6
         if: always()
