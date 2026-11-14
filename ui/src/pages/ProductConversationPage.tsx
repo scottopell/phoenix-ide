@@ -1576,6 +1576,12 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
       data-testid="product-conversation-page"
       ref={coordinator || inheritedJourney ? undefined : journey.attach}
     >
+      {error && (
+        <section role="alert" aria-label="Live view refresh failed">
+          <span>{error}</span>{' '}
+          <button type="button" onClick={() => setSnapshotRetry(retry => retry + 1)}>Retry live view</button>
+        </section>
+      )}
       {ordinarySnapshot && <ProductConversationHeader
         snapshot={ordinarySnapshot}
         productConversationId={snapshot.product_conversation_id}

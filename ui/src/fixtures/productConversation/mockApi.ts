@@ -361,6 +361,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
 
   const OriginalEventSource = globalThis.EventSource;
   const eventSources = new Set<FixtureEventSource>();
+  const eventSequenceByMember = new Map<string, number>();
   class FixtureEventSource {
     static readonly CONNECTING = 0;
     static readonly OPEN = 1;
@@ -377,6 +378,11 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     private readonly conversationId: string;
     get id(): number { return this.instanceId; }
     get memberId(): string { return this.conversationId; }
+    nextSequenceId(): number {
+      const next = (eventSequenceByMember.get(this.conversationId) ?? 1) + 1;
+      eventSequenceByMember.set(this.conversationId, next);
+      return next;
+    }
 
     constructor(url: string) {
       this.isSource = Boolean(sourceId && url.includes(sourceId));
@@ -392,7 +398,9 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     }
 
     emitMessage(message: Message): void {
-      const event = new MessageEvent<string>('message', { data: JSON.stringify({ opening: null, sequence_id: 2, message: { ...message, origin: { kind: 'user_api' } } }) });
+      const sequenceId = Math.max(this.nextSequenceId(), message.sequence_id);
+      eventSequenceByMember.set(this.conversationId, sequenceId);
+      const event = new MessageEvent<string>('message', { data: JSON.stringify({ opening: null, sequence_id: sequenceId, message: { ...message, sequence_id: sequenceId, origin: { kind: 'user_api' } } }) });
       for (const listener of this.listeners.get('message') ?? []) listener(event);
     }
 
@@ -415,20 +423,23 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
           eventSourceInitCount += 1;
           record('EventSourceInits', eventSourceInitCount);
           record('EventSourceLastInitializedInstance', this.instanceId);
+          const messages = this.isSource ? sourceMessages : this.conversationId === currentConversation.id ? currentMessages : (currentSnapshot?.segments.find(segment => segment.transcript_row_id === this.conversationId)?.messages ?? []);
+          const anchor = Math.max(1, eventSequenceByMember.get(this.conversationId) ?? 0, ...messages.map(message => message.sequence_id));
+          eventSequenceByMember.set(this.conversationId, anchor);
           const init = { opening: null,
-            sequence_id: 1,
+            sequence_id: anchor,
             conversation: this.isSource ? sourceConversation : this.conversationId === predecessorConversation?.id ? predecessorConversation : currentConversation,
             transcript_generation: 1,
             transcript_coverage: 'complete',
-            messages: this.isSource ? sourceMessages : this.conversationId === currentConversation.id ? currentMessages : (currentSnapshot?.segments.find(segment => segment.transcript_row_id === this.conversationId)?.messages ?? []),
+            messages,
             steering_messages: scenario.steeringMessages ?? [],
             agent_working: false,
-            last_sequence_id: 1,
+            last_sequence_id: anchor,
             stream_incarnation: `fixture-stream-${this.instanceId}`,
             presentation_mode: 'idle',
             context_window_size: 128_000,
             project_name: null,
-            pending_anchor_sequence_id: 1,
+            pending_anchor_sequence_id: anchor,
             pending_events: [],
             pending_truncated: false,
           };
@@ -488,7 +499,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     record('ContinuationOldSubscription', latestEventSource?.id ?? 0);
     const predecessorSource = [...eventSources].find(source => source.memberId === predecessorId && source.subscriptionCount > 0);
     if (!predecessorSource) throw new Error('Predecessor SSE is not subscribed');
-    predecessorSource.emit('conversation_update', { sequence_id: 2, conversation: { id: predecessorId, continued_in_conv_id: successorId } });
+    predecessorSource.emit('conversation_update', { sequence_id: predecessorSource.nextSequenceId(), conversation: { id: predecessorId, continued_in_conv_id: successorId } });
     record('ContinuationUpdateInstance', predecessorSource.id);
   };
   window.addEventListener('product-conversation-fixture-continue', publishContinuation);
@@ -498,7 +509,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     if (!successor) throw new Error('Successor SSE has not opened');
     const message: Message = {
       message_id: 'fixture-successor-message', conversation_id: currentConversation.id,
-      sequence_id: 2, message_type: 'agent', origin: { kind: 'unknown_historical' },
+      sequence_id: successor.nextSequenceId(), message_type: 'agent', origin: { kind: 'unknown_historical' },
       content: [{ type: 'text', text: 'Successor is streaming after the handoff.' }],
       display_data: null, usage_data: null, event_presentation: null, created_at: '2026-07-01T12:01:00Z',
     };

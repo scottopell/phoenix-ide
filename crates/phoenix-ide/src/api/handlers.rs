@@ -1949,21 +1949,34 @@ pub(crate) async fn validate_continuation_attachments(
     conversation_id: &str,
     files: &[crate::api::types::FileAttachment],
 ) -> Result<Vec<phoenix_core::domain::db_schema::FileAttachment>, AppError> {
+    validate_continuation_attachments_at_root(db, &attachment_root(), conversation_id, files).await
+}
+
+async fn validate_continuation_attachments_at_root(
+    db: &crate::db::Database,
+    root: &std::path::Path,
+    conversation_id: &str,
+    files: &[crate::api::types::FileAttachment],
+) -> Result<Vec<phoenix_core::domain::db_schema::FileAttachment>, AppError> {
     if files.is_empty() {
         return Ok(Vec::new());
     }
     let root_id = db
         .chain_root_of(conversation_id)
-        .await?
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
         .ok_or_else(|| AppError::BadRequest("Conversation does not exist".to_string()))?;
-    let members = db.chain_members_forward(&root_id).await?;
+    let members = db
+        .chain_members_forward(&root_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
     let current = members
         .iter()
         .position(|member| member == conversation_id)
         .ok_or_else(|| {
             AppError::BadRequest("Conversation is not in its continuation chain".to_string())
         })?;
-    validate_submitted_attachments_at_roots(&attachment_root(), &members[..=current], files).await
+    validate_submitted_attachments_at_roots(root, &members[..=current], files).await
 }
 
 async fn validate_submitted_attachments_at_root(
@@ -10211,14 +10224,7 @@ mod conversation_cwd_validation_tests {
             validate_submitted_attachments_at_roots(&root, &members, std::slice::from_ref(&file))
                 .await
                 .unwrap();
-        assert_eq!(
-            accepted[0].stored_path,
-            tokio::fs::canonicalize(&old_path)
-                .await
-                .unwrap()
-                .display()
-                .to_string()
-        );
+        assert_eq!(accepted[0].stored_path, old_path.display().to_string());
         let foreign = FileAttachment {
             stored_path: foreign_path.display().to_string(),
             ..file
@@ -10242,6 +10248,86 @@ mod conversation_cwd_validation_tests {
                 Err(AppError::BadRequest(message)) if message.contains("does not belong")
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn continuation_attachment_authorization_uses_persisted_chain_prefix() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        for id in ["root", "unrelated"] {
+            db.create_conversation(id, id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+        }
+        db.update_conversation_state(
+            "root",
+            &crate::state_machine::ConvState::ContextExhausted {
+                summary: "continue".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let middle_id = match db.continue_conversation("root").await.unwrap() {
+            crate::db::ContinueOutcome::Created(conversation) => conversation.id,
+            other => panic!("expected persisted root continuation, got {other:?}"),
+        };
+        db.update_conversation_state(
+            &middle_id,
+            &crate::state_machine::ConvState::ContextExhausted {
+                summary: "continue".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let latest_id = match db.continue_conversation(&middle_id).await.unwrap() {
+            crate::db::ContinueOutcome::Created(conversation) => conversation.id,
+            other => panic!("expected persisted middle continuation, got {other:?}"),
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        async fn make_attachment(root: &std::path::Path, id: &str) -> FileAttachment {
+            let directory = root.join(id);
+            tokio::fs::create_dir_all(&directory).await.unwrap();
+            let path = directory.join("file.txt");
+            tokio::fs::write(&path, b"hello").await.unwrap();
+            FileAttachment {
+                original_name: "file.txt".to_string(),
+                stored_path: path.display().to_string(),
+                media_type: "text/plain".to_string(),
+                size_bytes: 5,
+            }
+        }
+        let root_file = make_attachment(root.path(), "root").await;
+        let latest_file = make_attachment(root.path(), &latest_id).await;
+        let unrelated_file = make_attachment(root.path(), "unrelated").await;
+
+        validate_continuation_attachments_at_root(
+            &db,
+            root.path(),
+            &latest_id,
+            std::slice::from_ref(&root_file),
+        )
+        .await
+        .expect("latest continuation accepts root attachment");
+        assert!(matches!(
+            validate_continuation_attachments_at_root(
+                &db,
+                root.path(),
+                &middle_id,
+                std::slice::from_ref(&latest_file),
+            )
+            .await,
+            Err(AppError::BadRequest(message)) if message.contains("does not belong")
+        ));
+        assert!(matches!(
+            validate_continuation_attachments_at_root(
+                &db,
+                root.path(),
+                &latest_id,
+                &[unrelated_file],
+            )
+            .await,
+            Err(AppError::BadRequest(message)) if message.contains("does not belong")
+        ));
     }
 
     #[tokio::test]
