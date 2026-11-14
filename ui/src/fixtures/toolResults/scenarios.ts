@@ -543,20 +543,27 @@ const mobileSpacingMessages: Message[] = [
     id: 'mobile-send-message',
     name: 'send_conversation_message',
     input: {
-      conversation_id: 'fixture-review',
-      text: 'Please review the expanded mobile tool activity. This intentionally long but plausible message exercises wrapping, copy controls, and the complete expanded tool detail without fixture-only spacing.',
-      source: 'automatic_continuation',
+      target: '@conv:fixture-review',
+      message: 'Please review the expanded mobile tool activity. This intentionally long but plausible message exercises wrapping, copy controls, and the complete expanded tool detail without fixture-only spacing.',
+      message_id: '8f53edc3-0711-46d8-8f3b-004201a2f410',
     },
   }]),
-  toolMessage(3, 'mobile-send-message', JSON.stringify({ status: 'sent', recipient: 'review conversation', message_id: 'fixture-message-0042', detail: 'The review note was delivered and the next read_automatic_continuation step remains available.' }), { display_data: { duration_ms: 42 } }),
+  toolMessage(3, 'mobile-send-message', JSON.stringify({ outcome: 'delivered', target: '@conv:fixture-review', conversation_id: 'fixture-review-transcript', message_id: '8f53edc3-0711-46d8-8f3b-004201a2f410' }), { display_data: { duration_ms: 42 } }),
   agentMessage(4, [{
+    type: 'tool_use',
+    id: 'mobile-query-database',
+    name: 'query_database',
+    input: { sql: "SELECT conversation_id, state, updated_at FROM conversations WHERE conversation_id = 'fixture-review-transcript' LIMIT 1" },
+  }]),
+  toolMessage(5, 'mobile-query-database', JSON.stringify({ columns: ['conversation_id', 'state', 'updated_at'], rows: [['fixture-review-transcript', 'idle', '2026-02-01T10:03:00Z']] })),
+  agentMessage(6, [{
     type: 'tool_use',
     id: 'mobile-next-read',
     name: 'read_automatic_continuation',
     input: { continuation_id: 'fixture-continuation', reason: 'continue after send_conversation_message' },
   }]),
-  toolMessage(5, 'mobile-next-read', 'Continuation read successfully; no additional user input is required.', { display_data: { duration_ms: 18 } }),
-  agentMessage(6, [{ type: 'text', text: 'Automatic continuation completed. The review message was sent and its follow-up was read.' }]),
+  toolMessage(7, 'mobile-next-read', 'Continuation read successfully; no additional user input is required.', { display_data: { duration_ms: 18 } }),
+  agentMessage(8, [{ type: 'text', text: 'Automatic continuation completed. The review message was sent and its follow-up was read.' }]),
 ];
 
 export const toolResultsScenarios = [

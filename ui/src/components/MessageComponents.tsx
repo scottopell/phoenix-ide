@@ -1308,7 +1308,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
       data-inline-reaction-message={message.message_id}
       data-message-occurrence={(message.display_data as { productOccurrenceToken?: string } | null)?.productOccurrenceToken}
     >
-      {!(suppressMessageCopy && !isFirstInTurn) && <AssistantMessageChrome
+      {!(suppressMessageCopy && visibleToolUseId && !isFirstInTurn) && <AssistantMessageChrome
         isFirstInTurn={isFirstInTurn}
         metadata={(
           <AssistantMessageMetadata timestamp={timestamp} formattedTime={formatMessageTime(timestamp)}>

@@ -34,7 +34,7 @@ function resultFor(messages: Message[], id: string) {
 
 const expectedFamilies: ToolResultsScenarioFamily[] = ['shell', 'execution', 'discovery', 'media', 'profiling', 'grid', 'subagents'];
 
-const expectedIds = expectedFamilies.flatMap((family) => [`${family}-full`, `${family}-compact`]);
+const expectedIds = [...expectedFamilies.flatMap((family) => [`${family}-full`, `${family}-compact`]), 'mobile-spacing-compact'];
 
 function expectTextStates(messages: Message[], states: Record<string, string>) {
   for (const [id, marker] of Object.entries(states)) {

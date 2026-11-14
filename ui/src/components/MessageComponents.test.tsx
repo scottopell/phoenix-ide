@@ -695,6 +695,26 @@ describe('inline tool timers', () => {
     expect(document.querySelectorAll('.compact-tool-owner-copy .message-mobile-copy')).toHaveLength(1);
     expect(document.querySelectorAll('.compact-tool-selected-detail .message-mobile-copy')).toHaveLength(1);
     expect(document.querySelectorAll('.compact-tool-selected-detail .assistant-message-toolbar')).toHaveLength(0);
+    expect(screen.getByRole('button', { name: 'Copy to clipboard' })).toBeInTheDocument();
+  });
+
+  it('keeps continuation chrome controls on ordinary messages, not inside expanded compact detail', () => {
+    mockDensity = 'compact';
+    const owner = agentMessage('agent-copy-continuation', [
+      { type: 'tool_use', id: 'copy-continuation-read', name: 'read_file', input: { path: 'continuation.md' } },
+    ], 2);
+    const { container } = render(<MemoryRouter><>
+      <AgentMessage message={agentMessage('agent-normal-continuation', [{ type: 'text', text: 'Normal continuation.' }])} toolResults={new Map()} isFirstInTurn={false} />
+      <ToolOnlyAgentTurnGroup members={[
+        { kind: 'agent_turn', key: owner.message_id, agent: owner, toolResultsByUseId: new Map(), isFirstInTurn: false },
+      ]} />
+    </></MemoryRouter>);
+
+    expect(container.querySelector('.assistant-message-toolbar--continuation')).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: 'Copy Phoenix message' })).toHaveLength(2);
+    fireEvent.click(screen.getByRole('button', { name: /read_file:.*expand tool detail/i }));
+    expect(document.querySelectorAll('.compact-tool-selected-detail .assistant-message-toolbar')).toHaveLength(0);
+    expect(document.querySelector('.compact-tool-selected-detail .message-mobile-copy')).toBeInTheDocument();
   });
 
   it('keeps an expanded older compact tool before newer appended tools in DOM chronology', () => {

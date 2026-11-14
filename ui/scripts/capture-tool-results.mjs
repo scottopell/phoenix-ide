@@ -42,67 +42,66 @@ async function captureMobileExpandedSpacing({ page, id, outDir, viewport }) {
   const sendCard = page.locator('[data-tool-id="mobile-send-message"] .compact-tool-card-expand');
   await sendCard.waitFor({ state: 'visible' });
   await sendCard.click();
-  await page.getByRole('button', { name: 'Collapse expanded tool detail' }).waitFor({ state: 'visible' });
+  const collapse = page.getByRole('button', { name: 'Collapse expanded tool detail' });
+  await collapse.waitFor({ state: 'visible' });
+
   const evidence = await page.evaluate(() => {
-    const selectors = [
-      '.compact-tool-group',
-      '.compact-tool-group > .message-header',
-      '.compact-tool-group > .message-content',
-      '.compact-tool-selected-detail > .compact-tool-owner-copy',
-      '.compact-tool-selected-detail > .compact-tool-detail-collapse',
-      '.compact-tool-selected-detail > .message',
-      '.compact-tool-selected-detail > .message > .assistant-message-toolbar',
-      '.compact-tool-selected-detail > .message > .message-content',
-      '.compact-tool-selected-detail > .message > .message-content > *',
-      '.compact-tool-selected-detail > .message .tool-block',
-      '.compact-tool-selected-detail > .message .tool-block-header',
-      '.compact-tool-group',
-      '.compact-tool-group .message-content',
-      '.compact-tool-selected-detail',
-      '.compact-tool-selected-detail > .message',
-      '.tool-block-input',
-      '.tool-block-output',
-      '[data-tool-id="mobile-next-read"]',
-      '.compact-tool-detail-collapse',
-    ];
-    return Object.fromEntries(selectors.map((selector) => {
-      const element = document.querySelector(selector);
-      if (!(element instanceof HTMLElement)) return [selector, null];
-      const rect = element.getBoundingClientRect();
-      const style = getComputedStyle(element);
-      return [selector, {
-        top: Math.round(rect.top + scrollY),
-        bottom: Math.round(rect.bottom + scrollY),
-        height: Math.round(rect.height),
-        marginTop: style.marginTop,
-        marginBottom: style.marginBottom,
-        paddingTop: style.paddingTop,
-        paddingBottom: style.paddingBottom,
-        lineHeight: style.lineHeight,
-        display: style.display,
-        gap: style.gap,
-        flexDirection: style.flexDirection,
-        tagName: element.tagName,
-        className: element.className,
-        text: element.children.length === 0 ? element.textContent?.trim().slice(0, 80) : undefined,
-      }];
-    }));
-  });
-  const experimentStyle = await page.addStyleTag({
-    content: '.compact-tool-selected-detail > .message > .assistant-message-toolbar { display: none !important; }',
-  });
-  const toolbarHiddenExperiment = await page.evaluate(() => {
-    const toolbar = document.querySelector('.compact-tool-selected-detail > .message > .assistant-message-toolbar');
-    const content = document.querySelector('.compact-tool-selected-detail > .message > .message-content');
+    const detail = document.querySelector('.compact-tool-selected-detail');
+    const message = detail?.querySelector(':scope > .message');
+    const content = message?.querySelector(':scope > .message-content');
+    const toolbar = message?.querySelector(':scope > .assistant-message-toolbar');
+    const send = detail?.querySelector('[data-tool-id="mobile-send-message"]');
+    const result = send?.querySelector('.tool-block-output');
+    const query = document.querySelector('[data-tool-id="mobile-query-database"]');
+    const continuation = document.querySelector('[data-tool-id="mobile-next-read"]');
+    const copyInput = send?.querySelector('.tool-block-input button');
     const rect = (element) => element instanceof HTMLElement
-      ? { top: Math.round(element.getBoundingClientRect().top + scrollY), height: Math.round(element.getBoundingClientRect().height) }
+      ? { top: Math.round(element.getBoundingClientRect().top + scrollY), height: Math.round(element.getBoundingClientRect().height), scrollHeight: element.scrollHeight, clientHeight: element.clientHeight }
       : null;
-    return { toolbar: rect(toolbar), content: rect(content) };
+    return {
+      detail: rect(detail),
+      message: rect(message),
+      content: rect(content),
+      toolbarPresent: toolbar !== null,
+      inputText: send?.querySelector('.tool-block-input')?.textContent?.trim() ?? null,
+      resultText: result?.textContent?.trim() ?? null,
+      copyInputPresent: copyInput !== null,
+      queryDatabasePresent: query !== null,
+      continuationPresent: continuation !== null,
+      documentClientWidth: document.documentElement.clientWidth,
+      documentScrollWidth: document.documentElement.scrollWidth,
+    };
   });
-  await experimentStyle.evaluate((element) => element.remove());
+  if (evidence.toolbarPresent) throw new Error('expanded detail still contains a redundant message toolbar');
+  if (!evidence.inputText?.includes('@conv:fixture-review') || !evidence.inputText.includes('message_id')) {
+    throw new Error(`expanded send input is missing expected structured fields: ${JSON.stringify(evidence.inputText)}`);
+  }
+  if (!evidence.resultText?.includes('delivered') || !evidence.resultText.includes('8f53edc3-0711-46d8-8f3b-004201a2f410')) {
+    throw new Error(`expanded send result is missing its delivery outcome: ${JSON.stringify(evidence.resultText)}`);
+  }
+  if (!evidence.copyInputPresent || !evidence.queryDatabasePresent || !evidence.continuationPresent) {
+    throw new Error(`expanded detail lost a result control or later tool: ${JSON.stringify(evidence)}`);
+  }
+  if (evidence.documentScrollWidth !== evidence.documentClientWidth) {
+    throw new Error(`expanded detail created page overflow: ${JSON.stringify(evidence)}`);
+  }
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+  await page.locator('.compact-tool-selected-detail [data-tool-id="mobile-send-message"] .tool-block-input button').click();
+  const copiedInput = await page.evaluate(() => navigator.clipboard.readText());
+  if (!copiedInput.includes('@conv:fixture-review') || !copiedInput.includes('8f53edc3-0711-46d8-8f3b-004201a2f410')) {
+    throw new Error(`copy input action did not copy the structured tool input: ${copiedInput}`);
+  }
+
   const stem = `mobile-spacing-compact--${viewport.name ?? `${viewport.width}x${viewport.height}`}`;
   await page.screenshot({ path: path.join(outDir, `${stem}.png`), fullPage: true });
-  await writeFile(path.join(outDir, `${stem}.geometry.json`), `${JSON.stringify({ viewport, evidence, toolbarHiddenExperiment }, null, 2)}\n`);
+  await writeFile(path.join(outDir, `${stem}.geometry.json`), `${JSON.stringify({ viewport, evidence, copiedInput }, null, 2)}\n`);
+  await collapse.click();
+  if (await page.locator('.compact-tool-selected-detail').count() !== 0) {
+    throw new Error('collapse control did not restore compact details');
+  }
+  if (await page.locator('[data-tool-id="mobile-next-read"]').count() !== 1) {
+    throw new Error('collapse removed or duplicated the following continuation tool');
+  }
   return true;
 }
 
@@ -114,5 +113,6 @@ runSurfaceCapture({
   viewportMatrix: [
     { name: 'desktop', width: 1280, height: 900 },
     { name: 'mobile', width: 393, height: 852, hasTouch: true, isMobile: true },
+    { name: 'mobile-narrow', width: 320, height: 760, hasTouch: true, isMobile: true },
   ],
 });
