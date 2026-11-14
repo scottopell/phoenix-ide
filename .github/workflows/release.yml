@@ -23,6 +23,7 @@ on:
           - prepare-main
           - prepare-incident-237100-arm64
           - prepare-incident-237100-linux-x86_64
+          - release-frozen-rc5
           - retry-release
       tag:
         description: Existing immutable release tag (retry-release only)
@@ -102,6 +103,16 @@ jobs:
                 echo "version=$VERSION" >> "$GITHUB_OUTPUT"
                 echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
                 echo "commit=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+              release-frozen-rc5)
+                [[ -z "$RETRY_TAG" ]] || {
+                  echo "Frozen RC5 recovery does not accept a release tag" >&2
+                  exit 1
+                }
+                git fetch --no-tags origin refs/heads/release/frozen-rc5
+                test "$(git rev-parse FETCH_HEAD)" = 4da5f81c60d65d548254264003540bc7d462d2b0
+                python3 scripts/frozen_rc5_release.py gate >> "$GITHUB_OUTPUT"
                 exit 0
                 ;;
               retry-release)
@@ -217,18 +228,23 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.gate.outputs.commit }}
+          ref: ${{ needs.gate.outputs.operation == 'release-frozen-rc5' && needs.gate.outputs.controller_commit || needs.gate.outputs.commit }}
           fetch-depth: 0
       - name: Create exact release tag
         run: |
           TAG=${{ needs.gate.outputs.tag }}
+          COMMIT=${{ needs.gate.outputs.commit }}
           git rev-parse -q --verify "refs/tags/$TAG" >/dev/null && {
             echo "Tag $TAG appeared after the gate; refusing replacement." >&2
             exit 1
           }
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$TAG" -m "$TAG"
+          if [[ "${{ needs.gate.outputs.operation }}" == release-frozen-rc5 ]]; then
+            git tag -a "$TAG" "$COMMIT" -m "$TAG"
+          else
+            git tag -a "$TAG" -m "$TAG"
+          fi
           git push origin "$TAG"
 
   build-linux:
