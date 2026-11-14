@@ -120,6 +120,7 @@ const STREAMING_ROUTES: &[&str] = &[
 const MAX_REMOTE_QUERY_REQUEST_BODY_BYTES: usize = 100 * 1024;
 
 /// Create the API router
+#[allow(clippy::too_many_lines)] // one flat route table
 pub fn create_router(state: AppState) -> Router {
     // The SPA client routes (`/`, `/new`, `/c/:slug`, …) are registered below
     // from `spa_routes::SPA_ROUTES` — the single source of truth shared with the
