@@ -340,7 +340,7 @@ async fn settings_require_trusted_source_and_refuse_ordinary_sources_without_wri
         .unwrap();
     let input = json!({
         "target":{"kind":"ordinary", "product_conversation_id":ordinary.product_conversation_id},
-        "auto_continue_on_context_exhaustion":true
+        "auto_continue_on_context_exhaustion":false
     });
     let read = AutomaticContinuationTool::read(runtime.clone());
     assert!(read
@@ -408,7 +408,7 @@ async fn preclosed_setting_adapter_produces_no_ordinary_tool_output() {
     let tool = AutomaticContinuationTool::set(runtime);
     let future = tool.run(
         json!({
-            "target":{"kind":"coordinator"}, "auto_continue_on_context_exhaustion":true
+            "target":{"kind":"coordinator"}, "auto_continue_on_context_exhaustion":false
         }),
         native_context(&source),
     );
@@ -504,7 +504,7 @@ async fn registry_excludes_ordinary_subagent_and_rotated_coordinator_sources() {
     let refused = set
         .run(
             json!({
-                "target":{"kind":"coordinator"}, "auto_continue_on_context_exhaustion":true,
+                "target":{"kind":"coordinator"}, "auto_continue_on_context_exhaustion":false,
             }),
             native_context(&source),
         )
