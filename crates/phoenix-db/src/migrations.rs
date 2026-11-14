@@ -812,7 +812,88 @@ const MIGRATIONS: &[Migration] = &[
         name: "native_task_approval_receipts",
         sql: include_str!("migrations/native_task_approval_receipts.sql"),
     },
+    Migration {
+        version: 157,
+        name: "close_completion_allowances_and_native_retry_fence",
+        sql: MIGRATION_157,
+    },
 ];
+
+const MIGRATION_157: &str = r"
+ALTER TABLE close_obligations
+ADD COLUMN native_managed INTEGER NOT NULL DEFAULT 0
+    CHECK (typeof(native_managed) = 'integer' AND native_managed IN (0, 1));
+
+-- Dormant storage only: no caller may consume this allowance until the exact
+-- completion-only admission and live source/Stop fences are implemented.
+-- Consumption and suppression are independent: suppression after admission
+-- must retain the fact that the original allowance was already consumed.
+CREATE TABLE close_completion_retry_allowances (
+    attempt_id TEXT NOT NULL PRIMARY KEY
+        REFERENCES close_obligations(attempt_id) ON DELETE CASCADE,
+    consumed INTEGER NOT NULL DEFAULT 0
+        CHECK (typeof(consumed) = 'integer' AND consumed IN (0, 1)),
+    suppressed INTEGER NOT NULL DEFAULT 0
+        CHECK (typeof(suppressed) = 'integer' AND suppressed IN (0, 1))
+);
+
+CREATE TRIGGER close_obligations_create_completion_retry_allowance
+AFTER INSERT ON close_obligations
+BEGIN
+    INSERT INTO close_completion_retry_allowances (attempt_id)
+    VALUES (NEW.attempt_id);
+END;
+
+CREATE TRIGGER close_completion_retry_allowances_immutable_identity
+BEFORE UPDATE OF attempt_id ON close_completion_retry_allowances
+WHEN OLD.attempt_id <> NEW.attempt_id
+BEGIN
+    SELECT RAISE(ABORT, 'completion retry allowance identity is immutable');
+END;
+
+CREATE TRIGGER close_completion_retry_allowances_no_replacement
+BEFORE INSERT ON close_completion_retry_allowances
+WHEN EXISTS (SELECT 1 FROM close_completion_retry_allowances WHERE attempt_id = NEW.attempt_id)
+BEGIN
+    SELECT RAISE(ABORT, 'completion retry allowance cannot be replaced');
+END;
+
+CREATE TRIGGER close_completion_retry_allowances_monotonic_state
+BEFORE UPDATE OF consumed, suppressed ON close_completion_retry_allowances
+WHEN NEW.consumed < OLD.consumed OR NEW.suppressed < OLD.suppressed
+BEGIN
+    SELECT RAISE(ABORT, 'completion retry allowance state is monotonic');
+END;
+
+CREATE TRIGGER close_completion_retry_allowances_no_direct_delete
+BEFORE DELETE ON close_completion_retry_allowances
+WHEN EXISTS (SELECT 1 FROM close_obligations WHERE attempt_id = OLD.attempt_id)
+BEGIN
+    SELECT RAISE(ABORT, 'completion retry allowance cannot be removed');
+END;
+
+-- REPLACE deletes a conflicting parent before inserting defaults, bypassing
+-- DELETE triggers when recursive_triggers is OFF. Reject it before that deletion.
+CREATE TRIGGER close_obligations_reject_replacement
+BEFORE INSERT ON close_obligations
+WHEN EXISTS (
+    SELECT 1 FROM close_obligations
+    WHERE attempt_id = NEW.attempt_id
+       OR (product_conversation_id = NEW.product_conversation_id
+           AND (phase <> 'completed' OR close_outcome = 'close_incomplete')
+           AND (NEW.phase <> 'completed' OR NEW.close_outcome = 'close_incomplete'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'close obligation cannot be replaced');
+END;
+
+CREATE TRIGGER close_obligations_native_managed_monotonic
+BEFORE UPDATE OF native_managed ON close_obligations
+WHEN OLD.native_managed = 1 AND NEW.native_managed = 0
+BEGIN
+    SELECT RAISE(ABORT, 'native Close management cannot be cleared');
+END;
+";
 
 const MIGRATION_138: &str = concat!(
     include_str!("conversation_goals/execution_candidate.sql"),
@@ -15732,7 +15813,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(run_through_for_test(db.pool(), 152).await.unwrap(), 1);
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 3);
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 4);
         assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
         let ledger: Vec<(i64, String)> = sqlx::query_as(
             "SELECT version, name FROM _migrations WHERE version >= 150 ORDER BY version",
@@ -15749,6 +15830,10 @@ mod tests {
                 (153, "close_writer_observations".into()),
                 (155, "ordinary_self_goal_admission".into()),
                 (156, "native_task_approval_receipts".into()),
+                (
+                    157,
+                    "close_completion_allowances_and_native_retry_fence".into()
+                ),
             ]
         );
     }
@@ -15758,6 +15843,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (157, "close_completion_allowances_and_native_retry_fence"),
             (156, "native_task_approval_receipts"),
             (155, "ordinary_self_goal_admission"),
             (153, "close_writer_observations"),
@@ -20030,6 +20116,7 @@ mod tests {
                 (153, "close_writer_observations"),
                 (155, "ordinary_self_goal_admission"),
                 (156, "native_task_approval_receipts"),
+                (157, "close_completion_allowances_and_native_retry_fence"),
             ]
         );
         let goal = MIGRATIONS
@@ -20043,7 +20130,7 @@ mod tests {
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 154);
+        assert_eq!(MIGRATIONS.len(), 155);
     }
 
     #[tokio::test]
@@ -20059,7 +20146,7 @@ mod tests {
         }
         sqlx::query("UPDATE product_creation_jobs SET status = 'published', published_product_id = 'deleted-product', published_conversation_id = 'deleted-transcript' WHERE request_id = 'orphan-image'")
             .execute(&pool).await.unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 7);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 8);
         let identity: Vec<(String, String)> = sqlx::query_as(
             "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
         ).fetch_all(&pool).await.unwrap();
@@ -20113,7 +20200,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 7);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 8);
         let retained: (String, String, String) = sqlx::query_as(
             "SELECT status, published_product_id, published_conversation_id
              FROM product_creation_jobs WHERE request_id = 'orphan-text'",
@@ -22927,5 +23014,220 @@ mod tests {
             Some("claude-sonnet-4-6"),
             "non-Opus rows must not be touched"
         );
+    }
+}
+
+#[cfg(test)]
+mod close_completion_allowance_tests {
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::MIGRATION_157;
+
+    #[tokio::test]
+    // Keep the migration's before/after, failed-write, cascade and rollback
+    // assertions together so each observes the same retained fixture state.
+    #[allow(clippy::too_many_lines)]
+    async fn migration_157_seeds_only_future_operations_and_enforces_monotonicity() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE close_obligations (
+                 attempt_id TEXT PRIMARY KEY,
+                 product_conversation_id TEXT NOT NULL DEFAULT 'new-product',
+                 phase TEXT NOT NULL DEFAULT 'awaiting_blocker_resolution',
+                 close_outcome TEXT
+             );
+             CREATE UNIQUE INDEX close_obligations_one_active_per_product
+                 ON close_obligations(product_conversation_id)
+                 WHERE phase <> 'completed' OR close_outcome = 'close_incomplete';
+             INSERT INTO close_obligations (attempt_id, product_conversation_id)
+                 VALUES ('preexisting', 'old-product');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_157).execute(&pool).await.unwrap();
+
+        let old_marker: i64 = sqlx::query_scalar(
+            "SELECT native_managed FROM close_obligations WHERE attempt_id = 'preexisting'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(old_marker, 0);
+        let old_allowance: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_completion_retry_allowances WHERE attempt_id = 'preexisting'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(old_allowance, 0);
+
+        sqlx::query("INSERT INTO close_obligations (attempt_id) VALUES ('new-operation')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let initial: (i64, i64) = sqlx::query_as(
+            "SELECT consumed, suppressed FROM close_completion_retry_allowances WHERE attempt_id = 'new-operation'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(initial, (0, 0));
+
+        assert!(
+            sqlx::query("INSERT INTO close_obligations (attempt_id) VALUES ('new-operation')")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        assert!(sqlx::query(
+            "INSERT INTO close_completion_retry_allowances (attempt_id) VALUES ('new-operation')",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "INSERT OR REPLACE INTO close_completion_retry_allowances (attempt_id) VALUES ('new-operation')",
+        ).execute(&pool).await.is_err());
+        assert!(sqlx::query(
+            "INSERT INTO close_completion_retry_allowances (attempt_id) VALUES ('missing-operation')",
+        ).execute(&pool).await.is_err());
+        assert!(sqlx::query(
+            "UPDATE close_completion_retry_allowances SET attempt_id = 'preexisting' WHERE attempt_id = 'new-operation'",
+        ).execute(&pool).await.is_err());
+        assert!(sqlx::query(
+            "DELETE FROM close_completion_retry_allowances WHERE attempt_id = 'new-operation'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "UPDATE close_completion_retry_allowances SET consumed = 2 WHERE attempt_id = 'new-operation'",
+        ).execute(&pool).await.is_err());
+        assert!(sqlx::query(
+            "UPDATE close_completion_retry_allowances SET consumed = NULL WHERE attempt_id = 'new-operation'",
+        ).execute(&pool).await.is_err());
+        assert!(sqlx::query(
+            "UPDATE close_completion_retry_allowances SET consumed = 'bad' WHERE attempt_id = 'new-operation'",
+        ).execute(&pool).await.is_err());
+        assert!(sqlx::query(
+            "UPDATE close_completion_retry_allowances SET suppressed = NULL WHERE attempt_id = 'new-operation'",
+        ).execute(&pool).await.is_err());
+
+        sqlx::query(
+            "UPDATE close_completion_retry_allowances SET consumed = 1 WHERE attempt_id = 'new-operation'",
+        ).execute(&pool).await.unwrap();
+        sqlx::query(
+            "UPDATE close_completion_retry_allowances SET suppressed = 1 WHERE attempt_id = 'new-operation'",
+        ).execute(&pool).await.unwrap();
+        assert!(sqlx::query(
+            "UPDATE close_completion_retry_allowances SET consumed = 0 WHERE attempt_id = 'new-operation'",
+        ).execute(&pool).await.is_err());
+        assert!(sqlx::query(
+            "UPDATE close_completion_retry_allowances SET suppressed = 0 WHERE attempt_id = 'new-operation'",
+        ).execute(&pool).await.is_err());
+        let final_state: (i64, i64) = sqlx::query_as(
+            "SELECT consumed, suppressed FROM close_completion_retry_allowances WHERE attempt_id = 'new-operation'",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(final_state, (1, 1));
+
+        sqlx::query(
+            "UPDATE close_obligations SET native_managed = 1 WHERE attempt_id = 'new-operation'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(sqlx::query(
+            "UPDATE close_obligations SET native_managed = 0 WHERE attempt_id = 'new-operation'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "UPDATE close_obligations SET native_managed = 2 WHERE attempt_id = 'preexisting'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "UPDATE close_obligations SET native_managed = NULL WHERE attempt_id = 'preexisting'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        sqlx::query("PRAGMA recursive_triggers = OFF")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (attempt_id, product_id) in [
+            ("new-operation", "new-product"),
+            ("preexisting", "old-product"),
+            ("different-operation", "new-product"),
+        ] {
+            let error =
+                sqlx::query("INSERT OR REPLACE INTO close_obligations (attempt_id, product_conversation_id) VALUES (?1, ?2)")
+                    .bind(attempt_id)
+                    .bind(product_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap_err();
+            assert_eq!(
+                error.as_database_error().unwrap().message(),
+                "close obligation cannot be replaced"
+            );
+        }
+        let retained: (i64, i64, i64) = sqlx::query_as(
+            "SELECT o.native_managed, a.consumed, a.suppressed
+             FROM close_obligations o JOIN close_completion_retry_allowances a USING (attempt_id)
+             WHERE o.attempt_id = 'new-operation'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(retained, (1, 1, 1));
+        let old_retained: (i64, i64) = sqlx::query_as(
+            "SELECT native_managed,
+                (SELECT COUNT(*) FROM close_completion_retry_allowances WHERE attempt_id = 'preexisting')
+             FROM close_obligations WHERE attempt_id = 'preexisting'",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(old_retained, (0, 0));
+
+        // Isolate both sides of the partial-index predicate: nonparticipating
+        // historical rows must not turn a nonconflicting insert into replacement.
+        sqlx::raw_sql(
+            "INSERT INTO close_obligations (attempt_id, product_conversation_id, phase, close_outcome)
+                 VALUES ('incoming-history', 'new-product', 'completed', 'cancelled');
+             INSERT INTO close_obligations (attempt_id, product_conversation_id, phase, close_outcome)
+                 VALUES ('retained-history', 'history-product', 'completed', 'cancelled');
+             INSERT INTO close_obligations (attempt_id, product_conversation_id)
+                 VALUES ('after-history', 'history-product');
+             DELETE FROM close_obligations
+                 WHERE attempt_id IN ('incoming-history', 'retained-history', 'after-history');",
+        ).execute(&pool).await.unwrap();
+
+        sqlx::query("DELETE FROM close_obligations WHERE attempt_id = 'new-operation'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let cascaded: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_completion_retry_allowances WHERE attempt_id = 'new-operation'",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(cascaded, 0);
+
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("INSERT INTO close_obligations (attempt_id) VALUES ('rolled-back')")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        let rolled_back_allowances: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_completion_retry_allowances WHERE attempt_id = 'rolled-back'",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(rolled_back_allowances, 0);
     }
 }

@@ -5188,6 +5188,19 @@ impl Database {
         tx: &mut Transaction<'_, Sqlite>,
         request: &AdmitCloseSafeRetryRequest,
     ) -> DbResult<CloseRunRef> {
+        let native_managed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM close_obligations
+             WHERE attempt_id = ?1 AND native_managed = 1)",
+        )
+        .bind(request.failed_run.attempt_id.as_str())
+        .fetch_one(&mut **tx)
+        .await?;
+        if native_managed {
+            return Err(close_precondition(
+                "legacy generic retry is unavailable for native-managed Close operations",
+            ));
+        }
+
         let now = Utc::now().timestamp_micros();
         if request.observed_at_us < 0
             || request.observed_at_us > now
@@ -11506,6 +11519,275 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_creation_seeds_one_allowance_for_legacy_and_direct_admission() {
+        for (root, attempt, direct) in [
+            ("legacy-root", "legacy-attempt", false),
+            ("direct-root", "direct-attempt", true),
+        ] {
+            let db = Database::open_in_memory().await.unwrap();
+            create_root(&db, root).await;
+            let product = product_id(root);
+            let transcript = transcript_id(root);
+            if direct {
+                db.begin_direct_close_foundation(&product, &transcript, attempt)
+                    .await
+                    .unwrap();
+            } else {
+                db.begin_close_foundation(&product, &transcript, attempt)
+                    .await
+                    .unwrap();
+            }
+            let allowance_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM close_completion_retry_allowances WHERE attempt_id = ?1",
+            )
+            .bind(attempt)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(allowance_count, 1);
+            let run_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM close_runs WHERE attempt_id = ?1")
+                    .bind(attempt)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(run_count, 1);
+
+            sqlx::query(
+                "UPDATE close_completion_retry_allowances SET consumed = 1, suppressed = 1 WHERE attempt_id = ?1",
+            )
+            .bind(attempt)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            if direct {
+                db.begin_direct_close_foundation(&product, &transcript, attempt)
+                    .await
+                    .unwrap();
+            } else {
+                db.begin_close_foundation(&product, &transcript, attempt)
+                    .await
+                    .unwrap();
+            }
+            let allowance_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM close_completion_retry_allowances WHERE attempt_id = ?1",
+            )
+            .bind(attempt)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(allowance_count, 1);
+            let state: (i64, i64) = sqlx::query_as(
+                "SELECT consumed, suppressed FROM close_completion_retry_allowances WHERE attempt_id = ?1",
+            )
+            .bind(attempt)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(state, (1, 1));
+            let native_managed: i64 = sqlx::query_scalar(
+                "SELECT native_managed FROM close_obligations WHERE attempt_id = ?1",
+            )
+            .bind(attempt)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(native_managed, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn close_creation_capture_failure_rolls_back_allowance_and_topology() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "rollback-root").await;
+        sqlx::query(
+            "CREATE TRIGGER fail_close_topology_seal BEFORE UPDATE OF topology_sealed ON close_obligations
+             WHEN NEW.attempt_id = 'rollback-attempt' AND NEW.topology_sealed = 1
+             BEGIN SELECT RAISE(ABORT, 'injected topology seal failure'); END",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(db
+            .begin_close_foundation(
+                &product_id("rollback-root"),
+                &transcript_id("rollback-root"),
+                "rollback-attempt",
+            )
+            .await
+            .is_err());
+        for (table, query) in [
+            (
+                "close_obligations",
+                "SELECT COUNT(*) FROM close_obligations",
+            ),
+            ("close_runs", "SELECT COUNT(*) FROM close_runs"),
+            (
+                "close_completion_retry_allowances",
+                "SELECT COUNT(*) FROM close_completion_retry_allowances",
+            ),
+            (
+                "close_attempt_members",
+                "SELECT COUNT(*) FROM close_attempt_members",
+            ),
+        ] {
+            let count: i64 = sqlx::query_scalar(query)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(count, 0, "unexpected persisted rows in {table}");
+        }
+        let captured_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversations WHERE id = 'rollback-root' AND archived = 1",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(captured_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn native_managed_close_blocks_generic_retry_at_wrapper_and_transaction() {
+        let db = Database::open_in_memory().await.unwrap();
+        let failure =
+            initial_cleanup_failure_fixture(&db, CloseStopCertainty::ShutdownUncertain).await;
+        db.terminalize_initial_close_cleanup_failure(&failure)
+            .await
+            .unwrap();
+        let request = safe_retry_request(&failure);
+        sqlx::query("UPDATE close_obligations SET native_managed = 1 WHERE attempt_id = ?1")
+            .bind(failure.attempt_id.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(db.admit_close_safe_retry(&request).await.is_err());
+        let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert!(Database::admit_close_safe_retry_tx(&mut tx, &request)
+            .await
+            .is_err());
+        tx.rollback().await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_runs")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_run_retry_effects")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn close_obligation_replace_is_rejected_without_observation_children() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "replace-close").await;
+        db.begin_close_foundation(
+            &product_id("replace-close"),
+            &transcript_id("replace-close"),
+            "replace-attempt",
+        )
+        .await
+        .unwrap();
+
+        let mut conn = db.pool().acquire().await.unwrap();
+        sqlx::query("PRAGMA recursive_triggers = OFF")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE close_obligations SET native_managed = 1 WHERE attempt_id = ?1")
+            .bind("replace-attempt")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE close_completion_retry_allowances
+             SET consumed = 1, suppressed = 1 WHERE attempt_id = ?1",
+        )
+        .bind("replace-attempt")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM close_writer_observations WHERE attempt_id = ?1",
+            )
+            .bind("replace-attempt")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap(),
+            0
+        );
+
+        let replacement_time = Utc::now().to_rfc3339();
+        // The second insertion conflicts only through the owning partial unique
+        // product index, not through attempt identity. Neither may delete the parent.
+        for incoming_attempt in ["replace-attempt", "different-attempt"] {
+            let error = sqlx::query(
+                "INSERT OR REPLACE INTO close_obligations (
+                     attempt_id, product_conversation_id, phase, created_at, updated_at, completed_at
+                 ) VALUES (?1, ?2, 'awaiting_blocker_resolution', ?3, ?3, NULL)",
+            )
+            .bind(incoming_attempt)
+            .bind("replace-close")
+            .bind(&replacement_time)
+            .execute(&mut *conn)
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.as_database_error().unwrap().message(),
+                "close obligation cannot be replaced"
+            );
+        }
+
+        let obligation: (i64, i64, String) = sqlx::query_as(
+            "SELECT native_managed, topology_sealed, phase FROM close_obligations
+             WHERE attempt_id = ?1",
+        )
+        .bind("replace-attempt")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            obligation,
+            (1, 1, "awaiting_blocker_resolution".to_string())
+        );
+        let allowance: (i64, i64) = sqlx::query_as(
+            "SELECT consumed, suppressed FROM close_completion_retry_allowances
+             WHERE attempt_id = ?1",
+        )
+        .bind("replace-attempt")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(allowance, (1, 1));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = 1",
+            )
+            .bind("replace-attempt")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM close_attempt_members WHERE attempt_id = ?1",
+            )
+            .bind("replace-attempt")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn close_runs_safe_retry_allocates_run_two_without_resuming_stopped_authority() {
         for certainty in [
             CloseStopCertainty::ShutdownUncertain,
@@ -11616,6 +11898,11 @@ mod tests {
                 .unwrap();
             let request = safe_retry_request(&failure);
             let run = db.admit_close_safe_retry(&request).await.unwrap();
+            sqlx::query("UPDATE close_obligations SET native_managed = 1 WHERE attempt_id = ?1")
+                .bind(run.attempt_id.as_str())
+                .execute(db.pool())
+                .await
+                .unwrap();
             assert_eq!(
                 db.list_close_safe_retry_effects(&run).await.unwrap(),
                 request.remaining_effects
