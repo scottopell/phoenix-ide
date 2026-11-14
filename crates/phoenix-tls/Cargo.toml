@@ -13,7 +13,8 @@ name = "phoenix-tls"
 path = "src/main.rs"
 
 [dependencies]
-rcgen = { workspace = true, features = ["pem", "aws_lc_rs", "x509-parser"] }
+rcgen = { workspace = true, features = ["pem", "aws_lc_rs"] }
+x509-cert = { workspace = true, features = ["pem", "std"] }
 time = { workspace = true }
 
 [dev-dependencies]

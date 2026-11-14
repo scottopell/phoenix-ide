@@ -120,7 +120,7 @@ url = "2"
 uuid = "1"
 vte = "0.15"
 which = "8"
-x509-parser = "0.18"
+x509-cert = { version = "0.2", default-features = false }
 xmlparser = "0.13"
 
 [profile.release]

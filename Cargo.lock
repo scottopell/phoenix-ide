@@ -2947,7 +2947,7 @@ dependencies = [
  "ts-rs",
  "url",
  "uuid",
- "x509-parser",
+ "x509-cert",
 ]
 
 [[package]]
@@ -3095,6 +3095,7 @@ dependencies = [
  "rcgen",
  "tempfile",
  "time",
+ "x509-cert",
 ]
 
 [[package]]

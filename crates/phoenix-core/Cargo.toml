@@ -36,7 +36,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 rustls-pki-types = { workspace = true }
 rustls = { workspace = true, features = ["default"] }
-x509-parser = { workspace = true }
+x509-cert = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
