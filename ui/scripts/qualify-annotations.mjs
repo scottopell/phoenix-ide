@@ -72,7 +72,7 @@ try {
           await page.evaluate(() => {
             const ranges = [...CSS.highlights.get('phoenix-pending-annotations')];
             window.annotationReviewOldNodes = ranges.flatMap(range => [range.startContainer, range.endContainer]);
-            document.querySelectorAll('#messages .agent-text-block p').forEach(p => p.replaceChildren(...[...p.childNodes].map(node => node.cloneNode(true))));
+            document.querySelectorAll('#messages .agent-text-block').forEach(block => block.replaceChildren(...[...block.childNodes].map(node => node.cloneNode(true))));
           });
           try {
             await page.waitForFunction(quotes => {
