@@ -75,7 +75,13 @@ Remaining gates:
 - Exact final-source hosted CI, including publication mutation witness and the native automatic reserved-recovery regression.
 - Final ordinary/Coordinator mobile captures inspected (before/followed/reconnected), with same native editor/focus/selection and new post-reconnect message assertions.
 - Final source-review packet with explicit coverage and no unresolved actionable findings.
-- Exact terminal/unmaterialized failed-automatic service-level retry remains an explicit coverage gap; shared-path inspection and lower-level rearm tests are not claimed as that executed journey.
+- Exact terminal/unmaterialized failed-automatic service-level retry is now authored using real supported DB/workflow/send/retry APIs, with unchanged durable identity and separate cancellation/rearm generation assertions; hosted execution remains required.
 - Physical iOS/PWA keyboard/OS Accessibility coverage remains deferred. Historical RC5/deployed identity reports are not fresh independent production verification.
 
 The local build/test/browser/server/install resource hold remains respected. Hosted normal PR CI is the qualification path; no duplicate manual dispatch.
+
+### Generated-metadata and recovery follow-up
+
+Run 43643901904 at `3e4c64ace628d1553d4c76ee2fa65f948b8f944e` passed UI Vitest/type/spec, visual, E2E, clippy, musl and Rust build including the expected-failure/restored-pass publication mutation witness. Six ordinary/Global captures were inspected in the predecessor session; exact identities and limits are recorded in the QA ledger. Overall CI failed: our automatic reserved-recovery test incorrectly expected a capacity error instead of accepted dispatch (corrected), and an unchanged Federation multi-case fixture hit a unique peer-address constraint (unrelated blocking TODO captured in the QA ledger).
+
+A final backend review found saved generated-opening retry incorrectly rejects persisted user-agent metadata. The guard is corrected without altering generated authority, saved intent, successor identity, or Idle admission. A real configured-provider regression covers retry and one generated opening; the new terminal/unmaterialized failed-automatic regression covers the shared rearm branch. Both require hosted execution at the corrective head. Source-only rustfmt (edition 2021) and diff checks pass; no local builds/tests/browser/server/install and no merge/deploy.

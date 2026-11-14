@@ -10725,7 +10725,6 @@ where
                 if intent.successor_conversation_id != self.context.conversation_id
                     || intent.opening_authority
                         != ContinuationOpeningAuthority::GeneratedPredecessorContext
-                    || intent.user_agent.is_some()
                     || !matches!(self.state, ConvState::Idle)
                 {
                     return Err(
