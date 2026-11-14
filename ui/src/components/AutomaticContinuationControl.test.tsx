@@ -61,6 +61,10 @@ describe('AutomaticContinuationControl', () => {
 
     expect(await screen.findByText('offline')).toBeInTheDocument();
     await waitFor(() => expect(onStatusChange).toHaveBeenLastCalledWith('…', true));
+    const summary = screen.getByText(/Auto-continue/).closest('summary');
+    expect(summary).toHaveTextContent('Auto-continue …');
+    expect(summary).not.toHaveTextContent('Off');
+    expect(summary).not.toHaveTextContent('On');
   });
 
   it('preserves an existing ordinary ProductConversation OFF preference and PUTs the checked value', async () => {

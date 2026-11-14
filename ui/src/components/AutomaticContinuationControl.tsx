@@ -173,7 +173,7 @@ export function AutomaticContinuationControl({ scope, onStatusChange }: Automati
   return (
     <details ref={detailsRef} className="automatic-continuation" data-testid="automatic-continuation-control">
       <summary>
-        Auto-continue <span className={enabled ? 'automatic-continuation__on' : ''}>{loading ? '…' : enabled ? 'On' : 'Off'}</span>
+        Auto-continue <span className={enabled ? 'automatic-continuation__on' : ''}>{loading || view === null ? '…' : enabled ? 'On' : 'Off'}</span>
         {admission && <span className="automatic-continuation__phase"> · {phaseLabel}</span>}
       </summary>
       <div className="automatic-continuation__panel">
