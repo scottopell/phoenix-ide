@@ -658,6 +658,7 @@ impl RuntimeManager {
                     work_scope_key: None,
                     model: None,
                     archived: Some(archived),
+                    continued_in_conv_id: None,
                 },
             });
         }

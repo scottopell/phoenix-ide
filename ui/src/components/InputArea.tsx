@@ -58,12 +58,13 @@ interface InputAreaProps {
    */
   cwd: string | undefined;
   /**
-   * Composer identity (the conversation id). Transient composer state — voice
+   * Local composer identity. Transient composer state — voice
    * buffer, active autocomplete trigger, inline expansion error — resets when
    * this changes, so switching between two conversations that share a `cwd`
    * doesn't carry one's state into the other.
    */
   scopeKey: string | undefined;
+  uploadConversationId: string | undefined;
   convState: ConversationState;
   images: ImageData[];
   setImages: (images: ImageData[]) => void;
@@ -107,6 +108,7 @@ interface InputAreaProps {
   onRetry: (localId: string) => void;
   onDismissError?: (localId: string) => void;
   readOnly?: boolean;
+  retainComposerDuringContinuation?: boolean;
 }
 
 function formatBytes(bytes: number): string {
@@ -153,6 +155,7 @@ function canAcceptChatMessage(state: ConversationState): boolean {
 export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function InputArea({
   cwd,
   scopeKey,
+  uploadConversationId,
   convState,
   images,
   setImages: onImagesChange,
@@ -173,6 +176,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   onRetry,
   onDismissError,
   readOnly = false,
+  retainComposerDuringContinuation = false,
 }, ref) {
   const agentWorking = isAgentWorking(convState);
   const canCancel = !readOnly && canCancelConversationState(convState);
@@ -214,11 +218,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   recorderIdentityRef.current = recorderIdentity;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  // `scopeKey` is the conversation id for this (always in-conversation) composer;
-  // attachment uploads target it, and this ref lets an in-flight upload detect a
-  // conversation switch and discard its late response.
-  const scopeKeyRef = useRef(scopeKey);
-  scopeKeyRef.current = scopeKey;
+  const attachmentConversationId = uploadConversationId;
   const voiceSupported = isWebSpeechSupported();
   const [quickActionSending, setQuickActionSending] = useState(false);
 
@@ -275,7 +275,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
   // File-attachment drag/drop state.
   const [isDragOver, setIsDragOver] = useState(false);
-  const [isUploadingFiles, setIsUploadingFiles] = useState(false);
+  const [isUploadingFiles, setIsUploadingFiles] = useScopedState(scopeKey, false);
   owner.current.uploading = isUploadingFiles;
 
   // External draft insertions (file-tree context menu, drag-and-drop) bypass
@@ -355,12 +355,12 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       setExpansionError('Wait for the current attachment upload to finish before adding more files.');
       return;
     }
-    if (!scopeKey) {
+    if (!attachmentConversationId) {
       setExpansionError('Open a conversation before attaching files.');
       return;
     }
-
-    const uploadConversationId = scopeKey;
+    const uploadTarget = attachmentConversationId;
+    const uploadScopeEpoch = scopeEpoch;
 
     const unsupportedImage = dropped.find(file => file.type.startsWith('image/') && !SUPPORTED_IMAGE_TYPES.includes(file.type));
     if (unsupportedImage) {
@@ -392,13 +392,14 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     setIsUploadingFiles(true);
     setExpansionError(null);
     try {
-      const uploaded = await api.uploadAttachments(uploadConversationId, genericFiles);
-      if (scopeKeyRef.current !== uploadConversationId) return;
+      const uploaded = await api.uploadAttachments(uploadTarget, genericFiles);
+      if (owner.current.epoch !== uploadScopeEpoch) return;
       setFiles(prev => [...prev, ...uploaded]);
     } catch (err) {
+      if (owner.current.epoch !== uploadScopeEpoch) return;
       setExpansionError(err instanceof Error ? err.message : 'Failed to upload attachments');
     } finally {
-      setIsUploadingFiles(false);
+      if (owner.current.epoch === uploadScopeEpoch) setIsUploadingFiles(false);
     }
   };
 
@@ -815,7 +816,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       )}
 
       {annotationCards}
-      {convState.type === 'awaiting_continuation' ? (
+      {convState.type === 'awaiting_continuation' && (
         <div className="continuation-progress" role="status" aria-live="polite">
           <div className="continuation-progress-header">
             <span>Compacting conversation...</span>
@@ -826,7 +827,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           </div>
           <p className="continuation-progress-text">Phoenix is generating a continuation summary to preserve context for a new conversation.</p>
         </div>
-      ) : (
+      )}
+      {convState.type === 'awaiting_continuation' && !retainComposerDuringContinuation ? null : (
         <form
           className={`input-textarea-wrap${agentWorking ? ' input-textarea-wrap--working' : ''}`}
           onSubmit={(event) => {

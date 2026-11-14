@@ -125,6 +125,27 @@ jobs:
       - name: ./dev.py check (rust,cargo-fmt) build phase
         timeout-minutes: 20
         run: ./dev.py check --lanes rust,cargo-fmt --rust-phase build --profile-work --profile-work-dir "$RUST_EVIDENCE_DIR/check"
+      - name: Qualify missing continuation notification witness
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -euo pipefail
+          source=crates/phoenix-ide/src/continuation_service/native.rs
+          backup=$(mktemp)
+          cp "$source" "$backup"
+          trap 'cp "$backup" "$source"; rm -f "$backup"' EXIT
+          python3 -c 'from pathlib import Path; p=Path("crates/phoenix-ide/src/continuation_service/native.rs"); s=p.read_text(); call="        self.runtime\n            .publish_continuation_link(&request.predecessor_transcript_id, &successor.id)\n            .await;\n"; assert s.count(call)==1; p.write_text(s.replace(call, ""))'
+          set +e
+          cargo test --locked -p phoenix_ide pending_replay_requires_current_successor_capacity_and_retains_winning_intent -- --nocapture > /tmp/continuation-missing-notification.log 2>&1
+          missing_status=$?
+          set -e
+          cat /tmp/continuation-missing-notification.log
+          test "$missing_status" -eq 101
+          grep -q 'assertion.*left.*right.*failed' /tmp/continuation-missing-notification.log
+          grep -q 'pending_replay_requires_current_successor_capacity_and_retains_winning_intent.*FAILED' /tmp/continuation-missing-notification.log
+          cp "$backup" "$source"
+          cargo test --locked -p phoenix_ide pending_replay_requires_current_successor_capacity_and_retains_winning_intent -- --nocapture
+          git diff --exit-code -- "$source"
       - name: Upload test archive
         timeout-minutes: 5
         uses: actions/upload-artifact@v6
@@ -871,6 +892,7 @@ jobs:
           node scripts/capture-composer-rejection.mjs
           node scripts/capture-review-reading-position.mjs
           node scripts/capture-reminders.mjs
+          CAPTURE_STORIES=mobile-continuation-ordinary,mobile-continuation-global CAPTURE_VIEWPORT=mobile-light PLAYWRIGHT_INSTALLED_ONLY=1 node scripts/capture-product-conversation.mjs
           if [ -n "${BASE_SHA:-}" ]; then
             cd ..
             stop_server

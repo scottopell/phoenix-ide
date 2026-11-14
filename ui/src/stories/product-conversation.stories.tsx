@@ -1,4 +1,4 @@
-import { makeVirtualizedReactionScenario } from '../fixtures/productConversation/scenarios';
+import { makeMobileContinuationScenario, makeVirtualizedReactionScenario } from '../fixtures/productConversation/scenarios';
 import type { Story } from '@ladle/react';
 import {
   getProductConversationScenario,
@@ -23,6 +23,13 @@ DesktopMultiSegmentQaWork.storyName = 'desktop-multi-segment-qa-work';
 
 export const MobileOpen = storyFor('mobile-open');
 MobileOpen.storyName = 'mobile-open';
+
+const continuationOrdinary = makeMobileContinuationScenario('ordinary');
+const continuationGlobal = makeMobileContinuationScenario('coordinator');
+export const MobileContinuationOrdinary: Story = () => <ProductConversationFixture scenario={continuationOrdinary} />;
+MobileContinuationOrdinary.storyName = 'mobile-continuation-ordinary';
+export const MobileContinuationGlobal: Story = () => <ProductConversationFixture scenario={continuationGlobal} />;
+MobileContinuationGlobal.storyName = 'mobile-continuation-global';
 
 export const MobileContextExhausted = storyFor('mobile-context-exhausted');
 MobileContextExhausted.storyName = 'mobile-context-exhausted';

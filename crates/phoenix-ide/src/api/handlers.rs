@@ -323,6 +323,10 @@ pub fn create_router(state: AppState) -> Router {
             "/api/conversations/{id}/continue",
             post(continue_conversation),
         )
+        .route(
+            "/api/conversations/{id}/retry-continuation-opening",
+            post(retry_continuation_opening),
+        )
         // Task approval (REQ-BED-028)
         .route("/api/conversations/{id}/approve-task", post(approve_task))
         .route("/api/conversations/{id}/reject-task", post(reject_task))
@@ -1944,9 +1948,52 @@ pub(crate) async fn validate_submitted_attachments(
     validate_submitted_attachments_at_root(&attachment_root(), conversation_id, files).await
 }
 
+pub(crate) async fn validate_continuation_attachments(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    files: &[crate::api::types::FileAttachment],
+) -> Result<Vec<phoenix_core::domain::db_schema::FileAttachment>, AppError> {
+    validate_continuation_attachments_at_root(db, &attachment_root(), conversation_id, files).await
+}
+
+async fn validate_continuation_attachments_at_root(
+    db: &crate::db::Database,
+    root: &std::path::Path,
+    conversation_id: &str,
+    files: &[crate::api::types::FileAttachment],
+) -> Result<Vec<phoenix_core::domain::db_schema::FileAttachment>, AppError> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root_id = db
+        .chain_root_of(conversation_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .ok_or_else(|| AppError::BadRequest("Conversation does not exist".to_string()))?;
+    let members = db
+        .chain_members_forward(&root_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let current = members
+        .iter()
+        .position(|member| member == conversation_id)
+        .ok_or_else(|| {
+            AppError::BadRequest("Conversation is not in its continuation chain".to_string())
+        })?;
+    validate_submitted_attachments_at_roots(root, &members[..=current], files).await
+}
+
 async fn validate_submitted_attachments_at_root(
     root: &std::path::Path,
     conversation_id: &str,
+    files: &[crate::api::types::FileAttachment],
+) -> Result<Vec<phoenix_core::domain::db_schema::FileAttachment>, AppError> {
+    validate_submitted_attachments_at_roots(root, &[conversation_id.to_string()], files).await
+}
+
+async fn validate_submitted_attachments_at_roots(
+    root: &std::path::Path,
+    conversation_ids: &[String],
     files: &[crate::api::types::FileAttachment],
 ) -> Result<Vec<phoenix_core::domain::db_schema::FileAttachment>, AppError> {
     if files.is_empty() {
@@ -1957,10 +2004,23 @@ async fn validate_submitted_attachments_at_root(
             "A message can include at most {MAX_ATTACHMENTS_PER_MESSAGE} files"
         )));
     }
-    let expected_dir = root.join(conversation_id);
-    let canonical_expected_dir = tokio::fs::canonicalize(&expected_dir)
-        .await
-        .map_err(|_| AppError::BadRequest("Attachment directory does not exist".to_string()))?;
+    let mut canonical_dirs = Vec::new();
+    for id in conversation_ids {
+        match tokio::fs::canonicalize(root.join(id)).await {
+            Ok(dir) => canonical_dirs.push(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(AppError::Internal(format!(
+                    "Cannot read attachment directory: {error}"
+                )))
+            }
+        }
+    }
+    if canonical_dirs.is_empty() {
+        return Err(AppError::BadRequest(
+            "Attachment directory does not exist".to_string(),
+        ));
+    }
     let mut total_bytes = 0usize;
     let mut validated = Vec::with_capacity(files.len());
     for file in files {
@@ -1977,7 +2037,10 @@ async fn validate_submitted_attachments_at_root(
         let canonical_path = tokio::fs::canonicalize(&path).await.map_err(|_| {
             AppError::BadRequest(format!("Attachment '{}' is missing", file.original_name))
         })?;
-        if !canonical_path.starts_with(&canonical_expected_dir) {
+        if !canonical_dirs
+            .iter()
+            .any(|dir| canonical_path.starts_with(dir))
+        {
             return Err(AppError::BadRequest(format!(
                 "Attachment '{}' does not belong to this conversation",
                 file.original_name
@@ -6600,6 +6663,15 @@ async fn continue_conversation(
         .await
         .map(Json)
 }
+async fn retry_continuation_opening(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ContinueConversationResponse>, AppError> {
+    crate::continuation_service::ContinuationApplicationService::new(state.runtime)
+        .retry_pending_opening(&id)
+        .await
+        .map(Json)
+}
 
 // ============================================================
 // User Question Response (REQ-AUQ-003)
@@ -10140,6 +10212,137 @@ mod conversation_cwd_validation_tests {
                 if message.contains("fatal local authority loss")
         ));
         assert!(state.db.list_conversations().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn continuation_attachments_allow_predecessor_and_reject_foreign_paths() {
+        use crate::api::types::FileAttachment;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("attachments");
+        let predecessor = root.join("predecessor");
+        let unrelated = root.join("unrelated");
+        tokio::fs::create_dir_all(&predecessor).await.unwrap();
+        tokio::fs::create_dir_all(&unrelated).await.unwrap();
+        let old_path = predecessor.join("notes.txt");
+        let foreign_path = unrelated.join("foreign.txt");
+        tokio::fs::write(&old_path, b"hello").await.unwrap();
+        tokio::fs::write(&foreign_path, b"hello").await.unwrap();
+        let file = FileAttachment {
+            original_name: "notes.txt".to_string(),
+            stored_path: old_path.display().to_string(),
+            media_type: "text/plain".to_string(),
+            size_bytes: 5,
+        };
+        let members = vec!["predecessor".to_string(), "successor".to_string()];
+        let accepted =
+            validate_submitted_attachments_at_roots(&root, &members, std::slice::from_ref(&file))
+                .await
+                .unwrap();
+        assert_eq!(accepted[0].stored_path, old_path.display().to_string());
+        let foreign = FileAttachment {
+            stored_path: foreign_path.display().to_string(),
+            ..file
+        };
+        assert!(matches!(
+            validate_submitted_attachments_at_roots(&root, &members, &[foreign]).await,
+            Err(AppError::BadRequest(message)) if message.contains("does not belong")
+        ));
+        #[cfg(unix)]
+        {
+            let escape = predecessor.join("escape.txt");
+            std::os::unix::fs::symlink(&foreign_path, &escape).unwrap();
+            let escaped = FileAttachment {
+                original_name: "escape.txt".to_string(),
+                stored_path: escape.display().to_string(),
+                media_type: "text/plain".to_string(),
+                size_bytes: 5,
+            };
+            assert!(matches!(
+                validate_submitted_attachments_at_roots(&root, &members, &[escaped]).await,
+                Err(AppError::BadRequest(message)) if message.contains("does not belong")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn continuation_attachment_authorization_uses_persisted_chain_prefix() {
+        use crate::api::types::FileAttachment;
+        async fn make_attachment(root: &std::path::Path, id: &str) -> FileAttachment {
+            let directory = root.join(id);
+            tokio::fs::create_dir_all(&directory).await.unwrap();
+            let path = directory.join("file.txt");
+            tokio::fs::write(&path, b"hello").await.unwrap();
+            FileAttachment {
+                original_name: "file.txt".to_string(),
+                stored_path: path.display().to_string(),
+                media_type: "text/plain".to_string(),
+                size_bytes: 5,
+            }
+        }
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        for id in ["root", "unrelated"] {
+            db.create_conversation(id, id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+        }
+        db.update_conversation_state(
+            "root",
+            &crate::state_machine::ConvState::ContextExhausted {
+                summary: "continue".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let middle_id = match db.continue_conversation("root").await.unwrap() {
+            crate::db::ContinueOutcome::Created(conversation) => conversation.id,
+            other => panic!("expected persisted root continuation, got {other:?}"),
+        };
+        db.update_conversation_state(
+            &middle_id,
+            &crate::state_machine::ConvState::ContextExhausted {
+                summary: "continue".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let latest_id = match db.continue_conversation(&middle_id).await.unwrap() {
+            crate::db::ContinueOutcome::Created(conversation) => conversation.id,
+            other => panic!("expected persisted middle continuation, got {other:?}"),
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let root_file = make_attachment(root.path(), "root").await;
+        let latest_file = make_attachment(root.path(), &latest_id).await;
+        let unrelated_file = make_attachment(root.path(), "unrelated").await;
+
+        validate_continuation_attachments_at_root(
+            &db,
+            root.path(),
+            &latest_id,
+            std::slice::from_ref(&root_file),
+        )
+        .await
+        .expect("latest continuation accepts root attachment");
+        assert!(matches!(
+            validate_continuation_attachments_at_root(
+                &db,
+                root.path(),
+                &middle_id,
+                std::slice::from_ref(&latest_file),
+            )
+            .await,
+            Err(AppError::BadRequest(message)) if message.contains("does not belong")
+        ));
+        assert!(matches!(
+            validate_continuation_attachments_at_root(
+                &db,
+                root.path(),
+                &latest_id,
+                &[unrelated_file],
+            )
+            .await,
+            Err(AppError::BadRequest(message)) if message.contains("does not belong")
+        ));
     }
 
     #[tokio::test]
@@ -21800,6 +22003,133 @@ mod conversation_route_tests {
     use super::*;
     use crate::api::handlers::hard_delete_cascade_tests::make_test_state;
     use crate::db::{ContinuationContent, ContinueOutcome, ConvState, MessageContent};
+
+    #[tokio::test]
+    async fn retry_continuation_opening_reuses_exact_pending_intent() {
+        use phoenix_workflow::ClientTurnKey;
+
+        let state = make_test_state().await;
+        let parent = state
+            .db
+            .create_conversation("pending-root", "pending-root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_state(
+                &parent.id,
+                &ConvState::ContextExhausted {
+                    summary: "predecessor summary".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let (outcome, pending) = state
+            .db
+            .continue_conversation_with_intent(
+                &parent.id,
+                crate::db::NewContinuationDispatchIntent::user_authorized(
+                    ClientTurnKey::new("stable-opening-message").unwrap(),
+                    "the original accepted handoff".to_string(),
+                    Some("original-client".to_string()),
+                ),
+            )
+            .await
+            .unwrap();
+        let ContinueOutcome::Created(successor) = outcome else {
+            panic!("expected a reserved successor");
+        };
+        let pending = pending.expect("persisted opening intent");
+
+        let response = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/conversations/{}/retry-continuation-opening",
+                        parent.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["conversation_id"], successor.id);
+
+        let still_pending = state
+            .db
+            .continuation_dispatch_intent(&parent.id)
+            .await
+            .unwrap()
+            .expect("unsettled opening remains retryable");
+        assert_eq!(still_pending.message_id, pending.message_id);
+        assert_eq!(still_pending.handoff, pending.handoff);
+        assert_eq!(still_pending.user_agent, pending.user_agent);
+        assert_eq!(still_pending.opening_authority, pending.opening_authority);
+        assert_eq!(
+            still_pending.successor_conversation_id,
+            pending.successor_conversation_id
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_continuation_opening_without_pending_intent_does_not_create_successor() {
+        let state = make_test_state().await;
+        let parent = state
+            .db
+            .create_conversation(
+                "no-pending-root",
+                "no-pending-root",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_state(
+                &parent.id,
+                &ConvState::ContextExhausted {
+                    summary: "predecessor summary".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let response = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/conversations/{}/retry-continuation-opening",
+                        parent.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(state
+            .db
+            .get_conversation(&parent.id)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .is_none());
+        assert!(state
+            .db
+            .continuation_dispatch_intent(&parent.id)
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     #[tokio::test]
     async fn product_conversation_route_resolves_product_id_to_its_canonical_root() {

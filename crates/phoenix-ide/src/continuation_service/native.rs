@@ -415,6 +415,9 @@ impl ContinuationApplicationService {
                 );
             }
         };
+        self.runtime
+            .publish_continuation_link(&request.predecessor_transcript_id, &successor.id)
+            .await;
         let result = match opening {
             CoordinatorContinuationOpening::Accepted {
                 accepted_message_id,

@@ -78,6 +78,8 @@ export const productConversationScenarioDefinitions = [
   { id: 'reminders-retry-mutation-rejection', title: 'Reminder refresh retry and mutation conflict', viewport: 'mobile', state: 'ready' },
   { id: 'source-call-global', title: 'One-click Global source send', viewport: 'desktop', state: 'ready' },
   { id: 'source-call-ordinary', title: 'One-click historical ordinary source send', viewport: 'desktop', state: 'ready' },
+  { id: 'mobile-continuation-ordinary', title: 'Mobile ordinary continuation liveness', viewport: 'mobile', state: 'ready' },
+  { id: 'mobile-continuation-global', title: 'Mobile Global continuation liveness', viewport: 'mobile', state: 'ready' },
 ] as const satisfies readonly {
   id: string;
   title: string;
@@ -115,6 +117,7 @@ interface ScenarioCommon {
   chain?: ChainView;
   snapshotError?: string;
   reminderFixture?: ReminderFixture;
+  continuationJourney?: boolean;
 }
 
 export type ProductConversationScenario = ScenarioCommon & (

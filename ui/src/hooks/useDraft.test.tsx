@@ -1,10 +1,13 @@
 import { StrictMode, useLayoutEffect } from 'react';
 import type { ReactNode } from 'react';
 import { act, renderHook } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import type { Conversation } from '../api';
+import { describe, expect, it, vi } from 'vitest';
+import { ConversationContext } from '../conversation/ConversationContext';
+import { ConversationStore } from '../conversation/ConversationStore';
 import { DraftContext } from '../conversation/DraftContext';
 import { DraftStore } from '../conversation/DraftStore';
-import { useDraftRecovery } from './useDraft';
+import { clearDraftStorage, DraftLifecycle, useDraftRecovery, useDraftValue } from './useDraft';
 
 function wrapperFor(store: DraftStore) {
   return function Wrapper({ children }: { children: ReactNode }) {
@@ -12,7 +15,144 @@ function wrapperFor(store: DraftStore) {
   };
 }
 
+function productDraftWrapper(drafts: DraftStore, conversations: ConversationStore) {
+  const scope = 'product:pc-1';
+  conversations.upsertSnapshot('transcript-1', {
+    id: 'transcript-id',
+    slug: 'transcript-1',
+  } as Conversation);
+  return function Wrapper({ children }: { children: ReactNode }) {
+    return (
+      <ConversationContext.Provider value={conversations}>
+        <DraftContext.Provider value={drafts}>
+          <StrictMode>
+            <DraftLifecycle slug={scope} productScope={{ legacyTranscriptSlug: 'transcript-1' }} />
+            {children}
+          </StrictMode>
+        </DraftContext.Provider>
+      </ConversationContext.Provider>
+    );
+  };
+}
+
 const payload = { id: 'one', text: 'raw', images: [], files: [], error: 'missing' };
+
+describe('product composer draft lifecycle', () => {
+  it.each(['unmount', 'timer'] as const)('does not resurrect a hard-deleted product draft from its pending %s flush', mode => {
+    vi.useFakeTimers();
+    localStorage.clear();
+    localStorage.setItem('phoenix:draft:product:pc-1', 'persisted draft');
+    const drafts = new DraftStore();
+    const { result, unmount } = renderHook(() => useDraftValue('product:pc-1'), {
+      wrapper: productDraftWrapper(drafts, new ConversationStore()),
+    });
+    try {
+      expect(result.current).toBe('persisted draft');
+      act(() => drafts.dispatch('product:pc-1', { type: 'set_draft', text: 'not yet persisted' }));
+      act(() => {
+        clearDraftStorage('product:pc-1');
+        drafts.remove('product:pc-1');
+        if (mode === 'unmount') unmount();
+      });
+      act(() => vi.runAllTimers());
+      expect(localStorage.getItem('phoenix:draft:product:pc-1')).toBeNull();
+      expect(drafts.getSnapshot('product:pc-1').draft).toBe('');
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+    expect(localStorage.getItem('phoenix:draft:product:pc-1')).toBeNull();
+  });
+
+  it.each(['unmount', 'timer'] as const)('does not overwrite a replacement draft with a retired %s writer', mode => {
+    vi.useFakeTimers();
+    localStorage.clear();
+    const drafts = new DraftStore();
+    const { unmount } = renderHook(() => useDraftValue('product:pc-1'), {
+      wrapper: productDraftWrapper(drafts, new ConversationStore()),
+    });
+    try {
+      act(() => drafts.dispatch('product:pc-1', { type: 'set_draft', text: 'retired draft' }));
+      act(() => {
+        clearDraftStorage('product:pc-1');
+        drafts.remove('product:pc-1');
+        drafts.recovery('product:pc-1');
+        drafts.dispatch('product:pc-1', { type: 'set_draft', text: 'replacement draft' });
+        localStorage.setItem('phoenix:draft:product:pc-1', 'replacement draft');
+        if (mode === 'unmount') unmount();
+      });
+      act(() => vi.runAllTimers());
+      expect(localStorage.getItem('phoenix:draft:product:pc-1')).toBe('replacement draft');
+      expect(drafts.getSnapshot('product:pc-1').draft).toBe('replacement draft');
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+    expect(localStorage.getItem('phoenix:draft:product:pc-1')).toBe('replacement draft');
+  });
+
+  it.each(['unmount', 'timer'] as const)('persists a current product draft through its %s flush in StrictMode', mode => {
+    vi.useFakeTimers();
+    localStorage.clear();
+    const drafts = new DraftStore();
+    const { unmount } = renderHook(() => useDraftValue('product:pc-1'), {
+      wrapper: productDraftWrapper(drafts, new ConversationStore()),
+    });
+    try {
+      act(() => drafts.dispatch('product:pc-1', { type: 'set_draft', text: 'current draft' }));
+      if (mode === 'unmount') unmount();
+      else act(() => vi.runAllTimers());
+      expect(localStorage.getItem('phoenix:draft:product:pc-1')).toBe('current draft');
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['setItem', 'removeItem'] as const)('hydrates readable legacy text even when migration %s throws', method => {
+    localStorage.clear();
+    localStorage.setItem('phoenix:draft:transcript-id', 'legacy draft');
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const failure = vi.spyOn(localStorage, method).mockImplementation(() => { throw new Error('storage unavailable'); });
+    const drafts = new DraftStore();
+    const { result, unmount } = renderHook(() => useDraftValue('product:pc-1'), {
+      wrapper: productDraftWrapper(drafts, new ConversationStore()),
+    });
+    try {
+      expect(result.current).toBe('legacy draft');
+      expect(localStorage.getItem('phoenix:draft:transcript-id')).toBe('legacy draft');
+      if (method === 'removeItem') expect(localStorage.getItem('phoenix:draft:product:pc-1')).toBe('legacy draft');
+      expect(warning).toHaveBeenCalled();
+    } finally {
+      unmount();
+      failure.mockRestore();
+      warning.mockRestore();
+    }
+  });
+
+  it('migrates a transcript draft once and preserves an explicit clear over a surviving legacy key', () => {
+    localStorage.clear();
+    localStorage.setItem('phoenix:draft:transcript-id', 'legacy draft');
+    const drafts = new DraftStore();
+    const wrapper = productDraftWrapper(drafts, new ConversationStore());
+    const { result, unmount } = renderHook(() => useDraftValue('product:pc-1'), { wrapper });
+
+    expect(result.current).toBe('legacy draft');
+    expect(localStorage.getItem('phoenix:draft:product:pc-1')).toBe('legacy draft');
+    expect(localStorage.getItem('phoenix:draft:transcript-id')).toBeNull();
+
+    // Reintroduce a surviving legacy key after the successful migration.
+    localStorage.setItem('phoenix:draft:transcript-id', 'legacy draft');
+    act(() => drafts.dispatch('product:pc-1', { type: 'clear_draft' }));
+    unmount();
+
+    const remounted = renderHook(() => useDraftValue('product:pc-1'), {
+      wrapper: productDraftWrapper(drafts, new ConversationStore()),
+    });
+    expect(remounted.result.current).toBe('');
+    expect(localStorage.getItem('phoenix:draft:product:pc-1')).toBe('');
+  });
+});
 
 describe('useDraftRecovery lifetime', () => {
   it('reacquires on same-slug removal even when rejected submissions stay empty', () => {

@@ -395,9 +395,11 @@ describe('useConversationsRefreshDriver — REQ-VS-014 hard-delete cascade', () 
       store!.upsertSnapshot('leaf-slug', makeConv('leaf-slug', 'leaf-id'));
       draftStore!.dispatch('root-slug', { type: 'set_draft', text: 'root draft' });
       draftStore!.dispatch('leaf-slug', { type: 'set_draft', text: 'leaf draft' });
+      draftStore!.dispatch('product:product-id', { type: 'set_draft', text: 'aggregate draft' });
     });
     localStorage.setItem('phoenix:draft:root-id', 'root draft');
     localStorage.setItem('phoenix:draft:leaf-id', 'leaf draft');
+    localStorage.setItem('phoenix:draft:product:product-id', 'aggregate draft');
 
     act(() => {
       window.dispatchEvent(
@@ -414,8 +416,10 @@ describe('useConversationsRefreshDriver — REQ-VS-014 hard-delete cascade', () 
       expect(store!.listSnapshots()).toEqual([]);
       expect(draftStore!.getSnapshot('root-slug').draft).toBe('');
       expect(draftStore!.getSnapshot('leaf-slug').draft).toBe('');
+      expect(draftStore!.getSnapshot('product:product-id').draft).toBe('');
       expect(localStorage.getItem('phoenix:draft:root-id')).toBeNull();
       expect(localStorage.getItem('phoenix:draft:leaf-id')).toBeNull();
+      expect(localStorage.getItem('phoenix:draft:product:product-id')).toBeNull();
     });
   });
 

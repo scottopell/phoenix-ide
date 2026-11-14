@@ -5,6 +5,7 @@ import { decodedRouteReference } from '../transcriptReference';
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import { ChainWorkIdentityBlock } from '../components/ChainWorkIdentityBlock';
 import { AutomaticContinuationControl } from '../components/AutomaticContinuationControl';
+import { PendingContinuationOpening } from '../components/PendingContinuationOpening';
 import { MessageListSkeleton } from '../components/Skeleton';
 import {
   ApiResponseError,
@@ -1208,6 +1209,8 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
     setSnapshotRetry((retry) => retry + 1);
   }, [snapshot?.product_conversation_id]);
 
+  const observedContinuationId = currentLatestProjection?.conversation?.continued_in_conv_id ?? null;
+
   useEffect(() => {
     const notificationIds = new Set([
       productConversationId,
@@ -1224,19 +1227,32 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
         && (close.phase !== 'completed'
           || close.outcome === 'close_incomplete'
           || close.outcome === 'archived_cleanup_attention');
-      if (source === 'close' || closeNeedsLiveRefresh) setSnapshotRetry((retry) => retry + 1);
+      if (source === 'close' || closeNeedsLiveRefresh || observedContinuationId) {
+        setSnapshotRetry((retry) => retry + 1);
+      }
     };
     const unsubscribes = [...notificationIds].map((id) =>
       subscribeCloseSnapshotChanged(id, refresh));
     return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
-  }, [ordinarySnapshot?.close, productConversationId, snapshot]);
-
-  const observedContinuationId = currentLatestProjection?.conversation?.continued_in_conv_id ?? null;
+  }, [ordinarySnapshot?.close, productConversationId, snapshot, observedContinuationId]);
 
   useEffect(() => {
     if (currentLatestProjection?.conversationId !== snapshot?.latest_transcript_row_id) return;
     if (observedContinuationId) setSnapshotRetry((value) => value + 1);
   }, [currentLatestProjection?.conversationId, observedContinuationId, snapshot?.latest_transcript_row_id]);
+
+  useEffect(() => {
+    if (!observedContinuationId) return;
+    const recover = () => {
+      if (document.visibilityState === 'visible') setSnapshotRetry((retry) => retry + 1);
+    };
+    window.addEventListener('online', recover);
+    document.addEventListener('visibilitychange', recover);
+    return () => {
+      window.removeEventListener('online', recover);
+      document.removeEventListener('visibilitychange', recover);
+    };
+  }, [observedContinuationId]);
 
   useEffect(() => {
     if (!currentLatestProjection?.conversationId || !ordinarySnapshot) return;
@@ -1561,6 +1577,18 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
       data-testid="product-conversation-page"
       ref={coordinator || inheritedJourney ? undefined : journey.attach}
     >
+      {snapshot.latest_opening.status === 'pending' && <PendingContinuationOpening
+        key={snapshot.latest_opening.edge.continuation_message_id}
+        predecessorId={snapshot.latest_opening.edge.predecessor_transcript_row_id}
+        enabled={isOpen && !closeInProgress}
+        onRecovered={() => setSnapshotRetry(retry => retry + 1)}
+      />}
+      {observedContinuationId && !error && (
+        <section role="status" aria-label="Continuation readback pending">
+          <span>Continuation readback pending.</span>{' '}
+          <button type="button" onClick={() => setSnapshotRetry(retry => retry + 1)}>Retry live view</button>
+        </section>
+      )}
       {ordinarySnapshot && <ProductConversationHeader
         snapshot={ordinarySnapshot}
         productConversationId={snapshot.product_conversation_id}
@@ -1598,8 +1626,15 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
         <div className="error-message" role="alert">Original source transcript unavailable.</div>
       )}
       {(olderError || error || hashTargetExhausted) && (
-        <div className="product-conversation-page__status" role="alert">
+        <div
+          className="product-conversation-page__status"
+          role="alert"
+          aria-label={error ? 'Live view refresh failed' : undefined}
+        >
           {olderError ?? error ?? 'The linked message is not available in this conversation history.'}
+          {error && (
+            <button type="button" onClick={() => setSnapshotRetry((retry) => retry + 1)}>Retry live view</button>
+          )}
         </div>
       )}
       <section className="view active product-conversation-page__transcript" data-testid="product-conversation-transcript">
@@ -1661,6 +1696,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
         >
           <EmbeddedConversationPage
             slug={liveTranscriptRowId}
+            composerScopeKey={`product:${snapshot.product_conversation_id}`}
             showTranscript={false}
             embeddedShell
             suppressCanonicalization={true}

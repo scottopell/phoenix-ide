@@ -558,6 +558,16 @@ export const productConversationScenarios = [
   }),
 ] as const satisfies readonly ProductConversationScenario[];
 
+export function makeMobileContinuationScenario(kind: 'ordinary' | 'coordinator'): ProductConversationScenario {
+  const base = getProductConversationScenario('mobile-open');
+  if (!base.snapshot) throw new Error('mobile-open requires snapshot data');
+  const id = kind === 'ordinary' ? 'mobile-continuation-ordinary' : 'mobile-continuation-global';
+  return kind === 'coordinator'
+    ? { ...base, id, title: 'Mobile Global continuation liveness', kind: 'coordinator', initialEntry: `/global/${base.snapshot.latest_transcript_row_id}`, snapshot: coordinatorSnapshot(base.snapshot), continuationJourney: true }
+    : { ...base, id, title: 'Mobile ordinary continuation liveness', continuationJourney: true };
+}
+
+
 export function getProductConversationScenario(id: 'global-lazy-history'): GlobalProductConversationScenario;
 export function getProductConversationScenario(id: Exclude<ProductConversationScenarioId, 'global-lazy-history'>): OrdinaryProductConversationScenario;
 export function getProductConversationScenario(id: ProductConversationScenarioId): ProductConversationScenario;

@@ -2417,6 +2417,7 @@ async fn provision_conversation(
                     ),
                     model: Some(resolved_model.clone()),
                     archived: Some(persisted_conversation.archived),
+                    continued_in_conv_id: None,
                 },
             });
     }

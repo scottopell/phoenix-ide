@@ -1410,6 +1410,13 @@ export type CodexRedeemResult =
   | { type: 'account_changed' }
   | { type: 'failed' };
 
+export interface ContinueConversationResult {
+  conversation_id: string;
+  slug?: string;
+  status: 'accepted' | 'dispatch_failed' | 'already_exists';
+  error?: string;
+}
+
 export const api = {
   async authStatus(): Promise<AuthStatus> {
     const resp = await fetch('/api/auth/status');
@@ -2780,15 +2787,22 @@ export const api = {
     return resp.json();
   },
 
+  async retryContinuationOpening(convId: string): Promise<ContinueConversationResult> {
+    const resp = await fetch(`/api/conversations/${encodeURIComponent(convId)}/retry-continuation-opening`, {
+      method: 'POST',
+    });
+    if (!resp.ok) {
+      const err = await resp.json();
+      if (resp.status === 409) throw new ConflictError(err as ConflictErrorDetail);
+      throw new Error(err.error || 'Failed to retry continuation opening');
+    }
+    return resp.json();
+  },
+
   async continueConversation(
     convId: string,
     request: { handoff: string; source?: ContinueHandoffSource; message_id: string; user_agent?: string; retry_failed_automatic?: boolean },
-  ): Promise<{
-    conversation_id: string;
-    slug?: string;
-    status: 'accepted' | 'dispatch_failed' | 'already_exists';
-    error?: string;
-  }> {
+  ): Promise<ContinueConversationResult> {
     const resp = await fetch(`/api/conversations/${convId}/continue`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

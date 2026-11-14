@@ -89,6 +89,12 @@ impl ContinuationApplicationService {
     ) -> Result<crate::api::ContinueConversationResponse, crate::api::handlers::AppError> {
         manual::continue_manual(self, parent_id, req).await
     }
+    pub(crate) async fn retry_pending_opening(
+        &self,
+        parent_id: &str,
+    ) -> Result<crate::api::ContinueConversationResponse, crate::api::handlers::AppError> {
+        manual::retry_pending_opening(self, parent_id).await
+    }
 
     #[must_use]
     pub(crate) fn new(runtime: Arc<RuntimeManager>) -> Self {
@@ -195,6 +201,10 @@ impl ContinuationApplicationService {
             .get_conversation(&intent.successor_conversation_id)
             .await
             .map_err(|error| error.to_string())?;
+
+        self.runtime
+            .publish_continuation_link(&admission.predecessor_conversation_id, &successor.id)
+            .await;
 
         if plan.transfer_ownership && automatic_intent {
             self.advance_current(

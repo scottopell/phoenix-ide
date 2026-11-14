@@ -49,7 +49,7 @@ export function DeferredRejection() {
             error_type: 'file_not_found', reference: '@missing/synthetic-reference.ts',
           }));
         }}>Reject pending A</button>
-        <ConnectedInputArea slug="composer-rejection" scopeKey="composer-rejection" cwd={undefined}
+        <ConnectedInputArea slug="composer-rejection" scopeKey="composer-rejection" uploadConversationId={undefined} cwd={undefined}
           convState={{ type: 'idle' }} images={images} setImages={setImages}
           files={files} setFiles={setFiles} isOffline={false} failedMessages={[]}
           onSend={() => {

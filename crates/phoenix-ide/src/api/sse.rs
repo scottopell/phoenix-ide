@@ -1292,6 +1292,33 @@ mod tests {
     }
 
     #[test]
+    fn conversation_update_serializes_continuation_link() {
+        let event = SseEvent::ConversationUpdate {
+            sequence_id: 1,
+            update: ConversationMetadataUpdate {
+                slug: None,
+                title: None,
+                cwd: None,
+                project_id: None,
+                project_name: None,
+                updated_at: None,
+                branch_name: None,
+                worktree_path: None,
+                conv_mode_label: None,
+                base_branch: None,
+                task_title: None,
+                work_scope_key: None,
+                model: None,
+                archived: None,
+                continued_in_conv_id: Some("successor".into()),
+            },
+        };
+        assert_parity(&event);
+        let value = typed_sse_event_to_value(&event);
+        assert_eq!(value["conversation"]["continued_in_conv_id"], "successor");
+    }
+
+    #[test]
     fn parity_conversation_update() {
         let event = SseEvent::ConversationUpdate {
             sequence_id: 18,
@@ -1310,6 +1337,7 @@ mod tests {
                 work_scope_key: None,
                 model: None,
                 archived: None,
+                continued_in_conv_id: None,
             },
         };
         assert_parity(&event);
