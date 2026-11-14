@@ -17,10 +17,10 @@ jobs:
           fetch-depth: 0
       - name: Materialize integration tree against PR base
         env:
-          INTEGRATION_BASE: ${{ github.event.pull_request.base.sha }}
+          INTEGRATION_REF: ${{ github.event.pull_request.base.ref }}
         run: |
-          printf '%s\n' "$INTEGRATION_BASE" > /tmp/tool-results-base.txt
-          git fetch --no-tags origin "$INTEGRATION_BASE"
+          git fetch --no-tags origin "$INTEGRATION_REF"
+          git rev-parse FETCH_HEAD > /tmp/tool-results-base.txt
           git -c user.name='Hosted QA' -c user.email='qa@example.invalid' merge --no-commit --no-ff FETCH_HEAD
           git write-tree | tee /tmp/tool-results-merge-tree.txt
       - uses: actions/setup-node@v6
