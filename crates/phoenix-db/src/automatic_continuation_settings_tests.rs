@@ -7,6 +7,9 @@ async fn new_aggregates_are_enabled_but_existing_preferences_survive_reopen_and_
     let path = dir.path().join("continuation.sqlite");
     let path = path.to_str().unwrap();
     let db = Database::open(path).await.unwrap();
+    crate::migrations::run_pending_migrations(db.pool())
+        .await
+        .unwrap();
     let ordinary = db
         .create_conversation("fresh-ordinary", "fresh-ordinary", "/tmp", true, None, None)
         .await
@@ -50,6 +53,9 @@ async fn new_aggregates_are_enabled_but_existing_preferences_survive_reopen_and_
     drop(db);
 
     let db = Database::open(path).await.unwrap();
+    crate::migrations::run_pending_migrations(db.pool())
+        .await
+        .unwrap();
     let again = db
         .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
         .await
@@ -726,6 +732,12 @@ async fn native_settings_reject_subagent_sources_targets_and_unpublished_product
         )
         .await
         .unwrap();
+    db.set_auto_continue_on_context_exhaustion(
+        &root.product_conversation_id,
+        AutoContinueOnContextExhaustion::Disabled,
+    )
+    .await
+    .unwrap();
     let child = db
         .create_subagent_conversation(
             "settings-subagent",
