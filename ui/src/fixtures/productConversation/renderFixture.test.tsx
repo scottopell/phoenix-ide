@@ -64,7 +64,13 @@ describe('ProductConversationFixture', () => {
     const route = document.documentElement.dataset['sourceFixtureLocation'];
     fireEvent.change(composer, { target: { value: 'Unsent mobile draft' } });
     act(() => window.dispatchEvent(new Event('product-conversation-fixture-continue')));
-    await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureEventSourceLastUrl']).toContain('fixture-successor'));
+    await waitFor(() => {
+      const streamUrl = document.documentElement.dataset['productConversationFixtureEventSourceLastUrl'];
+      expect(streamUrl).toBeDefined();
+      const parsed = new URL(streamUrl!, window.location.href);
+      expect(parsed.pathname).toBe('/api/conversation-reads/stream');
+      expect(parsed.searchParams.get('reference')).toBe('fixture-successor');
+    });
     await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureActiveEventSourceSubscriptions']).toBe('1'));
     expect(document.documentElement.dataset['sourceFixtureLocation']).toBe(route);
     expect(screen.queryByRole('button', { name: 'Open continuation' })).toBeNull();
@@ -271,7 +277,7 @@ describe('ProductConversationFixture', () => {
       await waitFor(() => expect(screen.queryByRole('button', { name: 'Edit annotation 1' })).not.toBeInTheDocument());
       expect(draft).toHaveValue('');
       if (sendFailure === 'unacknowledged') {
-        await screen.findByRole('button', { name: 'Retry' });
+        expect(await screen.findAllByRole('button', { name: 'Retry' })).not.toHaveLength(0);
         expect(JSON.parse(localStorage.getItem('phoenix:queue:reaction-work')!)).toHaveLength(1);
         act(() => window.dispatchEvent(new Event('product-conversation-fixture-acknowledge-last-send')));
       }

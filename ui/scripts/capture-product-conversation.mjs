@@ -13,7 +13,13 @@ async function assertMobileContinuation(page, id, viewport, outDir) {
   const route = await page.locator('html').getAttribute('data-source-fixture-location');
   await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--before.png`, fullPage: true });
   await page.evaluate(() => window.dispatchEvent(new Event('product-conversation-fixture-continue')));
-  await page.waitForFunction(() => document.documentElement.dataset.productConversationFixtureEventSourceLastUrl?.includes('fixture-successor') && document.documentElement.dataset.productConversationFixtureActiveEventSourceSubscriptions === '1');
+  await page.waitForFunction(() => {
+    const streamUrl = document.documentElement.dataset.productConversationFixtureEventSourceLastUrl;
+    if (!streamUrl || document.documentElement.dataset.productConversationFixtureActiveEventSourceSubscriptions !== '1') return false;
+    const parsed = new URL(streamUrl, window.location.href);
+    return parsed.pathname === '/api/conversation-reads/stream'
+      && parsed.searchParams.get('reference') === 'fixture-successor';
+  });
   await page.evaluate(() => window.dispatchEvent(new Event('product-conversation-fixture-successor-message')));
   await page.getByText('Successor is streaming after the handoff.', { exact: true }).waitFor();
   if (await input.inputValue() !== 'Unsent mobile draft') throw new Error('Continuation lost the unsent draft');

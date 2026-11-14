@@ -539,10 +539,8 @@ async fn pending_replay_requires_current_successor_capacity_and_retains_winning_
     );
     let mut links = Vec::new();
     while let Ok(event) = predecessor_events.try_recv() {
-        if let SseEvent::ConversationUpdate { update, .. } = event
-            && let Some(id) = update.continued_in_conv_id
-        {
-            links.push(id);
+        if let crate::runtime::SseEvent::ConversationUpdate { update, .. } = event {
+            links.extend(update.continued_in_conv_id);
         }
     }
     assert_eq!(links, vec![intent.successor_conversation_id.clone()]);

@@ -202,14 +202,15 @@ export function useDraftLifecycle(slug: string, productScope?: { legacyTranscrip
         else writeDraft(pending.conversationId, pending.value);
       }
     }
+    const currentDraft = store.getSnapshot(slug).draft;
     pending.conversationId = conversationId;
-    pending.value = draft;
+    pending.value = currentDraft;
     pending.timer = window.setTimeout(() => {
-      if (isProductScope) writeProductDraft(conversationId, draft);
-      else writeDraft(conversationId, draft);
+      if (isProductScope) writeProductDraft(conversationId, currentDraft);
+      else writeDraft(conversationId, currentDraft);
       pending.timer = null;
     }, DEBOUNCE_MS);
-  }, [conversationId, draft, isProductScope]);
+  }, [conversationId, draft, isProductScope, slug, store]);
 
   // Flush any pending write on unmount (page close, navigation away).
   useEffect(() => {

@@ -82,6 +82,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   window.addEventListener('product-conversation-fixture-release-older', releaseOlderPage);
 
   api.getProductConversationHistorySnapshot = async (_productConversationId, options = {}) => {
+    const requestOptions = options ?? {};
     if (scenario.kind === 'coordinator') throw new Error('Global must not request ordinary history');
     if (scenario.sourceSnapshot && _productConversationId !== 'fixture-product-conversation') {
       if (scenario.sourceIsGlobal) throw new Error("Global must not request ordinary snapshot");
@@ -99,8 +100,8 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     if (!scenario.snapshot) {
       throw new Error(`Scenario ${scenario.id} is missing snapshot data`);
     }
-    if (options.before) {
-      const older = scenario.olderPages?.[options.before] ?? (options.before === scenario.snapshot.before ? scenario.olderSnapshot : undefined);
+    if (requestOptions.before) {
+      const older = scenario.olderPages?.[requestOptions.before] ?? (requestOptions.before === scenario.snapshot.before ? scenario.olderSnapshot : undefined);
       if (!older) {
         throw new Error(`Scenario ${scenario.id} received an unexpected older-history cursor`);
       }
@@ -115,7 +116,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       await heldOlderPage;
       return older;
     }
-    if (!currentSnapshot) throw new Error(`Scenario ${scenario.id} has no current snapshot`);
+    if (!currentSnapshot || !('close' in currentSnapshot)) throw new Error(`Scenario ${scenario.id} has no ordinary snapshot`);
     return currentSnapshot;
   };
 
@@ -304,7 +305,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       record('LastSentText', body.text ?? '');
       lastSubmittedMessage = {
         event_presentation: null, message_id: `${conversation.id}:${body.message_id}`, conversation_id: conversation.id,
-        sequence_id: Math.max(0, ...messages.map(message => message.sequence_id)) + 1,
+        sequence_id: Math.max(0, ...currentMessages.map(message => message.sequence_id)) + 1,
         message_type: 'user', content: { text: body.text ?? '' }, created_at: new Date().toISOString(),
       };
       if (scenario.sendFailure === 'before-acceptance') return Response.json({ error: 'Fixture expansion rejected', error_type: 'file_not_found', reference: '@missing.ts' }, { status: 422 });
