@@ -324,7 +324,7 @@ async fn continue_with_operation(
             }
             let (handoff, expansion_policy) = match intent.opening_authority {
                 phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext => (
-                    summary.summary.as_str(),
+                    intent.handoff.as_str(),
                     crate::send_chat_service::MessageExpansionPolicy::GeneratedPredecessorContext,
                 ),
                 phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction => (

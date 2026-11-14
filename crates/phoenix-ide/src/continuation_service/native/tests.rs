@@ -319,12 +319,14 @@ async fn failed_automatic_retry_rearms_terminal_unmaterialized_turn_without_repl
             .unwrap()
             .unwrap();
     let user_agent = "phoenix-automatic-continuation";
+    let saved_handoff = "Short generated winner.";
+    assert_ne!(saved_handoff, SUMMARY);
     let (_, intent) =
         f.db.continue_conversation_with_intent(
             &f.predecessor,
             phoenix_db::NewContinuationDispatchIntent {
                 message_id: admission.first_message_id.clone(),
-                handoff: SUMMARY.into(),
+                handoff: saved_handoff.into(),
                 user_agent: Some(user_agent.into()),
                 opening_authority: admission.opening_authority,
             },
@@ -347,7 +349,7 @@ async fn failed_automatic_retry_rearms_terminal_unmaterialized_turn_without_repl
             .send(crate::send_chat_service::SendChatRequest {
                 conversation_id: successor_id.clone(),
                 origin: InputOrigin::SystemGenerated,
-                text: SUMMARY.into(),
+                text: saved_handoff.into(),
                 message_id: admission.first_message_id.as_str().into(),
                 images: Vec::new(),
                 files: Vec::new(),

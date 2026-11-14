@@ -91,6 +91,10 @@ Source-only publication/recovery review of `6316b31a06e8768c25e25565e0c8c844b2f5
 
 The six ordinary/Global mobile-light before/followed/reconnected images from artifact `assistant-finalization-geometry-9cb1e67156862e6bb7e0e6aec4d8557142dd9654` were inspected in the predecessor session. The selected unsent draft remains visible, followed and post-reconnect successor messages appear, no redundant Open continuation is shown, and no obvious clipped composer/action overflow is visible at 390×844. The capture script also passed same-native-editor, active focus, selection 3..9, delayed INIT/readback, and unique post-reconnect message assertions. This is synthetic touch-capable mobile-browser evidence, not physical keyboard/PWA qualification. Subsequent backend fixes supersede the exact whole-source identity; final-source hosted artifacts remain required.
 
+### Differing generated winner on terminal retry
+
+Exact source review of `6316b31a06e8768c25e25565e0c8c844b2f521c7..e994159a3dc3588b1f6816fb9c787d243b0f6e59` found no actionable frontend finding, but identified an inherited on-path backend gap: failed-automatic terminal rearm used the predecessor summary instead of a persisted generated winner with different bytes. The winning shortened handoff therefore failed the prepared-fingerprint comparison. The branch now rearms with `intent.handoff`; generated authority still selects generated-context expansion, not user-instruction authority. The service regression now persists and accepts a distinct `Short generated winner.` while the predecessor retains the original summary. This must fail with the old substitution and preserves the same-turn rearm, metadata and admission assertions. The defect predates this PR but is addressed because the payload-free saved-opening retry intentionally shares this path. Hosted execution at the final corrective head remains required.
+
 ## Bounded lifecycle audit
 
 All entries below describe source-present coverage unless an exact hosted result is separately cited.
