@@ -10,106 +10,106 @@ datadog-tracing = ["dep:datadog-opentelemetry"]
 
 [dependencies]
 # Shared domain vocabulary (acyclic base crate)
-phoenix-core = { path = "../phoenix-core" }
+phoenix-core = { workspace = true }
 
 # LLM provider abstraction (LlmService trait, Anthropic/OpenAI/codex/mock
 # providers, model registry, credential + gateway resolution, SSE parsing).
 # Extracted so provider churn no longer recompiles the api/runtime layers.
-phoenix-llm = { path = "../phoenix-llm" }
+phoenix-llm = { workspace = true }
 
 # PTY-backed terminal sessions (spawn, relay, command tracking, session
 # registry). The axum/WebSocket glue lives here in `api::terminal_ws`, not in
 # the library crate, to keep phoenix-terminal acyclic.
-phoenix-terminal = { path = "../phoenix-terminal" }
+phoenix-terminal = { workspace = true }
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { workspace = true, features = ["full"] }
 
 # Web framework
-axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
-hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "service", "tokio"] }
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
-rustls-pki-types = "1"
-tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
-tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "fs", "compression-br", "compression-gzip", "trace"] }
+axum = { workspace = true, features = ["macros", "ws", "multipart"] }
+hyper-util = { workspace = true, features = ["server-auto", "server-graceful", "service", "tokio"] }
+rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-pki-types = { workspace = true }
+tokio-rustls = { workspace = true, features = ["aws_lc_rs", "tls12"] }
+tower = { workspace = true }
+tower-http = { workspace = true, features = ["cors", "fs", "compression-br", "compression-gzip", "trace"] }
 
 # Local TLS CA + leaf-cert issuance (separate workspace member to keep
 # `phoenix-tls`'s cold-compile cost off `phoenix-tls` itself).
-phoenix-tls = { path = "../phoenix-tls" }
+phoenix-tls = { workspace = true }
 
 # Skill discovery, metadata, and invocation. Extracted so the
 # `phoenix-tools` crate can call it without depending on phoenix-ide.
-phoenix-skills = { path = "../phoenix-skills" }
+phoenix-skills = { workspace = true }
 
 # Named-agent discovery (.claude/agents, .agents/agents) for the spawn-time
 # agent_type resolution and persona composition.
-phoenix-agents = { path = "../phoenix-agents" }
-phoenix-browser = { path = "../phoenix-browser" }
+phoenix-agents = { workspace = true }
+phoenix-browser = { workspace = true }
 
 # Tool implementations (bash, patch, browser, tmux, search, …). The Tool
 # trait, ToolContext, and ToolRegistry live here. The axum/HTTP glue that
 # drives tools (api::handlers, api::browser_view) stays in phoenix-ide.
-phoenix-tools = { path = "../phoenix-tools" }
+phoenix-tools = { workspace = true }
 
 # SQLite persistence (conversations, messages, steering queues, migrations).
 # Extracted so the persistence layer is a leaf depending only on phoenix-core.
-phoenix-db = { path = "../phoenix-db" }
-phoenix-svg = { path = "../phoenix-svg" }
+phoenix-db = { workspace = true }
+phoenix-svg = { workspace = true }
 
 # Pure conversation reducer (Elm-architecture state machine). Extracted so the
 # runtime/executor depend *down* onto the reducer + shared domain vocabulary.
-phoenix-state-machine = { path = "../phoenix-state-machine" }
-phoenix-workflow = { path = "../phoenix-workflow" }
+phoenix-state-machine = { workspace = true }
+phoenix-workflow = { workspace = true }
 
 # Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-schemars = { version = "0.8", features = ["uuid1"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+schemars = { workspace = true, features = ["uuid1"] }
 
 # Database
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
 
 # HTTP client
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+reqwest = { workspace = true, features = ["json", "stream", "rustls"] }
 
 # Socket configuration
-socket2 = "0.6"
+socket2 = { workspace = true }
 
 # Enumerate host interface addresses to decide whether a request originates on
 # the server host (gates host-local file-manager reveal — see api/local_reveal.rs).
-if-addrs = "0.13"
+if-addrs = { workspace = true }
 
 # Cross-platform (macOS + Linux) process/system resource sampling for the
 # About-this-deployment endpoint (specs/deployment-info/).
-sysinfo = "0.33"
+sysinfo = { workspace = true }
 
 # Async utilities
-async-trait = "0.1"
-futures = "0.3"
-tokio-stream = { version = "0.1", features = ["sync"] }
-tokio-util = "0.7"
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
+tokio-util = { workspace = true }
 
 # Static file embedding
 # `compression` (include-flate/DEFLATE) stores embedded UI assets compressed
 # in the binary and transparently inflates them on `.data` access. Shrinks the
 # release binary by ~15MB with no functional change — debug builds still serve
 # from the filesystem (no `debug-embed`), so this only affects release embeds.
-rust-embed = { version = "8", features = ["compression"] }
-mime_guess = "2"
+rust-embed = { workspace = true, features = ["compression"] }
+mime_guess = { workspace = true }
 
 # Utilities
-percent-encoding = "2.3"
-uuid = { version = "1", features = ["v4", "v5", "serde"] }
-chrono-tz = "0.10"
-chrono = { version = "0.4", features = ["serde"] }
-flate2 = "1"
-thiserror = "2"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+percent-encoding = { workspace = true }
+uuid = { workspace = true, features = ["v4", "v5", "serde"] }
+chrono-tz = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+flate2 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 # Non-blocking file writer for the optional PHOENIX_LOG_FILE sink. The worker
 # thread + WorkerGuard keep log I/O off the async runtime (specs/deployment-info/).
-tracing-appender = "0.2"
+tracing-appender = { workspace = true }
 
 # Trace export: `tracing-opentelemetry` bridges Phoenix `tracing` spans into
 # OpenTelemetry, then logging.rs selects exactly one exporter at startup.
@@ -120,72 +120,72 @@ tracing-appender = "0.2"
 # gRPC transport; upstream proto messages still depend on tonic codegen types.
 # Version pinning: published datadog-opentelemetry 0.4 uses opentelemetry 0.31,
 # so tracing-opentelemetry must be 0.32 (not 0.33, which needs otel 0.32).
-datadog-opentelemetry = { version = "0.4", optional = true }
-tracing-opentelemetry = "0.32"
-opentelemetry = "0.31"
-opentelemetry_sdk = "0.31"
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
-base64 = "0.22"
-sha2 = "0.11"
-rand = "0.10"
-fs2 = "0.4"
+datadog-opentelemetry = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+fs2 = { workspace = true }
 # Process management and PTY
-nix = { version = "0.31", features = ["signal", "process", "term", "fs"] }
-libc = "0.2"
+nix = { workspace = true, features = ["signal", "process", "term", "fs"] }
+libc = { workspace = true }
 
 # Gitignore-aware directory walking (for file search)
-ignore = "0.4"
+ignore = { workspace = true }
 
 # Temp dirs for materializing a branch ref's SKILL.md files during GitTree
 # skill discovery (resolution_root); also used across tests.
-tempfile = "3"
+tempfile = { workspace = true }
 
 # Markdown event-stream parser. Used to mask code regions during inline-
 # reference tokenization so `@`/`/` sigils inside fenced/inline/indented
 # code blocks don't get expanded as file or skill references.
-pulldown-cmark = { version = "0.13", default-features = false }
+pulldown-cmark = { workspace = true }
 
-taskmd-core = ">=1.3,<2"
-listenfd = "1.0.2"
-nucleo-matcher = "0.3.1"
+taskmd-core = { workspace = true }
+listenfd = { workspace = true }
+nucleo-matcher = { workspace = true }
 
 # Locating tmux on PATH at registry init (specs/tmux-integration/REQ-TMUX-003).
-which = "8"
+which = { workspace = true }
 
 # Rust -> TypeScript type codegen for the SSE wire format.
 # Used by the `export_sse_types` test in `src/api/wire.rs` to (re)generate
 # `ui/src/generated/sse.ts` on every `cargo test` run. CI guards staleness
 # via `git diff --exit-code ui/src/generated/` in `./dev.py check`.
-ts-rs = { version = "12", features = ["serde-compat", "chrono-impl"] }
+ts-rs = { workspace = true, features = ["serde-compat", "chrono-impl"] }
 
 [dev-dependencies]
 # Re-declared with test-support so phoenix-core's #[cfg(test)] domain
 # constructors (ContentBlock::tool_use, …) are visible to this crate's tests.
 # Dev-only: production `cargo build` never enables the feature.
-phoenix-core = { path = "../phoenix-core", features = ["test-support"] }
+phoenix-core = { workspace = true, features = ["test-support"] }
 # Re-declared with test-support so phoenix-llm's #[cfg(test)] registry
 # constructors (ModelRegistry::new_empty, for_test_with_sonnet) are visible to
 # this crate's runtime/api/chain tests. Dev-only.
-phoenix-llm = { path = "../phoenix-llm", features = ["test-support"] }
+phoenix-llm = { workspace = true, features = ["test-support"] }
 # Re-declared with test-support so phoenix-terminal's #[cfg(test)] ANSI/OSC
 # stream builders (full_command, TerminalStream) are visible to the api-layer
 # WebSocket relay tests. Dev-only.
-phoenix-terminal = { path = "../phoenix-terminal", features = ["test-support"] }
+phoenix-terminal = { workspace = true, features = ["test-support"] }
 # Re-declared with test-support so phoenix-db's #[cfg(test)] `create_conversation`
 # explore-mode test wrapper is visible to this crate's tests. Dev-only.
-phoenix-db = { path = "../phoenix-db", features = ["test-support"] }
-opentelemetry_sdk = { version = "0.31", features = ["testing"] }
-opentelemetry-proto = { version = "=0.31.0", default-features = false, features = ["gen-tonic-messages", "trace"] }
-prost = "=0.14.4"
+phoenix-db = { workspace = true, features = ["test-support"] }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+opentelemetry-proto = { workspace = true, features = ["gen-tonic-messages", "trace"] }
+prost = { workspace = true }
 # Re-declared with test-support so runtime tests can drive the in-memory
 # tmux backend (`phoenix_tools::tmux::fake_backend`).
-phoenix-tools = { path = "../phoenix-tools", features = ["test-support"] }
-proptest = "1"
-rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
+phoenix-tools = { workspace = true, features = ["test-support"] }
+proptest = { workspace = true }
+rcgen = { workspace = true, features = ["pem", "aws_lc_rs"] }
 # `test-util` enables `tokio::time::pause`/`advance`, used by the
 # bounded-shutdown drain tests to exercise the SHUTDOWN_GRACE timeout
 # without waiting the full real-time deadline. `full` does not include it.
-tokio = { version = "1", features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

@@ -12,28 +12,28 @@ path = "src/lib.rs"
 # Shared domain vocabulary (ConvState, Event, ContentBlock, db schema types,
 # BashToolInput, QuotaDetails, LlmLanguage, Priority, …) — the reducer depends
 # *down* onto this base crate.
-phoenix-core = { path = "../phoenix-core" }
+phoenix-core = { workspace = true }
 
 # `cd`-prefix stripping for bash command display data (effect.rs).
-phoenix-bash-display = { path = "../phoenix-bash-display" }
+phoenix-bash-display = { workspace = true }
 
 # Serialization for JSON-valued tool inputs / display data.
-serde_json = "1"
+serde_json = { workspace = true }
 
 # Timestamps on persisted messages and outcomes.
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { workspace = true, features = ["serde"] }
 
 # TransitionError and friends.
-thiserror = "2"
+thiserror = { workspace = true }
 
 # Server-generated message identifiers for synthesized messages.
-uuid = { version = "1", features = ["v4"] }
+uuid = { workspace = true, features = ["v4"] }
 
 # Structured diagnostics from the reducer.
-tracing = "0.1"
+tracing = { workspace = true }
 
 # Task status/priority constants for the propose-task acceptance gate.
-taskmd-core = ">=1.3,<2"
+taskmd-core = { workspace = true }
 
 [dev-dependencies]
 # Re-declared with test-support so phoenix-core's #[cfg(test)] domain
@@ -41,16 +41,16 @@ taskmd-core = ">=1.3,<2"
 # tests are built in isolation (`cargo test -p phoenix-state-machine`), not
 # only when workspace feature unification happens to pull the feature in via
 # phoenix-ide. Dev-only: production `cargo build` never enables it.
-phoenix-core = { path = "../phoenix-core", features = ["test-support"] }
+phoenix-core = { workspace = true, features = ["test-support"] }
 
 # Property-based tests for the reducer's invariants.
-proptest = "1"
+proptest = { workspace = true }
 
 # Deterministic RNG for the project proptest harness.
-rand = "0.10"
+rand = { workspace = true }
 
 # Temporary task-file fixtures for the propose-task acceptance tests.
-tempfile = "3"
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

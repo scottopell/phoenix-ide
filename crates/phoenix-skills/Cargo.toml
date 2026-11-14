@@ -10,14 +10,14 @@ path = "src/lib.rs"
 
 [dependencies]
 # Shared domain vocabulary (`SkillInvocation`) and `LlmLanguage`.
-phoenix-core = { path = "../phoenix-core" }
+phoenix-core = { workspace = true }
 
 # Built-in skills are embedded into the binary and extracted to disk.
-rust-embed = "8"
-tracing = "0.1"
+rust-embed = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

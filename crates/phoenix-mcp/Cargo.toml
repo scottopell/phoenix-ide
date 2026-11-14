@@ -11,46 +11,46 @@ path = "src/lib.rs"
 [dependencies]
 # Runtime-environment detection (config/data dir resolution for server configs
 # and the OAuth token/registration store).
-phoenix-core = { path = "../phoenix-core" }
+phoenix-core = { workspace = true }
 
 # Async transport trait (`McpTransport`, `ServerMessageSink`).
-async-trait = "0.1"
+async-trait = { workspace = true }
 
 # Async runtime (subprocess stdio, locks, timeouts, the callback listener).
-tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7"
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
 
 # Streaming combinators for the HTTP SSE response body.
-futures = "0.3"
+futures = { workspace = true }
 
 # HTTP client for the MCP Streamable HTTP transport (specs/mcp/); `form`
 # carries the OAuth token-endpoint grants (application/x-www-form-urlencoded).
-reqwest = { version = "0.13", default-features = false, features = ["json", "form", "stream", "rustls"] }
-rustls = { version = "0.23", default-features = false, features = ["std"] }
-httpdate = "1.0.3"
+reqwest = { workspace = true, features = ["json", "form", "stream", "rustls"] }
+rustls = { workspace = true, features = ["std"] }
+httpdate = { workspace = true }
 
 # Serialization (JSON-RPC messages, server configs, OAuth records).
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 
 # Timestamps on OAuth token/registration records.
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { workspace = true, features = ["serde"] }
 
 # PKCE verifier/challenge and state-parameter encoding.
-base64 = "0.22"
-sha2 = "0.11"
+base64 = { workspace = true }
+sha2 = { workspace = true }
 
 # Random session/state identifiers.
-uuid = { version = "1", features = ["v4"] }
+uuid = { workspace = true, features = ["v4"] }
 
-tracing = "0.1"
+tracing = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
-futures = "0.3"
+tempfile = { workspace = true }
+futures = { workspace = true }
 # test-util enables tokio::time::{pause, advance} for the deterministic
 # timer/ordering tests in the protocol and lifecycle suites.
-tokio = { version = "1", features = ["full", "test-util"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
 
 [lints]
 workspace = true
