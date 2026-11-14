@@ -59,6 +59,9 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   let latestEventSource: FixtureEventSource | null = null;
   let lastSubmittedMessage: Message | null = null;
   let currentSnapshot = scenario.snapshot;
+  let staleSnapshot: typeof currentSnapshot;
+  const holdStaleSnapshot = () => { staleSnapshot = currentSnapshot; };
+  window.addEventListener('product-conversation-fixture-stale-snapshot', holdStaleSnapshot);
   let currentConversation = latestConversation(scenario);
   let currentMessages = scenario.alignedLatestMessages
     ?? (scenario.snapshot?.segments.at(-1)?.messages ?? []) as Message[];
@@ -108,7 +111,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
 
   let snapshotUnavailable = false;
   const failSnapshot = () => { snapshotUnavailable = true; };
-  const restoreSnapshot = () => { snapshotUnavailable = false; };
+  const restoreSnapshot = () => { snapshotUnavailable = false; staleSnapshot = undefined; };
   const checkSnapshotFailure = () => {
     if (!snapshotUnavailable) return;
     throw new Error('Fixture continuation snapshot unavailable');
@@ -151,8 +154,9 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       await heldOlderPage;
       return older;
     }
-    if (!currentSnapshot || !('close' in currentSnapshot)) throw new Error(`Scenario ${scenario.id} has no ordinary snapshot`);
-    return currentSnapshot;
+    const snapshot = staleSnapshot ?? currentSnapshot;
+    if (!snapshot || !('close' in snapshot)) throw new Error(`Scenario ${scenario.id} has no ordinary snapshot`);
+    return snapshot;
   };
 
   api.getProductConversationSnapshot = async (reference, options = {}) => {
@@ -187,7 +191,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     if (![scenario.snapshot.product_conversation_id, ...scenario.snapshot.segments.map(segment => segment.transcript_row_id)].includes(reference)) throw new Error(`Unknown Global member: ${reference}`);
     snapshotRequestCount += 1;
     record('SnapshotRequests', snapshotRequestCount);
-    if (!options.before) return currentSnapshot as typeof scenario.snapshot;
+    if (!options.before) return (staleSnapshot ?? currentSnapshot) as typeof scenario.snapshot;
     const older = scenario.olderPages?.[options.before];
     if (!older) throw new Error(`Unknown Global cursor: ${options.before}`);
     record('OlderSnapshotRequests', Number(document.documentElement.dataset['productConversationFixtureOlderSnapshotRequests'] ?? '0') + 1);
@@ -608,6 +612,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
 
   return () => {
     window.removeEventListener('product-conversation-fixture-hold-older', holdOlderPage);
+    window.removeEventListener('product-conversation-fixture-stale-snapshot', holdStaleSnapshot);
     window.removeEventListener('product-conversation-fixture-fail-snapshot', failSnapshot);
     window.removeEventListener('product-conversation-fixture-restore-snapshot', restoreSnapshot);
     window.removeEventListener('product-conversation-fixture-release-older', releaseOlderPage);

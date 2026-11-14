@@ -37,6 +37,8 @@ Hosted [43636797869](https://github.com/scottopell/phoenix-ide/actions/runs/4363
 
 Independent review also identified a hydrated successor with a pending opening unmounting the composer after cold retention ended. The repair keeps an open aggregate's eligible embedded composer mounted while mutation authority remains disabled. The ordinary/Global regression now holds opening acceptance through real compaction phases and cold hydration, asserts DOM identity/focus and rejected submission, then separately releases opening and upload gates. Source-only formatting and diff checks are not behavioral qualification; exact-head hosted results and review remain required.
 
+The source-only review of `bc92612f1c2b39fdbffd0499188c7b5192513142..ead949fafdb2ab217ce84d96b245259a304b75ce` found a deterministic test-oracle mismatch: `InputArea.readOnly` gates dispatch but does not freeze local draft editing or bind a DOM `readonly` attribute. The test now checks actual mutation controls and rejected submission, including after upload completion while opening acceptance is still pending. This preserves local editing rather than introducing a new typing restriction. The same candidate's hosted clippy job 132578217732 also found a missing `sequence_id` field wildcard in the SSE test pattern; that compile repair is authored. Successful-but-stale predecessor snapshot regressions for ordinary and Global routes and a selection-range assertion are authored, not yet qualified.
+
 ## Bounded lifecycle audit
 
 All entries below describe source-present coverage unless an exact hosted result is separately cited.

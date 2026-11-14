@@ -227,7 +227,7 @@ async fn automatic_recovery_publishes_link_after_successor_was_reserved() {
 
     let mut links = Vec::new();
     while let Ok(event) = updates.try_recv() {
-        if let crate::runtime::SseEvent::ConversationUpdate { update } = event {
+        if let crate::runtime::SseEvent::ConversationUpdate { update, .. } = event {
             links.extend(update.continued_in_conv_id);
         }
     }
