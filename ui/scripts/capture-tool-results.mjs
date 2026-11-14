@@ -148,6 +148,19 @@ async function captureMobileExpandedSpacing({ page, id, outDir, viewport }) {
   if (copiedRead.aggregate.product_conversation_id !== 'fixture-review' || copiedRead.auto_continue_on_context_exhaustion !== false) {
     throw new Error('expanded preference read copy lost structured fields');
   }
+  let copiedSendOwner = null;
+  let copiedReadOwner = null;
+  if (viewport.hasTouch) {
+    const ownerCopies = page.locator('.compact-tool-group .compact-tool-owner-copy button');
+    await ownerCopies.nth(0).click();
+    copiedSendOwner = await page.evaluate(() => navigator.clipboard.readText());
+    await ownerCopies.nth(1).click();
+    copiedReadOwner = await page.evaluate(() => navigator.clipboard.readText());
+    if (!copiedSendOwner.includes('send_conversation_message') || copiedSendOwner.includes('read_automatic_continuation')
+        || !copiedReadOwner.includes('read_automatic_continuation') || copiedReadOwner.includes('send_conversation_message')) {
+      throw new Error('stacked copy controls did not retain their distinct message owners');
+    }
+  }
   const stack = await page.evaluate(() => {
     const group = document.querySelector('.compact-tool-group');
     const origin = group.getBoundingClientRect().top;
@@ -160,7 +173,7 @@ async function captureMobileExpandedSpacing({ page, id, outDir, viewport }) {
         text: el.matches('.compact-tool-card-summary, .compact-tool-detail-collapse') ? el.textContent : undefined };
     });
   });
-  await writeFile(path.join(outDir, `${stem}--stack.geometry.json`), `${JSON.stringify({ viewport, baseline, stack }, null, 2)}\n`);
+  await writeFile(path.join(outDir, `${stem}--stack.geometry.json`), `${JSON.stringify({ viewport, baseline, stack, copiedSendOwner, copiedReadOwner }, null, 2)}\n`);
   await page.screenshot({ path: path.join(outDir, `${stem}--read.png`), fullPage: true });
   await writeFile(path.join(outDir, `${stem}--read.geometry.json`), `${JSON.stringify({ viewport, readEvidence, copiedRead }, null, 2)}\n`);
   await page.locator('.compact-tool-selected-detail .compact-tool-detail-collapse').click();
