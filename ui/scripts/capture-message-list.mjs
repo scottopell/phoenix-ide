@@ -316,10 +316,11 @@ function collectTableMetrics(label) {
   };
 }
 
-async function collectNarrowMarkdownTableMetrics(page, viewport, label) {
+async function collectNarrowMarkdownTableMetrics(page, viewport, label, screenshotPath) {
   await page.setViewportSize(viewport);
   await page.waitForSelector('.conversation-markdown-table-scroll table');
   const patched = await page.evaluate(collectTableMetrics, `${label}:post`);
+  if (screenshotPath) await page.screenshot({ path: screenshotPath, fullPage: true });
   await page.addStyleTag({
     content: `
       .agent-text-block .conversation-markdown-table-scroll > table {
@@ -348,7 +349,12 @@ async function verifyNarrowMarkdownTable({ page, id, outDir }) {
   await page.evaluate((scenarioTheme) => {
     document.documentElement.classList.toggle('dark', scenarioTheme === 'dark');
   }, theme);
-  const narrow = await collectNarrowMarkdownTableMetrics(page, { width: 375, height: 900 }, `${theme}:narrow`);
+  const narrow = await collectNarrowMarkdownTableMetrics(
+    page,
+    { width: 375, height: 900 },
+    `${theme}:narrow`,
+    path.join(outDir, `${id}--narrow-table.png`),
+  );
   narrowMarkdownTableMetrics.push(desktop.baseline, desktop.patched, narrow.baseline, narrow.patched);
 
   for (const sample of [desktop.patched, narrow.patched]) {
@@ -379,7 +385,6 @@ async function verifyNarrowMarkdownTable({ page, id, outDir }) {
   if (narrow.patched.tableLayout !== 'fixed' || narrow.patched.cellOverflowWrap !== 'anywhere') {
     throw new Error(`Narrow table did not receive the narrow readability rule: ${JSON.stringify(narrow.patched)}`);
   }
-  await page.screenshot({ path: path.join(outDir, `${id}--narrow-table.png`), fullPage: true });
   console.log(`  verified narrow markdown table metrics (${id})`);
   return true;
 }
