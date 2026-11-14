@@ -482,7 +482,6 @@ describe('InputArea controlled-draft contract', () => {
     const { rerender } = renderInput({
       cwd: '/repo',
       scopeKey: 'conv-a',
-      uploadConversationId: 'conv-a',
       draft: currentDraft,
       onDraftChange,
     });
