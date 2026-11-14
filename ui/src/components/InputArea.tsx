@@ -58,13 +58,13 @@ interface InputAreaProps {
    */
   cwd: string | undefined;
   /**
-   * Composer identity (the conversation id). Transient composer state — voice
+   * Local composer identity. Transient composer state — voice
    * buffer, active autocomplete trigger, inline expansion error — resets when
    * this changes, so switching between two conversations that share a `cwd`
    * doesn't carry one's state into the other.
    */
   scopeKey: string | undefined;
-  uploadConversationId?: string | undefined;
+  uploadConversationId: string | undefined;
   convState: ConversationState;
   images: ImageData[];
   setImages: (images: ImageData[]) => void;
@@ -218,7 +218,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   recorderIdentityRef.current = recorderIdentity;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const attachmentConversationId = uploadConversationId ?? scopeKey;
+  const attachmentConversationId = uploadConversationId;
   const voiceSupported = isWebSpeechSupported();
   const [quickActionSending, setQuickActionSending] = useState(false);
 

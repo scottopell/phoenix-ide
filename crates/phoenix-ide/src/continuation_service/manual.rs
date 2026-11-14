@@ -207,7 +207,7 @@ async fn continue_with_operation(
                     .map_err(AppError::BadRequest)?;
                 if !review.source.fits() {
                     return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                        &format!(
+                        format!(
                             "Saved handoff exceeds reserved successor capacity: {:?}",
                             review.source
                         ),

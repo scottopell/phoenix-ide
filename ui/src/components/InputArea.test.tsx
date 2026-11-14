@@ -46,7 +46,7 @@ function RecoveryHarness({ send, scope = 'a', initialDraft = '  @missing.ts\n', 
   const [draft, setDraft] = useState(initialDraft);
   const [images, setImages] = useState<ImageData[]>(initialImages);
   const [files, setFiles] = useState<FileAttachment[]>([rejectedFile]);
-  return <InputArea cwd={undefined} scopeKey={scope} convState={idleState}
+  return <InputArea cwd={undefined} scopeKey={scope} uploadConversationId={scope} convState={idleState}
     draft={draft} onDraftChange={setDraft} images={images} setImages={setImages}
     files={files} setFiles={setFiles} isOffline={false} failedMessages={[]}
     onSend={send} onCancel={() => {}} onRetry={() => {}} />;
@@ -63,7 +63,7 @@ function ConnectedRecoveryHarness({ store, send, scope = 'a', initialFiles = [re
   const [files, setFiles] = useState<FileAttachment[]>(initialFiles);
   return <DraftContext.Provider value={store}>
     <button onClick={() => setFiles([{ ...rejectedFile, original_name: 'new.txt', stored_path: '/uploads/a/new.txt' }])}>Attach newer file</button>
-    <ConnectedInputArea quickAction={quickAction} slug={scope} cwd={undefined} scopeKey={scope} convState={idleState}
+    <ConnectedInputArea quickAction={quickAction} slug={scope} cwd={undefined} scopeKey={scope} uploadConversationId={scope} convState={idleState}
       images={images} setImages={setImages} files={files} setFiles={setFiles}
       isOffline={false} failedMessages={[]} onSend={send} onCancel={() => {}} onRetry={() => {}} />
   </DraftContext.Provider>;
@@ -397,6 +397,7 @@ function renderInput({
     <InputArea
       cwd={cwd}
       scopeKey={scopeKey ?? cwd}
+      uploadConversationId={scopeKey ?? cwd}
       convState={convState}
       images={[]}
       setImages={() => {}}
@@ -441,6 +442,7 @@ describe('InputArea controlled-draft contract', () => {
       <InputArea
         cwd="conv-b"
         scopeKey="conv-b"
+        uploadConversationId="conv-b"
         convState={idleState}
         images={[]}
         setImages={() => {}}
@@ -480,6 +482,7 @@ describe('InputArea controlled-draft contract', () => {
     const { rerender } = renderInput({
       cwd: '/repo',
       scopeKey: 'conv-a',
+      uploadConversationId: 'conv-a',
       draft: currentDraft,
       onDraftChange,
     });
@@ -490,6 +493,7 @@ describe('InputArea controlled-draft contract', () => {
       <InputArea
         cwd="/repo"
         scopeKey="conv-a"
+        uploadConversationId="conv-a"
         convState={idleState}
         images={[]}
         setImages={() => {}}
@@ -515,6 +519,7 @@ describe('InputArea controlled-draft contract', () => {
       <InputArea
         cwd="/repo"
         scopeKey="conv-b"
+        uploadConversationId="conv-b"
         convState={idleState}
         images={[]}
         setImages={() => {}}
@@ -664,6 +669,7 @@ describe('InputArea focusToken contract', () => {
       <InputArea
         cwd="conv-a"
         scopeKey="conv-a"
+        uploadConversationId="conv-a"
         convState={idleState}
         images={[]}
         setImages={() => {}}
@@ -692,6 +698,7 @@ describe('InputArea focusToken contract', () => {
             ref={ref}
             cwd="conv-a"
             scopeKey="conv-a"
+            uploadConversationId="conv-a"
             convState={idleState}
             images={[]}
             setImages={() => {}}
@@ -783,6 +790,7 @@ describe('InputArea cancellation affordance', () => {
     const commonProps = {
       cwd: 'conv-continuation',
       scopeKey: 'conv-continuation',
+      uploadConversationId: 'conv-continuation',
       images: [],
       setImages: () => {},
       files: [],
@@ -822,6 +830,7 @@ describe('InputArea cancellation affordance', () => {
     const commonProps = {
       cwd: 'conv-continuation',
       scopeKey: 'conv-continuation',
+      uploadConversationId: 'conv-continuation',
       images: [],
       setImages: () => {},
       isOffline: false,
@@ -855,6 +864,7 @@ describe('InputArea cancellation affordance', () => {
       <InputArea
         cwd="conv-recovery"
         scopeKey="conv-recovery"
+        uploadConversationId="conv-recovery"
         convState={{ type: 'awaiting_recovery', message: 'refreshing credentials', recovery_kind: 'credential', resume: { type: 'conversation_turn' } }}
         images={[]}
         setImages={() => {}}
@@ -878,6 +888,7 @@ describe('InputArea cancellation affordance', () => {
     const props = {
       cwd: 'conv-overload',
       scopeKey: 'conv-overload',
+      uploadConversationId: 'conv-overload',
       images: [],
       setImages: () => {},
       isOffline: false,
@@ -924,6 +935,7 @@ describe('InputArea cancellation affordance', () => {
       <InputArea
         cwd="conv-cancelling"
         scopeKey="conv-cancelling"
+        uploadConversationId="conv-cancelling"
         convState={{ type: 'cancelling_tool', current_tool: { id: 't', name: 'bash', input: {} } }}
         images={[]}
         setImages={() => {}}
@@ -949,6 +961,7 @@ describe('InputArea cancellation affordance', () => {
       <InputArea
         cwd="conv-awaiting-llm"
         scopeKey="conv-awaiting-llm"
+        uploadConversationId="conv-awaiting-llm"
         convState={{ type: 'awaiting_llm' }}
         images={[]}
         setImages={() => {}}
@@ -1093,7 +1106,7 @@ describe('bash tool rendering', () => {
   });
 });
 describe('InputArea continuation upload ownership', () => {
-  function UploadComposer({ scope, transcript }: { scope: string; transcript: string }) {
+  function UploadComposer({ scope, transcript }: { scope: string; transcript: string | undefined }) {
     const [files, setFiles] = useState<FileAttachment[]>([]);
     const [draft, setDraft] = useState('');
     return <InputArea cwd={undefined} scopeKey={scope} uploadConversationId={transcript}
@@ -1101,6 +1114,23 @@ describe('InputArea continuation upload ownership', () => {
       isOffline={false} failedMessages={[]} draft={draft} onDraftChange={setDraft}
       onSend={() => {}} onCancel={() => {}} onRetry={() => {}} />;
   }
+
+  it('never uploads with the product draft key while the transcript target is unhydrated', async () => {
+    const upload = vi.spyOn(api, 'uploadAttachments').mockResolvedValue([rejectedFile]);
+    const view = render(<UploadComposer scope="product:p" transcript={undefined} />);
+    fireEvent.drop(document.getElementById('input-area')!, {
+      dataTransfer: { types: ['Files'], files: [new File(['x'], 'notes.txt')] },
+    });
+    expect(upload).not.toHaveBeenCalled();
+    expect(screen.getByText('Open a conversation before attaching files.')).toBeInTheDocument();
+    view.rerender(<UploadComposer scope="product:p" transcript="b" />);
+    fireEvent.drop(document.getElementById('input-area')!, {
+      dataTransfer: { types: ['Files'], files: [new File(['x'], 'notes.txt')] },
+    });
+    await screen.findByText('notes.txt');
+    expect(upload).toHaveBeenCalledExactlyOnceWith('b', expect.any(Array));
+    upload.mockRestore();
+  });
 
   it('retains a pending upload across continuation and routes the next upload to the successor', async () => {
     let resolve!: (files: FileAttachment[]) => void;

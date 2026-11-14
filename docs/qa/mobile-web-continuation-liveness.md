@@ -71,6 +71,12 @@ The mobile capture now holds successor hydration, asserts the same native editor
 
 Run [43642525604](https://github.com/scottopell/phoenix-ide/actions/runs/43642525604) at historical head `b2a6cd0923afa11fe540d792b0f70fbc7032789d` exposed a nonexistent topology-query method in the newly authored test (clippy job 132593148104) and E2E startup failure from the new route's colon syntax after main's axum migration (132593148124). The branch is rebased onto `6316b31a06e8768c25e25565e0c8c844b2f521c7`; the route uses `{id}`, and the test queries `Database::chain_members_forward` using the predecessor root. The intermediate attempted `product_chain_topology` name was also not an API and is not retained. These are introduced test/integration defects, not unrelated failures. Historical source/runs above remain intermediate evidence only; all final review and qualification must use the new base/head. No local compile/test workaround was used.
 
+### Explicit upload target during cold hydration
+
+Independent UI review of `6316b31a06e8768c25e25565e0c8c844b2f521c7..c2049d2b05e8d20065a3c5e32bd3db090c4cb2b0` found that an unavailable transcript upload target fell back to the stable `product:…` draft key. The retained cold composer could therefore send a file drop to an invalid transcript endpoint. `InputArea` now requires an explicit upload-target prop (which can be unavailable), with no draft-key fallback. All direct callers were migrated; a regression requires no request while unhydrated and a request to the successor once hydrated. Existing same-product in-flight upload retention remains covered separately. This is source-authored evidence pending hosted tests.
+
+At `c2049d2b05e8d20065a3c5e32bd3db090c4cb2b0`, hosted clippy job 132595110049 rejected an unnecessary borrow in the new capacity error; that source lint is corrected. No local tests/builds were run. The final-source qualification and image-inspection gates remain open.
+
 ## Bounded lifecycle audit
 
 All entries below describe source-present coverage unless an exact hosted result is separately cited.

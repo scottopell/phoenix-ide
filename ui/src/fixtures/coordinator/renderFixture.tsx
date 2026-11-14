@@ -106,6 +106,7 @@ function FixtureConversation({ scenario }: { scenario: CoordinatorScenario }) {
             <InputArea
               cwd={undefined}
               scopeKey={transcript.conversationId}
+              uploadConversationId={transcript.conversationId}
               convState={convState}
               images={images}
               setImages={setImages}
