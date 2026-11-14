@@ -67,6 +67,10 @@ Source review of `bc92612f1c2b39fdbffd0499188c7b5192513142..b2a6cd0923afa11fe540
 
 The mobile capture now holds successor hydration, asserts the same native editor plus active focus and nontrivial selection before/after release, and observes a new successor INIT instance and a new post-reconnect message instead of a fixed INIT count. This strengthens the synthetic browser oracle, not physical keyboard coverage. The UI source review's possible failure-phase editor-removal concern was not established: the current ordinary-composer eligibility predicate does not exclude recoverable continuation failure, and InputArea's retention special case excludes only awaiting-continuation when retention is off. Failure/retry phase execution remains a targeted coverage gap rather than a proven defect.
 
+### Hosted compiler and integration corrections
+
+Run [43642525604](https://github.com/scottopell/phoenix-ide/actions/runs/43642525604) at historical head `b2a6cd0923afa11fe540d792b0f70fbc7032789d` exposed a nonexistent topology-query method in the newly authored test (clippy job 132593148104) and E2E startup failure from the new route's colon syntax after main's axum migration (132593148124). The branch is rebased onto `6316b31a06e8768c25e25565e0c8c844b2f521c7`; the route uses `{id}`, and the test queries `Database::chain_members_forward` using the predecessor root. The intermediate attempted `product_chain_topology` name was also not an API and is not retained. These are introduced test/integration defects, not unrelated failures. Historical source/runs above remain intermediate evidence only; all final review and qualification must use the new base/head. No local compile/test workaround was used.
+
 ## Bounded lifecycle audit
 
 All entries below describe source-present coverage unless an exact hosted result is separately cited.

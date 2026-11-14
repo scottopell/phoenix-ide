@@ -324,7 +324,7 @@ pub fn create_router(state: AppState) -> Router {
             post(continue_conversation),
         )
         .route(
-            "/api/conversations/:id/retry-continuation-opening",
+            "/api/conversations/{id}/retry-continuation-opening",
             post(retry_continuation_opening),
         )
         // Task approval (REQ-BED-028)

@@ -281,10 +281,9 @@ async fn saved_opening_retry_requires_capacity_and_retains_generated_intent_and_
         original.successor_conversation_id
     );
     assert_eq!(
-        f.db.product_chain_topology(&f.product)
+        f.db.chain_members_forward(&f.predecessor)
             .await
             .unwrap()
-            .members
             .len(),
         2
     );
