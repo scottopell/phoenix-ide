@@ -27,8 +27,6 @@ tokio = { version = "1", features = ["full"] }
 
 # Web framework
 axum = { version = "0.7", features = ["macros", "ws", "multipart"] }
-axum-extra = { version = "0.9", features = ["typed-header"] }
-hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "service", "tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-pki-types = "1"
@@ -71,7 +69,6 @@ schemars = { version = "0.8", features = ["uuid1"] }
 
 # Database
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
-libsqlite3-sys = { version = "0.37", features = ["bundled"] }
 
 # HTTP client
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
@@ -132,13 +129,9 @@ base64 = "0.22"
 sha2 = "0.11"
 rand = "0.10"
 fs2 = "0.4"
-# Process management
 # Process management and PTY
 nix = { version = "0.31", features = ["signal", "process", "term", "fs"] }
 libc = "0.2"
-
-# OSC 133 parsing for CommandTracker (REQ-TERM-021)
-vte = "0.15"
 
 # Gitignore-aware directory walking (for file search)
 ignore = "0.4"
@@ -188,7 +181,7 @@ prost = "=0.14.4"
 # tmux backend (`phoenix_tools::tmux::fake_backend`).
 phoenix-tools = { path = "../phoenix-tools", features = ["test-support"] }
 proptest = "1"
-rcgen = "0.14"
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 # `test-util` enables `tokio::time::pause`/`advance`, used by the
 # bounded-shutdown drain tests to exercise the SHUTDOWN_GRACE timeout
 # without waiting the full real-time deadline. `full` does not include it.

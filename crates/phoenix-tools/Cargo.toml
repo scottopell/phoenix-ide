@@ -91,7 +91,6 @@ which = "8"
 libc = "0.2"
 fs2 = "0.4"
 nono = { version = "0.53", default-features = false }
-taskmd-core = ">=1.3,<2"
 
 # Typed errors.
 thiserror = "2"

@@ -38,7 +38,7 @@ x509-parser = "0.18"
 [dev-dependencies]
 tempfile = "3"
 phoenix-tls = { path = "../phoenix-tls" }
-rcgen = "0.14"
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 
 [lints]
 workspace = true
