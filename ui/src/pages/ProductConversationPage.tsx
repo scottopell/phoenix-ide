@@ -1580,7 +1580,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
       {snapshot.latest_opening.status === 'pending' && <PendingContinuationOpening
         key={snapshot.latest_opening.edge.continuation_message_id}
         predecessorId={snapshot.latest_opening.edge.predecessor_transcript_row_id}
-        enabled={isOpen && !closeAdmissionPending}
+        enabled={isOpen && !closeInProgress}
         onRecovered={() => setSnapshotRetry(retry => retry + 1)}
       />}
       {observedContinuationId && !error && (

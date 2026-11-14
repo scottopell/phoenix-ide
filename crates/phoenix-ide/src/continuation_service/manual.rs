@@ -109,90 +109,37 @@ pub(super) async fn retry_pending_opening(
     service: &ContinuationApplicationService,
     parent_id: &str,
 ) -> Result<ContinueConversationResponse, AppError> {
-    let parent = service
-        .runtime
-        .db()
-        .get_conversation(parent_id)
-        .await
-        .map_err(|error| AppError::NotFound(error.to_string()))?;
-    let _product_admission = service
-        .runtime
-        .lock_product_message_admission(parent.product_conversation_id.as_str())
-        .await;
-    let admission = service
-        .runtime
-        .mutation_admission(parent_id)
-        .await
-        .map_err(map_admission_db_error)?;
-    let _mutation_admission = admission.lock().await;
-
-    let parent = service
-        .runtime
-        .db()
-        .get_conversation(parent_id)
-        .await
-        .map_err(|error| AppError::NotFound(error.to_string()))?;
-    let lifecycle = service
-        .runtime
-        .db()
-        .message_target_admission(parent_id)
-        .await
-        .map_err(map_admission_db_error)?;
-    map_ordinary_mutation_admission(&lifecycle, "continuation opening retry")?;
-
-    let intent = service
-        .runtime
-        .db()
-        .continuation_dispatch_intent(parent_id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-        .ok_or_else(|| {
-            AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                "No pending continuation opening exists to retry",
-                "continuation_opening_not_pending",
-            )))
-        })?;
-    if intent.parent_conversation_id != parent_id
-        || parent.continued_in_conv_id.as_deref() != Some(intent.successor_conversation_id.as_str())
-    {
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            "Pending continuation opening no longer matches the predecessor's successor",
-            "continuation_opening_not_pending",
-        ))));
-    }
-
-    let successor = service
-        .runtime
-        .db()
-        .get_conversation(&intent.successor_conversation_id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
-    let successor_id = successor.id.clone();
-    let runtime = service.runtime.clone();
-    tokio::spawn(async move {
-        if let Err(error) = runtime.get_or_create(&successor_id).await {
-            tracing::warn!(
-                conv_id = %successor_id,
-                error = %error,
-                "failed to spawn runtime for continuation opening retry",
-            );
-        }
-    });
-
-    let (status, error) = dispatch_continuation_handoff(service, intent).await;
-    Ok(ContinueConversationResponse {
-        conversation_id: successor.id,
-        slug: successor.slug,
-        status,
-        error,
-    })
+    continue_with_operation(
+        service,
+        parent_id,
+        ManualContinuationOperation::RetryPending,
+    )
+    .await
 }
 
-#[allow(clippy::too_many_lines)]
 pub(super) async fn continue_manual(
     service: &ContinuationApplicationService,
     parent_id: &str,
     req: crate::api::ContinueConversationRequest,
+) -> Result<ContinueConversationResponse, AppError> {
+    continue_with_operation(
+        service,
+        parent_id,
+        ManualContinuationOperation::Selected(req),
+    )
+    .await
+}
+
+enum ManualContinuationOperation {
+    Selected(crate::api::ContinueConversationRequest),
+    RetryPending,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn continue_with_operation(
+    service: &ContinuationApplicationService,
+    parent_id: &str,
+    operation: ManualContinuationOperation,
 ) -> Result<ContinueConversationResponse, AppError> {
     let id = parent_id;
 
@@ -219,6 +166,46 @@ pub(super) async fn continue_manual(
         .get_conversation(id)
         .await
         .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let req = match operation {
+        ManualContinuationOperation::Selected(req) => req,
+        ManualContinuationOperation::RetryPending => {
+            let lifecycle = service
+                .runtime
+                .db()
+                .message_target_admission(id)
+                .await
+                .map_err(map_admission_db_error)?;
+            map_ordinary_mutation_admission(&lifecycle, "continuation opening retry")?;
+            let intent = service
+                .runtime
+                .db()
+                .continuation_dispatch_intent(id)
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?
+                .ok_or_else(|| {
+                    AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                        "No pending continuation opening exists to retry",
+                        "continuation_opening_not_pending",
+                    )))
+                })?;
+            if intent.parent_conversation_id != id
+                || parent.continued_in_conv_id.as_deref()
+                    != Some(intent.successor_conversation_id.as_str())
+            {
+                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    "Pending continuation opening no longer matches the predecessor's successor",
+                    "continuation_opening_not_pending",
+                ))));
+            }
+            crate::api::ContinueConversationRequest {
+                handoff: intent.handoff,
+                source: crate::api::ContinueHandoffSource::Manual,
+                message_id: intent.message_id.as_str().to_string(),
+                user_agent: intent.user_agent,
+                retry_failed_automatic: true,
+            }
+        }
+    };
     if req.handoff.trim().is_empty() {
         return Err(AppError::BadRequest(
             "Continuation handoff must not be empty.".to_string(),

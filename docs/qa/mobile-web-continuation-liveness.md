@@ -55,6 +55,12 @@ Exact source reviews of `bc92612f1c2b39fdbffd0499188c7b5192513142..44d41e7966c31
 
 Hosted [43640562526](https://github.com/scottopell/phoenix-ide/actions/runs/43640562526), source `44d41e7966c31631cd6ee08bf659f69c138c370f`, passed 4271 UI tests, including draft writer retirement and reconnect/source jump repairs, but still failed the two pending-opening acceptance assertions. The fixture updated its HTTP snapshot and dispatched focus without publishing the accepted opening on the transcript SSE stream. The fixture now emits an accepted-opening message on the active successor stream, matching the real projection input. This correction and the new recovery flow are authored, not yet executed at this revision. No local builds/tests/browser/server/install were run.
 
+### Shared retry orchestration correction
+
+Hosted [43641563819](https://github.com/scottopell/phoenix-ide/actions/runs/43641563819), source `28a4ff2cec9bd772e932c5fc1895cfb830cfe3ad`, failed UI/specs (132590217690): `closeAdmissionPending` was undefined and pending-opening rendering threw. The correction uses the existing `closeInProgress` gate. Clippy (132590217726), musl (132590217722), and E2E (132590217756) passed at that intermediate source; Rust build and visual capture were still running when inspected. No full-run pass is claimed.
+
+Independent delta review also found that directly dispatching a saved intent bypassed manual continuation's exact terminal/unmaterialized automatic-turn rearm. Both entry points now use one orchestration path; the payload-free retry first requires the existing matching pending intent under continuation/product/mutation locks, then retains the existing failed-automatic retry policy. A real-DB regression is authored for generated intent/authority retention and exactly two topology members. The exact terminal/unmaterialized service-level rearm journey remains an explicit coverage gap; existing lower-level rearm tests and shared code inspection are not a substitute for that journey. Source-only rustfmt and `git diff --check` pass; hosted execution at the corrective head is required.
+
 ## Bounded lifecycle audit
 
 All entries below describe source-present coverage unless an exact hosted result is separately cited.

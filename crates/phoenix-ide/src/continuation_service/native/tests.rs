@@ -247,6 +247,39 @@ async fn automatic_recovery_publishes_link_after_successor_was_reserved() {
 }
 
 #[tokio::test]
+async fn saved_opening_retry_retains_generated_intent_and_successor() {
+    let f = Fixture::new().await;
+    let original = f.reserve().await;
+    let response = f
+        .service()
+        .retry_pending_opening(&f.predecessor)
+        .await
+        .unwrap();
+    assert_eq!(response.conversation_id, original.successor_conversation_id);
+    assert_eq!(response.status, ContinueConversationStatus::DispatchFailed);
+    let retained =
+        f.db.continuation_dispatch_intent(&f.predecessor)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(retained.message_id, original.message_id);
+    assert_eq!(retained.handoff, original.handoff);
+    assert_eq!(retained.opening_authority, original.opening_authority);
+    assert_eq!(
+        retained.successor_conversation_id,
+        original.successor_conversation_id
+    );
+    assert_eq!(
+        f.db.product_conversation_topology(&f.product)
+            .await
+            .unwrap()
+            .members
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn existing_pending_reserved_continuation_intent_retains_its_opening_authority() {
     let f = Fixture::new().await;
     let key = "reminder:historical-opening";
