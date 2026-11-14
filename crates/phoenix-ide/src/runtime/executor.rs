@@ -12766,6 +12766,50 @@ fn persist_fresh_approved_task_artifact_blocking(
     )
 }
 
+fn prove_head_task_artifact_matches_reviewed_bytes(
+    cwd: &std::path::Path,
+    task_file: &str,
+    reviewed_body: &str,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    let mut hash = phoenix_core::git::command()
+        .arg("hash-object")
+        .arg("--stdin")
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to start reviewed artifact hash: {error}"))?;
+    let write_result = hash
+        .stdin
+        .take()
+        .expect("hash-object stdin")
+        .write_all(reviewed_body.as_bytes());
+    // Reap the child even when writing to its stdin failed.
+    let output = hash
+        .wait_with_output()
+        .map_err(|error| format!("failed to wait for reviewed artifact hash: {error}"))?;
+    write_result.map_err(|error| format!("failed to hash reviewed artifact: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "hash-object failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let reviewed_blob = String::from_utf8(output.stdout)
+        .map_err(|error| format!("hash-object returned non-UTF-8 output: {error}"))?
+        .trim()
+        .to_string();
+    let committed_blob = run_git(cwd, &["rev-parse", &format!("HEAD:{task_file}")])?;
+    if committed_blob != reviewed_blob {
+        return Err("committed task artifact differs from the reviewed bytes".to_string());
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn persist_fresh_approved_task_artifact_blocking_with_progress(
     cwd: &std::path::Path,
@@ -12887,34 +12931,12 @@ fn persist_fresh_approved_task_artifact_blocking_with_progress(
     // a clean filter). Native settlement must prove the exact HEAD artifact
     // even when no new commit was necessary. Keep the User path unchanged.
     if native || checkpoint_created {
-        let mut hash = phoenix_core::git::command()
-            .arg("hash-object")
-            .arg("--stdin")
-            .current_dir(cwd)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|error| FollowUpArtifactError::AfterGit(error.to_string()))?;
-        std::io::Write::write_all(
-            &mut hash.stdin.take().expect("hash-object stdin"),
-            snapshot.artifact_body.as_bytes(),
+        prove_head_task_artifact_matches_reviewed_bytes(
+            cwd,
+            &snapshot.task_file,
+            &snapshot.artifact_body,
         )
-        .map_err(|error| FollowUpArtifactError::AfterGit(error.to_string()))?;
-        let reviewed_blob = String::from_utf8(
-            hash.wait_with_output()
-                .map_err(|error| FollowUpArtifactError::AfterGit(error.to_string()))?
-                .stdout,
-        )
-        .map_err(|error| FollowUpArtifactError::AfterGit(error.to_string()))?
-        .trim()
-        .to_string();
-        let committed_blob = run_git(cwd, &["rev-parse", &format!("HEAD:{}", snapshot.task_file)])
-            .map_err(FollowUpArtifactError::AfterGit)?;
-        if committed_blob != reviewed_blob {
-            return Err(FollowUpArtifactError::AfterGit(
-                "committed task artifact differs from the reviewed bytes".to_string(),
-            ));
-        }
+        .map_err(FollowUpArtifactError::AfterGit)?;
     }
     Ok(snapshot)
 }
@@ -14609,7 +14631,7 @@ fn execute_approve_task_blocking_reviewed_with_progress(
     )?;
     if let Some(stem) = detect_plain_markdown_task_stem(task_file) {
         *progress = native_task_approval::ApprovalGitProgress::EffectsMayHaveOccurred;
-        return execute_approve_plain_markdown_blocking(
+        let result = execute_approve_plain_markdown_blocking(
             cwd,
             repo_root,
             conv_id,
@@ -14618,7 +14640,15 @@ fn execute_approve_task_blocking_reviewed_with_progress(
             title,
             desired_base_branch,
             reviewed.artifact_body,
-        );
+        )?;
+        if native {
+            prove_head_task_artifact_matches_reviewed_bytes(
+                std::path::Path::new(&result.worktree_path),
+                task_file,
+                &result.artifact_body,
+            )?;
+        }
+        return Ok(result);
     }
 
     *progress = native_task_approval::ApprovalGitProgress::EffectsMayHaveOccurred;
@@ -14691,6 +14721,14 @@ fn execute_approve_task_blocking_reviewed_with_progress(
         tracing::info!(branch = %branch_name, commit_msg = %commit_msg, "Task file committed on task branch");
     } else {
         tracing::info!(branch = %branch_name, "Task file already on the branch unchanged — no commit needed");
+    }
+
+    if native {
+        prove_head_task_artifact_matches_reviewed_bytes(
+            &worktree_path,
+            &format!("{tasks_dir_name}/{final_filename}"),
+            &reviewed.artifact_body,
+        )?;
     }
 
     Ok(TaskApprovalResult {

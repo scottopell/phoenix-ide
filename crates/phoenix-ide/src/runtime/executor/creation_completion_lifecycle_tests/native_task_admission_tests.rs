@@ -660,6 +660,9 @@ enum InitialApprovalScenario {
     FollowUpProjectionFailure,
     FileBackedInitialProjectionReplay,
     FileBackedInitialProjectionRecovery,
+    InitialTaskmdCleanFilterMismatch,
+    InitialPlainAssumeUnchangedMismatch,
+    InitialPlainMatchingHeadNoCommit,
 }
 
 struct InitialApprovalHarness {
@@ -745,6 +748,33 @@ async fn production_native_follow_up_taskmd_compensates_promotion_failure() {
     Box::pin(assert_production_initial_approval(
         InitialApprovalScenario::FollowUpCompensatedFailure,
         ReviewedTaskKind::Taskmd,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn production_initial_taskmd_clean_filter_mismatch_fails_closed() {
+    Box::pin(assert_production_initial_approval(
+        InitialApprovalScenario::InitialTaskmdCleanFilterMismatch,
+        ReviewedTaskKind::Taskmd,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn production_initial_plain_assume_unchanged_mismatch_fails_closed() {
+    Box::pin(assert_production_initial_approval(
+        InitialApprovalScenario::InitialPlainAssumeUnchangedMismatch,
+        ReviewedTaskKind::PlainMarkdown,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn production_initial_plain_matching_head_without_commit_succeeds() {
+    Box::pin(assert_production_initial_approval(
+        InitialApprovalScenario::InitialPlainMatchingHeadNoCommit,
+        ReviewedTaskKind::PlainMarkdown,
     ))
     .await;
 }
@@ -890,6 +920,48 @@ async fn assert_production_initial_approval_inner(
         ),
     };
     std::fs::write(worktree.join(task_file), BODY).unwrap();
+    let clean_filter_mismatch =
+        scenario == InitialApprovalScenario::InitialTaskmdCleanFilterMismatch;
+    let assume_unchanged_mismatch =
+        scenario == InitialApprovalScenario::InitialPlainAssumeUnchangedMismatch;
+    let matching_head_no_commit =
+        scenario == InitialApprovalScenario::InitialPlainMatchingHeadNoCommit;
+    if assume_unchanged_mismatch {
+        std::fs::write(worktree.join(task_file), "# Committed different bytes\n").unwrap();
+        std::fs::write(worktree.join(".gitignore"), ".phoenix/\n").unwrap();
+        git(&worktree, &["add", "--", task_file, ".gitignore"]);
+        git(
+            &worktree,
+            &["commit", "-m", "Seed different plain artifact"],
+        );
+        std::fs::write(worktree.join(task_file), BODY).unwrap();
+        git(
+            &worktree,
+            &["update-index", "--assume-unchanged", "--", task_file],
+        );
+        assert_eq!(git(&worktree, &["diff", "--cached", "--quiet"]).trim(), "");
+        assert_eq!(git(&worktree, &["diff", "--quiet"]).trim(), "");
+    } else if matching_head_no_commit {
+        std::fs::write(worktree.join(".gitignore"), ".phoenix/\n").unwrap();
+        git(&worktree, &["add", "--", task_file, ".gitignore"]);
+        git(&worktree, &["commit", "-m", "Seed matching plain artifact"]);
+    } else if clean_filter_mismatch {
+        std::fs::write(
+            worktree.join(".gitattributes"),
+            "tasks/*-in-progress--*.md filter=approval-clean\n",
+        )
+        .unwrap();
+        git(
+            &worktree,
+            &[
+                "config",
+                "filter.approval-clean.clean",
+                "sed 's/Keep these bytes./Changed bytes./'",
+            ],
+        );
+        git(&worktree, &["add", "--", ".gitattributes"]);
+        git(&worktree, &["commit", "-m", "Configure task clean filter"]);
+    }
     if kind == ReviewedTaskKind::Taskmd {
         git(&worktree, &["add", "--", task_file]);
         git(&worktree, &["commit", "-m", "Seed existing ready taskmd"]);
@@ -1021,7 +1093,10 @@ async fn assert_production_initial_approval_inner(
         | InitialApprovalScenario::InitialProjectionFailure
         | InitialApprovalScenario::FollowUpProjectionFailure
         | InitialApprovalScenario::FileBackedInitialProjectionReplay
-        | InitialApprovalScenario::FileBackedInitialProjectionRecovery => {
+        | InitialApprovalScenario::FileBackedInitialProjectionRecovery
+        | InitialApprovalScenario::InitialTaskmdCleanFilterMismatch
+        | InitialApprovalScenario::InitialPlainAssumeUnchangedMismatch
+        | InitialApprovalScenario::InitialPlainMatchingHeadNoCommit => {
             phoenix_llm::ModelRegistry::for_test_with_sonnet(llm.clone())
         }
     };
@@ -1436,6 +1511,109 @@ async fn assert_production_initial_approval_inner(
         harness.handle = Some(handle.clone());
         let broadcaster = manager.conversation_broadcaster("actor-target").await;
         let events = broadcaster.subscribe();
+        if clean_filter_mismatch || assume_unchanged_mismatch {
+            let before = native_rollback_snapshot(&f.db, "actor-target").await;
+            assert_eq!(
+                manager.execute_native_task_approval(command.clone()).await,
+                NativeTaskApprovalOutcome::Unavailable
+            );
+            handle.event_tx.closed().await;
+            // Observe the real owning fence before fixture cleanup can close it.
+            assert!(manager.local_authority_is_closed());
+            assert_eq!(
+                native_rollback_snapshot(&f.db, "actor-target").await,
+                before
+            );
+            assert_eq!(native_authority_binding(&f.db).await, before_binding);
+            let after_target = f.db.get_conversation("actor-target").await.unwrap();
+            assert_eq!(
+                after_target.attached_work_scope_id,
+                before_target.attached_work_scope_id
+            );
+            assert_eq!(
+                after_target.product_conversation_id,
+                before_target.product_conversation_id
+            );
+            assert_eq!(after_target.cwd, before_target.cwd);
+            assert_eq!(after_target.conv_mode, before_target.conv_mode);
+            assert_eq!(llm.calls.load(Ordering::SeqCst), 0);
+            assert!(matches!(
+                requests.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+            assert_eq!(
+                f.db.inspect_native_task_approval_command(&command)
+                    .await
+                    .unwrap(),
+                NativeTaskApprovalInspection::RequiresOwningActorAdmission
+            );
+
+            // Git effects are retained, not rolled back. Taskmd must inspect the
+            // promoted filename; plain must inspect HEAD even without a commit.
+            let after_head = git(&worktree, &["rev-parse", "HEAD"]).trim().to_owned();
+            assert_eq!(
+                git(
+                    &worktree,
+                    &["rev-list", "--count", &format!("{before_head}..HEAD")]
+                )
+                .trim(),
+                if clean_filter_mismatch { "1" } else { "0" }
+            );
+            if clean_filter_mismatch {
+                assert_ne!(after_head, before_head);
+                assert!(!worktree.join(task_file).exists());
+                assert_eq!(
+                    git(&worktree, &["show", &format!("HEAD:{committed_task_file}")]),
+                    BODY.replace("Keep these bytes.", "Changed bytes.")
+                );
+            } else {
+                assert_eq!(after_head, before_head);
+                assert_eq!(
+                    git(&worktree, &["show", &format!("HEAD:{committed_task_file}")]),
+                    "# Committed different bytes\n"
+                );
+                git(&worktree, &["diff", "--cached", "--quiet"]);
+            }
+            assert_eq!(
+                std::fs::read(worktree.join(committed_task_file)).unwrap(),
+                BODY.as_bytes()
+            );
+            assert_ne!(
+                git(&worktree, &["symbolic-ref", "--short", "HEAD"]),
+                before_branch
+            );
+            let after_worktrees = worktree_identity();
+            assert_eq!(
+                after_worktrees
+                    .iter()
+                    .filter(|line| line.starts_with("worktree "))
+                    .collect::<Vec<_>>(),
+                before_worktrees
+                    .iter()
+                    .filter(|line| line.starts_with("worktree "))
+                    .collect::<Vec<_>>()
+            );
+            let mut events = events;
+            loop {
+                match events.try_recv() {
+                    Ok(SseEvent::StateChange {
+                        state: ConvState::LlmRequesting { .. },
+                        ..
+                    })
+                    | Ok(SseEvent::ConversationUpdate { .. })
+                    | Ok(SseEvent::Message { .. }) => panic!(
+                        "mismatched HEAD must not publish approval state, metadata or context"
+                    ),
+                    Ok(_) => {}
+                    Err(
+                        tokio::sync::broadcast::error::TryRecvError::Empty
+                        | tokio::sync::broadcast::error::TryRecvError::Closed,
+                    ) => break,
+                    Err(error) => panic!("must not lose approval publication evidence: {error}"),
+                }
+            }
+            return;
+        }
         if matches!(
             scenario,
             InitialApprovalScenario::InitialReceiptFailure
@@ -1743,7 +1921,11 @@ async fn assert_production_initial_approval_inner(
     assert!(content.text.contains(approval_prefix));
     assert!(content.text.contains(BODY));
     let after_head = git(&worktree, &["rev-parse", "HEAD"]).trim().to_owned();
-    assert_ne!(after_head, before_head);
+    if matching_head_no_commit {
+        assert_eq!(after_head, before_head);
+    } else {
+        assert_ne!(after_head, before_head);
+    }
     if old_approved.is_some() {
         assert_eq!(
             git(&worktree, &["symbolic-ref", "--short", "HEAD"]),
@@ -1763,7 +1945,7 @@ async fn assert_production_initial_approval_inner(
             &["rev-list", "--count", &format!("{before_head}..HEAD")]
         )
         .trim(),
-        "1"
+        if matching_head_no_commit { "0" } else { "1" }
     );
     assert_eq!(
         git(&worktree, &["show", &format!("HEAD:{committed_task_file}")]),
@@ -1814,6 +1996,7 @@ async fn assert_production_initial_approval_inner(
         InitialApprovalScenario::ProviderSuccess
             | InitialApprovalScenario::FollowUpProviderSuccess
             | InitialApprovalScenario::DroppedCallerProviderSuccess
+            | InitialApprovalScenario::InitialPlainMatchingHeadNoCommit
     ) {
         let request = match provider_request.take() {
             Some(request) => request,
@@ -1984,7 +2167,8 @@ async fn assert_production_initial_approval_inner(
     let expected_calls = match scenario {
         InitialApprovalScenario::ProviderSuccess
         | InitialApprovalScenario::DroppedCallerProviderSuccess
-        | InitialApprovalScenario::FollowUpProviderSuccess => 1,
+        | InitialApprovalScenario::FollowUpProviderSuccess
+        | InitialApprovalScenario::InitialPlainMatchingHeadNoCommit => 1,
         InitialApprovalScenario::ContextPressure
         | InitialApprovalScenario::FreezeFailure
         | InitialApprovalScenario::FollowUpCompensatedFailure
@@ -1993,7 +2177,9 @@ async fn assert_production_initial_approval_inner(
         | InitialApprovalScenario::InitialProjectionFailure
         | InitialApprovalScenario::FollowUpProjectionFailure
         | InitialApprovalScenario::FileBackedInitialProjectionReplay
-        | InitialApprovalScenario::FileBackedInitialProjectionRecovery => 0,
+        | InitialApprovalScenario::FileBackedInitialProjectionRecovery
+        | InitialApprovalScenario::InitialTaskmdCleanFilterMismatch
+        | InitialApprovalScenario::InitialPlainAssumeUnchangedMismatch => 0,
     };
     assert_eq!(llm.calls.load(Ordering::SeqCst), expected_calls);
     assert!(requests.try_recv().is_err(), "no additional provider entry");
