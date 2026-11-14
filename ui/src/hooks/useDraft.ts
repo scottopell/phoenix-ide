@@ -28,8 +28,12 @@ function readProductDraft(scopeKey: string, legacyTranscriptId: string): string 
     const legacyKey = storageKey(legacyTranscriptId);
     const legacy = localStorage.getItem(legacyKey);
     if (legacy === null) return '';
-    localStorage.setItem(storageKey(scopeKey), legacy);
-    localStorage.removeItem(legacyKey);
+    try {
+      localStorage.setItem(storageKey(scopeKey), legacy);
+      localStorage.removeItem(legacyKey);
+    } catch (error) {
+      console.warn('Error persisting transcript draft migration:', error);
+    }
     return legacy;
   } catch (error) {
     console.warn('Error moving transcript draft to product scope:', error);

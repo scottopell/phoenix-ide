@@ -223,7 +223,15 @@ async fn automatic_recovery_publishes_link_after_successor_was_reserved() {
     f.runtime.get_or_create(&f.predecessor).await.unwrap();
     let mut updates = f.runtime.subscribe(&f.predecessor).await.unwrap();
 
-    f.service().drive_admission(&recovered).await.unwrap();
+    let error = f
+        .service()
+        .drive_admission(&recovered)
+        .await
+        .expect_err("empty registry has no provider for successor capacity review");
+    assert!(
+        error.contains("unavailable through its selected connection"),
+        "{error}"
+    );
 
     let mut links = Vec::new();
     while let Ok(event) = updates.try_recv() {

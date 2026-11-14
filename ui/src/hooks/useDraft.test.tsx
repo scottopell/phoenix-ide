@@ -2,7 +2,7 @@ import { StrictMode, useLayoutEffect } from 'react';
 import type { ReactNode } from 'react';
 import { act, renderHook } from '@testing-library/react';
 import type { Conversation } from '../api';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ConversationContext } from '../conversation/ConversationContext';
 import { ConversationStore } from '../conversation/ConversationStore';
 import { DraftContext } from '../conversation/DraftContext';
@@ -38,6 +38,27 @@ function productDraftWrapper(drafts: DraftStore, conversations: ConversationStor
 const payload = { id: 'one', text: 'raw', images: [], files: [], error: 'missing' };
 
 describe('product composer draft lifecycle', () => {
+  it.each(['setItem', 'removeItem'] as const)('hydrates readable legacy text even when migration %s throws', method => {
+    localStorage.clear();
+    localStorage.setItem('phoenix:draft:transcript-id', 'legacy draft');
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const failure = vi.spyOn(Storage.prototype, method).mockImplementation(() => { throw new Error('storage unavailable'); });
+    const drafts = new DraftStore();
+    const { result, unmount } = renderHook(() => useDraftValue('product:pc-1'), {
+      wrapper: productDraftWrapper(drafts, new ConversationStore()),
+    });
+    try {
+      expect(result.current).toBe('legacy draft');
+      expect(localStorage.getItem('phoenix:draft:transcript-id')).toBe('legacy draft');
+      if (method === 'removeItem') expect(localStorage.getItem('phoenix:draft:product:pc-1')).toBe('legacy draft');
+      expect(warning).toHaveBeenCalled();
+    } finally {
+      unmount();
+      failure.mockRestore();
+      warning.mockRestore();
+    }
+  });
+
   it('migrates a transcript draft once and preserves an explicit clear over a surviving legacy key', () => {
     localStorage.clear();
     localStorage.setItem('phoenix:draft:transcript-id', 'legacy draft');
@@ -49,9 +70,7 @@ describe('product composer draft lifecycle', () => {
     expect(localStorage.getItem('phoenix:draft:product:pc-1')).toBe('legacy draft');
     expect(localStorage.getItem('phoenix:draft:transcript-id')).toBeNull();
 
-    // Cover a legacy-key cleanup failure: the product-scope empty value must
-    // cleanup failure: the product-scope empty value must
-    // prevent a transcript-scoped copy from being imported on a later mount.
+    // Reintroduce a surviving legacy key after the successful migration.
     localStorage.setItem('phoenix:draft:transcript-id', 'legacy draft');
     act(() => drafts.dispatch('product:pc-1', { type: 'clear_draft' }));
     unmount();

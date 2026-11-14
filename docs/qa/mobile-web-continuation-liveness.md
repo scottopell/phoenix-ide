@@ -39,6 +39,8 @@ Independent review also identified a hydrated successor with a pending opening u
 
 The source-only review of `bc92612f1c2b39fdbffd0499188c7b5192513142..ead949fafdb2ab217ce84d96b245259a304b75ce` found a deterministic test-oracle mismatch: `InputArea.readOnly` gates dispatch but does not freeze local draft editing or bind a DOM `readonly` attribute. The test now checks actual mutation controls and rejected submission, including after upload completion while opening acceptance is still pending. This preserves local editing rather than introducing a new typing restriction. The same candidate's hosted clippy job 132578217732 also found a missing `sequence_id` field wildcard in the SSE test pattern; that compile repair is authored. Successful-but-stale predecessor snapshot regressions for ordinary and Global routes and a selection-range assertion are authored, not yet qualified.
 
+A fresh source-only review of `bc92612f1c2b39fdbffd0499188c7b5192513142..749bea6024fe502a5555685ab964e7403c59a505` found two further defects: the recovery fixture has an empty provider registry, so notification must be asserted after the expected capacity-review rejection rather than requiring successful dispatch; and migration housekeeping exceptions discarded an already readable legacy draft. The repair asserts the precise capacity error before checking the committed link, and returns recovered draft text despite best-effort migration write/cleanup errors. Throwing `setItem`/`removeItem` regressions are authored. No production mutation or local test execution was used to qualify these repairs.
+
 ## Bounded lifecycle audit
 
 All entries below describe source-present coverage unless an exact hosted result is separately cited.
