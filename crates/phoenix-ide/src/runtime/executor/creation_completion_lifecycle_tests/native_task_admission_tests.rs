@@ -47,7 +47,13 @@ impl AdmissionFixture {
         db_path: Option<std::path::PathBuf>,
     ) -> Self {
         let db = match &db_path {
-            Some(path) => Database::open(path.to_str().unwrap()).await.unwrap(),
+            Some(path) => {
+                let db = Database::open(path.to_str().unwrap()).await.unwrap();
+                // File-backed open runs legacy schema setup; production startup
+                // and open_in_memory also apply the numbered migrations.
+                phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
+                db
+            }
             None => Database::open_in_memory().await.unwrap(),
         };
         let target = db
