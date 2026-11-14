@@ -9,12 +9,18 @@ User decisions from the planning conversation:
 - "the scanner auto adds, put the burden on ember to remove if it’s truly stale, this would then be visible to next scan"
 - "deprecate roadmap as part of this, it’s so stale and infrequently used"
 - "Wait there is only one ember global coordinator though"
+- Granularity: "1) use recommendation" — one item per independently meaningful concern or commitment, with a resumption/follow-through note and no parent/child task hierarchy initially.
+- Discovery scope: "2) ember only, focus is less on promises the agents made and more on user requested work, see adhd related prompt suggestion in gh issues".
+
+Related source: [Issue #1075 — preserve curiosity threads](https://github.com/scottopell/phoenix-ide/issues/1075). Preserve current topic, meaningful earlier threads, decisions, unanswered questions and a useful resumption point. A curiosity/bookmark is distinct from requested work; changing topics neither abandons the old thread nor commissions more tasks. Answer the current question first, avoid repeated inventories and topic-switch permission questions, and give a short refresher when the user returns.
+
+Attention behavior remains under discussion: adding a durable record means retaining a bookmark/request for subsequent context; it does not itself create a timed reminder, subscription or work-dispatch request. The user's question about "saving" asks for clarification, not approval of a new automatic wake policy. Full-history versus an explicit date-bounded initial backfill is also still being reviewed; do not treat a cutoff date as decided or as an expiration policy for records already saved.
 
 There is ONE Ember singleton and ONE tracking list attached to its durable product identity, independent of transcript continuation. Remote Phoenix instances are locations of referenced work, not other owners of this list. No shared-list synchronization is commissioned.
 
 ## Observed journey and verified environment
 
-A user commissions work or Ember promises follow-through; work spans messages, continuations, conversations and PRs. The obligation can gradually disappear from successive summaries even though the history survives. Watches, reminders and message receipts retain input facts, not an independent still-owed obligation.
+A user requests work or explores a question, then changes topics; work and discussion span messages, continuations, conversations and PRs. The requested work or place to resume can gradually disappear from successive summaries even though the history survives. Watches, reminders and message receipts retain input facts, not an independent record of the user's unfinished work or conversational threads. Agent-made promises are supporting context, not the scanner's primary capture target.
 
 Source baseline: e74290876a587a8c1b795f91d623825f92d0cbde, clean detached checkout before planning; planning branch plan/ember-tracking-consistency. This is source investigation plus disposable local experiments, not deployed behavior qualification.
 
@@ -28,7 +34,7 @@ Roadmap Issue #806 was read through GitHub on 2026-11-14: its generated projecti
 
 | Concept | Responsibility |
 | --- | --- |
-| Tracking item | Why Ember keeps something in view and what follow-through remains |
+| Tracking item | User-requested work or a meaningful conversational bookmark, why it matters and where to resume |
 | ProductConversation / transcript | Durable execution identity / exact historical evidence |
 | Goal | One worker conversation's objective and disposition |
 | Authority | Saved standing instructions and scope grants |
@@ -40,7 +46,7 @@ Tracking does not mirror PR or worker runtime status, issue commands, create Goa
 
 ### Record and native interface
 
-Proposed record: server-owned stable ID, title, prose note explaining purpose/current understanding, follow-through (action/question/watch condition), tracking/resolved/dismissed disposition, required nonblank retirement reason when retired, revision and integer microsecond creation/update/review times. Last-reviewed time must mean an explicit review, not merely a successful scan.
+Proposed record: server-owned stable ID, title, prose note explaining purpose/current understanding, resumption/follow-through (next useful question, action or watch condition), tracking/resolved/dismissed disposition, required nonblank retirement reason when retired, revision and integer microsecond creation/update/review times. Preserve the distinction between a curiosity bookmark and explicitly requested work; phase 1 chooses the smallest representation that keeps bookmarks from becoming execution obligations. This distinction is not a new permission grant. Last-reviewed time must mean an explicit review, not merely a successful scan.
 
 Use child rows for typed references and originating evidence, with explicit ordinal. Phoenix locators include immutable instance identity, product identity for a current target, and exact transcript/message identity for historical evidence. PR locators identify repository and PR; no cached PR-state authority is introduced. References that outlive source deletion remain honest unavailable evidence rather than fabricating content. Decide their feature-scoped retention in the normative contract.
 
@@ -60,9 +66,9 @@ Keep /global chat-first. Establish what users can inspect through conversation/t
 
 ### Scanner and coverage
 
-Recommended initial discovery scope: the existing Ember continuation chain, incrementally over persisted user/assistant prose with preserved source origins; exclude raw tool dumps and inline child transcripts from blanket discovery. Linked workers may be read to reconcile an existing item. Scanning every ordinary/remote conversation is separate scope because it changes cost and produces duplicate low-level worker todos.
+User-selected discovery scope: ONLY the existing Ember continuation chain, incrementally over persisted user/assistant prose with preserved source origins. Capture user-requested work and meaningful unfinished conversational threads; assistant prose supplies context, decisions and stopping points rather than making agent promises the primary target. Exclude raw tool dumps and worker/inline-child transcripts from scanner discovery. Ember may still use existing tools to inspect linked workers while following up on a user request; that does not enroll those transcripts in discovery.
 
-Backfill the singleton chain in bounded batches, and state historical coverage precisely. Freeze an activation high-water boundary and maintain separate live and historical frontiers for each preexisting transcript; a new tail may advance without marking an older gap covered. New continuation members enter live coverage from their start. Use one bounded worker with fair lane selection, not a general scheduler. Old roadmap excerpts, quoted prompts and historical claims are evidence, never fresh commissions. Automatic historical capture may temporarily retain an already-stale suggestion whose later completion/cancellation has not yet been scanned. Preserve historical provenance and state freshness as unverified; Ember must inspect later/current evidence before acting. This is the user's accepted capture-first/Ember-retires policy, not a claim of complete chronological reconciliation. Prioritize scanning new persisted Ember content; historical backfill must not monopolize the worker. Resolve the exact source enrollment, start point and coverage UX in phase 1 before implementing automatic capture.
+Recommended historical scope is the whole singleton chain in bounded batches. The user is considering full history versus a date-bounded initial backfill; the exact start point remains a product decision. An optional lower date bound limits initial discovery only, never expires older tracked records, and must leave the excluded history explicitly unscanned. Freeze an activation high-water boundary and maintain separate live and historical frontiers for each preexisting transcript; a new tail may advance without marking an older gap covered. New continuation members enter live coverage from their start. Use one bounded worker with fair lane selection, not a general scheduler. Old roadmap excerpts, quoted prompts and historical claims are evidence, never fresh commissions. Automatic historical capture may temporarily retain an already-stale suggestion whose later completion/cancellation has not yet been scanned. Preserve historical provenance and state freshness as unverified; Ember must inspect later/current evidence before acting. A bookmark may remain useful without requiring action at all. Prioritize new persisted Ember content; historical backfill must not monopolize the worker. Resolve start-point/date semantics and coverage UX in phase 1 before implementing automatic capture.
 
 Use one supervised bounded background inference service, with durable per-transcript coverage/cursors, coalesced post-commit triggers and startup discovery. A missed trigger is recovered by querying uncovered committed content. Do not create an ordinary agent conversation, a Goal, or a general-purpose job scheduler for scans.
 

@@ -8,7 +8,7 @@ Demonstrate the complete user journey through the real assembled Coordinator sur
 
 ## Validation journeys
 
-1. User commissions an outcome; Ember/worker discussion includes two follow-ups. Direct tool tracking records one, scanner captures the omission with exact source evidence.
+1. User requests two meaningful pieces of work in Ember, then detours into a separate exploratory question. Direct tracking records one request, scanner captures the omitted request and a useful conversational bookmark with exact source evidence. The curiosity remains a bookmark, not another commissioned task. Worker-only promises are outside discovery scope. Returning to the question supplies a short refresher and resumes from the stopping point, as in Issue #1075.
 2. Continue Ember; fresh tracker index retains identity and owed step despite a deliberately terse handoff. Exact source evidence remains historical; current worker target follows continuation.
 3. Dismiss a stale record while inference is in flight. Stale apply changes neither registry nor cursor; next scan sees retirement. Rediscovering old source cannot reopen that existing retired record; a semantic duplicate under a new identity is measured separately, not incorrectly claimed impossible. Fresh user renewal is an explicit Ember change.
 4. Interrupt before/after capture/cursor commit; reopen the same supported DB. No partial committed capture/coverage or duplicate exact application. Model-call repetition is not represented as exactly-once billing.

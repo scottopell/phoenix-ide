@@ -15,6 +15,7 @@ Ember sees a fresh compact index of what it is tracking on subsequent dispatches
 - Update global-recall requirements/ADRs for the deliberate new memory projection. Preserve the decision to fetch live activity on demand rather than reviving an inferred global activity capsule.
 - Keep /global chat-first. Establish user inspectability via explicit read/list and rendered tool/conversation results. Any bounded list/detail control must name its web/native scope and validation; no new workstream navigation identity or dashboard.
 - Distinguish record existence, last explicit review and scanner coverage. A successful scan does not mean Ember reviewed or completed the obligation. The scanner may add while idle without waking work.
+- Follow Issue #1075's thread-keeping behavior: retain user-requested work and useful question bookmarks, answer the current question first, avoid repeating the list each response, and provide a short refresher/resumption point when the user returns. Topic change alone neither abandons prior work nor commissions a new task. Automatic revisit/wake policy is still under product discussion; do not infer it merely from saving a record.
 
 ## Starting points
 

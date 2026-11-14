@@ -8,7 +8,7 @@ The ONE existing Ember singleton can retain, inspect, edit and deliberately reti
 
 ## Design boundary
 
-Use a stable tracking-item domain type and application service. Prose captures purpose/current understanding/follow-through. Structure identity, disposition, revision, timestamps, normalized ordered references and exact evidence. Use tracking/resolved/dismissed with nonblank retirement reason. Explicit reopening requires current evidence/revision and is not a scanner operation.
+Use a stable tracking-item domain type and application service. One item represents an independently meaningful concern/commitment, with no parent/child hierarchy initially. Prose captures purpose/current understanding and a resumption point or follow-through. Preserve the distinction between a user curiosity/bookmark and explicitly requested work; phase 1 chooses the minimal representation so bookmarks do not become work obligations. Structure identity, disposition, revision, timestamps, normalized ordered references and exact evidence. Use tracking/resolved/dismissed with nonblank retirement reason. Explicit reopening requires current evidence/revision and is not a scanner operation.
 
 Bind list ownership to stable Coordinator product identity, not current transcript. References distinguish current conversation target (immutable instance + stable product), exact source (instance/transcript/message) and GitHub PR (repository/number). Source unavailability does not resolve an obligation; decide feature-scoped retention without cascading away records.
 
