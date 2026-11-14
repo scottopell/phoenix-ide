@@ -30,6 +30,16 @@ async fn new_aggregates_are_enabled_but_existing_preferences_survive_reopen_and_
     )
     .await
     .unwrap();
+    let opted_out = db
+        .create_conversation("saved-opt-out", "saved-opt-out", "/tmp", true, None, None)
+        .await
+        .unwrap();
+    db.set_auto_continue_on_context_exhaustion(
+        &opted_out.product_conversation_id,
+        AutoContinueOnContextExhaustion::Disabled,
+    )
+    .await
+    .unwrap();
     let legacy_id = ProductConversationId::new();
     sqlx::query("INSERT INTO product_conversations (id, kind, ordinary_lifecycle) VALUES (?1, 'ordinary', 'open')")
         .bind(legacy_id.as_str())
@@ -66,6 +76,20 @@ async fn new_aggregates_are_enabled_but_existing_preferences_survive_reopen_and_
             .unwrap(),
         AutoContinueOnContextExhaustion::Disabled
     );
+    assert_eq!(
+        db.auto_continue_on_context_exhaustion(&opted_out.product_conversation_id)
+            .await
+            .unwrap(),
+        AutoContinueOnContextExhaustion::Disabled
+    );
+    for transcript in [&ordinary.id, &opted_out.id, &coordinator.id] {
+        assert!(db.get_messages(transcript).await.unwrap().is_empty());
+        assert!(db
+            .automatic_continuation_admission(transcript)
+            .await
+            .unwrap()
+            .is_none());
+    }
     let fresh = db
         .create_conversation("after-reopen", "after-reopen", "/tmp", true, None, None)
         .await
@@ -101,7 +125,10 @@ async fn manual_successor_keeps_explicit_opt_out_on_stable_aggregate() {
     .unwrap();
     let successor = match db.continue_conversation(&predecessor.id).await.unwrap() {
         crate::ContinueOutcome::Created(successor) => successor,
-        other => panic!("expected manual successor, got {other:?}"),
+        other @ (crate::ContinueOutcome::AlreadyContinued(_)
+        | crate::ContinueOutcome::ParentNotContextExhausted { .. }) => {
+            panic!("expected manual successor, got {other:?}")
+        }
     };
     assert_eq!(
         successor.product_conversation_id,
