@@ -634,7 +634,7 @@ async fn generated_saved_opening_with_user_agent_retries_under_generated_authori
         .filter(|message| matches!(message.content, MessageContent::Continuation(_)))
         .collect();
     assert_eq!(openings.len(), 1);
-    assert_eq!(openings[0].message_id, key);
+    assert_eq!(openings[0].message_id, format!("{successor_id}:{key}"));
     assert!(matches!(openings[0].origin, InputOrigin::SystemGenerated));
     assert!(f
         .db
