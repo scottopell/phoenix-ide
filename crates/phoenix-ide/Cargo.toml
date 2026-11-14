@@ -32,7 +32,7 @@ rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-pki-types = { workspace = true }
 tokio-rustls = { workspace = true, features = ["aws_lc_rs", "tls12"] }
 tower = { workspace = true }
-tower-http = { workspace = true, features = ["cors", "fs", "compression-br", "compression-gzip", "trace"] }
+tower-http = { workspace = true, features = ["cors", "fs", "compression-gzip", "trace"] }
 
 # Local TLS CA + leaf-cert issuance (separate workspace member to keep
 # `phoenix-tls`'s cold-compile cost off `phoenix-tls` itself).
@@ -82,7 +82,7 @@ if-addrs = { workspace = true }
 
 # Cross-platform (macOS + Linux) process/system resource sampling for the
 # About-this-deployment endpoint (specs/deployment-info/).
-sysinfo = { workspace = true }
+sysinfo = { workspace = true, features = ["system"] }
 
 # Async utilities
 async-trait = { workspace = true }
