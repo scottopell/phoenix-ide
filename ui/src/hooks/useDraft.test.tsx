@@ -42,7 +42,7 @@ describe('product composer draft lifecycle', () => {
     localStorage.clear();
     localStorage.setItem('phoenix:draft:transcript-id', 'legacy draft');
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const failure = vi.spyOn(Storage.prototype, method).mockImplementation(() => { throw new Error('storage unavailable'); });
+    const failure = vi.spyOn(localStorage, method).mockImplementation(() => { throw new Error('storage unavailable'); });
     const drafts = new DraftStore();
     const { result, unmount } = renderHook(() => useDraftValue('product:pc-1'), {
       wrapper: productDraftWrapper(drafts, new ConversationStore()),

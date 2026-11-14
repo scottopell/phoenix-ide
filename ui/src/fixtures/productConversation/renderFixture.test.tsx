@@ -104,19 +104,19 @@ describe('ProductConversationFixture', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled());
     act(() => window.dispatchEvent(new CustomEvent('product-conversation-fixture-phase', { detail: { type: 'awaiting_continuation', attempt: 1 } })));
     await screen.findByText('Compacting conversation...');
-    expect(screen.getByPlaceholderText('Type a message...')).toBe(textarea);
+    expect(document.getElementById('message-input')).toBe(textarea);
     expect(textarea).toHaveValue('Keep this embedded draft');
     expect(textarea).toHaveFocus();
     expect(screen.queryByRole('button', { name: 'Send message' })).toBeNull();
     act(() => window.dispatchEvent(new CustomEvent('product-conversation-fixture-phase', { detail: { type: 'context_exhausted', summary: 'manual continuation' } })));
     await waitFor(() => expect(screen.queryByText('Compacting conversation...')).toBeNull());
-    expect(screen.getByPlaceholderText('Type a message...')).toBe(textarea);
+    expect(document.getElementById('message-input')).toBe(textarea);
     expect(textarea).toHaveValue('Keep this embedded draft');
     expect(textarea).toHaveFocus();
     expect(screen.queryByRole('button', { name: 'Send message' })).toBeNull();
     act(() => window.dispatchEvent(new Event('product-conversation-fixture-continue')));
     await waitFor(() => expect(new URL(document.documentElement.dataset['productConversationFixtureEventSourceLastUrl']!, window.location.href).searchParams.get('reference')).toBe('fixture-successor'));
-    expect(screen.getByPlaceholderText('Type a message...')).toBe(textarea);
+    expect(document.getElementById('message-input')).toBe(textarea);
     expect(textarea).toHaveValue('Keep this embedded draft');
     expect(textarea).toHaveFocus();
     expect(screen.queryByRole('button', { name: 'Send message' })).toBeNull();
@@ -125,7 +125,7 @@ describe('ProductConversationFixture', () => {
     act(() => window.dispatchEvent(new Event('product-conversation-fixture-release-successor')));
     await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureLastDeliveredInitMember']).toBe('fixture-successor'));
     expect(document.documentElement.dataset['productConversationFixtureActiveTranscriptSubscriptions']).toBe('1');
-    expect(screen.getByPlaceholderText('Type a message...')).toBe(textarea);
+    expect(document.getElementById('message-input')).toBe(textarea);
     expect(textarea).toHaveValue('Keep this embedded draft');
     expect(textarea).toHaveFocus();
     expect([textarea.selectionStart, textarea.selectionEnd]).toEqual([5, 9]);
@@ -139,7 +139,7 @@ describe('ProductConversationFixture', () => {
     expect(document.documentElement.dataset['productConversationFixtureSendCount'] ?? '0').toBe('0');
     act(() => window.dispatchEvent(new Event('product-conversation-fixture-accept-opening')));
     await waitFor(() => expect(screen.getByRole('button', { name: 'Send message' })).toBeEnabled());
-    expect(screen.getByPlaceholderText('Type a message...')).toBe(textarea);
+    expect(document.getElementById('message-input')).toBe(textarea);
     expect(textarea).toHaveValue('Keep this embedded draft');
   });
 
@@ -156,7 +156,7 @@ describe('ProductConversationFixture', () => {
       window.dispatchEvent(new Event('product-conversation-fixture-continue'));
     });
     expect(await screen.findByRole('alert', { name: 'Live view refresh failed' })).toHaveTextContent('Fixture continuation snapshot unavailable');
-    expect(screen.getByPlaceholderText('Type a message...')).toBe(composer);
+    expect(document.getElementById('message-input')).toBe(composer);
     expect(composer).toHaveValue('Retained after readback failure');
     expect(composer).toHaveFocus();
     act(() => window.dispatchEvent(new Event('product-conversation-fixture-restore-snapshot')));
@@ -202,7 +202,7 @@ describe('ProductConversationFixture', () => {
     await waitFor(() => expect(Number(document.documentElement.dataset['productConversationFixtureSnapshotRequests'])).toBeGreaterThan(requests));
     expect(await screen.findByRole('status', { name: 'Continuation readback pending' })).toBeInTheDocument();
     expect(screen.queryByRole('alert', { name: 'Live view refresh failed' })).toBeNull();
-    expect(screen.getByPlaceholderText('Type a message...')).toBe(composer);
+    expect(document.getElementById('message-input')).toBe(composer);
     expect(composer).toHaveValue('Retain across successful stale readback');
     expect(composer).toHaveFocus();
     expect(document.documentElement.dataset['productConversationFixtureLastDeliveredInitMember']).not.toBe('fixture-successor');
@@ -210,7 +210,7 @@ describe('ProductConversationFixture', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Retry live view' }));
     await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureLastDeliveredInitMember']).toBe('fixture-successor'));
     expect(screen.queryByRole('status', { name: 'Continuation readback pending' })).toBeNull();
-    expect(screen.getByPlaceholderText('Type a message...')).toBe(composer);
+    expect(document.getElementById('message-input')).toBe(composer);
     expect(composer).toHaveValue('Retain across successful stale readback');
     expect(document.documentElement.dataset['sourceFixtureLocation']).toBe(route);
   });

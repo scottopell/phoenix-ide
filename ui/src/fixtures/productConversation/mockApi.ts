@@ -1,6 +1,10 @@
-import { api, ApiResponseError, type Conversation, type Message } from '../../api';
+import { api, ApiResponseError, type Conversation, type Message, type ProductConversationHistorySnapshotView } from '../../api';
 import { coordinatorSnapshot } from './scenarios';
 import type { ProductConversationScenario } from './types';
+
+function isOrdinarySnapshot(snapshot: NonNullable<ProductConversationScenario['snapshot']>): snapshot is ProductConversationHistorySnapshotView {
+  return 'close' in snapshot;
+}
 
 function latestConversation(scenario: ProductConversationScenario): Conversation {
   const snapshot = scenario.snapshot;
@@ -155,7 +159,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       return older;
     }
     const snapshot = staleSnapshot ?? currentSnapshot;
-    if (!snapshot || !('close' in snapshot)) throw new Error(`Scenario ${scenario.id} has no ordinary snapshot`);
+    if (!snapshot || !isOrdinarySnapshot(snapshot)) throw new Error(`Scenario ${scenario.id} has no ordinary snapshot`);
     return snapshot;
   };
 

@@ -137,6 +137,7 @@ async fn existing_manual_successor_ignores_reserved_losing_request_identity() {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn automatic_recovery_publishes_link_after_successor_was_reserved() {
     use phoenix_core::domain::product_conversation::{
