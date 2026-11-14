@@ -169,7 +169,11 @@ impl ContinuationApplicationService {
                 .map_err(|error| error.to_string())?
                 .0
             {
-                ContinueOutcome::Created(_) | ContinueOutcome::AlreadyContinued(_) => {}
+                ContinueOutcome::Created(successor) | ContinueOutcome::AlreadyContinued(successor) => {
+                    self.runtime
+                        .publish_continuation_link(&admission.predecessor_conversation_id, &successor.id)
+                        .await;
+                }
                 ContinueOutcome::ParentNotContextExhausted { state_variant } => {
                     return Err(format!("predecessor state changed to {state_variant}"));
                 }

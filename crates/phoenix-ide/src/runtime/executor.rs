@@ -11878,6 +11878,7 @@ where
                     work_scope_key: None,
                     model: None,
                     archived: None,
+                    continued_in_conv_id: None,
                 },
             });
 
@@ -12027,6 +12028,7 @@ where
                     work_scope_key: None,
                     model: None,
                     archived: None,
+                    continued_in_conv_id: None,
                 },
             });
         Ok(())
@@ -12338,6 +12340,7 @@ where
                             work_scope_key: Some(self.context.resource_scope.stable_key()),
                             model: None,
                             archived: None,
+                            continued_in_conv_id: None,
                         },
                     });
 

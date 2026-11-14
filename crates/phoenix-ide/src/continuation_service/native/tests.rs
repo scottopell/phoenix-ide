@@ -661,6 +661,8 @@ async fn fresh_concurrent_requests_dispatch_one_opening_through_exact_turn_settl
         .await;
     let (left_waiting, left_wait) = oneshot::channel();
     let (right_waiting, right_wait) = oneshot::channel();
+    f.runtime.get_or_create(&f.predecessor).await.unwrap();
+    let mut predecessor_events = f.runtime.subscribe(&f.predecessor).await.unwrap();
     let mut left_request = f.request("fresh-concurrent-left");
     left_request.source_gate_wait = Some(left_waiting);
     let mut right_request = f.request("fresh-concurrent-right");
@@ -703,6 +705,21 @@ async fn fresh_concurrent_requests_dispatch_one_opening_through_exact_turn_settl
     assert!(created.error.is_none());
     assert!(replayed.error.is_none());
     let successor_id = &created.conversation_id;
+    let mut published_links = Vec::new();
+    while let Ok(event) = predecessor_events.try_recv() {
+        if let SseEvent::ConversationUpdate { update, .. } = event {
+            if let Some(link) = update.continued_in_conv_id {
+                published_links.push(link);
+            }
+        }
+    }
+    assert!(!published_links.is_empty(), "connected predecessor must learn the committed continuation without reconnect");
+    assert!(published_links.iter().all(|link| link == successor_id));
+    assert_eq!(
+        f.db.get_conversation(&f.predecessor).await.unwrap().continued_in_conv_id.as_ref(),
+        Some(successor_id)
+    );
+
     let provider_conversation =
         tokio::time::timeout(std::time::Duration::from_secs(30), entered.recv())
             .await

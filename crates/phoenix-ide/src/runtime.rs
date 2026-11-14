@@ -1949,6 +1949,8 @@ pub struct ConversationMetadataUpdate {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archived: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continued_in_conv_id: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -7702,6 +7704,46 @@ impl RuntimeManager {
             .await
             .get(conversation_id)
             .cloned()
+    }
+
+    pub(crate) async fn publish_continuation_link(
+        &self,
+        predecessor_id: &str,
+        successor_id: &str,
+    ) {
+        let Ok(mut admitted) = self.acquire_local_authority_pass() else {
+            tracing::debug!(predecessor_id, successor_id, "continuation link live publication skipped after authority closed");
+            return;
+        };
+        let Some(broadcaster) = self.existing_conversation_broadcaster(predecessor_id).await else {
+            return;
+        };
+        if broadcaster
+            .admitted_publication(&mut admitted)
+            .event(|sequence_id| SseEvent::ConversationUpdate {
+                sequence_id,
+                update: ConversationMetadataUpdate {
+                    slug: None,
+                    title: None,
+                    cwd: None,
+                    project_id: None,
+                    project_name: None,
+                    updated_at: None,
+                    branch_name: None,
+                    worktree_path: None,
+                    conv_mode_label: None,
+                    base_branch: None,
+                    task_title: None,
+                    work_scope_key: None,
+                    model: None,
+                    archived: None,
+                    continued_in_conv_id: Some(successor_id.to_string()),
+                },
+            })
+            .is_err()
+        {
+            tracing::debug!(predecessor_id, successor_id, "continuation link live publication was rejected");
+        }
     }
 
     /// Remove and return the evicted broadcaster for `conversation_id`, if any.
