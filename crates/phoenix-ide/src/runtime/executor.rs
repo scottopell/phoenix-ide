@@ -2192,6 +2192,10 @@ where
     )>,
     #[cfg(test)]
     native_projection_gate: std::sync::Mutex<Option<super::NativeTaskApprovalProjectionGate>>,
+    #[cfg(test)]
+    native_early_target_gate: std::sync::Mutex<Option<super::NativeTaskApprovalEarlyTargetGate>>,
+    #[cfg(test)]
+    native_failure_observer: Option<tokio::sync::oneshot::Sender<(bool, String)>>,
     handoff_review_rx: Option<mpsc::Receiver<super::HandoffReviewRequest>>,
     exhausted_maintenance: bool,
     broadcast_tx: SseBroadcaster,
@@ -2389,6 +2393,7 @@ where
 #[derive(Debug)]
 enum FollowUpApprovalError {
     BeforeGit(String),
+    NativePreGit(native_task_approval::NativeTaskApprovalExecutionError),
     PersistenceFailed(String),
     AuthorityLost(String),
 }
@@ -2523,6 +2528,10 @@ where
             native_post_git_gate: None,
             #[cfg(test)]
             native_projection_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            native_early_target_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            native_failure_observer: None,
             handoff_review_rx: None,
             exhausted_maintenance: false,
             tool_execution: ToolExecutionSlot::default(),
@@ -2782,6 +2791,24 @@ where
         gate: Option<super::NativeTaskApprovalProjectionGate>,
     ) -> Self {
         *self.native_projection_gate.get_mut().unwrap() = gate;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_native_early_target_gate_for_test(
+        mut self,
+        gate: Option<super::NativeTaskApprovalEarlyTargetGate>,
+    ) -> Self {
+        *self.native_early_target_gate.get_mut().unwrap() = gate;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_native_failure_observer_for_test(
+        mut self,
+        observer: Option<tokio::sync::oneshot::Sender<(bool, String)>>,
+    ) -> Self {
+        self.native_failure_observer = observer;
         self
     }
 
@@ -12029,7 +12056,7 @@ where
         let blocking_admission = admitted.reborrow();
         let pre_git = self
             .native_pre_git_check(origin)
-            .map_err(FollowUpApprovalError::BeforeGit)?;
+            .map_err(FollowUpApprovalError::NativePreGit)?;
         let native = origin.is_native();
         let worker =
             crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move || {
@@ -12062,6 +12089,9 @@ where
         let reviewed = reviewed.map_err(|error| match error {
             FollowUpArtifactError::BeforeGit(error) if !origin.is_native() => {
                 FollowUpApprovalError::BeforeGit(error)
+            }
+            FollowUpArtifactError::NativePreGit(error) => {
+                FollowUpApprovalError::NativePreGit(error)
             }
             FollowUpArtifactError::BeforeGit(error) | FollowUpArtifactError::AfterGit(error) => {
                 FollowUpApprovalError::AuthorityLost(error)
@@ -12210,6 +12240,7 @@ where
             &mut native_task_approval::ApprovalOrigin::User,
         )
         .await
+        .map_err(|error| error.to_string())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -12219,7 +12250,7 @@ where
         execution: TaskApprovalExecution,
         admitted: &mut crate::runtime::AdmittedOperation,
         origin: &mut native_task_approval::ApprovalOrigin,
-    ) -> Result<(), String> {
+    ) -> Result<(), native_task_approval::NativeTaskApprovalExecutionError> {
         let TaskApprovalInput {
             task_file,
             title,
@@ -12229,7 +12260,9 @@ where
         } = approval;
         if origin.is_native() && execution == TaskApprovalExecution::DetachedApprovedTaskCheckpoint
         {
-            return Err("native detached checkpoint is unsupported".to_owned());
+            return Err("native detached checkpoint is unsupported"
+                .to_owned()
+                .into());
         }
         if execution == TaskApprovalExecution::FollowUp {
             let result = self
@@ -12251,18 +12284,19 @@ where
                         &error,
                         admitted,
                     )?;
-                    Err(error)
+                    Err(error.into())
                 }
-                Err(FollowUpApprovalError::BeforeGit(error)) => Err(error),
+                Err(FollowUpApprovalError::BeforeGit(error)) => Err(error.into()),
+                Err(FollowUpApprovalError::NativePreGit(error)) => Err(error),
                 Err(FollowUpApprovalError::PersistenceFailed(error)) => {
                     self.recovery_disposition = RuntimeRecoveryDisposition::RecreateFromDatabase;
                     Err(format!(
                         "follow-up approval persistence failed after Git mutation; recreate actor from database: {error}"
-                    ))
+                    ).into())
                 }
                 Err(FollowUpApprovalError::AuthorityLost(error)) => Err(format!(
                     "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: follow-up approval crossed the Git authority boundary without durable settlement: {error}"
-                )),
+                ).into()),
             };
         }
         if execution == TaskApprovalExecution::DetachedApprovedTaskCheckpoint {
@@ -12321,7 +12355,8 @@ where
                 admitted.close("detached_approval_authority_establishment");
                 return Err(
                     "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: detached task approval authority establishment is unclassified"
-                        .to_string(),
+                        .to_string()
+                        .into(),
                 );
             }
             self.install_live_state(approved_state, state_updated_at, true)?;
@@ -12367,7 +12402,11 @@ where
                 (result, progress)
             })
             .await
-            .map_err(|e| format!("Task approval join error: {e}"))?;
+            .map_err(|e| {
+                native_task_approval::NativeTaskApprovalExecutionError::Unclassified(format!(
+                    "Task approval join error: {e}"
+                ))
+            })?;
         origin.set_progress(progress);
 
         match result {
@@ -12426,7 +12465,7 @@ where
                     Err(error) => {
                         self.recovery_disposition =
                             RuntimeRecoveryDisposition::RecreateFromDatabase;
-                        return Err(error);
+                        return Err(error.into());
                     }
                 };
                 if matches!(
@@ -12434,7 +12473,9 @@ where
                     crate::db::LocalAuthorityResult::DurableFactUnclassified
                 ) {
                     admitted.close("task_approval_authority_establishment");
-                    return Err("approval authority establishment is unclassified".to_string());
+                    return Err("approval authority establishment is unclassified"
+                        .to_string()
+                        .into());
                 }
                 self.install_live_state(approved_state, state_updated_at, true)?;
                 self.context.resource_authority = crate::work_scope::ResourceAuthority::Work;
@@ -12519,6 +12560,7 @@ where
                 if origin.is_native() {
                     return Err(e);
                 }
+                let e = e.to_string();
                 tracing::error!(
                     error = %e,
                     conv_id = %self.context.conversation_id,
@@ -12560,7 +12602,7 @@ where
                     ),
                 });
 
-                Err(e)
+                Err(e.into())
             }
         }
     }
@@ -12605,6 +12647,7 @@ where
                     "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: fresh task approval crossed the Git authority boundary without reconciliation: {error}"
                 ));
             }
+            Err(FollowUpArtifactError::NativePreGit(error)) => return Err(error.to_string()),
             Err(FollowUpArtifactError::BeforeGit(e)) => {
                 tracing::error!(error = %e, "Fresh task approval artifact verification failed");
                 self.install_live_state(
@@ -12701,6 +12744,7 @@ struct ReviewedTaskHandoffSnapshot {
 #[derive(Debug)]
 enum FollowUpArtifactError {
     BeforeGit(String),
+    NativePreGit(native_task_approval::NativeTaskApprovalExecutionError),
     AfterGit(String),
 }
 
@@ -12708,6 +12752,7 @@ impl std::fmt::Display for FollowUpArtifactError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
             Self::BeforeGit(message) | Self::AfterGit(message) => message,
+            Self::NativePreGit(error) => return write!(formatter, "{error}"),
         };
         formatter.write_str(message)
     }
@@ -12828,11 +12873,10 @@ fn persist_fresh_approved_task_artifact_blocking_with_progress(
     let original_path_was_tracked =
         run_git(cwd, &["ls-files", "--error-unmatch", "--", task_file]).is_ok();
     if let Some(check) = pre_git {
-        check().map_err(FollowUpArtifactError::BeforeGit)?;
+        check().map_err(FollowUpArtifactError::NativePreGit)?;
     }
     let mut snapshot = if native {
-        reread_reviewed_task_handoff_snapshot_at_exact_path(
-            cwd,
+        reread_reviewed_task_handoff_snapshot_at_exact_path_native(
             cwd,
             tasks_dir_name,
             task_file,
@@ -12840,6 +12884,7 @@ fn persist_fresh_approved_task_artifact_blocking_with_progress(
             expected_priority,
             expected_plan,
         )
+        .map_err(FollowUpArtifactError::NativePreGit)?
     } else {
         reread_reviewed_task_handoff_snapshot(
             cwd,
@@ -12850,8 +12895,8 @@ fn persist_fresh_approved_task_artifact_blocking_with_progress(
             expected_priority,
             expected_plan,
         )
-    }
-    .map_err(FollowUpArtifactError::BeforeGit)?;
+        .map_err(FollowUpArtifactError::BeforeGit)?
+    };
     let mut promotion: Option<(String, String, std::path::PathBuf, std::path::PathBuf)> = None;
     if snapshot.task_file == task_file && detect_plain_markdown_task_stem(task_file).is_none() {
         let filename = Path::new(task_file)
@@ -12988,41 +13033,88 @@ fn reread_reviewed_task_handoff_snapshot(
     )
 }
 
-fn reread_reviewed_task_handoff_snapshot_at_exact_path(
-    cwd: &std::path::Path,
-    _repo_root: &std::path::Path,
+fn reread_reviewed_task_handoff_snapshot_at_exact_path_native(
+    cwd: &Path,
     tasks_dir_name: &str,
     task_file: &str,
     expected_title: &str,
     expected_priority: crate::task_source::Priority,
     expected_plan: &str,
-) -> Result<ReviewedTaskHandoffSnapshot, String> {
+) -> Result<ReviewedTaskHandoffSnapshot, native_task_approval::NativeTaskApprovalExecutionError> {
+    use native_task_approval::NativeTaskApprovalExecutionError::{Refused, Unclassified};
+
+    read_reviewed_task_handoff_snapshot_at_exact_path(
+        cwd,
+        tasks_dir_name,
+        task_file,
+        expected_title,
+        expected_priority,
+        expected_plan,
+    )
+    .map_err(|error| match error {
+        ReviewedTaskHandoffReadError::Semantic(_) => {
+            Refused(native_task_approval::NativeTaskApprovalRefusal::PendingChanged)
+        }
+        ReviewedTaskHandoffReadError::Unavailable(message) => Unclassified(message),
+    })
+}
+
+#[derive(Debug)]
+enum ReviewedTaskHandoffReadError {
+    Semantic(String),
+    Unavailable(String),
+}
+
+fn classify_reviewed_task_handoff_io_error(
+    error: &std::io::Error,
+    message: String,
+) -> ReviewedTaskHandoffReadError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        ReviewedTaskHandoffReadError::Semantic(message)
+    } else {
+        ReviewedTaskHandoffReadError::Unavailable(message)
+    }
+}
+
+fn read_reviewed_task_handoff_snapshot_at_exact_path(
+    cwd: &Path,
+    tasks_dir_name: &str,
+    task_file: &str,
+    expected_title: &str,
+    expected_priority: crate::task_source::Priority,
+    expected_plan: &str,
+) -> Result<ReviewedTaskHandoffSnapshot, ReviewedTaskHandoffReadError> {
     let path = cwd.join(task_file);
-    let metadata = path
-        .symlink_metadata()
-        .map_err(|error| format!("Failed to inspect reviewed task file '{task_file}': {error}"))?;
+    let metadata = path.symlink_metadata().map_err(|error| {
+        let message = format!("Failed to inspect reviewed task file '{task_file}': {error}");
+        classify_reviewed_task_handoff_io_error(&error, message)
+    })?;
     if !metadata.file_type().is_file() {
-        return Err(format!(
+        return Err(ReviewedTaskHandoffReadError::Semantic(format!(
             "Reviewed task file '{task_file}' must remain a regular file. Reject and re-approve the replacement artifact."
-        ));
+        )));
     }
-    let canonical_path = path
-        .canonicalize()
-        .map_err(|error| format!("Failed to resolve reviewed task file '{task_file}': {error}"))?;
-    let canonical_cwd = cwd
-        .canonicalize()
-        .map_err(|error| format!("Failed to resolve the working directory: {error}"))?;
+    let canonical_path = path.canonicalize().map_err(|error| {
+        let message = format!("Failed to resolve reviewed task file '{task_file}': {error}");
+        classify_reviewed_task_handoff_io_error(&error, message)
+    })?;
+    let canonical_cwd = cwd.canonicalize().map_err(|error| {
+        let message = format!("Failed to resolve the working directory: {error}");
+        classify_reviewed_task_handoff_io_error(&error, message)
+    })?;
     if !canonical_path.starts_with(&canonical_cwd) {
-        return Err(format!(
+        return Err(ReviewedTaskHandoffReadError::Semantic(format!(
             "Reviewed task file '{task_file}' resolves outside the working directory. Reject and re-approve the replacement artifact."
-        ));
+        )));
     }
-    let body = std::fs::read_to_string(&path)
-        .map_err(|error| format!("Failed to read reviewed task file '{task_file}': {error}"))?;
+    let body = std::fs::read_to_string(&path).map_err(|error| {
+        let message = format!("Failed to read reviewed task file '{task_file}': {error}");
+        classify_reviewed_task_handoff_io_error(&error, message)
+    })?;
     if body != expected_plan {
-        return Err(format!(
+        return Err(ReviewedTaskHandoffReadError::Semantic(format!(
             "Reviewed task file '{task_file}' no longer matches the approved plan. Reject and re-approve the updated artifact."
-        ));
+        )));
     }
     if let Some(stem) = detect_plain_markdown_task_stem(task_file) {
         let source = crate::task_source::TaskSource::PlainMarkdown { stem: stem.clone() };
@@ -13038,28 +13130,55 @@ fn reread_reviewed_task_handoff_snapshot_at_exact_path(
     let filename = std::path::Path::new(task_file)
         .file_name()
         .and_then(|f| f.to_str())
-        .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
+        .ok_or_else(|| {
+            ReviewedTaskHandoffReadError::Semantic(format!(
+                "task_file has no filename component: '{task_file}'"
+            ))
+        })?;
     let parsed = taskmd_core::filename::parse_filename(filename).ok_or_else(|| {
-        format!(
+        ReviewedTaskHandoffReadError::Semantic(format!(
             "task_file '{filename}' does not match the taskmd filename pattern (NNNNN-pX-status--slug.md)"
-        )
+        ))
     })?;
     if !task_file.starts_with(&format!("{tasks_dir_name}/")) {
-        return Err(format!(
+        return Err(ReviewedTaskHandoffReadError::Semantic(format!(
             "taskmd-named task files must be under {tasks_dir_name}/ (got '{task_file}')"
-        ));
+        )));
     }
     let derived_priority = phoenix_core::task_source::Priority(parsed.priority);
     if derived_priority != expected_priority {
-        return Err(format!(
+        return Err(ReviewedTaskHandoffReadError::Semantic(format!(
             "Reviewed task file '{task_file}' priority changed from the approved snapshot. Reject and re-approve the updated artifact."
-        ));
+        )));
     }
     Ok(ReviewedTaskHandoffSnapshot {
         task_id: parsed.id,
         task_title: expected_title.to_string(),
         artifact_body: body,
         task_file: task_file.to_string(),
+    })
+}
+
+fn reread_reviewed_task_handoff_snapshot_at_exact_path(
+    cwd: &std::path::Path,
+    _repo_root: &std::path::Path,
+    tasks_dir_name: &str,
+    task_file: &str,
+    expected_title: &str,
+    expected_priority: crate::task_source::Priority,
+    expected_plan: &str,
+) -> Result<ReviewedTaskHandoffSnapshot, String> {
+    read_reviewed_task_handoff_snapshot_at_exact_path(
+        cwd,
+        tasks_dir_name,
+        task_file,
+        expected_title,
+        expected_priority,
+        expected_plan,
+    )
+    .map_err(|error| match error {
+        ReviewedTaskHandoffReadError::Semantic(message)
+        | ReviewedTaskHandoffReadError::Unavailable(message) => message,
     })
 }
 
@@ -14581,6 +14700,7 @@ fn execute_approve_task_blocking_reviewed(
         None,
         &mut native_task_approval::ApprovalGitProgress::BeforeEffects,
     )
+    .map_err(|error| error.to_string())
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -14596,7 +14716,7 @@ fn execute_approve_task_blocking_reviewed_with_progress(
     desired_base_branch: Option<&str>,
     pre_git: Option<native_task_approval::PreGitCheck>,
     progress: &mut native_task_approval::ApprovalGitProgress,
-) -> Result<TaskApprovalResult, String> {
+) -> Result<TaskApprovalResult, native_task_approval::NativeTaskApprovalExecutionError> {
     let _guard = TASK_APPROVAL_MUTEX
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -14608,7 +14728,8 @@ fn execute_approve_task_blocking_reviewed_with_progress(
             "This approval predates the file-based propose_task flow. \
              Reject the plan and ask the agent to propose again — it will \
              draft a task file under {tasks_dir_name}/ this time."
-        ));
+        )
+        .into());
     }
 
     let native = pre_git.is_some();
@@ -14620,15 +14741,26 @@ fn execute_approve_task_blocking_reviewed_with_progress(
     } else {
         reread_reviewed_task_handoff_snapshot
     };
-    let reviewed = reread(
-        cwd,
-        repo_root,
-        tasks_dir_name,
-        task_file,
-        title,
-        priority,
-        reviewed_artifact,
-    )?;
+    let reviewed = if native {
+        reread_reviewed_task_handoff_snapshot_at_exact_path_native(
+            cwd,
+            tasks_dir_name,
+            task_file,
+            title,
+            priority,
+            reviewed_artifact,
+        )?
+    } else {
+        reread(
+            cwd,
+            repo_root,
+            tasks_dir_name,
+            task_file,
+            title,
+            priority,
+            reviewed_artifact,
+        )?
+    };
     if let Some(stem) = detect_plain_markdown_task_stem(task_file) {
         *progress = native_task_approval::ApprovalGitProgress::EffectsMayHaveOccurred;
         let result = execute_approve_plain_markdown_blocking(
@@ -14716,7 +14848,7 @@ fn execute_approve_task_blocking_reviewed_with_progress(
     let commit_msg = format!("task {task_id}: {title}");
     if run_git(&worktree_path, &["diff", "--cached", "--quiet"]).is_err() {
         if let Err(e) = run_git(&worktree_path, &["commit", "-m", &commit_msg]) {
-            return Err(format!("Failed to commit task file in worktree: {e}"));
+            return Err(format!("Failed to commit task file in worktree: {e}").into());
         }
         tracing::info!(branch = %branch_name, commit_msg = %commit_msg, "Task file committed on task branch");
     } else {

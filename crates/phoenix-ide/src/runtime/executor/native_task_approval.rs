@@ -14,7 +14,31 @@ pub(super) enum ApprovalGitProgress {
     EffectsMayHaveOccurred,
 }
 
-pub(super) type PreGitCheck = Box<dyn FnOnce() -> Result<(), String> + Send>;
+#[derive(Debug)]
+pub(super) enum NativeTaskApprovalExecutionError {
+    Refused(NativeTaskApprovalRefusal),
+    Database(phoenix_db::DbError),
+    Unclassified(String),
+}
+
+impl std::fmt::Display for NativeTaskApprovalExecutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(reason) => write!(formatter, "native approval refused: {reason:?}"),
+            Self::Database(error) => write!(formatter, "native approval database error: {error}"),
+            Self::Unclassified(error) => formatter.write_str(error),
+        }
+    }
+}
+
+impl From<String> for NativeTaskApprovalExecutionError {
+    fn from(error: String) -> Self {
+        Self::Unclassified(error)
+    }
+}
+
+pub(super) type PreGitCheck =
+    Box<dyn FnOnce() -> Result<(), NativeTaskApprovalExecutionError> + Send>;
 
 pub(super) enum ApprovalOrigin {
     User,
@@ -77,28 +101,6 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         {
             return Unsupported(NativeTaskApprovalUnsupported::InstalledGoalControls);
         }
-        let execution = match self.resolve_task_approval_execution().await {
-            Ok(TaskApprovalExecution::Initial) => TaskApprovalExecution::Initial,
-            Ok(TaskApprovalExecution::FollowUp) => TaskApprovalExecution::FollowUp,
-            Ok(TaskApprovalExecution::DetachedApprovedTaskCheckpoint) => {
-                return Unsupported(NativeTaskApprovalUnsupported::DetachedCheckpoint);
-            }
-            Err(_) => return Unavailable,
-        };
-        if let Err(error) = check_native_target(
-            &db,
-            &command,
-            &self.context.resource_scope,
-            self.context.filesystem_root(),
-        )
-        .await
-        {
-            tracing::debug!(%error, "native approval target refused before Git");
-            return NotApplied(NativeTaskApprovalRefusal::TargetChanged);
-        }
-        let Ok(mut admitted) = self.admit_authoritative_effect() else {
-            return Unavailable;
-        };
         let approval = TaskApprovalInput {
             task_file: command.pending.task_file.clone(),
             title: command.pending.title.clone(),
@@ -106,11 +108,54 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             plan: command.pending.plan.clone(),
             reviewed_proposal: command.pending.reviewed_proposal.clone(),
         };
+        let Ok(mut admitted) = self.admit_authoritative_effect() else {
+            return Unavailable;
+        };
         let mut origin = ApprovalOrigin::Native {
             command: Box::new(command),
             progress: ApprovalGitProgress::BeforeEffects,
             receipt: None,
         };
+        let execution = match self.resolve_task_approval_execution().await {
+            Ok(TaskApprovalExecution::Initial) => TaskApprovalExecution::Initial,
+            Ok(TaskApprovalExecution::FollowUp) => TaskApprovalExecution::FollowUp,
+            Ok(TaskApprovalExecution::DetachedApprovedTaskCheckpoint) => {
+                return Unsupported(NativeTaskApprovalUnsupported::DetachedCheckpoint);
+            }
+            Err(error) => {
+                return self
+                    .settle_native_approval_outcome(
+                        origin,
+                        Err(NativeTaskApprovalExecutionError::Unclassified(error)),
+                        &mut admitted,
+                    )
+                    .await;
+            }
+        };
+        let ApprovalOrigin::Native { command, .. } = &origin else {
+            unreachable!();
+        };
+        #[cfg(test)]
+        {
+            let gate = self.native_early_target_gate.lock().unwrap().take();
+            if let Some(super::super::NativeTaskApprovalEarlyTargetGate { entered, release }) = gate
+            {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+        }
+        if let Err(error) = check_native_target(
+            &db,
+            command,
+            &self.context.resource_scope,
+            self.context.filesystem_root(),
+        )
+        .await
+        {
+            return self
+                .settle_native_approval_outcome(origin, Err(error), &mut admitted)
+                .await;
+        }
         let result = self
             .execute_approve_task_with_origin(approval, execution, &mut admitted, &mut origin)
             .await;
@@ -121,10 +166,23 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
     async fn settle_native_approval_outcome(
         &mut self,
         origin: ApprovalOrigin,
-        result: Result<(), String>,
+        result: Result<(), NativeTaskApprovalExecutionError>,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> NativeTaskApprovalOutcome {
         use NativeTaskApprovalOutcome::{Committed, NotApplied, Unavailable};
+        // Passive, one-shot evidence from the actual execution result. The boolean
+        // is derived from typed variants; diagnostic text never selects behavior.
+        #[cfg(test)]
+        if let Some(observer) = self.native_failure_observer.take() {
+            let observation = match &result {
+                Err(NativeTaskApprovalExecutionError::Database(error)) => (
+                    matches!(error, phoenix_db::DbError::Sqlx(_)),
+                    error.to_string(),
+                ),
+                other => (false, format!("{other:?}")),
+            };
+            let _ = observer.send(observation);
+        }
         let ApprovalOrigin::Native {
             progress, receipt, ..
         } = origin
@@ -163,21 +221,34 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             admitted.close("native_approval_postgit_unavailable");
             return Unavailable;
         }
-        NotApplied(NativeTaskApprovalRefusal::BeforeGitRefused)
+        match result {
+            Err(NativeTaskApprovalExecutionError::Refused(reason)) => NotApplied(reason),
+            Err(error) => {
+                tracing::error!(%error, "native approval unclassified failure before Git");
+                admitted.close("native_approval_pregit_unavailable");
+                Unavailable
+            }
+            Ok(()) => {
+                tracing::error!("native approval returned success without a durable receipt");
+                admitted.close("native_approval_missing_receipt");
+                Unavailable
+            }
+        }
     }
 
     pub(super) fn native_pre_git_check(
         &self,
         origin: &ApprovalOrigin,
-    ) -> Result<Option<PreGitCheck>, String> {
+    ) -> Result<Option<PreGitCheck>, NativeTaskApprovalExecutionError> {
         let ApprovalOrigin::Native { command, .. } = origin else {
             return Ok(None);
         };
         let command = command.clone();
-        let db = self
-            .native_task_admission_db
-            .clone()
-            .ok_or_else(|| "native approval database unavailable".to_owned())?;
+        let db = self.native_task_admission_db.clone().ok_or_else(|| {
+            NativeTaskApprovalExecutionError::Unclassified(
+                "native approval database unavailable".to_owned(),
+            )
+        })?;
         let scope = self.context.resource_scope.clone();
         let cwd = self.context.filesystem_root().to_path_buf();
         let handle = tokio::runtime::Handle::current();
@@ -192,11 +263,13 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                 match db
                     .inspect_native_task_approval_command(&command)
                     .await
-                    .map_err(|error| error.to_string())?
+                    .map_err(classify_native_preflight_error)?
                 {
                     NativeTaskApprovalInspection::RequiresOwningActorAdmission => {}
                     NativeTaskApprovalInspection::Replay(_) => {
-                        return Err("approval became historical before Git".to_owned());
+                        return Err(NativeTaskApprovalExecutionError::Refused(
+                            NativeTaskApprovalRefusal::BeforeGitRefused,
+                        ));
                     }
                 }
                 check_native_target(&db, &command, &scope, &cwd).await
@@ -258,35 +331,80 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
     }
 }
 
+fn classify_native_preflight_error(
+    error: phoenix_db::native_task_approval::NativeTaskApprovalError,
+) -> NativeTaskApprovalExecutionError {
+    use phoenix_db::native_task_approval::NativeTaskApprovalError;
+    match error {
+        NativeTaskApprovalError::RequestConflict => {
+            NativeTaskApprovalExecutionError::Refused(NativeTaskApprovalRefusal::RequestConflict)
+        }
+        NativeTaskApprovalError::Database(
+            phoenix_db::DbError::MessageConflict(_) | phoenix_db::DbError::ConversationNotFound(_),
+        ) => NativeTaskApprovalExecutionError::Refused(
+            NativeTaskApprovalRefusal::SourceOrRequestRefused,
+        ),
+        NativeTaskApprovalError::Database(error) => {
+            NativeTaskApprovalExecutionError::Database(error)
+        }
+    }
+}
+
 async fn check_native_target(
     db: &phoenix_db::Database,
     command: &NativeTaskApprovalCommand,
     scope: &crate::work_scope::ResourceScopeKey,
     cwd: &Path,
-) -> Result<(), String> {
-    let conversation = db
-        .get_conversation(&command.current_transcript_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    let authority = crate::resource_authority::resolve_resource_authority(db, &conversation)
-        .await
-        .map_err(|error| error.to_string())?;
+) -> Result<(), NativeTaskApprovalExecutionError> {
+    let conversation = match db.get_conversation(&command.current_transcript_id).await {
+        Ok(conversation) => conversation,
+        Err(phoenix_db::DbError::ConversationNotFound(_)) => {
+            return Err(NativeTaskApprovalExecutionError::Refused(
+                NativeTaskApprovalRefusal::TargetChanged,
+            ));
+        }
+        Err(error) => return Err(NativeTaskApprovalExecutionError::Database(error)),
+    };
+    let authority =
+        match crate::resource_authority::resolve_resource_authority(db, &conversation).await {
+            Ok(authority) => authority,
+            Err(phoenix_db::DbError::ConversationNotFound(_)) => {
+                return Err(NativeTaskApprovalExecutionError::Refused(
+                    NativeTaskApprovalRefusal::TargetChanged,
+                ));
+            }
+            Err(error) => return Err(NativeTaskApprovalExecutionError::Database(error)),
+        };
     if authority.scope != *scope
         || authority.task_approval_authority()
             != crate::resource_authority::TaskApprovalAuthority::GitBackedActiveWorkScope
         || authority.worktree_path().map(Path::new) != Some(cwd)
     {
-        return Err("native approval WorkScope/role/lifecycle changed".to_owned());
+        return Err(NativeTaskApprovalExecutionError::Refused(
+            NativeTaskApprovalRefusal::TargetChanged,
+        ));
     }
+    let admission = match db
+        .message_target_admission(&command.current_transcript_id)
+        .await
+    {
+        Ok(admission) => admission,
+        Err(phoenix_db::DbError::ConversationNotFound(_)) => {
+            return Err(NativeTaskApprovalExecutionError::Refused(
+                NativeTaskApprovalRefusal::TargetChanged,
+            ));
+        }
+        Err(error) => return Err(NativeTaskApprovalExecutionError::Database(error)),
+    };
     if !matches!(
-        db.message_target_admission(&command.current_transcript_id)
-            .await
-            .map_err(|error| error.to_string())?,
+        admission,
         phoenix_db::MessageTargetAdmission::Aggregate(
             phoenix_db::ProductConversationAdmission::Accepted { .. }
         )
     ) {
-        return Err("native approval target lifecycle refused".to_owned());
+        return Err(NativeTaskApprovalExecutionError::Refused(
+            NativeTaskApprovalRefusal::TargetChanged,
+        ));
     }
     Ok(())
 }
@@ -313,7 +431,11 @@ mod tests {
                 crate::task_source::Priority::P1,
                 reviewed,
                 Some("main"),
-                Some(Box::new(|| Err("source cancelled".into()))),
+                Some(Box::new(|| {
+                    Err(NativeTaskApprovalExecutionError::Refused(
+                        NativeTaskApprovalRefusal::BeforeGitRefused,
+                    ))
+                })),
                 &mut progress,
             );
             assert!(result.is_err());
@@ -372,8 +494,9 @@ mod tests {
             crate::task_source::Priority::P1,
             body,
             Some(Box::new(move || {
-                std::fs::write(gate_root.join(reviewed), "edited during source gate")
-                    .map_err(|error| error.to_string())
+                std::fs::write(gate_root.join(reviewed), "edited during source gate").map_err(
+                    |error| NativeTaskApprovalExecutionError::Unclassified(error.to_string()),
+                )
             })),
             true,
             &mut progress,
@@ -403,7 +526,11 @@ mod tests {
             "Exact title",
             crate::task_source::Priority::P1,
             body,
-            Some(Box::new(|| Err("source cancelled".into()))),
+            Some(Box::new(|| {
+                Err(NativeTaskApprovalExecutionError::Refused(
+                    NativeTaskApprovalRefusal::BeforeGitRefused,
+                ))
+            })),
             true,
             &mut progress,
         );

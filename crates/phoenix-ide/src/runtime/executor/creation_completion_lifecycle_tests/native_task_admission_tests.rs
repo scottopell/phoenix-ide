@@ -570,6 +570,10 @@ async fn production_manager_cancel_before_native_command_has_no_approval_artifac
     ));
     let handle = manager.get_or_create(&f.target).await.unwrap();
     assert_eq!(
+        checked(&handle.acknowledged_event_tx, f.expected.clone()).await,
+        NativeTaskAdmissionReadiness::PendingMatchesRequiresFullAdmission
+    );
+    assert_eq!(
         event_settled(
             &handle.acknowledged_event_tx,
             Event::UserCancel {
@@ -581,11 +585,18 @@ async fn production_manager_cancel_before_native_command_has_no_approval_artifac
         AcknowledgedEventOutcome::Settled
     );
     let before = f.db.get_messages(&f.target).await.unwrap().len();
+    assert_eq!(
+        checked(&handle.acknowledged_event_tx, f.expected.clone()).await,
+        NativeTaskAdmissionReadiness::StalePending
+    );
+    assert!(!manager.local_authority_is_closed());
     assert!(matches!(
         manager.execute_native_task_approval(command).await,
         NativeTaskApprovalOutcome::NotApplied(_)
     ));
     assert_cancelled_native_approval_unchanged(&f, before).await;
+    assert!(!manager.local_authority_is_closed());
+    assert!(!handle.event_tx.is_closed());
     handle.event_tx.send(Event::Shutdown).await.unwrap();
 }
 
@@ -663,10 +674,22 @@ enum InitialApprovalScenario {
     InitialTaskmdCleanFilterMismatch,
     InitialPlainAssumeUnchangedMismatch,
     InitialPlainMatchingHeadNoCommit,
+    EarlyTargetReadFailure,
+    PreGitReadFailure,
+}
+
+#[derive(Clone, Copy)]
+enum P2bSchemaFault {
+    WorkScopeEnvironments,
+    NativeApprovalReceipts,
 }
 
 struct InitialApprovalHarness {
     temp: Option<tempfile::TempDir>,
+    database: Option<Database>,
+    schema_fault: Option<P2bSchemaFault>,
+    schema_view_definition: Option<String>,
+    schema_operation: Option<tokio::task::JoinHandle<Result<(), sqlx::Error>>>,
     manager: Option<Arc<crate::runtime::RuntimeManager>>,
     handle: Option<crate::runtime::ConversationHandle>,
     caller: Option<
@@ -680,6 +703,10 @@ impl InitialApprovalHarness {
     fn new() -> Self {
         Self {
             temp: None,
+            database: None,
+            schema_fault: None,
+            schema_view_definition: None,
+            schema_operation: None,
             manager: None,
             handle: None,
             caller: None,
@@ -699,6 +726,24 @@ impl InitialApprovalHarness {
 
     async fn cleanup(&mut self) {
         self.release_gate();
+        let operation_error = if let Some(operation) = self.schema_operation.take() {
+            match operation.await {
+                Ok(Ok(())) => None,
+                other => Some(format!("schema operation failed: {other:?}")),
+            }
+        } else {
+            None
+        };
+        let restore_error = if let (Some(db), Some(fault)) = (&self.database, self.schema_fault) {
+            restore_p2b_schema_fault(db, fault, self.schema_view_definition.as_deref())
+                .await
+                .err()
+        } else {
+            None
+        };
+        if restore_error.is_none() {
+            self.schema_fault = None;
+        }
         if let Some(caller) = self.caller.take() {
             caller.abort();
             let _ = caller.await;
@@ -713,7 +758,30 @@ impl InitialApprovalHarness {
         drop(self.manager.take());
         drop(self.handle.take());
         drop(self.temp.take());
+        assert!(operation_error.is_none(), "{operation_error:?}");
+        assert!(
+            restore_error.is_none(),
+            "failed to restore disposable schema: {restore_error:?}"
+        );
     }
+}
+
+#[tokio::test]
+async fn production_initial_approval_early_target_read_failure_is_unavailable_before_effects() {
+    assert_production_initial_approval(
+        InitialApprovalScenario::EarlyTargetReadFailure,
+        ReviewedTaskKind::PlainMarkdown,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn production_initial_approval_pre_git_read_failure_is_unavailable_before_effects() {
+    assert_production_initial_approval(
+        InitialApprovalScenario::PreGitReadFailure,
+        ReviewedTaskKind::PlainMarkdown,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -869,6 +937,243 @@ async fn production_initial_approval_settles_immediate_freeze_failure_and_replay
     .await;
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_p2b_database_read_failure(
+    scenario: InitialApprovalScenario,
+    harness: &mut InitialApprovalHarness,
+    fixture: &AdmissionFixture,
+    manager: &Arc<crate::runtime::RuntimeManager>,
+    command: &phoenix_db::native_task_approval::NativeTaskApprovalCommand,
+    root: &std::path::Path,
+    worktree: &std::path::Path,
+    before_head: &str,
+    before_target: &phoenix_db::Conversation,
+    llm: &Arc<NativeApprovalLlm>,
+    requests: &mut mpsc::UnboundedReceiver<phoenix_llm::LlmRequest>,
+) {
+    use crate::runtime::task_approval_admission::NativeTaskApprovalOutcome;
+    use crate::runtime::SseEvent;
+
+    let fault = match scenario {
+        InitialApprovalScenario::EarlyTargetReadFailure => P2bSchemaFault::WorkScopeEnvironments,
+        InitialApprovalScenario::PreGitReadFailure => P2bSchemaFault::NativeApprovalReceipts,
+        _ => unreachable!(),
+    };
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    if matches!(fault, P2bSchemaFault::WorkScopeEnvironments) {
+        manager.set_native_early_target_gate_for_test("actor-target", entered_tx, release_rx);
+        harness.projection_release = Some(release_tx);
+    } else {
+        let (pre_git_tx, pre_git_rx) = std::sync::mpsc::channel();
+        manager.set_native_pre_git_gate_for_test("actor-target", move || {
+            let _ = entered_tx.send(());
+            let _ = pre_git_rx.recv();
+        });
+        harness.release = Some(NativeApprovalReleaseOnDrop(Some(pre_git_tx)));
+        drop(release_rx);
+    }
+    let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+    manager.set_native_failure_observer_for_test("actor-target", observed_tx);
+    let handle = manager.get_or_create("actor-target").await.unwrap();
+    harness.handle = Some(handle.clone());
+    assert!(matches!(
+        *handle.state_rx.borrow(),
+        ConvState::AwaitingTaskApproval { .. }
+    ));
+    let before = native_rollback_snapshot(&fixture.db, "actor-target").await;
+    let before_git = interleavings::try_git_snapshot(root, worktree).unwrap();
+    let before_files = interleavings::try_worktree_files(worktree).unwrap();
+    let before_binding = native_authority_binding(&fixture.db).await;
+    let before_source = fixture
+        .db
+        .get_conversation(&command.source_transcript_id)
+        .await
+        .unwrap()
+        .state;
+    let broadcaster = manager.conversation_broadcaster("actor-target").await;
+    let mut events = broadcaster.subscribe();
+    let caller_manager = Arc::clone(manager);
+    let caller_command = command.clone();
+    harness.caller = Some(tokio::spawn(async move {
+        caller_manager
+            .execute_native_task_approval(caller_command)
+            .await
+    }));
+    tokio::time::timeout(std::time::Duration::from_secs(10), entered_rx)
+        .await
+        .expect("failure gate should be reached")
+        .expect("failure gate sender should remain live");
+
+    let db = fixture.db.clone();
+    let rename_sql = match fault {
+        P2bSchemaFault::WorkScopeEnvironments => {
+            "DROP VIEW work_scope_environments"
+        }
+        P2bSchemaFault::NativeApprovalReceipts => {
+            "ALTER TABLE native_task_approval_receipts RENAME TO p2b_fault_native_task_approval_receipts"
+        }
+    };
+    harness.database = Some(fixture.db.clone());
+    // Numbered migration 054 made this a compatibility VIEW, not a table.
+    // Preserve its exact fixture-owned DDL before dropping it; no rows move.
+    if matches!(fault, P2bSchemaFault::WorkScopeEnvironments) {
+        harness.schema_view_definition = Some(sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'work_scope_environments'",
+        ).fetch_one(fixture.db.pool()).await.unwrap());
+    }
+    harness.schema_fault = Some(fault);
+    harness.schema_operation = Some(tokio::spawn(async move {
+        sqlx::query(rename_sql).execute(db.pool()).await.map(|_| ())
+    }));
+    let renamed = harness.schema_operation.as_mut().unwrap().await;
+    // Consume before any fallible assertion so panic cleanup cannot re-poll a
+    // completed handle. Cancellation during await leaves it with the owner.
+    drop(harness.schema_operation.take());
+    renamed
+        .expect("schema rename operation must join")
+        .expect("real schema rename must succeed");
+    harness.release_gate();
+    let observed = observed_rx
+        .await
+        .expect("actual actor settlement must report its typed result");
+    let outcome = harness.caller.as_mut().unwrap().await;
+    drop(harness.caller.take());
+    let outcome = outcome.unwrap();
+    handle.event_tx.closed().await;
+    let authority_closed = manager.local_authority_is_closed();
+
+    // Restoration is itself owned across cancellation; cleanup joins it before
+    // checking/restoring the disposable schema and draining the manager.
+    let restore_db = fixture.db.clone();
+    let view_definition = harness.schema_view_definition.clone();
+    harness.schema_operation = Some(tokio::spawn(async move {
+        restore_p2b_schema_fault(&restore_db, fault, view_definition.as_deref()).await
+    }));
+    let restored = harness.schema_operation.as_mut().unwrap().await;
+    drop(harness.schema_operation.take());
+    restored
+        .expect("schema restoration must join")
+        .expect("restore renamed table before any DB oracle");
+    harness.schema_fault = None;
+    assert!(
+        observed.0,
+        "expected actual Database(DbError::Sqlx), got {observed:?}"
+    );
+    let missing_table = match fault {
+        P2bSchemaFault::WorkScopeEnvironments => "no such table: work_scope_environments",
+        P2bSchemaFault::NativeApprovalReceipts => "no such table: native_task_approval_receipts",
+    };
+    assert!(observed.1.contains(missing_table), "{observed:?}");
+    assert_eq!(outcome, NativeTaskApprovalOutcome::Unavailable);
+    assert!(
+        authority_closed,
+        "actual failure must close the owning fence before cleanup"
+    );
+    assert_eq!(
+        native_rollback_snapshot(&fixture.db, "actor-target").await,
+        before
+    );
+    assert_eq!(
+        git(worktree, &["rev-parse", "HEAD"]).trim(),
+        before_head.trim()
+    );
+    assert_eq!(
+        interleavings::try_git_snapshot(root, worktree).unwrap(),
+        before_git
+    );
+    assert_eq!(
+        interleavings::try_worktree_files(worktree).unwrap(),
+        before_files
+    );
+    assert_eq!(native_authority_binding(&fixture.db).await, before_binding);
+    assert_eq!(
+        fixture
+            .db
+            .get_conversation(&command.source_transcript_id)
+            .await
+            .unwrap()
+            .state,
+        before_source
+    );
+    let after_target = fixture.db.get_conversation("actor-target").await.unwrap();
+    assert_eq!(
+        after_target.product_conversation_id,
+        before_target.product_conversation_id
+    );
+    assert_eq!(
+        after_target.attached_work_scope_id,
+        before_target.attached_work_scope_id
+    );
+    assert_eq!(after_target.cwd, before_target.cwd);
+    assert_eq!(after_target.conv_mode, before_target.conv_mode);
+    assert_eq!(llm.calls.load(Ordering::SeqCst), 0);
+    assert!(requests.try_recv().is_err());
+    assert_eq!(
+        fixture.db.inspect_native_task_approval_command(command).await.unwrap(),
+        phoenix_db::native_task_approval::NativeTaskApprovalInspection::RequiresOwningActorAdmission
+    );
+    loop {
+        match events.try_recv() {
+            Ok(
+                SseEvent::StateChange {
+                    state: ConvState::LlmRequesting { .. },
+                    ..
+                }
+                | SseEvent::ConversationUpdate { .. }
+                | SseEvent::Message { .. },
+            ) => panic!("unavailable approval published approval effects"),
+            Ok(_) => {}
+            Err(
+                tokio::sync::broadcast::error::TryRecvError::Empty
+                | tokio::sync::broadcast::error::TryRecvError::Closed,
+            ) => break,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(count)) => {
+                panic!("lost {count} events while proving no approval publication");
+            }
+        }
+    }
+}
+
+async fn restore_p2b_schema_fault(
+    db: &Database,
+    fault: P2bSchemaFault,
+    view_definition: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    match fault {
+        P2bSchemaFault::WorkScopeEnvironments => {
+            let definition = view_definition.ok_or_else(|| {
+                sqlx::Error::Protocol("missing disposable view restoration DDL".to_owned())
+            })?;
+            let present: Option<String> = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'work_scope_environments'",
+            ).fetch_optional(db.pool()).await?;
+            if present.is_none() {
+                // Exact DDL captured from this private fixture before DROP VIEW.
+                sqlx::query(definition).execute(db.pool()).await?;
+            }
+            let restored: String = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'work_scope_environments'",
+            ).fetch_one(db.pool()).await?;
+            if restored != definition {
+                return Err(sqlx::Error::Protocol(
+                    "disposable view DDL changed".to_owned(),
+                ));
+            }
+        }
+        P2bSchemaFault::NativeApprovalReceipts => {
+            let renamed: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'p2b_fault_native_task_approval_receipts'",
+            ).fetch_one(db.pool()).await?;
+            if renamed == 1 {
+                sqlx::query("ALTER TABLE p2b_fault_native_task_approval_receipts RENAME TO native_task_approval_receipts")
+                    .execute(db.pool()).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn assert_production_initial_approval(
     scenario: InitialApprovalScenario,
     kind: ReviewedTaskKind,
@@ -993,6 +1298,7 @@ async fn assert_production_initial_approval_inner(
         None
     };
     let f = AdmissionFixture::with_cwd_and_task_file_at("/nonexistent", task_file, db_path).await;
+    harness.database = Some(f.db.clone());
     assert_eq!(
         f.db.goal_control_installation(),
         GoalControlInstallation::Disabled
@@ -1096,7 +1402,9 @@ async fn assert_production_initial_approval_inner(
         | InitialApprovalScenario::FileBackedInitialProjectionRecovery
         | InitialApprovalScenario::InitialTaskmdCleanFilterMismatch
         | InitialApprovalScenario::InitialPlainAssumeUnchangedMismatch
-        | InitialApprovalScenario::InitialPlainMatchingHeadNoCommit => {
+        | InitialApprovalScenario::InitialPlainMatchingHeadNoCommit
+        | InitialApprovalScenario::EarlyTargetReadFailure
+        | InitialApprovalScenario::PreGitReadFailure => {
             phoenix_llm::ModelRegistry::for_test_with_sonnet(llm.clone())
         }
     };
@@ -1110,6 +1418,28 @@ async fn assert_production_initial_approval_inner(
         None,
     ));
     harness.manager = Some(Arc::clone(&manager));
+    if matches!(
+        scenario,
+        InitialApprovalScenario::EarlyTargetReadFailure
+            | InitialApprovalScenario::PreGitReadFailure
+    ) {
+        run_p2b_database_read_failure(
+            scenario,
+            harness,
+            &f,
+            &manager,
+            &command,
+            &root,
+            &worktree,
+            &before_head,
+            &before_target,
+            &llm,
+            &mut requests,
+        )
+        .await;
+        return;
+    }
+
     if matches!(
         scenario,
         InitialApprovalScenario::InitialProjectionFailure
@@ -2181,7 +2511,9 @@ async fn assert_production_initial_approval_inner(
         | InitialApprovalScenario::FileBackedInitialProjectionReplay
         | InitialApprovalScenario::FileBackedInitialProjectionRecovery
         | InitialApprovalScenario::InitialTaskmdCleanFilterMismatch
-        | InitialApprovalScenario::InitialPlainAssumeUnchangedMismatch => 0,
+        | InitialApprovalScenario::InitialPlainAssumeUnchangedMismatch
+        | InitialApprovalScenario::EarlyTargetReadFailure
+        | InitialApprovalScenario::PreGitReadFailure => 0,
     };
     assert_eq!(llm.calls.load(Ordering::SeqCst), expected_calls);
     assert!(requests.try_recv().is_err(), "no additional provider entry");

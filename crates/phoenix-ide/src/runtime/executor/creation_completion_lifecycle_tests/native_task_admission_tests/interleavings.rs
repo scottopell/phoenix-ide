@@ -587,7 +587,7 @@ async fn rotate_cancelled_source(
     Ok(successor.id)
 }
 
-fn try_git_snapshot(root: &Path, worktree: &Path) -> Result<Vec<String>, String> {
+pub(super) fn try_git_snapshot(root: &Path, worktree: &Path) -> Result<Vec<String>, String> {
     Ok(vec![
         try_git(root, &["rev-parse", "HEAD"])?,
         try_git(root, &["show-ref"])?,
@@ -618,7 +618,9 @@ fn try_git(path: &Path, args: &[&str]) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|error| error.to_string())
 }
 
-fn try_worktree_files(root: &Path) -> Result<BTreeMap<PathBuf, Option<Vec<u8>>>, String> {
+pub(super) fn try_worktree_files(
+    root: &Path,
+) -> Result<BTreeMap<PathBuf, Option<Vec<u8>>>, String> {
     fn visit(
         root: &Path,
         dir: &Path,
