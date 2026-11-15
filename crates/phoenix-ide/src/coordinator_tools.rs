@@ -439,7 +439,7 @@ pub(crate) fn tools(
         db: watch_db.clone(),
         peer_db: db.clone(),
     }));
-    tools.push(instance::RouteTool::boxed(ListWatchedConversations {
+    tools.push(Arc::new(ListWatchedConversations {
         db: watch_db,
         peer_db: db.clone(),
     }));
@@ -530,12 +530,65 @@ struct WatchInput {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ListWatchInput {}
+struct ListWatchEnvelope {
+    request: ListWatchRequest,
+}
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RemoteListWatchInput {
-    after: Option<uuid::Uuid>,
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+enum ListWatchRequest {
+    Local {},
+    Remote {
+        instance: instance::RemoteInstanceSelector,
+        after: Option<uuid::Uuid>,
+    },
+}
+
+fn list_watch_request_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["request"],
+        "properties": {
+            "request": {"oneOf": [
+                {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["op"],
+                    "properties": {"op": {"const": "local"}}
+                },
+                {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["op", "instance"],
+                    "properties": {
+                        "op": {"const": "remote"},
+                        "instance": {
+                            "type": "string",
+                            "minLength": 1,
+                            "not": {"const": "local"},
+                            "description": "Exact saved peer UUID or unambiguous saved name."
+                        },
+                        "after": {
+                            "anyOf": [{"type": "string", "format": "uuid"}, {"type": "null"}],
+                            "description": "Omit or null for the first page; otherwise use the preceding next_cursor."
+                        }
+                    }
+                }
+            ]}
+        }
+    })
+}
+
+fn parse_list_watch_request(input: Value) -> Result<ListWatchRequest, String> {
+    serde_json::from_value::<ListWatchEnvelope>(input)
+        .map(|envelope| envelope.request)
+        .map_err(|error| format!(
+            "Invalid list_watched_conversations request: {error}. \
+             Use {{\"request\":{{\"op\":\"local\"}}}} for local watches, or \
+             {{\"request\":{{\"op\":\"remote\",\"instance\":\"<saved peer UUID or name>\"}}}} \
+             for a remote first page. Only remote requests accept after; use the returned next_cursor for later pages."
+        ))
 }
 
 fn remote_watch_page(
@@ -691,52 +744,43 @@ impl instance::RoutedTool for UnwatchConversation {
 }
 
 #[async_trait]
-impl instance::RoutedTool for ListWatchedConversations {
+impl Tool for ListWatchedConversations {
     fn name(&self) -> &'static str {
         "list_watched_conversations"
     }
-    fn peer_resolution(&self) -> instance::PeerResolution {
-        instance::PeerResolution::WatchUuidIdentity
-    }
     fn description(&self) -> String {
-        "List local active watches, or page through durable remote subscriptions for one explicit saved instance with lifecycle and admitted cursor (not a live remote snapshot). For remote pages, pass next_cursor as after until has_more is false. No remote fallback.".into()
+        "List watches using one operation in request: local lists active local watches; remote pages through locally retained subscriptions for one saved peer, including lifecycle and admitted delivery cursor (not a live remote snapshot). For remote paging, omit after on the first page, then pass next_cursor as after until has_more is false. No remote fallback.".into()
     }
     fn clearable(&self) -> bool {
         true
     }
-    fn schema_without_instance(&self) -> Value {
-        json!({"type":"object","properties":{"after":{"type":"string","format":"uuid","description":"Continue a remote listing after the previous page's next_cursor; not valid for local watches."}},"additionalProperties":false})
+    fn input_schema(&self) -> Value {
+        list_watch_request_schema()
     }
-    fn resolution_db(&self) -> &crate::db::Database {
-        &self.peer_db
-    }
-    fn self_peer_policy(&self) -> instance::SelfPeerPolicy {
-        instance::SelfPeerPolicy::Allow
-    }
-    async fn run_routed(
-        &self,
-        input: Value,
-        route: instance::Route<crate::api::federation::ResolvedPeer>,
-        _ctx: ToolContext,
-    ) -> ToolOutput {
-        match route {
-            instance::Route::Local => {
-                if let Err(error) = serde_json::from_value::<ListWatchInput>(input) {
-                    return ToolOutput::error(error.to_string());
-                }
-                match self.db.list_coordinator_watches().await {
-                    Ok(watches) => watch_output(watches),
-                    Err(error) => ToolOutput::error(error.to_string()),
-                }
-            }
-            instance::Route::Remote(peer) => {
-                let parsed: RemoteListWatchInput = match serde_json::from_value(input) {
-                    Ok(parsed) => parsed,
+    async fn run(&self, input: Value, _ctx: ToolContext) -> ToolOutput {
+        let request = match parse_list_watch_request(input) {
+            Ok(request) => request,
+            Err(error) => return ToolOutput::error(error),
+        };
+        match request {
+            ListWatchRequest::Local {} => match self.db.list_coordinator_watches().await {
+                Ok(watches) => watch_output(watches),
+                Err(error) => ToolOutput::error(error.to_string()),
+            },
+            ListWatchRequest::Remote { instance, after } => {
+                let peer = match crate::api::federation::resolve_tool_peer_allow_self(
+                    &self.peer_db,
+                    &instance,
+                    instance::PeerResolution::WatchUuidIdentity,
+                )
+                .await
+                {
+                    Ok(peer) => peer,
                     Err(error) => return ToolOutput::error(error.to_string()),
                 };
                 match self
                     .db
-                    .remote_subscriptions_page(peer.instance_id(), parsed.after, 50)
+                    .remote_subscriptions_page(peer.instance_id(), after, 50)
                     .await
                 {
                     Ok(rows) => remote_watch_page(rows),
@@ -2132,6 +2176,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn watch_list_request_schema_and_decoder_separate_local_from_remote() {
+        let schema = list_watch_request_schema();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"], json!(["request"]));
+        assert_eq!(schema["additionalProperties"], false);
+        for keyword in ["oneOf", "anyOf", "allOf"] {
+            assert!(schema.get(keyword).is_none());
+        }
+        let branches = schema["properties"]["request"]["oneOf"].as_array().unwrap();
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0]["properties"], json!({"op":{"const":"local"}}));
+        assert_eq!(branches[0]["required"], json!(["op"]));
+        assert_eq!(branches[1]["required"], json!(["op", "instance"]));
+        assert!(branches[1]["properties"].get("after").is_some());
+        assert_eq!(
+            branches[1]["properties"]["instance"]["not"],
+            json!({"const":"local"})
+        );
+        for branch in branches {
+            assert_eq!(branch["additionalProperties"], false);
+        }
+        for valid in [
+            json!({"request":{"op":"local"}}),
+            json!({"request":{"op":"remote","instance":"saved-peer"}}),
+            json!({"request":{"op":"remote","instance":"saved-peer","after":null}}),
+            json!({"request":{"op":"remote","instance":"saved-peer","after":"00000000-0000-0000-0000-000000000001"}}),
+        ] {
+            assert!(parse_list_watch_request(valid.clone()).is_ok(), "{valid}");
+        }
+        for invalid in [
+            json!({}),
+            json!({"instance":"local","after":"00000000-0000-0000-0000-000000000000"}),
+            json!({"request":{"op":"local","after":null}}),
+            json!({"request":{"op":"local","after":"00000000-0000-0000-0000-000000000001"}}),
+            json!({"request":{"op":"local","instance":"saved-peer"}}),
+            json!({"request":{"op":"remote"}}),
+            json!({"request":{"op":"remote","instance":null}}),
+            json!({"request":{"op":"remote","instance":""}}),
+            json!({"request":{"op":"remote","instance":"local"}}),
+            json!({"request":{"op":"remote","instance":"saved-peer","after":17}}),
+            json!({"request":{"op":"remote","instance":"saved-peer","after":"not-a-uuid"}}),
+            json!({"request":{"op":"local"},"after":null}),
+            json!({"request":{"op":"local"},"instance":"local"}),
+        ] {
+            let error = parse_list_watch_request(invalid.clone())
+                .err()
+                .expect("invalid shape accepted");
+            assert!(
+                error.contains("Only remote requests accept after"),
+                "{invalid}: {error}"
+            );
+            assert!(error.contains(r#"{"request":{"op":"local"}}"#));
+        }
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn registered_watch_list_pages_all_remote_subscriptions_without_crossing_peers() {
@@ -2209,9 +2309,9 @@ mod tests {
             .iter()
             .find(|tool| tool.name() == "list_watched_conversations")
             .unwrap();
-        assert!(tool.input_schema()["properties"].get("after").is_some());
+        assert!(tool.input_schema()["properties"].get("request").is_some());
         let local = tool
-            .run(json!({"instance":"local"}), context("coordinator"))
+            .run(json!({"request":{"op":"local"}}), context("coordinator"))
             .await;
         assert!(local.is_success());
         assert_eq!(
@@ -2220,17 +2320,24 @@ mod tests {
         );
         let invalid_local = tool
             .run(
-                json!({"instance":"local","after":uuid::Uuid::new_v4()}),
+                json!({"request":{"op":"local","after":uuid::Uuid::new_v4()}}),
                 context("coordinator"),
             )
             .await;
         assert!(!invalid_local.is_success());
+        assert!(invalid_local
+            .output()
+            .contains("Only remote requests accept after"));
+        let recovered = tool
+            .run(json!({"request":{"op":"local"}}), context("coordinator"))
+            .await;
+        assert!(recovered.is_success());
         let mut after = None;
         let mut ids = Vec::new();
         loop {
             let output = tool
                 .run(
-                    json!({"instance":peer.to_string(),"after":after}),
+                    json!({"request":{"op":"remote","instance":peer.to_string(),"after":after}}),
                     context("coordinator"),
                 )
                 .await;
@@ -2267,7 +2374,7 @@ mod tests {
         );
         let isolated = tool
             .run(
-                json!({"instance":other.to_string()}),
+                json!({"request":{"op":"remote","instance":other.to_string()}}),
                 context("coordinator"),
             )
             .await;
@@ -2293,7 +2400,7 @@ mod tests {
         }
         let first = tool
             .run(
-                json!({"instance":other.to_string(),"after":uuid::Uuid::from_u128(2048)}),
+                json!({"request":{"op":"remote","instance":other.to_string(),"after":uuid::Uuid::from_u128(2048)}}),
                 context("coordinator"),
             )
             .await;
@@ -2308,7 +2415,7 @@ mod tests {
         );
         let last = tool
             .run(
-                json!({"instance":other.to_string(),"after":first_page["next_cursor"]}),
+                json!({"request":{"op":"remote","instance":other.to_string(),"after":first_page["next_cursor"]}}),
                 context("coordinator"),
             )
             .await;
@@ -2333,7 +2440,7 @@ mod tests {
         .unwrap();
         let oversized = tool
             .run(
-                json!({"instance":other.to_string(),"after":uuid::Uuid::from_u128(2050)}),
+                json!({"request":{"op":"remote","instance":other.to_string(),"after":uuid::Uuid::from_u128(2050)}}),
                 context("coordinator"),
             )
             .await;
