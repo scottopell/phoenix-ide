@@ -5,7 +5,7 @@ use phoenix_db::native_close::{NativeCloseObserveResult, NativeCloseRunRef};
 use phoenix_db::workflow::LocalAuthorityResult;
 
 use crate::runtime::native_close_application::{
-    NativeCloseApplicationError, observe_command_from_executing_source,
+    observe_command_from_executing_source, NativeCloseApplicationError,
 };
 
 use super::{

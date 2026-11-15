@@ -69,7 +69,9 @@ async fn apply_initial_tx(
 ) -> DbResult<NativeCloseInitialResult> {
     super::receipts::require_source_and_target_tx(tx, command).await?;
     let NativeCloseIntent::Initial { target } = command.intent() else {
-        return Err(DbError::CloseFoundationPrecondition("expected initial Close intent".into()));
+        return Err(DbError::CloseFoundationPrecondition(
+            "expected initial Close intent".into(),
+        ));
     };
     if let Some(admitted) = super::receipts::read_receipt_tx(tx, command).await? {
         return Ok(NativeCloseInitialResult::Replay(NativeCloseReceipt {

@@ -46,7 +46,12 @@ pub(super) fn initial_command_from_executing_source(
     source: &SourceToolCall,
     target: ProductConversationId,
 ) -> Result<NativeCloseCommand, NativeCloseSourceRefusal> {
-    command_from_executing_source(state, source_transcript_id, source, NativeCloseIntent::Initial { target })
+    command_from_executing_source(
+        state,
+        source_transcript_id,
+        source,
+        NativeCloseIntent::Initial { target },
+    )
 }
 
 pub(super) fn observe_command_from_executing_source(
@@ -55,11 +60,16 @@ pub(super) fn observe_command_from_executing_source(
     source: &SourceToolCall,
     referenced: NativeCloseRunRef,
 ) -> Result<NativeCloseCommand, NativeCloseSourceRefusal> {
-    command_from_executing_source(state, source_transcript_id, source, NativeCloseIntent::Observe {
-        target: referenced.target,
-        attempt_id: referenced.attempt_id,
-        run_ordinal: referenced.run_ordinal,
-    })
+    command_from_executing_source(
+        state,
+        source_transcript_id,
+        source,
+        NativeCloseIntent::Observe {
+            target: referenced.target,
+            attempt_id: referenced.attempt_id,
+            run_ordinal: referenced.run_ordinal,
+        },
+    )
 }
 
 fn command_from_executing_source(
@@ -112,12 +122,8 @@ fn command_from_executing_source(
     {
         return Err(invalid);
     }
-    NativeCloseCommand::new(
-        source_transcript_id.to_owned(),
-        source.clone(),
-        intent,
-    )
-    .map_err(|_| invalid)
+    NativeCloseCommand::new(source_transcript_id.to_owned(), source.clone(), intent)
+        .map_err(|_| invalid)
 }
 
 /// Owned queue envelope: neither caller cancellation nor a dropped reply can

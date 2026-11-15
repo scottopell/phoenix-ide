@@ -17,7 +17,9 @@ const FINGERPRINT_DOMAIN: &[u8] = b"phoenix.native_close.intent.v1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeCloseIntent {
-    Initial { target: ProductConversationId },
+    Initial {
+        target: ProductConversationId,
+    },
     Observe {
         target: ProductConversationId,
         attempt_id: CloseAttemptId,
@@ -40,7 +42,11 @@ impl NativeCloseIntent {
             Self::Initial { target } => serde_json::json!({
                 "action": "initial", "product_conversation_id": target.as_str()
             }),
-            Self::Observe { target, attempt_id, run_ordinal } => serde_json::json!({
+            Self::Observe {
+                target,
+                attempt_id,
+                run_ordinal,
+            } => serde_json::json!({
                 "action": "observe", "product_conversation_id": target.as_str(),
                 "attempt_id": attempt_id.as_str(), "run_ordinal": run_ordinal.get()
             }),
@@ -98,7 +104,11 @@ impl NativeCloseCommand {
                 append_field(&mut canonical, b"initial");
                 append_field(&mut canonical, target.as_str().as_bytes());
             }
-            NativeCloseIntent::Observe { target, attempt_id, run_ordinal } => {
+            NativeCloseIntent::Observe {
+                target,
+                attempt_id,
+                run_ordinal,
+            } => {
                 append_field(&mut canonical, b"observe");
                 append_field(&mut canonical, target.as_str().as_bytes());
                 append_field(&mut canonical, attempt_id.as_str().as_bytes());

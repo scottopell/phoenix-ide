@@ -292,7 +292,10 @@ fn registered_identity_order_and_exact_bodies() {
         (include_str!("goal_preparation_inflight_source.sql"), 152),
         (include_str!("close_writer_observations.sql"), 153),
         (include_str!("close_original_retirement_anchor.sql"), 159),
-        (include_str!("native_close_exact_observation_receipts.sql"), 160),
+        (
+            include_str!("native_close_exact_observation_receipts.sql"),
+            160,
+        ),
     ] {
         let entries = MIGRATIONS
             .iter()

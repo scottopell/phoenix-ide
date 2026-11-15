@@ -45,7 +45,12 @@ impl CloseFixture {
             message_id: "executing-close-message".into(),
             tool_use_id: "executing-close-call".into(),
         };
-        let state = executing_state(&source, &NativeCloseIntent::Initial { target: target.clone() });
+        let state = executing_state(
+            &source,
+            &NativeCloseIntent::Initial {
+                target: target.clone(),
+            },
+        );
         db.update_conversation_state(&coordinator.id, &state)
             .await
             .unwrap();
@@ -71,24 +76,36 @@ impl CloseFixture {
         use phoenix_core::domain::close::{CloseRunOrdinal, TranscriptConversationId};
 
         let mut fixture = Self::new().await;
-        let obligation = fixture.db.begin_close_foundation(
-            &fixture.target, &TranscriptConversationId::parse(TARGET_ID).unwrap(),
-            "retained-observe-attempt",
-        ).await.unwrap();
+        let obligation = fixture
+            .db
+            .begin_close_foundation(
+                &fixture.target,
+                &TranscriptConversationId::parse(TARGET_ID).unwrap(),
+                "retained-observe-attempt",
+            )
+            .await
+            .unwrap();
         let referenced = NativeCloseRunRef {
-            target: fixture.target.clone(), attempt_id: obligation.attempt_id().clone(),
+            target: fixture.target.clone(),
+            attempt_id: obligation.attempt_id().clone(),
             run_ordinal: CloseRunOrdinal::INITIAL,
         };
         fixture.command = NativeCloseCommand::new(
-            fixture.source_transcript_id.clone(), fixture.source.clone(),
+            fixture.source_transcript_id.clone(),
+            fixture.source.clone(),
             NativeCloseIntent::Observe {
-                target: referenced.target.clone(), attempt_id: referenced.attempt_id.clone(),
+                target: referenced.target.clone(),
+                attempt_id: referenced.attempt_id.clone(),
                 run_ordinal: referenced.run_ordinal,
             },
-        ).unwrap();
+        )
+        .unwrap();
         fixture.state = executing_state(&fixture.source, fixture.command.intent());
-        fixture.db.update_conversation_state(&fixture.source_transcript_id, &fixture.state)
-            .await.unwrap();
+        fixture
+            .db
+            .update_conversation_state(&fixture.source_transcript_id, &fixture.state)
+            .await
+            .unwrap();
         (fixture, referenced)
     }
 
@@ -325,36 +342,58 @@ fn observe_request(
 ) {
     let (response, result) = oneshot::channel();
     let request = NativeCloseObserveRequest {
-        source: fixture.source.clone(), referenced, admitted, target_gate, response,
+        source: fixture.source.clone(),
+        referenced,
+        admitted,
+        target_gate,
+        response,
     };
-    (AcknowledgedRuntimeRequest::ExecuteNativeCloseObserve(Box::new(request)), result)
+    (
+        AcknowledgedRuntimeRequest::ExecuteNativeCloseObserve(Box::new(request)),
+        result,
+    )
 }
 
 #[tokio::test]
 async fn stopped_live_source_refuses_exact_observe_replay_before_database_lookup() {
     let (fixture, referenced) = CloseFixture::observing().await;
-    assert!(matches!(fixture.db.apply_native_close_observe(&fixture.command).await,
-        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(
-            Ok(NativeCloseObserveResult::Observed(_))
-        )
+    assert!(matches!(
+        fixture
+            .db
+            .apply_native_close_observe(&fixture.command)
+            .await,
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(
+            NativeCloseObserveResult::Observed(_)
+        ))
     ));
     let mut harness = fixture.runtime(true);
     let fence = Arc::clone(&harness.runtime.fatal_local_authority_fence);
     let admitted = harness.runtime.admit_authoritative_effect().unwrap();
     let (sender, running) = start_actor(&mut harness);
     stop_actor(&sender).await;
-    assert!(!matches!(harness.storage.get_current_state(&fixture.source_transcript_id).unwrap(),
+    assert!(!matches!(
+        harness
+            .storage
+            .get_current_state(&fixture.source_transcript_id)
+            .unwrap(),
         ConvState::ToolExecuting { .. }
     ));
     // InMemoryStorage received Stop; SQLite still permits this historical replay.
-    assert!(matches!(fixture.db.apply_native_close_observe(&fixture.command).await,
-        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(
-            Ok(NativeCloseObserveResult::Replay(_))
-        )
+    assert!(matches!(
+        fixture
+            .db
+            .apply_native_close_observe(&fixture.command)
+            .await,
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(
+            NativeCloseObserveResult::Replay(_)
+        ))
     ));
     let gate = Arc::new(Mutex::new(()));
     let (request, result) = observe_request(
-        &fixture, referenced, admitted, Arc::clone(&gate).lock_owned().await,
+        &fixture,
+        referenced,
+        admitted,
+        Arc::clone(&gate).lock_owned().await,
     );
     sender.send(request).await.unwrap();
     assert!(matches!(
@@ -383,7 +422,10 @@ async fn dropped_observe_reply_keeps_queue_ownership_through_adoption_and_classi
     let sender = setup_actor_queue(&mut harness);
     let gate = Arc::new(Mutex::new(()));
     let (request, dropped_reply) = observe_request(
-        &fixture, referenced.clone(), admitted, Arc::clone(&gate).lock_owned().await,
+        &fixture,
+        referenced.clone(),
+        admitted,
+        Arc::clone(&gate).lock_owned().await,
     );
     sender.send(request).await.unwrap();
     drop(dropped_reply);

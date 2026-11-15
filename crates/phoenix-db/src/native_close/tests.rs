@@ -66,13 +66,17 @@ fn observe_fingerprint_binds_intent_target_attempt_and_exact_ordinal_not_source(
     let observe = |source: &str, target: &str, attempt: &str, ordinal: i64| {
         NativeCloseCommand::new(
             source.into(),
-            SourceToolCall { message_id: "message".into(), tool_use_id: "tool".into() },
+            SourceToolCall {
+                message_id: "message".into(),
+                tool_use_id: "tool".into(),
+            },
             NativeCloseIntent::Observe {
                 target: ProductConversationId::parse(target).unwrap(),
                 attempt_id: CloseAttemptId::parse(attempt).unwrap(),
                 run_ordinal: CloseRunOrdinal::parse(ordinal).unwrap(),
             },
-        ).unwrap()
+        )
+        .unwrap()
     };
     let base = observe("source", "ab", "c", 1);
     assert_eq!(base, observe("source", "ab", "c", 1));
@@ -90,10 +94,13 @@ fn observe_fingerprint_binds_intent_target_attempt_and_exact_ordinal_not_source(
     let other_source = observe("other-source", "ab", "c", 1);
     assert_ne!(base.request_id(), other_source.request_id());
     assert_eq!(base.fingerprint(), other_source.fingerprint());
-    assert_eq!(base.intent().source_input(), serde_json::json!({
-        "action": "observe", "product_conversation_id": "ab",
-        "attempt_id": "c", "run_ordinal": 1,
-    }));
+    assert_eq!(
+        base.intent().source_input(),
+        serde_json::json!({
+            "action": "observe", "product_conversation_id": "ab",
+            "attempt_id": "c", "run_ordinal": 1,
+        })
+    );
 }
 
 #[test]

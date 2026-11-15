@@ -12602,41 +12602,70 @@ mod tests {
         db: &Database,
         run: &CloseRunRef,
     ) -> crate::native_close::NativeCloseCommand {
-        use crate::native_close::{NativeCloseCommand, NativeCloseIntent, NativeCloseObserveResult};
+        use crate::native_close::{
+            NativeCloseCommand, NativeCloseIntent, NativeCloseObserveResult,
+        };
         use phoenix_core::domain::db_schema::SourceToolCall;
         use phoenix_core::domain::llm_types::ContentBlock;
         use phoenix_core::domain::sm_state::{AssistantMessage, ConvState, ToolCall, ToolInput};
 
-        let coordinator = db.get_or_create_coordinator(
-            None, phoenix_core::llm_language::LlmLanguage::default(),
-        ).await.unwrap();
-        let target = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap()
-            .product_conversation_id().clone();
+        let coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let target = db
+            .get_close_obligation(run.attempt_id.as_str())
+            .await
+            .unwrap()
+            .product_conversation_id()
+            .clone();
         let source = SourceToolCall {
             message_id: "observe-retained-message".into(),
             tool_use_id: "observe-retained-call".into(),
         };
-        let command = NativeCloseCommand::new(coordinator.id.clone(), source.clone(),
+        let command = NativeCloseCommand::new(
+            coordinator.id.clone(),
+            source.clone(),
             NativeCloseIntent::Observe {
-                target, attempt_id: run.attempt_id.clone(), run_ordinal: run.ordinal,
+                target,
+                attempt_id: run.attempt_id.clone(),
+                run_ordinal: run.ordinal,
             },
-        ).unwrap();
+        )
+        .unwrap();
         let input = command.intent().source_input();
-        db.update_conversation_state(&coordinator.id, &ConvState::ToolExecuting {
-            current_tool: ToolCall::new(&source.tool_use_id, ToolInput::Unknown {
-                name: "close_conversation".into(), input: input.clone(),
-            }),
-            remaining_tools: vec![], completed_results: vec![], pending_sub_agents: vec![],
-            assistant_message: AssistantMessage::new(source.message_id,
-                vec![ContentBlock::ToolUse {
-                    id: source.tool_use_id, name: "close_conversation".into(), input,
-                }], None, None,
-            ),
-        }).await.unwrap();
-        assert!(matches!(db.apply_native_close_observe(&command).await,
-            crate::workflow::LocalAuthorityResult::DurableFactEstablished(
-                Ok(NativeCloseObserveResult::Observed(_))
-            )
+        db.update_conversation_state(
+            &coordinator.id,
+            &ConvState::ToolExecuting {
+                current_tool: ToolCall::new(
+                    &source.tool_use_id,
+                    ToolInput::Unknown {
+                        name: "close_conversation".into(),
+                        input: input.clone(),
+                    },
+                ),
+                remaining_tools: vec![],
+                completed_results: vec![],
+                pending_sub_agents: vec![],
+                assistant_message: AssistantMessage::new(
+                    source.message_id,
+                    vec![ContentBlock::ToolUse {
+                        id: source.tool_use_id,
+                        name: "close_conversation".into(),
+                        input,
+                    }],
+                    None,
+                    None,
+                ),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            db.apply_native_close_observe(&command).await,
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(
+                NativeCloseObserveResult::Observed(_)
+            ))
         ));
         command
     }
@@ -12648,28 +12677,51 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("before-observe.db");
         let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::migrations::run_through_for_test(db.pool(), 159).await.unwrap();
-        let failure = initial_cleanup_failure_fixture(&db, CloseStopCertainty::ShutdownUncertain).await;
-        db.terminalize_initial_close_cleanup_failure(&failure).await.unwrap();
-        let retry = db.admit_close_safe_retry(&safe_retry_request(&failure)).await.unwrap();
+        crate::migrations::run_through_for_test(db.pool(), 159)
+            .await
+            .unwrap();
+        let failure =
+            initial_cleanup_failure_fixture(&db, CloseStopCertainty::ShutdownUncertain).await;
+        db.terminalize_initial_close_cleanup_failure(&failure)
+            .await
+            .unwrap();
+        let retry = db
+            .admit_close_safe_retry(&safe_retry_request(&failure))
+            .await
+            .unwrap();
         assert_eq!(retry.ordinal.get(), 2);
         sqlx::query("UPDATE close_obligations SET native_managed = 1 WHERE attempt_id = ?1")
-            .bind(failure.attempt_id.as_str()).execute(db.pool()).await.unwrap();
+            .bind(failure.attempt_id.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
         sqlx::query(
             "INSERT INTO native_close_initial_receipts
                 (request_id, source_transcript_id, source_message_id, source_tool_use_id,
                  request_fingerprint, product_conversation_id, attempt_id, run_ordinal)
              VALUES ('receipt-158', 'historical-source', 'historical-message', 'historical-call',
                      'historical-fingerprint', ?1, ?2, 1)",
-        ).bind(failure.source_product_conversation_id.as_str())
-            .bind(failure.attempt_id.as_str()).execute(db.pool()).await.unwrap();
+        )
+        .bind(failure.source_product_conversation_id.as_str())
+        .bind(failure.attempt_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
         let before: (String, String, String, String, String, String, String, i64) = sqlx::query_as(
             "SELECT request_id, source_transcript_id, source_message_id, source_tool_use_id,
                     request_fingerprint, product_conversation_id, attempt_id, run_ordinal
              FROM native_close_initial_receipts WHERE request_id = 'receipt-158'",
-        ).fetch_one(db.pool()).await.unwrap();
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
 
-        assert_eq!(crate::migrations::run_pending_migrations(db.pool()).await.unwrap(), 1);
+        assert_eq!(
+            crate::migrations::run_pending_migrations(db.pool())
+                .await
+                .unwrap(),
+            1
+        );
         let after: (String, String, String, String, String, String, String, i64) = sqlx::query_as(
             "SELECT request_id, source_transcript_id, source_message_id, source_tool_use_id,
                     request_fingerprint, product_conversation_id, attempt_id, run_ordinal
@@ -12679,7 +12731,11 @@ mod tests {
         let observation = observe_retained_run(&db, &retry).await;
         let exact: (String, i64) = sqlx::query_as(
             "SELECT intent, run_ordinal FROM native_close_initial_receipts WHERE request_id = ?1",
-        ).bind(observation.request_id().to_string()).fetch_one(db.pool()).await.unwrap();
+        )
+        .bind(observation.request_id().to_string())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
         assert_eq!(exact, ("observe".into(), 2));
 
         for intent in [None, Some("initial")] {
@@ -12689,9 +12745,13 @@ mod tests {
                      request_fingerprint, product_conversation_id, attempt_id, run_ordinal, intent)
                  VALUES ('invalid-initial', 'new-source', 'new-message', 'new-call', 'fingerprint',
                          ?1, ?2, 2, COALESCE(?3, 'initial'))",
-            ).bind(failure.source_product_conversation_id.as_str())
-                .bind(failure.attempt_id.as_str()).bind(intent)
-                .execute(db.pool()).await.unwrap_err();
+            )
+            .bind(failure.source_product_conversation_id.as_str())
+            .bind(failure.attempt_id.as_str())
+            .bind(intent)
+            .execute(db.pool())
+            .await
+            .unwrap_err();
             assert!(error.to_string().contains("CHECK constraint failed"));
         }
         let missing_run = sqlx::query(
@@ -12700,19 +12760,33 @@ mod tests {
                  request_fingerprint, product_conversation_id, attempt_id, run_ordinal, intent)
              VALUES ('missing-run', 'new-source', 'new-message', 'new-call', 'fingerprint',
                      ?1, ?2, 3, 'observe')",
-        ).bind(failure.source_product_conversation_id.as_str())
-            .bind(failure.attempt_id.as_str()).execute(db.pool()).await.unwrap_err();
-        assert!(missing_run.to_string().contains("FOREIGN KEY constraint failed"));
+        )
+        .bind(failure.source_product_conversation_id.as_str())
+        .bind(failure.attempt_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap_err();
+        assert!(missing_run
+            .to_string()
+            .contains("FOREIGN KEY constraint failed"));
         let foreign_keys: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT \"table\", \"from\", \"to\" FROM pragma_foreign_key_list('native_close_initial_receipts')",
         ).fetch_all(db.pool()).await.unwrap();
         for expected in [
             ("close_obligations", "attempt_id", "attempt_id"),
-            ("close_obligations", "product_conversation_id", "product_conversation_id"),
+            (
+                "close_obligations",
+                "product_conversation_id",
+                "product_conversation_id",
+            ),
             ("close_runs", "attempt_id", "attempt_id"),
             ("close_runs", "run_ordinal", "run_ordinal"),
         ] {
-            assert!(foreign_keys.contains(&(expected.0.into(), expected.1.into(), expected.2.into())));
+            assert!(foreign_keys.contains(&(
+                expected.0.into(),
+                expected.1.into(),
+                expected.2.into()
+            )));
         }
         for statement in [
             "UPDATE native_close_initial_receipts SET request_fingerprint = 'changed'",
@@ -12722,11 +12796,24 @@ mod tests {
         ] {
             assert!(sqlx::query(statement).execute(db.pool()).await.is_err(), "{statement}");
         }
-        assert_eq!(sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM native_close_initial_receipts",
-        ).fetch_one(db.pool()).await.unwrap(), 2);
-        assert!(sqlx::query("PRAGMA foreign_key_check").fetch_all(db.pool()).await.unwrap().is_empty());
-        assert_eq!(crate::migrations::run_pending_migrations(db.pool()).await.unwrap(), 0);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM native_close_initial_receipts",)
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            crate::migrations::run_pending_migrations(db.pool())
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -13058,10 +13145,14 @@ mod tests {
             );
             let crate::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(
                 crate::native_close::NativeCloseObserveResult::Replay(replay),
-            )) = db.apply_native_close_observe(&observation).await else {
+            )) = db.apply_native_close_observe(&observation).await
+            else {
                 panic!("completed admitted retry must remain observable");
             };
-            assert_eq!(replay.current_referenced_run_status, CloseRunStatus::Completed);
+            assert_eq!(
+                replay.current_referenced_run_status,
+                CloseRunStatus::Completed
+            );
             assert!(db.get_conversation("latest").await.unwrap().archived);
             assert!(db.get_conversation("participant").await.unwrap().archived);
             assert!(db.complete_close_safe_retry(&run).await.is_err());

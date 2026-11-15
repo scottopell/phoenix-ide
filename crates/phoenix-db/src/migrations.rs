@@ -23469,7 +23469,7 @@ mod close_completion_allowance_tests {
             2
         );
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 2);
         let migrated: (i64, i64) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM close_original_retirement_anchors WHERE attempt_id = ?1),
                     (SELECT COUNT(*) FROM close_retirement_anchor_exclusions WHERE attempt_id = ?1)"

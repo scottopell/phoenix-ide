@@ -61,8 +61,15 @@ async fn apply_observe_tx(
     command: &NativeCloseCommand,
 ) -> DbResult<NativeCloseObserveResult> {
     super::receipts::require_source_and_target_tx(tx, command).await?;
-    let NativeCloseIntent::Observe { target, attempt_id, run_ordinal } = command.intent() else {
-        return Err(DbError::CloseFoundationPrecondition("expected exact Close observation intent".into()));
+    let NativeCloseIntent::Observe {
+        target,
+        attempt_id,
+        run_ordinal,
+    } = command.intent()
+    else {
+        return Err(DbError::CloseFoundationPrecondition(
+            "expected exact Close observation intent".into(),
+        ));
     };
     let replay = super::receipts::read_receipt_tx(tx, command).await?;
     let referenced = replay.clone().unwrap_or_else(|| NativeCloseRunRef {
@@ -96,7 +103,10 @@ async fn apply_observe_tx(
         super::receipts::adopt_and_insert_receipt_tx(tx, command, &referenced).await?;
     }
     let observation = NativeCloseObservation {
-        receipt: NativeCloseObserveReceipt { request_id: command.request_id(), referenced },
+        receipt: NativeCloseObserveReceipt {
+            request_id: command.request_id(),
+            referenced,
+        },
         current_referenced_run_status: retained_run.status,
         current_operation,
     };

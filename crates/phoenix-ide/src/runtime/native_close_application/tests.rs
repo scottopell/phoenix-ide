@@ -1,6 +1,6 @@
 use super::*;
 use crate::state_machine::state::{AssistantMessage, ToolCall, ToolInput};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 fn fixture(input: Value) -> (ConvState, SourceToolCall) {
     let source = SourceToolCall {
@@ -164,12 +164,14 @@ fn observe_input() -> Value {
         target: observed_reference().target,
         attempt_id: observed_reference().attempt_id,
         run_ordinal: observed_reference().run_ordinal,
-    }.source_input()
+    }
+    .source_input()
 }
 
-fn derive_observe(state: &ConvState, source: &SourceToolCall)
-    -> Result<NativeCloseCommand, NativeCloseSourceRefusal>
-{
+fn derive_observe(
+    state: &ConvState,
+    source: &SourceToolCall,
+) -> Result<NativeCloseCommand, NativeCloseSourceRefusal> {
     observe_command_from_executing_source(state, "source-transcript", source, observed_reference())
 }
 
@@ -183,13 +185,22 @@ fn exact_observe_source_binds_the_retained_run_and_rejects_idle_or_initial_sourc
     assert!(derive_observe(&ConvState::Idle, &source).is_err());
     assert!(derive_observe(&fixture(initial_input()).0, &source).is_err());
     for changed in [
-        SourceToolCall { message_id: "other".into(), ..source.clone() },
-        SourceToolCall { tool_use_id: "other".into(), ..source.clone() },
+        SourceToolCall {
+            message_id: "other".into(),
+            ..source.clone()
+        },
+        SourceToolCall {
+            tool_use_id: "other".into(),
+            ..source.clone()
+        },
     ] {
         assert!(derive_observe(&state, &changed).is_err());
     }
     for changed in [
-        NativeCloseRunRef { target: ProductConversationId::parse("other").unwrap(), ..observed_reference() },
+        NativeCloseRunRef {
+            target: ProductConversationId::parse("other").unwrap(),
+            ..observed_reference()
+        },
         NativeCloseRunRef {
             attempt_id: phoenix_core::domain::close::CloseAttemptId::parse("other").unwrap(),
             ..observed_reference()
@@ -199,7 +210,13 @@ fn exact_observe_source_binds_the_retained_run_and_rejects_idle_or_initial_sourc
             ..observed_reference()
         },
     ] {
-        assert!(observe_command_from_executing_source(&state, "source-transcript", &source, changed).is_err());
+        assert!(observe_command_from_executing_source(
+            &state,
+            "source-transcript",
+            &source,
+            changed
+        )
+        .is_err());
     }
 }
 
@@ -220,9 +237,12 @@ fn observe_source_rejects_nonexact_payloads_even_when_canonical_and_executing_ag
         assert!(derive_observe(&state, &source).is_err(), "{field}");
     }
     let (mut state, source) = fixture(observe_input());
-    let ConvState::ToolExecuting { current_tool, .. } = &mut state else { unreachable!() };
+    let ConvState::ToolExecuting { current_tool, .. } = &mut state else {
+        unreachable!()
+    };
     current_tool.input = ToolInput::Unknown {
-        name: "close_conversation".into(), input: initial_input(),
+        name: "close_conversation".into(),
+        input: initial_input(),
     };
     assert!(derive_observe(&state, &source).is_err());
 }
@@ -230,12 +250,26 @@ fn observe_source_rejects_nonexact_payloads_even_when_canonical_and_executing_ag
 #[test]
 fn observe_source_rejects_duplicate_canonical_and_pending_occurrences() {
     let (mut state, source) = fixture(observe_input());
-    let ConvState::ToolExecuting { assistant_message, .. } = &mut state else { unreachable!() };
-    assistant_message.content.push(assistant_message.content[0].clone());
+    let ConvState::ToolExecuting {
+        assistant_message, ..
+    } = &mut state
+    else {
+        unreachable!()
+    };
+    assistant_message
+        .content
+        .push(assistant_message.content[0].clone());
     assert!(derive_observe(&state, &source).is_err());
 
     let (mut state, source) = fixture(observe_input());
-    let ConvState::ToolExecuting { current_tool, remaining_tools, .. } = &mut state else { unreachable!() };
+    let ConvState::ToolExecuting {
+        current_tool,
+        remaining_tools,
+        ..
+    } = &mut state
+    else {
+        unreachable!()
+    };
     remaining_tools.push(current_tool.clone());
     assert!(derive_observe(&state, &source).is_err());
 }

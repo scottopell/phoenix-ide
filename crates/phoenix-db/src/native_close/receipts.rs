@@ -65,10 +65,14 @@ pub(super) async fn read_receipt_tx(
         let intent: String = row.try_get("intent")?;
         let referenced = super::initial::decode_run_ref(&row)?;
         let exact_matches = match command.intent() {
-            NativeCloseIntent::Initial { .. } => referenced.run_ordinal == phoenix_core::domain::close::CloseRunOrdinal::INITIAL,
-            NativeCloseIntent::Observe { attempt_id, run_ordinal, .. } => {
-                &referenced.attempt_id == attempt_id && referenced.run_ordinal == *run_ordinal
+            NativeCloseIntent::Initial { .. } => {
+                referenced.run_ordinal == phoenix_core::domain::close::CloseRunOrdinal::INITIAL
             }
+            NativeCloseIntent::Observe {
+                attempt_id,
+                run_ordinal,
+                ..
+            } => &referenced.attempt_id == attempt_id && referenced.run_ordinal == *run_ordinal,
         };
         if source_transcript != command.source_transcript_id()
             || message != command.source().message_id

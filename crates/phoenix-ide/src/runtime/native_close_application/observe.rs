@@ -23,7 +23,9 @@ impl crate::runtime::RuntimeManager {
         referenced: NativeCloseRunRef,
     ) -> Result<phoenix_db::native_close::NativeCloseObserveResult, NativeCloseApplicationError>
     {
-        let gate = self.conversation_admission(referenced.target.as_str()).await;
+        let gate = self
+            .conversation_admission(referenced.target.as_str())
+            .await;
         let target_gate = gate.lock_owned().await;
         let admitted = self
             .acquire_local_authority_pass()
