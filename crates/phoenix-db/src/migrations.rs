@@ -827,6 +827,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "close_original_retirement_anchors",
         sql: include_str!("migrations/close_original_retirement_anchor.sql"),
     },
+    Migration {
+        version: 160,
+        name: "native_close_exact_observation_receipts",
+        sql: include_str!("migrations/native_close_exact_observation_receipts.sql"),
+    },
 ];
 
 const MIGRATION_158: &str = r"
@@ -15888,7 +15893,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(run_through_for_test(db.pool(), 152).await.unwrap(), 1);
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 6);
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 7);
         assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
         let ledger: Vec<(i64, String)> = sqlx::query_as(
             "SELECT version, name FROM _migrations WHERE version >= 150 ORDER BY version",
@@ -15911,6 +15916,7 @@ mod tests {
                 ),
                 (158, "native_close_initial_receipts".into()),
                 (159, "close_original_retirement_anchors".into()),
+                (160, "native_close_exact_observation_receipts".into()),
             ]
         );
     }
@@ -15920,6 +15926,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (160, "native_close_exact_observation_receipts"),
             (159, "close_original_retirement_anchors"),
             (158, "native_close_initial_receipts"),
             (157, "close_completion_allowances_and_native_retry_fence"),
@@ -20204,6 +20211,7 @@ mod tests {
                 (157, "close_completion_allowances_and_native_retry_fence"),
                 (158, "native_close_initial_receipts"),
                 (159, "close_original_retirement_anchors"),
+                (160, "native_close_exact_observation_receipts"),
             ]
         );
         let goal = MIGRATIONS
@@ -20217,7 +20225,7 @@ mod tests {
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 157);
+        assert_eq!(MIGRATIONS.len(), 158);
     }
 
     #[tokio::test]
@@ -20233,7 +20241,7 @@ mod tests {
         }
         sqlx::query("UPDATE product_creation_jobs SET status = 'published', published_product_id = 'deleted-product', published_conversation_id = 'deleted-transcript' WHERE request_id = 'orphan-image'")
             .execute(&pool).await.unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 9);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 11);
         let identity: Vec<(String, String)> = sqlx::query_as(
             "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
         ).fetch_all(&pool).await.unwrap();
@@ -20287,7 +20295,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 9);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 11);
         let retained: (String, String, String) = sqlx::query_as(
             "SELECT status, published_product_id, published_conversation_id
              FROM product_creation_jobs WHERE request_id = 'orphan-text'",

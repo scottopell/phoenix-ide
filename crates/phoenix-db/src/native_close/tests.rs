@@ -60,6 +60,43 @@ fn target_changes_fingerprint_but_not_source_request_identity() {
 }
 
 #[test]
+fn observe_fingerprint_binds_intent_target_attempt_and_exact_ordinal_not_source() {
+    use phoenix_core::domain::close::{CloseAttemptId, CloseRunOrdinal};
+
+    let observe = |source: &str, target: &str, attempt: &str, ordinal: i64| {
+        NativeCloseCommand::new(
+            source.into(),
+            SourceToolCall { message_id: "message".into(), tool_use_id: "tool".into() },
+            NativeCloseIntent::Observe {
+                target: ProductConversationId::parse(target).unwrap(),
+                attempt_id: CloseAttemptId::parse(attempt).unwrap(),
+                run_ordinal: CloseRunOrdinal::parse(ordinal).unwrap(),
+            },
+        ).unwrap()
+    };
+    let base = observe("source", "ab", "c", 1);
+    assert_eq!(base, observe("source", "ab", "c", 1));
+    assert_eq!(base.fingerprint().len(), 64);
+    for changed in [
+        command("source", "message", "tool", "ab"),
+        observe("source", "other", "c", 1),
+        observe("source", "ab", "other", 1),
+        observe("source", "ab", "c", 2),
+        observe("source", "a", "bc", 1),
+    ] {
+        assert_eq!(base.request_id(), changed.request_id());
+        assert_ne!(base.fingerprint(), changed.fingerprint());
+    }
+    let other_source = observe("other-source", "ab", "c", 1);
+    assert_ne!(base.request_id(), other_source.request_id());
+    assert_eq!(base.fingerprint(), other_source.fingerprint());
+    assert_eq!(base.intent().source_input(), serde_json::json!({
+        "action": "observe", "product_conversation_id": "ab",
+        "attempt_id": "c", "run_ordinal": 1,
+    }));
+}
+
+#[test]
 fn empty_source_fields_are_rejected() {
     for (transcript, message, tool_use) in [
         ("", "message", "tool"),

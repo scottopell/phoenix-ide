@@ -9,8 +9,7 @@
 use phoenix_core::domain::db_schema::SourceToolCall;
 use phoenix_core::domain::llm_types::ContentBlock;
 use phoenix_core::domain::product_conversation::ProductConversationId;
-use phoenix_db::native_close::{NativeCloseCommand, NativeCloseIntent};
-use serde_json::json;
+use phoenix_db::native_close::{NativeCloseCommand, NativeCloseIntent, NativeCloseRunRef};
 
 use crate::state_machine::ConvState;
 
@@ -47,6 +46,28 @@ pub(super) fn initial_command_from_executing_source(
     source: &SourceToolCall,
     target: ProductConversationId,
 ) -> Result<NativeCloseCommand, NativeCloseSourceRefusal> {
+    command_from_executing_source(state, source_transcript_id, source, NativeCloseIntent::Initial { target })
+}
+
+pub(super) fn observe_command_from_executing_source(
+    state: &ConvState,
+    source_transcript_id: &str,
+    source: &SourceToolCall,
+    referenced: NativeCloseRunRef,
+) -> Result<NativeCloseCommand, NativeCloseSourceRefusal> {
+    command_from_executing_source(state, source_transcript_id, source, NativeCloseIntent::Observe {
+        target: referenced.target,
+        attempt_id: referenced.attempt_id,
+        run_ordinal: referenced.run_ordinal,
+    })
+}
+
+fn command_from_executing_source(
+    state: &ConvState,
+    source_transcript_id: &str,
+    source: &SourceToolCall,
+    intent: NativeCloseIntent,
+) -> Result<NativeCloseCommand, NativeCloseSourceRefusal> {
     let invalid = NativeCloseSourceRefusal::NotExactExecutingSource;
     let ConvState::ToolExecuting {
         current_tool,
@@ -73,7 +94,7 @@ pub(super) fn initial_command_from_executing_source(
         return Err(invalid);
     }
     let executing = current_tool.input.to_value();
-    let expected = json!({"action": "initial", "product_conversation_id": target.as_str()});
+    let expected = intent.source_input();
     let mut occurrences = assistant_message.content.iter().filter_map(|block| {
         if let ContentBlock::ToolUse { id, name, input } = block {
             (id == &source.tool_use_id).then_some((name, input))
@@ -94,7 +115,7 @@ pub(super) fn initial_command_from_executing_source(
     NativeCloseCommand::new(
         source_transcript_id.to_owned(),
         source.clone(),
-        NativeCloseIntent::Initial { target },
+        intent,
     )
     .map_err(|_| invalid)
 }
@@ -161,6 +182,9 @@ impl super::RuntimeManager {
             .map_err(|_| NativeCloseApplicationError::Unavailable)?
     }
 }
+
+mod observe;
+pub(crate) use observe::NativeCloseObserveRequest;
 
 #[cfg(test)]
 mod tests;

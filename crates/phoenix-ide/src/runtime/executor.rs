@@ -60,6 +60,7 @@ use tracing::Instrument;
 mod capacity;
 mod continuation;
 mod native_close;
+mod native_close_observe;
 mod native_task_approval;
 mod self_goal;
 #[cfg(test)]
@@ -3310,6 +3311,19 @@ where
                             // through the whole DB transaction and classification.
                             // It must not reacquire the transferred target gate.
                             let result = self.execute_native_close_initial(source, target, admitted).await;
+                            let fatal = matches!(result, Err(super::native_close_application::NativeCloseApplicationError::FatalAuthority));
+                            let _ = response.send(result);
+                            drop(target_gate);
+                            if fatal {
+                                return self.fatal_local_authority_exit();
+                            }
+                            continue;
+                        }
+                        AcknowledgedRuntimeRequest::ExecuteNativeCloseObserve(request) => {
+                            let super::native_close_application::NativeCloseObserveRequest {
+                                source, referenced, admitted, target_gate, response,
+                            } = *request;
+                            let result = self.execute_native_close_observe(source, referenced, admitted).await;
                             let fatal = matches!(result, Err(super::native_close_application::NativeCloseApplicationError::FatalAuthority));
                             let _ = response.send(result);
                             drop(target_gate);

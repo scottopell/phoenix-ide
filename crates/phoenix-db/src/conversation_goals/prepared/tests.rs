@@ -329,6 +329,8 @@ async fn goal_preparation_migration_follows_conversation_tool_migrations() {
                 "close_completion_allowances_and_native_retry_fence".into()
             ),
             (158, "native_close_initial_receipts".into()),
+            (159, "close_original_retirement_anchors".into()),
+            (160, "native_close_exact_observation_receipts".into()),
         ]
     );
 }

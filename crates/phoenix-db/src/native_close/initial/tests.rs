@@ -1,7 +1,7 @@
 use super::*;
 use phoenix_core::domain::db_schema::SourceToolCall;
 use phoenix_core::domain::llm_types::ContentBlock;
-use phoenix_core::domain::sm_state::{AssistantMessage, ToolCall, ToolInput};
+use phoenix_core::domain::sm_state::{AssistantMessage, ConvState, ToolCall, ToolInput};
 use phoenix_core::llm_language::LlmLanguage;
 use serde_json::json;
 

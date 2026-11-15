@@ -2,6 +2,7 @@
 
 use std::fmt::Write as _;
 
+use phoenix_core::domain::close::{CloseAttemptId, CloseRunOrdinal};
 use phoenix_core::domain::db_schema::SourceToolCall;
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use sha2::{Digest, Sha256};
@@ -17,6 +18,41 @@ const FINGERPRINT_DOMAIN: &[u8] = b"phoenix.native_close.intent.v1\0";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeCloseIntent {
     Initial { target: ProductConversationId },
+    Observe {
+        target: ProductConversationId,
+        attempt_id: CloseAttemptId,
+        run_ordinal: CloseRunOrdinal,
+    },
+}
+
+impl NativeCloseIntent {
+    #[must_use]
+    pub fn target(&self) -> &ProductConversationId {
+        match self {
+            Self::Initial { target } | Self::Observe { target, .. } => target,
+        }
+    }
+
+    /// The exact source occurrence matched by both the actor and durable verifier.
+    #[must_use]
+    pub fn source_input(&self) -> serde_json::Value {
+        match self {
+            Self::Initial { target } => serde_json::json!({
+                "action": "initial", "product_conversation_id": target.as_str()
+            }),
+            Self::Observe { target, attempt_id, run_ordinal } => serde_json::json!({
+                "action": "observe", "product_conversation_id": target.as_str(),
+                "attempt_id": attempt_id.as_str(), "run_ordinal": run_ordinal.get()
+            }),
+        }
+    }
+
+    fn receipt_intent(&self) -> &'static str {
+        match self {
+            Self::Initial { .. } => "initial",
+            Self::Observe { .. } => "observe",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -61,6 +97,12 @@ impl NativeCloseCommand {
             NativeCloseIntent::Initial { target } => {
                 append_field(&mut canonical, b"initial");
                 append_field(&mut canonical, target.as_str().as_bytes());
+            }
+            NativeCloseIntent::Observe { target, attempt_id, run_ordinal } => {
+                append_field(&mut canonical, b"observe");
+                append_field(&mut canonical, target.as_str().as_bytes());
+                append_field(&mut canonical, attempt_id.as_str().as_bytes());
+                append_field(&mut canonical, &run_ordinal.get().to_be_bytes());
             }
         }
         let fingerprint = Sha256::digest(&canonical).iter().fold(
@@ -115,6 +157,9 @@ fn append_field(bytes: &mut Vec<u8>, value: &[u8]) {
 
 mod initial;
 pub use initial::{NativeCloseInitialResult, NativeCloseReceipt, NativeCloseRunRef};
+mod observe;
+mod receipts;
+pub use observe::{NativeCloseObservation, NativeCloseObserveReceipt, NativeCloseObserveResult};
 
 #[cfg(test)]
 mod tests;

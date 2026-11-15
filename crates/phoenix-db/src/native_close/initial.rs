@@ -2,7 +2,6 @@
 
 use phoenix_core::domain::close::{CloseAttemptId, CloseRunOrdinal, TranscriptConversationId};
 use phoenix_core::domain::product_conversation::ProductConversationId;
-use phoenix_core::domain::sm_state::ConvState;
 use sqlx::{Row, Sqlite, Transaction};
 use uuid::Uuid;
 
@@ -68,64 +67,14 @@ async fn apply_initial_tx(
     tx: &mut Transaction<'_, Sqlite>,
     command: &NativeCloseCommand,
 ) -> DbResult<NativeCloseInitialResult> {
-    // MUST precede receipt lookup, including the exact historical replay path.
-    crate::product_conversation_rename::require_current_gc_tx(tx, command.source_transcript_id())
-        .await?;
-    let state_json: String = sqlx::query_scalar("SELECT state FROM conversations WHERE id = ?1")
-        .bind(command.source_transcript_id())
-        .fetch_one(&mut **tx)
-        .await?;
-    let state: ConvState = serde_json::from_str(&state_json)
-        .map_err(|error| DbError::Serialization(error.to_string()))?;
-    let NativeCloseIntent::Initial { target } = command.intent();
-    let input = serde_json::json!({"action":"initial", "product_conversation_id":target.as_str()});
-    crate::task_approval_inspection::require_executing_source(
-        &state,
-        command.source(),
-        "close_conversation",
-        &input,
-    )
-    .map_err(|_| {
-        DbError::CloseFoundationPrecondition("Close requires its current executing source".into())
-    })?;
-    let ordinary: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM product_conversations WHERE id = ?1 AND kind = 'ordinary')",
-    )
-    .bind(target.as_str())
-    .fetch_one(&mut **tx)
-    .await?;
-    if !ordinary {
-        return Err(DbError::CloseFoundationPrecondition(
-            "Close requires an ordinary target".into(),
-        ));
-    }
-    if let Some(row) = sqlx::query(
-        "SELECT source_transcript_id, source_message_id, source_tool_use_id,
-                request_fingerprint, product_conversation_id, attempt_id, run_ordinal
-         FROM native_close_initial_receipts WHERE request_id = ?1",
-    )
-    .bind(command.request_id().to_string())
-    .fetch_optional(&mut **tx)
-    .await?
-    {
-        let source_transcript: String = row.try_get("source_transcript_id")?;
-        let message: String = row.try_get("source_message_id")?;
-        let tool: String = row.try_get("source_tool_use_id")?;
-        let fingerprint: String = row.try_get("request_fingerprint")?;
-        let retained_target: String = row.try_get("product_conversation_id")?;
-        if source_transcript != command.source_transcript_id()
-            || message != command.source().message_id
-            || tool != command.source().tool_use_id
-            || fingerprint != command.fingerprint()
-            || retained_target != target.as_str()
-        {
-            return Err(DbError::CloseFoundationConflict(
-                "Close request identity conflict".into(),
-            ));
-        }
+    super::receipts::require_source_and_target_tx(tx, command).await?;
+    let NativeCloseIntent::Initial { target } = command.intent() else {
+        return Err(DbError::CloseFoundationPrecondition("expected initial Close intent".into()));
+    };
+    if let Some(admitted) = super::receipts::read_receipt_tx(tx, command).await? {
         return Ok(NativeCloseInitialResult::Replay(NativeCloseReceipt {
             request_id: command.request_id(),
-            admitted: decode_run_ref(&row)?,
+            admitted,
         }));
     }
     // Receipt replay precedes current target topology/latest checks. A different
@@ -155,33 +104,15 @@ async fn apply_initial_tx(
     let attempt_id = Uuid::new_v4().to_string();
     let obligation =
         Database::begin_close_foundation_inner(tx, target, &latest, &attempt_id, false).await?;
-    let marked = sqlx::query(
-        "UPDATE close_obligations SET native_managed = 1
-         WHERE attempt_id = ?1 AND product_conversation_id = ?2",
+    super::receipts::adopt_and_insert_receipt_tx(
+        tx,
+        command,
+        &NativeCloseRunRef {
+            target: target.clone(),
+            attempt_id: obligation.attempt_id().clone(),
+            run_ordinal: CloseRunOrdinal::INITIAL,
+        },
     )
-    .bind(obligation.attempt_id().as_str())
-    .bind(target.as_str())
-    .execute(&mut **tx)
-    .await?;
-    if marked.rows_affected() != 1 {
-        return Err(DbError::CloseFoundationPrecondition(
-            "Close native operation binding disappeared".into(),
-        ));
-    }
-    sqlx::query(
-        "INSERT INTO native_close_initial_receipts
-         (request_id, source_transcript_id, source_message_id, source_tool_use_id,
-          request_fingerprint, product_conversation_id, attempt_id, run_ordinal)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
-    )
-    .bind(command.request_id().to_string())
-    .bind(command.source_transcript_id())
-    .bind(command.source().message_id.as_str())
-    .bind(command.source().tool_use_id.as_str())
-    .bind(command.fingerprint())
-    .bind(target.as_str())
-    .bind(obligation.attempt_id().as_str())
-    .execute(&mut **tx)
     .await?;
     Ok(NativeCloseInitialResult::NewlyAdmitted(
         NativeCloseReceipt {
@@ -195,7 +126,7 @@ async fn apply_initial_tx(
     ))
 }
 
-fn decode_run_ref(row: &sqlx::sqlite::SqliteRow) -> DbResult<NativeCloseRunRef> {
+pub(super) fn decode_run_ref(row: &sqlx::sqlite::SqliteRow) -> DbResult<NativeCloseRunRef> {
     let target: String = row.try_get("product_conversation_id")?;
     let attempt: String = row.try_get("attempt_id")?;
     Ok(NativeCloseRunRef {

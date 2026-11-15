@@ -15,7 +15,7 @@ concurrency:
 jobs:
   database:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: never
       CARGO_BUILD_JOBS: '2'
@@ -48,7 +48,7 @@ jobs:
           set -euo pipefail
           cargo test -p phoenix-db --lib --no-run 2>&1 | tee evidence/compile.log
           cargo test -p phoenix-db --lib -- --list 2>&1 | tee evidence/inventory.log
-          grep -E '^close_foundation::tests::.*: test$|^migrations::close_completion_allowance_tests::migration_159_.*: test$' evidence/inventory.log > evidence/selected-tests.txt
+          grep -E '^close_foundation::tests::.*: test$|^migrations::close_completion_allowance_tests::migration_159_.*: test$|^native_close::.*: test$' evidence/inventory.log > evidence/selected-tests.txt
           test -s evidence/selected-tests.txt
           grep -F 'stopped_original_retirement_proof_rejects_missing_and_excluded_provenance: test' evidence/selected-tests.txt
           grep -F 'dispatched_absence_retry_resumes_retirement_with_retained_snapshot: test' evidence/selected-tests.txt
@@ -66,6 +66,26 @@ jobs:
           set -euo pipefail
           cargo test -p phoenix-db --lib migrations::close_completion_allowance_tests::migration_159_ -- --nocapture --test-threads=1 2>&1 | tee evidence/migration159.log
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/migration159.log
+      - name: Execute native Close DB request and observation tests
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p phoenix-db --lib native_close:: -- --nocapture --test-threads=1 2>&1 | tee evidence/native-close-db.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-db.log
+      - name: Execute native Close runtime matcher and actor ownership tests
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p phoenix_ide --lib -- --list 2>&1 | tee evidence/runtime-inventory.log
+          grep -E 'native_close_application::tests::.*: test$|native_close_admission_tests::.*: test$' evidence/runtime-inventory.log > evidence/runtime-selected-tests.txt
+          test -s evidence/runtime-selected-tests.txt
+          grep -F 'stopped_live_source_refuses_exact_observe_replay_before_database_lookup: test' evidence/runtime-selected-tests.txt
+          cargo test -p phoenix_ide --lib native_close_application::tests:: -- --nocapture --test-threads=1 2>&1 | tee evidence/native-close-runtime-matcher.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-runtime-matcher.log
+          cargo test -p phoenix_ide --lib native_close_admission_tests:: -- --nocapture --test-threads=1 2>&1 | tee evidence/native-close-runtime-actor.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-runtime-actor.log
       - name: Require exact source formatting
         if: success() || failure()
         shell: bash
