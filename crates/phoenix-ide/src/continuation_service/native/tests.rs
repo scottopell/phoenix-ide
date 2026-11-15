@@ -721,7 +721,7 @@ async fn recovery_dispatch_uses_persisted_generated_authority_for_differing_key_
         f.db.continue_conversation_with_intent(
             &f.predecessor,
             phoenix_db::NewContinuationDispatchIntent {
-                message_id: winner_key.into(),
+                message_id: ClientTurnKey::try_from(winner_key).unwrap(),
                 handoff: winner_text.into(),
                 user_agent: Some("persisted-winner-test".into()),
                 opening_authority: ContinuationOpeningAuthority::GeneratedPredecessorContext,
@@ -823,7 +823,7 @@ async fn recovery_dispatch_keeps_differing_key_literal_winner_literal() {
         f.db.continue_conversation_with_intent(
             &f.predecessor,
             phoenix_db::NewContinuationDispatchIntent {
-                message_id: winner_key.into(),
+                message_id: ClientTurnKey::try_from(winner_key).unwrap(),
                 handoff: winner_text.into(),
                 user_agent: None,
                 opening_authority: ContinuationOpeningAuthority::UserAuthorizedInstruction,
