@@ -29,9 +29,9 @@ class FrozenRc5GateTests(unittest.TestCase):
         git(self.repo, "config", "user.email", "test@example.invalid")
         (self.repo / "crates/phoenix-ide").mkdir(parents=True)
         (self.repo / "crates/phoenix-ide/Cargo.toml").write_bytes(
-            b'[package]\nname = "phoenix_ide"\nversion = "0.13.2-rc.3"\n')
+            b'[package]\nname = "phoenix_ide"\nversion = "0.13.2-rc.4"\n')
         (self.repo / "Cargo.lock").write_bytes(
-            b'[[package]]\nname = "phoenix_ide"\nversion = "0.13.2-rc.3"\n')
+            b'[[package]]\nname = "phoenix_ide"\nversion = "0.13.2-rc.4"\n')
         (self.repo / "stable.txt").write_text("unchanged\n")
         git(self.repo, "add", ".")
         git(self.repo, "commit", "-qm", "base")
@@ -44,9 +44,9 @@ class FrozenRc5GateTests(unittest.TestCase):
         git(self.repo, "checkout", "-q", "--detach", parent or self.base)
         manifest = self.repo / "crates/phoenix-ide/Cargo.toml"
         lock = self.repo / "Cargo.lock"
-        manifest.write_bytes(manifest.read_bytes().replace(b"0.13.2-rc.3", b"0.13.2-rc.5"))
-        lock.write_bytes(lock.read_bytes().replace(b'phoenix_ide"\nversion = "0.13.2-rc.3',
-                                                    b'phoenix_ide"\nversion = "0.13.2-rc.5'))
+        manifest.write_bytes(manifest.read_bytes().replace(b"0.13.2-rc.4", b"0.13.2-rc.6"))
+        lock.write_bytes(lock.read_bytes().replace(b'phoenix_ide"\nversion = "0.13.2-rc.4',
+                                                    b'phoenix_ide"\nversion = "0.13.2-rc.6'))
         if mutate:
             mutate(self.repo)
         if mode:
@@ -75,7 +75,7 @@ class FrozenRc5GateTests(unittest.TestCase):
     def test_rejects_version_mismatch(self):
         def wrong_version(repo):
             path = repo / "crates/phoenix-ide/Cargo.toml"
-            path.write_bytes(path.read_bytes().replace(b"0.13.2-rc.5", b"0.13.2-rc.4"))
+            path.write_bytes(path.read_bytes().replace(b"0.13.2-rc.6", b"0.13.2-rc.5"))
         with self.assertRaisesRegex(ValueError, "exact two-file/version-only"):
             self.candidate(mutate=wrong_version)
 
@@ -127,6 +127,28 @@ class FrozenRc5GateTests(unittest.TestCase):
             payload = __import__("io").BytesIO(__import__("json").dumps({"workflow_runs": [good]}).encode())
             open_url.return_value = __import__("contextlib").nullcontext(payload)
             self.assertEqual(77, release.workflow_dispatch_ci_run()["id"])
+
+    def test_newest_matching_ci_run_must_succeed(self):
+        successful = {"path": ".github/workflows/ci.yml", "head_sha": release.CANDIDATE,
+                      "event": "workflow_dispatch", "status": "completed", "conclusion": "success",
+                      "run_number": 12, "id": 77}
+        newer_failure = dict(successful, run_number=13, id=78, conclusion="failure")
+        payload = __import__("io").BytesIO(__import__("json").dumps(
+            {"workflow_runs": [successful, newer_failure]}).encode())
+        with mock.patch.object(release.urllib.request, "urlopen",
+                               return_value=__import__("contextlib").nullcontext(payload)):
+            with self.assertRaisesRegex(ValueError, "latest exact-candidate"):
+                release.workflow_dispatch_ci_run()
+
+    def test_workflow_wires_only_the_frozen_rc6_controller(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertIn("release-frozen-rc6", workflow)
+        self.assertIn("refs/heads/release/frozen-rc6", workflow)
+        self.assertIn(release.CANDIDATE, workflow)
+        self.assertIn("refs/heads/main", workflow)
+        self.assertIn('test \"$(git rev-parse FETCH_HEAD)\" = \"$GITHUB_SHA\"', workflow)
+        self.assertIn("needs.gate.outputs.operation == 'release-frozen-rc6' && needs.gate.outputs.controller_commit", workflow)
+        self.assertIn('"${{ needs.gate.outputs.operation }}" == release-frozen-rc6', workflow)
 
 
 if __name__ == "__main__":

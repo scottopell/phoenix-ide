@@ -23,7 +23,7 @@ on:
           - prepare-main
           - prepare-incident-237100-arm64
           - prepare-incident-237100-linux-x86_64
-          - release-frozen-rc5
+          - release-frozen-rc6
           - retry-release
       tag:
         description: Existing immutable release tag (retry-release only)
@@ -105,13 +105,18 @@ jobs:
                 echo "commit=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
                 exit 0
                 ;;
-              release-frozen-rc5)
+              release-frozen-rc6)
                 [[ -z "$RETRY_TAG" ]] || {
-                  echo "Frozen RC5 recovery does not accept a release tag" >&2
+                  echo "Frozen RC6 recovery does not accept a release tag" >&2
                   exit 1
                 }
-                git fetch --no-tags origin refs/heads/release/frozen-rc5
-                test "$(git rev-parse FETCH_HEAD)" = 4da5f81c60d65d548254264003540bc7d462d2b0
+                git fetch --no-tags origin refs/heads/main
+                test "$(git rev-parse FETCH_HEAD)" = "$GITHUB_SHA" || {
+                  echo "Frozen RC6 release must run from the current main commit" >&2
+                  exit 1
+                }
+                git fetch --no-tags origin refs/heads/release/frozen-rc6
+                test "$(git rev-parse FETCH_HEAD)" = bccfd66b2470a86910b952f22ccf327ed2c78f2f
                 python3 scripts/frozen_rc5_release.py gate >> "$GITHUB_OUTPUT"
                 exit 0
                 ;;
@@ -228,7 +233,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.gate.outputs.operation == 'release-frozen-rc5' && needs.gate.outputs.controller_commit || needs.gate.outputs.commit }}
+          ref: ${{ needs.gate.outputs.operation == 'release-frozen-rc6' && needs.gate.outputs.controller_commit || needs.gate.outputs.commit }}
           fetch-depth: 0
       - name: Create exact release tag
         run: |
@@ -240,7 +245,7 @@ jobs:
           }
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [[ "${{ needs.gate.outputs.operation }}" == release-frozen-rc5 ]]; then
+          if [[ "${{ needs.gate.outputs.operation }}" == release-frozen-rc6 ]]; then
             git tag -a "$TAG" "$COMMIT" -m "$TAG"
           else
             git tag -a "$TAG" -m "$TAG"
