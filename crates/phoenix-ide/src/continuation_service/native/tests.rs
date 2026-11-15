@@ -644,6 +644,256 @@ async fn generated_saved_opening_with_user_agent_retries_under_generated_authori
         .is_none());
 }
 
+async fn automatic_admission_with_committed_summary(
+    f: &Fixture,
+) -> phoenix_db::AutomaticContinuationAdmission {
+    use phoenix_core::domain::product_conversation::AutoContinueOnContextExhaustion;
+    use phoenix_core::domain::sm_state::ContinuationSummaryRequest;
+
+    f.db.set_auto_continue_on_context_exhaustion(
+        &f.product,
+        AutoContinueOnContextExhaustion::Enabled,
+    )
+    .await
+    .unwrap();
+    let operation_id = "differing-key-recovery-summary";
+    f.db.update_conversation_state(
+        &f.predecessor,
+        &ConvState::AwaitingContinuation {
+            request: ContinuationSummaryRequest {
+                operation_id: operation_id.into(),
+                rejected_tool_calls: Vec::new(),
+                attempt: 1,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let mut summary =
+        f.db.get_messages(&f.predecessor)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+    summary.message_id = "differing-key-recovery-summary-message".into();
+    summary.sequence_id += 1;
+    assert_eq!(
+        f.db.commit_continuation(
+            &f.predecessor,
+            operation_id,
+            &summary,
+            &ConvState::ContextExhausted {
+                summary: SUMMARY.into(),
+            },
+            summary.created_at,
+        )
+        .await
+        .unwrap(),
+        phoenix_db::ContinuationCommitOutcome::Applied
+    );
+    f.db.automatic_continuation_admission(&f.predecessor)
+        .await
+        .unwrap()
+        .expect("committed summary and enabled preference admit recovery")
+}
+
+#[tokio::test]
+async fn recovery_dispatch_uses_persisted_generated_authority_for_differing_key_winner() {
+    use phoenix_core::domain::product_conversation::{
+        AutomaticContinuationPhase, ContinuationOpeningAuthority,
+    };
+    use phoenix_core::domain::sm_event::{
+        PreparedDirectTurnPayload, SubmittedDirectTurnExpansionPolicy,
+    };
+    use phoenix_workflow::{ConversationAuthority, Materialization};
+
+    let registry = Arc::new(phoenix_llm::ModelRegistry::for_test_with_sonnet(Arc::new(
+        OpeningProvider {
+            entered: tokio::sync::Notify::new(),
+        },
+    )));
+    let f = Fixture::with_registry(registry).await;
+    let admission = automatic_admission_with_committed_summary(&f).await;
+    let winner_key = "persisted-generated-winner";
+    let winner_text = "Generated winner's exact handoff.";
+    assert_ne!(winner_key, admission.first_message_id.as_str());
+    let (_, reserved) =
+        f.db.continue_conversation_with_intent(
+            &f.predecessor,
+            phoenix_db::NewContinuationDispatchIntent {
+                message_id: ClientTurnKey::try_from(winner_key).unwrap(),
+                handoff: winner_text.into(),
+                user_agent: Some("persisted-winner-test".into()),
+                opening_authority: ContinuationOpeningAuthority::GeneratedPredecessorContext,
+            },
+        )
+        .await
+        .unwrap();
+    let reserved = reserved.expect("the differing-key winner is durably reserved");
+    let successor_id = reserved.successor_conversation_id;
+
+    assert!(crate::continuation_service::drain_automatic_continuations(f.runtime.clone()).await);
+    assert_eq!(
+        f.db.automatic_continuation_admission(&f.predecessor)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        AutomaticContinuationPhase::SuccessorReserved
+    );
+    assert!(crate::continuation_service::drain_automatic_continuations(f.runtime.clone()).await);
+
+    assert!(f.db.get_messages(&successor_id).await.unwrap().is_empty());
+    let retained =
+        f.db.continuation_dispatch_intent(&f.predecessor)
+            .await
+            .unwrap()
+            .expect("the accepted opening intent remains unmaterialized");
+    assert_eq!(retained.message_id.as_str(), winner_key);
+    assert_eq!(retained.handoff, winner_text);
+    assert_eq!(
+        retained.opening_authority,
+        ContinuationOpeningAuthority::GeneratedPredecessorContext
+    );
+    assert_eq!(retained.successor_conversation_id, successor_id);
+    assert_eq!(
+        f.db.chain_members_forward(&f.predecessor)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        f.db.automatic_continuation_admission(&f.predecessor)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        AutomaticContinuationPhase::SuccessorReserved
+    );
+
+    let turn =
+        f.db.workflow_repository()
+            .load_owning_authoritative_turn(&ConversationAuthority(successor_id))
+            .await
+            .unwrap()
+            .expect("the accepted opening owns the successor turn");
+    assert_eq!(turn.client_key.as_str(), winner_key);
+    assert_eq!(turn.materialization, Materialization::Unmaterialized);
+    let prepared = PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload()).unwrap();
+    assert_eq!(prepared.submitted.message_id, winner_key);
+    assert_eq!(prepared.submitted.text, winner_text);
+    assert_eq!(prepared.submitted.origin, InputOrigin::SystemGenerated);
+    assert_eq!(
+        prepared.submitted.expansion_policy,
+        SubmittedDirectTurnExpansionPolicy::GeneratedPredecessorContext
+    );
+    assert_eq!(prepared.delivery.text, winner_text);
+    assert_eq!(
+        prepared.delivery.llm_text,
+        Some(crate::send_chat_service::generated_predecessor_context_projection(winner_text))
+    );
+    assert_eq!(
+        retained.user_agent.as_deref(),
+        Some("persisted-winner-test")
+    );
+}
+
+#[tokio::test]
+async fn recovery_dispatch_keeps_differing_key_literal_winner_literal() {
+    use phoenix_core::domain::product_conversation::{
+        AutomaticContinuationPhase, ContinuationOpeningAuthority,
+    };
+    use phoenix_core::domain::sm_event::{
+        PreparedDirectTurnPayload, SubmittedDirectTurnExpansionPolicy,
+    };
+    use phoenix_workflow::{ConversationAuthority, Materialization};
+
+    let registry = Arc::new(phoenix_llm::ModelRegistry::for_test_with_sonnet(Arc::new(
+        OpeningProvider {
+            entered: tokio::sync::Notify::new(),
+        },
+    )));
+    let f = Fixture::with_registry(registry).await;
+    let admission = automatic_admission_with_committed_summary(&f).await;
+    let winner_key = "persisted-literal-winner";
+    let winner_text = "Literal user's exact instruction.";
+    assert_ne!(winner_key, admission.first_message_id.as_str());
+    let (_, reserved) =
+        f.db.continue_conversation_with_intent(
+            &f.predecessor,
+            phoenix_db::NewContinuationDispatchIntent {
+                message_id: ClientTurnKey::try_from(winner_key).unwrap(),
+                handoff: winner_text.into(),
+                user_agent: None,
+                opening_authority: ContinuationOpeningAuthority::UserAuthorizedInstruction,
+            },
+        )
+        .await
+        .unwrap();
+    let reserved = reserved.expect("the differing-key literal winner is durably reserved");
+    let successor_id = reserved.successor_conversation_id;
+
+    assert!(crate::continuation_service::drain_automatic_continuations(f.runtime.clone()).await);
+    assert_eq!(
+        f.db.automatic_continuation_admission(&f.predecessor)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        AutomaticContinuationPhase::SuccessorReserved
+    );
+    assert!(crate::continuation_service::drain_automatic_continuations(f.runtime.clone()).await);
+
+    assert!(f.db.get_messages(&successor_id).await.unwrap().is_empty());
+    let retained =
+        f.db.continuation_dispatch_intent(&f.predecessor)
+            .await
+            .unwrap()
+            .expect("the accepted opening intent remains unmaterialized");
+    assert_eq!(retained.message_id.as_str(), winner_key);
+    assert_eq!(retained.handoff, winner_text);
+    assert_eq!(
+        retained.opening_authority,
+        ContinuationOpeningAuthority::UserAuthorizedInstruction
+    );
+    assert_eq!(retained.successor_conversation_id, successor_id);
+    assert_eq!(
+        f.db.chain_members_forward(&f.predecessor)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        f.db.automatic_continuation_admission(&f.predecessor)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        AutomaticContinuationPhase::SuccessorReserved
+    );
+
+    let turn =
+        f.db.workflow_repository()
+            .load_owning_authoritative_turn(&ConversationAuthority(successor_id))
+            .await
+            .unwrap()
+            .expect("the accepted opening owns the successor turn");
+    assert_eq!(turn.client_key.as_str(), winner_key);
+    assert_eq!(turn.materialization, Materialization::Unmaterialized);
+    let prepared = PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload()).unwrap();
+    assert_eq!(prepared.submitted.message_id, winner_key);
+    assert_eq!(prepared.submitted.text, winner_text);
+    assert_eq!(prepared.submitted.origin, InputOrigin::UserApi);
+    assert_eq!(
+        prepared.submitted.expansion_policy,
+        SubmittedDirectTurnExpansionPolicy::LiteralText
+    );
+    assert_eq!(prepared.delivery.text, winner_text);
+    assert_eq!(prepared.delivery.llm_text, None);
+}
+
 #[tokio::test]
 async fn existing_pending_reserved_continuation_intent_retains_its_opening_authority() {
     let f = Fixture::new().await;
