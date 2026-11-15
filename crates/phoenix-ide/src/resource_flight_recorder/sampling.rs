@@ -162,7 +162,8 @@ pub(crate) fn spawn_sampler(state: AppState, handle: Handle) {
             sample.managed_pid_count =
                 Some(u64::from(summary.managed_total.deduplicated_pid_count));
             sample.host_bytes = host_bytes(&generation.host, generation.host_swap);
-            let disk = crate::api::deployment_observations::recorder_space(&state.runtime_env).await;
+            let disk =
+                crate::api::deployment_observations::recorder_space(&state.runtime_env).await;
             set_disk_observation(&mut sample, disk, unix_ms());
             sample.live_materialized_handles = state.runtime.live_materialized_handle_count();
             let mut failure_counts = failures(&mut sample);
