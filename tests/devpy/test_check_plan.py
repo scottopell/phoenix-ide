@@ -745,6 +745,7 @@ class CheckPlanTests(unittest.TestCase):
             "scripts/systemd_deploy_helper.py",
             "skills/phoenix-adversarial-review/SKILL.md",
             ".agents/skills/phoenix-adversarial-review",
+            ".node-version",
             "Cargo.toml",
             "rust-toolchain.toml",
             "crates/phoenix-core/src/unrelated.rs",

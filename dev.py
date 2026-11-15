@@ -4262,6 +4262,7 @@ _DEVPY_DEPENDENCY_PREFIXES = (
 )
 _DEVPY_DEPENDENCY_PATHS = {
     ".agents/skills/phoenix-adversarial-review",
+    ".node-version",
     ".python-version",
     "Cargo.lock",
     "Cargo.toml",
