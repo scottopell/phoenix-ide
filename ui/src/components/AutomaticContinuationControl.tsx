@@ -173,7 +173,7 @@ export function AutomaticContinuationControl({ scope, onStatusChange }: Automati
   return (
     <details ref={detailsRef} className="automatic-continuation" data-testid="automatic-continuation-control">
       <summary>
-        Auto-continue <span className={enabled ? 'automatic-continuation__on' : ''}>{loading ? '…' : enabled ? 'On' : 'Off'}</span>
+        Auto-continue <span className={enabled ? 'automatic-continuation__on' : ''}>{loading || view === null ? '…' : enabled ? 'On' : 'Off'}</span>
         {admission && <span className="automatic-continuation__phase"> · {phaseLabel}</span>}
       </summary>
       <div className="automatic-continuation__panel">
@@ -187,7 +187,7 @@ export function AutomaticContinuationControl({ scope, onStatusChange }: Automati
           <span>Automatically accept future generated handoffs and continue</span>
         </label>
         <p className="automatic-continuation__help">
-          Applies only to future entries into context exhaustion. Changing this setting does not start or resume an already-exhausted conversation, or cancel continuation work already admitted.
+          Applies only to future entries into context exhaustion. New conversations start with this setting on; existing preferences are preserved. This does not authorize unrelated work or unconditional error retries. Changing this setting does not start or resume an already-exhausted conversation, or cancel continuation work already admitted.
         </p>
         {admission && (
           <div className={`automatic-continuation__admission automatic-continuation__admission--${admission.phase}`}>

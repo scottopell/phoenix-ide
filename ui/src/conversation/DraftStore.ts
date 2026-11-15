@@ -16,6 +16,7 @@ const NO_REJECTIONS: readonly RejectedSubmission[] = [];
 export type DraftRevision = DraftAtom;
 
 export interface DraftRecovery {
+  isCurrent(): boolean;
   readRevision(): DraftRevision;
   clearForSubmission(): DraftRevision;
   restoreIfUnchanged(revision: DraftRevision, text: string): boolean;
@@ -98,6 +99,7 @@ export class DraftStore extends RoutedStore<string, DraftAtom, DraftAction> {
     this.getSnapshot(slug);
     const isCurrent = () => this.recoveries.get(slug) === recovery;
     const recovery: DraftRecovery = {
+      isCurrent,
       readRevision: () => isCurrent() ? this.getSnapshot(slug) : this.invalidRevision,
       clearForSubmission: () => {
         if (!isCurrent()) return this.invalidRevision;

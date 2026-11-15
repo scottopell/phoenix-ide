@@ -12,10 +12,11 @@ const add = vi.fn();
 const close = vi.fn();
 const navigate = vi.fn<(source: ReactionSource, signal: AbortSignal) => boolean | Promise<boolean>>(() => true);
 let offscreen = false;
-function Fixture({ mounted = true, body = 'Keep this guarantee', touchDocked = false, captureSource, available = true, composerAvailable = true, composerKey = 'composer', composerTop, bubbleRef = createRef<HTMLDivElement>(), onChange = () => {} }: { mounted?: boolean; body?: string; touchDocked?: boolean; captureSource?: () => void; available?: boolean; composerAvailable?: boolean; composerKey?: string; composerTop?: number; bubbleRef?: RefObject<HTMLDivElement>; onChange?: (body: string) => void }) {
+function Fixture({ mounted = true, body = 'Keep this guarantee', touchDocked = false, captureSource, available = true, composerAvailable = true, composerKey = 'composer', composerTop, bubbleRef = createRef<HTMLDivElement>(), onChange = () => {}, columnKey = 'column', churn = false }: { mounted?: boolean; body?: string; touchDocked?: boolean; captureSource?: () => void; available?: boolean; composerAvailable?: boolean; composerKey?: string; composerTop?: number; bubbleRef?: RefObject<HTMLDivElement>; onChange?: (body: string) => void; columnKey?: string; churn?: boolean }) {
   return <FocusScopeProvider>
-    <div className="conversation-column">
+    <div key={columnKey} className="conversation-column">
     <div id="messages">
+      {churn && <div data-testid="churn" />}
       {mounted && <div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div>}
     </div>
     {composerAvailable && <footer key={composerKey} id="input-area" {...(composerTop === undefined ? {} : { 'data-composer-top': composerTop })} />}
@@ -130,6 +131,31 @@ describe('reaction pill', () => {
     await waitFor(() => expect(screen.getByRole('textbox')).toHaveValue('Keep this guarantee'));
     expect(window.getSelection()?.toString()).toBe('second');
     expect(screen.getByRole('textbox')).not.toHaveFocus();
+  });
+
+  it('undocks once the source mounts even while the transcript keeps changing faster than a frame', async () => {
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => window.setTimeout(() => callback(performance.now()), 16));
+    vi.stubGlobal('cancelAnimationFrame', (handle: number) => window.clearTimeout(handle));
+    const bubbleRef = createRef<HTMLDivElement>();
+    const view = render(<Fixture mounted={false} churn bubbleRef={bubbleRef} />);
+    await screen.findByRole('button', { name: /Return to passage/ });
+    const churn = screen.getByTestId('churn');
+    const interval = window.setInterval(() => { churn.replaceChildren(document.createElement('span')); }, 1);
+    try {
+      view.rerender(<Fixture churn bubbleRef={bubbleRef} />);
+      await waitFor(() => expect(screen.getByRole('textbox', { name: 'Your reaction' })).toBeInTheDocument());
+    } finally {
+      window.clearInterval(interval);
+    }
+  });
+
+  it('undocks when the source mounts after the conversation column remounts', async () => {
+    const bubbleRef = createRef<HTMLDivElement>();
+    const view = render(<Fixture mounted={false} bubbleRef={bubbleRef} />);
+    await screen.findByRole('button', { name: /Return to passage/ });
+    view.rerender(<Fixture mounted={false} columnKey="remounted" bubbleRef={bubbleRef} />);
+    view.rerender(<Fixture columnKey="remounted" bubbleRef={bubbleRef} />);
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Your reaction' })).toBeInTheDocument());
   });
 
   it('keeps an unavailable reaction editable when desktop source return fails', async () => {

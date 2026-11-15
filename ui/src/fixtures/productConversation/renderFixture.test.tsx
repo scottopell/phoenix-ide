@@ -4,7 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { api } from '../../api';
 import { InlineReactionStore } from '../../conversation/InlineReactionStore';
 import { ProductConversationFixture } from './renderFixture';
-import { getProductConversationScenario } from './scenarios';
+import { getProductConversationScenario, makeMobileContinuationScenario } from './scenarios';
 import { makeCompactEventsScenario } from './eventCards';
 import { installProductConversationFixtureApi } from './mockApi';
 
@@ -55,6 +55,139 @@ describe('ProductConversationFixture', () => {
     }
   });
 
+  it.each(['ordinary', 'coordinator'] as const)('follows a published %s continuation through the real stream and resumes after disconnect', async (kind) => {
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(1000);
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ x: 0, y: 0, top: 0, left: 0, right: 390, bottom: 844, width: 390, height: 844, toJSON: () => ({}) });
+    render(<ProductConversationFixture scenario={makeMobileContinuationScenario(kind)} />);
+    const composer = await screen.findByPlaceholderText('Type a message...');
+    await waitFor(() => expect(composer).toBeEnabled());
+    const route = document.documentElement.dataset['sourceFixtureLocation'];
+    fireEvent.change(composer, { target: { value: 'Unsent mobile draft' } });
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-continue')));
+    await waitFor(() => {
+      const streamUrl = document.documentElement.dataset['productConversationFixtureEventSourceLastUrl'];
+      expect(streamUrl).toBeDefined();
+      const parsed = new URL(streamUrl!, window.location.href);
+      expect(parsed.pathname).toBe('/api/conversation-reads/stream');
+      expect(parsed.searchParams.get('reference')).toBe('fixture-successor');
+    });
+    await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureActiveTranscriptSubscriptions']).toBe('1'));
+    expect(document.documentElement.dataset['sourceFixtureLocation']).toBe(route);
+    expect(screen.queryByRole('button', { name: 'Open continuation' })).toBeNull();
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-successor-message')));
+    await screen.findByText('Successor is streaming after the handoff.');
+    expect(screen.getByPlaceholderText('Type a message...')).toHaveValue('Unsent mobile draft');
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-stream-failure')));
+    const failedInstance = Number(document.documentElement.dataset['productConversationFixtureFailedTranscriptInstance']);
+    await waitFor(() => {
+      expect(Number(document.documentElement.dataset['productConversationFixtureLastDeliveredInitInstance'])).toBeGreaterThan(failedInstance);
+      expect(document.documentElement.dataset['productConversationFixtureLastDeliveredInitMember']).toBe('fixture-successor');
+    }, { timeout: 10_000 });
+    expect(document.documentElement.dataset['productConversationFixtureActiveTranscriptSubscriptions']).toBe('1');
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-successor-message')));
+    await screen.findByText('Successor is streaming after reconnect.');
+    expect(screen.getAllByText('Successor is streaming after the handoff.')).toHaveLength(1);
+    expect(document.documentElement.dataset['sourceFixtureLocation']).toBe(route);
+  });
+
+  it.each(['ordinary', 'coordinator'] as const)('keeps the %s composer through compaction, cold hydration, pending opening and upload completion', async kind => {
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(1000);
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ x: 0, y: 0, top: 0, left: 0, right: 390, bottom: 844, width: 390, height: 844, toJSON: () => ({}) });
+    render(<ProductConversationFixture scenario={makeMobileContinuationScenario(kind)} />);
+    const textarea = await screen.findByPlaceholderText<HTMLTextAreaElement>('Type a message...');
+    await waitFor(() => expect(textarea).toBeEnabled());
+    fireEvent.change(textarea, { target: { value: 'Keep this embedded draft' } });
+    textarea.focus();
+    textarea.setSelectionRange(5, 9);
+    act(() => {
+      window.dispatchEvent(new Event('product-conversation-fixture-hold-opening'));
+      window.dispatchEvent(new Event('product-conversation-fixture-hold-successor'));
+      window.dispatchEvent(new Event('product-conversation-fixture-hold-successor-readback'));
+      window.dispatchEvent(new Event('product-conversation-fixture-hold-upload'));
+      fireEvent.drop(document.getElementById('input-area')!, {
+        dataTransfer: { types: ['Files'], files: [new File(['text'], 'notes.txt', { type: 'text/plain' })] },
+      });
+    });
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled());
+    act(() => window.dispatchEvent(new CustomEvent('product-conversation-fixture-phase', { detail: { type: 'awaiting_continuation', attempt: 1 } })));
+    await screen.findByText('Compacting conversation...');
+    expect(document.getElementById('message-input')).toBe(textarea);
+    expect(textarea).toHaveValue('Keep this embedded draft');
+    expect(textarea).toHaveFocus();
+    expect(screen.queryByRole('button', { name: 'Send message' })).toBeNull();
+    act(() => window.dispatchEvent(new CustomEvent('product-conversation-fixture-phase', { detail: { type: 'context_exhausted', summary: 'manual continuation' } })));
+    await waitFor(() => expect(screen.queryByText('Compacting conversation...')).toBeNull());
+    expect(document.getElementById('message-input')).toBe(textarea);
+    expect(textarea).toHaveValue('Keep this embedded draft');
+    expect(textarea).toHaveFocus();
+    expect(screen.queryByRole('button', { name: 'Send message' })).toBeNull();
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-continue')));
+    await waitFor(() => expect(new URL(document.documentElement.dataset['productConversationFixtureEventSourceLastUrl']!, window.location.href).searchParams.get('reference')).toBe('fixture-successor'));
+    expect(document.getElementById('message-input')).toBe(textarea);
+    expect(textarea).toHaveValue('Keep this embedded draft');
+    expect(textarea).toHaveFocus();
+    expect(screen.queryByRole('button', { name: 'Send message' })).toBeNull();
+
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-release-successor-readback')));
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-release-successor')));
+    await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureLastDeliveredInitMember']).toBe('fixture-successor'));
+    expect(document.documentElement.dataset['productConversationFixtureActiveTranscriptSubscriptions']).toBe('1');
+    expect(document.getElementById('message-input')).toBe(textarea);
+    expect(textarea).toHaveValue('Keep this embedded draft');
+    expect(textarea).toHaveFocus();
+    expect([textarea.selectionStart, textarea.selectionEnd]).toEqual([5, 9]);
+    expect(screen.queryByRole('button', { name: 'Send message' })).toBeNull();
+    fireEvent.submit(textarea.closest('form')!);
+    expect(document.documentElement.dataset['productConversationFixtureSendCount'] ?? '0').toBe('0');
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-complete-upload')));
+    await screen.findByText('notes.txt');
+    expect(screen.queryByRole('button', { name: 'Send message' })).toBeNull();
+    fireEvent.submit(textarea.closest('form')!);
+    expect(document.documentElement.dataset['productConversationFixtureSendCount'] ?? '0').toBe('0');
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-fail-opening-retry')));
+    fireEvent.click(screen.getByRole('button', { name: 'Retry saved handoff' }));
+    await screen.findByText('Fixture opening dispatch failed');
+    expect(screen.getByRole('status', { name: 'Continuation opening pending' })).toBeInTheDocument();
+    expect(document.documentElement.dataset['productConversationFixtureOpeningRetryPredecessor']).toBe(makeMobileContinuationScenario(kind).snapshot?.latest_transcript_row_id);
+    expect(document.documentElement.dataset['productConversationFixtureOpeningRetryCount']).toBe('1');
+    expect(document.getElementById('message-input')).toBe(textarea);
+    expect(textarea).toHaveValue('Keep this embedded draft');
+    fireEvent.submit(textarea.closest('form')!);
+    expect(document.documentElement.dataset['productConversationFixtureSendCount'] ?? '0').toBe('0');
+    fireEvent.click(screen.getByRole('button', { name: 'Retry saved handoff' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Send message' })).toBeEnabled());
+    expect(document.documentElement.dataset['productConversationFixtureOpeningRetryCount']).toBe('2');
+    expect(screen.queryByRole('status', { name: 'Continuation opening pending' })).toBeNull();
+    expect(document.getElementById('message-input')).toBe(textarea);
+    expect(textarea).toHaveValue('Keep this embedded draft');
+  });
+
+  it.each(['ordinary', 'coordinator'] as const)('retains the %s composer after failed continuation readback and retries without reload', async kind => {
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(1000);
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ x: 0, y: 0, top: 0, left: 0, right: 390, bottom: 844, width: 390, height: 844, toJSON: () => ({}) });
+    render(<ProductConversationFixture scenario={makeMobileContinuationScenario(kind)} />);
+    const composer = await screen.findByPlaceholderText('Type a message...');
+    await waitFor(() => expect(composer).toBeEnabled());
+    fireEvent.change(composer, { target: { value: 'Retained after readback failure' } });
+    composer.focus();
+    act(() => {
+      window.dispatchEvent(new Event('product-conversation-fixture-fail-snapshot'));
+      window.dispatchEvent(new Event('product-conversation-fixture-continue'));
+    });
+    expect(await screen.findByRole('alert', { name: 'Live view refresh failed' })).toHaveTextContent('Fixture continuation snapshot unavailable');
+    expect(document.getElementById('message-input')).toBe(composer);
+    expect(composer).toHaveValue('Retained after readback failure');
+    expect(composer).toHaveFocus();
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-restore-snapshot')));
+    fireEvent.click(screen.getByRole('button', { name: 'Retry live view' }));
+    await waitFor(() => {
+      const url = document.documentElement.dataset['productConversationFixtureEventSourceLastUrl'];
+      expect(new URL(url!, window.location.href).searchParams.get('reference')).toBe('fixture-successor');
+    });
+    expect(screen.getByPlaceholderText('Type a message...')).toHaveValue('Retained after readback failure');
+    expect(screen.queryByRole('alert', { name: 'Live view refresh failed' })).toBeNull();
+  });
+
   it.each(['ordinary-lazy-history', 'global-lazy-history'] as const)('keeps an explicit loaded prompt selection when the %s unloaded-boundary read resolves', async (id) => {
     vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(1000);
     vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ x: 0, y: 0, top: 0, left: 0, right: 960, bottom: 1000, width: 960, height: 1000, toJSON: () => ({}) });
@@ -72,13 +205,44 @@ describe('ProductConversationFixture', () => {
     expect(screen.getByPlaceholderText('Type a message...')).toBeEnabled();
   });
 
+  it.each(['ordinary', 'coordinator'] as const)('keeps the %s successor pending when readback succeeds with a stale predecessor snapshot', async kind => {
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(1000);
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ x: 0, y: 0, top: 0, left: 0, right: 390, bottom: 844, width: 390, height: 844, toJSON: () => ({}) });
+    render(<ProductConversationFixture scenario={makeMobileContinuationScenario(kind)} />);
+    const composer = await screen.findByPlaceholderText('Type a message...');
+    const route = document.documentElement.dataset['sourceFixtureLocation'];
+    fireEvent.change(composer, { target: { value: 'Retain across successful stale readback' } });
+    composer.focus();
+    const requests = Number(document.documentElement.dataset['productConversationFixtureSnapshotRequests'] ?? '0');
+    act(() => {
+      window.dispatchEvent(new Event('product-conversation-fixture-stale-snapshot'));
+      window.dispatchEvent(new Event('product-conversation-fixture-continue'));
+    });
+    await waitFor(() => expect(Number(document.documentElement.dataset['productConversationFixtureSnapshotRequests'])).toBeGreaterThan(requests));
+    expect(await screen.findByRole('status', { name: 'Continuation readback pending' })).toBeInTheDocument();
+    expect(screen.queryByRole('alert', { name: 'Live view refresh failed' })).toBeNull();
+    expect(document.getElementById('message-input')).toBe(composer);
+    expect(composer).toHaveValue('Retain across successful stale readback');
+    expect(composer).toHaveFocus();
+    expect(document.documentElement.dataset['productConversationFixtureLastDeliveredInitMember']).not.toBe('fixture-successor');
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-restore-snapshot')));
+    fireEvent.click(screen.getByRole('button', { name: 'Retry live view' }));
+    await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureLastDeliveredInitMember']).toBe('fixture-successor'));
+    expect(screen.queryByRole('status', { name: 'Continuation readback pending' })).toBeNull();
+    expect(document.getElementById('message-input')).toBe(composer);
+    expect(composer).toHaveValue('Retain across successful stale readback');
+    expect(document.documentElement.dataset['sourceFixtureLocation']).toBe(route);
+  });
+
   it.each(['source-call-ordinary', 'source-call-global'] as const)('resolves the real %s alias and expands its exact source call', async (id) => {
     vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(1000);
     vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ x: 0, y: 0, top: 0, left: 0, right: 960, bottom: 1000, width: 960, height: 1000, toJSON: () => ({}) });
     render(<ProductConversationFixture scenario={getProductConversationScenario(id)} />);
-    const sourceLink = await screen.findByRole('link', { name: /transcript ID source-member · source call$/ });
+    const sourceLinks = await screen.findAllByRole('link', { name: /transcript ID source-member · source call$/ });
+    const sourceLink = sourceLinks.find(link => link.closest('#message-received-send'));
+    expect(sourceLink).toBeDefined();
     const exactTranscript = vi.spyOn(api, 'getConversation');
-    fireEvent.click(sourceLink);
+    fireEvent.click(sourceLink!);
     const sourceRoute = id === 'source-call-global' ? '/global' : '/c/source-member';
     await waitFor(() => expect(document.documentElement.dataset['sourceFixtureLocation']).toBe(
       `${sourceRoute}?source_transcript=source-member&source_tool=source-send-call#message-source-assistant`,
@@ -249,7 +413,7 @@ describe('ProductConversationFixture', () => {
       await waitFor(() => expect(screen.queryByRole('button', { name: 'Edit annotation 1' })).not.toBeInTheDocument());
       expect(draft).toHaveValue('');
       if (sendFailure === 'unacknowledged') {
-        await screen.findByRole('button', { name: 'Retry' });
+        expect(await screen.findAllByRole('button', { name: 'Retry' })).not.toHaveLength(0);
         expect(JSON.parse(localStorage.getItem('phoenix:queue:reaction-work')!)).toHaveLength(1);
         act(() => window.dispatchEvent(new Event('product-conversation-fixture-acknowledge-last-send')));
       }
@@ -310,7 +474,14 @@ describe('ProductConversationFixture', () => {
     await act(async () => { fireEvent.click(returnButton); });
     await waitFor(() => expect(container.querySelector('[data-inline-reaction-message="reaction-answer-older"]')).not.toBeNull());
     await act(async () => { await new Promise<void>(resolve => requestAnimationFrame(() => resolve())); });
-    const input = await screen.findByRole('textbox', { name: 'Your reaction' });
+    const input = await screen.findByRole('textbox', { name: 'Your reaction' }, {
+      // The pill is portaled after the transcript, past where the DOM dump truncates.
+      onTimeout: (error) => {
+        const pill = document.querySelector('.reaction-pill');
+        error.message = `reaction pill at timeout: ${pill?.outerHTML ?? 'not rendered'}\n\n${error.message}`;
+        return error;
+      },
+    });
     expect(input).toHaveValue('Keep this guarantee.');
     expect(input).not.toHaveFocus();
     expect(fetchSnapshot).toHaveBeenCalledWith('fixture-product-conversation', expect.objectContaining({ before: 'reaction-page' }));

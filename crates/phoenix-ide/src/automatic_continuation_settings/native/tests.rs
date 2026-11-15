@@ -79,7 +79,18 @@ async fn native_preference_application_reads_and_sets_without_provider_dispatch(
     let Completion::Established(Ok(initial)) = initial else {
         panic!("initial native preference read was not established");
     };
-    assert!(!initial.auto_continue_on_context_exhaustion);
+    assert!(initial.auto_continue_on_context_exhaustion);
+    let opted_out = from_coordinator(
+        runtime.clone(),
+        coordinator.clone(),
+        target(),
+        Operation::Set(AutoContinueOnContextExhaustion::Disabled),
+    )
+    .await;
+    let Completion::Established(Ok(opted_out)) = opted_out else {
+        panic!("native opt-out was not established");
+    };
+    assert!(!opted_out.auto_continue_on_context_exhaustion);
     let changed = from_coordinator(
         runtime.clone(),
         coordinator.clone(),
@@ -125,7 +136,7 @@ async fn preclosed_native_setting_has_terminal_completion_and_no_preference_writ
         runtime,
         coordinator.clone(),
         Target::Coordinator,
-        Operation::Set(AutoContinueOnContextExhaustion::Enabled),
+        Operation::Set(AutoContinueOnContextExhaustion::Disabled),
     )
     .await;
     assert!(matches!(completion, Completion::LocalAuthorityClosed));
@@ -134,7 +145,7 @@ async fn preclosed_native_setting_has_terminal_completion_and_no_preference_writ
         db.auto_continue_on_context_exhaustion(&coordinator.product_conversation_id)
             .await
             .unwrap(),
-        AutoContinueOnContextExhaustion::Disabled,
+        AutoContinueOnContextExhaustion::Enabled,
     );
 }
 
@@ -142,6 +153,12 @@ async fn preclosed_native_setting_has_terminal_completion_and_no_preference_writ
 async fn requester_cancellation_does_not_cancel_owned_preference_classification() {
     let (runtime, db, coordinator) = native_runtime().await;
     let source = db.get_conversation(&coordinator).await.unwrap();
+    db.set_auto_continue_on_context_exhaustion(
+        &source.product_conversation_id,
+        AutoContinueOnContextExhaustion::Disabled,
+    )
+    .await
+    .unwrap();
     let gate = runtime
         .lock_product_message_admission(source.product_conversation_id.as_str())
         .await;
@@ -186,7 +203,7 @@ async fn authority_closure_while_waiting_refuses_write_and_ordinary_completion()
         runtime.clone(),
         coordinator,
         Target::Coordinator,
-        Operation::Set(AutoContinueOnContextExhaustion::Enabled),
+        Operation::Set(AutoContinueOnContextExhaustion::Disabled),
         Some(BoundaryObservation {
             source_gate_wait,
             worker_completed,
@@ -207,7 +224,7 @@ async fn authority_closure_while_waiting_refuses_write_and_ordinary_completion()
         db.auto_continue_on_context_exhaustion(&source.product_conversation_id)
             .await
             .unwrap(),
-        AutoContinueOnContextExhaustion::Disabled,
+        AutoContinueOnContextExhaustion::Enabled,
     );
 }
 
@@ -215,7 +232,7 @@ async fn authority_closure_while_waiting_refuses_write_and_ordinary_completion()
 async fn rotation_while_waiting_revalidates_read_and_write_source_at_database_boundary() {
     for operation in [
         Operation::Read,
-        Operation::Set(AutoContinueOnContextExhaustion::Enabled),
+        Operation::Set(AutoContinueOnContextExhaustion::Disabled),
     ] {
         let (runtime, db, coordinator) = native_runtime().await;
         let source = db.get_conversation(&coordinator).await.unwrap();
@@ -260,7 +277,7 @@ async fn rotation_while_waiting_revalidates_read_and_write_source_at_database_bo
             db.auto_continue_on_context_exhaustion(&source.product_conversation_id)
                 .await
                 .unwrap(),
-            AutoContinueOnContextExhaustion::Disabled,
+            AutoContinueOnContextExhaustion::Enabled,
         );
         assert!(!runtime.local_authority_is_closed());
     }

@@ -105,11 +105,41 @@ pub(super) async fn dispatch_continuation_handoff(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+pub(super) async fn retry_pending_opening(
+    service: &ContinuationApplicationService,
+    parent_id: &str,
+) -> Result<ContinueConversationResponse, AppError> {
+    continue_with_operation(
+        service,
+        parent_id,
+        ManualContinuationOperation::RetryPending,
+    )
+    .await
+}
+
 pub(super) async fn continue_manual(
     service: &ContinuationApplicationService,
     parent_id: &str,
     req: crate::api::ContinueConversationRequest,
+) -> Result<ContinueConversationResponse, AppError> {
+    continue_with_operation(
+        service,
+        parent_id,
+        ManualContinuationOperation::Selected(req),
+    )
+    .await
+}
+
+enum ManualContinuationOperation {
+    Selected(crate::api::ContinueConversationRequest),
+    RetryPending,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn continue_with_operation(
+    service: &ContinuationApplicationService,
+    parent_id: &str,
+    operation: ManualContinuationOperation,
 ) -> Result<ContinueConversationResponse, AppError> {
     let id = parent_id;
 
@@ -136,6 +166,64 @@ pub(super) async fn continue_manual(
         .get_conversation(id)
         .await
         .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let req = match operation {
+        ManualContinuationOperation::Selected(req) => req,
+        ManualContinuationOperation::RetryPending => {
+            let lifecycle = service
+                .runtime
+                .db()
+                .message_target_admission(id)
+                .await
+                .map_err(map_admission_db_error)?;
+            map_ordinary_mutation_admission(&lifecycle, "continuation opening retry")?;
+            let intent = service
+                .runtime
+                .db()
+                .continuation_dispatch_intent(id)
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?
+                .ok_or_else(|| {
+                    AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                        "No pending continuation opening exists to retry",
+                        "continuation_opening_not_pending",
+                    )))
+                })?;
+            if intent.parent_conversation_id != id
+                || parent.continued_in_conv_id.as_deref()
+                    != Some(intent.successor_conversation_id.as_str())
+            {
+                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    "Pending continuation opening no longer matches the predecessor's successor",
+                    "continuation_opening_not_pending",
+                ))));
+            }
+            if intent.opening_authority
+                == phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext
+            {
+                let review = service
+                    .runtime
+                    .review_reserved_continuation_opening(intent.clone())
+                    .await
+                    .map_err(AppError::BadRequest)?;
+                if !review.source.fits() {
+                    return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                        format!(
+                            "Saved handoff exceeds reserved successor capacity: {:?}",
+                            review.source
+                        ),
+                        "context_capacity_conflict",
+                    ))));
+                }
+            }
+            crate::api::ContinueConversationRequest {
+                handoff: intent.handoff,
+                source: crate::api::ContinueHandoffSource::Manual,
+                message_id: intent.message_id.as_str().to_string(),
+                user_agent: intent.user_agent,
+                retry_failed_automatic: true,
+            }
+        }
+    };
     if req.handoff.trim().is_empty() {
         return Err(AppError::BadRequest(
             "Continuation handoff must not be empty.".to_string(),
@@ -236,7 +324,7 @@ pub(super) async fn continue_manual(
             }
             let (handoff, expansion_policy) = match intent.opening_authority {
                 phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext => (
-                    summary.summary.as_str(),
+                    intent.handoff.as_str(),
                     crate::send_chat_service::MessageExpansionPolicy::GeneratedPredecessorContext,
                 ),
                 phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction => (
@@ -303,9 +391,15 @@ pub(super) async fn continue_manual(
             .map_err(AppError::BadRequest)?;
         if !review.source.fits() {
             let message = match review.source.status {
-                crate::runtime::HandoffCapacityStatus::RequiredOverhead => "Required instructions/tools and full output reservation leave no successor working room. Handoff editing and shortening cannot fix this overhead; explicitly change model or revise required instructions/tools.",
-                crate::runtime::HandoffCapacityStatus::HandoffTooLarge { .. } => "The supplied handoff leaves insufficient successor working room. Review the capacity target, edit the handoff, request one shortening candidate, or explicitly change model.",
-                crate::runtime::HandoffCapacityStatus::Ready { .. } => unreachable!("fit checked above"),
+                crate::runtime::HandoffCapacityStatus::RequiredOverhead => {
+                    "Required instructions/tools and full output reservation leave no successor working room. Handoff editing and shortening cannot fix this overhead; explicitly change model or revise required instructions/tools."
+                }
+                crate::runtime::HandoffCapacityStatus::HandoffTooLarge { .. } => {
+                    "The supplied handoff leaves insufficient successor working room. Review the capacity target, edit the handoff, request one shortening candidate, or explicitly change model."
+                }
+                crate::runtime::HandoffCapacityStatus::Ready { .. } => {
+                    unreachable!("fit checked above")
+                }
             };
             let mut conflict =
                 ConflictErrorResponse::new(message, "continuation_capacity_conflict");
@@ -385,6 +479,15 @@ pub(super) async fn continue_manual(
                 AppError::Internal(other.to_string())
             }
         })?;
+
+    if let ContinueOutcome::Created(successor) | ContinueOutcome::AlreadyContinued(successor) =
+        &outcome
+    {
+        service
+            .runtime
+            .publish_continuation_link(id, &successor.id)
+            .await;
+    }
 
     if let Some(retry_phase) = automatic_retry_phase {
         service

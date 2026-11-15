@@ -63,7 +63,7 @@ function Harness({ store, send }: {
   const [images, setImages] = useState<ImageData[]>([]);
   const [files, setFiles] = useState<FileAttachment[]>([]);
   return <DraftContext.Provider value={store}>
-    <ConnectedInputArea slug="conversation" scopeKey="conversation" cwd={undefined}
+    <ConnectedInputArea slug="conversation" scopeKey="conversation" uploadConversationId="conversation" cwd={undefined}
       convState={{ type: 'idle' }} images={images} setImages={setImages}
       files={files} setFiles={setFiles} isOffline={false} failedMessages={[]}
       onSend={send} onCancel={() => {}} onRetry={() => {}} />

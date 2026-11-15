@@ -10725,7 +10725,6 @@ where
                 if intent.successor_conversation_id != self.context.conversation_id
                     || intent.opening_authority
                         != ContinuationOpeningAuthority::GeneratedPredecessorContext
-                    || intent.user_agent.is_some()
                     || !matches!(self.state, ConvState::Idle)
                 {
                     return Err(
@@ -11878,6 +11877,7 @@ where
                     work_scope_key: None,
                     model: None,
                     archived: None,
+                    continued_in_conv_id: None,
                 },
             });
 
@@ -12027,6 +12027,7 @@ where
                     work_scope_key: None,
                     model: None,
                     archived: None,
+                    continued_in_conv_id: None,
                 },
             });
         Ok(())
@@ -12338,6 +12339,7 @@ where
                             work_scope_key: Some(self.context.resource_scope.stable_key()),
                             model: None,
                             archived: None,
+                            continued_in_conv_id: None,
                         },
                     });
 

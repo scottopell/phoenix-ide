@@ -1477,7 +1477,6 @@ async fn production_coordinator_registry_has_exact_instance_selector_contract() 
         "send_conversation_message",
         "watch_conversation",
         "unwatch_conversation",
-        "list_watched_conversations",
         "read_goal",
         "continue_conversation",
         "prepare_goal",
@@ -1499,7 +1498,6 @@ async fn production_coordinator_registry_has_exact_instance_selector_contract() 
             "send_conversation_message"
                 | "watch_conversation"
                 | "unwatch_conversation"
-                | "list_watched_conversations"
                 | "prepare_goal"
                 | "apply_goal"
                 | "create_conversation"
@@ -1514,6 +1512,19 @@ async fn production_coordinator_registry_has_exact_instance_selector_contract() 
             "{name} must expose its standard instance selector"
         );
     }
+    let list = definitions
+        .iter()
+        .find(|definition| definition.name == "list_watched_conversations")
+        .unwrap();
+    assert_eq!(list.input_schema["required"], json!(["request"]));
+    assert!(list.input_schema["properties"].get("instance").is_none());
+    assert!(list.input_schema["properties"].get("after").is_none());
+    let branches = list.input_schema["properties"]["request"]["oneOf"]
+        .as_array()
+        .unwrap();
+    assert_eq!(branches[0]["properties"], json!({"op":{"const":"local"}}));
+    assert_eq!(branches[0]["additionalProperties"], false);
+    assert_eq!(branches[1]["required"], json!(["op", "instance"]));
     for name in ["read_automatic_continuation", "set_automatic_continuation"] {
         let definition = definitions
             .iter()
@@ -1681,13 +1692,6 @@ async fn watch_tools_treat_omitted_and_exact_local_as_equal_and_reject_invalid_s
     );
     assert_eq!(omitted_unwatch, explicit_local_unwatch);
 
-    let omitted_list = value(&f.invoke("list_watched_conversations", json!({})).await);
-    let explicit_local_list = value(
-        &f.invoke("list_watched_conversations", json!({"instance":"local"}))
-            .await,
-    );
-    assert_eq!(omitted_list, explicit_local_list);
-
     let _ = f
         .invoke(
             "watch_conversation",
@@ -1704,7 +1708,6 @@ async fn watch_tools_treat_omitted_and_exact_local_as_equal_and_reject_invalid_s
             "unwatch_conversation",
             json!({"product_conversation_id":target}),
         ),
-        ("list_watched_conversations", json!({})),
     ] {
         for selector in [
             json!("missing-peer"),
@@ -1725,6 +1728,47 @@ async fn watch_tools_treat_omitted_and_exact_local_as_equal_and_reject_invalid_s
                 "{name} with invalid selector must not change local watches"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn watch_list_closed_requests_preserve_local_watches_and_reject_invalid_peers() {
+    let f = Fixture::new().await;
+    let _ = f
+        .invoke(
+            "watch_conversation",
+            json!({"product_conversation_id":f.owner.as_str()}),
+        )
+        .await;
+    let before = f.db.list_coordinator_watches().await.unwrap();
+    assert!(!before.is_empty());
+    let local = value(
+        &f.invoke(
+            "list_watched_conversations",
+            json!({"request":{"op":"local"}}),
+        )
+        .await,
+    );
+    assert_eq!(local, serde_json::to_value(&before).unwrap());
+    for selector in [
+        json!("missing-peer"),
+        json!("Local"),
+        json!(" local "),
+        json!(false),
+        json!(null),
+        json!("local"),
+    ] {
+        let output = f
+            .invoke(
+                "list_watched_conversations",
+                json!({"request":{"op":"remote","instance":selector}}),
+            )
+            .await;
+        assert!(!output.is_success());
+        assert_eq!(
+            serde_json::to_value(&before).unwrap(),
+            serde_json::to_value(f.db.list_coordinator_watches().await.unwrap()).unwrap(),
+        );
     }
 }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-use gate for the frozen 0.13.2-rc.5 release candidate."""
+"""Single-use gate for the frozen 0.13.2-rc.6 release candidate."""
 
 import json
 import subprocess
@@ -8,12 +8,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-BASE = "3b107af7536faf237e4d85fe0705a6a524a94229"
-CANDIDATE = "4da5f81c60d65d548254264003540bc7d462d2b0"
-TAG = "v0.13.2-rc.5"
-VERSION = "0.13.2-rc.5"
-OLD_VERSION = b"0.13.2-rc.3"
-NEW_VERSION = b"0.13.2-rc.5"
+BASE = "f3926c7c784934efcbb11985ed66aa64c46c0ae1"
+CANDIDATE = "bccfd66b2470a86910b952f22ccf327ed2c78f2f"
+TAG = "v0.13.2-rc.6"
+VERSION = "0.13.2-rc.6"
+OLD_VERSION = b"0.13.2-rc.4"
+NEW_VERSION = b"0.13.2-rc.6"
 MANIFEST = "crates/phoenix-ide/Cargo.toml"
 LOCKFILE = "Cargo.lock"
 REPOSITORY = "scottopell/phoenix-ide"
@@ -45,7 +45,7 @@ def tree(repo, commit):
 
 def substitute_once(data, description):
     if data.count(OLD_VERSION) != 1:
-        raise ValueError(f"expected exactly one rc.3 version in {description}")
+        raise ValueError(f"expected exactly one rc.4 version in {description}")
     return data.replace(OLD_VERSION, NEW_VERSION, 1)
 
 
@@ -53,7 +53,7 @@ def expected_lockfile(data):
     old = b'name = "phoenix_ide"\nversion = "' + OLD_VERSION + b'"'
     new = b'name = "phoenix_ide"\nversion = "' + NEW_VERSION + b'"'
     if data.count(old) != 1:
-        raise ValueError("expected exactly one phoenix_ide rc.3 package in Cargo.lock")
+        raise ValueError("expected exactly one phoenix_ide rc.4 package in Cargo.lock")
     return data.replace(old, new, 1)
 
 
@@ -86,7 +86,7 @@ def verify_candidate(repo):
         raise ValueError("candidate differs from exact two-file/version-only tree: " + ", ".join(mismatches[:8]))
     candidate_manifest = git(repo, "cat-file", "blob", CANDIDATE + ":" + MANIFEST)
     if candidate_manifest.count(NEW_VERSION) != 1:
-        raise ValueError("candidate manifest does not encode exactly one rc.5 version")
+        raise ValueError("candidate manifest does not encode exactly one rc.6 version")
     return True
 
 
@@ -94,7 +94,7 @@ def workflow_dispatch_ci_run():
     """Require the newest matching manual ci.yml run to have completed successfully."""
     query = urllib.parse.urlencode({"head_sha": CANDIDATE, "event": "workflow_dispatch", "per_page": 100})
     url = f"https://api.github.com/repos/{REPOSITORY}/actions/workflows/ci.yml/runs?{query}"
-    request = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "phoenix-frozen-rc5-gate"})
+    request = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "phoenix-frozen-rc6-gate"})
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
             payload = json.load(response)
@@ -140,7 +140,7 @@ def gate(repo="."):
 
 if __name__ == "__main__":
     if sys.argv[1:] not in ([], ["gate"]):
-        raise SystemExit("frozen rc5 gate accepts no candidate, base, tag, or run inputs")
+        raise SystemExit("frozen rc6 gate accepts no candidate, base, tag, or run inputs")
     try:
         gate()
     except (ValueError, subprocess.CalledProcessError) as error:
