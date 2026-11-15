@@ -198,17 +198,19 @@ async fn stopped_live_source_refuses_exact_initial_replay_before_database_lookup
     let receipt = fixture.admitted().await;
     assert_eq!(count(&fixture.db, "native_close_initial_receipts").await, 1);
 
-    // The actor's Stop settles only in InMemoryStorage. SQLite deliberately remains
-    // executing, so only live source-actor matching can prevent this exact replay.
+    // Stop ACK persists source revocation in InMemoryStorage, not full cancellation.
+    // SQLite remains executing, so live actor matching must prevent this exact replay.
     let mut harness = fixture.runtime(true);
     let admitted = harness.runtime.admit_authoritative_effect().unwrap();
     let (sender, running) = start_actor(&mut harness);
     stop_actor(&sender).await;
-    assert_eq!(
-        harness
-            .storage
-            .get_current_state(&fixture.source_transcript_id),
-        Some(ConvState::Idle)
+    let stopped_source_state = harness
+        .storage
+        .get_current_state(&fixture.source_transcript_id)
+        .expect("Stop ACK must persist the live source state");
+    assert!(
+        !matches!(stopped_source_state, ConvState::ToolExecuting { .. }),
+        "acknowledged Stop must revoke the live executing Close source"
     );
     assert!(matches!(
         fixture
