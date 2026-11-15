@@ -66,11 +66,7 @@ impl CloseFixture {
     }
 
     async fn admitted(&self) -> phoenix_db::native_close::NativeCloseReceipt {
-        match self
-            .db
-            .apply_native_close_initial(&self.command)
-            .await
-        {
+        match self.db.apply_native_close_initial(&self.command).await {
             phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(
                 NativeCloseInitialResult::NewlyAdmitted(receipt),
             )) => receipt,
@@ -79,10 +75,8 @@ impl CloseFixture {
     }
 
     fn runtime(&self, is_coordinator: bool) -> RuntimeHarness {
-        let mut harness = runtime_with_storage(
-            self.state.clone(),
-            Arc::new(InMemoryStorage::new()),
-        );
+        let mut harness =
+            runtime_with_storage(self.state.clone(), Arc::new(InMemoryStorage::new()));
         harness.runtime.context.conversation_id = self.source_transcript_id.clone();
         harness.runtime.context.is_coordinator = is_coordinator;
         harness.runtime = harness
@@ -121,9 +115,7 @@ fn executing_state(source: &SourceToolCall, target: &ProductConversationId) -> C
     }
 }
 
-fn setup_actor_queue(
-    harness: &mut RuntimeHarness,
-) -> mpsc::Sender<AcknowledgedRuntimeRequest> {
+fn setup_actor_queue(harness: &mut RuntimeHarness) -> mpsc::Sender<AcknowledgedRuntimeRequest> {
     let (watch_tx, _watch_rx) = tokio::sync::watch::channel(harness.runtime.state.clone());
     let (sender, receiver) = mpsc::channel(4);
     harness.runtime = std::mem::replace(&mut harness.runtime, runtime(ConvState::Idle).runtime)
@@ -182,19 +174,14 @@ async fn count(db: &Database, table: &str) -> i64 {
         }
         _ => panic!("unexpected Close table"),
     };
-    sqlx::query_scalar(sql)
-        .fetch_one(db.pool())
-        .await
-        .unwrap()
+    sqlx::query_scalar(sql).fetch_one(db.pool()).await.unwrap()
 }
 
 fn initial_request(
     admitted: crate::runtime::AdmittedOperation,
     fixture: &CloseFixture,
     target_gate: tokio::sync::OwnedMutexGuard<()>,
-    response: oneshot::Sender<
-        Result<NativeCloseInitialResult, NativeCloseApplicationError>,
-    >,
+    response: oneshot::Sender<Result<NativeCloseInitialResult, NativeCloseApplicationError>>,
 ) -> AcknowledgedRuntimeRequest {
     AcknowledgedRuntimeRequest::ExecuteNativeCloseInitial(Box::new(NativeCloseInitialRequest {
         source: fixture.source.clone(),
@@ -340,7 +327,9 @@ async fn aborted_owning_initial_execution_task_latches_authority_before_releasin
     let (suspended, reached_boundary) = oneshot::channel();
     let owning_task = tokio::spawn(async move {
         let mut future = Box::pin(
-            harness.runtime.execute_native_close_initial(source, target, admitted),
+            harness
+                .runtime
+                .execute_native_close_initial(source, target, admitted),
         );
         // The sole connection is held outside this task. Every earlier check is
         // synchronous, so Pending witnesses the actual DB-await boundary.
@@ -382,11 +371,7 @@ async fn established_initial_rollback_releases_owner_without_closing_authority()
     assert_eq!(
         harness
             .runtime
-            .execute_native_close_initial(
-                fixture.source.clone(),
-                fixture.target.clone(),
-                admitted,
-            )
+            .execute_native_close_initial(fixture.source.clone(), fixture.target.clone(), admitted,)
             .await,
         Err(NativeCloseApplicationError::Storage)
     );

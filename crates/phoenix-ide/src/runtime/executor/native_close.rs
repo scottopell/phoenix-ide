@@ -1,6 +1,9 @@
 //! Source-owned, initial-only Close admission. No cleanup or retry dispatch.
 
-use super::*;
+use super::{
+    CancellationToken, ConversationRuntime, LlmClient, RuntimeSettlementAuthority, Storage,
+    ToolExecutor,
+};
 use crate::runtime::native_close_application::{
     initial_command_from_executing_source, NativeCloseApplicationError,
 };
@@ -28,7 +31,8 @@ where
     ) -> Result<NativeCloseInitialResult, NativeCloseApplicationError> {
         if !self.context.is_coordinator
             || self.context.is_sub_agent
-            || self.fatal_external_effect_cancellation
+            || self
+                .fatal_external_effect_cancellation
                 .as_ref()
                 .is_some_and(CancellationToken::is_cancelled)
         {
@@ -44,7 +48,9 @@ where
         .map_err(|_| NativeCloseApplicationError::SourceRefused)?;
         // Production already installs the same database used by native admission.
         // An absent test/dormant dependency fails closed; no synthetic manager.
-        let db = self.native_task_admission_db.as_ref()
+        let db = self
+            .native_task_admission_db
+            .as_ref()
             .ok_or(NativeCloseApplicationError::Unavailable)?;
         // Once this boundary starts, losing its future before a typed result must
         // close authority before releasing the admitted owner (REQ-BED-033).

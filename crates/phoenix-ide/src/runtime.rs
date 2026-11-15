@@ -296,8 +296,8 @@ pub(crate) enum AcknowledgedRuntimeRequest {
     },
 }
 
-mod task_approval_admission;
 mod native_close_application;
+mod task_approval_admission;
 
 #[cfg(test)]
 impl AcknowledgedRuntimeRequest {

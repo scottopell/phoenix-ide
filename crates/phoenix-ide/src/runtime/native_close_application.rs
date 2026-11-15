@@ -63,7 +63,9 @@ pub(super) fn initial_command_from_executing_source(
         || assistant_message.message_id != source.message_id
         || current_tool.id != source.tool_use_id
         || current_tool.name() != "close_conversation"
-        || remaining_tools.iter().any(|tool| tool.id == source.tool_use_id)
+        || remaining_tools
+            .iter()
+            .any(|tool| tool.id == source.tool_use_id)
         || completed_results
             .iter()
             .any(|result| result.tool_use_id() == source.tool_use_id)
@@ -125,7 +127,8 @@ impl super::RuntimeManager {
         source_transcript_id: &str,
         source: SourceToolCall,
         target: ProductConversationId,
-    ) -> Result<phoenix_db::native_close::NativeCloseInitialResult, NativeCloseApplicationError> {
+    ) -> Result<phoenix_db::native_close::NativeCloseInitialResult, NativeCloseApplicationError>
+    {
         let gate = self.conversation_admission(target.as_str()).await;
         let target_gate = gate.lock_owned().await;
         let admitted = self
@@ -140,15 +143,17 @@ impl super::RuntimeManager {
         .ok_or(NativeCloseApplicationError::Unavailable)?;
         let (response, receiver) = tokio::sync::oneshot::channel();
         sender
-            .send(super::AcknowledgedRuntimeRequest::ExecuteNativeCloseInitial(
-                Box::new(NativeCloseInitialRequest {
-                    source,
-                    target,
-                    admitted,
-                    target_gate,
-                    response,
-                }),
-            ))
+            .send(
+                super::AcknowledgedRuntimeRequest::ExecuteNativeCloseInitial(Box::new(
+                    NativeCloseInitialRequest {
+                        source,
+                        target,
+                        admitted,
+                        target_gate,
+                        response,
+                    },
+                )),
+            )
             .await
             .map_err(|_| NativeCloseApplicationError::Unavailable)?;
         receiver

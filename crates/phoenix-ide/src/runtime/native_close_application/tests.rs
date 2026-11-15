@@ -36,7 +36,10 @@ fn initial_input() -> Value {
     json!({"action":"initial", "product_conversation_id":"target"})
 }
 
-fn derive(state: &ConvState, source: &SourceToolCall) -> Result<NativeCloseCommand, NativeCloseSourceRefusal> {
+fn derive(
+    state: &ConvState,
+    source: &SourceToolCall,
+) -> Result<NativeCloseCommand, NativeCloseSourceRefusal> {
     initial_command_from_executing_source(
         state,
         "source-transcript",
@@ -67,34 +70,65 @@ fn idle_source_cannot_replay_even_with_same_historical_ids() {
 fn source_message_and_current_call_must_both_match() {
     let (state, source) = fixture(initial_input());
     for changed in [
-        SourceToolCall { message_id: "other".into(), ..source.clone() },
-        SourceToolCall { tool_use_id: "other".into(), ..source.clone() },
-        SourceToolCall { message_id: String::new(), ..source.clone() },
+        SourceToolCall {
+            message_id: "other".into(),
+            ..source.clone()
+        },
+        SourceToolCall {
+            tool_use_id: "other".into(),
+            ..source.clone()
+        },
+        SourceToolCall {
+            message_id: String::new(),
+            ..source.clone()
+        },
     ] {
-        assert_eq!(derive(&state, &changed), Err(NativeCloseSourceRefusal::NotExactExecutingSource));
+        assert_eq!(
+            derive(&state, &changed),
+            Err(NativeCloseSourceRefusal::NotExactExecutingSource)
+        );
     }
 }
 
 #[test]
 fn canonical_and_executing_payload_must_agree_exactly() {
     let (mut state, source) = fixture(initial_input());
-    let ConvState::ToolExecuting { current_tool, .. } = &mut state else { unreachable!() };
+    let ConvState::ToolExecuting { current_tool, .. } = &mut state else {
+        unreachable!()
+    };
     current_tool.input = ToolInput::Unknown {
         name: "close_conversation".into(),
         input: json!({"action":"initial", "product_conversation_id":"different-target"}),
     };
-    assert_eq!(derive(&state, &source), Err(NativeCloseSourceRefusal::NotExactExecutingSource));
+    assert_eq!(
+        derive(&state, &source),
+        Err(NativeCloseSourceRefusal::NotExactExecutingSource)
+    );
 }
 
 #[test]
 fn duplicate_canonical_or_pending_occurrence_is_rejected() {
     let (mut state, source) = fixture(initial_input());
-    let ConvState::ToolExecuting { assistant_message, .. } = &mut state else { unreachable!() };
-    assistant_message.content.push(assistant_message.content[0].clone());
+    let ConvState::ToolExecuting {
+        assistant_message, ..
+    } = &mut state
+    else {
+        unreachable!()
+    };
+    assistant_message
+        .content
+        .push(assistant_message.content[0].clone());
     assert!(derive(&state, &source).is_err());
 
     let (mut state, source) = fixture(initial_input());
-    let ConvState::ToolExecuting { current_tool, remaining_tools, .. } = &mut state else { unreachable!() };
+    let ConvState::ToolExecuting {
+        current_tool,
+        remaining_tools,
+        ..
+    } = &mut state
+    else {
+        unreachable!()
+    };
     remaining_tools.push(current_tool.clone());
     assert!(derive(&state, &source).is_err());
 }
@@ -110,6 +144,9 @@ fn unsupported_or_authority_bearing_fields_never_become_initial() {
         json!({"action":"initial", "product_conversation_id":"different-target"}),
     ] {
         let (state, source) = fixture(input);
-        assert_eq!(derive(&state, &source), Err(NativeCloseSourceRefusal::NotExactExecutingSource));
+        assert_eq!(
+            derive(&state, &source),
+            Err(NativeCloseSourceRefusal::NotExactExecutingSource)
+        );
     }
 }
