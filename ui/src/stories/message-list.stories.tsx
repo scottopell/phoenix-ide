@@ -23,6 +23,12 @@ ScrollPolicyLong.storyName = 'scroll-policy-long';
 export const PrefixContinuityOffsetBug = storyFor('prefix-continuity-offset-bug');
 PrefixContinuityOffsetBug.storyName = 'prefix-continuity-offset-bug';
 
+export const NarrowWebKitMarkdownTable = storyFor('narrow-webkit-markdown-table');
+NarrowWebKitMarkdownTable.storyName = 'narrow-webkit-markdown-table';
+
+export const NarrowWebKitMarkdownTableLight = storyFor('narrow-webkit-markdown-table-light');
+NarrowWebKitMarkdownTableLight.storyName = 'narrow-webkit-markdown-table-light';
+
 export const WideMarkdownTable = storyFor('wide-markdown-table');
 WideMarkdownTable.storyName = 'wide-markdown-table';
 
