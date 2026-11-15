@@ -11661,15 +11661,23 @@ mod tests {
     #[tokio::test]
     async fn zero_scope_inventory_requires_exact_authorized_snapshot() {
         let db = Database::open_in_memory().await.unwrap();
-        // Normal admission captures the root WorkScope even without a worktree.
-        // Use the explicit scope-free shape rather than dropping captured scopes.
-        scope_free_close_fixture(&db).await;
-        set_close_phase(
-            &db,
-            "scope-free",
-            ClosePhase::AwaitingRetirementInspection,
-        )
-        .await;
+        // Model a legacy root with no attached WorkScope before admission.
+        // Normal admission must seal its real empty scope set; the unsealed
+        // interruption fixture is not retirement authority.
+        create_root(&db, "root").await;
+        sqlx::query("UPDATE conversations SET work_scope_id = NULL WHERE id = 'root'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "scope-free")
+            .await
+            .unwrap();
+        assert!(db
+            .list_close_attempt_scopes("scope-free")
+            .await
+            .unwrap()
+            .is_empty());
+        set_close_phase(&db, "scope-free", ClosePhase::AwaitingRetirementInspection).await;
         db.replace_close_inspection(ReplaceCloseInspectionRequest {
             attempt_id: CloseAttemptId::parse("scope-free").unwrap(),
             scopes: Vec::new(),
