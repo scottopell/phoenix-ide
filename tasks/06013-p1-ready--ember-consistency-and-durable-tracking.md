@@ -61,6 +61,8 @@ Installed descriptions/schemas totaled 41,923 characters; this is not a token co
 
 Routing remains operation-specific: search is local; selected-peer read/query/resolve/send/watch and lifecycle/Goal capabilities retain their actual contracts and unsupported cases. Never reinterpret an unknown peer as local. Current-target ProductConversation, exact transcript/message, generated summary, run ordinal, revision and prepared reference retain distinct meanings.
 
+Follow-up production inspection on 2026-11-15 found a specific list_watched_conversations interface/recovery problem: the shared schema exposes remote-only after, while local execution rejects it with an opaque empty-struct error. Four observed local calls failed, including three retries changing only UUID values. after is a remote subscription-list cursor, not a timestamp or event-delivery cursor; local calls omit it. Phase 1 now explicitly qualifies route/field agreement, first/next-page examples and model recovery. This is a demonstrated narrow audit finding, not a blanket criticism of flat schemas or a claim that the runtime fix has shipped.
+
 ## Keep the domain responsibilities distinct
 
 | Concept | Responsibility |
