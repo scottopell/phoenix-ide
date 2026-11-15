@@ -9,6 +9,69 @@ const SUMMARY: &str = "Retained generated context, not new user authority.";
 const SUMMARY_ID: &str = "exhausted-summary";
 const WINNER: &str = "winning-opening";
 
+#[test]
+fn federated_pending_result_keeps_reservation_time_opening_evidence() {
+    let result = FederatedNativeContinueResult::Pending {
+        conversation_id: "successor".into(),
+        slug: Some("successor".into()),
+        opening_message_id: "opening-key".into(),
+        dispatch: FederatedNativePendingDispatch::from_parts(
+            ContinueConversationStatus::DispatchFailed,
+            Some("dispatch failed".into()),
+        )
+        .unwrap(),
+    };
+
+    let (response, opening) = result.into_response_and_opening();
+
+    assert_eq!(response.status, ContinueConversationStatus::DispatchFailed);
+    assert_eq!(response.error.as_deref(), Some("dispatch failed"));
+    assert_eq!(
+        opening,
+        FederatedNativeOpeningEvidence::Pending {
+            message_id: "opening-key".into()
+        }
+    );
+}
+
+#[test]
+fn federated_pending_dispatch_rejects_incoherent_response_matrices() {
+    for (status, error) in [
+        (ContinueConversationStatus::Accepted, Some("error".into())),
+        (
+            ContinueConversationStatus::AlreadyExists,
+            Some("error".into()),
+        ),
+        (ContinueConversationStatus::DispatchFailed, None),
+        (
+            ContinueConversationStatus::DispatchFailed,
+            Some(String::new()),
+        ),
+    ] {
+        assert!(FederatedNativePendingDispatch::from_parts(status, error).is_err());
+    }
+}
+
+#[test]
+fn federated_accepted_result_has_one_valid_response_matrix() {
+    let result = FederatedNativeContinueResult::Accepted {
+        conversation_id: "successor".into(),
+        slug: Some("successor".into()),
+        opening_message_id: "successor:opening-key".into(),
+    };
+
+    let (response, opening) = result.into_response_and_opening();
+
+    assert_eq!(response.status, ContinueConversationStatus::AlreadyExists);
+    assert_eq!(response.error, None);
+    assert_eq!(
+        opening,
+        FederatedNativeOpeningEvidence::Accepted {
+            message_id: "successor:opening-key".into()
+        }
+    );
+}
+
 #[tokio::test]
 async fn reserved_reminder_opening_is_rejected_before_manual_successor_creation() {
     for message_id in ["reminder:reserved", "another-transcript:reminder:reserved"] {
@@ -72,6 +135,763 @@ async fn existing_manual_successor_ignores_reserved_losing_request_identity() {
         assert_eq!(response.conversation_id, intent.successor_conversation_id);
         assert_eq!(response.status, ContinueConversationStatus::AlreadyExists);
     }
+}
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn automatic_recovery_publishes_link_after_successor_was_reserved() {
+    use phoenix_core::domain::product_conversation::{
+        AutoContinueOnContextExhaustion, AutomaticContinuationPhase,
+    };
+    use phoenix_core::domain::sm_state::ContinuationSummaryRequest;
+
+    let f = Fixture::new().await;
+    let predecessor = f.db.get_conversation(&f.predecessor).await.unwrap();
+    f.db.set_auto_continue_on_context_exhaustion(
+        &predecessor.product_conversation_id,
+        AutoContinueOnContextExhaustion::Enabled,
+    )
+    .await
+    .unwrap();
+    let operation_id = "recovered-reservation-summary";
+    f.db.update_conversation_state(
+        &f.predecessor,
+        &ConvState::AwaitingContinuation {
+            request: ContinuationSummaryRequest {
+                operation_id: operation_id.into(),
+                rejected_tool_calls: Vec::new(),
+                attempt: 1,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let mut summary =
+        f.db.get_messages(&f.predecessor)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+    summary.message_id = "recovered-reservation-summary-message".into();
+    summary.sequence_id += 1;
+    assert_eq!(
+        f.db.commit_continuation(
+            &f.predecessor,
+            operation_id,
+            &summary,
+            &ConvState::ContextExhausted {
+                summary: SUMMARY.into()
+            },
+            summary.created_at,
+        )
+        .await
+        .unwrap(),
+        phoenix_db::ContinuationCommitOutcome::Applied
+    );
+    let admission =
+        f.db.automatic_continuation_admission(&f.predecessor)
+            .await
+            .unwrap()
+            .unwrap();
+    let (_, intent) =
+        f.db.continue_conversation_with_intent(
+            &f.predecessor,
+            phoenix_db::NewContinuationDispatchIntent {
+                message_id: admission.first_message_id,
+                handoff: SUMMARY.into(),
+                user_agent: None,
+                opening_authority: admission.opening_authority,
+            },
+        )
+        .await
+        .unwrap();
+    let successor_id = intent.unwrap().successor_conversation_id;
+    f.db.advance_automatic_continuation(
+        &f.predecessor,
+        AutomaticContinuationPhase::SuccessorReserved,
+    )
+    .await
+    .unwrap();
+    let recovered =
+        f.db.automatic_continuation_admission(&f.predecessor)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        recovered.phase,
+        AutomaticContinuationPhase::SuccessorReserved
+    );
+    f.runtime.get_or_create(&f.predecessor).await.unwrap();
+    let mut updates = f.runtime.subscribe(&f.predecessor).await.unwrap();
+
+    assert!(f
+        .service()
+        .drive_admission(&recovered)
+        .await
+        .expect("reserved recovery dispatches without repeating reservation capacity review"));
+    assert_eq!(
+        f.db.automatic_continuation_admission(&f.predecessor)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        AutomaticContinuationPhase::DispatchAccepted
+    );
+    assert_eq!(
+        f.db.chain_members_forward(&f.predecessor)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let mut links = Vec::new();
+    while let Ok(event) = updates.try_recv() {
+        if let crate::runtime::SseEvent::ConversationUpdate { update, .. } = event {
+            links.extend(update.continued_in_conv_id);
+        }
+    }
+    assert!(
+        links.contains(&successor_id),
+        "recovered reservation must notify predecessor subscribers"
+    );
+}
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn failed_automatic_retry_rearms_terminal_unmaterialized_turn_without_replacing_identity() {
+    use phoenix_core::domain::product_conversation::{
+        AutoContinueOnContextExhaustion, AutomaticContinuationPhase,
+    };
+    use phoenix_core::domain::sm_state::ContinuationSummaryRequest;
+
+    let provider = Arc::new(OpeningProvider {
+        entered: tokio::sync::Notify::new(),
+    });
+    let registry = Arc::new(phoenix_llm::ModelRegistry::for_test_with_sonnet(provider));
+    let f = Fixture::with_registry(registry).await;
+    let predecessor = f.db.get_conversation(&f.predecessor).await.unwrap();
+    f.db.set_auto_continue_on_context_exhaustion(
+        &predecessor.product_conversation_id,
+        AutoContinueOnContextExhaustion::Enabled,
+    )
+    .await
+    .unwrap();
+
+    let operation_id = "failed-terminal-unmaterialized-retry";
+    f.db.update_conversation_state(
+        &f.predecessor,
+        &ConvState::AwaitingContinuation {
+            request: ContinuationSummaryRequest {
+                operation_id: operation_id.into(),
+                rejected_tool_calls: Vec::new(),
+                attempt: 1,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let mut summary =
+        f.db.get_messages(&f.predecessor)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+    summary.message_id = "terminal-retry-summary-message".into();
+    summary.sequence_id += 1;
+    assert_eq!(
+        f.db.commit_continuation(
+            &f.predecessor,
+            operation_id,
+            &summary,
+            &ConvState::ContextExhausted {
+                summary: SUMMARY.into(),
+            },
+            summary.created_at,
+        )
+        .await
+        .unwrap(),
+        phoenix_db::ContinuationCommitOutcome::Applied
+    );
+    let admission =
+        f.db.automatic_continuation_admission(&f.predecessor)
+            .await
+            .unwrap()
+            .unwrap();
+    let user_agent = "phoenix-automatic-continuation";
+    let saved_handoff = "Short generated winner.";
+    assert_ne!(saved_handoff, SUMMARY);
+    let (_, intent) =
+        f.db.continue_conversation_with_intent(
+            &f.predecessor,
+            phoenix_db::NewContinuationDispatchIntent {
+                message_id: admission.first_message_id.clone(),
+                handoff: saved_handoff.into(),
+                user_agent: Some(user_agent.into()),
+                opening_authority: admission.opening_authority,
+            },
+        )
+        .await
+        .unwrap();
+    let intent = intent.unwrap();
+    let successor_id = intent.successor_conversation_id.clone();
+    f.db.advance_automatic_continuation(
+        &f.predecessor,
+        AutomaticContinuationPhase::SuccessorReserved,
+    )
+    .await
+    .unwrap();
+
+    let send_chat =
+        crate::send_chat_service::SendChatApplicationService::new(f.db.clone(), f.runtime.clone());
+    assert!(matches!(
+        send_chat
+            .send(crate::send_chat_service::SendChatRequest {
+                conversation_id: successor_id.clone(),
+                origin: InputOrigin::SystemGenerated,
+                text: saved_handoff.into(),
+                message_id: admission.first_message_id.as_str().into(),
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: Some(user_agent.into()),
+                expansion_policy:
+                    crate::send_chat_service::MessageExpansionPolicy::GeneratedPredecessorContext,
+            })
+            .await
+            .unwrap(),
+        crate::send_chat_service::SendChatOutcome::Delivered
+    ));
+    f.db.advance_automatic_continuation(
+        &f.predecessor,
+        AutomaticContinuationPhase::OwnershipTransferred,
+    )
+    .await
+    .unwrap();
+    f.db.advance_automatic_continuation(
+        &f.predecessor,
+        AutomaticContinuationPhase::DispatchAccepted,
+    )
+    .await
+    .unwrap();
+
+    let repo = f.db.workflow_repository();
+    let authority = phoenix_workflow::ConversationAuthority(successor_id.clone());
+    let accepted = repo
+        .load_owning_authoritative_turn(&authority)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(accepted.owns_conversation());
+    assert_eq!(
+        accepted.materialization,
+        phoenix_workflow::Materialization::Unmaterialized
+    );
+    let turn_id = accepted.id;
+    let original_generation = accepted.generation;
+    let original_key = accepted.client_key.clone();
+    let original_prepared = accepted.prepared.clone();
+    repo.terminate_authoritative_turn(phoenix_workflow::TurnCommand::Cancel {
+        turn_id,
+        expected_generation: original_generation,
+    })
+    .await
+    .unwrap();
+    let terminal = repo
+        .load_authoritative_turn(turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        terminal.lifecycle,
+        phoenix_workflow::TurnLifecycle::Terminal { .. }
+    ));
+    assert!(!terminal.owns_conversation());
+    assert_eq!(terminal.generation, original_generation + 1);
+    assert_eq!(
+        terminal.materialization,
+        phoenix_workflow::Materialization::Unmaterialized
+    );
+    assert!(repo
+        .load_owning_authoritative_turn(&authority)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        f.db.get_conversation(&successor_id).await.unwrap().state,
+        ConvState::Idle
+    ));
+
+    for _ in 0..phoenix_db::AutomaticContinuationAdmission::MAX_NO_PROGRESS_ATTEMPTS {
+        f.db.record_automatic_continuation_no_progress(
+            &f.predecessor,
+            "synthetic terminal unmaterialized fixture failure",
+        )
+        .await
+        .unwrap();
+    }
+    let failed =
+        f.db.automatic_continuation_admission(&f.predecessor)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(failed.phase, AutomaticContinuationPhase::Failed);
+    assert_eq!(
+        failed.resume_phase,
+        AutomaticContinuationPhase::DispatchAccepted
+    );
+    assert_eq!(
+        failed.no_progress_attempts,
+        phoenix_db::AutomaticContinuationAdmission::MAX_NO_PROGRESS_ATTEMPTS
+    );
+    assert!(failed.last_error.is_some());
+    let persisted_intent =
+        f.db.continuation_dispatch_intent(&f.predecessor)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(persisted_intent.message_id, intent.message_id);
+    assert_eq!(persisted_intent.handoff, intent.handoff);
+    assert_eq!(persisted_intent.user_agent.as_deref(), Some(user_agent));
+    assert_eq!(persisted_intent.opening_authority, intent.opening_authority);
+    assert_eq!(persisted_intent.successor_conversation_id, successor_id);
+    assert!(f.db.get_messages(&successor_id).await.unwrap().is_empty());
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        f.service().retry_pending_opening(&f.predecessor),
+    )
+    .await
+    .expect("automatic failed-opening retry must not deadlock")
+    .expect("failed automatic opening retry succeeds for its accepted reservation");
+    assert_eq!(response.conversation_id, successor_id);
+    assert_eq!(response.status, ContinueConversationStatus::AlreadyExists);
+    assert!(response.error.is_none());
+
+    let rearmed = repo
+        .load_owning_authoritative_turn(&authority)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rearmed.id, turn_id);
+    assert_eq!(rearmed.client_key, original_key);
+    assert_eq!(rearmed.prepared, original_prepared);
+    assert_eq!(rearmed.generation, terminal.generation + 1);
+    assert!(rearmed.owns_conversation());
+    assert_eq!(
+        rearmed.materialization,
+        phoenix_workflow::Materialization::Unmaterialized
+    );
+
+    let retried =
+        f.db.automatic_continuation_admission(&f.predecessor)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(retried.phase, AutomaticContinuationPhase::DispatchAccepted);
+    assert_eq!(
+        retried.resume_phase,
+        AutomaticContinuationPhase::DispatchAccepted
+    );
+    assert_eq!(retried.no_progress_attempts, 0);
+    assert_eq!(retried.last_error, None);
+    assert_eq!(retried.first_message_id, admission.first_message_id);
+    assert_eq!(retried.opening_authority, admission.opening_authority);
+    let retained_intent =
+        f.db.continuation_dispatch_intent(&f.predecessor)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(retained_intent.successor_conversation_id, successor_id);
+    assert_eq!(retained_intent.message_id, intent.message_id);
+    assert_eq!(retained_intent.opening_authority, intent.opening_authority);
+    assert_eq!(retained_intent.handoff, intent.handoff);
+    assert_eq!(retained_intent.user_agent, intent.user_agent);
+    assert_eq!(
+        f.db.chain_members_forward(&f.predecessor)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(f.db.get_messages(&successor_id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn saved_opening_retry_requires_capacity_and_retains_generated_intent_and_successor() {
+    let f = Fixture::new().await;
+    let original = f.reserve().await;
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        f.service().retry_pending_opening(&f.predecessor),
+    )
+    .await
+    .expect("saved opening capacity review must not reacquire the predecessor mutation lock")
+    .expect_err("unknown successor capacity must withhold the generated opening");
+    assert!(
+        matches!(error, crate::api::handlers::AppError::BadRequest(ref message)
+            if message.contains("unavailable through its selected connection")),
+        "{error:?}"
+    );
+    assert!(f
+        .db
+        .get_messages(&original.successor_conversation_id)
+        .await
+        .unwrap()
+        .is_empty());
+    let retained =
+        f.db.continuation_dispatch_intent(&f.predecessor)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(retained.message_id, original.message_id);
+    assert_eq!(retained.handoff, original.handoff);
+    assert_eq!(retained.opening_authority, original.opening_authority);
+    assert_eq!(
+        retained.successor_conversation_id,
+        original.successor_conversation_id
+    );
+    assert_eq!(
+        f.db.chain_members_forward(&f.predecessor)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn generated_saved_opening_with_user_agent_retries_under_generated_authority() {
+    let provider = Arc::new(OpeningProvider {
+        entered: tokio::sync::Notify::new(),
+    });
+    let registry = Arc::new(phoenix_llm::ModelRegistry::for_test_with_sonnet(
+        provider.clone(),
+    ));
+    let f = Fixture::with_registry(registry).await;
+    f.runtime
+        .start_direct_turn_worker()
+        .await
+        .expect("pending opening fixture direct-turn worker startup");
+
+    let key = "generated-saved-opening";
+    let handoff = "Short saved generated context.";
+    let user_agent = "saved-client-agent";
+    let (outcome, intent) =
+        f.db.continue_conversation_with_intent(
+            &f.predecessor,
+            phoenix_db::NewContinuationDispatchIntent {
+                message_id: ClientTurnKey::try_from(key).unwrap(),
+                handoff: handoff.into(),
+                user_agent: Some(user_agent.into()),
+                opening_authority: ContinuationOpeningAuthority::GeneratedPredecessorContext,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, ContinueOutcome::Created(_)));
+    let intent = intent.expect("new generated opening is reserved durably");
+    assert_eq!(intent.message_id.as_str(), key);
+    assert_eq!(intent.handoff, handoff);
+    assert_eq!(intent.user_agent.as_deref(), Some(user_agent));
+    assert_eq!(
+        intent.opening_authority,
+        ContinuationOpeningAuthority::GeneratedPredecessorContext
+    );
+    let successor_id = intent.successor_conversation_id.clone();
+
+    let persisted =
+        f.db.continuation_dispatch_intent(&f.predecessor)
+            .await
+            .unwrap()
+            .expect("reserved opening metadata remains persisted before retry");
+    assert_eq!(persisted.message_id.as_str(), key);
+    assert_eq!(persisted.handoff, handoff);
+    assert_eq!(persisted.user_agent.as_deref(), Some(user_agent));
+    assert_eq!(
+        persisted.opening_authority,
+        ContinuationOpeningAuthority::GeneratedPredecessorContext
+    );
+    assert_eq!(persisted.successor_conversation_id, successor_id);
+
+    let response = f
+        .service()
+        .retry_pending_opening(&f.predecessor)
+        .await
+        .expect("saved generated opening metadata must not invalidate its authority");
+    assert_eq!(response.conversation_id, successor_id);
+    assert_eq!(response.status, ContinueConversationStatus::AlreadyExists);
+    assert!(response.error.is_none());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        provider.entered.notified(),
+    )
+    .await
+    .expect("provider entry follows durable generated opening dispatch");
+
+    let messages = f.db.get_messages(&successor_id).await.unwrap();
+    let openings: Vec<_> = messages
+        .iter()
+        .filter(|message| matches!(message.content, MessageContent::Continuation(_)))
+        .collect();
+    assert_eq!(openings.len(), 1);
+    assert_eq!(openings[0].message_id, format!("{successor_id}:{key}"));
+    assert!(matches!(openings[0].origin, InputOrigin::SystemGenerated));
+    assert!(f
+        .db
+        .continuation_dispatch_intent(&f.predecessor)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+async fn automatic_admission_with_committed_summary(
+    f: &Fixture,
+) -> phoenix_db::AutomaticContinuationAdmission {
+    use phoenix_core::domain::product_conversation::AutoContinueOnContextExhaustion;
+    use phoenix_core::domain::sm_state::ContinuationSummaryRequest;
+
+    f.db.set_auto_continue_on_context_exhaustion(
+        &f.product,
+        AutoContinueOnContextExhaustion::Enabled,
+    )
+    .await
+    .unwrap();
+    let operation_id = "differing-key-recovery-summary";
+    f.db.update_conversation_state(
+        &f.predecessor,
+        &ConvState::AwaitingContinuation {
+            request: ContinuationSummaryRequest {
+                operation_id: operation_id.into(),
+                rejected_tool_calls: Vec::new(),
+                attempt: 1,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let mut summary =
+        f.db.get_messages(&f.predecessor)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+    summary.message_id = "differing-key-recovery-summary-message".into();
+    summary.sequence_id += 1;
+    assert_eq!(
+        f.db.commit_continuation(
+            &f.predecessor,
+            operation_id,
+            &summary,
+            &ConvState::ContextExhausted {
+                summary: SUMMARY.into(),
+            },
+            summary.created_at,
+        )
+        .await
+        .unwrap(),
+        phoenix_db::ContinuationCommitOutcome::Applied
+    );
+    f.db.automatic_continuation_admission(&f.predecessor)
+        .await
+        .unwrap()
+        .expect("committed summary and enabled preference admit recovery")
+}
+
+#[tokio::test]
+async fn recovery_dispatch_uses_persisted_generated_authority_for_differing_key_winner() {
+    use phoenix_core::domain::product_conversation::{
+        AutomaticContinuationPhase, ContinuationOpeningAuthority,
+    };
+    use phoenix_core::domain::sm_event::{
+        PreparedDirectTurnPayload, SubmittedDirectTurnExpansionPolicy,
+    };
+    use phoenix_workflow::{ConversationAuthority, Materialization};
+
+    let registry = Arc::new(phoenix_llm::ModelRegistry::for_test_with_sonnet(Arc::new(
+        OpeningProvider {
+            entered: tokio::sync::Notify::new(),
+        },
+    )));
+    let f = Fixture::with_registry(registry).await;
+    let admission = automatic_admission_with_committed_summary(&f).await;
+    let winner_key = "persisted-generated-winner";
+    let winner_text = "Generated winner's exact handoff.";
+    assert_ne!(winner_key, admission.first_message_id.as_str());
+    let (_, reserved) =
+        f.db.continue_conversation_with_intent(
+            &f.predecessor,
+            phoenix_db::NewContinuationDispatchIntent {
+                message_id: ClientTurnKey::try_from(winner_key).unwrap(),
+                handoff: winner_text.into(),
+                user_agent: Some("persisted-winner-test".into()),
+                opening_authority: ContinuationOpeningAuthority::GeneratedPredecessorContext,
+            },
+        )
+        .await
+        .unwrap();
+    let reserved = reserved.expect("the differing-key winner is durably reserved");
+    let successor_id = reserved.successor_conversation_id;
+
+    assert!(crate::continuation_service::drain_automatic_continuations(f.runtime.clone()).await);
+    assert_eq!(
+        f.db.automatic_continuation_admission(&f.predecessor)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        AutomaticContinuationPhase::SuccessorReserved
+    );
+    assert!(crate::continuation_service::drain_automatic_continuations(f.runtime.clone()).await);
+
+    assert!(f.db.get_messages(&successor_id).await.unwrap().is_empty());
+    let retained =
+        f.db.continuation_dispatch_intent(&f.predecessor)
+            .await
+            .unwrap()
+            .expect("the accepted opening intent remains unmaterialized");
+    assert_eq!(retained.message_id.as_str(), winner_key);
+    assert_eq!(retained.handoff, winner_text);
+    assert_eq!(
+        retained.opening_authority,
+        ContinuationOpeningAuthority::GeneratedPredecessorContext
+    );
+    assert_eq!(retained.successor_conversation_id, successor_id);
+    assert_eq!(
+        f.db.chain_members_forward(&f.predecessor)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        f.db.automatic_continuation_admission(&f.predecessor)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        AutomaticContinuationPhase::SuccessorReserved
+    );
+
+    let turn =
+        f.db.workflow_repository()
+            .load_owning_authoritative_turn(&ConversationAuthority(successor_id))
+            .await
+            .unwrap()
+            .expect("the accepted opening owns the successor turn");
+    assert_eq!(turn.client_key.as_str(), winner_key);
+    assert_eq!(turn.materialization, Materialization::Unmaterialized);
+    let prepared = PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload()).unwrap();
+    assert_eq!(prepared.submitted.message_id, winner_key);
+    assert_eq!(prepared.submitted.text, winner_text);
+    assert_eq!(prepared.submitted.origin, InputOrigin::SystemGenerated);
+    assert_eq!(
+        prepared.submitted.expansion_policy,
+        SubmittedDirectTurnExpansionPolicy::GeneratedPredecessorContext
+    );
+    assert_eq!(prepared.delivery.text, winner_text);
+    assert_eq!(
+        prepared.delivery.llm_text,
+        Some(crate::send_chat_service::generated_predecessor_context_projection(winner_text))
+    );
+    assert_eq!(
+        retained.user_agent.as_deref(),
+        Some("persisted-winner-test")
+    );
+}
+
+#[tokio::test]
+async fn recovery_dispatch_keeps_differing_key_literal_winner_literal() {
+    use phoenix_core::domain::product_conversation::{
+        AutomaticContinuationPhase, ContinuationOpeningAuthority,
+    };
+    use phoenix_core::domain::sm_event::{
+        PreparedDirectTurnPayload, SubmittedDirectTurnExpansionPolicy,
+    };
+    use phoenix_workflow::{ConversationAuthority, Materialization};
+
+    let registry = Arc::new(phoenix_llm::ModelRegistry::for_test_with_sonnet(Arc::new(
+        OpeningProvider {
+            entered: tokio::sync::Notify::new(),
+        },
+    )));
+    let f = Fixture::with_registry(registry).await;
+    let admission = automatic_admission_with_committed_summary(&f).await;
+    let winner_key = "persisted-literal-winner";
+    let winner_text = "Literal user's exact instruction.";
+    assert_ne!(winner_key, admission.first_message_id.as_str());
+    let (_, reserved) =
+        f.db.continue_conversation_with_intent(
+            &f.predecessor,
+            phoenix_db::NewContinuationDispatchIntent {
+                message_id: ClientTurnKey::try_from(winner_key).unwrap(),
+                handoff: winner_text.into(),
+                user_agent: None,
+                opening_authority: ContinuationOpeningAuthority::UserAuthorizedInstruction,
+            },
+        )
+        .await
+        .unwrap();
+    let reserved = reserved.expect("the differing-key literal winner is durably reserved");
+    let successor_id = reserved.successor_conversation_id;
+
+    assert!(crate::continuation_service::drain_automatic_continuations(f.runtime.clone()).await);
+    assert_eq!(
+        f.db.automatic_continuation_admission(&f.predecessor)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        AutomaticContinuationPhase::SuccessorReserved
+    );
+    assert!(crate::continuation_service::drain_automatic_continuations(f.runtime.clone()).await);
+
+    assert!(f.db.get_messages(&successor_id).await.unwrap().is_empty());
+    let retained =
+        f.db.continuation_dispatch_intent(&f.predecessor)
+            .await
+            .unwrap()
+            .expect("the accepted opening intent remains unmaterialized");
+    assert_eq!(retained.message_id.as_str(), winner_key);
+    assert_eq!(retained.handoff, winner_text);
+    assert_eq!(
+        retained.opening_authority,
+        ContinuationOpeningAuthority::UserAuthorizedInstruction
+    );
+    assert_eq!(retained.successor_conversation_id, successor_id);
+    assert_eq!(
+        f.db.chain_members_forward(&f.predecessor)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        f.db.automatic_continuation_admission(&f.predecessor)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        AutomaticContinuationPhase::SuccessorReserved
+    );
+
+    let turn =
+        f.db.workflow_repository()
+            .load_owning_authoritative_turn(&ConversationAuthority(successor_id))
+            .await
+            .unwrap()
+            .expect("the accepted opening owns the successor turn");
+    assert_eq!(turn.client_key.as_str(), winner_key);
+    assert_eq!(turn.materialization, Materialization::Unmaterialized);
+    let prepared = PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload()).unwrap();
+    assert_eq!(prepared.submitted.message_id, winner_key);
+    assert_eq!(prepared.submitted.text, winner_text);
+    assert_eq!(prepared.submitted.origin, InputOrigin::UserApi);
+    assert_eq!(
+        prepared.submitted.expansion_policy,
+        SubmittedDirectTurnExpansionPolicy::LiteralText
+    );
+    assert_eq!(prepared.delivery.text, winner_text);
+    assert_eq!(prepared.delivery.llm_text, None);
 }
 
 #[tokio::test]
@@ -444,6 +1264,8 @@ async fn completed_generated_opening_replays_without_a_provider_or_new_successor
 async fn pending_replay_requires_current_successor_capacity_and_retains_winning_intent() {
     let f = Fixture::new().await;
     let intent = f.reserve().await;
+    f.runtime.get_or_create(&f.predecessor).await.unwrap();
+    let mut predecessor_events = f.runtime.subscribe(&f.predecessor).await.unwrap();
     let error = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         f.service()
@@ -472,6 +1294,18 @@ async fn pending_replay_requires_current_successor_capacity_and_retains_winning_
         pending.opening_authority,
         ContinuationOpeningAuthority::GeneratedPredecessorContext
     );
+    let mut links = Vec::new();
+    while let Ok(event) = predecessor_events.try_recv() {
+        if let crate::runtime::SseEvent::ConversationUpdate { update, .. } = event {
+            links.extend(update.continued_in_conv_id);
+        }
+    }
+    assert_eq!(links, vec![intent.successor_conversation_id.clone()]);
+    assert!(f
+        .db
+        .has_pending_continuation_opening(&intent.successor_conversation_id)
+        .await
+        .unwrap());
     assert!(pending.user_agent.is_none());
     assert!(f
         .db
@@ -598,6 +1432,8 @@ async fn fresh_concurrent_requests_dispatch_one_opening_through_exact_turn_settl
         .await;
     let (left_waiting, left_wait) = oneshot::channel();
     let (right_waiting, right_wait) = oneshot::channel();
+    f.runtime.get_or_create(&f.predecessor).await.unwrap();
+    let mut predecessor_events = f.runtime.subscribe(&f.predecessor).await.unwrap();
     let mut left_request = f.request("fresh-concurrent-left");
     left_request.source_gate_wait = Some(left_waiting);
     let mut right_request = f.request("fresh-concurrent-right");
@@ -640,6 +1476,28 @@ async fn fresh_concurrent_requests_dispatch_one_opening_through_exact_turn_settl
     assert!(created.error.is_none());
     assert!(replayed.error.is_none());
     let successor_id = &created.conversation_id;
+    let mut published_links = Vec::new();
+    while let Ok(event) = predecessor_events.try_recv() {
+        if let SseEvent::ConversationUpdate { update, .. } = event {
+            if let Some(link) = update.continued_in_conv_id {
+                published_links.push(link);
+            }
+        }
+    }
+    assert!(
+        !published_links.is_empty(),
+        "connected predecessor must learn the committed continuation without reconnect"
+    );
+    assert!(published_links.iter().all(|link| link == successor_id));
+    assert_eq!(
+        f.db.get_conversation(&f.predecessor)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .as_ref(),
+        Some(successor_id)
+    );
+
     let provider_conversation =
         tokio::time::timeout(std::time::Duration::from_secs(30), entered.recv())
             .await

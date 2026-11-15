@@ -1,0 +1,24 @@
+{
+  "viewport": {
+    "name": "mobile",
+    "width": 393,
+    "height": 852,
+    "hasTouch": true,
+    "isMobile": true
+  },
+  "readEvidence": {
+    "contentGap": 14,
+    "toolbarPresent": false,
+    "input": "{\n  \"target\": {\n    \"kind\": \"ordinary\",\n    \"product_conversation_id\": \"fixture-review\"\n  }\n}",
+    "output": "{\"aggregate\":{\"kind\":\"ordinary\",\"product_conversation_id\":\"fixture-review\"},\"auto_continue_on_context_exhaustion\":false}",
+    "clientWidth": 393,
+    "scrollWidth": 393
+  },
+  "copiedRead": {
+    "aggregate": {
+      "kind": "ordinary",
+      "product_conversation_id": "fixture-review"
+    },
+    "auto_continue_on_context_exhaustion": false
+  }
+}

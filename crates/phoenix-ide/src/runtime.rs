@@ -416,6 +416,20 @@ mod conversation_mutex_gate_tests {
 
         assert!(conversation_b.try_lock_owned().is_ok());
     }
+
+    #[tokio::test]
+    async fn remote_goal_apply_gate_serializes_per_reference_only() {
+        let gates = ConversationMutexGates::default();
+        let reference_a = uuid::Uuid::new_v4();
+        let reference_b = uuid::Uuid::new_v4();
+        let first_a = gates.gate_for(&reference_a.to_string()).await;
+        let duplicate_a = gates.gate_for(&reference_a.to_string()).await;
+        let independent_b = gates.gate_for(&reference_b.to_string()).await;
+
+        let _claimed_without_receipt = first_a.lock_owned().await;
+        assert!(duplicate_a.try_lock_owned().is_err());
+        assert!(independent_b.try_lock_owned().is_ok());
+    }
 }
 
 type RuntimeMaterializationResult = Result<ConversationHandle, String>;
@@ -773,6 +787,9 @@ pub struct RuntimeManager {
     /// conversations independent.
     message_acceptance: ConversationMutexGates,
     product_message_admission: ConversationMutexGates,
+    remote_goal_apply: ConversationMutexGates,
+    #[cfg(test)]
+    remote_goal_apply_arrivals: AsyncMutex<HashMap<uuid::Uuid, Arc<Notify>>>,
     /// Serializes the final durable queue snapshot and executor publication
     /// with queue mutations. The database remains authoritative; this gate
     /// only prevents a newly-started executor from observing an older snapshot.
@@ -847,8 +864,6 @@ pub(crate) enum DatabaseTerminalRecovery {
     AlreadyCommitted,
     Committed {
         projection: Box<phoenix_db::workflow::PersistedConversationProjection>,
-        is_sub_agent: bool,
-        worktree_path: Option<std::path::PathBuf>,
     },
 }
 
@@ -1934,6 +1949,8 @@ pub struct ConversationMetadataUpdate {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archived: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continued_in_conv_id: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2447,6 +2464,28 @@ pub(crate) async fn conversation_retains_work_scope(
     ))
 }
 
+pub(crate) async fn conversation_retains_work_scope_for_reclamation(
+    db: &crate::db::Database,
+    conv: &crate::db::Conversation,
+) -> Result<bool, crate::db::DbError> {
+    match db.message_target_admission(&conv.id).await? {
+        crate::db::MessageTargetAdmission::Aggregate(
+            crate::db::ProductConversationAdmission::Accepted { .. }
+            | crate::db::ProductConversationAdmission::Refused(_),
+        ) => Ok(true),
+        crate::db::MessageTargetAdmission::Aggregate(
+            crate::db::ProductConversationAdmission::History(product_conversation_id),
+        ) => Ok(db
+            .get_active_close_projection_for_product(&product_conversation_id)
+            .await?
+            .is_some()),
+        crate::db::MessageTargetAdmission::StandaloneAvailable
+        | crate::db::MessageTargetAdmission::StandaloneArchived => {
+            Ok(conversation_attachment_retains_work_scope(conv))
+        }
+    }
+}
+
 fn conversation_resource_scope(conv: &crate::db::Conversation) -> Option<ResourceScopeKey> {
     if conv.runtime_role == crate::work_scope::RuntimeRole::Coordinator {
         return Some(ResourceScopeKey::Coordinator);
@@ -2663,6 +2702,9 @@ impl RuntimeManager {
             fatal_runtime_map_barrier: AsyncMutex::new(None),
             message_acceptance: ConversationMutexGates::default(),
             product_message_admission: ConversationMutexGates::default(),
+            remote_goal_apply: ConversationMutexGates::default(),
+            #[cfg(test)]
+            remote_goal_apply_arrivals: AsyncMutex::new(HashMap::new()),
             steering_projection: ConversationMutexGates::default(),
             evicted_broadcasters: RwLock::new(HashMap::new()),
             aggregate_event_tx,
@@ -3808,6 +3850,11 @@ impl RuntimeManager {
     #[cfg(test)]
     pub(crate) fn fatal_authority_owners_at_first_close(&self) -> Option<usize> {
         self.fatal_local_authority_fence.owners_at_first_close()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fatal_authority_owner_count(&self) -> usize {
+        self.fatal_local_authority_fence.owner_count()
     }
 
     #[cfg(test)]
@@ -5488,12 +5535,7 @@ impl RuntimeManager {
         conversation_id: &str,
         recovery: DatabaseTerminalRecovery,
     ) {
-        let DatabaseTerminalRecovery::Committed {
-            projection,
-            is_sub_agent,
-            worktree_path,
-        } = recovery
-        else {
+        let DatabaseTerminalRecovery::Committed { projection } = recovery else {
             return;
         };
         if !projection.state.is_terminal() {
@@ -5522,9 +5564,6 @@ impl RuntimeManager {
             });
             executor::emit_terminal_lifecycle_event(
                 conversation_id,
-                is_sub_agent,
-                &projection.state,
-                worktree_path.as_deref(),
                 Some(&self.fork_cmd_tx),
                 &broadcaster,
             )
@@ -5532,9 +5571,6 @@ impl RuntimeManager {
         } else {
             executor::complete_terminal_lifecycle_without_broadcast(
                 conversation_id,
-                is_sub_agent,
-                &projection.state,
-                worktree_path.as_deref(),
                 Some(&self.fork_cmd_tx),
             )
             .await;
@@ -5569,7 +5605,7 @@ impl RuntimeManager {
                 Ok(child) => child,
                 Err(crate::db::DbError::ConversationNotFound(_)) => continue,
                 Err(error) => {
-                    return Err(DatabaseTerminalRecoveryError::Retryable(error.to_string()))
+                    return Err(DatabaseTerminalRecoveryError::Retryable(error.to_string()));
                 }
             };
             if child.runtime_role == crate::work_scope::RuntimeRole::SubAgent
@@ -5616,12 +5652,6 @@ impl RuntimeManager {
             };
             executor::complete_terminal_lifecycle_without_broadcast(
                 &conversation.id,
-                conversation.parent_conversation_id.is_some(),
-                &conversation.state,
-                conversation
-                    .conv_mode
-                    .worktree_path()
-                    .map(std::path::Path::new),
                 Some(&self.fork_cmd_tx),
             )
             .await;
@@ -5726,9 +5756,6 @@ impl RuntimeManager {
                             }
                             executor::complete_terminal_lifecycle_without_broadcast(
                                 &conversation_id,
-                                false,
-                                &projection.state,
-                                Some(std::path::Path::new(&projection.cwd)),
                                 Some(&self.fork_cmd_tx),
                             )
                             .await;
@@ -5860,11 +5887,6 @@ impl RuntimeManager {
                 ))
             })?;
         let parent_conversation_id = conversation.parent_conversation_id.clone();
-        let is_sub_agent = parent_conversation_id.is_some();
-        let worktree_path = conversation
-            .conv_mode
-            .worktree_path()
-            .map(std::path::PathBuf::from);
         let command = match obligation.terminal {
             phoenix_workflow::TurnTerminal::Completed => phoenix_workflow::TurnCommand::Complete {
                 turn_id: obligation.turn_id,
@@ -5912,8 +5934,6 @@ impl RuntimeManager {
                 }
                 Ok(DatabaseTerminalRecovery::Committed {
                     projection: Box::new(projection),
-                    is_sub_agent,
-                    worktree_path,
                 })
             }
             Err(settlement_error) => {
@@ -5946,8 +5966,6 @@ impl RuntimeManager {
                     phoenix_db::workflow::TerminalProjectionProbe::Current => {
                         Ok(DatabaseTerminalRecovery::Committed {
                             projection: Box::new(projection),
-                            is_sub_agent,
-                            worktree_path,
                         })
                     }
                     phoenix_db::workflow::TerminalProjectionProbe::Superseded => {
@@ -6938,6 +6956,39 @@ impl RuntimeManager {
         }
     }
 
+    pub(crate) async fn lock_remote_goal_apply(
+        &self,
+        action_reference: uuid::Uuid,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = self
+            .remote_goal_apply
+            .gate_for(&action_reference.to_string())
+            .await;
+        #[cfg(test)]
+        if let Some(arrival) = self
+            .remote_goal_apply_arrivals
+            .lock()
+            .await
+            .remove(&action_reference)
+        {
+            arrival.notify_one();
+        }
+        gate.lock_owned().await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn observe_next_remote_goal_apply_gate_arrival(
+        &self,
+        action_reference: uuid::Uuid,
+    ) -> Arc<Notify> {
+        let arrival = Arc::new(Notify::new());
+        self.remote_goal_apply_arrivals
+            .lock()
+            .await
+            .insert(action_reference, arrival.clone());
+        arrival
+    }
+
     pub(crate) async fn lock_message_acceptance(
         &self,
         conversation_id: &str,
@@ -7652,14 +7703,59 @@ impl RuntimeManager {
         &self,
         conversation_id: &str,
     ) -> Option<SseBroadcaster> {
-        if let Some(handle) = self.try_get_handle(conversation_id).await {
-            return Some(handle.broadcast_tx);
+        let runtimes = self.runtimes.read().await;
+        if let Some(handle) = runtimes.get(conversation_id) {
+            return Some(handle.broadcast_tx.clone());
         }
         self.evicted_broadcasters
             .read()
             .await
             .get(conversation_id)
             .cloned()
+    }
+
+    pub(crate) async fn publish_continuation_link(&self, predecessor_id: &str, successor_id: &str) {
+        let Ok(mut admitted) = self.acquire_local_authority_pass() else {
+            tracing::debug!(
+                predecessor_id,
+                successor_id,
+                "continuation link live publication skipped after authority closed"
+            );
+            return;
+        };
+        let Some(broadcaster) = self.existing_conversation_broadcaster(predecessor_id).await else {
+            return;
+        };
+        if broadcaster
+            .admitted_publication(&mut admitted)
+            .event(|sequence_id| SseEvent::ConversationUpdate {
+                sequence_id,
+                update: ConversationMetadataUpdate {
+                    slug: None,
+                    title: None,
+                    cwd: None,
+                    project_id: None,
+                    project_name: None,
+                    updated_at: None,
+                    branch_name: None,
+                    worktree_path: None,
+                    conv_mode_label: None,
+                    base_branch: None,
+                    task_title: None,
+                    work_scope_key: None,
+                    model: None,
+                    archived: None,
+                    continued_in_conv_id: Some(successor_id.to_string()),
+                },
+            })
+            .is_err()
+        {
+            tracing::debug!(
+                predecessor_id,
+                successor_id,
+                "continuation link live publication was rejected"
+            );
+        }
     }
 
     /// Remove and return the evicted broadcaster for `conversation_id`, if any.
@@ -14393,6 +14489,14 @@ mod scope_liveness_tests {
         let mut receiver = first.subscribe();
         let second = mgr.conversation_broadcaster("invalid-cwd-shell").await;
 
+        mgr.publish_continuation_link("invalid-cwd-shell", "successor")
+            .await;
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            SseEvent::ConversationUpdate { update, .. }
+                if update.continued_in_conv_id.as_deref() == Some("successor")
+        ));
+
         let idle = ConvState::Idle;
         second
             .send_seq(|seq| SseEvent::StateChange {
@@ -14409,6 +14513,23 @@ mod scope_liveness_tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn existing_broadcaster_lookup_holds_materialization_fence() {
+        let mgr = test_manager().await;
+        let first = mgr.conversation_broadcaster("lookup-fence").await;
+        let reservations = mgr.evicted_broadcasters.write().await;
+        let lookup = mgr.existing_conversation_broadcaster("lookup-fence");
+        tokio::pin!(lookup);
+        tokio::select! {
+            biased;
+            _ = &mut lookup => panic!("lookup must wait for reservations"),
+            () = std::future::ready(()) => {}
+        }
+        assert!(mgr.runtimes.try_write().is_err());
+        drop(reservations);
+        assert!(first.same_channel(&lookup.await.unwrap()));
     }
 
     #[tokio::test]
@@ -14955,8 +15076,6 @@ mod scope_liveness_tests {
                     state: ConvState::Idle,
                     state_updated_at: Utc::now(),
                 }),
-                is_sub_agent: false,
-                worktree_path: None,
             },
         )
         .await;

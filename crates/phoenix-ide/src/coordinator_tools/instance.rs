@@ -17,6 +17,18 @@ impl RemoteInstanceSelector {
     }
 }
 
+impl<'de> Deserialize<'de> for RemoteInstanceSelector {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let selector = String::deserialize(deserializer)?;
+        if selector.is_empty() || selector == "local" {
+            return Err(serde::de::Error::custom(
+                "expected a saved remote peer UUID or name, not local",
+            ));
+        }
+        Ok(Self(selector))
+    }
+}
+
 impl<'de> Deserialize<'de> for InstanceSelector {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let selector = String::deserialize(deserializer)?;
@@ -53,9 +65,16 @@ pub(crate) enum Route<T> {
     Remote(T),
 }
 
+#[derive(Clone, Copy)]
 pub(crate) enum PeerResolution {
     SavedUuidOrName,
     WatchUuidIdentity,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SelfPeerPolicy {
+    Allow,
+    Reject,
 }
 
 #[async_trait::async_trait]
@@ -66,16 +85,47 @@ pub(crate) trait RoutedTool: Send + Sync {
     fn nullable_instance(&self) -> bool {
         false
     }
+    fn local_authority_is_closed(&self) -> bool {
+        false
+    }
+    fn route_error(&self, error: String, _local: bool) -> ToolOutput {
+        ToolOutput::error(error)
+    }
     fn schema_without_instance(&self) -> Value;
     fn resolution_db(&self) -> &crate::db::Database;
     fn peer_resolution(&self) -> PeerResolution {
         PeerResolution::SavedUuidOrName
     }
+    fn self_peer_policy(&self) -> SelfPeerPolicy;
     async fn authorize(&self, _ctx: &ToolContext) -> Result<(), String> {
         Ok(())
     }
     fn validate_before_peer_lookup(&self, _input: &Value) -> Result<(), String> {
         Ok(())
+    }
+    async fn resolve_remote_peer(
+        &self,
+        selector: &RemoteInstanceSelector,
+    ) -> Result<crate::api::federation::ResolvedPeer, crate::api::federation::FederationClientError>
+    {
+        match self.self_peer_policy() {
+            SelfPeerPolicy::Allow => {
+                crate::api::federation::resolve_tool_peer_allow_self(
+                    self.resolution_db(),
+                    selector,
+                    self.peer_resolution(),
+                )
+                .await
+            }
+            SelfPeerPolicy::Reject => {
+                crate::api::federation::resolve_tool_peer_reject_self(
+                    self.resolution_db(),
+                    selector,
+                    self.peer_resolution(),
+                )
+                .await
+            }
+        }
     }
     async fn run_routed(
         &self,
@@ -119,46 +169,52 @@ impl<T: RoutedTool + 'static> Tool for RouteTool<T> {
         schema
     }
     async fn run(&self, mut input: Value, ctx: ToolContext) -> ToolOutput {
-        let selector = match input
-            .as_object_mut()
-            .and_then(|object| object.remove("instance"))
-        {
-            None => InstanceSelector::Local,
-            Some(Value::Null) if self.0.nullable_instance() => InstanceSelector::Local,
-            Some(Value::Null) => {
-                return ToolOutput::error(
-                    "invalid instance selector: expected a string".to_string(),
-                );
-            }
-            Some(value) => match serde_json::from_value::<InstanceSelector>(value) {
-                Ok(selector) => selector,
-                Err(error) => {
-                    return ToolOutput::error(format!("invalid instance selector: {error}"));
-                }
-            },
-        };
-        if let Err(error) = self.0.authorize(&ctx).await {
-            return ToolOutput::error(error);
+        if self.0.local_authority_is_closed() {
+            std::future::pending::<()>().await;
         }
-        let route = match selector {
-            InstanceSelector::Local => Route::Local,
-            InstanceSelector::Remote(selector) => {
-                if let Err(error) = self.0.validate_before_peer_lookup(&input) {
-                    return ToolOutput::error(error);
+        let result = async {
+            let selector = match input
+                .as_object_mut()
+                .and_then(|object| object.remove("instance"))
+            {
+                None => InstanceSelector::Local,
+                Some(Value::Null) if self.0.nullable_instance() => InstanceSelector::Local,
+                Some(Value::Null) => {
+                    return ToolOutput::error(
+                        "invalid instance selector: expected a string".to_string(),
+                    );
                 }
-                match crate::api::federation::resolve_tool_peer(
-                    self.0.resolution_db(),
-                    &selector,
-                    self.0.peer_resolution(),
-                )
-                .await
-                {
-                    Ok(peer) => Route::Remote(peer),
-                    Err(error) => return ToolOutput::error(error.to_string()),
-                }
+                Some(value) => match serde_json::from_value::<InstanceSelector>(value) {
+                    Ok(selector) => selector,
+                    Err(error) => {
+                        return ToolOutput::error(format!("invalid instance selector: {error}"));
+                    }
+                },
+            };
+            if let Err(error) = self.0.authorize(&ctx).await {
+                return self
+                    .0
+                    .route_error(error, matches!(selector, InstanceSelector::Local));
             }
-        };
-        self.0.run_routed(input, route, ctx).await
+            let route = match selector {
+                InstanceSelector::Local => Route::Local,
+                InstanceSelector::Remote(selector) => {
+                    if let Err(error) = self.0.validate_before_peer_lookup(&input) {
+                        return ToolOutput::error(error);
+                    }
+                    match self.0.resolve_remote_peer(&selector).await {
+                        Ok(peer) => Route::Remote(peer),
+                        Err(error) => return ToolOutput::error(error.to_string()),
+                    }
+                }
+            };
+            self.0.run_routed(input, route, ctx).await
+        }
+        .await;
+        if self.0.local_authority_is_closed() {
+            std::future::pending::<()>().await;
+        }
+        result
     }
 }
 

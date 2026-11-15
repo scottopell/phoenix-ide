@@ -12,3 +12,12 @@
 .tool-results-fixture-shell > .message {
   flex: none;
 }
+
+[data-tool-results-fixture] .fixture-toolbar {
+  flex-wrap: wrap;
+}
+
+[data-tool-results-fixture] .fixture-toolbar > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}

@@ -8,12 +8,13 @@ export type ToolResultsScenarioFamily =
   | 'media'
   | 'profiling'
   | 'grid'
-  | 'subagents';
+  | 'subagents'
+  | 'mobile-spacing';
 
 export interface ToolResultsFixtureData {
   conversationId: string;
   slug: string;
-  theme: 'dark';
+  theme: 'dark' | 'light';
   density: ToolResultsDensity;
   filePathRootDir: string;
   workScopeKey: string;
@@ -28,4 +29,5 @@ export interface ToolResultsScenario {
   description: string;
   density: ToolResultsDensity;
   family: ToolResultsScenarioFamily;
+  theme?: 'dark' | 'light';
 }

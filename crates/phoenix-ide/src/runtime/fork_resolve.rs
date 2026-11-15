@@ -1655,6 +1655,7 @@ fn map_db_resolve_error(e: DbError) -> ForkResolveError {
         | DbError::ProductConversationUnavailable(_)
         | DbError::SteeringQueueFull
         | DbError::ProductCreationClaimLost
+        | DbError::ProductCreationRequestConflict
         | DbError::CloseFoundationPrecondition(_)
         | DbError::CloseFoundationStaleLatest { .. }
         | DbError::CloseFoundationRepairRequired(_)

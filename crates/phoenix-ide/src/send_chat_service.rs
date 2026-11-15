@@ -1,4 +1,4 @@
-use crate::api::{record_pr_auto_fix_context_baseline, validate_submitted_attachments};
+use crate::api::{record_pr_auto_fix_context_baseline, validate_continuation_attachments};
 use crate::api::{FileAttachment, ImageAttachment};
 use crate::db::ConvState;
 use crate::runtime::RuntimeManager;
@@ -669,7 +669,7 @@ impl SendChatApplicationService {
             }
         }
 
-        let validated_files = validate_files(&req).await?;
+        let validated_files = validate_files(&self.db, &req).await?;
         let expanded = expand_request(&self.db, &conversation, &req).await?;
         let acceptance_state = self
             .effective_state(&conversation.id, &conversation.state)
@@ -1033,9 +1033,10 @@ pub(crate) struct ExpandedDispatchMessage {
 }
 
 async fn validate_files(
+    db: &crate::db::Database,
     req: &SendChatRequest,
 ) -> Result<Vec<phoenix_core::domain::db_schema::FileAttachment>, SendChatServiceError> {
-    validate_submitted_attachments(&req.conversation_id, &req.files)
+    validate_continuation_attachments(db, &req.conversation_id, &req.files)
         .await
         .map_err(|error| SendChatServiceError::AttachmentValidation(format!("{error:?}")))
 }
@@ -1308,7 +1309,8 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
         | crate::db::DbError::DormantGitRepositoryReadinessCatchupInProgress
         | crate::db::DbError::DormantGitRepositoryReadinessReceiptTargetMismatch
         | crate::db::DbError::DormantGitRepositoryReadinessReceiptOperationMismatch
-        | crate::db::DbError::ProductCreationClaimLost) => map_db_internal_error(&other),
+        | crate::db::DbError::ProductCreationClaimLost
+        | crate::db::DbError::ProductCreationRequestConflict) => map_db_internal_error(&other),
     }
 }
 
@@ -1372,7 +1374,8 @@ fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceErr
         | crate::db::DbError::DormantGitRepositoryReadinessCatchupInProgress
         | crate::db::DbError::DormantGitRepositoryReadinessReceiptTargetMismatch
         | crate::db::DbError::DormantGitRepositoryReadinessReceiptOperationMismatch
-        | crate::db::DbError::ProductCreationClaimLost) => map_db_internal_error(&other),
+        | crate::db::DbError::ProductCreationClaimLost
+        | crate::db::DbError::ProductCreationRequestConflict) => map_db_internal_error(&other),
     }
 }
 

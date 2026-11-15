@@ -31,6 +31,7 @@
 }
 
 .ember-entry-mark {
+  position: relative;
   display: grid;
   place-items: center;
   width: 28px;
@@ -89,4 +90,24 @@
   .conversation-list-pinned-header > .ember-entry {
     min-height: 44px;
   }
+}
+
+.ember-entry-unread-dot {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--accent-blue, #3b82f6);
+  box-shadow: 0 0 0 2px var(--bg-secondary, transparent);
+}
+
+.ember-entry-unread-dot--marked {
+  background: var(--bg-secondary, transparent);
+  border: 1.5px solid var(--accent-blue, #3b82f6);
+}
+
+.ember-entry.unread .ember-entry-copy strong {
+  font-weight: 700;
 }

@@ -18,46 +18,46 @@ test-support = []
 [dependencies]
 # Shared domain vocabulary: ContentBlock/Usage (llm_types), runtime env probe,
 # retry/quota policy, and the persisted error-kind schema.
-phoenix-core = { path = "../phoenix-core" }
+phoenix-core = { workspace = true }
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
+tokio = { workspace = true, features = ["full"] }
+tokio-stream = { workspace = true, features = ["sync"] }
 
 # Loopback OAuth callback server for the ChatGPT/codex login flow
 # (llm/codex_login). Self-contained — not wired into the phoenix-ide router.
-axum = { version = "0.7", features = ["ws"] }
+axum = { workspace = true, features = ["ws"] }
 
 # HTTP client for provider requests + SSE streaming
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+reqwest = { workspace = true, features = ["json", "stream", "rustls"] }
 
 # Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 
 # Async utilities
-async-trait = "0.1"
-futures = "0.3"
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 
 # Utilities
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["serde", "v4"] }
-httpdate = "1"
-thiserror = "2"
-tracing = "0.1"
-base64 = "0.22"
-sha2 = "0.11"
-rand = "0.10"
+chrono = { workspace = true, features = ["serde"] }
+uuid = { workspace = true, features = ["serde", "v4"] }
+httpdate = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util"] }
 # test-support exposes phoenix-core's #[cfg(test)] constructors
 # (PhoenixRuntimeEnvironment::with_root, ContentBlock::tool_use, …) across the
 # crate boundary. Dev-only: production builds never enable the feature.
-phoenix-core = { path = "../phoenix-core", features = ["test-support"] }
-proptest = "1"
-tempfile = "3"
+phoenix-core = { workspace = true, features = ["test-support"] }
+proptest = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

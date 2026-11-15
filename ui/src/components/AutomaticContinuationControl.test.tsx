@@ -61,9 +61,13 @@ describe('AutomaticContinuationControl', () => {
 
     expect(await screen.findByText('offline')).toBeInTheDocument();
     await waitFor(() => expect(onStatusChange).toHaveBeenLastCalledWith('…', true));
+    const summary = screen.getByText(/Auto-continue/).closest('summary');
+    expect(summary).toHaveTextContent('Auto-continue …');
+    expect(summary).not.toHaveTextContent('Off');
+    expect(summary).not.toHaveTextContent('On');
   });
 
-  it('defaults an ordinary ProductConversation OFF from GET and immediately PUTs the checked value', async () => {
+  it('preserves an existing ordinary ProductConversation OFF preference and PUTs the checked value', async () => {
     render(<AutomaticContinuationControl scope={{ kind: 'ordinary', reference: 'pc/1' }} />);
 
     const checkbox = await openControl();
@@ -78,6 +82,27 @@ describe('AutomaticContinuationControl', () => {
     await waitFor(() => expect(apiMock.updateProductConversationAutomaticContinuation).toHaveBeenCalledWith('pc/1', true));
     expect(await screen.findByText('Saved')).toBeInTheDocument();
     expect(checkbox).toBeChecked();
+  });
+
+  it.each(['ordinary', 'coordinator'] as const)('shows the new %s default ON and allows explicit opt-out', async (kind) => {
+    const get = kind === 'ordinary' ? apiMock.getProductConversationAutomaticContinuation : apiMock.getCoordinatorAutomaticContinuation;
+    const update = kind === 'ordinary' ? apiMock.updateProductConversationAutomaticContinuation : apiMock.updateCoordinatorAutomaticContinuation;
+    const aggregate = kind === 'ordinary'
+      ? { kind, product_conversation_id: 'pc-1' }
+      : { kind, product_conversation_id: 'coordinator-pc' };
+    get.mockResolvedValue(view({ aggregate, auto_continue_on_context_exhaustion: true }));
+    update.mockResolvedValue(view({ aggregate, auto_continue_on_context_exhaustion: false }));
+
+    render(<AutomaticContinuationControl scope={kind === 'ordinary' ? { kind, reference: 'pc-1' } : { kind }} />);
+    const checkbox = await openControl();
+    expect(checkbox).toBeChecked();
+    expect(screen.getByText(/New conversations start with this setting on; existing preferences are preserved/)).toBeInTheDocument();
+    expect(screen.getByText(/does not authorize unrelated work or unconditional error retries/)).toBeInTheDocument();
+    fireEvent.click(checkbox);
+    await waitFor(() => expect(update).toHaveBeenCalledWith(...(kind === 'ordinary' ? ['pc-1', false] : [false])));
+    expect(await screen.findByText('Saved')).toBeInTheDocument();
+    expect(checkbox).not.toBeChecked();
+    expect(apiMock.continueConversation).not.toHaveBeenCalled();
   });
 
   it('uses the Global Coordinator contract and exposes admitted progress', async () => {

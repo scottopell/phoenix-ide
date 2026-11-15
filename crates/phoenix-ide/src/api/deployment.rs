@@ -570,7 +570,7 @@ async fn cleanup_managed_worktree_inner(
         )
     })?;
     for owner in &owners {
-        if crate::runtime::conversation_retains_work_scope(&state.db, owner)
+        if crate::runtime::conversation_retains_work_scope_for_reclamation(&state.db, owner)
             .await
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         {
@@ -1057,7 +1057,9 @@ async fn managed_worktrees_disk(
 
     let mut retained_conversation_ids = std::collections::HashSet::new();
     for conversation in &conversations {
-        match crate::runtime::conversation_retains_work_scope(db, conversation).await {
+        match crate::runtime::conversation_retains_work_scope_for_reclamation(db, conversation)
+            .await
+        {
             Ok(true) | Err(_) => {
                 retained_conversation_ids.insert(conversation.id.clone());
             }

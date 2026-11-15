@@ -16,6 +16,8 @@ mod coordinator_authority;
 mod coordinator_query;
 mod coordinator_watches;
 mod coordinator_work_scope;
+mod federation_conversation_authority;
+pub use federation_conversation_authority::FederationConversationAuthority;
 mod federation_enrollment;
 pub use federation_enrollment::FederationSendAuthority;
 mod federation_peers;
@@ -61,14 +63,22 @@ pub use automatic_continuation_settings::{
 mod native_continuation;
 pub use native_continuation::{
     CoordinatorContinuationOpening, CurrentCoordinatorContinuationRequest,
+    FederatedContinuationSource, FederatedCoordinatorContinuationRequest,
 };
 mod product_conversation_rename;
 pub use product_conversation_rename::{
+    HistoricalProductConversationRenameReceipt, HistoricalProductConversationRenameReceiptSource,
     NormalizedConversationTitle, ProductConversationRenameCommand, ProductConversationRenameDetail,
-    ProductConversationRenameReceipt, ProductConversationRenameResult,
+    ProductConversationRenameReceipt, ProductConversationRenameReceiptRecord,
+    ProductConversationRenameReceiptSource, ProductConversationRenameResult,
     ProductConversationRenameSource,
 };
 mod product_conversation_read;
+mod product_conversation_read_state;
+pub use product_conversation_read_state::{
+    ProductConversationReadAdvance, ProductConversationReadState,
+    ProductConversationReadStateEntry, ProductConversationUnreadReason,
+};
 pub mod retrieval;
 mod sqlite_native_statement;
 mod sqlite_telemetry;
@@ -406,6 +416,8 @@ pub enum DbError {
     ),
     #[error("federation send authority is no longer active")]
     FederationSendAuthorityInactive,
+    #[error("product creation request identity is owned by another acceptance source")]
+    ProductCreationRequestConflict,
     #[error("federation send identity is already owned by another conversation")]
     FederationSendIdentityConflict,
     #[error("saved federation peer not found")]
@@ -452,7 +464,9 @@ pub enum DbError {
     DormantGitRepositoryReadinessCatchupInProgress,
     #[error("dormant git repository readiness receipt targeted a different database lifecycle")]
     DormantGitRepositoryReadinessReceiptTargetMismatch,
-    #[error("dormant git repository readiness receipt did not match an exact completed catch-up operation")]
+    #[error(
+        "dormant git repository readiness receipt did not match an exact completed catch-up operation"
+    )]
     DormantGitRepositoryReadinessReceiptOperationMismatch,
 }
 
@@ -4638,8 +4652,8 @@ impl Database {
                         if values.0.as_ref() != *expected_scope {
                             tx.rollback().await?;
                             return Err(DbError::CloseFoundationConflict(format!(
-                            "parent conversation {parent_id} no longer owns captured WorkScope {expected_scope:?}"
-                        )));
+                                "parent conversation {parent_id} no longer owns captured WorkScope {expected_scope:?}"
+                            )));
                         }
                         values
                     }
@@ -4647,21 +4661,22 @@ impl Database {
             let inherited_effort = sub_agent_execution
                 .as_ref()
                 .map_or(inherited_effort, |execution| execution.effort);
-            let product_conversation_id =
-                if let Some(product_conversation_id) = inherited_product_conversation_id {
-                    product_conversation_id
-                } else {
-                    let product_conversation_id =
-                        phoenix_core::domain::product_conversation::ProductConversationId::new();
-                    sqlx::query(
-                        "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
-                     VALUES (?1, 'ordinary', 'open')",
+            let product_conversation_id = if let Some(product_conversation_id) =
+                inherited_product_conversation_id
+            {
+                product_conversation_id
+            } else {
+                let product_conversation_id =
+                    phoenix_core::domain::product_conversation::ProductConversationId::new();
+                sqlx::query(
+                        "INSERT INTO product_conversations (id, kind, ordinary_lifecycle, auto_continue_on_context_exhaustion)
+                     VALUES (?1, 'ordinary', 'open', 1)",
                     )
                     .bind(product_conversation_id.as_str())
                     .execute(&mut *tx)
                     .await?;
-                    product_conversation_id
-                };
+                product_conversation_id
+            };
             if parent_id.is_none() && user_initiated {
                 actual_slug = conversation_name::allocate_slug_tx(&mut tx, &root_name, id).await?;
             }
@@ -4837,8 +4852,8 @@ impl Database {
             let product_conversation_id =
                 phoenix_core::domain::product_conversation::ProductConversationId::new();
             sqlx::query(
-                "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
-                 VALUES (?1, 'coordinator', NULL)",
+                "INSERT INTO product_conversations (id, kind, ordinary_lifecycle, auto_continue_on_context_exhaustion)
+                 VALUES (?1, 'coordinator', NULL, 1)",
             )
             .bind(product_conversation_id.as_str())
             .execute(&mut *tx)
@@ -5528,8 +5543,8 @@ impl Database {
         let product_conversation_id =
             phoenix_core::domain::product_conversation::ProductConversationId::new();
         sqlx::query(
-            "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
-             VALUES (?1, 'ordinary', 'open')",
+            "INSERT INTO product_conversations (id, kind, ordinary_lifecycle, auto_continue_on_context_exhaustion)
+             VALUES (?1, 'ordinary', 'open', 1)",
         )
         .bind(product_conversation_id.as_str())
         .execute(&mut *tx)
@@ -9112,7 +9127,7 @@ impl Database {
             other => {
                 return Err(DbError::Serialization(format!(
                     "unknown WorkScope lifecycle: {other}"
-                )))
+                )));
             }
         };
         let environment = match environment.as_str() {
@@ -9142,7 +9157,7 @@ impl Database {
             other => {
                 return Err(DbError::Serialization(format!(
                     "unknown WorkScope environment kind: {other}"
-                )))
+                )));
             }
         };
         Ok((authority, lifecycle, environment))
@@ -9486,7 +9501,7 @@ impl Database {
         }
 
         let product_id = phoenix_core::domain::product_conversation::ProductConversationId::new();
-        sqlx::query("INSERT INTO product_conversations (id, kind, ordinary_lifecycle) VALUES (?1, 'ordinary', 'open')")
+        sqlx::query("INSERT INTO product_conversations (id, kind, ordinary_lifecycle, auto_continue_on_context_exhaustion) VALUES (?1, 'ordinary', 'open', 1)")
             .bind(product_id.as_str())
             .execute(&mut *tx)
             .await?;
@@ -11054,8 +11069,8 @@ impl Database {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         sqlx::query(
-            "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
-             VALUES (?1, 'ordinary', 'open')
+            "INSERT INTO product_conversations (id, kind, ordinary_lifecycle, auto_continue_on_context_exhaustion)
+             VALUES (?1, 'ordinary', 'open', 1)
              ON CONFLICT(id) DO NOTHING",
         )
         .bind(child.product_conversation_id.as_str())
@@ -11231,7 +11246,7 @@ impl Database {
                     _ => {
                         return Err(DbError::Serialization(
                             "Candidate has invalid source revision".to_string(),
-                        ))
+                        ));
                     }
                 };
                 let origin = match row.get::<&str, _>("origin") {
@@ -11246,7 +11261,7 @@ impl Database {
                         ContinuationSourceRevision::ExhaustedState { .. } => {
                             return Err(DbError::Serialization(
                                 "Oversized summary lacks operation revision".to_string(),
-                            ))
+                            ));
                         }
                     },
                     "ai_shortening" => ContinuationCandidateOrigin::AiShortening { revision },
@@ -11254,7 +11269,7 @@ impl Database {
                     other => {
                         return Err(DbError::Serialization(format!(
                             "Unknown candidate origin {other}"
-                        )))
+                        )));
                     }
                 };
                 Ok(ContinuationHandoffCandidate {
@@ -11275,7 +11290,7 @@ impl Database {
                         (Some(_), Some(_)) => {
                             return Err(DbError::Serialization(
                                 "Candidate has conflicting sources".to_string(),
-                            ))
+                            ));
                         }
                     },
                     text: row.get("candidate_text"),
@@ -13139,7 +13154,7 @@ impl Database {
                     value => {
                         return Err(DbError::Serialization(format!(
                             "unknown startup parent action {value}"
-                        )))
+                        )));
                     }
                 };
                 Ok(StartupParentActionRecord {
@@ -15813,8 +15828,8 @@ async fn insert_conversation_tx(
     conv: &Conversation,
 ) -> DbResult<()> {
     sqlx::query(
-        "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
-         VALUES (?1, 'ordinary', 'open')
+        "INSERT INTO product_conversations (id, kind, ordinary_lifecycle, auto_continue_on_context_exhaustion)
+         VALUES (?1, 'ordinary', 'open', 1)
          ON CONFLICT(id) DO NOTHING",
     )
     .bind(conv.product_conversation_id.as_str())
@@ -19513,7 +19528,10 @@ mod tests {
             "SELECT server_name, resource_uri, scopes, expires_at FROM mcp_oauth_tokens",
             "SELECT id, caller_instance_id, caller_display_name, created_at_us, revoked_at_us FROM federation_enrollments",
         ] {
-            assert!(!db.coordinator_query(sql).await.unwrap().rows.is_empty(), "{sql}");
+            assert!(
+                !db.coordinator_query(sql).await.unwrap().rows.is_empty(),
+                "{sql}"
+            );
         }
     }
 
@@ -21791,19 +21809,17 @@ mod tests {
             db.create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
                 .await
                 .unwrap();
-            if enabled {
-                let product_conversation_id = db
-                    .get_conversation(conversation_id)
-                    .await
-                    .unwrap()
-                    .product_conversation_id;
-                db.set_auto_continue_on_context_exhaustion(
-                    &product_conversation_id,
-                    AutoContinueOnContextExhaustion::Enabled,
-                )
+            let product_conversation_id = db
+                .get_conversation(conversation_id)
                 .await
-                .unwrap();
-            }
+                .unwrap()
+                .product_conversation_id;
+            db.set_auto_continue_on_context_exhaustion(
+                &product_conversation_id,
+                AutoContinueOnContextExhaustion::from(enabled),
+            )
+            .await
+            .unwrap();
             db.update_conversation_state(
                 conversation_id,
                 &ConvState::AwaitingContinuation {
@@ -24176,8 +24192,10 @@ mod tests {
                         .take_native_statement_shapes_for_test(),
                 );
                 assert!(small_tail_steps > 0);
-                assert!(large_tail_steps <= small_tail_steps + 32,
-                    "tail work grew with 64 older parents: {small_tail_steps} -> {large_tail_steps} VM steps");
+                assert!(
+                    large_tail_steps <= small_tail_steps + 32,
+                    "tail work grew with 64 older parents: {small_tail_steps} -> {large_tail_steps} VM steps"
+                );
             }
             db.pool()
                 .acquire()

@@ -975,6 +975,7 @@ fn sqlx_from_db_error(error: crate::DbError) -> sqlx::Error {
         | crate::DbError::DormantGitRepositoryCatchupBlockedByReadinessClaim
         | crate::DbError::DormantGitRepositoryReadinessCatchupInProgress
         | crate::DbError::DormantGitRepositoryReadinessReceiptTargetMismatch
+        | crate::DbError::ProductCreationRequestConflict
         | crate::DbError::DormantGitRepositoryReadinessReceiptOperationMismatch => {
             unreachable!("retrieval telemetry closure only returns SQLx errors")
         }

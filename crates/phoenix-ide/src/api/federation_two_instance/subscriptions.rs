@@ -220,8 +220,11 @@ async fn registered_watch_unwatch_and_list_route_saved_peer_without_local_watch_
     .await;
     assert!(watch_result.is_success(), "{}", watch_result.output());
 
-    let listed_by_name =
-        run_coordinator_tool(&list, json!({"instance": "isolated receiver"})).await;
+    let listed_by_name = run_coordinator_tool(
+        &list,
+        json!({"request":{"op":"remote","instance":"isolated receiver"}}),
+    )
+    .await;
     assert!(listed_by_name.is_success(), "{}", listed_by_name.output());
     let listed_by_name: Value = serde_json::from_str(listed_by_name.output()).unwrap();
     assert_eq!(listed_by_name["subscriptions"].as_array().unwrap().len(), 1);
@@ -230,7 +233,7 @@ async fn registered_watch_unwatch_and_list_route_saved_peer_without_local_watch_
     assert!(listed_by_name.to_string().contains(&remote_id));
     assert!(!listed_by_name.to_string().contains(&local_id));
 
-    let listed_local = run_coordinator_tool(&list, json!({"instance": "local"})).await;
+    let listed_local = run_coordinator_tool(&list, json!({"request":{"op":"local"}})).await;
     assert!(listed_local.is_success(), "{}", listed_local.output());
     let listed_local: Value = serde_json::from_str(listed_local.output()).unwrap();
     assert!(listed_local.to_string().contains(&local_id));
@@ -258,7 +261,7 @@ async fn registered_watch_unwatch_and_list_route_saved_peer_without_local_watch_
 
     let listed_after_unwatch = run_coordinator_tool(
         &list,
-        json!({"instance": peer.peer_instance_id.to_string()}),
+        json!({"request":{"op":"remote","instance":peer.peer_instance_id.to_string()}}),
     )
     .await;
     assert!(

@@ -437,6 +437,10 @@ sub-agent transcripts, other ProductConversations, and typed source relations
 such as `approved_task` and `follow_up`, including when resources are shared
 AND SHALL NOT grant this capability to sub-agents or the Coordinator
 
+THE `previous_transcripts` tool SHALL advertise a required `request` whose operation is exactly one of `list` (optional cursor), `search` (required query), or `read` (required exact transcript reference and optional cursor)
+AND SHALL disallow fields from other operations before invoking predecessor retrieval
+AND SHALL give operation-specific corrective guidance without echoing caller-supplied query text or transcript contents when arguments are malformed.
+
 WHEN an eligible agent is oriented for a transcript with predecessors
 THE SYSTEM SHALL supply bounded host-authored orientation identifying the
 current transcript and its immediate predecessor, describing the predecessor

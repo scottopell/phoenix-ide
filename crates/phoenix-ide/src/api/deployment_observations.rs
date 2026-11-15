@@ -98,7 +98,7 @@ pub async fn deployment_observations(
 
 pub(crate) async fn recorder_space(
     environment: &phoenix_core::runtime_env::PhoenixRuntimeEnvironment,
-) -> [Option<u64>; 3] {
+) -> Option<[Option<u64>; 3]> {
     let targets = vec![
         ("database".into(), environment.db_path().clone()),
         ("data".into(), environment.data_dir().to_path_buf()),
@@ -116,7 +116,7 @@ pub(crate) async fn recorder_space(
         recorder_roles(&groups)
     })
     .await
-    .unwrap_or([None; 3])
+    .ok()
 }
 
 fn recorder_roles(groups: &[FilesystemSpaceObservation]) -> [Option<u64>; 3] {

@@ -144,6 +144,13 @@
   font-weight: 600;
 }
 
+.sg-gesture-guide code {
+  display: block;
+  margin-top: 8px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
 .sg-discovery-toggle {
   display: flex;
   align-items: center;

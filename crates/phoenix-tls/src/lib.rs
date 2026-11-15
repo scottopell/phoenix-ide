@@ -1,6 +1,6 @@
 use rcgen::{
-    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
-    KeyUsagePurpose,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, DnValue,
+    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyIdMethod, KeyPair, KeyUsagePurpose,
 };
 use std::{
     error::Error,
@@ -127,7 +127,7 @@ fn write_leaf(
     let ca_cert_pem = fs::read_to_string(ca_cert_path)?;
     let ca_key_pem = fs::read_to_string(ca_key_path)?;
     let ca_key = KeyPair::from_pem(&ca_key_pem)?;
-    let issuer = Issuer::from_ca_cert_pem(&ca_cert_pem, ca_key)?;
+    let issuer = ca_issuer(&ca_cert_pem, ca_key)?;
 
     let mut params = CertificateParams::new(hosts.to_vec())?;
     let (not_before, not_after) = validity_window(LEAF_VALID_DAYS)?;
@@ -147,6 +147,76 @@ fn write_leaf(
     write_pem(cert_path, &cert.pem(), PemKind::Public)?;
     write_pem(key_path, &key_pair.serialize_pem(), PemKind::Private)?;
     Ok(())
+}
+
+/// Builds the signing issuer from a CA certificate on disk: its subject,
+/// key usages and subject key identifier, the fields rcgen's
+/// `Issuer::from_ca_cert_pem` reads.
+fn ca_issuer(
+    ca_cert_pem: &str,
+    ca_key: KeyPair,
+) -> Result<Issuer<'static, KeyPair>, Box<dyn Error>> {
+    use x509_cert::der::oid::AssociatedOid as _;
+    use x509_cert::der::{Decode as _, DecodePem as _, Tag, Tagged as _};
+    use x509_cert::ext::pkix::{KeyUsage, KeyUsages, SubjectKeyIdentifier};
+
+    let tbs = x509_cert::Certificate::from_pem(ca_cert_pem)?.tbs_certificate;
+    let mut params = CertificateParams::default();
+    params.distinguished_name = DistinguishedName::new();
+    for rdn in &tbs.subject.0 {
+        let [attribute] = rdn.0.as_slice() else {
+            return Err("CA subject has a multi-valued RDN".into());
+        };
+        let arcs: Vec<u64> = attribute.oid.arcs().map(u64::from).collect();
+        let text = std::str::from_utf8(attribute.value.value())?;
+        let tag = attribute.value.tag();
+        let value = if tag == Tag::Utf8String {
+            DnValue::Utf8String(text.to_owned())
+        } else if tag == Tag::PrintableString {
+            DnValue::PrintableString(text.try_into()?)
+        } else if tag == Tag::Ia5String {
+            DnValue::Ia5String(text.try_into()?)
+        } else {
+            return Err(format!("unsupported CA subject string type {tag}").into());
+        };
+        params
+            .distinguished_name
+            .push(DnType::from_oid(&arcs), value);
+    }
+    for extension in tbs.extensions.as_deref().unwrap_or_default() {
+        let value = extension.extn_value.as_bytes();
+        if extension.extn_id == KeyUsage::OID {
+            let flags = KeyUsage::from_der(value)?.0;
+            params.key_usages = [
+                (
+                    KeyUsages::DigitalSignature,
+                    KeyUsagePurpose::DigitalSignature,
+                ),
+                (
+                    KeyUsages::NonRepudiation,
+                    KeyUsagePurpose::ContentCommitment,
+                ),
+                (KeyUsages::KeyEncipherment, KeyUsagePurpose::KeyEncipherment),
+                (
+                    KeyUsages::DataEncipherment,
+                    KeyUsagePurpose::DataEncipherment,
+                ),
+                (KeyUsages::KeyAgreement, KeyUsagePurpose::KeyAgreement),
+                (KeyUsages::KeyCertSign, KeyUsagePurpose::KeyCertSign),
+                (KeyUsages::CRLSign, KeyUsagePurpose::CrlSign),
+                (KeyUsages::EncipherOnly, KeyUsagePurpose::EncipherOnly),
+                (KeyUsages::DecipherOnly, KeyUsagePurpose::DecipherOnly),
+            ]
+            .into_iter()
+            .filter_map(|(flag, purpose)| flags.contains(flag).then_some(purpose))
+            .collect();
+        } else if extension.extn_id == SubjectKeyIdentifier::OID {
+            let identifier = SubjectKeyIdentifier::from_der(value)?.0;
+            params.key_identifier_method =
+                KeyIdMethod::PreSpecified(identifier.as_bytes().to_vec());
+        }
+    }
+    Ok(Issuer::new(params, ca_key))
 }
 
 fn validity_window(valid_days: i64) -> Result<(OffsetDateTime, OffsetDateTime), Box<dyn Error>> {
@@ -311,6 +381,49 @@ mod tests {
         assert!(ca.key_path.exists(), "CA key should exist");
         assert!(issued.cert_path.exists(), "leaf cert should exist");
         assert!(issued.key_path.exists(), "leaf key should exist");
+    }
+
+    #[test]
+    fn leaf_issuer_and_authority_key_match_the_ca_on_disk() {
+        use x509_cert::der::{oid::AssociatedOid as _, Decode as _, DecodePem as _, Encode as _};
+        use x509_cert::ext::pkix::{AuthorityKeyIdentifier, SubjectKeyIdentifier};
+
+        let tmp = TempDir::new().unwrap();
+        let ca_dir = tmp.path().join("ca");
+        let hosts = vec!["localhost".to_string()];
+        let issued = issue_leaf(
+            &ca_dir,
+            &tmp.path().join("leaf.pem"),
+            &tmp.path().join("leaf-key.pem"),
+            &hosts,
+        )
+        .unwrap();
+
+        let read = |path: &Path| {
+            x509_cert::Certificate::from_pem(fs::read_to_string(path).unwrap())
+                .unwrap()
+                .tbs_certificate
+        };
+        let extension = |tbs: &x509_cert::TbsCertificate, oid| {
+            tbs.extensions
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .find(|extension| extension.extn_id == oid)
+                .map(|extension| extension.extn_value.as_bytes().to_vec())
+                .expect("extension present")
+        };
+        let ca = read(&ca_paths(&ca_dir).cert_path);
+        let leaf = read(&issued.cert_path);
+
+        assert_eq!(ca.subject.to_der().unwrap(), leaf.issuer.to_der().unwrap());
+        let ca_key_id = SubjectKeyIdentifier::from_der(&extension(&ca, SubjectKeyIdentifier::OID))
+            .unwrap()
+            .0;
+        let leaf_authority =
+            AuthorityKeyIdentifier::from_der(&extension(&leaf, AuthorityKeyIdentifier::OID))
+                .unwrap();
+        assert_eq!(Some(ca_key_id), leaf_authority.key_identifier);
     }
 
     #[test]

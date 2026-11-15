@@ -6,6 +6,62 @@ import { buildLadleStoryUrl, runSurfaceCapture } from './capture-ladle-surface.m
 const measurements = [];
 const journeys = [];
 
+async function assertMobileContinuation(page, id, viewport, outDir) {
+  const input = page.locator('.product-conversation-page__composer #message-input');
+  await input.waitFor();
+  await input.fill('Unsent mobile draft');
+  await input.evaluate(element => {
+    window.__continuationComposer = element;
+    element.setSelectionRange(3, 9);
+  });
+  const assertRetainedEditor = async () => {
+    if (!await input.evaluate(element => element === window.__continuationComposer
+      && document.activeElement === element && element.selectionStart === 3 && element.selectionEnd === 9)) {
+      throw new Error('Continuation replaced the editor or lost native focus/selection');
+    }
+  };
+  await page.evaluate(() => {
+    window.dispatchEvent(new Event('product-conversation-fixture-hold-successor'));
+    window.dispatchEvent(new Event('product-conversation-fixture-hold-successor-readback'));
+  });
+  const route = await page.locator('html').getAttribute('data-source-fixture-location');
+  await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--before.png`, fullPage: true });
+  await page.evaluate(() => window.dispatchEvent(new Event('product-conversation-fixture-continue')));
+  await page.waitForFunction(() => {
+    const streamUrl = document.documentElement.dataset.productConversationFixtureEventSourceLastUrl;
+    if (!streamUrl || document.documentElement.dataset.productConversationFixtureActiveTranscriptSubscriptions !== '1') return false;
+    const parsed = new URL(streamUrl, window.location.href);
+    return parsed.pathname === '/api/conversation-reads/stream'
+      && parsed.searchParams.get('reference') === 'fixture-successor';
+  });
+  await assertRetainedEditor();
+  await page.evaluate(() => {
+    window.dispatchEvent(new Event('product-conversation-fixture-release-successor-readback'));
+    window.dispatchEvent(new Event('product-conversation-fixture-release-successor'));
+  });
+  await page.waitForFunction(() => document.documentElement.dataset.productConversationFixtureLastDeliveredInitMember === 'fixture-successor');
+  await assertRetainedEditor();
+  await page.evaluate(() => window.dispatchEvent(new Event('product-conversation-fixture-successor-message')));
+  await page.getByText('Successor is streaming after the handoff.', { exact: true }).waitFor();
+  if (await input.inputValue() !== 'Unsent mobile draft') throw new Error('Continuation lost the unsent draft');
+  if (await page.locator('html').getAttribute('data-source-fixture-location') !== route) throw new Error('Continuation navigated the stable route');
+  if (await page.getByRole('button', { name: 'Open continuation', exact: true }).count()) throw new Error('Redundant continuation action remains');
+  await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--followed.png`, fullPage: true });
+  await page.evaluate(() => window.dispatchEvent(new Event('product-conversation-fixture-stream-failure')));
+  await page.waitForFunction(() => {
+    const data = document.documentElement.dataset;
+    return Number(data.productConversationFixtureLastDeliveredInitInstance) > Number(data.productConversationFixtureFailedTranscriptInstance)
+      && data.productConversationFixtureLastDeliveredInitMember === 'fixture-successor'
+      && data.productConversationFixtureActiveTranscriptSubscriptions === '1';
+  });
+  await page.evaluate(() => window.dispatchEvent(new Event('product-conversation-fixture-successor-message')));
+  await page.getByText('Successor is streaming after reconnect.', { exact: true }).waitFor();
+  if (await page.getByText('Successor is streaming after the handoff.', { exact: true }).count() !== 1) throw new Error('Reconnect duplicated/lost successor message');
+  await assertRetainedEditor();
+  await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--reconnected.png`, fullPage: true });
+  journeys.push(`${id}/${viewport.name}: stable-route real SSE continuation, held cold hydration, retained native editor/focus/selection/draft, one subscription and new post-reconnect message; synthetic mobile browser only`);
+}
+
 async function assertSourceCall(page, id, viewport, outDir) {
   await page.evaluate(() => { window.__sourcePulseSeen = false; const observer = new MutationObserver(() => { if (document.querySelector('[data-tool-id="source-send-call"].jump-highlight')) window.__sourcePulseSeen = true; }); observer.observe(document.body, { subtree: true, attributes: true, attributeFilter: ["class"] }); });
   const expectedPath = id === 'source-call-global' ? '/global/source-member' : '/c/source-member';
@@ -415,7 +471,7 @@ runSurfaceCapture({
   outDir: process.env.PRODUCT_CONVERSATION_QA_OUT ?? 'qa-artifacts/product-conversation',
   viewportMatrix: [
     { name: 'desktop-light', width: 1440, height: 900 }, { name: 'desktop-dark', width: 1440, height: 900 },
-    { name: 'mobile-light', width: 390, height: 844 }, { name: 'mobile-dark', width: 390, height: 844 },
+    { name: 'mobile-light', width: 390, height: 844, isMobile: true, hasTouch: true }, { name: 'mobile-dark', width: 390, height: 844, isMobile: true, hasTouch: true },
   ],
   urlForStory: ({ storyKey, id, viewport }) => {
     const theme = viewport.name.endsWith('-light') ? 'light' : 'dark';
@@ -429,6 +485,10 @@ runSurfaceCapture({
     await page.route('**/api/**', route => route.abort('blockedbyclient'));
   },
   captureStory: async ({ page, id, outDir, viewport }) => {
+    if (id === 'mobile-continuation-ordinary' || id === 'mobile-continuation-global') {
+      await assertMobileContinuation(page, id, viewport, outDir);
+      return;
+    }
     const theme = await fixtureValue(page, 'theme') ?? 'dark';
     if (id === 'ordinary-lazy-history' || id === 'global-lazy-history') {
       await assertSupersededBoundary(page, id, viewport, outDir);

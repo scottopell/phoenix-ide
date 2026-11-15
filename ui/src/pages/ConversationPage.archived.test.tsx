@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { useEffect, useRef } from 'react';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
-import { ConversationPage } from './ConversationPage';
+import { ConversationPage, EmbeddedConversationPage } from './ConversationPage';
 import { resolveOwnedConversationTarget } from '../conversation/conversationNavigation';
 import { DesktopLayout } from '../components/DesktopLayout';
 import { ConversationContext } from '../conversation/ConversationContext';
@@ -262,6 +262,7 @@ function renderPage(
   routePrefix: '/c' | '/global' = '/c',
   activeFocusScope = false,
   messages: Message[] = [historyMessage],
+  mutationEnabled = true,
 ) {
   authoritativeConversations.set(conversation.id, conversation);
   authoritativeMessages.set(conversation.id, messages);
@@ -309,7 +310,7 @@ function renderPage(
               <Routes>
                 <Route
                   path={`${routePrefix}/:slug`}
-                  element={<>{activeFocusScope && <PersistentFocusScope />}<DesktopLayout><ConversationPage routePrefix={routePrefix} /></DesktopLayout><LocationProbe /></>}
+                  element={<>{activeFocusScope && <PersistentFocusScope />}<DesktopLayout>{mutationEnabled ? <ConversationPage routePrefix={routePrefix} /> : <EmbeddedConversationPage slug={conversation.slug} routePrefix={routePrefix} mutationEnabled={false} suppressCanonicalization />}</DesktopLayout><LocationProbe /></>}
                 />
               </Routes>
             </MemoryRouter>
@@ -1272,6 +1273,24 @@ describe('ConversationPage context exhausted handoff', () => {
     expect(screen.queryByRole('button', { name: 'Regenerate handoff' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Check fit' })).toBeInTheDocument();
     expect(screen.getByText(/conversation model selector/)).toBeInTheDocument();
+  });
+
+  it('keeps continuation recovery read-only while aggregate mutations are disabled', async () => {
+    renderPage(makeConversation({ state: { type: 'recoverable_continuation_failure', message: 'Network interrupted', error_kind: 'network', operation_id: 'op', attempt: 1 } }), slug, '', '/c', false, [historyMessage], false);
+    const retry = await screen.findByRole('button', { name: 'Retry summary' });
+    expect(retry).toBeDisabled();
+    fireEvent.click(retry);
+    expect(api.triggerContinuation).not.toHaveBeenCalled();
+    expect(api.continueConversation).not.toHaveBeenCalled();
+  });
+
+  it('keeps reviewed handoff controls disabled while aggregate mutations are disabled', async () => {
+    renderPage(makeConversation({ state: { type: 'context_exhausted', summary: 'Generated summary' } }), slug, '', '/c', false, [historyMessage], false);
+    const regenerate = await screen.findByRole('button', { name: 'Regenerate handoff' });
+    expect(regenerate).toBeDisabled();
+    fireEvent.click(regenerate);
+    expect(api.triggerContinuation).not.toHaveBeenCalled();
+    expect(api.continueConversation).not.toHaveBeenCalled();
   });
 
   it('keeps explicit retry for a transient continuation failure', async () => {

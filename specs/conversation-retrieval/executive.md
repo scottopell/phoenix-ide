@@ -101,8 +101,8 @@ ADR-051, including restricted planning parents.
 
 ## Predecessor Recall Delivery
 
-`previous_transcripts` gives each ordinary parent a closed list/search/read
-surface bound to its persisted ProductConversation identity and executing
+`previous_transcripts` gives each ordinary parent a closed, nested-request
+list/search/read surface with operation-specific fields and corrective errors, bound to its persisted ProductConversation identity and executing
 transcript. Each operation revalidates the strict predecessor prefix from the
 ordinary aggregate. Search applies that prefix before ranking; listing and
 bounded source reads remain usable independently of index readiness.

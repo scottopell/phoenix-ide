@@ -602,11 +602,16 @@ rule OAuthClientPreconfigured {
     ensures: srv.pending_auth_url = authorization_url(srv)
 
     @guidance
-        -- When the pre-configured client pins a loopback callback port (its
-        -- app allows only http://localhost:<port>/callback and cannot register
-        -- Phoenix's own route), the authorization_url's redirect_uri is that
-        -- loopback URI, and a listener on that port (bound before the URL is
-        -- surfaced, on both IP families, accepting until the flow resolves)
+        -- A pre-configured client's oauth.callbackPort selects
+        -- http://localhost:<port>/callback; oauth.callbackUrl selects the exact
+        -- configured HTTP URI on localhost, 127.0.0.1, or [::1], with a nonzero
+        -- resolved port and no credentials, query, fragment, whitespace, controls,
+        -- or backslashes.
+        -- Both settings together, an invalid URL, or a URL without clientId
+        -- makes the server config unusable. The selected URI is used in both
+        -- authorization and code exchange. A listener on its port (bound before
+        -- the URL is surfaced, on both IP families for localhost or the specified IP
+        -- literal's family, accepting until the flow resolves)
         -- bounces the browser's callback to the real /api/mcp/oauth/callback
         -- route (REQ-MCP-020). A callback accepted before the 25-minute deadline
         -- with exactly one matching nonce retains thirty seconds to reach Phoenix;

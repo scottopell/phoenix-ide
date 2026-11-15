@@ -12,6 +12,8 @@ import {
   ChangeEvent,
   DragEvent,
   type SetStateAction,
+  type ReactNode,
+  useSyncExternalStore,
 } from 'react';
 import { Square, SendHorizontal, Zap } from 'lucide-react';
 import type { QueuedMessage } from '../hooks';
@@ -23,7 +25,9 @@ import { ImageAttachments } from './ImageAttachments';
 import { VoiceRecorder, isWebSpeechSupported } from './VoiceInput';
 import type { VoiceRecorderHandle } from './VoiceInput/VoiceRecorder';
 import type { ComposerDraftRecovery, DraftRevision, RejectedSubmission } from '../conversation/DraftStore';
-import { useDraftRecovery } from '../hooks/useDraft';
+import { useAnnotationDraft, useDraftRecovery } from '../hooks/useDraft';
+import { formatAnnotatedMessage } from '../conversation/AnnotationDraftStore';
+import { DraftAnnotationCards } from './DraftAnnotationCards';
 import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
 import { FILE_TREE_DRAG_TYPE } from './FileExplorer/FileTree';
 import './InputArea.css';
@@ -54,12 +58,13 @@ interface InputAreaProps {
    */
   cwd: string | undefined;
   /**
-   * Composer identity (the conversation id). Transient composer state — voice
+   * Local composer identity. Transient composer state — voice
    * buffer, active autocomplete trigger, inline expansion error — resets when
    * this changes, so switching between two conversations that share a `cwd`
    * doesn't carry one's state into the other.
    */
   scopeKey: string | undefined;
+  uploadConversationId: string | undefined;
   convState: ConversationState;
   images: ImageData[];
   setImages: (images: ImageData[]) => void;
@@ -82,6 +87,8 @@ interface InputAreaProps {
    *  commit, paste). */
   onDraftChange: (text: string) => void;
   draftRecovery?: ComposerDraftRecovery;
+  annotationCards?: ReactNode;
+  hasAnnotations?: boolean;
   /**
    * Monotonic counter bumped by the parent when it wants the textarea
    * focused (terminal selection arrival, retry-of-failed, skill insert,
@@ -90,7 +97,7 @@ interface InputAreaProps {
    */
   focusToken?: number;
   /** Optional action and context displayed directly above the composer. */
-  quickAction?: ComposerQuickAction | undefined;
+  quickAction?: Pick<ComposerQuickAction, 'label' | 'compactLabel'> & { send: () => Promise<void> | void } | undefined;
   /**
    * Called when the user sends a message.
    * May reject with an expansion error (REQ-IR-007) — the component will
@@ -101,6 +108,7 @@ interface InputAreaProps {
   onRetry: (localId: string) => void;
   onDismissError?: (localId: string) => void;
   readOnly?: boolean;
+  retainComposerDuringContinuation?: boolean;
 }
 
 function formatBytes(bytes: number): string {
@@ -147,6 +155,7 @@ function canAcceptChatMessage(state: ConversationState): boolean {
 export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function InputArea({
   cwd,
   scopeKey,
+  uploadConversationId,
   convState,
   images,
   setImages: onImagesChange,
@@ -159,12 +168,15 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   onDraftChange,
   focusToken,
   draftRecovery,
+  annotationCards,
+  hasAnnotations = false,
   onSend,
   quickAction,
   onCancel,
   onRetry,
   onDismissError,
   readOnly = false,
+  retainComposerDuringContinuation = false,
 }, ref) {
   const agentWorking = isAgentWorking(convState);
   const canCancel = !readOnly && canCancelConversationState(convState);
@@ -206,11 +218,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   recorderIdentityRef.current = recorderIdentity;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  // `scopeKey` is the conversation id for this (always in-conversation) composer;
-  // attachment uploads target it, and this ref lets an in-flight upload detect a
-  // conversation switch and discard its late response.
-  const scopeKeyRef = useRef(scopeKey);
-  scopeKeyRef.current = scopeKey;
+  const attachmentConversationId = uploadConversationId;
   const voiceSupported = isWebSpeechSupported();
   const [quickActionSending, setQuickActionSending] = useState(false);
 
@@ -267,7 +275,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
   // File-attachment drag/drop state.
   const [isDragOver, setIsDragOver] = useState(false);
-  const [isUploadingFiles, setIsUploadingFiles] = useState(false);
+  const [isUploadingFiles, setIsUploadingFiles] = useScopedState(scopeKey, false);
   owner.current.uploading = isUploadingFiles;
 
   // External draft insertions (file-tree context menu, drag-and-drop) bypass
@@ -347,12 +355,12 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       setExpansionError('Wait for the current attachment upload to finish before adding more files.');
       return;
     }
-    if (!scopeKey) {
+    if (!attachmentConversationId) {
       setExpansionError('Open a conversation before attaching files.');
       return;
     }
-
-    const uploadConversationId = scopeKey;
+    const uploadTarget = attachmentConversationId;
+    const uploadScopeEpoch = scopeEpoch;
 
     const unsupportedImage = dropped.find(file => file.type.startsWith('image/') && !SUPPORTED_IMAGE_TYPES.includes(file.type));
     if (unsupportedImage) {
@@ -384,13 +392,14 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     setIsUploadingFiles(true);
     setExpansionError(null);
     try {
-      const uploaded = await api.uploadAttachments(uploadConversationId, genericFiles);
-      if (scopeKeyRef.current !== uploadConversationId) return;
+      const uploaded = await api.uploadAttachments(uploadTarget, genericFiles);
+      if (owner.current.epoch !== uploadScopeEpoch) return;
       setFiles(prev => [...prev, ...uploaded]);
     } catch (err) {
+      if (owner.current.epoch !== uploadScopeEpoch) return;
       setExpansionError(err instanceof Error ? err.message : 'Failed to upload attachments');
     } finally {
-      setIsUploadingFiles(false);
+      if (owner.current.epoch === uploadScopeEpoch) setIsUploadingFiles(false);
     }
   };
 
@@ -482,7 +491,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       : draft;
     const text = rawText.trim();
 
-    if (!text && images.length === 0 && files.length === 0) return;
+    if (!text && images.length === 0 && files.length === 0 && !hasAnnotations) return;
     if (!acceptsChatMessage || isUploadingFiles) return;
     // The Send button is disabled while an expansion error is shown; gate the
     // keyboard (Enter) path too so a stale broken @reference isn't resubmitted
@@ -518,15 +527,13 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     try {
       await onSend(text, images, files);
     } catch (err) {
-      if (err instanceof ExpansionError) {
-        const rejection = { ...submitted, error: err.detail.error };
+      if (err instanceof ExpansionError || hasAnnotations) {
+        const rejection = { ...submitted, error: err instanceof ExpansionError ? err.detail.error : err instanceof Error ? err.message : 'Could not send your annotations.' };
         if (!restoreSubmission(rejection, submittedEpoch, clearedRevision, draftRevision)) {
           if (draftRecovery) draftRecovery.retainRejected(rejection);
           else if (mounted.current) setLocalRejected(items => [...items, { scopeKey: submittedScope, submission: rejection }]);
         }
       }
-      // Non-expansion errors: draft is already cleared; the message queue
-      // shows the failure with a retry button.
     }
   }, [
     voiceBase,
@@ -534,6 +541,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     draft,
     images,
     files,
+    hasAnnotations,
     acceptsChatMessage,
     expansionError,
     isUploadingFiles,
@@ -628,7 +636,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   // =========================================================================
 
   const displayedText = voiceBase !== null ? voiceBase : draft;
-  const hasContent = displayedText.trim().length > 0 || voiceInterim.trim().length > 0 || images.length > 0 || files.length > 0;
+  const hasContent = displayedText.trim().length > 0 || voiceInterim.trim().length > 0 || images.length > 0 || files.length > 0 || hasAnnotations;
   const canSend = acceptsChatMessage && !isUploadingFiles;
   const sendEnabled = !readOnly && canSend && hasContent && !expansionError;
   const recoveryRevision = owner.current.revision;
@@ -807,7 +815,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
         </div>
       )}
 
-      {convState.type === 'awaiting_continuation' ? (
+      {annotationCards}
+      {convState.type === 'awaiting_continuation' && (
         <div className="continuation-progress" role="status" aria-live="polite">
           <div className="continuation-progress-header">
             <span>Compacting conversation...</span>
@@ -818,7 +827,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           </div>
           <p className="continuation-progress-text">Phoenix is generating a continuation summary to preserve context for a new conversation.</p>
         </div>
-      ) : (
+      )}
+      {convState.type === 'awaiting_continuation' && !retainComposerDuringContinuation ? null : (
         <form
           className={`input-textarea-wrap${agentWorking ? ' input-textarea-wrap--working' : ''}`}
           onSubmit={(event) => {
@@ -854,7 +864,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                 onClick={async () => {
                   setQuickActionSending(true);
                   try {
-                    await onSend(quickAction.prompt, [], []);
+                    await quickAction.send();
                   } finally {
                     setQuickActionSending(false);
                   }
@@ -909,15 +919,36 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
  * Hosting the subscription in this wrapper keeps the re-render scoped to
  * the composer subtree — sibling components don't see keystroke churn.
  */
-export type ConnectedInputAreaProps = Omit<InputAreaProps, 'draft' | 'onDraftChange' | 'draftRecovery'> & {
+export type ConnectedInputAreaProps = Omit<InputAreaProps, 'draft' | 'onDraftChange' | 'draftRecovery' | 'annotationCards' | 'hasAnnotations' | 'quickAction'> & {
   slug: string;
+  quickAction?: ComposerQuickAction | undefined;
 };
 
 export const ConnectedInputArea = forwardRef<InputAreaHandle, ConnectedInputAreaProps>(
-  function ConnectedInputArea({ slug, ...rest }, ref) {
+  function ConnectedInputArea({ slug, quickAction, ...rest }, ref) {
     const draft = useDraftValue(slug);
     const { setDraft } = useDraftActions(slug);
     const draftRecovery = useDraftRecovery(slug);
-    return <InputArea ref={ref} {...rest} draft={draft} onDraftChange={setDraft} draftRecovery={draftRecovery} />;
+    const annotationDraft = useAnnotationDraft(slug);
+    const annotations = useSyncExternalStore(annotationDraft.subscribe, annotationDraft.getSnapshot);
+    const send = async (text: string, images: ImageData[], files: FileAttachment[]) => {
+      const submission = annotationDraft.getSnapshot().some(annotation => annotation.submission === null) ? annotationDraft.beginSubmission() : null;
+      try {
+        if (submission) await rest.onSend(formatAnnotatedMessage(text, submission.annotations), images, files);
+        else await rest.onSend(text, images, files);
+        if (submission) annotationDraft.finishSubmission(submission, true);
+      } catch (error) {
+        if (submission) annotationDraft.finishSubmission(submission, false);
+        throw error;
+      }
+    };
+    return <InputArea ref={ref} {...rest} draft={draft} onDraftChange={setDraft} draftRecovery={draftRecovery}
+      quickAction={quickAction ? {
+        label: quickAction.label,
+        compactLabel: quickAction.compactLabel,
+        send: () => rest.onSend(quickAction.prompt, [], []),
+      } : undefined}
+      onSend={send} hasAnnotations={annotations.some(annotation => annotation.submission === null)}
+      annotationCards={<DraftAnnotationCards draft={annotationDraft} annotations={annotations} disabled={Boolean(rest.readOnly) || !canAcceptChatMessage(rest.convState)} />} />;
   },
 );

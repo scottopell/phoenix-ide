@@ -935,7 +935,8 @@ final class AppModel {
         let startedNudgeGeneration = nudgePreferenceGeneration
         let startedEvidenceGeneration = attentionEvidenceGeneration
         let listToken = listStore.externalRefreshToken()
-        guard let fresh = try? await api.listConversations() else { return false }
+        guard let page = try? await api.listConversationPage() else { return false }
+        let fresh = page.conversations
         let provisioningShells = await listStore.confirmedMissingProvisioningShellRows(
             api: api,
             fresh: fresh)
@@ -947,6 +948,7 @@ final class AppModel {
               listStore.applyExternal(
                 fresh,
                 preserving: provisioningShells,
+                annotations: page,
                 startedAt: listToken)
         else { return false }
         let isCurrent: @MainActor () -> Bool = { [weak self] in
@@ -1094,6 +1096,43 @@ final class AppModel {
             return false
         }
         return true
+    }
+
+    /// Advance the server read cursor for a conversation the user is looking
+    /// at. Best-effort: a missed advance only leaves an unread dot until the
+    /// next view.
+    @discardableResult
+    func advanceRead(productConversationId: String, advance: ProductConversationReadAdvance) async -> Bool {
+        guard ClientOperation.readState.policy == .onlineOnly,
+              let api, connectivity.isOnline else { return false }
+        let startedGeneration = apiGeneration
+        guard let state = try? await api.markProductConversationRead(
+            productConversationId: productConversationId, advance: advance),
+              apiGeneration == startedGeneration
+        else { return false }
+        listStore.setReadState(state, forAggregateId: productConversationId)
+        return true
+    }
+
+    /// Explicit "mark unread to revisit later" / "mark read" from the list.
+    func setUnread(_ unread: Bool, productConversationId: String) async {
+        guard ClientOperation.readState.policy == .onlineOnly,
+              let api, connectivity.isOnline
+        else {
+            lastActionError = "Changing read state needs a connection."
+            return
+        }
+        let startedGeneration = apiGeneration
+        do {
+            let state = unread
+                ? try await api.markProductConversationUnread(productConversationId: productConversationId)
+                : try await api.markProductConversationRead(
+                    productConversationId: productConversationId, advance: .acknowledged)
+            guard apiGeneration == startedGeneration else { return }
+            listStore.setReadState(state, forAggregateId: productConversationId)
+        } catch {
+            lastActionError = (error as? APIError)?.errorDescription ?? error.localizedDescription
+        }
     }
 
     @discardableResult
@@ -1875,6 +1914,7 @@ final class AppModel {
 
     private func applyAggregateListForReconciliation(
         _ fresh: [Conversation],
+        annotations page: PhoenixAPI.ConversationListPage? = nil,
         startedAt token: ConversationListStore.ExternalRefreshToken,
         startedGeneration: Int,
         reconciliationId: UUID
@@ -1898,6 +1938,7 @@ final class AppModel {
         return listStore.applyExternal(
             fresh,
             preserving: provisioningShells,
+            annotations: page,
             startedAt: token)
     }
 
@@ -1917,9 +1958,11 @@ final class AppModel {
             attempt: { [weak self] in
                 guard let self else { return nil }
                 let token = self.listStore.externalRefreshToken()
-                let fresh = try await api.listConversations()
+                let page = try await api.listConversationPage()
+                let fresh = page.conversations
                 guard await self.applyAggregateListForReconciliation(
                     fresh,
+                    annotations: page,
                     startedAt: token,
                     startedGeneration: startedGeneration,
                     reconciliationId: reconciliationId)

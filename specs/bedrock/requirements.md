@@ -823,7 +823,9 @@ AND display the continuation summary prominently
 AND offer action to start new conversation
 
 EACH stable ordinary ProductConversation aggregate and THE stable Global Coordinator aggregate SHALL own one prospective `auto_continue_on_context_exhaustion` setting
-AND the setting SHALL default to OFF independently for each aggregate
+AND the setting SHALL initialize to ON independently for each newly created aggregate
+AND existing persisted ON and OFF preferences SHALL remain unchanged by initialization, upgrade, restart, or continuation
+AND an explicit OFF preference SHALL remain OFF until explicitly changed
 AND subordinate conversations, sub-agents, legacy row-only routes, and aggregates other than those two typed kinds SHALL NOT own or inherit that setting
 
 WHEN a continuation summary is committed and its latest parent transcript row enters context exhausted state

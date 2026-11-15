@@ -24,9 +24,23 @@ describe('Slack gateway schema compatibility', () => {
     const tools = catalog(); tools.find(tool => tool.name === 'slack_send_message')!.input_schema = schema;
     expect(slackGatewayToolProblem(tools, 'slack')).toContain('Incompatible tool schema: slack_send_message');
   });
+  it('also checks identity searches that omit the message-only restriction', () => {
+    const tools = catalog();
+    tools.find(tool => tool.name === 'slack_search_public_and_private')!.input_schema = {
+      type: 'object', required: ['content_types'], properties: { content_types: { const: 'messages' } },
+    };
+    expect(slackGatewayToolProblem(tools, 'slack')).toContain('Incompatible tool schema: slack_search_public_and_private');
+  });
   it('isolates schema identifiers between independently advertised tools', () => {
     const tools = catalog().map(tool => ({ ...tool, input_schema: { $id: 'https://example.test/arguments', type: 'object' } }));
     expect(slackGatewayToolProblem(tools, 'slack')).toBeNull();
+  });
+  it('checks the message-only search argument used by discovery', () => {
+    const tools = catalog();
+    tools.find(tool => tool.name === 'slack_search_public_and_private')!.input_schema = {
+      type: 'object', properties: { content_types: { const: 'files' } },
+    };
+    expect(slackGatewayToolProblem(tools, 'slack')).toContain('Incompatible tool schema: slack_search_public_and_private');
   });
   it('reports unsupported schemas as unverified instead of healthy', () => {
     const tools = catalog(); tools[0]!.input_schema = { $ref: 'https://unavailable.example/schema' };

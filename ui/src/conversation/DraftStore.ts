@@ -1,5 +1,6 @@
 import { RoutedStore } from './RoutedStore';
 import type { FileAttachment, ImageData } from '../api';
+import { AnnotationDraftStore } from './AnnotationDraftStore';
 
 export interface RejectedSubmission {
   id: string;
@@ -15,6 +16,7 @@ const NO_REJECTIONS: readonly RejectedSubmission[] = [];
 export type DraftRevision = DraftAtom;
 
 export interface DraftRecovery {
+  isCurrent(): boolean;
   readRevision(): DraftRevision;
   clearForSubmission(): DraftRevision;
   restoreIfUnchanged(revision: DraftRevision, text: string): boolean;
@@ -81,6 +83,7 @@ export function draftReducer(atom: DraftAtom, action: DraftAction): DraftAtom {
 }
 
 export class DraftStore extends RoutedStore<string, DraftAtom, DraftAction> {
+  readonly annotations = new AnnotationDraftStore();
   private readonly rejected = new Map<string, readonly RejectedSubmission[]>();
   private readonly recoveries = new Map<string, DraftRecovery>();
   private readonly invalidRevision: DraftRevision = { draft: '' };
@@ -96,6 +99,7 @@ export class DraftStore extends RoutedStore<string, DraftAtom, DraftAction> {
     this.getSnapshot(slug);
     const isCurrent = () => this.recoveries.get(slug) === recovery;
     const recovery: DraftRecovery = {
+      isCurrent,
       readRevision: () => isCurrent() ? this.getSnapshot(slug) : this.invalidRevision,
       clearForSubmission: () => {
         if (!isCurrent()) return this.invalidRevision;
@@ -135,6 +139,7 @@ export class DraftStore extends RoutedStore<string, DraftAtom, DraftAction> {
    * separately at the cascade site.
    */
   remove(slug: string): void {
+    this.annotations.remove(slug);
     this.recoveries.delete(slug);
     this.rejected.delete(slug);
     this.removeAtom(slug);

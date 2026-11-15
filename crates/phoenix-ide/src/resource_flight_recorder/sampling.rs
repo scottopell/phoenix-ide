@@ -139,6 +139,15 @@ fn host_bytes(
     ]
 }
 
+fn set_disk_observation(sample: &mut Sample, roles: Option<[Option<u64>; 3]>, time: Option<u64>) {
+    if let Some(roles) = roles {
+        if roles.iter().any(Option::is_some) {
+            sample.disk_unix_ms = time;
+        }
+        sample.disk_available_bytes = roles;
+    }
+}
+
 pub(crate) fn spawn_sampler(state: AppState, handle: Handle) {
     tokio::spawn(async move {
         while next_attempt(&handle).await {
@@ -153,9 +162,8 @@ pub(crate) fn spawn_sampler(state: AppState, handle: Handle) {
             sample.managed_pid_count =
                 Some(u64::from(summary.managed_total.deduplicated_pid_count));
             sample.host_bytes = host_bytes(&generation.host, generation.host_swap);
-            sample.disk_available_bytes =
-                crate::api::deployment_observations::recorder_space(&state.runtime_env).await;
-            sample.disk_unix_ms = unix_ms();
+            let disk = crate::api::deployment_observations::recorder_space(&state.runtime_env).await;
+            set_disk_observation(&mut sample, disk, unix_ms());
             sample.live_materialized_handles = state.runtime.live_materialized_handle_count();
             let mut failure_counts = failures(&mut sample);
             let sinks = crate::logging::observations::snapshot(&state.deployment.log);
@@ -264,6 +272,25 @@ mod tests {
         }
         assert_eq!(value["b"], serde_json::json!([null, null, null, null]));
         assert_eq!(value["s"], serde_json::json!([null, null, null]));
+    }
+
+    #[test]
+    fn disk_time_requires_at_least_one_successful_role() {
+        let mut sample = unavailable(Phase::Running);
+        set_disk_observation(&mut sample, None, Some(123));
+        let value = serde_json::to_value(sample).unwrap();
+        assert!(value["d"].is_null());
+        assert_eq!(value["s"], serde_json::json!([null, null, null]));
+
+        set_disk_observation(&mut sample, Some([None; 3]), Some(123));
+        let value = serde_json::to_value(sample).unwrap();
+        assert!(value["d"].is_null());
+        assert_eq!(value["s"], serde_json::json!([null, null, null]));
+
+        set_disk_observation(&mut sample, Some([Some(0), None, None]), Some(123));
+        let value = serde_json::to_value(sample).unwrap();
+        assert_eq!(value["d"], 123);
+        assert_eq!(value["s"], serde_json::json!([0, null, null]));
     }
 
     #[tokio::test(start_paused = true)]

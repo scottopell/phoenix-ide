@@ -11,6 +11,7 @@ use phoenix_core::work_scope::WorkScopeId;
 
 use super::{DbError, DbResult, ProjectSeedId};
 
+mod federated_conversation_actions;
 mod federated_subscriptions;
 mod goal_execution;
 mod local_goal_watch;
@@ -806,6 +807,41 @@ const MIGRATIONS: &[Migration] = &[
         version: 155,
         name: "ordinary_self_goal_admission",
         sql: include_str!("migrations/ordinary_self_goal_admission.sql"),
+    },
+    Migration {
+        version: 156,
+        name: "remote_coordinator_goals",
+        sql: include_str!("migrations/remote_coordinator_goals.sql"),
+    },
+    Migration {
+        version: 158,
+        name: "federated_conversation_actions",
+        sql: "-- Native conversation action source qualification (special migration runner).",
+    },
+    Migration {
+        version: 159,
+        name: "federated_continuation_receipts",
+        sql: include_str!("migrations/federated_continuation_receipts.sql"),
+    },
+    Migration {
+        version: 160,
+        name: "slack_trigger_emojis",
+        sql: include_str!("migrations/slack_trigger_emojis.sql"),
+    },
+    Migration {
+        version: 161,
+        name: "slack_single_trigger_emoji",
+        sql: include_str!("migrations/slack_single_trigger_emoji.sql"),
+    },
+    Migration {
+        version: 162,
+        name: "slack_saved_capture",
+        sql: include_str!("migrations/slack_saved_capture.sql"),
+    },
+    Migration {
+        version: 163,
+        name: "product_conversation_read_state",
+        sql: include_str!("migrations/product_conversation_read_state.sql"),
     },
 ];
 
@@ -12017,6 +12053,7 @@ async fn migration_080_prepare(tx: &mut Transaction<'_, Sqlite>) -> DbResult<boo
 }
 
 mod coordinator_home;
+mod slack_saved_capture;
 
 struct WritableSchemaGuard {
     connection: Option<sqlx::pool::PoolConnection<Sqlite>>,
@@ -12294,6 +12331,75 @@ pub(crate) async fn run_unpublished_tools_d3_for_test(pool: &SqlitePool) -> DbRe
     run_migration_list(pool, &unpublished).await
 }
 
+struct ForeignKeysDisabledConnection {
+    connection: sqlx::pool::PoolConnection<Sqlite>,
+    armed: bool,
+}
+
+impl Drop for ForeignKeysDisabledConnection {
+    fn drop(&mut self) {
+        if self.armed {
+            self.connection.close_on_drop();
+        }
+    }
+}
+
+async fn run_migration_156(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
+    let mut guard = ForeignKeysDisabledConnection {
+        connection: pool.acquire().await?,
+        armed: true,
+    };
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *guard.connection)
+        .await?;
+    let result = async {
+        let mut tx = guard.connection.begin_with("BEGIN IMMEDIATE").await?;
+        let result: DbResult<()> = async {
+            sqlx::raw_sql(migration.sql).execute(&mut *tx).await?;
+            let violation = sqlx::query(
+                "SELECT 1 FROM pragma_foreign_key_check WHERE \"table\" IN (
+                'conversation_goal_actors','conversation_goal_preparations',
+                'conversation_goal_coordinator_receipts','conversation_goal_history') LIMIT 1",
+            )
+            .fetch_optional(&mut *tx)
+            .await?;
+            if violation.is_some() {
+                return Err(DbError::Serialization(
+                    "migration 156 left invalid goal foreign keys".to_string(),
+                ));
+            }
+            sqlx::query("INSERT INTO _migrations (version, name) VALUES (?, ?)")
+                .bind(migration.version)
+                .bind(migration.name)
+                .execute(&mut *tx)
+                .await?;
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => tx.commit().await.map_err(DbError::from),
+            Err(error) => {
+                tx.rollback().await?;
+                Err(error)
+            }
+        }
+    }
+    .await;
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *guard.connection)
+        .await?;
+    let enabled: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+        .fetch_one(&mut *guard.connection)
+        .await?;
+    if enabled != 1 {
+        return Err(DbError::Serialization(
+            "migration 156 could not restore foreign keys".to_string(),
+        ));
+    }
+    guard.armed = false;
+    result
+}
+
 #[cfg(test)]
 pub(crate) async fn run_through_for_test(pool: &SqlitePool, version: u32) -> DbResult<u32> {
     let end = MIGRATIONS.partition_point(|migration| migration.version <= version);
@@ -12376,8 +12482,26 @@ async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbRe
             continue;
         }
 
+        if migration.version == 158 {
+            federated_conversation_actions::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
         if migration.version == 133 {
             federated_subscriptions::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 156 {
+            run_migration_156(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 162 {
+            slack_saved_capture::run(pool, migration).await?;
             applied += 1;
             continue;
         }
@@ -13253,6 +13377,397 @@ END;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn migration_163_seeds_existing_product_conversations_as_read() {
+        use phoenix_core::domain::llm_types::ContentBlock;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("read-state.db");
+        let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+        run_through_for_test(db.pool(), 162).await.unwrap();
+        let conversation = db
+            .create_conversation("seeded", "seeded", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "seeded-agent",
+            &conversation.id,
+            &crate::MessageContent::agent(vec![ContentBlock::text("done")]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(run_through_for_test(db.pool(), 163).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(db.pool(), 163).await.unwrap(), 0);
+        let cursor: Option<String> = sqlx::query_scalar(
+            "SELECT read_through_message_id FROM product_conversation_read_state
+             WHERE product_conversation_id = ?1",
+        )
+        .bind(conversation.product_conversation_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(cursor.as_deref(), Some("seeded-agent"));
+        let states = db.list_product_conversation_read_states().await.unwrap();
+        assert!(states
+            .iter()
+            .all(|entry| entry.read_state == crate::ProductConversationReadState::Read));
+    }
+
+    #[tokio::test]
+    async fn migration_160_defaults_to_fire_without_reinitializing_existing_discovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("slack-emojis.db");
+        let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+        run_through_for_test(db.pool(), 159).await.unwrap();
+        let config = r#"{"workspace":"example.slack.com","owner":"UOWNER","enabled":true}"#;
+        db.set_app_setting("slack_gateway", config).await.unwrap();
+        sqlx::raw_sql("INSERT INTO slack_gateway_accounts(workspace,owner,baseline_complete,status,last_scan_at_unix_micros,retry_at_us) VALUES ('example.slack.com','UOWNER',1,'healthy',123,456); INSERT INTO slack_gateway_discovery(workspace,owner,kind,after_date,cursor) VALUES ('example.slack.com','UOWNER','reaction','2026-11-01','retained-cursor');").execute(db.pool()).await.unwrap();
+        assert_eq!(run_through_for_test(db.pool(), 160).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(db.pool(), 160).await.unwrap(), 0);
+        let rows: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM slack_gateway_trigger_emojis ORDER BY ordinal")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(rows, ["fire"]);
+        let account: (bool, String, i64, i64) = sqlx::query_as("SELECT baseline_complete,status,last_scan_at_unix_micros,retry_at_us FROM slack_gateway_accounts").fetch_one(db.pool()).await.unwrap();
+        assert_eq!(account, (true, "healthy".into(), 123, 456));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT cursor FROM slack_gateway_discovery")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            "retained-cursor"
+        );
+        assert_eq!(
+            db.get_app_setting("slack_gateway")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(config)
+        );
+        db.pool().close().await;
+        let reopened = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(run_through_for_test(reopened.pool(), 162).await.unwrap(), 2);
+        assert_eq!(run_through_for_test(reopened.pool(), 162).await.unwrap(), 0);
+        let value: serde_json::Value =
+            serde_json::from_str(&reopened.slack_configuration().await.unwrap().unwrap()).unwrap();
+        assert_eq!(value["trigger_emoji"], serde_json::json!("fire"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn migration_161_retains_the_first_emoji_and_durable_work() {
+        // REQ-SG-018
+        for multiple in [false, true] {
+            for ready in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("slack-single.db");
+                let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+                run_through_for_test(db.pool(), 160).await.unwrap();
+                db.set_app_setting(
+                    "slack_gateway",
+                    r#"{"workspace":"example.slack.com","owner":"UOWNER","enabled":true}"#,
+                )
+                .await
+                .unwrap();
+                sqlx::query("UPDATE slack_gateway_trigger_emojis SET name='phoenix-please-look'")
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                if multiple {
+                    sqlx::query(
+                        "INSERT INTO slack_gateway_trigger_emojis(name,ordinal) VALUES ('fire',1)",
+                    )
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                }
+                let source = crate::SlackSource {
+                    workspace: "example.slack.com".into(),
+                    owner: "UOWNER".into(),
+                    channel: "C123".into(),
+                    message_ts: "100.000001".into(),
+                    thread_ts: "100.000001".into(),
+                    source_url: "https://example.slack.com/archives/C123/p100000001".into(),
+                    instruction: "investigate".into(),
+                    context: "quoted".into(),
+                    observed_at_unix_micros: 1,
+                    kind: crate::SlackRequestKind::Explicit,
+                    trigger_kind: crate::SlackTriggerKind::Prefix,
+                };
+                sqlx::raw_sql("INSERT INTO slack_gateway_bindings(binding_id,workspace,owner,channel,thread_ts,kind,creation_id) VALUES ('retained-binding','example.slack.com','UOWNER','C123','100.000001','explicit','retained-creation'); INSERT INTO slack_gateway_requests(request_id,workspace,owner,channel,message_ts,thread_ts,kind,instruction,context,source_url,binding_id,accepted_at_unix_micros,input_id,observed_at_unix_micros,trigger_kind) VALUES ('retained-request','example.slack.com','UOWNER','C123','100.000001','100.000001','explicit','investigate','quoted','https://example.slack.com/archives/C123/p100000001','retained-binding',1,'retained-input',1,'prefix');").execute(db.pool()).await.unwrap();
+                let requests = db
+                    .slack_requests(&source.workspace, &source.owner)
+                    .await
+                    .unwrap();
+                let request = &requests[0];
+                sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,created_at_unix_micros) VALUES ('retained',?1,'done','thread','reply',1)").bind(&request.binding_id).execute(db.pool()).await.unwrap();
+                sqlx::query("INSERT INTO slack_gateway_return_coverage(return_id,request_id) VALUES ('retained',?1)").bind(&request.request_id).execute(db.pool()).await.unwrap();
+                sqlx::query(
+                    "INSERT INTO slack_gateway_accounts(workspace,owner,baseline_complete,retry_at_us) VALUES ('example.slack.com','UOWNER',?1,456)",
+                )
+                .bind(ready)
+                .execute(db.pool())
+                .await
+                .unwrap();
+                sqlx::query("INSERT INTO slack_gateway_discovery(workspace,owner,kind,after_date,cursor) VALUES ('example.slack.com','UOWNER','reaction','2026-11-01','retained-cursor')").execute(db.pool()).await.unwrap();
+                assert_eq!(run_through_for_test(db.pool(), 162).await.unwrap(), 2);
+                assert_eq!(run_through_for_test(db.pool(), 162).await.unwrap(), 0);
+                let value: serde_json::Value =
+                    serde_json::from_str(&db.slack_configuration().await.unwrap().unwrap())
+                        .unwrap();
+                assert_eq!(value["trigger_emoji"], "phoenix-please-look");
+                assert!(value.get("trigger_emojis").is_none());
+                let account: (bool, i64) = sqlx::query_as(
+                    "SELECT baseline_complete,retry_at_us FROM slack_gateway_accounts",
+                )
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                assert_eq!(account, (ready, 456));
+                assert_eq!(
+                    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM slack_gateway_discovery")
+                        .fetch_one(db.pool())
+                        .await
+                        .unwrap(),
+                    i64::from(!multiple)
+                );
+                assert_eq!(
+                    db.slack_requests(&source.workspace, &source.owner)
+                        .await
+                        .unwrap()[0]
+                        .request_id,
+                    request.request_id
+                );
+                assert_eq!(
+                    db.slack_returns(&source.workspace, &source.owner)
+                        .await
+                        .unwrap()[0]
+                        .request_ids,
+                    vec![request.request_id.clone()]
+                );
+                assert!(db
+                    .slack_source_recorded(
+                        &source.workspace,
+                        &source.owner,
+                        &source.channel,
+                        &source.message_ts,
+                        source.trigger_kind,
+                    )
+                    .await
+                    .unwrap());
+                assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sqlite_schema WHERE name='slack_gateway_trigger_emojis'").fetch_one(db.pool()).await.unwrap(), 0);
+                db.pool().close().await;
+                let reopened = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+                assert_eq!(run_through_for_test(reopened.pool(), 161).await.unwrap(), 0);
+                assert_eq!(
+                    reopened.slack_configuration().await.unwrap(),
+                    Some(value.to_string())
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn migration_156_preserves_populated_local_goal_ledger_and_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("migration-156.db");
+        let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+        let pool = db.pool().clone();
+        run_through_for_test(&pool, 155).await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let source_product_id = coordinator.product_conversation_id.to_string();
+        sqlx::raw_sql(
+            "INSERT INTO product_conversations(id,kind,ordinary_lifecycle) VALUES('owner','ordinary','open');
+             INSERT INTO conversation_goal_ids(goal_id,objective,owner_id) VALUES('goal','objective','owner');
+             INSERT INTO conversation_goal_actors(actor_id,owner_id,kind,host_action_id)
+                 VALUES(1,'owner','generated_host','host-action');
+             INSERT INTO conversation_goal_history(owner_id,version,goal_id,state,action_id,change_kind,requested_actor_id,applied_actor_id,recorded_at_us)
+                 VALUES('owner',1,'goal','underway','goal-action','create',1,1,100);
+             INSERT INTO workflows(workflow_id,profile_kind,profile_version,runtime_acceptance_enabled,external_acceptance_enabled,version,generation,status,snapshot_codec_family,snapshot_codec_version,snapshot_payload,created_at,updated_at)
+                 VALUES(1,'direct_turn',1,0,1,1,0,'Active','direct_turn.snapshot',1,X'01',1,1);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO durable_turns(turn_id,workflow_id,conversation_id,client_turn_key,prepared_fingerprint,prepared_payload,disposition,generation,owns_conversation,origin_kind,canonical_message_id,materialized) VALUES(1,1,?,'migration-turn','migration-fingerprint',X'01','Runtime',0,1,'user_api',NULL,0)")
+            .bind(&coordinator.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO messages(message_id,conversation_id,sequence_id,message_type,content,created_at) VALUES('message',?,1,'agent','{}','2026-10-31T00:00:00Z')")
+            .bind(&coordinator.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO conversation_goal_preparations(reference,owner_id,caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,tool_use_id,operation,expected_version,objective) VALUES(zeroblob(16),'owner',?,?,1,1,'message','tool','create',0,'prepared objective')")
+            .bind(&coordinator.id)
+            .bind(&source_product_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO conversation_goal_coordinator_receipts(preparation_reference,owner_id,outcome,result_version,recorded_at_us) VALUES(zeroblob(16),'owner','rejected_busy',0,101)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let before: Vec<(String, String)> = sqlx::query_as(
+            "SELECT type,name FROM sqlite_schema
+             WHERE name LIKE 'conversation_goal_%'
+               AND name NOT IN (
+                 'conversation_goal_local_preparations_source_call',
+                 'conversation_goal_remote_preparations_source_call',
+                 'conversation_goal_remote_receipts_require_claimed'
+               )
+             ORDER BY type,name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        run_through_for_test(&pool, 156).await.unwrap();
+        let after: Vec<(String, String)> = sqlx::query_as(
+            "SELECT type,name FROM sqlite_schema
+             WHERE name LIKE 'conversation_goal_%'
+               AND name NOT IN (
+                 'conversation_goal_local_preparations_source_call',
+                 'conversation_goal_remote_preparations_source_call',
+                 'conversation_goal_remote_receipts_require_claimed'
+               )
+             ORDER BY type,name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(before, after);
+        let source_call_indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_schema
+             WHERE type='index' AND name IN (
+               'conversation_goal_local_preparations_source_call',
+               'conversation_goal_remote_preparations_source_call'
+             ) ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            source_call_indexes,
+            vec![
+                "conversation_goal_local_preparations_source_call".to_owned(),
+                "conversation_goal_remote_preparations_source_call".to_owned(),
+            ]
+        );
+        let receipt_claim_trigger: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type='trigger' AND name='conversation_goal_remote_receipts_require_claimed'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(receipt_claim_trigger, 1);
+        let enrollment_fk: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT \"table\",\"from\",\"on_delete\" FROM pragma_foreign_key_list('conversation_goal_preparations') WHERE \"from\"='enrollment_id'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            enrollment_fk,
+            vec![(
+                "federation_enrollments".to_owned(),
+                "enrollment_id".to_owned(),
+                "NO ACTION".to_owned()
+            )]
+        );
+        let preparation_columns: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('conversation_goal_preparations')",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(!preparation_columns.contains(&"source_instance_id".to_owned()));
+        assert!(preparation_columns.contains(&"apply_state".to_owned()));
+        for (table, expected) in [
+            ("conversation_goal_ids", 1),
+            ("conversation_goal_actors", 1),
+            ("conversation_goal_history", 1),
+            ("conversation_goal_preparations", 1),
+            ("conversation_goal_coordinator_receipts", 1),
+        ] {
+            let count: i64 =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(count, expected, "{table}");
+        }
+        let local: (Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT enrollment_id,expires_at_us FROM conversation_goal_preparations WHERE source_kind='local'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(local, (None, None));
+        let violations: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[tokio::test]
+    async fn migration_156_applies_when_158_is_already_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("migration-156-after-158.db");
+        let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+        let pool = db.pool();
+
+        run_through_for_test(pool, 155).await.unwrap();
+        let migration_158 = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 158)
+            .expect("migration 158 must remain registered");
+        federated_conversation_actions::run(pool, migration_158)
+            .await
+            .unwrap();
+
+        let before: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM _migrations WHERE version >= 156 ORDER BY version",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(before, vec![158]);
+
+        assert_eq!(run_pending_migrations(pool).await.unwrap(), 6);
+
+        let after: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM _migrations WHERE version >= 156 ORDER BY version",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(after, vec![156, 158, 159, 160, 161, 162, 163]);
+        sqlx::query("SELECT enrollment_id FROM conversation_goal_actors LIMIT 0")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("SELECT objective_source_instance_id FROM product_creation_jobs LIMIT 0")
+            .execute(pool)
+            .await
+            .unwrap();
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     #[tokio::test]
     async fn slack_final_schema_excludes_obsolete_prototype_storage() {
@@ -15727,7 +16242,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(run_through_for_test(db.pool(), 152).await.unwrap(), 1);
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 2);
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 9);
         assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
         let ledger: Vec<(i64, String)> = sqlx::query_as(
             "SELECT version, name FROM _migrations WHERE version >= 150 ORDER BY version",
@@ -15743,6 +16258,13 @@ mod tests {
                 (152, "goal_preparation_inflight_source".into()),
                 (153, "close_writer_observations".into()),
                 (155, "ordinary_self_goal_admission".into()),
+                (156, "remote_coordinator_goals".into()),
+                (158, "federated_conversation_actions".into()),
+                (159, "federated_continuation_receipts".into()),
+                (160, "slack_trigger_emojis".into()),
+                (161, "slack_single_trigger_emoji".into()),
+                (162, "slack_saved_capture".into()),
+                (163, "product_conversation_read_state".into()),
             ]
         );
     }
@@ -15752,6 +16274,13 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (163, "product_conversation_read_state"),
+            (162, "slack_saved_capture"),
+            (161, "slack_single_trigger_emoji"),
+            (160, "slack_trigger_emojis"),
+            (159, "federated_continuation_receipts"),
+            (158, "federated_conversation_actions"),
+            (156, "remote_coordinator_goals"),
             (155, "ordinary_self_goal_admission"),
             (153, "close_writer_observations"),
             (152, "goal_preparation_inflight_source"),
@@ -15794,7 +16323,6 @@ mod tests {
             (115, "federation_enrollments"),
             (114, "persist_instance_identity"),
             (113, "settle_historical_continuation_openings"),
-            (112, "input_source_tool_call"),
         ];
         assert_eq!(
             ledger
@@ -20022,6 +20550,13 @@ mod tests {
                 (152, "goal_preparation_inflight_source"),
                 (153, "close_writer_observations"),
                 (155, "ordinary_self_goal_admission"),
+                (156, "remote_coordinator_goals"),
+                (158, "federated_conversation_actions"),
+                (159, "federated_continuation_receipts"),
+                (160, "slack_trigger_emojis"),
+                (161, "slack_single_trigger_emoji"),
+                (162, "slack_saved_capture"),
+                (163, "product_conversation_read_state"),
             ]
         );
         let goal = MIGRATIONS
@@ -20035,7 +20570,7 @@ mod tests {
         assert!(goal
             .sql
             .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
-        assert_eq!(MIGRATIONS.len(), 153);
+        assert_eq!(MIGRATIONS.len(), 160);
     }
 
     #[tokio::test]
@@ -20051,7 +20586,7 @@ mod tests {
         }
         sqlx::query("UPDATE product_creation_jobs SET status = 'published', published_product_id = 'deleted-product', published_conversation_id = 'deleted-transcript' WHERE request_id = 'orphan-image'")
             .execute(&pool).await.unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 6);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 13);
         let identity: Vec<(String, String)> = sqlx::query_as(
             "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
         ).fetch_all(&pool).await.unwrap();
@@ -20105,7 +20640,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 6);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 13);
         let retained: (String, String, String) = sqlx::query_as(
             "SELECT status, published_product_id, published_conversation_id
              FROM product_creation_jobs WHERE request_id = 'orphan-text'",

@@ -42,6 +42,7 @@ enum ClientOperation {
     case archive
     case close
     case delete
+    case readState
     case conversationAction(ConversationAction)
 
     enum DeliveryPolicy: Equatable {
@@ -53,7 +54,7 @@ enum ClientOperation {
         switch self {
         case .chat:
             return .outboxed
-        case .archive, .close, .delete, .conversationAction:
+        case .archive, .close, .delete, .readState, .conversationAction:
             return .onlineOnly
         }
     }

@@ -104,6 +104,13 @@ pub enum NativeDefault {
     Unknown,
 }
 
+fn effort_levels_are_unique(levels: &[ModelEffort]) -> bool {
+    levels
+        .iter()
+        .enumerate()
+        .all(|(index, level)| !levels[..index].contains(level))
+}
+
 impl EffortCapabilities {
     #[must_use]
     pub const fn unsupported() -> Self {
@@ -117,13 +124,17 @@ impl EffortCapabilities {
 
     /// # Panics
     ///
-    /// Panics when `levels` is empty or a known native default is not one of the
-    /// supported levels.
+    /// Panics when `levels` is empty or contains duplicates, or when a known
+    /// native default is not one of the supported levels.
     #[must_use]
     pub fn supported(levels: &[ModelEffort], native_default: NativeDefault) -> Self {
         assert!(
             !levels.is_empty(),
             "supported effort levels must be non-empty"
+        );
+        assert!(
+            effort_levels_are_unique(levels),
+            "supported effort levels must be unique"
         );
         if let NativeDefault::Known(level) = native_default {
             assert!(
@@ -501,6 +512,12 @@ fn validate_external_effort_capabilities(
                     spec.id
                 ));
             }
+            if !effort_levels_are_unique(levels) {
+                return Err(format!(
+                    "model '{}' must not declare duplicate supported effort levels",
+                    spec.id
+                ));
+            }
             if matches!(spec.backend, ExternalBackend::Anthropic)
                 && levels
                     .iter()
@@ -873,6 +890,12 @@ mod tests {
     use super::*;
 
     #[test]
+    #[should_panic(expected = "supported effort levels must be unique")]
+    fn supported_effort_capabilities_reject_duplicate_levels() {
+        let _ = EffortCapabilities::supported_unknown(&[ModelEffort::Low, ModelEffort::Low]);
+    }
+
+    #[test]
     fn catalog_output_maxima_are_explicit_and_fit_context() {
         for model in all_models() {
             let expected = if model.id == "claude-haiku-4-5" {
@@ -1121,6 +1144,27 @@ mod tests {
         .expect("top-level external model array parses");
 
         assert!(models.is_empty());
+    }
+
+    #[test]
+    fn duplicate_external_effort_levels_reject_only_the_invalid_model() {
+        let models = parse_external_models(
+            r#"[
+                {"id":"duplicate","backend":"openai_responses","description":"Duplicate metadata","context_window":128000,"max_output_tokens":32768,"recommended":false,"supports_tool_search":false,"effort_capabilities":{"support":"supported","levels":["low","low"]}},
+                {"id":"valid","backend":"openai_responses","description":"Valid metadata","context_window":128000,"max_output_tokens":32768,"recommended":false,"supports_tool_search":false,"effort_capabilities":{"support":"supported","levels":["low","high"],"native_default":"high"}}
+            ]"#,
+        )
+        .expect("top-level external model array parses");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "valid");
+        assert_eq!(
+            models[0].effort_capabilities,
+            EffortCapabilities::supported_known(
+                &[ModelEffort::Low, ModelEffort::High],
+                ModelEffort::High,
+            )
+        );
     }
 
     #[test]

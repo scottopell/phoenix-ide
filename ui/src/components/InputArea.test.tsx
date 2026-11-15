@@ -46,22 +46,24 @@ function RecoveryHarness({ send, scope = 'a', initialDraft = '  @missing.ts\n', 
   const [draft, setDraft] = useState(initialDraft);
   const [images, setImages] = useState<ImageData[]>(initialImages);
   const [files, setFiles] = useState<FileAttachment[]>([rejectedFile]);
-  return <InputArea cwd={undefined} scopeKey={scope} convState={idleState}
+  return <InputArea cwd={undefined} scopeKey={scope} uploadConversationId={scope} convState={idleState}
     draft={draft} onDraftChange={setDraft} images={images} setImages={setImages}
     files={files} setFiles={setFiles} isOffline={false} failedMessages={[]}
     onSend={send} onCancel={() => {}} onRetry={() => {}} />;
 }
 
-function ConnectedRecoveryHarness({ store, send, scope = 'a' }: {
+function ConnectedRecoveryHarness({ store, send, scope = 'a', initialFiles = [rejectedFile], quickAction }: {
   store: DraftStore;
+  quickAction?: ComposerQuickAction;
   send: (text: string, images: ImageData[], files: FileAttachment[]) => Promise<void>;
   scope?: string;
+  initialFiles?: FileAttachment[];
 }) {
   const [images, setImages] = useState<ImageData[]>([]);
-  const [files, setFiles] = useState<FileAttachment[]>([rejectedFile]);
+  const [files, setFiles] = useState<FileAttachment[]>(initialFiles);
   return <DraftContext.Provider value={store}>
     <button onClick={() => setFiles([{ ...rejectedFile, original_name: 'new.txt', stored_path: '/uploads/a/new.txt' }])}>Attach newer file</button>
-    <ConnectedInputArea slug={scope} cwd={undefined} scopeKey={scope} convState={idleState}
+    <ConnectedInputArea quickAction={quickAction} slug={scope} cwd={undefined} scopeKey={scope} uploadConversationId={scope} convState={idleState}
       images={images} setImages={setImages} files={files} setFiles={setFiles}
       isOffline={false} failedMessages={[]} onSend={send} onCancel={() => {}} onRetry={() => {}} />
   </DraftContext.Provider>;
@@ -70,6 +72,84 @@ function ConnectedRecoveryHarness({ store, send, scope = 'a' }: {
 async function rejectExpansion(pending: ReturnType<typeof deferredSend>) {
   await act(async () => pending.reject(new ExpansionError({ error: 'Missing file', error_type: 'file_not_found', reference: '@missing.ts' })));
 }
+
+describe('editable annotation cards', () => {
+  const source = { messageId: 'answer', sequenceId: 2, occurrenceToken: 'earlier:answer', quote: 'Selected passage' };
+
+  it('submits edited comments and preserves new draft work while that submission completes', async () => {
+    const store = new DraftStore();
+    store.dispatch('a', { type: 'set_draft', text: 'General feedback' });
+    const annotations = store.annotations.forScope('a');
+    annotations.add({ source, body: 'Original comment' });
+    let complete!: () => void;
+    const send = vi.fn(() => new Promise<void>(resolve => { complete = resolve; }));
+    render(<ConnectedRecoveryHarness store={store} send={send} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Edit annotation 1' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Annotation 1 comment' }), { target: { value: 'Edited in composer' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Done' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    expect(send).toHaveBeenCalledWith('General feedback\n\nRegarding message #2 (earlier:answer):\n\n```text\nSelected passage\n```\n\nEdited in composer', [], [rejectedFile]);
+    fireEvent.click(screen.getByRole('button', { name: 'Edit annotation 1' }));
+    expect(screen.getByRole('textbox', { name: 'Annotation 1 comment' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Delete annotation' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Done' }));
+    act(() => {
+      annotations.add({ source, body: 'Next annotation' });
+      store.dispatch('a', { type: 'set_draft', text: 'Next message' });
+    });
+    await act(async () => complete());
+    expect(annotations.getSnapshot().map(item => item.body)).toEqual(['Next annotation']);
+    expect(store.getSnapshot('a').draft).toBe('Next message');
+  });
+
+  it('retains editable cards and restores text when delivery admission rejects', async () => {
+    const store = new DraftStore();
+    store.dispatch('a', { type: 'set_draft', text: 'General feedback' });
+    const annotations = store.annotations.forScope('a');
+    annotations.add({ source, body: 'Retain me' });
+    const pending = deferredSend();
+    render(<ConnectedRecoveryHarness store={store} send={pending.send} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    await act(async () => pending.reject(new Error('Destination unavailable')));
+    expect(store.getSnapshot('a').draft).toBe('General feedback');
+    fireEvent.click(screen.getByRole('button', { name: 'Edit annotation 1' }));
+    expect(screen.getByRole('textbox', { name: 'Annotation 1 comment' })).toBeEnabled();
+    expect(screen.getByRole('textbox', { name: 'Annotation 1 comment' })).toHaveValue('Retain me');
+    expect(annotations.getSnapshot()[0]!.submission).toBeNull();
+  });
+
+  it('sends a quick action without submitting any of the ordinary draft or annotations', async () => {
+    const store = new DraftStore();
+    store.dispatch('a', { type: 'set_draft', text: 'Separate ordinary draft' });
+    const annotations = store.annotations.forScope('a');
+    annotations.add({ source, body: 'Unsent annotation for my separate draft.' });
+    const original = annotations.getSnapshot();
+    const send = vi.fn().mockResolvedValue(undefined);
+    render(<ConnectedRecoveryHarness store={store} send={send} quickAction={{ label: 'Check in & drive', compactLabel: 'Check in', prompt: 'Brief me' }} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Check in & drive' }));
+    await waitFor(() => expect(send).toHaveBeenCalledOnce());
+    expect(send).toHaveBeenCalledWith('Brief me', [], []);
+    expect(store.getSnapshot('a').draft).toBe('Separate ordinary draft');
+    expect(annotations.getSnapshot()).toBe(original);
+    expect(screen.getByRole('button', { name: 'Edit annotation 1' })).toHaveTextContent('Unsent annotation for my separate draft.');
+  });
+
+  it('supports annotation-only messages and removal without changing ordinary draft text', async () => {
+    const store = new DraftStore();
+    const annotations = store.annotations.forScope('a');
+    annotations.add({ source, body: 'Only annotation' });
+    const send = vi.fn().mockResolvedValue(undefined);
+    render(<ConnectedRecoveryHarness store={store} send={send} initialFiles={[]} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Edit annotation 1' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Delete annotation' }));
+    expect(annotations.getSnapshot()).toEqual([]);
+    act(() => annotations.add({ source, body: 'Only annotation' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    await waitFor(() => expect(annotations.getSnapshot()).toEqual([]));
+    expect(send.mock.calls[0]![0]).toContain('Only annotation');
+    expect(store.getSnapshot('a').draft).toBe('');
+  });
+});
 
 describe('InputArea rejected submission ownership', () => {
   it('restores raw text and attachments to an untouched cleared composer', async () => {
@@ -296,7 +376,7 @@ interface InputAreaTestProps {
   draft?: string;
   onDraftChange?: (text: string) => void;
   onCancel?: () => void;
-  onSend?: (text: string) => void;
+  onSend?: (text: string, images: ImageData[], files: FileAttachment[]) => void;
   focusToken?: number;
   quickAction?: ComposerQuickAction;
 }
@@ -317,6 +397,7 @@ function renderInput({
     <InputArea
       cwd={cwd}
       scopeKey={scopeKey ?? cwd}
+      uploadConversationId={scopeKey ?? cwd}
       convState={convState}
       images={[]}
       setImages={() => {}}
@@ -325,7 +406,7 @@ function renderInput({
       draft={draft}
       onDraftChange={onDraftChange}
       {...focusProps}
-      quickAction={quickAction}
+      quickAction={quickAction ? { ...quickAction, send: () => onSend(quickAction.prompt, [], []) } : undefined}
       onSend={onSend}
       onCancel={onCancel}
       onRetry={() => {}}
@@ -361,6 +442,7 @@ describe('InputArea controlled-draft contract', () => {
       <InputArea
         cwd="conv-b"
         scopeKey="conv-b"
+        uploadConversationId="conv-b"
         convState={idleState}
         images={[]}
         setImages={() => {}}
@@ -410,6 +492,7 @@ describe('InputArea controlled-draft contract', () => {
       <InputArea
         cwd="/repo"
         scopeKey="conv-a"
+        uploadConversationId="conv-a"
         convState={idleState}
         images={[]}
         setImages={() => {}}
@@ -435,6 +518,7 @@ describe('InputArea controlled-draft contract', () => {
       <InputArea
         cwd="/repo"
         scopeKey="conv-b"
+        uploadConversationId="conv-b"
         convState={idleState}
         images={[]}
         setImages={() => {}}
@@ -584,6 +668,7 @@ describe('InputArea focusToken contract', () => {
       <InputArea
         cwd="conv-a"
         scopeKey="conv-a"
+        uploadConversationId="conv-a"
         convState={idleState}
         images={[]}
         setImages={() => {}}
@@ -612,6 +697,7 @@ describe('InputArea focusToken contract', () => {
             ref={ref}
             cwd="conv-a"
             scopeKey="conv-a"
+            uploadConversationId="conv-a"
             convState={idleState}
             images={[]}
             setImages={() => {}}
@@ -698,11 +784,52 @@ describe('InputArea cancellation affordance', () => {
     expect(screen.queryByRole('button', { name: /stop|send|queue/i })).not.toBeInTheDocument();
   });
 
+  it('keeps the embedded composer identity while continuation progress and handoff gate actions', () => {
+    const onSend = vi.fn();
+    const commonProps = {
+      cwd: 'conv-continuation',
+      scopeKey: 'conv-continuation',
+      uploadConversationId: 'conv-continuation',
+      images: [],
+      setImages: () => {},
+      files: [],
+      setFiles: () => {},
+      isOffline: false,
+      failedMessages: [],
+      draft: 'retained follow-up',
+      onDraftChange: () => {},
+      onSend,
+      onCancel: () => {},
+      onRetry: () => {},
+      retainComposerDuringContinuation: true,
+    };
+    const { rerender } = render(<InputArea {...commonProps} convState={idleState} />);
+    const textarea = screen.getByRole('textbox');
+    textarea.focus();
+    for (const convState of [
+      { type: 'awaiting_continuation' as const, attempt: 1 },
+      { type: 'context_exhausted' as const, summary: 'manual handoff' },
+      { type: 'idle' as const },
+    ]) {
+      rerender(<InputArea {...commonProps} convState={convState} />);
+      expect(screen.getByRole('textbox')).toBe(textarea);
+      expect(textarea).toHaveValue('retained follow-up');
+      expect(textarea).toHaveFocus();
+      if (convState.type !== 'idle') {
+        expect(screen.queryByRole('button', { name: 'Send message' })).toBeNull();
+        fireEvent.submit(textarea.closest('form')!);
+        expect(onSend).not.toHaveBeenCalled();
+      }
+    }
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
   it('restores the retained draft after continuation completes', () => {
     const onSend = vi.fn();
     const commonProps = {
       cwd: 'conv-continuation',
       scopeKey: 'conv-continuation',
+      uploadConversationId: 'conv-continuation',
       images: [],
       setImages: () => {},
       isOffline: false,
@@ -736,6 +863,7 @@ describe('InputArea cancellation affordance', () => {
       <InputArea
         cwd="conv-recovery"
         scopeKey="conv-recovery"
+        uploadConversationId="conv-recovery"
         convState={{ type: 'awaiting_recovery', message: 'refreshing credentials', recovery_kind: 'credential', resume: { type: 'conversation_turn' } }}
         images={[]}
         setImages={() => {}}
@@ -759,6 +887,7 @@ describe('InputArea cancellation affordance', () => {
     const props = {
       cwd: 'conv-overload',
       scopeKey: 'conv-overload',
+      uploadConversationId: 'conv-overload',
       images: [],
       setImages: () => {},
       isOffline: false,
@@ -805,6 +934,7 @@ describe('InputArea cancellation affordance', () => {
       <InputArea
         cwd="conv-cancelling"
         scopeKey="conv-cancelling"
+        uploadConversationId="conv-cancelling"
         convState={{ type: 'cancelling_tool', current_tool: { id: 't', name: 'bash', input: {} } }}
         images={[]}
         setImages={() => {}}
@@ -830,6 +960,7 @@ describe('InputArea cancellation affordance', () => {
       <InputArea
         cwd="conv-awaiting-llm"
         scopeKey="conv-awaiting-llm"
+        uploadConversationId="conv-awaiting-llm"
         convState={{ type: 'awaiting_llm' }}
         images={[]}
         setImages={() => {}}
@@ -973,6 +1104,78 @@ describe('bash tool rendering', () => {
     expect(screen.queryByRole('button', { name: /peek/i })).not.toBeInTheDocument();
   });
 });
+describe('InputArea continuation upload ownership', () => {
+  function UploadComposer({ scope, transcript }: { scope: string; transcript: string | undefined }) {
+    const [files, setFiles] = useState<FileAttachment[]>([]);
+    const [draft, setDraft] = useState('');
+    return <InputArea cwd={undefined} scopeKey={scope} uploadConversationId={transcript}
+      convState={idleState} images={[]} setImages={() => {}} files={files} setFiles={setFiles}
+      isOffline={false} failedMessages={[]} draft={draft} onDraftChange={setDraft}
+      onSend={() => {}} onCancel={() => {}} onRetry={() => {}} />;
+  }
+
+  it('never uploads with the product draft key while the transcript target is unhydrated', async () => {
+    const upload = vi.spyOn(api, 'uploadAttachments').mockResolvedValue([rejectedFile]);
+    const view = render(<UploadComposer scope="product:p" transcript={undefined} />);
+    fireEvent.drop(document.getElementById('input-area')!, {
+      dataTransfer: { types: ['Files'], files: [new File(['x'], 'notes.txt')] },
+    });
+    expect(upload).not.toHaveBeenCalled();
+    expect(screen.getByText('Open a conversation before attaching files.')).toBeInTheDocument();
+    view.rerender(<UploadComposer scope="product:p" transcript="b" />);
+    fireEvent.drop(document.getElementById('input-area')!, {
+      dataTransfer: { types: ['Files'], files: [new File(['x'], 'notes.txt')] },
+    });
+    await screen.findByText('notes.txt');
+    expect(upload).toHaveBeenCalledExactlyOnceWith('b', expect.any(Array));
+    upload.mockRestore();
+  });
+
+  it('retains a pending upload across continuation and routes the next upload to the successor', async () => {
+    let resolve!: (files: FileAttachment[]) => void;
+    const upload = vi.spyOn(api, 'uploadAttachments')
+      .mockImplementationOnce(() => new Promise<FileAttachment[]>(done => { resolve = done; }))
+      .mockResolvedValueOnce([{ ...rejectedFile, original_name: 'next.txt' }]);
+    const view = render(<UploadComposer scope="product:p" transcript="a" />);
+    fireEvent.drop(document.getElementById('input-area')!, {
+      dataTransfer: { types: ['Files'], files: [new File(['x'], 'notes.txt')] },
+    });
+    expect(upload).toHaveBeenLastCalledWith('a', expect.any(Array));
+    const textarea = screen.getByRole('textbox');
+    fireEvent.change(textarea, { target: { value: 'keep this draft' } });
+    textarea.focus();
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled();
+    view.rerender(<UploadComposer scope="product:p" transcript="b" />);
+    expect(screen.getByRole('textbox')).toBe(textarea);
+    expect(document.activeElement).toBe(textarea);
+    expect(textarea).toHaveValue('keep this draft');
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled();
+    await act(async () => { resolve([rejectedFile]); });
+    expect(screen.getByText('notes.txt')).toBeInTheDocument();
+    fireEvent.drop(document.getElementById('input-area')!, {
+      dataTransfer: { types: ['Files'], files: [new File(['x'], 'next.txt')] },
+    });
+    await screen.findByText('next.txt');
+    expect(upload).toHaveBeenLastCalledWith('b', expect.any(Array));
+    upload.mockRestore();
+  });
+
+  it('discards a pending upload after navigation to a different product', async () => {
+    let resolve!: (files: FileAttachment[]) => void;
+    const upload = vi.spyOn(api, 'uploadAttachments').mockImplementationOnce(
+      () => new Promise<FileAttachment[]>(done => { resolve = done; }));
+    const view = render(<UploadComposer scope="product:p" transcript="a" />);
+    fireEvent.drop(document.getElementById('input-area')!, {
+      dataTransfer: { types: ['Files'], files: [new File(['x'], 'notes.txt')] },
+    });
+    view.rerender(<UploadComposer scope="product:q" transcript="c" />);
+    await act(async () => { resolve([rejectedFile]); });
+    expect(screen.queryByText('notes.txt')).not.toBeInTheDocument();
+    expect(screen.queryByText('Uploading attachments...')).not.toBeInTheDocument();
+    upload.mockRestore();
+  });
+});
+
 describe('InputArea file-tree drag-and-drop', () => {
   const FILE_TREE_DRAG_TYPE = 'application/x-phoenix-file-path';
 

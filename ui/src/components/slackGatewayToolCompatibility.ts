@@ -6,10 +6,11 @@ export interface SlackToolSchema { server: string; name: string; input_schema: u
 const channel = 'C0123456789';
 const timestamp = '1700000000.000001';
 const search = { filters: 'after:2026-01-01', keywords: [':fire:'], natural_language_query: '', limit: 1, response_format: 'detailed', include_context: false, include_bots: false, sort: 'timestamp', sort_dir: 'desc' };
+const messageSearch = { ...search, content_types: 'messages' };
 // Probe the argument forms the adapter sends; this does not prove live access.
 export const slackGatewayArgumentProbes: Record<string, Record<string, unknown>[]> = {
   slack_read_user_profile: [{ response_format: 'detailed' }],
-  slack_search_public_and_private: [search, { ...search, cursor: 'next-page' }, { ...search, keywords: [], include_bots: true }, { ...search, keywords: [], include_bots: true, cursor: 'next-page' }],
+  slack_search_public_and_private: [{ ...search, keywords: [], include_bots: true }, messageSearch, { ...messageSearch, cursor: 'next-page' }, { ...messageSearch, keywords: [], include_bots: true }, { ...messageSearch, keywords: [], include_bots: true, cursor: 'next-page' }],
   slack_read_thread: [
     { channel_id: channel, message_ts: timestamp, limit: 100, response_format: 'detailed' },
     { channel_id: channel, message_ts: timestamp, oldest: '1700000000.000000', latest: '1700000000.000002', limit: 1, response_format: 'detailed' },

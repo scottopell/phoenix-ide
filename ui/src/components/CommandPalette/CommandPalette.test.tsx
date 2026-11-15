@@ -147,6 +147,8 @@ describe('CommandPalette lifecycle availability', () => {
               latest_transcript_row_id: 'latest-id',
               updated_at: '2026-01-01T00:00:00Z',
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
+              read_state: { state: 'read' },
+              cached_pr: null,
             }]}
             activeConversation={latest}
           />
@@ -171,6 +173,8 @@ describe('CommandPalette lifecycle availability', () => {
               lifecycle: { state: 'open', close_action: { availability: 'available' } }, latest_transcript_row_id: 'latest-id',
               updated_at: '2026-01-01T00:00:00Z',
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
+              read_state: { state: 'read' },
+              cached_pr: null,
             }]}
             activeConversation={latest}
           />
@@ -201,6 +205,8 @@ describe('CommandPalette lifecycle availability', () => {
               lifecycle: { state: 'open', close_action: { availability: 'available' } },
               latest_transcript_row_id: 'latest-id', updated_at: '2026-01-01T00:00:00Z',
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
+              read_state: { state: 'read' },
+              cached_pr: null,
             }]}
             activeConversation={latest}
           />
@@ -231,6 +237,8 @@ describe('CommandPalette lifecycle availability', () => {
               lifecycle: { state: 'open', close_action: { availability: 'available' } },
               latest_transcript_row_id: 'latest-id', updated_at: '2026-01-01T00:00:00Z',
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
+              read_state: { state: 'read' },
+              cached_pr: null,
             }]}
             activeConversation={latest}
           />
@@ -259,6 +267,8 @@ describe('CommandPalette lifecycle availability', () => {
               lifecycle: { state: 'open', close_action: { availability: 'available' } }, latest_transcript_row_id: 'latest-id',
               updated_at: '2026-01-01T00:00:00Z',
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
+              read_state: { state: 'read' },
+              cached_pr: null,
             }]}
             activeConversation={active}
           />
@@ -287,6 +297,8 @@ describe('CommandPalette lifecycle availability', () => {
               latest_transcript_row_id: 'latest-id',
               updated_at: '2026-01-01T00:00:00Z',
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
+              read_state: { state: 'read' },
+              cached_pr: null,
             }]}
             activeConversation={latest}
           />
@@ -311,6 +323,8 @@ describe('CommandPalette lifecycle availability', () => {
               lifecycle: { state: 'history' }, latest_transcript_row_id: 'latest-id',
               updated_at: '2026-01-01T00:00:00Z',
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
+              read_state: { state: 'read' },
+              cached_pr: null,
             }]}
             activeConversation={latest}
           />

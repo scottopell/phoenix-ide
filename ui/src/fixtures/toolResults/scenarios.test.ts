@@ -34,7 +34,7 @@ function resultFor(messages: Message[], id: string) {
 
 const expectedFamilies: ToolResultsScenarioFamily[] = ['shell', 'execution', 'discovery', 'media', 'profiling', 'grid', 'subagents'];
 
-const expectedIds = expectedFamilies.flatMap((family) => [`${family}-full`, `${family}-compact`]);
+const expectedIds = [...expectedFamilies.flatMap((family) => [`${family}-full`, `${family}-compact`]), 'mobile-spacing-compact'];
 
 function expectTextStates(messages: Message[], states: Record<string, string>) {
   for (const [id, marker] of Object.entries(states)) {
@@ -59,7 +59,7 @@ describe('tool results fixture scenarios', () => {
       const data = toolResultsFixtureData(scenario);
       expect(data.slug).toContain(scenario.id);
       expect(data.conversationId).toContain(scenario.id);
-      expect(data.theme).toBe('dark');
+      expect(data.theme).toBe('theme' in scenario ? scenario.theme : 'dark');
       expect(data.density).toBe(scenario.density);
       expect(data.pendingMessages).toEqual([]);
       expect(data.messages.length).toBeGreaterThanOrEqual(4);
@@ -76,13 +76,14 @@ describe('tool results fixture scenarios', () => {
       profiling: ['profile-run-missing'],
       grid: [],
       subagents: [],
+      'mobile-spacing': [],
     };
 
-    for (const family of expectedFamilies) {
-      const messages = familyData(family).messages;
+    for (const scenario of toolResultsScenarios) {
+      const messages = toolResultsFixtureData(scenario).messages;
       const resultIds = toolResults(messages).map(({ content }) => content.tool_use_id);
       expect(new Set(resultIds).size).toBe(resultIds.length);
-      expect(unpairedIds(messages)).toEqual(expectedUnpaired[family]);
+      expect(unpairedIds(messages)).toEqual(expectedUnpaired[scenario.family]);
     }
   });
 
