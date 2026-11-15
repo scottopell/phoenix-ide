@@ -23535,12 +23535,12 @@ mod close_completion_allowance_tests {
                     scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
                         worktree: Some(worktree),
-                        work_scopes: Default::default(),
-                        bash_process_groups: Default::default(),
-                        tmux_servers: Default::default(),
-                        pty_sessions: Default::default(),
-                        browser_sessions: Default::default(),
-                        equivalent_live_resources: Default::default(),
+                        work_scopes: std::collections::BTreeSet::default(),
+                        bash_process_groups: std::collections::BTreeSet::default(),
+                        tmux_servers: std::collections::BTreeSet::default(),
+                        pty_sessions: std::collections::BTreeSet::default(),
+                        browser_sessions: std::collections::BTreeSet::default(),
+                        equivalent_live_resources: std::collections::BTreeSet::default(),
                     },
                 }],
             })

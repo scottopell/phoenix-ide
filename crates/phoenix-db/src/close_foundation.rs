@@ -11661,34 +11661,33 @@ mod tests {
     #[tokio::test]
     async fn zero_scope_inventory_requires_exact_authorized_snapshot() {
         let db = Database::open_in_memory().await.unwrap();
-        create_root(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-zero")
-            .await
-            .unwrap();
+        // Normal admission captures the root WorkScope even without a worktree.
+        // Use the explicit scope-free shape rather than dropping captured scopes.
+        scope_free_close_fixture(&db).await;
         set_close_phase(
             &db,
-            "attempt-zero",
+            "scope-free",
             ClosePhase::AwaitingRetirementInspection,
         )
         .await;
         db.replace_close_inspection(ReplaceCloseInspectionRequest {
-            attempt_id: CloseAttemptId::parse("attempt-zero").unwrap(),
+            attempt_id: CloseAttemptId::parse("scope-free").unwrap(),
             scopes: Vec::new(),
         })
         .await
         .unwrap();
-        let snapshot = current_test_snapshot(&db, "attempt-zero").await;
+        let snapshot = current_test_snapshot(&db, "scope-free").await;
         let initial_anchor_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM close_original_retirement_anchors WHERE attempt_id = ?1",
         )
-        .bind("attempt-zero")
+        .bind("scope-free")
         .fetch_one(db.pool())
         .await
         .unwrap();
         assert_eq!(initial_anchor_count, 0);
 
         let request = CaptureCloseRetirementInventoryRequest {
-            attempt_id: CloseAttemptId::parse("attempt-zero").unwrap(),
+            attempt_id: CloseAttemptId::parse("scope-free").unwrap(),
             snapshot: snapshot.clone(),
             scopes: Vec::new(),
         };
@@ -11701,7 +11700,7 @@ mod tests {
             "SELECT inspection_generation, inspection_fingerprint
              FROM close_original_retirement_anchors WHERE attempt_id = ?1",
         )
-        .bind("attempt-zero")
+        .bind("scope-free")
         .fetch_one(db.pool())
         .await
         .unwrap();
@@ -11717,7 +11716,7 @@ mod tests {
             "SELECT inspection_generation, inspection_fingerprint
              FROM close_original_retirement_anchors WHERE attempt_id = ?1",
         )
-        .bind("attempt-zero")
+        .bind("scope-free")
         .fetch_one(db.pool())
         .await
         .unwrap();
@@ -17715,12 +17714,10 @@ mod tests {
         .unwrap();
         assert_eq!(retained_anchor, original_anchor);
         assert_ne!(retained_anchor.0, current_snapshot.generation());
-        assert_eq!(
-            db.close_retirement_inventory_is_complete(attempt.as_str())
-                .await
-                .unwrap(),
-            true
-        );
+        assert!(db
+            .close_retirement_inventory_is_complete(attempt.as_str())
+            .await
+            .unwrap());
         assert!(db
             .close_retirement_resource_was_dispatched(
                 &attempt,
