@@ -13488,7 +13488,7 @@ mod tests {
         .unwrap();
         assert_eq!(ledger, vec![119, 122]);
     }
-    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
     use sqlx::Row;
     use std::str::FromStr;
 
@@ -23109,7 +23109,7 @@ mod close_completion_allowance_tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
     use super::{
-        MIGRATION_157, MIGRATIONS, run_pending_migrations, tests::setup_real_pre_159_schema,
+        run_pending_migrations, tests::setup_real_pre_159_schema, MIGRATIONS, MIGRATION_157,
     };
 
     #[tokio::test]
@@ -23355,17 +23355,27 @@ mod close_completion_allowance_tests {
             "UPDATE work_scopes SET environment_kind = 'allocated_worktree', cwd = '/tmp',
                 worktree_path = '/tmp/worktree', worktree_id = lower(hex(randomblob(16))),
                 worktree_fingerprint = lower(hex(randomblob(32))), branch_name = 'branch',
-                base_branch = 'main' WHERE id = ?1"
-        ).bind(scope.as_str()).execute(&pool).await.unwrap();
+                base_branch = 'main' WHERE id = ?1",
+        )
+        .bind(scope.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
         let attempt = CloseAttemptId::parse("legacy-sealed-attempt").unwrap();
         db.begin_close_foundation(
             &conversation.product_conversation_id,
             &TranscriptConversationId::parse("legacy-sealed").unwrap(),
             attempt.as_str(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         for phase in ["settling_active_work", "awaiting_retirement_inspection"] {
             sqlx::query("UPDATE close_obligations SET phase = ?2 WHERE attempt_id = ?1")
-                .bind(attempt.as_str()).bind(phase).execute(&pool).await.unwrap();
+                .bind(attempt.as_str())
+                .bind(phase)
+                .execute(&pool)
+                .await
+                .unwrap();
         }
         db.replace_close_inspection(ReplaceCloseInspectionRequest {
             attempt_id: attempt.clone(),
@@ -23374,41 +23384,82 @@ mod close_completion_allowance_tests {
                 snapshot: CloseRetirementSnapshot::parse("g1", "g1-fingerprint").unwrap(),
                 losses: Vec::new(),
             }],
-        }).await.unwrap();
-        let g1 = db.get_close_obligation(attempt.as_str()).await.unwrap().snapshot().unwrap().clone();
+        })
+        .await
+        .unwrap();
+        let g1 = db
+            .get_close_obligation(attempt.as_str())
+            .await
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .clone();
 
         // Author the genuine pre-159 capture using only tables and constraints
         // available at 158. In particular, no modern capture API can run here.
         sqlx::query(
             "INSERT INTO close_retirement_inventories
                  (attempt_id, scope, inspection_generation, inspection_fingerprint, captured_at)
-             VALUES (?1, ?2, ?3, ?4, '2026-01-01T00:00:00Z')"
-        ).bind(attempt.as_str()).bind(scope.as_str()).bind(g1.generation())
-            .bind(g1.fingerprint()).execute(&pool).await.unwrap();
+             VALUES (?1, ?2, ?3, ?4, '2026-01-01T00:00:00Z')",
+        )
+        .bind(attempt.as_str())
+        .bind(scope.as_str())
+        .bind(g1.generation())
+        .bind(g1.fingerprint())
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query(
             "INSERT INTO close_expected_retirement_resources
                  (attempt_id, scope, inspection_generation, inspection_fingerprint,
                   resource_kind, identity_kind, identity_codec, identity_value)
              SELECT ?1, ?2, ?3, ?4, 'worktree', 'worktree', 'worktree_id_v1',
                     captured_worktree_identity
-             FROM close_attempt_scopes WHERE attempt_id = ?1 AND scope = ?2"
-        ).bind(attempt.as_str()).bind(scope.as_str()).bind(g1.generation())
-            .bind(g1.fingerprint()).execute(&pool).await.unwrap();
+             FROM close_attempt_scopes WHERE attempt_id = ?1 AND scope = ?2",
+        )
+        .bind(attempt.as_str())
+        .bind(scope.as_str())
+        .bind(g1.generation())
+        .bind(g1.fingerprint())
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query(
             "INSERT INTO close_expected_retirement_resources
                  (attempt_id, scope, inspection_generation, inspection_fingerprint,
                   resource_kind, identity_kind, identity_codec, identity_value)
-             VALUES (?1, ?2, ?3, ?4, 'work_scope', 'opaque', 'opaque_string_v1', ?2)"
-        ).bind(attempt.as_str()).bind(scope.as_str()).bind(g1.generation())
-            .bind(g1.fingerprint()).execute(&pool).await.unwrap();
+             VALUES (?1, ?2, ?3, ?4, 'work_scope', 'opaque', 'opaque_string_v1', ?2)",
+        )
+        .bind(attempt.as_str())
+        .bind(scope.as_str())
+        .bind(g1.generation())
+        .bind(g1.fingerprint())
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query(
             "UPDATE close_retirement_inventories SET sealed = 1
              WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
-               AND inspection_fingerprint = ?4"
-        ).bind(attempt.as_str()).bind(scope.as_str()).bind(g1.generation())
-            .bind(g1.fingerprint()).execute(&pool).await.unwrap();
-        assert!(db.close_retirement_inventory_is_complete(attempt.as_str()).await.unwrap());
-        assert_eq!(db.list_close_expected_retirement_resources(attempt.as_str()).await.unwrap().len(), 2);
+               AND inspection_fingerprint = ?4",
+        )
+        .bind(attempt.as_str())
+        .bind(scope.as_str())
+        .bind(g1.generation())
+        .bind(g1.fingerprint())
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(db
+            .close_retirement_inventory_is_complete(attempt.as_str())
+            .await
+            .unwrap());
+        assert_eq!(
+            db.list_close_expected_retirement_resources(attempt.as_str())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
 
         assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
         let migrated: (i64, i64) = sqlx::query_as(
@@ -23416,12 +23467,19 @@ mod close_completion_allowance_tests {
                     (SELECT COUNT(*) FROM close_retirement_anchor_exclusions WHERE attempt_id = ?1)"
         ).bind(attempt.as_str()).fetch_one(&pool).await.unwrap();
         assert_eq!(migrated, (0, 1));
-        let g1_resources = db.list_close_expected_retirement_resources(attempt.as_str()).await.unwrap();
+        let g1_resources = db
+            .list_close_expected_retirement_resources(attempt.as_str())
+            .await
+            .unwrap();
         assert_eq!(g1_resources.len(), 2);
         assert!(g1_resources.iter().all(|resource| resource.snapshot == g1));
-        assert!(db.close_retirement_inventory_is_complete(attempt.as_str()).await.unwrap());
+        assert!(db
+            .close_retirement_inventory_is_complete(attempt.as_str())
+            .await
+            .unwrap());
 
-        let worktree_resource = g1_resources.iter()
+        let worktree_resource = g1_resources
+            .iter()
             .find(|resource| resource.resource.kind() == RetiredResourceKind::Worktree)
             .unwrap();
         db.route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
@@ -23430,9 +23488,13 @@ mod close_completion_allowance_tests {
             residual: worktree_resource.resource.clone(),
             reason: RetirementFailureReason::IdentityNotProven,
             detail: "legacy worktree requires reinspection".to_string(),
-        }).await.unwrap();
-        assert_eq!(db.retry_close_retirement(&attempt).await.unwrap().phase(),
-            ClosePhase::AwaitingRetirementInspection);
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            db.retry_close_retirement(&attempt).await.unwrap().phase(),
+            ClosePhase::AwaitingRetirementInspection
+        );
         db.replace_close_inspection(ReplaceCloseInspectionRequest {
             attempt_id: attempt.clone(),
             scopes: vec![ReplaceCloseInspectionScopeRequest {
@@ -23440,47 +23502,77 @@ mod close_completion_allowance_tests {
                 snapshot: CloseRetirementSnapshot::parse("g2", "g2-fingerprint").unwrap(),
                 losses: Vec::new(),
             }],
-        }).await.unwrap();
-        let g2 = db.get_close_obligation(attempt.as_str()).await.unwrap().snapshot().unwrap().clone();
+        })
+        .await
+        .unwrap();
+        let g2 = db
+            .get_close_obligation(attempt.as_str())
+            .await
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .clone();
         assert_ne!(g1, g2);
         let (id, fingerprint, locator): (String, String, String) = sqlx::query_as(
             "SELECT worktree_id, worktree_fingerprint,
                     'git_path_bytes_hex_v1:' || lower(hex(CAST(worktree_path AS BLOB)))
-             FROM work_scopes WHERE id = ?1"
-        ).bind(scope.as_str()).fetch_one(&pool).await.unwrap();
+             FROM work_scopes WHERE id = ?1",
+        )
+        .bind(scope.as_str())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let worktree = WorktreeIdentity::from_parts(
             WorktreeId::parse(id).unwrap(),
             WorktreeFingerprint::parse(fingerprint).unwrap(),
             GitPathIdentity::decode_exact(&locator).unwrap(),
         );
-        let resources = db.capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
-            attempt_id: attempt.clone(),
-            snapshot: g2.clone(),
-            scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
-                scope: scope.clone(),
-                inventory: CloseOwnedResourceInventory {
-                    worktree: Some(worktree),
-                    work_scopes: Default::default(),
-                    bash_process_groups: Default::default(),
-                    tmux_servers: Default::default(),
-                    pty_sessions: Default::default(),
-                    browser_sessions: Default::default(),
-                    equivalent_live_resources: Default::default(),
-                },
-            }],
-        }).await.unwrap();
+        let resources = db
+            .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
+                attempt_id: attempt.clone(),
+                snapshot: g2.clone(),
+                scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
+                    scope: scope.clone(),
+                    inventory: CloseOwnedResourceInventory {
+                        worktree: Some(worktree),
+                        work_scopes: Default::default(),
+                        bash_process_groups: Default::default(),
+                        tmux_servers: Default::default(),
+                        pty_sessions: Default::default(),
+                        browser_sessions: Default::default(),
+                        equivalent_live_resources: Default::default(),
+                    },
+                }],
+            })
+            .await
+            .unwrap();
         assert_eq!(resources.len(), 2);
         assert!(resources.iter().all(|resource| resource.snapshot == g2));
-        assert!(db.close_retirement_inventory_is_complete(attempt.as_str()).await.unwrap());
-        assert_eq!(db.list_close_expected_retirement_resources(attempt.as_str()).await.unwrap(), resources);
+        assert!(db
+            .close_retirement_inventory_is_complete(attempt.as_str())
+            .await
+            .unwrap());
+        assert_eq!(
+            db.list_close_expected_retirement_resources(attempt.as_str())
+                .await
+                .unwrap(),
+            resources
+        );
         let sealed: Vec<(String, String)> = sqlx::query_as(
             "SELECT inspection_generation, inspection_fingerprint FROM close_retirement_inventories
-             WHERE attempt_id = ?1 AND sealed = 1 ORDER BY inspection_generation"
-        ).bind(attempt.as_str()).fetch_all(&pool).await.unwrap();
-        assert_eq!(sealed, vec![
-            (g1.generation().to_string(), g1.fingerprint().to_string()),
-            (g2.generation().to_string(), g2.fingerprint().to_string()),
-        ]);
+             WHERE attempt_id = ?1 AND sealed = 1 ORDER BY inspection_generation",
+        )
+        .bind(attempt.as_str())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            sealed,
+            vec![
+                (g1.generation().to_string(), g1.fingerprint().to_string()),
+                (g2.generation().to_string(), g2.fingerprint().to_string()),
+            ]
+        );
         let retained: (i64, i64) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM close_original_retirement_anchors WHERE attempt_id = ?1),
                     (SELECT COUNT(*) FROM close_retirement_anchor_exclusions WHERE attempt_id = ?1)"
@@ -23593,7 +23685,10 @@ mod close_completion_allowance_tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-            assert!(sql.contains("WITHOUT ROWID"), "{table} must not have a hidden rowid");
+            assert!(
+                sql.contains("WITHOUT ROWID"),
+                "{table} must not have a hidden rowid"
+            );
             // The identifier comes only from the two fixed table names above.
             let rowid_probe = sqlx::AssertSqlSafe(format!("SELECT rowid FROM {table}"));
             assert!(matches!(
@@ -23621,12 +23716,20 @@ mod close_completion_allowance_tests {
         let anchor = "INSERT INTO close_original_retirement_anchors
              (attempt_id, inspection_generation, inspection_fingerprint)
              VALUES ('fresh', 'generation', 'fingerprint')";
-        assert!(sqlx::query(anchor).execute(&pool).await.is_err(), "unsealed inventory");
-        sqlx::query("UPDATE close_retirement_inventories SET sealed = 1 WHERE attempt_id = 'fresh'")
-            .execute(&pool)
-            .await
-            .unwrap();
-        assert!(sqlx::query(anchor).execute(&pool).await.is_err(), "missing work scope");
+        assert!(
+            sqlx::query(anchor).execute(&pool).await.is_err(),
+            "unsealed inventory"
+        );
+        sqlx::query(
+            "UPDATE close_retirement_inventories SET sealed = 1 WHERE attempt_id = 'fresh'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            sqlx::query(anchor).execute(&pool).await.is_err(),
+            "missing work scope"
+        );
         sqlx::query(
             "INSERT INTO close_expected_retirement_resources VALUES
                  ('fresh', 'scope-a', 'generation', 'fingerprint',
@@ -23635,7 +23738,10 @@ mod close_completion_allowance_tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert!(sqlx::query(anchor).execute(&pool).await.is_err(), "wrong scope identity");
+        assert!(
+            sqlx::query(anchor).execute(&pool).await.is_err(),
+            "wrong scope identity"
+        );
         sqlx::query(
             "UPDATE close_expected_retirement_resources SET identity_value = 'scope-a'
              WHERE attempt_id = 'fresh'",
@@ -23647,7 +23753,10 @@ mod close_completion_allowance_tests {
             .execute(&pool)
             .await
             .unwrap();
-        assert!(sqlx::query(anchor).execute(&pool).await.is_err(), "missing inventory");
+        assert!(
+            sqlx::query(anchor).execute(&pool).await.is_err(),
+            "missing inventory"
+        );
         sqlx::query(
             "INSERT INTO close_retirement_inventories VALUES
                  ('fresh', 'scope-a', 'generation', 'fingerprint', 1)",
@@ -23662,7 +23771,10 @@ mod close_completion_allowance_tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert!(sqlx::query(anchor).execute(&pool).await.is_err(), "extra inventory scope");
+        assert!(
+            sqlx::query(anchor).execute(&pool).await.is_err(),
+            "extra inventory scope"
+        );
         sqlx::query("DELETE FROM close_retirement_inventories WHERE scope = 'unexpected-scope'")
             .execute(&pool)
             .await
@@ -23675,11 +23787,16 @@ mod close_completion_allowance_tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert!(sqlx::query(anchor).execute(&pool).await.is_err(), "duplicate work scope");
-        sqlx::query("DELETE FROM close_expected_retirement_resources WHERE identity_value = 'second-scope'")
-            .execute(&pool)
-            .await
-            .unwrap();
+        assert!(
+            sqlx::query(anchor).execute(&pool).await.is_err(),
+            "duplicate work scope"
+        );
+        sqlx::query(
+            "DELETE FROM close_expected_retirement_resources WHERE identity_value = 'second-scope'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         assert!(sqlx::query(
             "INSERT INTO close_original_retirement_anchors
                  (attempt_id, inspection_generation, inspection_fingerprint)
