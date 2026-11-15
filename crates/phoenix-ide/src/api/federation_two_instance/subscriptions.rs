@@ -261,7 +261,7 @@ async fn registered_watch_unwatch_and_list_route_saved_peer_without_local_watch_
 
     let listed_after_unwatch = run_coordinator_tool(
         &list,
-        json!({"instance": peer.peer_instance_id.to_string()}),
+        json!({"request":{"op":"remote","instance":peer.peer_instance_id.to_string()}}),
     )
     .await;
     assert!(
