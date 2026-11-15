@@ -6,7 +6,11 @@ Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). Fi
 
 Demonstrate the complete user journey through the real assembled Coordinator surface, and prove which portions are shipped rather than confusing branch completion, notification acceptance and useful follow-through.
 
+Qualification is incremental, not a final big-bang harness gate. First accept phase 5→6's manual record → detour → continuation → return journey with no scanner. Independently qualify phase 3→4's event retrieval improvement and phase 2's roadmap cutoff. Then qualify scanner auto-add against those proven contracts and run the combined journey. The latest product-direction review requests no new implementation slice or executive-oversight subsystem.
+
 ## Validation journeys
+
+Before scanner activation: manually record a user request and conversational bookmark, detour/continue, and answer “where were we / what am I forgetting?” through bounded inspection with an honest stopping point/source. Verify historical note versus new evidence versus reconciled next step in both receipts and compact context. Source gaps/overflow remain explicit. Also verify that nothing useful due produces no inventory recital, worker nudge, alternating unchanged-item check or new wakeup. Existing Goal/turn/PR completion cannot resolve the broader item automatically, nor can the open item diagnose worker stall.
 
 1. User requests two meaningful pieces of work in Ember, then detours into a separate exploratory question. Direct tracking records one request, scanner captures the omitted request and a useful conversational bookmark with exact source evidence. The curiosity remains a bookmark, not another commissioned task. Worker-only promises are outside discovery scope. Returning to the question supplies a short refresher and resumes from the stopping point, as in Issue #1075.
 2. Continue Ember; fresh tracker index retains identity and owed step despite a deliberately terse handoff. Exact source evidence remains historical; current worker target follows continuation.

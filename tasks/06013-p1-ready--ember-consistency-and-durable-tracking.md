@@ -2,7 +2,7 @@
 
 ## Outcome and user decisions
 
-Make Ember's existing coordination surface easier to use, preserve the user's requested work and conversational stopping points across continuations, and retire the stale roadmap. Improve the event-driven reading journey first; deliver tracking and scanning as a separate dependent path. This task owns the full program; planning completion is not runtime implementation.
+Make Ember's existing coordination surface easier to use, preserve the user's requested work and conversational stopping points across continuations, and retire the stale roadmap. Deliver useful manual tracking/continuity and event enrichment as independent paths; prove the manual memory journey before activating scanning. This task owns the full program; planning completion is not runtime implementation.
 
 Accepted user decisions:
 - "things ember is keeping track of is right"
@@ -77,7 +77,7 @@ Follow-up production inspection on 2026-11-15 found a specific list_watched_conv
 
 Tracking does not mirror PR/runtime state, create Goals, issue commands or grant authority. Event acceptance, message delivery, Goal application and execution completion cannot independently resolve a tracked user outcome.
 
-## First behavior slice: useful existing completion events
+## Independent behavior slice: useful existing completion events
 
 ### Bind the right evidence
 
@@ -166,6 +166,28 @@ The user selected both recommendations. Remaining model budgets, excerpt tuning 
 Dependencies are feature-local: the event-relevant baseline/contract in phase 1 unblocks 3→4; the tracking-relevant subset unblocks 5→6→7. Neither requires all of phase 1 to finish. Phase 3 owns its occurrence/retention/privacy/capture contract, phase 5 its record/native-tool/reconciliation contract, and phase 7 its frontier/invalidation/application/model-budget contract before activation. Scanner design cannot block events or direct tracking. Phase 2 is independently shippable; phase 8 combines delivered slices. Each slice qualifies before integration; event measurements do not wait for the scanner.
 
 Use logical PRs with the mandatory phase tasks visible. Ready filenames denote planned work, not satisfaction of dependencies or delivery.
+
+## Prioritized parallel execution
+
+The [latest product-direction review](https://github.com/scottopell/phoenix-ide/pull/1082#pullrequestreview-5913509329) endorses incremental delivery, not every implementation detail or a broader executive-oversight system. It requests no additional implementation slice. Phase numbers above identify existing tasks; they are not a global serial order.
+
+| Wave / priority | Owner lane | Existing tasks | Concrete delivery and gate |
+| --- | --- | --- | --- |
+| Start / 1 | A: useful memory | 06016 → 06017 | One owner delivers store/native tools, then bounded inspection and prefix-preserving continuity. The first usable milestone is manual record → detour → continuation → “where were we / what am I forgetting?” with an honest source/stopping point, without any scanner. |
+| Start / 2 | B: useful events | 06020 → 06021 | Capture the exact ending evidence, then project it into existing notifications and qualify total follow-up cost. Ship independently of memory/scanner design; preserve privacy and version-guarded reads. |
+| Start / 3 | C: retirement, then narrow audit | 06015; bounded remainder of 06014 | Retire roadmap guidance/automation with archive readback in its own PR. Then close source-grounded tool gaps and identity examples, preserving merged #1088. No broad tool rewrite or prerequisite inventory project. |
+| After manual-memory gate / 1 | A: scanner safety net | 06018 | Consume the proven tracking service; qualify tool-free extraction, revision/coverage recovery and cost limits before enabling auto-add. Gradual all-history coverage remains mandatory, with live priority. Offline corpus/budget preparation may happen earlier; runtime activation cannot precede useful manual tracking. |
+| At each landing; final combined gate | Integrator / owning lane | 06019 | Each lane qualifies its own user journey before merge/activation; combine them afterward. Do not postpone basic value or all evaluation until the scanner exists. |
+
+Use three implementation owners plus an integrator, not a new coordination subsystem. Each lane writes its feature-local requirements/ADR before behavior changes. Settle only the small shared tracking identity/revision/reference handoff needed by dependent work. The integrator coordinates migration numbering and shared executor/tool-registry edits; use short-lived branches and logical PRs, with no parallel heavy validation on the same constrained host.
+
+The manual milestone must preserve the visible distinction between Goals (worker objective/disposition and execution), tracking (broader user intent/bookmarks), and events (factual evidence). A completed Goal/turn/PR cannot automatically resolve the tracked outcome; an open item cannot establish that a worker is stalled. Tool receipts and compact wording must expose saved historical notes, new evidence needing reconciliation, and reconciled resumption points, plus omissions/source gaps. Scanner coverage is not review or fresh status.
+
+Do not hold the first useful manual release for perfect relevance selection or a separate attention model. Ship the small record/inspection/continuation foundation, learn from actual use, and finish basic foreground resurfacing within the existing phase 6. The first manual milestone does not by itself establish automatic omission recovery; the program's later quiet-forgotten-request gate still applies.
+
+Qualify relief as well as capture: recover a forgotten request without a fresh user prod; return to a bookmark without commissioning work; and do nothing conspicuous when nothing useful is due. No inventory recital, alternating small-list checks, redundant worker nudge or new wakeup to demonstrate activity. Measure accumulated prompt/retrieval cost and actual recovery burden, not just scanner usage.
+
+Explicitly excluded: the separate discussion's workstream taxonomy, per-worker status checker, periodic silence sweeps, executive dashboard/projection, and human read markers. Basic contextual/occasional resurfacing uses existing turns and tools; a separate relevance-model service is not an initial dependency. Use real usage of the small foundation to justify any later visibility expansion.
 
 ## Retire the roadmap without erasing evidence
 

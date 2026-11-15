@@ -4,7 +4,7 @@ Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). Re
 
 ## User-approved outcome
 
-The existing completion event identifies which input settled, who sent it, and the exact ending response. Delayed delivery must never attach a response from a later execution. User approved event enrichment after production showed repeated latest-message lookups.
+The existing completion event identifies which input settled, who sent it, and the exact ending response. Delayed delivery must never attach a response from a later execution. User approved event enrichment after production showed repeated latest-message lookups. Lane B delivers this independently alongside the higher-priority manual memory lane; neither waits for scanner design.
 
 ## Reuse and scope
 

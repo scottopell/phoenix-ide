@@ -1,6 +1,6 @@
 # Ember phase 1: tool contracts and consistency baseline
 
-Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). Read its accepted user decisions, proposed scope, derisking evidence and non-goals before implementation. This is the first implementation phase.
+Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). Read its accepted user decisions, proposed scope, derisking evidence and non-goals before implementation. This is a shared baseline task, not a first-complete global implementation gate. Lanes A/B own their necessary contract subsets; lane C closes the remaining bounded audit after roadmap retirement.
 
 ## Outcome
 

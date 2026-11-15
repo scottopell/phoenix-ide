@@ -6,6 +6,8 @@ Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). Re
 
 The ONE existing Ember singleton can retain, inspect, edit and deliberately retire things independently of transcript continuation, worker execution, PR state and generated summaries.
 
+Priority 1 lane A pairs this task with phase 6 as the first useful memory delivery. Storage/tools may land in a focused PR first, but the milestone is not complete until manually saved work survives detour/continuation and can be resumed through bounded inspection without the scanner. Scanner-specific design is not a prerequisite.
+
 ## Design boundary
 
 Use a stable tracking-item domain type and application service. One item represents an independently meaningful concern/commitment, with no parent/child hierarchy initially. Prose captures purpose/current understanding and a resumption point or follow-through. Preserve the distinction between a user curiosity/bookmark and explicitly requested work; this feature's contract chooses the minimal representation so bookmarks do not become work obligations. Structure identity, disposition, revision, timestamps, normalized ordered references and exact evidence. Use tracking/resolved/dismissed with nonblank retirement reason. Explicit reopening requires current evidence/revision and is not a scanner operation.
@@ -25,6 +27,8 @@ Appending evidence must atomically invalidate any claim that the saved resumptio
 Within this evidence contract, revised source observations append at a new position rather than silently mutating evidence behind the reviewed watermark. The marker must track actual evidence changes, not only row count or a scan timestamp. Define this alongside feature-scoped evidence retention before implementation.
 
 Expose a typed review-required versus reviewed projection. Review-required records retain notes for inspection but cannot return the old resumption note as a ready next step. List/detail/context reads carry this state. It is distinct from tracking/resolved/dismissed disposition and grants no execution authority even when reviewed.
+
+Keep those distinctions readable in tool receipts as well as types: a saved historical note, newly attached evidence requiring reconciliation, and an Ember-reconciled resumption point must not look like the same fresh status. Missing source evidence remains visibly unavailable. Goal/turn/PR completion does not resolve a tracking item; an unresolved tracking item does not diagnose worker stall.
 
 Only a trusted Ember reconciliation through the existing update service may advance the reviewed watermark, with expected item/evidence revision checks. It reads the new source evidence, retains any user pause/correction and revises the note as needed; concurrent evidence causes a conflict. Scanner append cannot clear this state, rewrite Ember prose, lift a pause or reopen a retired record. Exact duplicate evidence application must not manufacture new review work. No separate review workflow/tool is required.
 

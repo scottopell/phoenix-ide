@@ -6,6 +6,10 @@ Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). De
 
 Ember sees a fresh compact index of what it is tracking on subsequent dispatches and continuations, and the user can inspect the saved record and evidence without maintaining a second project-management system.
 
+Priority 1 lane A completes the manual memory milestone with phase 5, independently of event enrichment and before scanner activation. The user's “where were we / what am I forgetting?” journey must work with explicitly recorded requests/bookmarks and no background extraction. This is the foundation's usefulness gate, not a new dashboard or comprehensive model-free executive summary.
+
+Land that usable foundation before tuning sophisticated relevance or claiming automatic omission recovery. Basic foreground resurfacing and its quiet/no-op checks stay in this existing task; no new ranking/checker service is required to finish it. Use early real usage to identify missing visibility rather than expanding the first release preemptively.
+
 ## Work
 
 - Add a bounded tracking observation at an already admitted Coordinator turn/wakeup boundary. Include registry revision, active count, review-needed state, entries/read pointers and explicit partial-list/pagination information. Pagination is user-approved; exact context budget and selection order still need qualification.
@@ -14,6 +18,7 @@ Ember sees a fresh compact index of what it is tracking on subsequent dispatches
 - Mark prior observations as historical by their captured revision, without rewriting their text. Same-turn tool mutations supply committed revisions through their appended results; a later normal turn/wakeup obtains current tracking data. Stored notes remain untrusted data, not system instructions. Continue/restart must recover through durable evidence and current registry reads. Use existing continuation/capacity policies for growing history; do not invent deletion of earlier prefix content. Measure accumulated observation context as well as one page's size.
 - Keep full notes/evidence behind bounded native reads. Never present a prefix as the complete or fully reviewed list. Define ordering and overflow behavior; no invented priority scores.
 - Carry phase 5's mandatory review-needed state through list/detail/fresh context. New evidence since explicit review invalidates the saved next step; present it as unreviewed historical note, never a ready action. Require trusted source reconciliation before using it for follow-through. Overflow reports omitted and review-needed counts with bounded read pointers; omitted entries or an older context index cannot establish current readiness. Reconcile only the selected item, without blocking unrelated work or introducing a review scheduler.
+- Make uncertainty readable: distinguish the saved historical next step, new evidence awaiting reconciliation, and a reconciled resumption point. Show source gaps and omitted entries. Do not present scanner coverage, explicit review or a recorded Goal/turn/PR outcome as a fresh comprehensive status assessment. Preserve these meanings in existing tool/conversation wording.
 - Use stable singleton ownership through continuation topology. Exact source citations remain pinned; a current conversation link resolves its actual successor.
 - Treat notes and extracted source as untrusted stored data. Do not promote prose into Authority or reported live state. Clearly separate a saved bookmark/request and supporting agent report from permission to act.
 - Update global-recall requirements/ADRs for the deliberate new memory projection. Preserve the decision to fetch live activity on demand rather than reviving an inferred global activity capsule.
@@ -48,10 +53,14 @@ runtime/executor.rs durable meta observation persistence, active prompt projecti
 
 A record created before continuation is discoverable in the successor's fresh context without relying on the handoff summary; retirement/revisions survive restart; overflow is explicit; exact historical evidence and current conversation navigation remain distinct. Test malicious note text, absent evidence, ordinary/child context exclusion, empty registry and over-budget index.
 
+Before adding the scanner, manually record a requested outcome and a useful question bookmark, detour and continue Ember, then answer “where were we / what am I forgetting?” using bounded list/read results and exact evidence. Resume the stopping point without making the bookmark an execution commission. A source gap/overflow yields honest uncertainty, not an invented comprehensive summary.
+
+Negative acceptance: with no useful eligible item, no inventory recital, alternating unchanged-item checks, redundant worker nudge or new wakeup. A still-open tracking item alone cannot justify querying/nudging a healthy worker. Measure user reminder burden and accumulated context/retrieval cost alongside positive recovery.
+
 Missed-pause journey: store “resume deployment,” append the later user's pause as evidence, continue Ember and attempt to use the old step. Fresh index/detail and overflow paths must expose reconciliation required; the stale step cannot appear ready. Trusted revision-checked reconciliation preserves the pause, and no scanner operation can clear it or supply permission.
 
 Qualify through production context construction and a controlled real continuation journey. Existing four-tool coordinator-drive-eval does not prove this path. Run owning Rust/spec checks and UI/native checks only for actual presentation changes.
 
 Compare successive assembled provider requests: registry/page updates may append context but must leave the tracker-independent system block and earlier message prefix unchanged. Test no-change loops, retry/restart, an idle scanner commit, same-turn tool mutation and continuation. Record request/context accounting; do not infer actual provider cache savings from prefix equality alone. A requested-work detour/continuation journey must recover useful follow-through on an existing wakeup without a fresh user reminder.
 
-Out of scope: scanner inference, new periodic review wakeups, a workstream dashboard and task hierarchy.
+Out of scope: scanner inference, new periodic review wakeups, a workstream taxonomy/hierarchy, per-worker checker, silence sweep, executive dashboard/projection and human read markers.
