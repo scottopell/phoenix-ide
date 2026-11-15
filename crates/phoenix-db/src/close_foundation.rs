@@ -11659,76 +11659,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_scope_inventory_requires_exact_authorized_snapshot() {
+    async fn unsealed_scope_free_obligation_cannot_mint_original_anchor() {
         let db = Database::open_in_memory().await.unwrap();
-        // Model a legacy root with no attached WorkScope before admission.
-        // Normal admission must seal its real empty scope set; the unsealed
-        // interruption fixture is not retirement authority.
-        create_root(&db, "root").await;
-        sqlx::query("UPDATE conversations SET work_scope_id = NULL WHERE id = 'root'")
-            .execute(db.pool())
-            .await
-            .unwrap();
-        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "scope-free")
-            .await
-            .unwrap();
-        assert!(db
-            .list_close_attempt_scopes("scope-free")
-            .await
-            .unwrap()
-            .is_empty());
-        set_close_phase(&db, "scope-free", ClosePhase::AwaitingRetirementInspection).await;
-        db.replace_close_inspection(ReplaceCloseInspectionRequest {
-            attempt_id: CloseAttemptId::parse("scope-free").unwrap(),
-            scopes: Vec::new(),
-        })
-        .await
-        .unwrap();
-        let snapshot = current_test_snapshot(&db, "scope-free").await;
-        let initial_anchor_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM close_original_retirement_anchors WHERE attempt_id = ?1",
+        // Current user roots always have a WorkScope. The scope-free fixture
+        // represents interrupted legacy data, not a sealed retirement topology.
+        let run = scope_free_close_fixture(&db).await;
+        let transition = sqlx::query(
+            "UPDATE close_obligations SET phase = 'awaiting_retirement_inspection'
+             WHERE attempt_id = ?1",
         )
-        .bind("scope-free")
+        .bind(run.attempt_id.as_str())
+        .execute(db.pool())
+        .await;
+        assert!(matches!(transition, Err(sqlx::Error::Database(_))));
+        let snapshot = CloseRetirementSnapshot::parse("initial", "initial").unwrap();
+        let capture = db
+            .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
+                attempt_id: run.attempt_id.clone(),
+                snapshot,
+                scopes: Vec::new(),
+            })
+            .await;
+        assert!(matches!(
+            capture,
+            Err(DbError::CloseFoundationPrecondition(_))
+        ));
+        let retained: (i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT COUNT(*) FROM close_original_retirement_anchors WHERE attempt_id = ?1),
+                (SELECT COUNT(*) FROM close_retirement_inventories WHERE attempt_id = ?1)",
+        )
+        .bind(run.attempt_id.as_str())
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(initial_anchor_count, 0);
-
-        let request = CaptureCloseRetirementInventoryRequest {
-            attempt_id: CloseAttemptId::parse("scope-free").unwrap(),
-            snapshot: snapshot.clone(),
-            scopes: Vec::new(),
-        };
-        let first = db
-            .capture_close_retirement_inventory(request.clone())
-            .await
-            .unwrap();
-        assert!(first.is_empty());
-        let anchor: (String, String) = sqlx::query_as(
-            "SELECT inspection_generation, inspection_fingerprint
-             FROM close_original_retirement_anchors WHERE attempt_id = ?1",
-        )
-        .bind("scope-free")
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(anchor.0, snapshot.generation());
-        assert_eq!(anchor.1, snapshot.fingerprint());
-
-        let replay = db
-            .capture_close_retirement_inventory(request)
-            .await
-            .unwrap();
-        assert_eq!(replay, first);
-        let replay_anchor: (String, String) = sqlx::query_as(
-            "SELECT inspection_generation, inspection_fingerprint
-             FROM close_original_retirement_anchors WHERE attempt_id = ?1",
-        )
-        .bind("scope-free")
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(replay_anchor, anchor);
+        assert_eq!(retained, (0, 0));
     }
 
     #[tokio::test]
