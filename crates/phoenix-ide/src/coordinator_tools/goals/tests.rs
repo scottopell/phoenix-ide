@@ -1692,15 +1692,6 @@ async fn watch_tools_treat_omitted_and_exact_local_as_equal_and_reject_invalid_s
     );
     assert_eq!(omitted_unwatch, explicit_local_unwatch);
 
-    let local_list = value(
-        &f.invoke(
-            "list_watched_conversations",
-            json!({"request":{"op":"local"}}),
-        )
-        .await,
-    );
-    assert_eq!(local_list, json!([]));
-
     let _ = f
         .invoke(
             "watch_conversation",
@@ -1738,6 +1729,27 @@ async fn watch_tools_treat_omitted_and_exact_local_as_equal_and_reject_invalid_s
             );
         }
     }
+}
+
+#[tokio::test]
+async fn watch_list_closed_requests_preserve_local_watches_and_reject_invalid_peers() {
+    let f = Fixture::new().await;
+    let _ = f
+        .invoke(
+            "watch_conversation",
+            json!({"product_conversation_id":f.owner.as_str()}),
+        )
+        .await;
+    let before = f.db.list_coordinator_watches().await.unwrap();
+    assert!(!before.is_empty());
+    let local = value(
+        &f.invoke(
+            "list_watched_conversations",
+            json!({"request":{"op":"local"}}),
+        )
+        .await,
+    );
+    assert_eq!(local, serde_json::to_value(&before).unwrap());
     for selector in [
         json!("missing-peer"),
         json!("Local"),
