@@ -59,6 +59,7 @@ use tracing::Instrument;
 
 mod capacity;
 mod continuation;
+mod native_close;
 mod native_task_approval;
 mod self_goal;
 #[cfg(test)]
@@ -3301,6 +3302,22 @@ where
                 Some(request) = self.acknowledged_event_rx.recv() => {
                     let super::AcknowledgedEventRequest { event, acknowledgement, retirement } = match request {
                         AcknowledgedRuntimeRequest::Event(event) => *event,
+                        AcknowledgedRuntimeRequest::ExecuteNativeCloseInitial(request) => {
+                            let super::native_close_application::NativeCloseInitialRequest {
+                                source, target, admitted, target_gate, response,
+                            } = *request;
+                            // The actual source actor remains exclusively borrowed
+                            // through the whole DB transaction and classification.
+                            // It must not reacquire the transferred target gate.
+                            let result = self.execute_native_close_initial(source, target, admitted).await;
+                            let fatal = matches!(result, Err(super::native_close_application::NativeCloseApplicationError::FatalAuthority));
+                            let _ = response.send(result);
+                            drop(target_gate);
+                            if fatal {
+                                return self.fatal_local_authority_exit();
+                            }
+                            continue;
+                        }
                         AcknowledgedRuntimeRequest::ExecuteNativeTaskApproval { command, response, admission } => {
                             // The queued command, not its caller, owns mutation admission to settlement.
                             let _admission = admission;
@@ -16774,8 +16791,8 @@ mod test_git_helpers {
 #[cfg(test)]
 mod creation_completion_lifecycle_tests {
     use super::*;
+    mod native_close_admission_tests;
     mod native_task_admission_tests;
-
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
     use crate::runtime::AcknowledgedEventRequest;
     use crate::tools::BrowserSessionManager;
