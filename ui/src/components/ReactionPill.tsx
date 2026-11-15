@@ -191,10 +191,13 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       el.style.left = `${Math.max(left + 12, Math.min(x, left + width - pillWidth - 12))}px`;
       el.style.top = `${Math.max(top + 12, Math.min(y, bottom - height - 12))}px`;
     };
-    const schedule = () => { cancelAnimationFrame(frame); frame = requestAnimationFrame(position); };
+    // Coalesce rather than debounce: a change during a pending frame is covered by
+    // that frame, and position() clears `frame` first, so later changes schedule anew.
+    const schedule = () => { if (!frame) frame = requestAnimationFrame(position); };
     if (dockActive) scroller.classList.add('reaction-dock-reserved');
     const mutations = new MutationObserver(schedule);
-    mutations.observe(layoutOwner, { childList: true, subtree: true });
+    // document.body, not layoutOwner: a remounted transcript must not escape observation.
+    mutations.observe(document.body, { childList: true, subtree: true, characterData: true });
     const resize = new ResizeObserver(schedule);
     position();
     resize.observe(scroller);

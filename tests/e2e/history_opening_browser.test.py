@@ -1014,15 +1014,22 @@ class OpeningQualificationTests(unittest.TestCase):
     def test_rust_lane_contains_full_suite_budget_and_non_test_reserve(self):
         import re
         workflow = (Path(opening.__file__).resolve().parents[2] / '.github/workflows/ci.yml').read_text()
-        job = workflow.split('  check-rust:', 1)[1].split('\n  check-clippy:', 1)[0]
-        minutes = int(re.search(r'    timeout-minutes: (\d+)', job).group(1))
-        cargo = int(re.search(r'PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS: "(\d+)"', job).group(1))
+        jobs = {block.split(':', 1)[0].strip(): block
+                for block in re.split(r'\n(?=  [A-Za-z0-9_-]+:\n)', workflow)
+                if re.match(r'  [A-Za-z0-9_-]+:\n', block)}
+        build, split, musl, gate = (jobs[name] for name in (
+            'check-rust-build', 'check-rust-split', 'check-rust-musl', 'check-rust'))
+        minutes = int(re.search(r'^    timeout-minutes: (\d+)', split, re.M).group(1))
+        cargo = int(re.search(r'PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS: "(\d+)"', split).group(1))
         self.assertGreaterEqual(cargo, 1500)
         self.assertGreaterEqual(minutes * 60, cargo + 600 + 300)
-        self.assertIn('./dev.py check --lanes rust,cargo-fmt', job)
-        self.assertIn('cargo check --target x86_64-unknown-linux-musl', job)
-        self.assertNotIn('--skip', job)
-        self.assertNotIn('continue-on-error', job)
+        self.assertIn('./dev.py check --lanes rust,cargo-fmt --rust-phase build', build)
+        self.assertIn('./dev.py check --lanes rust --rust-phase ${{ matrix.phase }}', split)
+        self.assertIn('--target x86_64-unknown-linux-musl --features phoenix_ide/datadog-tracing', musl)
+        self.assertIn('needs: [plan_check, check-rust-build, check-rust-split, check-rust-musl]', gate)
+        for job in (build, split, musl, gate):
+            self.assertNotIn('--skip', job)
+            self.assertNotIn('continue-on-error', job)
 
     def test_frozen_geometry_workflow_uses_its_frozen_harness_bundle(self):
         workflow = (Path(opening.__file__).resolve().parents[2] / '.github/workflows/history-geometry-repro.yml').read_text()
