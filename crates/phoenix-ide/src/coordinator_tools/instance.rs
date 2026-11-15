@@ -17,6 +17,18 @@ impl RemoteInstanceSelector {
     }
 }
 
+impl<'de> Deserialize<'de> for RemoteInstanceSelector {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let selector = String::deserialize(deserializer)?;
+        if selector.is_empty() || selector == "local" {
+            return Err(serde::de::Error::custom(
+                "expected a saved remote peer UUID or name, not local",
+            ));
+        }
+        Ok(Self(selector))
+    }
+}
+
 impl<'de> Deserialize<'de> for InstanceSelector {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let selector = String::deserialize(deserializer)?;

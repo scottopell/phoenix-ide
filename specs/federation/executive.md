@@ -22,6 +22,8 @@ Phoenix has saved-peer enrollment, authenticated peer reads, optional-instance c
 
 ## Existing foundations
 
+The list-watch hotfix uses one required closed request with local and remote branches (REQ-FED-009, ADR-257). Local has no cursor or peer field; remote requires an exact saved-peer selector and accepts an omitted/null first-page cursor or a returned subscription UUID. Both schema and typed decoding reject remote-only fields on local requests. Invalid and historical flat calls return valid next-call examples; no legacy-shape fallback is added. Decoder, registered pagination/isolation, production-registry and two-instance regressions cover the native contract; qualification results are recorded in [the hotfix PR](https://github.com/scottopell/phoenix-ide/pull/1088). Live provider acceptance and production activation are not established.
+
 - Saved peer identity, strict TLS trust, bearer authentication, and destination identity verification.
 - Shared `InstanceSelector` reserves exact `"local"` before peer lookup without changing saved peers or local-only ordinary tools. Its property test preserves every non-local string as a remote selector; authority-specific query schemas and tool tests preserve null/type validation.
 - New enrollment and saved-connection names use `PeerDisplayName`, which reserves local independent of ASCII case and surrounding whitespace. Saved labels are not rewritten by selection.

@@ -44,6 +44,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [257](257_watch-list-requests-separate-local-and-remote-shapes.md) | Watch listing separates local and remote request shapes | Accepted | REQ-FED-009 |
 | [256](256_new-conversations-default-to-automatic-context-continuation.md) | New conversations default to automatic context continuation | Accepted; partially supersedes 054 | REQ-BED-021, REQ-API-029, REQ-CONV-024 |
 | [255](255_compact-annotation-stack-with-modal-editing.md) | Compact annotation stack with modal editing | Accepted | REQ-PF-019–020 |
 | [254](254_editable-annotation-cards-own-pending-source-highlights.md) | Editable annotation cards own pending source highlights | Superseded by ADR-255 | REQ-PF-018–020 |
