@@ -313,6 +313,17 @@ AND SHALL make duplicate, concurrent, replayed, and lost-response observations r
 AND SHALL reject absent or stale references for a retained action without selecting a latest fallback or creating an operation
 AND SHALL preserve existing active, failed, completed, and cancelled references as exact attempt, run ordinal, and ProductConversation identities
 
+WHEN a supported transaction writer performs the first complete retirement capture for a Close attempt
+THE SYSTEM SHALL atomically capture its full inventory and establish one immutable original-snapshot anchor for the exact inspection generation and fingerprint
+AND a retry or resumed inspection with a later generation SHALL preserve that anchor rather than replace or adopt it
+AND the schema SHALL enforce the complete sealed shape of an original anchor and the immutability of original anchors and negative exclusions
+AND every attempt that predates this migration SHALL be negatively excluded from original-anchor provenance, including attempts with no retained inventory or other ambiguity
+AND no positive anchor SHALL be backfilled for a pre-migration attempt or restored through native adoption
+AND legacy shared capture, reinspection, observation, and generic retry operations SHALL continue normally, but SHALL NOT gain native original-anchor proof from those writes
+AND partial repair and copied inventory writes SHALL NOT originate original-anchor proof
+AND persistence SHALL refuse a supported fresh capture's anchor unless its exact captured scope set has a sealed inventory and matching expected resources, including each scope's WorkScope identity
+AND this supported-writer transaction guarantee and schema shape SHALL NOT claim a temporal guarantee against arbitrary future SQL writers
+
 WHEN an authorized explicit action requests retry of an exact retained failed Close run and fresh read-only safety proof establishes the retry is safe under the original authority
 THE SYSTEM SHALL admit at most one exact successor run with the next ordinal under the original Close authority
 AND duplicate observations SHALL report that retained successor rather than admit another run

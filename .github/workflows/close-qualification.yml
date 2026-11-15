@@ -1,0 +1,80 @@
+name: Close exact-source qualification
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/unified-close-receipts]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: close-qualification-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  database:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+          components: rustfmt
+          rustflags: ''
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: close-database-qualification
+      - name: Pin source and prepare hosted-only formatting proposal
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git rev-parse HEAD | tee evidence/source.sha
+          git rev-parse HEAD^{tree} | tee evidence/source.tree
+          cargo fmt --all
+          git diff --binary > evidence/hosted-format.patch
+          git restore --worktree .
+          git diff --exit-code
+      - name: Compile database tests and inventory exact selectors
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p phoenix-db --lib --no-run 2>&1 | tee evidence/compile.log
+          cargo test -p phoenix-db --lib -- --list 2>&1 | tee evidence/inventory.log
+          grep -E '^close_foundation::tests::.*: test$|^migrations::tests::migration_159_.*: test$' evidence/inventory.log > evidence/selected-tests.txt
+          test -s evidence/selected-tests.txt
+          grep -F 'stopped_original_retirement_proof_rejects_missing_and_excluded_provenance: test' evidence/selected-tests.txt
+          grep -F 'dispatched_absence_retry_resumes_retirement_with_retained_snapshot: test' evidence/selected-tests.txt
+          grep -F 'migration_159_excludes_legacy_sealed_inventory_and_preserves_shared_g2_capture: test' evidence/selected-tests.txt
+      - name: Execute complete Close foundation module
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p phoenix-db --lib close_foundation::tests:: -- --nocapture --test-threads=1 2>&1 | tee evidence/close-foundation.log
+      - name: Execute migration159 regression module selectors
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p phoenix-db --lib migrations::tests::migration_159_ -- --nocapture --test-threads=1 2>&1 | tee evidence/migration159.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/migration159.log
+      - name: Require exact source formatting
+        if: success() || failure()
+        shell: bash
+        run: |
+          test ! -s evidence/hosted-format.patch
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: close-exact-source-${{ github.sha }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14
