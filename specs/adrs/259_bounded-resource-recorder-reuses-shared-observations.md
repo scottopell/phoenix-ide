@@ -1,4 +1,4 @@
-# ADR-258: A bounded resource recorder reuses shared observations
+# ADR-259: A bounded resource recorder reuses shared observations
 
 - **Status:** Accepted
 - **Date:** 2026-11-08

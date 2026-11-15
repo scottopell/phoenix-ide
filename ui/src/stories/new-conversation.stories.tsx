@@ -14,3 +14,6 @@ const storyFor = (id: NewConversationScenarioId): Story => {
 
 export const ReadyGitProject = storyFor('ready-git-project');
 ReadyGitProject.storyName = 'ready-git-project';
+
+export const CrowdedRepositories = storyFor('crowded-repositories');
+CrowdedRepositories.storyName = 'crowded-repositories';

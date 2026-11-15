@@ -44,7 +44,8 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
-| [258](258_bounded-resource-recorder-reuses-shared-observations.md) | A bounded resource recorder reuses shared observations | Accepted | REQ-DEPLOY-007a–007d |
+| [259](259_bounded-resource-recorder-reuses-shared-observations.md) | A bounded resource recorder reuses shared observations | Accepted | REQ-DEPLOY-007a–007d |
+| [258](258_search-hidden-visibility-trusts-fts-index.md) | Ranked search trusts indexed text for hidden-message eligibility | Accepted | REQ-RET-003, REQ-RET-007 |
 | [257](257_watch-list-requests-separate-local-and-remote-shapes.md) | Watch listing separates local and remote request shapes | Accepted | REQ-FED-009 |
 | [256](256_new-conversations-default-to-automatic-context-continuation.md) | New conversations default to automatic context continuation | Accepted; partially supersedes 054 | REQ-BED-021, REQ-API-029, REQ-CONV-024 |
 | [255](255_compact-annotation-stack-with-modal-editing.md) | Compact annotation stack with modal editing | Accepted | REQ-PF-019–020 |
