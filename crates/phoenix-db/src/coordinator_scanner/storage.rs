@@ -542,18 +542,18 @@ async fn coverage(
         ) = if let Some(generation) = generation {
             let live = position(&row, ScanLane::Live)?;
             let historical = position(&row, ScanLane::Historical)?;
-            let stale = generation != source_generation;
-            let live_pending = stale
+            let generation_changed = generation != source_generation;
+            let live_pending = generation_changed
                 || matches!(live, ScanPosition::Fragment { .. })
                 || seq(&live) < row.try_get::<i64, _>("tail")?;
-            let historical_pending = stale || seq(&historical) > 0;
+            let historical_pending = generation_changed || seq(&historical) > 0;
             (
                 Some(generation),
                 row.try_get("activation_boundary")?,
                 Some(row.try_get("activation_boundary")?),
                 Some(live),
                 Some(historical),
-                if stale {
+                if generation_changed {
                     ScanCoverageState::GenerationStale
                 } else if live_pending || historical_pending {
                     ScanCoverageState::Incomplete
