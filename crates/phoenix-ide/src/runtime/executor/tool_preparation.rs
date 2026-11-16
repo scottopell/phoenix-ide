@@ -120,7 +120,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             assistant_message_id: assistant_message.message_id.clone(),
             tool,
             context: self.context.clone(),
-            direct_turn: self.active_direct_turn.clone(),
+            direct_turn: self.active_direct_turn.as_deref().cloned(),
         });
         let storage = self.storage.clone();
         let executor = self.tool_executor.clone();
