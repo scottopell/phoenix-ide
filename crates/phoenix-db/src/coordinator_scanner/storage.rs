@@ -113,6 +113,7 @@ pub(super) async fn set_blocker(
     sqlx::query("UPDATE coordinator_scan_state SET last_blocker=?1,next_resume_at_us=?2,observed_at_us=?3 WHERE singleton=1").bind(reason.as_str()).bind(next).bind(now).execute(&mut **tx).await?;
     Ok(())
 }
+#[allow(clippy::too_many_lines)]
 async fn prepare(
     tx: &mut Transaction<'_, Sqlite>,
     profile: Option<&ScanProfile>,
@@ -476,6 +477,7 @@ pub(super) async fn complete_attempt(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn coverage(
     tx: &mut Transaction<'_, Sqlite>,
     after: Option<i64>,

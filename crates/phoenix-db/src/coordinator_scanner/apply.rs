@@ -102,6 +102,7 @@ fn primary(fragment: &ScanFragment) -> bool {
                 | InputOrigin::RemoteApi { .. }
         )
 }
+#[allow(clippy::too_many_lines)]
 async fn apply(
     tx: &mut Transaction<'_, Sqlite>,
     attempt: &ReservedScanAttempt,

@@ -821,6 +821,306 @@ mod live {
         assert!(fixture.denied.lock().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn tracking_scanner_idle_capture_reaches_authoritative_turn_and_pause_survives_two_continuations(
+    ) {
+        use phoenix_db::coordinator_scanner::{
+            ScanAction, ScanApplyOutcome, ScanConnection, ScanMetrics, ScanPreparation,
+            ScanProfile, ScanQuote, ScanReservation, ScanResult, ScanUsage,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let isolated =
+            phoenix_core::runtime_env::PhoenixRuntimeEnvironment::with_root(directory.path());
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.initialize_coordinator_work_scope(directory.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let source = db
+            .get_or_create_coordinator(
+                Some("test-model"),
+                phoenix_core::llm_language::LlmLanguage::PhoenixNative,
+            )
+            .await
+            .unwrap()
+            .id;
+        let registry = Arc::new(ModelRegistry::new_empty());
+        let manager = Arc::new(
+            crate::runtime::RuntimeManager::new_with_message_retriever_and_runtime_env(
+                db.clone(),
+                registry.clone(),
+                Arc::new(db.fts_retriever()),
+                crate::platform::PlatformCapability::None {
+                    details: "isolated scanner/context composition".into(),
+                },
+                Arc::new(crate::tools::mcp::McpClientManager::new()),
+                None,
+                &isolated,
+            ),
+        );
+        let client = Arc::new(MockLlmClient::new("test-model"));
+        let fixture = Fixture {
+            manager,
+            db: db.clone(),
+            registry,
+            client: client.clone(),
+            model: "test-model".into(),
+            cwd: directory.path().to_path_buf(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            denied: Arc::new(Mutex::new(Vec::new())),
+            source_checkpoint_presence: Arc::new(Mutex::new(Vec::new())),
+        };
+        let answer = |text: &str| LlmResponse {
+            provider_replay: None,
+            content: vec![ContentBlock::text(text)],
+            end_turn: true,
+            usage: phoenix_llm::Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        };
+        client.queue_response(answer("We can return to those after the detour."));
+        fixture.turn(&source,"Please compare Cobalt totals, first asking which period. Also, why are immutable snapshots helpful? Let's detour.").await;
+        let first = client.recorded_requests()[0].clone();
+        let before_scan = db.get_messages(&source).await.unwrap();
+        let profile = ScanProfile {
+            connection: ScanConnection::Codex,
+            endpoint_hash: [1; 32],
+            prompt_hash: [2; 32],
+            instruction_bytes: 64,
+        };
+        let now = Utc::now().timestamp_micros();
+        let ScanPreparation::Ready(batch) = db
+            .prepare_coordinator_scan(Some(&profile), now)
+            .await
+            .established()
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("own history not prepared")
+        };
+        let original = batch
+            .input()
+            .fragments
+            .iter()
+            .find(|f| {
+                matches!(
+                    f.origin,
+                    phoenix_core::domain::db_schema::InputOrigin::UserApi
+                )
+            })
+            .unwrap();
+        let quote = ScanQuote {
+            fragment_id: original.fragment_id.clone(),
+            quotation: original.text.clone(),
+        };
+        let result = ScanResult::Complete {
+            actions: vec![
+                ScanAction::New {
+                    kind: TrackingKind::RequestedWork,
+                    title: "Recover omitted Cobalt totals".into(),
+                    note: "Requested comparison after a detour; ask before work".into(),
+                    resumption: "Ask which period before any work".into(),
+                    quotes: vec![quote.clone()],
+                },
+                ScanAction::New {
+                    kind: TrackingKind::Bookmark,
+                    title: "Why immutable snapshots help".into(),
+                    note: "Useful conversational question, not permission to implement".into(),
+                    resumption: "Explain the original design question when returning".into(),
+                    quotes: vec![quote],
+                },
+            ],
+        };
+        let bytes = serde_json::to_vec(batch.input()).unwrap().len() + 64;
+        let ScanReservation::Reserved(attempt) = db
+            .reserve_coordinator_scan(batch, bytes, now)
+            .await
+            .established()
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("not reserved")
+        };
+        let observed = || ScanMetrics {
+            elapsed_ms: 1,
+            usage: Some(ScanUsage {
+                input_tokens: Some(10),
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                output_tokens: Some(10),
+            }),
+        };
+        let ScanApplyOutcome::Applied {
+            created_item_ids, ..
+        } = db
+            .apply_coordinator_scan(&attempt, &result, observed(), now)
+            .await
+            .established()
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("not captured")
+        };
+        let requested = &created_item_ids[0];
+        let bookmark = &created_item_ids[1];
+        assert_eq!(
+            client.recorded_requests().len(),
+            1,
+            "idle scanner never invokes foreground model"
+        );
+        assert!(matches!(
+            db.get_conversation(&source).await.unwrap().state,
+            ConvState::Idle
+        ));
+        let after_scan = db.get_messages(&source).await.unwrap();
+        assert_eq!(before_scan.len(), after_scan.len());
+        for (before, after) in before_scan.iter().zip(&after_scan) {
+            assert_eq!(before.message_id, after.message_id);
+            assert_eq!(before.content, after.content);
+        }
+        client.queue_response(answer("4."));
+        fixture.turn(&source, "What is2+2?").await;
+        let fresh = client.recorded_requests().last().unwrap().clone();
+        let text = request_text(&fresh);
+        assert!(text.contains(requested));
+        assert!(text.contains(bookmark));
+        assert!(text.contains("Recover omitted Cobalt totals"));
+        assert!(text.contains("Why immutable snapshots help"));
+        assert_eq!(first.system[0].text, fresh.system[0].text);
+        for (old, new) in first.messages.iter().zip(&fresh.messages) {
+            assert_eq!(old.source_message_id, new.source_message_id);
+            assert_eq!(old.content, new.content);
+        }
+        let call = SourceToolCall {
+            message_id: uuid::Uuid::new_v4().to_string(),
+            tool_use_id: "trusted-reconciliation".into(),
+        };
+        apply_pending_round(
+            &db,
+            &source,
+            &call,
+            &TrackingMutation::Update {
+                id: requested.clone(),
+                expected_revision: 1,
+                kind: TrackingKind::RequestedWork,
+                title: "Recover omitted Cobalt totals".into(),
+                note: "Reviewed original Cobalt purpose".into(),
+                resumption: "Ask which period before any work".into(),
+                reviewed_evidence_ordinal: 1,
+                references: vec![],
+            },
+        )
+        .await;
+        assert!(matches!(
+            db.read_coordinator_tracking(&source, requested, 0)
+                .await
+                .unwrap()
+                .item
+                .resumption,
+            TrackingResumption::Reviewed { .. }
+        ));
+        client.queue_response(answer("Paused."));
+        fixture
+            .turn(
+                &source,
+                "Pause Cobalt. Do not proceed until I explicitly resume.",
+            )
+            .await;
+        let pause_now = Utc::now().timestamp_micros();
+        let ScanPreparation::Ready(batch) = db
+            .prepare_coordinator_scan(Some(&profile), pause_now)
+            .await
+            .established()
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("pause not prepared")
+        };
+        let pause = batch
+            .input()
+            .fragments
+            .iter()
+            .find(|f| f.text == "Pause Cobalt. Do not proceed until I explicitly resume.")
+            .unwrap();
+        let result = ScanResult::Complete {
+            actions: vec![ScanAction::Append {
+                item_id: requested.clone(),
+                quotes: vec![ScanQuote {
+                    fragment_id: pause.fragment_id.clone(),
+                    quotation: pause.text.clone(),
+                }],
+            }],
+        };
+        let bytes = serde_json::to_vec(batch.input()).unwrap().len() + 64;
+        let ScanReservation::Reserved(attempt) = db
+            .reserve_coordinator_scan(batch, bytes, pause_now)
+            .await
+            .established()
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("pause not reserved")
+        };
+        db.apply_coordinator_scan(&attempt, &result, observed(), pause_now)
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
+        assert_eq!(client.recorded_requests().len(), 3);
+        assert!(matches!(
+            db.read_coordinator_tracking(&source, requested, 0)
+                .await
+                .unwrap()
+                .item
+                .resumption,
+            TrackingResumption::ReviewRequired { .. }
+        ));
+        let mut head = source;
+        for _ in 0..2 {
+            db.update_conversation_state(
+                &head,
+                &ConvState::ContextExhausted {
+                    summary: "Unrelated detour only; Cobalt and bookmark deliberately absent"
+                        .into(),
+                },
+            )
+            .await
+            .unwrap();
+            head = match db.continue_conversation(&head).await.unwrap() {
+                phoenix_db::ContinueOutcome::Created(next) => next.id,
+                other => panic!("{other:?}"),
+            };
+        }
+        client.queue_response(answer("7."));
+        fixture.turn(&head, "What is3+4?").await;
+        let continued = client.recorded_requests().last().unwrap().clone();
+        let continued_text = request_text(&continued);
+        assert!(continued_text.contains(requested));
+        assert!(continued_text.contains(bookmark));
+        assert!(continued_text.contains("\"review_required\":true"));
+        let detail = db
+            .read_coordinator_tracking(&head, requested, 0)
+            .await
+            .unwrap();
+        assert!(matches!(
+            detail.item.resumption,
+            TrackingResumption::ReviewRequired { .. }
+        ));
+        assert!(detail
+            .evidence
+            .iter()
+            .any(|(_, e)| e.quotation.contains("Do not proceed")));
+        assert_eq!(
+            db.list_coordinator_tracking(&head, None, false)
+                .await
+                .unwrap()
+                .active_count,
+            2
+        );
+        assert!(fixture.denied.lock().unwrap().is_empty());
+        assert!(fixture.calls.lock().unwrap().is_empty());
+    }
+
     /// Opt-in, synthetic and isolated. Expected behavior is fixed before model calls:
     /// two records; quiet arithmetic; summary-independent return; then a due request.
     #[tokio::test]

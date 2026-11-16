@@ -122,6 +122,7 @@ pub(super) async fn capture(
 ) -> DbResult<Captured> {
     capture_range(tx, transcript, generation, lane, start, None).await
 }
+#[allow(clippy::too_many_lines)]
 pub(super) async fn capture_range(
     tx: &mut Transaction<'_, Sqlite>,
     transcript: &str,

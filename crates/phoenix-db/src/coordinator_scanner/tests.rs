@@ -805,6 +805,7 @@ fn append_output(batch: &PreparedScanBatch, id: &str) -> ScanResult {
     }
 }
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn scanner_unchanged_generation_rescan_dedups_but_new_restriction_invalidates_review() {
     use crate::coordinator_tracking::TrackingMutation;
     let (db, source) = setup().await;
@@ -1377,6 +1378,7 @@ async fn drain_empty(db: &Database, now: &mut i64, append: Option<(&str, &str)>)
     panic!("bounded drain did not finish")
 }
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn scanner_restart_finds_old_generation_edit_without_append_across_two_continuations() {
     use crate::coordinator_tracking::{TrackingMutation, TrackingRetirement, TrackingState};
     let dir = tempfile::tempdir().unwrap();
