@@ -167,7 +167,10 @@ describe('conversationIdentity', () => {
   });
 
   it.each(['Explore', 'Product', 'Work', 'Direct', undefined])('uses Coordinator role instead of %s mode permissions', (mode) => {
-    const { mode: identity } = getConversationIdentity(makeConversation({ conv_mode_label: mode, runtime_role: 'coordinator' }));
+    const conversation = makeConversation({ runtime_role: 'coordinator' });
+    delete conversation.conv_mode_label;
+    if (mode !== undefined) conversation.conv_mode_label = mode;
+    const { mode: identity } = getConversationIdentity(conversation);
     expect(identity.label).toBe('Coordinator');
     expect(identity.detail).toBe('Coordinator tools');
     expect(identity.title).toContain('not the ordinary conversation tool set');
@@ -175,7 +178,10 @@ describe('conversationIdentity', () => {
   });
 
   it.each([undefined, '', '   ', 'Future Mode'])('fails conservatively for mode %s', (conv_mode_label) => {
-    const { mode } = getConversationIdentity(makeConversation({ conv_mode_label }));
+    const conversation = makeConversation();
+    delete conversation.conv_mode_label;
+    if (conv_mode_label !== undefined) conversation.conv_mode_label = conv_mode_label;
+    const { mode } = getConversationIdentity(conversation);
     expect(mode.key).toBe('unknown');
     expect(mode.detail).toBe('Access unavailable');
     expect(mode.title).toContain('unavailable');

@@ -1620,7 +1620,10 @@ describe('StateBar mobile layout', () => {
   });
 
   it.each(['Future Mode', '', undefined])('does not claim full access for an unavailable mode: %s', (conv_mode_label) => {
-    renderStateBar({ conversation: makeConversation({ conv_mode_label }) });
+    const conversation = makeConversation();
+    delete conversation.conv_mode_label;
+    if (conv_mode_label !== undefined) conversation.conv_mode_label = conv_mode_label;
+    renderStateBar({ conversation });
     fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i }).at(-1)!);
     expect(screen.queryByText(/full access/i)).not.toBeInTheDocument();
     if (conv_mode_label) {
@@ -1633,6 +1636,7 @@ describe('StateBar mobile layout', () => {
     const props: ComponentProps<typeof StateBar> = {
       conversation: makeConversation({ conv_mode_label: 'Product', runtime_role: 'user' }),
       convState: { type: 'idle' }, contextWindowUsed: 0, modelContextWindow: 200_000,
+      connectionState: 'connected', connectionAttempt: 0, nextRetryIn: 0,
     };
     const { rerender } = render(<StateBar {...props} />, { wrapper: MemoryRouter });
     fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i }).at(-1)!);
