@@ -16,9 +16,12 @@ pub(crate) async fn project_prompt_events(
 ) -> DbResult<()> {
     let ids: Vec<&str> = messages
         .iter()
-        .filter_map(|message| match &message.origin {
-            InputOrigin::SubscriptionEvent { event_id } => Some(event_id.as_str()),
-            _ => None,
+        .filter_map(|message| {
+            if let InputOrigin::SubscriptionEvent { event_id } = &message.origin {
+                Some(event_id.as_str())
+            } else {
+                None
+            }
         })
         .collect();
     let mut projections = std::collections::HashMap::new();
@@ -66,7 +69,7 @@ pub(crate) async fn project_prompt_events(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SettledWatchInput {
     pub message_id: String,
-    pub origin: InputOrigin,
+    pub origin: Option<InputOrigin>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -112,7 +115,10 @@ impl WatchEndingEvidence {
                 format!(
                     "Settled input {} (not necessarily the sole cause), origin: {}.\n",
                     input.message_id,
-                    serde_json::to_string(&input.origin).expect("typed origin serializes")
+                    input.origin.as_ref().map_or_else(
+                        || "unavailable source origin".to_string(),
+                        |origin| serde_json::to_string(origin).expect("typed origin serializes")
+                    )
                 )
             });
         match &self.response {
@@ -124,7 +130,7 @@ impl WatchEndingEvidence {
                 ..
             } => {
                 text.push_str(&format!(
-                    "Ending response {message_id}; version-checked read: @event:{event_id}.\n"
+                    "Ending response {message_id}; evidence @event:{event_id}. Recover omitted prose with read_event_evidence {{\"event_id\":\"{event_id}\",\"cursor\":0}} (local only; retain event_id for every page).\n"
                 ));
                 if let Some(excerpt) = excerpt {
                     text.push_str(
@@ -164,7 +170,10 @@ pub(super) fn decode_evidence(row: &sqlx::sqlite::SqliteRow) -> DbResult<WatchEn
         .map(|message_id| {
             Ok::<_, DbError>(SettledWatchInput {
                 message_id,
-                origin: crate::decode_origin(row)?,
+                origin: row
+                    .try_get::<Option<String>, _>("origin_kind")?
+                    .map(|_| crate::decode_origin(row))
+                    .transpose()?,
             })
         })
         .transpose()?;
@@ -262,7 +271,7 @@ pub(crate) async fn capture_turn_response_tx(
         .map_err(|_| DbError::Serialization("generation overflow".into()))?;
     let row = sqlx::query(
         "SELECT t.conversation_id, o.response_message_id FROM durable_turns t
-         LEFT JOIN direct_turn_terminal_obligations o ON o.turn_id=t.turn_id
+         LEFT JOIN direct_turn_terminal_obligations o ON o.turn_id=t.turn_id AND o.expected_generation=t.generation
          WHERE t.turn_id=?1 AND t.generation=?2 AND t.terminal_kind IS NULL",
     )
     .bind(turn)
@@ -329,7 +338,7 @@ pub(crate) async fn attach_response_tx(
          (event_id,response_state,response_message_id,digest_version,response_digest,excerpt,prose_bytes,capture_limit,
           input_message_id,origin_kind,origin_product_conversation_id,origin_transcript_id,origin_subscription_event_id,
           origin_source_instance_id,origin_slack_request_id,origin_reminder_id,origin_source_message_id,origin_source_tool_use_id)
-         SELECT e.event_id,?1,?2,?3,?4,?5,?6,?7,m.message_id,m.origin_kind,m.origin_product_conversation_id,
+         SELECT e.event_id,?1,?2,?3,?4,?5,?6,?7,?8,m.origin_kind,m.origin_product_conversation_id,
            m.origin_transcript_id,m.origin_subscription_event_id,m.origin_source_instance_id,m.origin_slack_request_id,
            m.origin_reminder_id,m.origin_source_message_id,m.origin_source_tool_use_id
          FROM coordinator_watch_events e LEFT JOIN messages m ON m.message_id=?8 AND m.conversation_id=?9
@@ -673,6 +682,70 @@ mod tests {
             db.coordinator_watch_ending_evidence(&event).await.unwrap(),
             frozen
         );
+    }
+
+    #[tokio::test]
+    async fn historical_missing_evidence_keeps_private_presentation_identity() {
+        let (db, _, event) = fixture("before migration").await;
+        sqlx::query("DELETE FROM coordinator_watch_ending_evidence WHERE event_id=?1")
+            .bind(&event)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let presentations = db
+            .coordinator_watch_event_presentations(std::slice::from_ref(&event))
+            .await
+            .unwrap();
+        let presentation = &presentations[&event];
+        assert_eq!(presentation.event_id, event);
+        assert_eq!(
+            presentation.ending_evidence.response,
+            EndingResponse::HistoricalNotCaptured
+        );
+        for sql in [
+            "INSERT INTO coordinator_watch_ending_evidence(event_id,response_state) VALUES(NULL,'no_carrier')",
+            "INSERT INTO coordinator_watch_ending_evidence(event_id,response_state,response_message_id) VALUES(?1,'captured','missing-digest')",
+            "INSERT INTO coordinator_watch_ending_evidence(event_id,response_state,input_message_id,origin_kind) VALUES(?1,'no_carrier','known-input','remote_api')",
+            "INSERT INTO coordinator_watch_ending_evidence(event_id,response_state,input_message_id,origin_kind,origin_transcript_id) VALUES(?1,'no_carrier','known-input','user_api','wrong-origin-field')",
+        ] {
+            let result = if sql.contains("?1") { sqlx::query(sql).bind(&event).execute(db.pool()).await }
+                else { sqlx::query(sql).execute(db.pool()).await };
+            assert!(result.is_err(),"invalid evidence shape admitted: {sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn known_settled_input_identity_survives_unavailable_source_origin() {
+        let (db, source, event) = fixture("known ending").await;
+        let mut tx = db.pool().begin().await.unwrap();
+        super::super::record_watch_event_with_response_tx(
+            &mut tx,
+            "creation",
+            "missing-input-origin",
+            0,
+            &source,
+            "Completed",
+            None,
+            false,
+            Some("known-but-missing-input"),
+            &EndingResponse::NoCarrier,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let id:String=sqlx::query_scalar("SELECT event_id FROM coordinator_watch_events WHERE source_occurrence_id='missing-input-origin'")
+            .fetch_one(db.pool()).await.unwrap();
+        let evidence = db.coordinator_watch_ending_evidence(&id).await.unwrap();
+        assert_eq!(
+            evidence.settled_input,
+            Some(SettledWatchInput {
+                message_id: "known-but-missing-input".into(),
+                origin: None
+            })
+        );
+        assert!(evidence
+            .readable(&event)
+            .contains("unavailable source origin"));
     }
 
     #[tokio::test]
