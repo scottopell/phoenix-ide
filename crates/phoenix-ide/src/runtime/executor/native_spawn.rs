@@ -2,7 +2,7 @@
 use super::ToolCall;
 use super::{
     ConvState, ConversationRuntime, Effect, Event, LlmClient, PendingSubAgentActivation,
-    StateStore, Storage, ToolExecutor, ToolResult,
+    Storage, ToolExecutor, ToolResult,
 };
 use crate::runtime::{
     NativeSpawnClosureReceipt, NativeSpawnTerminalEvidence, SubAgentAdmissionReceipt,
