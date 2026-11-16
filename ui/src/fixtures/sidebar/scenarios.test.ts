@@ -90,6 +90,11 @@ describe('sidebar fixture scenarios', () => {
     expect(rows.map(row => row.cached_pr?.display_state)).toEqual(['open', 'draft', 'merged', 'closed', undefined]);
     expect(rows[1]?.canonical_root.title?.length).toBeGreaterThan(60);
     expect(rows.filter(row => row.read_state.state === 'unread')).toHaveLength(2);
+    for (const scenario of visualScenarios) {
+      const active = rows.find(row => row.canonical_root.slug === scenario.activeSlug);
+      expect(active?.cached_pr?.display_state).toBe('merged');
+      expect(active?.read_state.state).toBe('unread');
+    }
     expect(rows[0]?.presentation.presentation_mode).toBe('working');
     expect(rows[3]?.presentation.presentation_mode).toBe('error');
   });

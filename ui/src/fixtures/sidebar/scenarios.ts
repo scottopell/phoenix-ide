@@ -238,7 +238,7 @@ export const sidebarScenarios: SidebarScenario[] = [
     theme: 'light',
     collapsed: false,
     initialProjectId: null,
-    activeSlug: null,
+    activeSlug: 'sidebar-visual-normal-title-merged',
     sidebarWidth: 280,
   },
   {
@@ -246,7 +246,7 @@ export const sidebarScenarios: SidebarScenario[] = [
     theme: 'light',
     collapsed: false,
     initialProjectId: null,
-    activeSlug: null,
+    activeSlug: 'sidebar-visual-normal-title-merged',
     sidebarWidth: 160,
   },
   {

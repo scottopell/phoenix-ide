@@ -22,6 +22,7 @@ runSurfaceCapture({
       if (media.coarse !== !!viewport.hasTouch) throw new Error('Capture pointer media does not match requested context');
       const rows = page.locator('.product-conversation-list-row');
       await rows.first().waitFor();
+      await page.locator('.product-conversation-list-row.active.unread').waitFor();
       await page.screenshot({ path: `${outDir}/${id}--${viewport.name}.png`, fullPage: false });
       await page.locator('.sidebar').screenshot({ path: `${outDir}/${id}--${viewport.name}-sidebar.png` });
       const controls = await page.locator('.sidebar-header button, .sidebar-header a, .sidebar-lifecycle-tab, .ember-entry').evaluateAll(elements => elements.map(el => {
