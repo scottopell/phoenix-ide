@@ -65,6 +65,7 @@ mod self_goal;
 #[cfg(test)]
 mod self_goal_tests;
 mod tool_execution;
+mod tool_preparation;
 use capacity::{CapacityDecision, CountingBudget, RequestCapacity, SuccessorCapacity};
 use tool_execution::ToolExecutionSlot;
 #[cfg(test)]
@@ -1060,31 +1061,6 @@ where
             error: format!("Unknown tool: {tool_name}"),
         }
     }
-}
-
-/// Forward a permission-gate denial to the conversation loop as a completed
-/// tool outcome, without spawning a tool task (specs/permissions REQ-PERM-005,
-/// deny-and-continue). The denial reaches the model through the same channel a
-/// real tool result uses, so it can attempt an alternative.
-fn forward_denial_outcome(
-    tool_use_id: String,
-    denial: crate::runtime::deny_gate::Denial,
-    generation: u64,
-    tool_outcome_tx: mpsc::Sender<(u64, ToolExecOutcome)>,
-) {
-    let outcome = ToolExecOutcome::Completed(ToolResult {
-        tool_use_id: tool_use_id.clone(),
-        outcome: tool_output_to_outcome(denial.into_tool_output()),
-        duration_ms: Some(0),
-    });
-    let (denied_tx, denied_rx) = oneshot::channel::<ToolExecOutcome>();
-    let _ = denied_tx.send(outcome);
-    tokio::spawn(forward_tool_outcome(
-        denied_rx,
-        tool_use_id,
-        generation,
-        tool_outcome_tx,
-    ));
 }
 
 fn fresh_response_is_text_only(content: &[ContentBlock]) -> bool {
@@ -2194,6 +2170,8 @@ where
     pending_sub_agent_acceptance: Option<String>,
     pending_sub_agent_terminal: Option<phoenix_db::SubAgentTerminalCause>,
     native_spawn_handoff: Option<NativeSpawnHandoff>,
+    tool_preparation_runtime: uuid::Uuid,
+    tool_preparation: Option<tool_preparation::ToolPreparation>,
     /// Browser session manager for `ToolContext`
     browser_sessions: Arc<BrowserSessionManager>,
     /// Bash handle registry for `ToolContext` (REQ-BASH-014).
@@ -2523,6 +2501,8 @@ where
             pending_sub_agent_acceptance: None,
             pending_sub_agent_terminal: None,
             native_spawn_handoff: None,
+            tool_preparation_runtime: uuid::Uuid::new_v4(),
+            tool_preparation: None,
             browser_sessions,
             bash_handles,
             tmux_registry,
@@ -3339,6 +3319,29 @@ where
                             state = self.state.variant_name(),
                             "Conversation reached terminal state, exiting executor loop"
                         );
+                        self.emit_terminal_lifecycle_event().await;
+                        return RuntimeExitDisposition::Terminal;
+                    }
+                }
+                prepared = async {
+                    match self.tool_preparation.as_mut() {
+                        Some(preparation) => preparation.observe().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match self.accept_tool_preparation(prepared) {
+                        Ok(Some(event)) => {
+                            if let Err(error) = self.process_event(event).await {
+                                tracing::error!(%error, "failed to settle prepared tool");
+                            }
+                        }
+                        Ok(None) => {},
+                        Err(error) => tracing::error!(%error, "tool preparation failed"),
+                    }
+                    if self.fatal_local_authority_fence.fatal_authority_loss_is_latched() {
+                        return self.fatal_local_authority_exit();
+                    }
+                    if matches!(self.state.step_result(), StepResult::Terminal(_)) {
                         self.emit_terminal_lifecycle_event().await;
                         return RuntimeExitDisposition::Terminal;
                     }
@@ -6651,10 +6654,42 @@ where
         })
     }
 
-    #[allow(clippy::too_many_lines)]
+    fn start_selected_spawn_agents_tool(
+        &mut self,
+        current: tool_preparation::CurrentSelection,
+    ) -> Result<Option<Event>, String> {
+        let selection = current.into_selection();
+        self.start_spawn_agents_tool_from_selection(
+            selection.tool.clone(),
+            &selection.context,
+            &selection.assistant_message_id,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn start_spawn_agents_tool(
         &mut self,
         tool: ToolCall,
+    ) -> Result<Option<Event>, String> {
+        let assistant_message_id = match &self.state {
+            ConvState::ToolExecuting {
+                assistant_message, ..
+            } => assistant_message.message_id.clone(),
+            _ => String::new(),
+        };
+        self.start_spawn_agents_tool_from_selection(
+            tool,
+            &self.context.clone(),
+            &assistant_message_id,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn start_spawn_agents_tool_from_selection(
+        &mut self,
+        tool: ToolCall,
+        context: &ConvContext,
+        expected_assistant_message_id: &str,
     ) -> Result<Option<Event>, String> {
         use crate::state_machine::state::{PendingSubAgent, SpawnAgentsInput, SubAgentSpec};
 
@@ -6715,8 +6750,8 @@ where
             .iter()
             .map(|task| task.mode.unwrap_or_default())
             .collect();
-        let parent_allows_work = !self.context.is_coordinator
-            && self.context.resource_authority == crate::work_scope::ResourceAuthority::Work;
+        let parent_allows_work = !context.is_coordinator
+            && context.resource_authority == crate::work_scope::ResourceAuthority::Work;
 
         let mut work_count_in_batch = 0u32;
         for &mode in &resolved_tasks {
@@ -6740,9 +6775,9 @@ where
         let parallel_work_qualified =
             self.spawn_parent_parallel_work_qualified
                 .unwrap_or_else(|| {
-                    self.llm_registry.is_builtin_model(&self.context.model_id)
+                    self.llm_registry.is_builtin_model(&context.model_id)
                         && phoenix_core::subagent_qualification::supports_parallel_work_subagents(
-                            &self.context.model_id,
+                            &context.model_id,
                         )
                 });
 
@@ -6781,7 +6816,7 @@ where
         for (task, &mode) in input.tasks.iter().zip(&resolved_tasks) {
             use phoenix_core::domain::sm_state::ConversationExecutionEnvironment;
             let cwd_override = nonblank(task.cwd.as_deref());
-            let environment = if self.context.is_coordinator {
+            let environment = if context.is_coordinator {
                 if task.cwd.is_some() {
                     return Ok(Some(Event::ToolComplete {
                         tool_use_id: tool_use_id.clone(),
@@ -6794,13 +6829,13 @@ where
                 ConversationExecutionEnvironment::NoFilesystem
             } else {
                 let cwd_path = cwd_override.map_or_else(
-                    || self.context.filesystem_root().to_path_buf(),
+                    || context.filesystem_root().to_path_buf(),
                     |cwd| {
                         let path = std::path::Path::new(cwd);
                         if path.is_absolute() {
                             path.to_path_buf()
                         } else {
-                            self.context.filesystem_root().join(path)
+                            context.filesystem_root().join(path)
                         }
                     },
                 );
@@ -6849,8 +6884,8 @@ where
             let selected = match catalog.select(
                 task.agent_type.as_deref(),
                 task.execution.as_ref(),
-                &self.context.model_id,
-                self.context.effort,
+                &context.model_id,
+                context.effort,
             ) {
                 Ok(selected) => selected,
                 Err(error) => {
@@ -6942,14 +6977,18 @@ where
                 current_tool,
                 assistant_message,
                 ..
-            } if current_tool.id == tool_use_id => assistant_message.message_id.clone(),
+            } if current_tool == &tool
+                && assistant_message.message_id == expected_assistant_message_id =>
+            {
+                assistant_message.message_id.clone()
+            }
             _ => return Err("native spawn preparation lost its originating selection".into()),
         };
         if self.native_spawn_handoff.is_some() {
             return Err("native spawn origin already has an unresolved handoff".into());
         }
         let invocation = phoenix_db::SubAgentSpawnInvocation {
-            parent_conversation_id: self.context.conversation_id.clone(),
+            parent_conversation_id: context.conversation_id.clone(),
             assistant_message_id,
             tool_use_id: tool_use_id.clone(),
             batch_id: uuid::Uuid::new_v4().to_string(),
@@ -6961,7 +7000,7 @@ where
         let request = SubAgentSpawnRequest {
             invocation: invocation.clone(),
             specs,
-            parent_scope: self.context.resource_scope.work_scope_id().cloned(),
+            parent_scope: context.resource_scope.work_scope_id().cloned(),
             parallel_work_qualified,
             parent_turn_link,
             response_tx,
@@ -7126,6 +7165,7 @@ where
     }
 
     fn abort_external_effects_in_memory(&mut self) {
+        self.tool_preparation = None;
         self.abort_active_llm_task();
         self.retry_generation = self.retry_generation.wrapping_add(1);
         if let Some(handle) = self.retry_timer_handle.take() {
@@ -7139,6 +7179,7 @@ where
     }
 
     async fn abort_external_effects(&mut self) {
+        self.tool_preparation = None;
         self.abort_active_llm_task();
         self.retry_generation = self.retry_generation.wrapping_add(1);
         if let Some(handle) = self.retry_timer_handle.take() {
@@ -8114,9 +8155,7 @@ where
                 Ok(None)
             }
 
-            AuthoritativeEffect::ExecuteTool { tool } => {
-                self.dispatch_tool_execution(tool, admitted).await
-            }
+            AuthoritativeEffect::ExecuteTool { tool } => self.begin_tool_preparation(tool),
 
             AuthoritativeEffect::ScheduleRetry {
                 delay,
@@ -8465,6 +8504,9 @@ where
             }
             ControlEffect::AbortTool { tool_use_id } => {
                 tracing::info!(tool_id = %tool_use_id, "Aborting tool execution");
+                if self.cancel_read_only_tool_preparation(&tool_use_id) {
+                    return Ok(Some(Event::ToolAborted { tool_use_id }));
+                }
                 self.tool_execution.request_cancel();
                 if let Some(handoff) = self.native_spawn_handoff.as_mut() {
                     if handoff.invocation.tool_use_id == tool_use_id
@@ -9797,57 +9839,7 @@ where
         Ok(None)
     }
 
-    /// Dispatch tool execution: resolve the tool, build the execution context,
-    /// spawn the background task, and wire up the outcome channel.
-    #[allow(clippy::too_many_lines)]
-    /// REQ-WPV-002: broadcast `tool_starts[tool_use_id] = now_unix_ms` on
-    /// the parent assistant message via `MessageUpdated` so the client's
-    /// tool widget can render a live elapsed counter sourced from the
-    /// server clock. The state machine is guaranteed to be in
-    /// `ToolExecuting` when `dispatch_tool_execution` fires (only
-    /// `Effect::ExecuteTool { tool }` reaches that method, and that
-    /// effect is only emitted on entry to / between tools of
-    /// `ToolExecuting`), so the destructure below is structurally safe;
-    /// the defensive `else` arm covers a hypothetical future call path.
-    ///
-    /// Why broadcast-only (no DB write): the assistant message that
-    /// owns this `tool_use` is NOT persisted yet during the tool round —
-    /// it lives in the state machine via `BroadcastAssistantMessage`
-    /// (the eager broadcast, ring-replayable per `sse_wire.allium`'s
-    /// `EagerAssistantMessageAppendedToReplayRing`) and the DB write
-    /// happens later via `PersistCheckpoint` at the end of the round.
-    /// `update_message_display_data` against an unpersisted message
-    /// row no-ops with `MessageNotFound`. The client merges the
-    /// broadcast `MessageUpdated.display_data` shallowly onto the
-    /// in-memory message — that's the entire surface the live elapsed
-    /// counter consumes (REQ-WPV-002). Once the tool result lands and
-    /// the round checkpoint persists, the message's permanent
-    /// `display_data` doesn't need `tool_starts` because the
-    /// per-result `duration_ms` (`schema.rs:649`) takes over the
-    /// display.
-    fn broadcast_tool_start_timestamp(&self, tool_use_id: &str) {
-        let assistant_message_id = match &self.state {
-            ConvState::ToolExecuting {
-                assistant_message, ..
-            }
-            | ConvState::CancellingTool {
-                assistant_message, ..
-            } => assistant_message.message_id.clone(),
-            _ => {
-                tracing::warn!(
-                    conv_id = %self.context.conversation_id,
-                    tool_use_id = %tool_use_id,
-                    state = self.state.variant_name(),
-                    "tool_starts broadcast skipped — dispatch_tool_execution called outside ToolExecuting/CancellingTool"
-                );
-                return;
-            }
-        };
-
-        // Build the patch: { "tool_starts": { <id>: <unix_ms> } }.
-        // The client's MessageUpdated reducer merges this shallowly
-        // onto the existing message's display_data, so omitting the
-        // existing bash/etc. keys is safe.
+    fn broadcast_tool_start_timestamp(&self, assistant_message_id: &str, tool_use_id: &str) {
         let now_ms = Utc::now().timestamp_millis();
         let mut tool_starts = serde_json::Map::new();
         tool_starts.insert(
@@ -9864,7 +9856,7 @@ where
         let _ = self.broadcast_tx.send_seq(|seq| SseEvent::MessageUpdated {
             opening: None,
             sequence_id: seq,
-            message_id: assistant_message_id.clone(),
+            message_id: assistant_message_id.to_owned(),
             transcript_generation: None,
             display_data: Some(display_for_broadcast),
             content: None,
@@ -9900,102 +9892,33 @@ where
         self.create_tool_llm_metrics_sink(admitted)
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[cfg(test)]
     async fn dispatch_tool_execution(
         &mut self,
         tool: ToolCall,
+        _admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<Option<Event>, String> {
+        self.begin_tool_preparation(tool)?;
+        let observed = self
+            .tool_preparation
+            .as_mut()
+            .expect("preparation installed")
+            .observe()
+            .await;
+        self.accept_tool_preparation(observed)
+    }
+
+    fn launch_cleared_tool(
+        &mut self,
+        current: tool_preparation::CurrentSelection,
+        cleared: tool_preparation::ClearedOrdinaryCall,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
-        let request_policy = self
-            .storage
-            .load_tool_admission_policy(&self.context.conversation_id)
-            .await?;
-        let request_definition = request_policy.declarations().iter().find(|definition| {
-            definition.name == tool.name() && request_policy.is_callable(tool.name())
-        });
-        let Some(request_definition) = request_definition else {
-            return Ok(Some(Event::ToolComplete {
-                tool_use_id: tool.id.clone(),
-                result: ToolResult::error(
-                    tool.id.clone(),
-                    "EUNAVAIL: tool was unavailable in the originating request policy".into(),
-                ),
-            }));
-        };
-        let request_schema = request_definition.input_schema.clone();
-        let surface = if self.context.is_sub_agent && self.grace_turn_granted {
-            LlmToolSurface::SubAgentTerminal
-        } else {
-            LlmToolSurface::Full
-        };
-        if surface == LlmToolSurface::SubAgentTerminal
-            && !matches!(tool.name(), "submit_result" | "submit_error")
-        {
-            return Ok(Some(Event::ToolComplete {
-                tool_use_id: tool.id.clone(),
-                result: ToolResult::error(
-                    tool.id.clone(),
-                    "EUNAVAIL: tool is unavailable under the current conversation policy"
-                        .to_owned(),
-                ),
-            }));
-        }
-        if matches!(tool.name(), "create_goal" | "enable_auto_continuation") {
-            return self.prepare_self_goal(tool).await;
-        }
-        if tool.name() == "spawn_agents" {
-            let advertised = self
-                .tool_executor
-                .definitions()
-                .await
-                .iter()
-                .any(|definition| definition.name == "spawn_agents");
-            let catalog = super::agent_execution::SpawnCatalog::resolve(
-                &self.agent_config,
-                self.llm_registry.available_execution_routes(),
-            );
-            let definition = catalog.tool_definition(
-                &self.context.model_id,
-                self.llm_registry.is_builtin_model(&self.context.model_id),
-                self.context.is_coordinator,
-            );
-            if !advertised || definition.input_schema != request_schema {
-                return Ok(Some(Event::ToolComplete {
-                    tool_use_id: tool.id.clone(),
-                    result: ToolResult::error(
-                        tool.id.clone(),
-                        "EUNAVAIL: spawn_agents no longer matches the originating request policy"
-                            .into(),
-                    ),
-                }));
-            }
-            self.spawn_catalog = Some(catalog);
-            return self.start_spawn_agents_tool(tool);
-        }
-
-        let legacy_tmux_conversation_id = match &self.context.resource_scope {
-            phoenix_core::work_scope::ResourceScopeKey::Work(scope_id) => {
-                self.storage
-                    .get_work_scope_legacy_conversation_id(scope_id)
-                    .await?
-            }
-            phoenix_core::work_scope::ResourceScopeKey::Unattached(id) => Some(id.clone()),
-            phoenix_core::work_scope::ResourceScopeKey::Coordinator
-            | phoenix_core::work_scope::ResourceScopeKey::GlobalTerminal => None,
-        };
-
-        // REQ-WPV-002: stamp the per-tool start time into the parent
-        // assistant message's `display_data.tool_starts[tool_use_id]` map
-        // (unix ms, server-authoritative) and broadcast `MessageUpdated`
-        // so the client's tool widget can render a live elapsed counter
-        // that survives reconnect / reload / multi-tab. The runtime
-        // discovers the parent message_id by destructuring the current
-        // ToolExecuting state — the state machine guarantees we're in
-        // ToolExecuting when this method is called (the only path here
-        // is `Effect::ExecuteTool { tool }` which fires on entry to
-        // ToolExecuting). If the destructure fails it's a bug and we
-        // silently skip the stamp rather than panic.
-        self.broadcast_tool_start_timestamp(&tool.id);
+        let selection = current.into_selection();
+        let tool = &selection.tool;
+        let context = &selection.context;
+        let (checked, request_schema, surface, legacy_tmux_conversation_id) = cleared.into_parts();
+        self.broadcast_tool_start_timestamp(&selection.assistant_message_id, &tool.id);
 
         // Typed oneshot channel: background task gets Sender<ToolExecOutcome>,
         // physically cannot send an LlmOutcome or other type.
@@ -10020,7 +9943,7 @@ where
         // derivations: a sub-agent Explore resolves to
         // `WorkScope::Conversation(id)` on both sides instead of diverging to
         // `WorkScope::Worktree(cwd)` on the tool side only.
-        let scope_worktree = self.context.work_scope_worktree.clone();
+        let scope_worktree = context.work_scope_worktree.clone();
         let progress_broadcaster = self.broadcast_tx.clone();
         let progress_tool_use_id = tool.id.clone();
         let bash_progress_sink: Arc<dyn BashProgressSink> = Arc::new(move |progress| {
@@ -10032,12 +9955,12 @@ where
                 });
         });
         let llm_metrics_tx = self.create_tool_llm_metrics_sink(admitted);
-        let mut tool_ctx = match &self.context.execution_environment {
+        let mut tool_ctx = match &context.execution_environment {
             phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
                 working_dir,
             } => ToolContext::new_with_resource_scope(
                 cancel_token,
-                self.context.conversation_id.clone(),
+                context.conversation_id.clone(),
                 working_dir.clone(),
                 self.browser_sessions.clone(),
                 self.bash_handles.clone(),
@@ -10045,29 +9968,29 @@ where
                 self.terminals.clone(),
                 self.tmux_registry.clone(),
                 scope_worktree,
-                self.context.resource_scope.clone(),
-                self.context.resource_authority,
+                context.resource_scope.clone(),
+                context.resource_authority,
             ),
             phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem => {
                 ToolContext::new_without_filesystem(
                     cancel_token,
-                    self.context.conversation_id.clone(),
+                    context.conversation_id.clone(),
                     self.browser_sessions.clone(),
                     self.bash_handles.clone(),
                     self.llm_registry.clone(),
                     self.terminals.clone(),
                     self.tmux_registry.clone(),
-                    if self.context.is_coordinator {
+                    if context.is_coordinator {
                         phoenix_core::work_scope::ResourceScopeKey::Coordinator
                     } else {
-                        self.context.resource_scope.clone()
+                        context.resource_scope.clone()
                     },
-                    self.context.resource_authority,
+                    context.resource_authority,
                 )
             }
         }
         .with_bash_progress_sink(bash_progress_sink)
-        .with_root_conversation_id(self.context.root_conversation_id.clone())
+        .with_root_conversation_id(context.root_conversation_id.clone())
         .with_legacy_tmux_conversation_id(legacy_tmux_conversation_id)
         .with_tool_use_id(tool.id.clone())
         .with_svg_artifact_store(Arc::new(
@@ -10079,24 +10002,16 @@ where
         ))
         .with_llm_metrics_tx(llm_metrics_tx);
 
-        if let ConvState::ToolExecuting {
-            assistant_message, ..
-        }
-        | ConvState::CancellingTool {
-            assistant_message, ..
-        } = &self.state
-        {
-            tool_ctx = tool_ctx.with_svg_assistant_message_id(&assistant_message.message_id);
-        }
+        tool_ctx = tool_ctx.with_svg_assistant_message_id(&selection.assistant_message_id);
 
-        if let Some(turn) = &self.active_direct_turn {
+        if let Some(turn) = &selection.direct_turn {
             tool_ctx = tool_ctx.with_direct_turn_id(
                 phoenix_core::domain::sm_event::DirectTurnTurnId(turn.turn_id.0),
             );
         }
 
-        let conv_id = self.context.conversation_id.clone();
-        let root_conv_id = self.context.root_conversation_id.clone();
+        let conv_id = context.conversation_id.clone();
+        let root_conv_id = context.root_conversation_id.clone();
         let storage = self.storage.clone();
         let tool_executor = self.tool_executor.clone();
         let tool_use_id = tool.id.clone();
@@ -10104,30 +10019,6 @@ where
         // aborted tool task) still produces a typed outcome for this tool_use.
         let forwarder_tool_use_id = tool.id.clone();
         let tool_name = tool.name().to_string();
-        let tool_input = tool.input.to_value();
-
-        // Permission seam (specs/permissions REQ-PERM-001): every tool call is
-        // gate-cleared before the tool task is spawned, upstream of the
-        // registry-vs-MCP split inside `ToolExecutor::execute` so MCP tools are
-        // covered too. On clear the minted `CheckedToolCall` is the only value
-        // `execute` accepts; on deny no task spawns and the denial returns via
-        // the existing outcome channel (REQ-PERM-005). `spawn_agents` is handled
-        // above and bypasses Layer 0 as intent-relative (REQ-PERM-007).
-        let checked =
-            match crate::runtime::deny_gate::DenyGate::check(tool_name.clone(), tool_input) {
-                Ok(checked) => checked,
-                Err(denial) => {
-                    tracing::info!(conv_id = %conv_id, tool = %tool_name, id = %tool_use_id,
-                    error = %denial.error, "Tool call denied by permission gate");
-                    forward_denial_outcome(
-                        forwarder_tool_use_id,
-                        denial,
-                        dispatch_generation,
-                        tool_outcome_tx,
-                    );
-                    return Ok(None);
-                }
-            };
 
         // Instrumenting the detached task with the turn span parents the
         // `tool.execute` span (execute_tool_to_outcome) into this turn's trace.

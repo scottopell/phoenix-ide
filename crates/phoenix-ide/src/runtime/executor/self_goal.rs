@@ -61,53 +61,62 @@ fn apply_self_goal_round_commit(
 impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'static>
     ConversationRuntime<S, L, T>
 {
-    pub(super) async fn prepare_self_goal(&self, tool: ToolCall) -> Result<Option<Event>, String> {
-        let result = if self.context.is_coordinator || self.context.is_sub_agent {
-            ToolResult::error(tool.id.clone(), "ordinary_role_required".into()).into()
-        } else {
-            let input = tool.input.to_value();
-            match SelfGoalOperation::parse(tool.name(), input) {
-                Err(error) => {
-                    ToolResult::error(tool.id.clone(), format!("Invalid input: {error}")).into()
-                }
-                Ok(operation) => {
-                    let turn = self
-                        .active_direct_turn
-                        .as_ref()
-                        .ok_or("self-goal tool has no active turn authority")?;
-                    let ConvState::ToolExecuting {
-                        assistant_message, ..
-                    } = &self.state
-                    else {
-                        return Err("self-goal tool outside executing state".into());
-                    };
-                    let pending = self
-                        .storage
-                        .prepare_self_goal_tool(
-                            &self.context.conversation_id,
-                            turn,
-                            &assistant_message.message_id,
-                            &tool.id,
-                            operation,
-                        )
-                        .await?;
-                    ToolRoundResult::PendingSelfGoal {
-                        pending,
-                        duration_ms: None,
+    pub(super) fn prepare_self_goal(
+        &self,
+        tool: ToolCall,
+    ) -> impl std::future::Future<Output = Result<Option<Event>, String>> + Send + 'static {
+        let context = self.context.clone();
+        let active_turn = self.active_direct_turn.clone();
+        let assistant_message_id = match &self.state {
+            ConvState::ToolExecuting {
+                assistant_message, ..
+            } => Some(assistant_message.message_id.clone()),
+            _ => None,
+        };
+        let storage = self.storage.clone();
+        async move {
+            let result = if context.is_coordinator || context.is_sub_agent {
+                ToolResult::error(tool.id.clone(), "ordinary_role_required".into()).into()
+            } else {
+                let input = tool.input.to_value();
+                match SelfGoalOperation::parse(tool.name(), input) {
+                    Err(error) => {
+                        ToolResult::error(tool.id.clone(), format!("Invalid input: {error}")).into()
+                    }
+                    Ok(operation) => {
+                        let turn = active_turn
+                            .as_ref()
+                            .ok_or("self-goal tool has no active turn authority")?;
+                        let assistant_message_id = assistant_message_id
+                            .as_ref()
+                            .ok_or("self-goal tool outside executing state")?;
+                        let pending = storage
+                            .prepare_self_goal_tool(
+                                &context.conversation_id,
+                                turn,
+                                assistant_message_id,
+                                &tool.id,
+                                operation,
+                            )
+                            .await?;
+                        ToolRoundResult::PendingSelfGoal {
+                            pending,
+                            duration_ms: None,
+                        }
                     }
                 }
-            }
-        };
-        Ok(Some(match result {
-            ToolRoundResult::Finalized(result) => Event::ToolComplete {
-                tool_use_id: tool.id,
-                result,
-            },
-            pending => Event::ToolRoundComplete {
-                tool_use_id: tool.id,
-                result: pending,
-            },
-        }))
+            };
+            Ok(Some(match result {
+                ToolRoundResult::Finalized(result) => Event::ToolComplete {
+                    tool_use_id: tool.id,
+                    result,
+                },
+                pending => Event::ToolRoundComplete {
+                    tool_use_id: tool.id,
+                    result: pending,
+                },
+            }))
+        }
     }
 
     pub(super) async fn persist_self_goal_checkpoint(
