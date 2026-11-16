@@ -44,6 +44,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [263](263_verify-native-backup-and-bound-predecessor-recovery-for-macos-deploy.md) | Verify a native backup and bound predecessor recovery for macOS deploy | Accepted; qualifies ADR-230 | REQ-LDD-002/004/009/029–031, REQ-PD-010, REQ-COMP-021 |
 | [262](262_retire-delivery-roadmap-with-preserved-history.md) | Retire the delivery roadmap while preserving historical evidence | Accepted | REQ-ROADMAP-001–014 |
 | [259](259_bounded-resource-recorder-reuses-shared-observations.md) | A bounded resource recorder reuses shared observations | Accepted | REQ-DEPLOY-007a–007d |
 | [258](258_search-hidden-visibility-trusts-fts-index.md) | Ranked search trusts indexed text for hidden-message eligibility | Accepted | REQ-RET-003, REQ-RET-007 |

@@ -85,9 +85,9 @@ value TargetService {
 -- activation_claim_available() -> Boolean
 --   No deploy/restart marker exists. A terminal status never reclaims a marker.
 -- preparation_complete(transaction) -> Boolean
---   Protocol 2, exact local/published source, SHA-256 and --build-identity,
+--   Deploy protocol 3, exact local/published source, SHA-256 and --build-identity,
 --   full candidate SHA, complete plist/environment/path binding and atomic
---   installation preparations verify without production database access.
+--   installation preparations verify. Restart retains protocol 2.
 -- helper_is_launchd_owned(transaction) -> Boolean
 --   Independent one-shot helper owns activation and the matching operation lock.
 -- exact_candidate_running(transaction, service) -> Boolean
@@ -97,10 +97,32 @@ value TargetService {
 --   grant reclamation. Completed release is not undone by later interruption.
 -- transaction_evidence_retained(transaction) -> Boolean
 --   Manifest, helper, log, private plist and failed candidate evidence remain.
--- deployment_without_database_controller(transaction) -> Boolean
---   No deployment-side database scans, registry parsing, snapshots or rehearsals.
--- NoPredecessorStartupOrDatabaseRestore(transaction) -> Boolean
---   Deployment never restores a database or starts a previous runtime.
+-- verified_backup_retained(transaction) -> Boolean
+--   Native SQLite backup of the stopped source passed integrity and logical
+--   comparison, was fsynced and remains available as transaction evidence.
+-- first_install_absence_proven(transaction) -> Boolean
+--   Transaction-matched private proof records database_source absent and backup
+--   null only when the database path is absent and no managed predecessor,
+--   installed binary/plist or loaded service exists. The path is rechecked
+--   before the candidate boundary; an existing database requires a backup.
+-- existing_database_source(transaction) -> Boolean
+--   The configured database path exists; the absence exception does not apply.
+-- maintenance_exclusivity(transaction) -> Boolean
+--   No external database clients write during the update, including after
+--   handoff to the candidate when the helper no longer holds its writer slot.
+-- writer_reservation_held(transaction) -> Boolean
+--   A bounded SQLite BEGIN IMMEDIATE reservation spans backup verification and
+--   durable candidate boundary recording for an existing database.
+-- boundary_not_crossed(transaction) -> Boolean
+--   Durable proof establishes that neither candidate binary replacement nor
+--   candidate migration was attempted; missing or ambiguous proof is insufficient.
+-- predecessor_recovery_proven(transaction) -> Boolean
+--   Captured predecessor PID is gone, target absent, binary/plist unchanged,
+--   and a new stable PID serves the exact predecessor identity after private
+--   startup and canonical publication.
+-- deployment_without_schema_controller(transaction) -> Boolean
+--   Backup verification is permitted; migration registry parsing, schema-specific
+--   upgrade admission and rehearsal are not. No automatic database restore.
 -- FailureText(phase, error, stop_error) -> String
 --   One human-readable failed phase/error plus any failed teardown observation.
 -- restart_preparation_complete(restart) -> Boolean
@@ -162,6 +184,7 @@ rule ActivateCandidate {
     requires: preparation_complete(transaction)
     requires: helper_is_launchd_owned(transaction)
     requires: DeploymentOwnsActivationClaim(transaction)
+    ensures: SourceCapacityPreflightPassed(transaction)
     ensures: transaction.state = stopping
     ensures: CanonicalPlistQuarantined(transaction)
     ensures: PredecessorStopRequested(transaction)
@@ -172,17 +195,50 @@ rule ActivateCandidate {
         -- plist into previous.plist before observed bootout. Never replay activation.
 }
 
-rule BeginCandidateMigration {
+rule VerifyStoppedDatabaseBackup {
     when: PredecessorStopped(transaction)
     requires: transaction.state = stopping
+    requires: existing_database_source(transaction)
+    requires: maintenance_exclusivity(transaction)
+    requires: writer_reservation_held(transaction)
+    ensures: NativeBackupIntegrityAndLogicalContentsVerified(transaction)
+    ensures: verified_backup_retained(transaction)
+    ensures: TransactionBackupProofWritten(transaction)
+    ensures: DatabaseSourceValidated(transaction)
+
+    @guidance
+        -- Hold a bounded SQLite BEGIN IMMEDIATE writer reservation across
+        -- backup verification, proof and durable candidate boundary recording.
+        -- Retain the native backup after success or failure.
+}
+
+rule VerifyFirstInstallAbsence {
+    when: PredecessorStopped(transaction)
+    requires: transaction.state = stopping
+    requires: first_install_absence_proven(transaction)
+    ensures: FirstInstallAbsenceProofWritten(transaction)
+    ensures: DatabaseSourceValidated(transaction)
+}
+
+rule BeginCandidateMigration {
+    when: DatabaseSourceValidated(transaction)
+    requires: transaction.state = stopping
+    requires: verified_backup_retained(transaction) or first_install_absence_proven(transaction)
+    requires: maintenance_exclusivity(transaction)
+    ensures: OperationalReserveRechecked(transaction)
+    ensures: CandidateBoundaryAttemptRecorded(transaction)
     ensures: CandidateBinaryInstalledAtomically(transaction)
     ensures: transaction.state = migration_started
     ensures: DurableStatusWritten(transaction)
     ensures: CandidateMigrationInvokedOnce(transaction, config.migration_timeout_seconds)
 
     @guidance
-        -- The durable marker precedes exact candidate --migrate-only. Use the
-        -- staged environment and inherited log output. The helper never opens DB.
+        -- Record boundary attempted before binary replacement; migration_started
+        -- precedes exact candidate --migrate-only. Use staged environment and log.
+        -- For an existing DB, release the writer reservation only after durable
+        -- boundary recording, before candidate migration or predecessor recovery.
+        -- For first install, recheck path absence before boundary recording; do
+        -- not create an empty backup. The reserve does not cover migration peak.
 }
 
 rule BeginCandidateStartup {
@@ -233,10 +289,27 @@ rule CleanCommittedCopies {
         -- Retain the private plist/helper/manifest/log as transaction evidence.
 }
 
+rule RecoverUnchangedPredecessor {
+    when: PreboundaryActivationFailed(transaction, error)
+    requires: transaction.state = stopping
+    requires: boundary_not_crossed(transaction)
+    requires: CapturedPredecessorUnchangedAndStopped(transaction)
+    ensures: predecessor_recovery_proven(transaction)
+    ensures: transaction.state = failed
+    ensures: DurableRecoveryProofWritten(transaction)
+    ensures: OnlyOwnedClaimReleased(transaction)
+
+    @guidance
+        -- Privately bootstrap only the captured unchanged predecessor; verify
+        -- exact health identity and stable new PID before canonical publication.
+        -- If any proof fails, retain quarantine and ownership for an operator.
+}
+
 rule StopAndRetainFailedDeployment {
     when: ActivationFailed(transaction, phase, error, stop_error)
     requires: transaction.state in { stopping, migration_started, starting, verifying, publishing }
-    ensures: TargetStopAttempted(transaction)
+    requires: not predecessor_recovery_proven(transaction)
+    ensures: PostboundaryTargetStopAttemptedIfBoundaryAttempted(transaction)
     ensures: PublishedCandidatePlistRemovalAttempted(transaction)
     ensures: transaction.state = failed
     ensures: transaction.failure = FailureText(phase, error, stop_error)
@@ -248,7 +321,8 @@ rule StopAndRetainFailedDeployment {
     @guidance
         -- Publication failure before durable committed stops and retains ownership.
         -- Inspect actual target/helper state; stop failure remains explicit.
-        -- No predecessor start, database restore, replay, resume or finalization.
+        -- If candidate boundary was attempted or uncertain, never start the
+        -- predecessor. Never automatically restore DB, replay or resume.
 }
 
 rule PrepareInstalledRestart {
@@ -309,14 +383,13 @@ invariant ExactCandidateSource {
 
 invariant FailedDeploymentRetainsOwnership {
     for transaction in DeployTransactions:
-        transaction.state = failed implies
+        transaction.state = failed and not predecessor_recovery_proven(transaction) implies
             owned_claim_retained(transaction) and transaction_evidence_retained(transaction)
 }
 
 invariant CandidateOwnsDatabase {
     for transaction in DeployTransactions:
-        deployment_without_database_controller(transaction)
-        and NoPredecessorStartupOrDatabaseRestore(transaction)
+        deployment_without_schema_controller(transaction)
 }
 
 invariant CommittedRestartPreservesInstalledState {
@@ -336,7 +409,9 @@ surface DeploymentOperator {
         -- Inspect logs/evidence and actual service/helper state. Preserve failed
         -- transaction; confirm helper absence before explicit operator marker
         -- clearance and a new chosen forward deployment. Older binary requires
-        -- offline matching database restore. No automatic retained-helper replay.
+        -- offline matching database restore after attempted/uncertain candidate
+        -- boundary. Verified unchanged preboundary recovery needs no restore.
+        -- No automatic retained-helper replay.
 }
 
 surface ActivationObservations {
@@ -346,6 +421,8 @@ surface ActivationObservations {
         PreparationFailed(transaction, error: String)
         ActivationHelperStarted(transaction)
         PredecessorStopped(transaction)
+        DatabaseSourceValidated(transaction)
+        PreboundaryActivationFailed(transaction, error: String)
         CandidateMigrationSucceeded(transaction)
         CandidateProcessStarted(transaction)
         CandidateRuntimeObserved(transaction, service: TargetService)
