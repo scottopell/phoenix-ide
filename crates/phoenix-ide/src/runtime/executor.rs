@@ -24770,6 +24770,107 @@ mod steer_drain_detector_tests {
     }
 
     #[tokio::test]
+    async fn forced_tool_notice_follows_sqlite_child_acceptance_and_summary() {
+        use phoenix_db::{SubAgentBatchAdmission, SubAgentExecutionAuthority, SubAgentRunAdmission, SubAgentTerminalCause};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forced-notice.db");
+        let db = crate::db::Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::db::run_pending_migrations(db.pool()).await.unwrap();
+        let id = "sqlite-forced-notice";
+        db.create_conversation(id, id, "/tmp", true, None, None).await.unwrap();
+        db.create_conversation("child", "child", "/tmp", false, Some(id), None).await.unwrap();
+        db.admit_sub_agent_batch(&SubAgentBatchAdmission {
+            batch_id: "batch".into(), parent_conversation_id: id.into(), parallel_work_qualified: false,
+            runs: vec![SubAgentRunAdmission { child_conversation_id: "child".into(), execution_authority: SubAgentExecutionAuthority::ReadOnly }],
+        }).await.unwrap();
+        let mut initial = ordinary_completion_state();
+        if let ConvState::ToolExecuting { pending_sub_agents, .. } = &mut initial {
+            pending_sub_agents.push(PendingSubAgent { agent_id: "child".into(), task: "task".into(), mode: SubAgentMode::Explore });
+        }
+        db.update_conversation_state(id, &initial).await.unwrap();
+        let (event_tx, event_rx) = mpsc::channel(16);
+        let mut runtime = ConversationRuntime::new(
+            ConvContext::new(id, PathBuf::from("/tmp"), "test-model", 200_000, 16_384),
+            initial, crate::runtime::traits::DatabaseStorage::new(db.clone()),
+            Arc::new(MockLlmClient::new("test-model")), Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()), Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()), Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(), event_rx, event_tx, SseBroadcaster::new(128, 0),
+        );
+        let mut broadcasts = runtime.broadcast_tx.subscribe();
+        runtime.process_event(Event::UserCancel { reason: None, cause: crate::state_machine::event::CancelCause::UserRequested }).await.unwrap();
+        runtime.handle_cancelling_tool_timeout().await;
+        let at = Utc::now();
+        db.update_child_state_and_record_sub_agent_terminal("child", &ConvState::Completed { result: "authentic result".into() }, at, SubAgentTerminalCause::SubmitResult, at).await.established().unwrap().unwrap();
+        // A rejected summary/acceptance transaction must keep the phase's notice owed.
+        sqlx::query("CREATE TRIGGER reject_parent_acceptance BEFORE UPDATE OF parent_accepted_at_unix_micros ON sub_agent_runs BEGIN SELECT RAISE(ABORT, 'injected known acceptance failure'); END").execute(db.pool()).await.unwrap();
+        let child = Event::SubAgentResult { agent_id: "child".into(), outcome: SubAgentOutcome::Success { result: "authentic result".into() } };
+        runtime.process_event(child.clone()).await.unwrap();
+        assert!(!db.sub_agent_terminal_is_accepted("child").await.unwrap());
+        assert!(matches!(runtime.state, ConvState::CancellingSubAgents { .. }));
+        assert!(!db.get_messages(id).await.unwrap().iter().any(|message| matches!(&message.content, MessageContent::System(content) if content.text.starts_with("Cancellation completed."))));
+        sqlx::query("DROP TRIGGER reject_parent_acceptance").execute(db.pool()).await.unwrap();
+        runtime.process_event(child.clone()).await.unwrap();
+        assert!(db.sub_agent_terminal_is_accepted("child").await.unwrap());
+        assert!(matches!(db.get_conversation(id).await.unwrap().state, ConvState::Idle));
+        let messages = db.get_messages(id).await.unwrap();
+        let notices = messages.iter().filter(|message| matches!(&message.content, MessageContent::System(content) if content.text.starts_with("Cancellation completed."))).collect::<Vec<_>>();
+        assert_eq!(notices.len(), 1);
+        let notice = notices[0];
+        assert_eq!(messages.last().unwrap().message_id, notice.message_id);
+        assert!(messages.iter().filter(|message| message.message_id != notice.message_id).all(|message| message.sequence_id < notice.sequence_id));
+        let notice_id = notice.message_id.clone();
+        let mut published = 0;
+        while let Ok(event) = broadcasts.try_recv() {
+            if matches!(event, SseEvent::Message { ref message, .. } if message.message_id == notice_id) { published += 1; }
+        }
+        assert_eq!(published, 1);
+        runtime.process_event(child).await.unwrap();
+        runtime.handle_cancelling_sub_agents_timeout().await;
+        assert_eq!(serde_json::to_value(db.get_messages(id).await.unwrap()).unwrap(), serde_json::to_value(&messages).unwrap());
+        drop(runtime);
+        db.pool().close().await;
+        let reopened = crate::db::Database::open(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(serde_json::to_value(reopened.get_messages(id).await.unwrap()).unwrap(), serde_json::to_value(&messages).unwrap());
+    }
+
+    #[tokio::test]
+    async fn forced_tool_notice_survives_delayed_cooperative_child_drain() {
+        let mut initial = ordinary_completion_state();
+        if let ConvState::ToolExecuting { pending_sub_agents, .. } = &mut initial {
+            for child in ["child-a", "child-b"] {
+                pending_sub_agents.push(PendingSubAgent {
+                    agent_id: child.into(), task: "task".into(), mode: SubAgentMode::Work,
+                });
+            }
+        }
+        let id = "forced-tool-delayed-children";
+        let (mut runtime, storage) = build_runtime_with_state_and_queue(id, initial, vec![]);
+        let notices = |storage: &InMemoryStorage| storage.get_all_messages(id).into_iter().filter(|message| {
+            matches!(&message.content, MessageContent::System(content) if content.text.starts_with("Cancellation completed."))
+        }).collect::<Vec<_>>();
+        runtime.process_event(Event::UserCancel {
+            reason: None, cause: crate::state_machine::event::CancelCause::UserRequested,
+        }).await.unwrap();
+        runtime.handle_cancelling_tool_timeout().await;
+        assert!(matches!(runtime.state, ConvState::CancellingSubAgents { .. }));
+        assert!(notices(&storage).is_empty());
+        for child in ["child-a", "child-b"] {
+            runtime.process_event(Event::SubAgentResult {
+                agent_id: child.into(), outcome: SubAgentOutcome::Success { result: "done".into() },
+            }).await.unwrap();
+            assert_eq!(notices(&storage).len(), usize::from(child == "child-b"));
+        }
+        assert_eq!(storage.sub_agent_acceptance_count(), 2);
+        assert!(matches!(runtime.state, ConvState::Idle));
+        let messages = storage.get_all_messages(id);
+        assert_eq!(messages.last().unwrap().message_id, notices(&storage)[0].message_id);
+        runtime.handle_cancelling_sub_agents_timeout().await;
+        runtime.handle_cancelling_tool_timeout().await;
+        assert_eq!(notices(&storage).len(), 1);
+    }
+
+    #[tokio::test]
     async fn child_backstop_does_not_repeat_its_completed_forced_tool_notice() {
         let mut initial = ordinary_completion_state();
         if let ConvState::ToolExecuting {
