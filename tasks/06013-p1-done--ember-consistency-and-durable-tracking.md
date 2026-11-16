@@ -229,7 +229,7 @@ Out of scope: broad tool consolidation, new wrappers around every API, already-d
 | 4: Useful event context | #1092 accepted compact C after the complete 39-trial comparison and fixture web checks | First capped experiment remains partial/unaccepted; no general billing or remote-parity claim |
 | 5: Tracking store/tools | #1093 merged at `5b0e01c09`; native/store/authority checks and manual usefulness accepted | Scanner composition qualified; delivery in PR #1098 |
 | 6: Continuity and attention | Manual detour/continuation gate accepted; [foreground quiet/contextual recovery](../scripts/qa/ember-foreground-memory/foreground-32ada836a.md) accepted; actual-input scanner composition passed | Supplemental guidance/composition qualified; delivery in PR #1098 |
-| 7: Cheap safety net | Twenty-five DB tests, eighteen runner/kick tests, actual 37-case host fixtures, owning all-target Clippy and fresh source reviews passed; third real-model trial independently accepted | Earlier two trials remain rejected; bounded synthetic qualification |
+| 7: Cheap safety net | Thirty DB tests, eighteen runner/kick tests, actual 37-case host fixtures, owning all-target Clippy and fresh source reviews passed; third real-model trial independently accepted | Earlier two trials remain rejected; bounded synthetic qualification |
 | 8: Combined qualification | Inventory, actual-input/two-continuation/pause lifecycle composition and third frozen scanner semantic trial accepted | Implementation/qualification complete; GitHub owns exact review/CI/merge state |
 
 The manual [qualification report](../scripts/qa/ember-tracking/manual-memory-aca480.md)
@@ -271,3 +271,15 @@ recursive traversal/count work still scales with lineage. Offline preparation us
 providers and preserves every accepted input, prior state, prepared record and
 binding byte for byte. Exact receipts are appended to the [accepted scanner report](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#host-only-topology-follow-up);
 its `e978b7686` paid-trial identity and limitations remain unchanged.
+
+
+The later host-resource/fairness repair at `1824f48d3` passed thirty DB tests,
+owning Clippy, scoped Allium and all 37 host fixtures. Preparation shares one
+32-fetched-source-row allowance across members/lanes, charges before errors/backoff
+and checks known spending before prose. Exhausted blocked Wait persists opposite
+lane preference; non-prose Progress uses ordinary preference without an inference
+charge, and Ready retains normal reserve behavior. Restart, route-absence,
+continuous non-prose progress and actual hourly-cap regressions passed. Zero-call
+offline preparation retains all 111 files/37 hashes/bindings exactly; see the
+[resource receipts](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#later-host-resource-and-fairness-follow-up).
+Paid model and topology receipts retain their original provenance.

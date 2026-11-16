@@ -10,7 +10,7 @@ activation is claimed.
 
 | Requirements | Qualification evidence | Scope |
 |---|---|---|
-| REQ-SCAN-001–005: Scope, coverage, source validity, authority and recovery | Twenty-five actual DB tests passed, including strict typed retirement/source chronology, old-prose generation-only restart, two continuations, exact deduplication, retirement races, live gaps and contention recovery | Deterministic production-host lifecycle evidence |
+| REQ-SCAN-001–005: Scope, coverage, source validity, authority and recovery | Thirty actual DB tests passed, including strict typed retirement/source chronology, old-prose generation-only restart, two continuations, exact deduplication, retirement races, live gaps and contention recovery | Deterministic production-host lifecycle evidence |
 | REQ-SCAN-006: Bounded resource use | Eighteen runner/kick tests passed; strict catalog/outbound Luna/Low, accepted-output bounds, durable spending/retry limits and no foreground wake are covered | Codex generation/billing is not capped by accepted-output checks |
 | REQ-SCAN-007: Bounded inspectability | Native coverage inspection and accepted eight-variant assembled inventory include the closed tracking coverage operation | Synthetic assembled configuration, not production inventory |
 | REQ-SCAN-008: Historical recovery and qualification | Manual/foreground usefulness, actual 37-case host fixtures, owning all-target Clippy and fresh source reviews passed; third semantic trial independently accepted | Small synthetic corpus; bookmark miss and invisible duplicate disclosed below |
@@ -21,7 +21,7 @@ sees a fresh bounded index; appended pause evidence invalidates the old stopping
 point through two real continuations. This synthetic inference proves lifecycle
 composition, not cheap-model interpretation or general user utility.
 
-The twenty-five DB tests preserve original/retired evidence through supported file
+The thirty DB tests preserve original/retired evidence through supported file
 restart. The old sequence-5/covered-through-100 case first proves metadata-only
 invalidation and unchanged exact deduplication, then atomically changes valid
 old prose and its generation without appending a row, closes/reopens and recovers
@@ -115,3 +115,23 @@ or billing ceiling. Timeout, durable attempt/hour/day/input budgets and independ
 observed usage fields remain separate. Scanning grants no authority and creates no foreground
 turn or new review wakeup. Physical-device and deployed-backfill results are not
 claimed by these local synthetic qualifications.
+
+
+## Later resource and fairness qualification
+
+At `1824f48d3`, thirty DB tests, owning DB/IDE all-target Clippy, scoped Allium
+and all 37 host fixtures passed. One non-Clone allowance now caps the entire
+preparation at 32 fetched source rows across members and lanes, charged before
+projection, errors or backoff; known spending is checked before reading prose.
+An exhausted blocked Wait durably prefers the opposite of the last consumed lane,
+including when the model route is absent. Committed non-prose Progress applies
+the normal lane preference without an inference charge or clearing a blocker;
+Ready retains the existing reserve behavior. Tests cover restart in both
+directions, route absence, continuous non-prose progress and actual hourly caps.
+
+Offline preparation made zero provider calls and reproduced all 111 accepted
+input/prepared/before files byte for byte, with identical 37 hashes and bindings.
+The [separate resource follow-up](../../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#later-host-resource-and-fairness-follow-up)
+records exact receipts. The original paid model trial and earlier topology
+qualification remain unchanged; SQLite traversal/working data can still scale
+with lineage.

@@ -106,3 +106,17 @@ typed handoff seeded before corruption, and an explicit test-only edge-guard dro
 to verify detached-source CAS refusal. The [offline follow-up](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#host-only-topology-follow-up)
 made zero model calls and reproduced all 37 accepted inputs, prepared records,
 prior states and bindings exactly. The accepted paid run remains `e978b7686`.
+
+
+The later resource/fairness repair at `1824f48d3` passed all thirty DB tests,
+owning DB/IDE Clippy, scoped Allium and all 37 host fixtures. A single non-Clone
+32-row allowance limits fetched source rows for the whole preparation across
+members and lanes, charging before errors/backoff and checking known spending
+before prose. Exhausted blocked Wait, including absent route, persists preference
+for the opposite of the last consumed lane; committed non-prose Progress updates
+the ordinary preference without an inference charge or clearing blockers. Ready
+continues through existing reserve behavior. Restart in both directions,
+continuous non-prose backlog and real hourly-cap cases passed. [Offline receipts](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#later-host-resource-and-fairness-follow-up)
+show zero provider calls, all 111 files byte-identical to the accepted preparation
+and unchanged 37 input hashes/bindings. Earlier e978 model and 7488 topology
+qualification remain separate unchanged evidence.

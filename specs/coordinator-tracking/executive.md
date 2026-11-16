@@ -44,3 +44,11 @@ path; exact membership refuses a detached source. Offline preparation at
 `74881f401` retains all 37 accepted model inputs and bindings unchanged and makes
 zero provider calls. See the [host follow-up](../../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#host-only-topology-follow-up).
 Data returned to scanner/Rust is bounded; recursive lineage/count work is not constant CPU.
+
+
+The later resource/fairness follow-up at `1824f48d3` passed thirty DB tests,
+owning Clippy, scoped Allium and all 37 host fixtures. A single 32-fetched-row
+allowance spans preparation members/lanes; blocked exhaustion persists opposite
+lane preference, while non-prose Progress preserves normal fairness without
+inference spending. All 111 offline artifacts and 37 hashes/bindings match the
+accepted preparation; zero provider calls were made. See the [separate resource receipts](../../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#later-host-resource-and-fairness-follow-up).

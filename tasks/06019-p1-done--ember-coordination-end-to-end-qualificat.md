@@ -80,7 +80,7 @@ integration are tracked by GitHub PR #1098.
 | 11: Whole-history progress and no wakeup | Own-chain/member enrollment, historical/live fairness/gaps and file restart; repaired discovery-page cursor covers fourteen transcripts/thirteen actual continuations and revisits middle generations; idle scanner → next normal admitted input fresh index | Host lifecycle and separate semantic gates passed; deployed backfill unclaimed |
 | 12: Edited uncaptured tail and paging | Whole typed-response digest, explicit changed/unavailable reads, between-page edits and C2 controls | Component merged; no mixed-version quotation claim |
 | 13: Missed pause and stale resumption | Storage CAS/overflow/review-required tests plus actual scanner append → two-continuation invalidation | Host review-state/CAS proof plus third trial 13/13 restriction attachments |
-| 14: Old source edit without append/kick | DB25 includes the `89ff24d7b` case: sequence-5/covered-through-100 metadata restart/dedup, then external valid-prose/new-generation rewrite, reopen/rescan/new evidence with old history retained; contention recovery | Externally changed source fixture; no generic user-edit API claimed |
+| 14: Old source edit without append/kick | DB30 includes the `89ff24d7b` case: sequence-5/covered-through-100 metadata restart/dedup, then external valid-prose/new-generation rewrite, reopen/rescan/new evidence with old history retained; contention recovery | Externally changed source fixture; no generic user-edit API claimed |
 | 15: Immutable prefix and bounded context | Assembled request prefix/no-change snapshot regressions; manual/foreground actual request and token accounting | No provider cache/billing savings inferred |
 | 16: Useful owed next step | Accepted manual `aca480f4a` and foreground `32ada836a` due-item → specific question → real user pause → revision-checked update | Controlled synthetic usefulness; general utility/deployment unclaimed |
 | 17: Two recently reviewed items stay quiet | Accepted foreground arithmetic returns only its answer with zero tools/cue after actual pause reconciliation; durable cooldown tests | No wall-clock wakeup or healthy-worker polling introduced |
@@ -127,3 +127,16 @@ passed. Offline preparation made zero provider calls and matches all 37 accepted
 inputs, prepared records, prior states, input hashes and bindings byte for byte.
 The [accepted report](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#host-only-topology-follow-up)
 retains the original `e978b7686` model trial and appends the later host receipts.
+
+
+Later host-resource/fairness qualification at `1824f48d3` passed thirty DB tests,
+owning DB/IDE all-target Clippy, scoped Allium and all 37 host fixtures. One shared
+32-fetched-source-row allowance covers the complete preparation across members
+and lanes, charged before errors/backoff with known spending checked before
+prose. Blocked exhaustion persists opposite lane preference even without a route;
+committed non-prose Progress uses ordinary preference without an inference charge
+or blocker clearing, and Ready keeps existing reserve behavior. Restart in both
+lane directions, route absence, continuous non-prose progress and actual hourly
+caps are covered. All 111 offline artifacts/37 hashes/bindings match the accepted
+preparation with zero provider calls; the [resource follow-up](../scripts/qa/coordinator-scanner-quality/results-e978b7686.md#later-host-resource-and-fairness-follow-up)
+records exact provenance separately from paid model and topology results.

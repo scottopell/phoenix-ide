@@ -195,3 +195,47 @@ The original `e978b7686` paid-trial source, executable, prepared/live hashes,
 37-case scores, missed bookmark, invisible duplicate, prior rejected experiments
 and provider accounting remain unchanged. Exact delivery review/CI/merge state is
 tracked by PR #1098. No additional provider call was made for this follow-up.
+
+
+## Later host resource and fairness follow-up
+
+A later cumulative-read review found that individual LIMIT32 queries could still
+fetch many source rows across one preparation loop. The repair creates one
+non-Clone 32-fetched-source-row allowance for the whole preparation, shared across
+members and lanes. Rows are charged when fetched, before projection, errors or
+backoff; known spending is checked before prose is read. This bounds fetched
+source rows per preparation, not SQLite's lineage traversal or internal working
+data, and does not change the model input/result contract.
+
+When a blocked pass exhausts the allowance, its Wait durably prefers the opposite
+of the last consumed lane, including the missing-route path. Committed non-prose
+Progress updates the ordinary lane preference without an inference attempt charge
+or clearing a recorded blocker. Ready leaves the existing reserve behavior
+unchanged. Regressions cover both lane directions across restart, malformed
+source and route absence, continuous non-prose history/live progress, and actual
+hourly caps. No additional daily-byte-limit regression is claimed.
+
+At `1824f48d39ef76d6ea07560070b78cfe18bc2907`, all thirty DB tests passed
+(35.19 seconds), owning DB/IDE all-target Clippy passed (2m18s), scoped Allium
+passed, and the actual 37-case host fixture passed (54.78 seconds). Independent
+source review of the cumulative-read/fairness changes found no further blocker.
+
+Offline preparation reused the original closed seeds and made zero provider
+calls (3.86 seconds). Root and a fresh independent reviewer compared all 111
+input/prepared/before files against the accepted `288329e4…` preparation: every
+file was byte-identical. All input/record hashes and binding IDs were recomputed
+and matched, and the retained executable hash below was independently verified. Model, effort, endpoint, prompt, DTO,
+corpus, oracles, limits and 262,621 logical content bytes were unchanged; the
+protocol differed only in source/workspace and executable provenance. This is
+host-only evidence, not another model trial.
+
+| Later resource artifact | SHA256 / identity |
+|---|---|
+| Compiled source and preparation workspace | `1824f48d39ef76d6ea07560070b78cfe18bc2907` |
+| Retained executable | `5d422c915b86eeaffcdffd3293d319500b5e526bc8bddc448cb592eebd2002fa` |
+| Offline prepared manifest | `8c5d79fd6e20e1db09892b903814440470ffa212b404f53dab5a9be647c345ac` |
+| Offline protocol | `dab3f3655167002f6b36cc0c7e7a0daebc2da17c5c9d85097d04cbaff4af0ebf` |
+
+The original e978 paid-trial identity, hashes, scores, failed experiments and
+B04/I01 limitations remain unchanged, as does the earlier 7488 topology receipt
+above. No additional provider calls were made or used to replace prior evidence.
