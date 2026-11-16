@@ -317,7 +317,7 @@ async function captureOverlayProjection(page, result, mode, fixture) {
   result.geometryPreserved = samples.every(s => JSON.stringify(s.rects) === JSON.stringify(before.rects));
   result.nodesPreserved = samples.every(s => s.sameNode && s.sameDiagram && s.sameSvg);
   result.loadingObserved = [...samples, ...mutations].some(s => s.loading || s.addedLoading);
-  assert.equal(events.filter(e => ['pointerdown', 'touchstart', 'keydown', 'click'].includes(e.type)).length, 0, 'New input during background measurement');
+  assert.equal(events.filter(e => ['pointerdown', 'touchstart', 'keydown', 'click', 'focusin'].includes(e.type)).length, 0, 'New input or focus during background measurement');
   if (mode === 'changed-message') {
     assert.equal(result.trace.paragraphsUnchanged, false, 'Intentional content update must reach reviewed message');
     assert.notEqual(result.trace.probeBefore.reviewedContent, result.trace.probeAfter.reviewedContent, 'Changed-message control must reach atom');
@@ -347,6 +347,10 @@ try {
     report.cases.push(result);
     const context = await browser.newContext({ viewport: { width, height: width === 390 ? 844 : 900 }, hasTouch: (idleAudit || overlayProjectionQa) && width === 390 });
     const page = await context.newPage();
+    page.setDefaultTimeout(6500);
+    page.setDefaultNavigationTimeout(15000);
+    page.on('pageerror', error => report.errors.push(`${id}: ${error.message}`));
+    page.on('console', message => { if (message.type() === 'error') report.errors.push(`${id}: console: ${message.text()}`); });
     if (overlayProjectionQa) {
       try {
         await page.route('**/api/**', route => { report.errors.push(`${id}: unexpected network API ${route.request().url()}`); return route.abort('blockedbyclient'); });
@@ -375,10 +379,6 @@ try {
         };
       }
     });
-    page.setDefaultTimeout(6500);
-    page.setDefaultNavigationTimeout(15000);
-    page.on('pageerror', error => report.errors.push(`${id}: ${error.message}`));
-    page.on('console', message => { if (message.type() === 'error') report.errors.push(`${id}: console: ${message.text()}`); });
     await page.route('**/api/**', route => {
       report.errors.push(`${id}: unexpected network API ${route.request().url()}`);
       return route.abort('blockedbyclient');
