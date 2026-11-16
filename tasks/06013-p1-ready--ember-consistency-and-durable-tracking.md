@@ -156,8 +156,8 @@ The user selected both recommendations. Remaining model budgets, excerpt tuning 
 | --- | --- | --- |
 | 1 | Current-deployment baseline and narrow contracts | [06014](./06014-p1-ready--ember-tool-contract-and-consistency-base.md) |
 | 2 | Independent roadmap retirement | [06015](./06015-p1-ready--retire-stale-delivery-roadmap.md) |
-| 3 | Exact completion-evidence binding | [06020](./06020-p1-ready--bind-watch-events-to-ending-response-evi.md) |
-| 4 | Useful bounded event context and incremental qualification | [06021](./06021-p1-ready--enrich-ember-event-context-and-measure-f.md) |
+| 3 | Exact completion-evidence binding | [06020](./06020-p1-in-progress--bind-watch-events-to-ending-response-evi.md) |
+| 4 | Useful bounded event context and incremental qualification | [06021](./06021-p1-in-progress--enrich-ember-event-context-and-measure-f.md) |
 | 5 | Durable tracking store/application service/tools | [06016](./06016-p1-ready--ember-durable-tracking-store-and-tools.md) |
 | 6 | Fresh continuity context and inspection | [06017](./06017-p1-ready--ember-tracking-continuity-and-inspection.md) |
 | 7 | Cheap origin-aware scanner | [06018](./06018-p1-ready--ember-cheap-transcript-safety-net.md) |

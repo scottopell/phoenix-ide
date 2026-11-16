@@ -1,6 +1,6 @@
 # Ember phase 4: useful, bounded event context and qualification
 
-Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). Depends on [phase 3 exact evidence](./06020-p1-ready--bind-watch-events-to-ending-response-evi.md) and only the event-relevant [phase 1 baseline](./06014-p1-ready--ember-tool-contract-and-consistency-base.md), not a whole-program contract freeze. Lane B brings captured evidence into existing completion events independently of lane A's manual memory delivery; either useful slice may ship first. Neither waits for scanner activation.
+Parent: [06013](./06013-p1-ready--ember-consistency-and-durable-tracking.md). Depends on [phase 3 exact evidence](./06020-p1-in-progress--bind-watch-events-to-ending-response-evi.md) and only the event-relevant [phase 1 baseline](./06014-p1-ready--ember-tool-contract-and-consistency-base.md), not a whole-program contract freeze. Lane B brings captured evidence into existing completion events independently of lane A's manual memory delivery; either useful slice may ship first. Neither waits for scanner activation.
 
 ## Outcome
 
@@ -51,3 +51,14 @@ coordinator_watch_delivery.rs; runtime/executor.rs::render_messages; coordinator
 The exact source/absence/truncation contract survives model and private/shared UI paths, required checks pass, and a bounded full-runtime comparison meets the predeclared promotion rule and reports total follow-up work. Retain honest gates if real-model or deployed acceptance is unexercised. No raw production messages, IDs, credentials or database artifacts go into test fixtures or public PR evidence.
 
 Out of scope: notification filtering/coalescing, another send alert, new automatic wakes, remote protocol enrichment, tracking/scanner implementation and a new event dashboard.
+
+## Current delivery evidence
+
+PR [#1092](https://github.com/scottopell/phoenix-ide/pull/1092) implements this
+component. Scoped capture, settlement, native read/schema/privacy, genuine codegen
+and fixture web checks pass. Independent review accepted compact projection C's
+[complete 39-trial comparison](../scripts/qa/ember-event-eval/results-cfda0b0.md);
+the earlier capped invocation remains partial/unaccepted. This task stays in
+progress until memory migration 164 is integrated, event migration 165 is rebased,
+exact-head CI/review pass and the PR merges. No deployment or combined Ember
+qualification is claimed.
