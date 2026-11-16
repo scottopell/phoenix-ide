@@ -107,7 +107,23 @@ async fn settled(events: &mut tokio::sync::broadcast::Receiver<crate::runtime::S
                 | crate::runtime::SseEvent::Error { .. } => {
                     panic!("owner turn failed before settlement")
                 }
-                _ => {}
+                crate::runtime::SseEvent::Init { .. }
+                | crate::runtime::SseEvent::Message { .. }
+                | crate::runtime::SseEvent::MessageUpdated { .. }
+                | crate::runtime::SseEvent::StateChange { .. }
+                | crate::runtime::SseEvent::Token { .. }
+                | crate::runtime::SseEvent::LlmFirstByte { .. }
+                | crate::runtime::SseEvent::LlmAttempt { .. }
+                | crate::runtime::SseEvent::AgentDone { .. }
+                | crate::runtime::SseEvent::ConversationBecameTerminal { .. }
+                | crate::runtime::SseEvent::ConversationUpdate { .. }
+                | crate::runtime::SseEvent::ConversationHardDeleted { .. }
+                | crate::runtime::SseEvent::BrowserSessionState { .. }
+                | crate::runtime::SseEvent::BashToolProgress { .. }
+                | crate::runtime::SseEvent::SteerMessageQueued { .. }
+                | crate::runtime::SseEvent::SteerMessageCancelled { .. }
+                | crate::runtime::SseEvent::RateLimitSnapshot { .. }
+                | crate::runtime::SseEvent::WorkScopeUpdate { .. } => {}
             }
         }
     })
@@ -216,6 +232,10 @@ pub(super) fn context(conversation_id: &str) -> ToolContext {
     )
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the tracking fixture keeps trusted pending tool context, replay, and persisted evidence assertions together"
+)]
 async fn record_paused_concern(f: &Fixture, tracking: &dyn Tool) -> TrackingDetail {
     f.db.add_message(
         "handoff-user-commission",
@@ -231,7 +251,7 @@ async fn record_paused_concern(f: &Fixture, tracking: &dyn Tool) -> TrackingDeta
         "kind":"requested_work", "title":"Paused release concern: do not deploy",
         "note":"Execution remains paused. An owner response is evidence, not resolution or permission to deploy.",
         "resumption":"Inspect evidence only; wait for explicit user approval before deployment.",
-        "references":[{"type":"product_conversation", "instance_id":instance, "product_conversation_id":f.product}],
+        "references":[{"kind":"conversation", "instance_id":instance, "product_id":f.product}],
         "evidence":[{"instance_id":instance, "transcript_id":f.source, "message_id":"handoff-user-commission", "quotation":COMMISSION}]
     }}});
     let content = vec![ContentBlock::ToolUse {
