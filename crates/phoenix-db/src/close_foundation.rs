@@ -3279,6 +3279,54 @@ impl Database {
         .collect()
     }
 
+    /// Reads retained inspection rows only when they still match an explicit aggregate snapshot.
+    /// Replacement inspection rows cannot stand in for a missing original generation.
+    ///
+    /// # Errors
+    /// Rejects missing or mismatched snapshot evidence, or unreadable rows.
+    pub async fn list_close_retirement_inspections_for_snapshot(
+        &self,
+        attempt_id: &str,
+        snapshot: &CloseRetirementSnapshot,
+    ) -> DbResult<Vec<CloseInspection>> {
+        let inspections = self.list_close_retirement_inspections(attempt_id).await?;
+        if inspections.is_empty() {
+            let retained = sqlx::query_scalar::<_, i64>(
+                "SELECT EXISTS(SELECT 1 FROM close_obligations
+                 WHERE attempt_id = ?1 AND inspection_generation = ?2
+                   AND inspection_fingerprint = ?3)",
+            )
+            .bind(attempt_id)
+            .bind(snapshot.generation())
+            .bind(snapshot.fingerprint())
+            .fetch_one(&self.pool)
+            .await?;
+            if retained == 0 {
+                return Err(close_precondition(
+                    "empty inspection rows lack exact retained snapshot provenance",
+                ));
+            }
+        }
+        let generation = encode_aggregate_snapshot_component(
+            inspections
+                .iter()
+                .map(|inspection| (&inspection.target.scope, inspection.snapshot.generation())),
+        );
+        let fingerprint = encode_aggregate_snapshot_component(
+            inspections
+                .iter()
+                .map(|inspection| (&inspection.target.scope, inspection.snapshot.fingerprint())),
+        );
+        if fingerprint != snapshot.fingerprint()
+            || (!inspections.is_empty() && generation != snapshot.generation())
+        {
+            return Err(close_precondition(
+                "retained inspection rows do not prove the requested exact snapshot",
+            ));
+        }
+        Ok(inspections)
+    }
+
     pub async fn list_close_retirement_losses(
         &self,
         attempt_id: &str,
@@ -10738,6 +10786,21 @@ mod tests {
         let snapshot = obligation.snapshot().expect("rotated no-worktree snapshot");
         assert_eq!(snapshot.generation(), "server_git_status_v2_retry_test");
         assert_eq!(snapshot.fingerprint(), "no-worktree");
+        assert!(db
+            .list_close_retirement_inspections_for_snapshot("attempt-empty-retry", snapshot)
+            .await
+            .unwrap()
+            .is_empty());
+        let unrelated =
+            CloseRetirementSnapshot::parse("unproven-generation", "no-worktree").unwrap();
+        assert!(db
+            .list_close_retirement_inspections_for_snapshot("attempt-empty-retry", &unrelated)
+            .await
+            .is_err());
+        assert!(db
+            .list_close_retirement_inspections_for_snapshot("missing-attempt", snapshot)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -17983,6 +18046,10 @@ mod tests {
         assert!(current_resources
             .iter()
             .all(|resource| resource.snapshot == replacement));
+        assert!(db
+            .list_close_retirement_inspections_for_snapshot(attempt.as_str(), &snapshot)
+            .await
+            .is_err());
         // The later generation may succeed without rewriting the G1 residual.
         // Original-bound reads must not substitute this conflicting G2 receipt.
         db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {

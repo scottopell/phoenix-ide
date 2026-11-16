@@ -9,11 +9,12 @@ use std::{
 use sha2::{Digest, Sha256};
 
 use phoenix_core::domain::close::{
-    AbsenceBasis, CapturedWorktreeIdentity, CloseAttemptId, CloseCompletionOutcome,
-    CloseExpectedRetirementResource, CloseLossItem, CloseOwnedResourceInventory, ClosePhase,
-    CloseRetirementSnapshot, CloseRunOrdinal, CloseRunRef, CloseRunStatus, CloseStopCertainty,
-    GitOidIdentity, GitPathIdentity, LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity,
-    RetiredResourceKind, RetirementFailureReason, RetirementOutcome, WorktreeIdentity,
+    AbsenceBasis, CapturedWorktreeIdentity, CloseAttemptId, CloseAttemptScope, CloseCompletionOutcome,
+    CloseExpectedRetirementResource, CloseInspection, CloseLossItem, CloseOwnedResourceInventory,
+    ClosePhase, CloseRetiredResource, CloseRetirementSnapshot, CloseRunOrdinal, CloseRunRef,
+    CloseRunStatus, CloseStopCertainty, GitOidIdentity, GitPathIdentity, LossItemIdentity,
+    OpaqueIdentity, RetiredResourceIdentity, RetiredResourceKind, RetirementFailureReason,
+    RetirementOutcome, WorktreeIdentity,
 };
 use phoenix_core::work_scope::{
     ResourceScopeKey, WorkScopeId, WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
@@ -39,7 +40,7 @@ use crate::db::{
     CloseWorktreeFinalTombstone, RecordCloseRetirementDispatchRequest,
     RecordCloseRetirementEvidenceRequest, RecordCloseWorktreeCleanupPlanRequest,
     ReplaceCloseInspectionRequest, ReplaceCloseInspectionScopeRequest,
-    TerminalizeInitialCloseCleanupFailureRequest,
+    StoppedCloseOriginalRetirementProof, TerminalizeInitialCloseCleanupFailureRequest,
 };
 use crate::db::{
     CloseDescriptorAccess, CloseFileWriteAccess, CloseWriterAuthority, CloseWriterDetector,
@@ -124,6 +125,144 @@ impl std::fmt::Display for CloseLeaseFailure {
             Self::Tmux { detail, .. } => write!(formatter, "tmux teardown failed: {detail}"),
         }
     }
+}
+
+/// Read-only candidate assessment, not admission, dispatch, or completion authority.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct NativeCloseRetryAssessment {
+    pub original: StoppedCloseOriginalRetirementProof,
+    pub remaining_effects: Vec<CloseSafeRetryEffect>,
+    pub safety_evidence: String,
+}
+
+#[derive(Clone, Copy)]
+enum CloseRetryReceiptSource {
+    GenericRetryHistory,
+    OriginalSnapshotOnly,
+}
+
+struct CloseRetryLiveEvidence<'a> {
+    scopes: &'a [CloseAttemptScope],
+    expected: &'a [CloseExpectedRetirementResource],
+    inspections: &'a [CloseInspection],
+    retired: &'a [CloseRetiredResource],
+    receipt_source: CloseRetryReceiptSource,
+}
+
+#[allow(clippy::too_many_lines)]
+fn native_close_retry_remaining_effects(
+    run: &CloseRunRef,
+    proof: &StoppedCloseOriginalRetirementProof,
+    inspections: &[CloseInspection],
+) -> Result<Vec<CloseSafeRetryEffect>, String> {
+    if proof.run.run != *run || proof.run.status != CloseRunStatus::Stopped {
+        return Err("native retry assessment requires the exact stopped run".into());
+    }
+    if proof.scopes.is_empty() || proof.resources.is_empty() {
+        return Err("native retry assessment lacks original captured resources".into());
+    }
+    for (index, captured) in proof.scopes.iter().enumerate() {
+        if captured.attempt_id != run.attempt_id
+            || proof.scopes[..index]
+                .iter()
+                .any(|prior| prior.scope == captured.scope)
+        {
+            return Err("native retry assessment has duplicate or mismatched captured scopes".into());
+        }
+        let scope_targets = proof
+            .resources
+            .iter()
+            .filter(|target| target.scope == captured.scope);
+        let work_scope = opaque_resource(RetiredResourceKind::WorkScope, captured.scope.to_string());
+        if scope_targets
+            .clone()
+            .filter(|target| target.resource == work_scope)
+            .count()
+            != 1
+        {
+            return Err("native retry assessment lacks independent exact WorkScope evidence".into());
+        }
+        let worktree_targets = scope_targets
+            .filter(|target| target.resource.kind() == RetiredResourceKind::Worktree)
+            .collect::<Vec<_>>();
+        match &captured.captured_worktree {
+            Some(CapturedWorktreeIdentity::Resolved(identity))
+                if worktree_targets.len() == 1
+                    && worktree_targets[0].resource.identity()
+                        == &LossItemIdentity::Worktree(identity.clone()) => {}
+            None if worktree_targets.is_empty() => {}
+            _ => {
+                return Err("native retry assessment has mismatched captured worktree evidence".into());
+            }
+        }
+        let confirmed = inspections
+            .iter()
+            .filter(|inspection| inspection.target.scope == captured.scope);
+        if confirmed.count() != usize::from(captured.captured_worktree.is_some()) {
+            return Err("native retry assessment lacks a unique original worktree inspection".into());
+        }
+    }
+    for inspection in inspections {
+        if inspection.attempt_id != run.attempt_id
+            || !proof
+                .scopes
+                .iter()
+                .any(|captured| captured.scope == inspection.target.scope)
+        {
+            return Err("native retry assessment has mismatched inspection evidence".into());
+        }
+    }
+    for (index, target) in proof.resources.iter().enumerate() {
+        if target.attempt_id != run.attempt_id
+            || target.snapshot != proof.snapshot
+            || !proof
+                .scopes
+                .iter()
+                .any(|captured| captured.scope == target.scope)
+            || proof.resources[..index].iter().any(|prior| {
+                prior.scope == target.scope && prior.resource == target.resource
+            })
+        {
+            return Err("native retry assessment has duplicate or mismatched original targets".into());
+        }
+        if target.resource.kind() == RetiredResourceKind::WorkScope
+            && target.resource
+                != opaque_resource(RetiredResourceKind::WorkScope, target.scope.to_string())
+        {
+            return Err("native retry assessment has a mismatched WorkScope identity".into());
+        }
+    }
+    for outcome in &proof.outcomes {
+        if outcome.attempt_id != run.attempt_id
+            || outcome.snapshot != proof.snapshot
+            || !proof.resources.iter().any(|target| {
+                target.scope == outcome.scope && target.resource == outcome.resource
+            })
+        {
+            return Err("native retry assessment has mismatched original outcome evidence".into());
+        }
+    }
+    let mut remaining = Vec::new();
+    for target in &proof.resources {
+        let receipts = proof
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome.scope == target.scope && outcome.resource == target.resource)
+            .collect::<Vec<_>>();
+        let [receipt] = receipts.as_slice() else {
+            return Err("native retry assessment requires a unique original outcome for every resource".into());
+        };
+        match receipt.outcome {
+            RetirementOutcome::Retired | RetirementOutcome::AbsenceAdopted { .. } => {}
+            RetirementOutcome::Residual { .. } => remaining.push(CloseCleanupFailureResource {
+                scope: target.scope.clone(),
+                resource: target.resource.clone(),
+                disposition: CloseCleanupResourceDisposition::Failed,
+            }),
+        }
+    }
+    close_safe_retry_effects(&remaining)
 }
 
 fn close_safe_retry_effects(
@@ -1664,7 +1803,48 @@ impl RuntimeManager {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Assesses an exact stopped native operation without admitting or executing a successor.
+    #[allow(dead_code)]
+    pub(crate) async fn assess_native_close_retry(
+        &self,
+        failed_run: &CloseRunRef,
+    ) -> Result<NativeCloseRetryAssessment, String> {
+        let original = self
+            .db()
+            .read_stopped_close_original_retirement_proof(failed_run)
+            .await
+            .map_err(|error| error.to_string())?;
+        let inspections = self
+            .db()
+            .list_close_retirement_inspections_for_snapshot(
+                failed_run.attempt_id.as_str(),
+                &original.snapshot,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let remaining_effects =
+            native_close_retry_remaining_effects(failed_run, &original, &inspections)?;
+        let safety_evidence = self
+            .validate_close_safe_retry_with_evidence(
+                &failed_run.attempt_id,
+                &original.snapshot,
+                &remaining_effects,
+                CloseRetryLiveEvidence {
+                    scopes: &original.scopes,
+                    expected: &original.resources,
+                    inspections: &inspections,
+                    retired: &original.outcomes,
+                    receipt_source: CloseRetryReceiptSource::OriginalSnapshotOnly,
+                },
+            )
+            .await?;
+        Ok(NativeCloseRetryAssessment {
+            original,
+            remaining_effects,
+            safety_evidence,
+        })
+    }
+
     async fn validate_close_safe_retry(
         &self,
         attempt_id: &CloseAttemptId,
@@ -1691,6 +1871,36 @@ impl RuntimeManager {
             .list_close_retirement_evidence(attempt_id.as_str())
             .await
             .map_err(|error| error.to_string())?;
+        self.validate_close_safe_retry_with_evidence(
+            attempt_id,
+            snapshot,
+            plan,
+            CloseRetryLiveEvidence {
+                scopes: &scopes,
+                expected: &expected,
+                inspections: &inspections,
+                retired: &retired,
+                receipt_source: CloseRetryReceiptSource::GenericRetryHistory,
+            },
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn validate_close_safe_retry_with_evidence(
+        &self,
+        attempt_id: &CloseAttemptId,
+        snapshot: &CloseRetirementSnapshot,
+        plan: &[CloseSafeRetryEffect],
+        evidence: CloseRetryLiveEvidence<'_>,
+    ) -> Result<String, String> {
+        let CloseRetryLiveEvidence {
+            scopes,
+            expected,
+            inspections,
+            retired,
+            receipt_source,
+        } = evidence;
         for effect in plan {
             if !expected
                 .iter()
@@ -1701,7 +1911,7 @@ impl RuntimeManager {
             }
         }
         let mut observations = Vec::new();
-        for captured in &scopes {
+        for captured in scopes {
             let scope = &captured.scope;
             if self
                 .db()
@@ -1825,11 +2035,12 @@ impl RuntimeManager {
                                     RetirementOutcome::Retired
                                         | RetirementOutcome::AbsenceAdopted { .. }
                                 )
-                        }) || self
-                            .db()
-                            .close_resource_has_retry_success(attempt_id, scope, &target.resource)
-                            .await
-                            .map_err(|error| error.to_string())?;
+                        }) || (matches!(receipt_source, CloseRetryReceiptSource::GenericRetryHistory)
+                            && self
+                                .db()
+                                .close_resource_has_retry_success(attempt_id, scope, &target.resource)
+                                .await
+                                .map_err(|error| error.to_string())?);
                         let dispatched = self
                             .db()
                             .close_retirement_resource_was_dispatched(
@@ -9133,6 +9344,251 @@ mod tests {
             tmux,
             terminal,
         }
+    }
+
+    async fn stopped_native_retry_fixture() -> (
+        ProcessStepFixture,
+        super::StoppedCloseOriginalRetirementProof,
+        Vec<super::CloseInspection>,
+    ) {
+        let fixture = process_step_fixture(false).await;
+        let db = fixture.manager.db();
+        let targets = db
+            .list_close_expected_retirement_resources(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        for target in targets {
+            if target.resource.kind() != super::RetiredResourceKind::WorkScope {
+                db.record_close_retirement_evidence(crate::db::RecordCloseRetirementEvidenceRequest {
+                    attempt_id: fixture.run.attempt_id.clone(),
+                    snapshot: fixture.snapshot.clone(),
+                    scope: target.scope,
+                    resource: target.resource,
+                    outcome: super::RetirementOutcome::Retired,
+                    detail: None,
+                })
+                .await
+                .unwrap();
+            }
+        }
+        db.classify_interrupted_close_run(&fixture.run)
+            .await
+            .unwrap();
+        let original = db
+            .read_stopped_close_original_retirement_proof(&fixture.run)
+            .await
+            .unwrap();
+        let inspections = db
+            .list_close_retirement_inspections_for_snapshot(
+                fixture.run.attempt_id.as_str(),
+                &original.snapshot,
+            )
+            .await
+            .unwrap();
+        (fixture, original, inspections)
+    }
+
+    #[tokio::test]
+    async fn native_retry_preserves_independent_work_scope_after_worktree_success() {
+        let (fixture, original, inspections) = stopped_native_retry_fixture().await;
+        let effects =
+            super::native_close_retry_remaining_effects(&fixture.run, &original, &inspections)
+                .unwrap();
+        assert_eq!(effects.len(), 1);
+        assert_eq!(
+            effects[0].resource.kind(),
+            super::RetiredResourceKind::WorkScope,
+        );
+        assert_eq!(effects[0].scope, fixture.scopes[0]);
+        assert!(original.outcomes.iter().any(|outcome| {
+            outcome.resource.kind() == super::RetiredResourceKind::Worktree
+                && outcome.outcome == super::RetirementOutcome::Retired
+        }));
+        let mut all_successful = original.clone();
+        for outcome in &mut all_successful.outcomes {
+            outcome.outcome = super::RetirementOutcome::Retired;
+        }
+        assert!(super::native_close_retry_remaining_effects(
+            &fixture.run,
+            &all_successful,
+            &inspections,
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn native_retry_refuses_missing_duplicate_and_mismatched_original_evidence() {
+        let (fixture, original, inspections) = stopped_native_retry_fixture().await;
+        let assess = |proof: &super::StoppedCloseOriginalRetirementProof| {
+            super::native_close_retry_remaining_effects(&fixture.run, proof, &inspections)
+        };
+        let mut missing = original.clone();
+        missing.outcomes.pop();
+        assert!(assess(&missing).is_err());
+        let mut duplicate = original.clone();
+        duplicate.outcomes.push(duplicate.outcomes[0].clone());
+        assert!(assess(&duplicate).is_err());
+        let mut duplicate_target = original.clone();
+        duplicate_target
+            .resources
+            .push(duplicate_target.resources[0].clone());
+        assert!(assess(&duplicate_target).is_err());
+        let mut mismatched = original.clone();
+        mismatched.outcomes[0].snapshot =
+            super::CloseRetirementSnapshot::parse("G2", "G2-fingerprint").unwrap();
+        assert!(assess(&mismatched).is_err());
+        let mut wrong_identity = original.clone();
+        let worktree = wrong_identity
+            .resources
+            .iter_mut()
+            .find(|target| target.resource.kind() == super::RetiredResourceKind::Worktree)
+            .unwrap();
+        let identity = match worktree.resource.identity() {
+            super::LossItemIdentity::Worktree(identity) => identity,
+            _ => panic!("expected worktree identity"),
+        };
+        let replacement = super::WorktreeIdentity::from_parts(
+            identity.id().clone(),
+            identity.fingerprint().clone(),
+            super::GitPathIdentity::from_bytes(b"/different/repository".to_vec()),
+        );
+        worktree.resource = super::RetiredResourceIdentity::parse(
+            super::RetiredResourceKind::Worktree,
+            super::LossItemIdentity::Worktree(replacement),
+        )
+        .unwrap();
+        assert!(assess(&wrong_identity).is_err());
+        assert!(super::native_close_retry_remaining_effects(&fixture.run, &original, &[]).is_err());
+        let duplicate_inspections = vec![inspections[0].clone(), inspections[0].clone()];
+        assert!(super::native_close_retry_remaining_effects(
+            &fixture.run,
+            &original,
+            &duplicate_inspections,
+        )
+        .is_err());
+        let mut wrong_run = fixture.run.clone();
+        wrong_run.ordinal = super::CloseRunOrdinal::parse(2).unwrap();
+        assert!(super::native_close_retry_remaining_effects(
+            &wrong_run,
+            &original,
+            &inspections,
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn native_retry_requires_original_scope_even_with_complete_remaining_receipts() {
+        let (fixture, original, inspections) = stopped_native_retry_fixture().await;
+        let assess = |proof: &super::StoppedCloseOriginalRetirementProof| {
+            super::native_close_retry_remaining_effects(&fixture.run, proof, &inspections)
+        };
+        let mut missing_scope = original.clone();
+        missing_scope
+            .resources
+            .retain(|target| target.resource.kind() != super::RetiredResourceKind::WorkScope);
+        missing_scope
+            .outcomes
+            .retain(|outcome| outcome.resource.kind() != super::RetiredResourceKind::WorkScope);
+        assert!(assess(&missing_scope)
+            .unwrap_err()
+            .contains("independent exact WorkScope"));
+
+        let mut wrong_scope_identity = original.clone();
+        let replacement = super::opaque_resource(
+            super::RetiredResourceKind::WorkScope,
+            "unrelated-scope".to_string(),
+        );
+        for target in &mut wrong_scope_identity.resources {
+            if target.resource.kind() == super::RetiredResourceKind::WorkScope {
+                target.resource = replacement.clone();
+            }
+        }
+        for outcome in &mut wrong_scope_identity.outcomes {
+            if outcome.resource.kind() == super::RetiredResourceKind::WorkScope {
+                outcome.resource = replacement.clone();
+            }
+        }
+        assert!(assess(&wrong_scope_identity).is_err());
+
+        let mut duplicate_scope = original.clone();
+        duplicate_scope.scopes.push(duplicate_scope.scopes[0].clone());
+        assert!(assess(&duplicate_scope).is_err());
+        let mut wrong_snapshot = original.clone();
+        wrong_snapshot.resources[0].snapshot =
+            super::CloseRetirementSnapshot::parse("G2", "G2-fingerprint").unwrap();
+        assert!(assess(&wrong_snapshot).is_err());
+        let mut not_stopped = original.clone();
+        not_stopped.run.status = super::CloseRunStatus::Running;
+        assert!(assess(&not_stopped).is_err());
+    }
+
+    #[tokio::test]
+    async fn native_retry_refuses_original_process_local_residuals() {
+        let (fixture, original, inspections) = stopped_native_retry_fixture().await;
+        for kind in [
+            super::RetiredResourceKind::BashProcessGroup,
+            super::RetiredResourceKind::PtySession,
+            super::RetiredResourceKind::BrowserSession,
+        ] {
+            let mut residual = original.clone();
+            residual
+                .outcomes
+                .iter_mut()
+                .find(|outcome| outcome.resource.kind() == kind)
+                .unwrap()
+                .outcome = super::RetirementOutcome::Residual {
+                residual_reason: super::RetirementFailureReason::ManualRepairRequired,
+            };
+            assert!(super::native_close_retry_remaining_effects(
+                &fixture.run,
+                &residual,
+                &inspections,
+            )
+            .unwrap_err()
+            .contains("separate repair authority"));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_retry_assessment_keeps_exact_snapshot_and_does_not_dispatch() {
+        let (fixture, original, _) = stopped_native_retry_fixture().await;
+        let assessment = fixture
+            .manager
+            .assess_native_close_retry(&fixture.run)
+            .await
+            .unwrap();
+        assert_eq!(assessment.original, original);
+        assert_eq!(assessment.remaining_effects.len(), 1);
+        assert_eq!(
+            assessment.remaining_effects[0].resource.kind(),
+            super::RetiredResourceKind::WorkScope,
+        );
+        assert!(!assessment.safety_evidence.is_empty());
+        let g2 = super::CloseRetirementSnapshot::parse(
+            "different-generation",
+            original.snapshot.fingerprint(),
+        )
+        .unwrap();
+        assert!(fixture
+            .manager
+            .db()
+            .list_close_retirement_inspections_for_snapshot(fixture.run.attempt_id.as_str(), &g2)
+            .await
+            .is_err());
+        assert_eq!(
+            fixture.manager.db().get_close_run(&fixture.run).await.unwrap(),
+            original.run,
+        );
+        let successor = super::CloseRunRef {
+            attempt_id: fixture.run.attempt_id.clone(),
+            ordinal: super::CloseRunOrdinal::parse(2).unwrap(),
+        };
+        assert!(fixture
+            .manager
+            .db()
+            .get_close_run(&successor)
+            .await
+            .is_err());
     }
 
     async fn run_scope(
