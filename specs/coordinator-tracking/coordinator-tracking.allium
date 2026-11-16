@@ -127,7 +127,7 @@ rule AppendNovelEvidence {
 }
 
 rule ReconcileTrackingItem {
-    when: UpdateRequested(call, item, expected_revision, expected_evidence, title, note, resumption, now_us)
+    when: UpdateRequested(call, item, expected_revision, expected_evidence, kind, title, note, resumption, now_us)
     requires: call.input.current_head
     requires: item.registry.runtime_authority_open
     requires: not call.retained
@@ -135,6 +135,7 @@ rule ReconcileTrackingItem {
     requires: item.revision = expected_revision
     requires: item.latest_evidence_ordinal = expected_evidence
     ensures:
+        item.kind = kind
         item.title = title
         item.note = note
         item.resumption = resumption
@@ -244,7 +245,7 @@ surface SavedIntent {
         call.retained
     provides:
         RecordRequested(call, registry, id, kind, title, note, resumption, evidence_ordinal, now_us)
-        UpdateRequested(call, item, expected_revision, expected_evidence, title, note, resumption, now_us)
+        UpdateRequested(call, item, expected_revision, expected_evidence, kind, title, note, resumption, now_us)
         RetireRequested(call, item, expected_revision, disposition, reason, now_us)
         ReopenRequested(call, item, expected_revision, current_evidence_present)
         EvidenceAttached(call, item, expected_revision, novel_count, now_us)

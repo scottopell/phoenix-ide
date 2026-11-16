@@ -104,6 +104,7 @@ pub enum TrackingMutation {
     Update {
         id: String,
         expected_revision: i64,
+        kind: TrackingKind,
         title: String,
         note: String,
         resumption: String,
@@ -548,6 +549,7 @@ impl Database {
                     .is_none();
                 let changed = match other {
                     TrackingMutation::Update {
+                        kind,
                         title,
                         note,
                         resumption,
@@ -570,7 +572,7 @@ impl Database {
                                 "evidence revision conflict; inspect new source evidence",
                             ));
                         }
-                        sqlx::query("UPDATE coordinator_tracking_items SET title=?2,note=?3,resumption=?4,reviewed_evidence_ordinal=?5,reviewed_at_us=?6 WHERE id=?1").bind(id).bind(title).bind(note).bind(resumption).bind(latest).bind(now).execute(&mut **tx).await?;
+                        sqlx::query("UPDATE coordinator_tracking_items SET title=?2,note=?3,resumption=?4,reviewed_evidence_ordinal=?5,reviewed_at_us=?6,kind=?7 WHERE id=?1").bind(id).bind(title).bind(note).bind(resumption).bind(latest).bind(now).bind(kind.as_str()).execute(&mut **tx).await?;
                         sqlx::query("DELETE FROM coordinator_tracking_references WHERE item_id=?1")
                             .bind(id)
                             .execute(&mut **tx)

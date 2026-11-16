@@ -196,6 +196,7 @@ async fn tracking_new_pause_invalidates_step_and_conflicts_stale_reconciliation(
     assert_eq!(duplicate.outcome, TrackingOutcome::Unchanged);
     assert_eq!(duplicate.item_revision, changed.item_revision);
     let stale = TrackingMutation::Update {
+        kind: TrackingKind::RequestedWork,
         id: receipt.item_id.clone(),
         expected_revision: changed.item_revision,
         title: "Deployment".into(),
@@ -215,6 +216,7 @@ async fn tracking_new_pause_invalidates_step_and_conflicts_stale_reconciliation(
         &db,
         &source,
         TrackingMutation::Update {
+            kind: TrackingKind::RequestedWork,
             id: receipt.item_id.clone(),
             expected_revision: changed.item_revision,
             title: "Deployment".into(),
@@ -578,6 +580,7 @@ async fn tracking_reference_updates_and_retirement_history_paginate_honestly() {
         &db,
         &source,
         TrackingMutation::Update {
+            kind: TrackingKind::Bookmark,
             id: receipt.item_id.clone(),
             expected_revision: revision,
             title: "Growing discussion".into(),
@@ -645,4 +648,60 @@ async fn tracking_worst_case_escaped_titles_and_due_cue_fit_complete_context_bou
         .all(|item| item.title_truncated));
     assert_eq!(parsed.captured_registry.omitted_count, 1);
     assert!(parsed.requested_item_due_for_review.is_some());
+}
+
+#[tokio::test]
+async fn tracking_explicit_kind_change_preserves_evidence_and_pause_without_dispatching_work() {
+    let (db, source) = setup().await;
+    let saved = apply(
+        &db,
+        &source,
+        record(TrackingKind::Bookmark, "Question later commissioned"),
+    )
+    .await;
+    let evidence = TrackingEvidence {
+        instance_id: db.instance_id().await.unwrap().to_string(),
+        transcript_id: source.clone(),
+        message_id: "restriction-source".into(),
+        quotation: "Work is requested, but keep execution paused until I approve".into(),
+    };
+    let attached = apply(
+        &db,
+        &source,
+        TrackingMutation::AppendEvidence {
+            id: saved.item_id.clone(),
+            expected_revision: 1,
+            evidence: vec![evidence.clone()],
+        },
+    )
+    .await;
+    apply(
+        &db,
+        &source,
+        TrackingMutation::Update {
+            id: saved.item_id.clone(),
+            expected_revision: attached.item_revision,
+            kind: TrackingKind::RequestedWork,
+            title: "Question later commissioned".into(),
+            note: "User now requests the outcome; restriction remains".into(),
+            resumption: "Keep execution paused until the user approves".into(),
+            reviewed_evidence_ordinal: 1,
+            references: vec![],
+        },
+    )
+    .await;
+    let detail = db
+        .read_coordinator_tracking(&source, &saved.item_id, 0)
+        .await
+        .unwrap();
+    assert_eq!(detail.item.kind, TrackingKind::RequestedWork);
+    assert_eq!(detail.evidence[0].1, evidence);
+    assert!(matches!(detail.item.disposition, TrackingState::Tracking));
+    assert!(
+        matches!(detail.item.resumption,TrackingResumption::Reviewed{resumption,..} if resumption.contains("paused"))
+    );
+    assert!(matches!(
+        db.get_conversation(&source).await.unwrap().state,
+        phoenix_core::domain::sm_state::ConvState::Idle
+    ));
 }
