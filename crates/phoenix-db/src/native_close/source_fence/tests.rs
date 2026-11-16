@@ -294,6 +294,21 @@ async fn finalized_native_retry_only_suppresses_allowance_on_source_loss() {
     }
 }
 
+async fn assert_initial_captured_scope_interruption(db: &Database, run: &CloseRunRef) {
+    let failures = db.list_close_cleanup_failures(run.attempt_id.as_str()).await.unwrap();
+    assert_eq!(failures.len(), 1);
+    let failure = &failures[0].occurrence;
+    let CloseCleanupFailureAuthority::CapturedScope { scope, resource } = &failure.authority else {
+        panic!("initial fixture retains a captured scope: {:?}", failure.authority);
+    };
+    assert_eq!(resource, &opaque_resource(RetiredResourceKind::WorkScope, scope.as_str()));
+    assert!(failure.remaining_resources.contains(&CloseCleanupFailureResource {
+        scope: scope.clone(),
+        resource: resource.clone(),
+        disposition: CloseCleanupResourceDisposition::Failed,
+    }));
+}
+
 #[tokio::test]
 async fn initial_native_source_loss_suppresses_allowance_without_a_successor() {
     for replay in [false, true] {
@@ -308,18 +323,8 @@ async fn initial_native_source_loss_suppresses_allowance_without_a_successor() {
             panic!("expected initial native admission");
         };
         let run = CloseRunRef::initial(receipt.admitted.attempt_id);
-        let interruption = TerminalizeInitialCloseCleanupFailureRequest {
-            failure_occurrence_id: run.failure_occurrence_id(),
-            attempt_id: run.attempt_id.clone(),
-            source_product_conversation_id: command.intent().target().clone(),
-            authority: CloseCleanupFailureAuthority::AttemptInterrupted,
-            remaining_resources: vec![],
-            reason: RetirementFailureReason::Interrupted,
-            detail: "initial native Close stopped before cleanup".into(),
-            stop_certainty: CloseStopCertainty::ShutdownUncertain,
-            occurred_at_us: Utc::now().timestamp_micros(),
-        };
-        db.terminalize_initial_close_cleanup_failure(&interruption).await.unwrap();
+        db.classify_interrupted_close_run(&run).await.unwrap();
+        assert_initial_captured_scope_interruption(&db, &run).await;
         let state = db.get_conversation(command.source_transcript_id()).await.unwrap().state;
         write_source_fence_state(&db, &command, &state, replay).await.unwrap();
         assert_eq!(source_fence_allowance(&db, &run).await, Some((0, 0)));
@@ -495,6 +500,7 @@ async fn startup_preserves_initial_and_stopped_native_receipts_and_both_allowanc
                 let run = CloseRunRef::initial(receipt.admitted.attempt_id);
                 if stopped {
                     db.classify_interrupted_close_run(&run).await.unwrap();
+                    assert_initial_captured_scope_interruption(&db, &run).await;
                 }
                 set_startup_allowance_bits(&db, &run, consumed, suppressed).await;
                 let retained_run = db.get_close_run(&run).await.unwrap();

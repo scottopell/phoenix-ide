@@ -42,6 +42,13 @@ jobs:
           git diff --binary > evidence/hosted-format.patch
           git restore --worktree .
           git diff --exit-code
+      - name: Retain hosted formatting proposal
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: close-format-${{ github.sha }}-${{ github.run_attempt }}
+          path: evidence/hosted-format.patch
+          if-no-files-found: error
       - name: Compile database tests and inventory exact selectors
         shell: bash
         run: |

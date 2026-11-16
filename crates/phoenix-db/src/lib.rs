@@ -16718,8 +16718,8 @@ pub(crate) async fn write_conversation_state_tx(
     state_updated_at: DateTime<Utc>,
 ) -> DbResult<()> {
     native_close::fence_native_retry_sources_tx(tx, id, state).await?;
-    let state_json = serde_json::to_string(state)
-        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let state_json =
+        serde_json::to_string(state).map_err(|error| DbError::Serialization(error.to_string()))?;
     let result = sqlx::query(
         "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
     )

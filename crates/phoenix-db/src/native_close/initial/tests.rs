@@ -121,7 +121,7 @@ async fn count(db: &Database, table: &str) -> i64 {
     sqlx::query_scalar(sql).fetch_one(db.pool()).await.unwrap()
 }
 
-async fn assert_one_operation(f: &Fixture, receipt: &NativeCloseReceipt) {
+async fn assert_one_operation(f: &Fixture, receipt: &NativeCloseReceipt, suppressed: i64) {
     assert_eq!(receipt.admitted.target, f.target);
     assert_eq!(receipt.admitted.run_ordinal, CloseRunOrdinal::INITIAL);
     for table in [
@@ -143,7 +143,7 @@ async fn assert_one_operation(f: &Fixture, receipt: &NativeCloseReceipt) {
     .fetch_one(f.db.pool())
     .await
     .unwrap();
-    assert_eq!(marker, (1, 0, 0));
+    assert_eq!(marker, (1, 0, suppressed));
     let persisted: (String, String, i64) = sqlx::query_as(
         "SELECT attempt_id, product_conversation_id, run_ordinal
          FROM native_close_initial_receipts WHERE request_id = ?1",
@@ -165,12 +165,12 @@ async fn live_coordinator_exact_source_admits_and_replays_without_refilling_allo
         panic!("expected a new operation")
     };
     assert_eq!(receipt.request_id, command.request_id());
-    assert_one_operation(&f, &receipt).await;
+    assert_one_operation(&f, &receipt, 0).await;
     assert_eq!(
         f.apply(&command).await.unwrap(),
         NativeCloseInitialResult::Replay(receipt.clone())
     );
-    assert_one_operation(&f, &receipt).await;
+    assert_one_operation(&f, &receipt, 0).await;
 }
 
 #[tokio::test]
@@ -189,7 +189,7 @@ async fn exact_receipt_replay_keeps_run_one_after_operation_progress() {
         f.apply(&command).await.unwrap(),
         NativeCloseInitialResult::Replay(receipt.clone())
     );
-    assert_one_operation(&f, &receipt).await;
+    assert_one_operation(&f, &receipt, 0).await;
 }
 
 #[tokio::test]
@@ -208,7 +208,7 @@ async fn same_source_changed_target_conflicts_instead_of_starting_second_operati
         f.apply(&changed).await,
         Err(DbError::CloseFoundationConflict(message)) if message.contains("request identity conflict")
     ));
-    assert_one_operation(&f, &receipt).await;
+    assert_one_operation(&f, &receipt, 0).await;
 }
 
 #[tokio::test]
@@ -239,7 +239,7 @@ async fn idle_or_replaced_coordinator_refuses_even_exact_historical_replay() {
                 Err(DbError::CloseFoundationPrecondition(_))
             ));
         }
-        assert_one_operation(&f, &receipt).await;
+        assert_one_operation(&f, &receipt, i64::from(!replaced)).await;
     }
 }
 
@@ -261,7 +261,7 @@ async fn new_source_tuple_must_reference_retained_operation_without_new_allowanc
         f.apply(&second).await.unwrap(),
         NativeCloseInitialResult::ExistingOperationNeedsExactReference(receipt.admitted.clone())
     );
-    assert_one_operation(&f, &receipt).await;
+    assert_one_operation(&f, &receipt, 1).await;
 }
 
 #[tokio::test]
@@ -315,7 +315,7 @@ async fn concurrent_identical_commands_commit_once_and_return_one_replay() {
         }
         _ => panic!("expected exactly one admission and one replay: {first:?}, {second:?}"),
     };
-    assert_one_operation(&f, receipt).await;
+    assert_one_operation(&f, receipt, 0).await;
 }
 
 #[tokio::test]

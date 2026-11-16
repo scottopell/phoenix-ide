@@ -395,7 +395,8 @@ impl Database {
                 .fetch_one(&mut *tx)
                 .await?;
         crate::coordinator_watches::record_wait_entry_tx(&mut tx, conversation_id, state).await?;
-        crate::write_conversation_state_tx(&mut tx, conversation_id, state, state_updated_at).await?;
+        crate::write_conversation_state_tx(&mut tx, conversation_id, state, state_updated_at)
+            .await?;
         if previous_kind != crate::conv_state_kind(state) {
             crate::record_initial_execution_outcome_tx(&mut tx, conversation_id, state).await?;
         }

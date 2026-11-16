@@ -197,12 +197,12 @@ mod observe;
 mod receipts;
 mod retry;
 mod source_fence;
+pub use observe::{NativeCloseObservation, NativeCloseObserveReceipt, NativeCloseObserveResult};
+pub use retry::{NativeCloseRetryResult, NativeCloseRetrySourceAssessment};
 pub(crate) use source_fence::{
     NativeRetrySourceFence, fence_native_retry_sources_tx, interrupt_native_retry_tx,
     recover_native_retry_sources_tx,
 };
-pub use observe::{NativeCloseObservation, NativeCloseObserveReceipt, NativeCloseObserveResult};
-pub use retry::{NativeCloseRetryResult, NativeCloseRetrySourceAssessment};
 
 #[cfg(test)]
 mod tests;

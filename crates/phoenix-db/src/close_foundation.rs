@@ -12936,7 +12936,7 @@ mod tests {
             crate::migrations::run_pending_migrations(db.pool())
                 .await
                 .unwrap(),
-            2
+            3
         );
         let after: (String, String, String, String, String, String, String, i64) = sqlx::query_as(
             "SELECT request_id, source_transcript_id, source_message_id, source_tool_use_id,

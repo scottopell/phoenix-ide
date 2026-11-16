@@ -101,41 +101,29 @@ async fn fixture(
     resources: Vec<RetiredResourceIdentity>,
     complete_receipts: bool,
 ) -> TerminalizeInitialCloseCleanupFailureRequest {
-    let failure = initial_cleanup_failure_fixture_with_resources(
+    let mut failure = initial_cleanup_failure_fixture_with_resources(
         db, CloseStopCertainty::ShutdownUncertain, resources,
     ).await;
     if complete_receipts {
-        let CloseCleanupFailureAuthority::ExpectedResource { snapshot, .. } = &failure.authority else {
+        let CloseCleanupFailureAuthority::ExpectedResource { scope, snapshot, resource } = &failure.authority else {
             panic!("expected inventory authority");
         };
         for remaining in &failure.remaining_resources {
-            insert_receipt(db, &failure.attempt_id, &remaining.scope, snapshot, &remaining.resource, "residual", &failure.detail).await;
+            db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+                attempt_id: failure.attempt_id.clone(),
+                scope: remaining.scope.clone(),
+                snapshot: snapshot.clone(),
+                resource: remaining.resource.clone(),
+                outcome: RetirementOutcome::Residual { residual_reason: failure.reason },
+                detail: Some(failure.detail.clone()),
+            }).await.unwrap();
         }
+        failure.remaining_resources = db.expected_close_cleanup_failure_resources(
+            failure.attempt_id.as_str(), scope, resource,
+        ).await.unwrap();
     }
     db.terminalize_initial_close_cleanup_failure(&failure).await.unwrap();
     failure
-}
-
-async fn insert_receipt(
-    db: &Database,
-    attempt: &CloseAttemptId,
-    scope: &WorkScopeId,
-    snapshot: &CloseRetirementSnapshot,
-    resource: &RetiredResourceIdentity,
-    proof_kind: &str,
-    detail: &str,
-) {
-    sqlx::query("INSERT INTO close_retirement_resources
-        (attempt_id, scope, inspection_generation, inspection_fingerprint, resource_kind,
-         identity_kind, identity_codec, identity_value, proof_kind, residual_reason, detail, created_at, updated_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
-                CASE WHEN ?9 = 'residual' THEN 'removal_failed' END, ?10, ?11, ?11)")
-        .bind(attempt.as_str()).bind(scope.as_str())
-        .bind(snapshot.generation()).bind(snapshot.fingerprint())
-        .bind(resource.kind().as_str()).bind(resource.identity().identity_kind())
-        .bind(resource.identity().codec()).bind(resource.identity().value()).bind(proof_kind)
-        .bind(detail).bind(Utc::now().to_rfc3339())
-        .execute(db.pool()).await.unwrap();
 }
 
 fn admitted(result: LocalAuthorityResult<DbResult<NativeCloseRetryResult>>) -> NativeCloseReceipt {
@@ -309,7 +297,7 @@ async fn native_retry_uses_g1_residuals_not_g2_success() {
         .find(|remaining| remaining.resource.kind() == RetiredResourceKind::Worktree)
         .unwrap().resource.clone();
     let work_scope = failure.remaining_resources.iter()
-        .find(|remaining| remaining.resource.kind() == RetiredResourceKind::WorkScope)
+        .find(|remaining| remaining.scope == scope && remaining.resource.kind() == RetiredResourceKind::WorkScope)
         .unwrap().resource.clone();
     db.retry_close_retirement(&failure.attempt_id).await.unwrap();
     db.replace_close_inspection(ReplaceCloseInspectionRequest {
