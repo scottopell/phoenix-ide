@@ -13,7 +13,7 @@ import { copyToClipboard } from '../utils/clipboard';
 
 vi.mock('../utils/clipboard', () => ({ copyToClipboard: vi.fn().mockResolvedValue(true) }));
 const available = {
-  ending_evidence: 'Historical ending evidence not captured.',
+  ending_evidence: 'Settled input user-input. Ending response exact-response. Recorded ending quotation: finished safely. @event:event-exact',
   status: 'available', event_id: 'event-exact', product_conversation_id: 'product-1', display_name: 'Fix routing',
   source_transcript_id: 'transcript-exact', source_occurrence_kind: 'turn', source_occurrence_id: 'occurrence-exact',
   source_generation: 7, occurred_at_us: 1791800000123456, provenance: 'subscription', outcome: { kind: 'turn_finished' },
@@ -98,6 +98,14 @@ describe('compact conversation events', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Copy original event text' }));
     expect(copyToClipboard).toHaveBeenCalledWith(original);
     expect(container.querySelector('[data-fragment-id="message-text"]')!.textContent).toBe(original);
+  });
+  it('keeps the exact ending quotation in inspectable provenance', () => {
+    const { container } = mount();
+    container.querySelector('details')!.open = true;
+    expect(container.querySelector('.conversation-event-provenance')).toHaveTextContent('Settled input user-input');
+    expect(container.querySelector('.conversation-event-provenance')).toHaveTextContent('finished safely');
+    expect(container.querySelector('.conversation-event-provenance')).toHaveTextContent('@event:event-exact');
+    expect(container.querySelector('.conversation-event-summary')).not.toHaveTextContent('finished safely');
   });
   it('uses canonical query-safe routing and preserves the complete Coordinator return origin', () => {
     mount({ ...available, product_conversation_id: 'id/?query#hash' });
