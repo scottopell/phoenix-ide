@@ -46,6 +46,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | --- | --- | --- | --- |
 | [264](264_scan-only-coordinator-history-with-host-owned-batches.md) | Scan only Coordinator history through bounded host-owned batches | Accepted | REQ-SCAN-001–008, REQ-TRACK-004–007 |
 | [263](263_verify-native-backup-and-bound-predecessor-recovery-for-macos-deploy.md) | Verify a native backup and bound predecessor recovery for macOS deploy | Accepted; qualifies ADR-230 | REQ-LDD-002/004/009/029–031, REQ-PD-010, REQ-COMP-021 |
+| [264](264_publish-recovered-launchd-plist-before-canonical-bootstrap.md) | Preserve SQLite path and recovered launchd plist identity | Accepted; qualifies ADR-263 | REQ-LDD-029–030 |
 | [262](262_retire-delivery-roadmap-with-preserved-history.md) | Retire the delivery roadmap while preserving historical evidence | Accepted | REQ-ROADMAP-001–014 |
 | [261](261_completion-events-capture-occurrence-bound-ending-evidence.md) | Completion events capture occurrence-bound ending evidence | Accepted | REQ-CEVT-006–009, REQ-RET-012 |
 | [260](260_coordinator-tracking-retains-intent-at-the-transcript-tail.md) | Retain Coordinator intent independently of continuations | Accepted | REQ-TRACK-001–007, REQ-GR-011 |

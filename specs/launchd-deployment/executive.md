@@ -82,3 +82,7 @@ status alone does not prove this. Confirm exact helper absence and resolve targe
 attempted/uncertain candidate boundary, an older binary requires its matching
 offline database restore with all users stopped. See `LAUNCHD.md`; historical
 helper commands are not recovery APIs.
+
+## Path and recovery identity correction
+
+SQLite capacity, backup source and writer reservation use encoded file URIs. Regression fixtures include URI metacharacters and control characters in directory and database names, verify actual rows and writer exclusion, and reject missing sources without creating siblings. Preboundary predecessor recovery publishes and bootstraps the canonical plist so the loaded path satisfies the unchanged normal-restart same-file check. A composition regression executes the actual restart validator with mocked loaded-path inspection; it is not a live-launchd recovery/restart qualification. ADR-264 records the ordering correction and the original fixture blind spots.

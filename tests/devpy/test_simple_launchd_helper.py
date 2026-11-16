@@ -32,7 +32,9 @@ class FakeLaunchctl:
     def inspect(self):
         return ("running", self.pid) if self.pid is not None else ("not_loaded", None)
 
-    def stop(self):
+    def stop(self, *, expected_pid=None):
+        if expected_pid is not None and self.pid != expected_pid:
+            raise helper.ActivationError("recovery target changed before bootout")
         self.stops += 1
         old, self.pid = self.pid, None
         with (Path(self.manifest.candidate_binary).parent / "events").open("a") as stream:
@@ -56,6 +58,58 @@ class FakeLaunchctl:
         with (Path(self.manifest.candidate_binary).parent / "events").open("a") as stream:
             stream.write("start\n")
         return self.pid
+
+
+class SQLiteUriPathTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="phoenix-sqlite-uri-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.parent = self.root / "parent # ? % \x01"
+        self.parent.mkdir()
+        self.database = self.parent / "real # ? % \x02.sqlite"
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("CREATE TABLE entries(value TEXT NOT NULL)")
+            connection.executemany("INSERT INTO entries VALUES (?)", [("one",), ("two %?#",)])
+        self.expected = [("one",), ("two %?#",)]
+
+    def test_capacity_and_verified_backup_use_actual_special_character_source(self):
+        before = set(self.parent.iterdir())
+        with sqlite3.connect(self.database) as connection:
+            expected_size = connection.execute("PRAGMA page_count").fetchone()[0] * connection.execute("PRAGMA page_size").fetchone()[0]
+        self.assertEqual(helper._database_size_bytes(str(self.database)), expected_size)
+        with mock.patch.object(helper.shutil, "disk_usage", return_value=type("Usage", (), {"free": 1 << 30})()):
+            self.assertEqual(helper._preflight_backup_capacity(str(self.database), self.root), expected_size + 16 * 1024 * 1024)
+        backup = helper.create_verified_database_backup(str(self.database), self.root)
+        with sqlite3.connect(backup) as connection:
+            self.assertEqual(connection.execute("SELECT value FROM entries ORDER BY rowid").fetchall(), self.expected)
+        self.assertGreater(backup.stat().st_size, 0)
+        self.assertEqual(set(self.parent.iterdir()), before)
+        self.assertEqual(set(self.root.iterdir()), {self.parent, backup})
+
+    def test_writer_guard_fences_real_special_character_database(self):
+        before = set(self.parent.iterdir())
+        with helper.sqlite_writer_guard(str(self.database), timeout=0.1):
+            with sqlite3.connect(self.database, timeout=0.05) as competitor:
+                with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                    competitor.execute("BEGIN IMMEDIATE")
+        with sqlite3.connect(self.database, timeout=0.05) as competitor:
+            competitor.execute("BEGIN IMMEDIATE")
+            competitor.rollback()
+        self.assertEqual(set(self.parent.iterdir()), before)
+
+    def test_missing_special_character_source_is_never_created(self):
+        missing = self.parent / "absent # ? % \x03.sqlite"
+        before = set(self.parent.iterdir())
+        with self.assertRaises(helper.ActivationError):
+            helper._database_size_bytes(str(missing))
+        with self.assertRaises(sqlite3.OperationalError):
+            with helper.sqlite_writer_guard(str(missing), timeout=0.05):
+                self.fail("missing source acquired a writer slot")
+        with self.assertRaises(sqlite3.OperationalError):
+            helper.create_verified_database_backup(str(missing), self.root)
+        self.assertEqual(set(self.parent.iterdir()), before)
+        self.assertEqual(set(self.root.iterdir()), {self.parent})
 
 
 class SimpleLaunchdHelperTests(unittest.TestCase):
@@ -420,14 +474,126 @@ if sys.argv[1:] == ["--build-identity"]:
             return capacity(database_path, directory)
         with mock.patch.object(helper, "_preflight_backup_capacity", side_effect=fail_after_stop):
             self.assertEqual(self.activate(), "failed")
-        self.assertEqual(self.launch.starts, [str(self.root / "previous.plist")])
+        self.assertEqual(self.launch.starts, [self.manifest.target_plist])
         self.assertEqual(self.launch.pid, 99)
         self.assertTrue(Path(self.manifest.target_plist).exists())
         self.assertEqual(Path(self.manifest.target_binary).read_bytes(), self.previous_binary)
         self.assertFalse(Path(self.manifest.active_path).exists())
         self.assertIn("unchanged predecessor restored and exact identity verified", self.status()["failure"])
 
-    def test_recovery_publication_failure_stops_private_job_and_requarantines(self):
+    def test_recovered_canonical_plist_passes_actual_dev_restart_preflight(self):
+        dev_spec = importlib.util.spec_from_file_location("devpy_recovery_preflight_test", ROOT / "dev.py")
+        dev = importlib.util.module_from_spec(dev_spec)
+        sys.modules[dev_spec.name] = dev
+        dev_spec.loader.exec_module(dev)
+        plist = Path(self.manifest.candidate_plist)
+        data = plistlib.loads(plist.read_bytes())
+        installed_binary = self.root / "phoenix-ide"
+        Path(self.manifest.target_binary).rename(installed_binary)
+        self.manifest = dataclasses.replace(self.manifest, target_binary=str(installed_binary))
+        data["ProgramArguments"] = [str(installed_binary)]
+        data.update({"KeepAlive": True, "Sockets": {"Listeners": {"SockServiceName": "18111", "SockType": "stream"}}})
+        plist.write_bytes(plistlib.dumps(data))
+        Path(self.manifest.target_plist).write_bytes(plist.read_bytes())
+        self.manifest = dataclasses.replace(self.manifest, candidate_plist_sha256=helper.sha256(plist))
+        Path(self.manifest.deployed_sha_path).write_text("b" * 40 + "\n")
+        self.launch.manifest = self.manifest
+        capacity = helper._preflight_backup_capacity
+        calls = 0
+        def fail_after_stop(database_path, directory):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise helper.ActivationError("capacity changed after stop")
+            return capacity(database_path, directory)
+        def start(old_pid, *, plist_path=None):
+            self.assertEqual(plist_path, self.manifest.target_plist)
+            self.assertTrue(Path(plist_path).is_file())
+            return FakeLaunchctl.start(self.launch, old_pid, plist_path=plist_path)
+        with mock.patch.object(helper, "_preflight_backup_capacity", side_effect=fail_after_stop), \
+             mock.patch.object(self.launch, "start", side_effect=start):
+            self.assertEqual(self.activate(), "failed")
+        loaded_path = self.launch.starts[-1]
+        inspection = dev.LoadedLaunchdJob("running", self.launch.pid, True, loaded_path,
+                                          self.manifest.target_binary, ("18111",))
+        identity = dev.RuntimeIdentity("0.9", "b" * 40)
+        with mock.patch.object(dev, "LAUNCHD_INSTALL_DIR", self.root), \
+             mock.patch.object(dev, "LAUNCHD_LABEL", self.manifest.label), \
+             mock.patch.object(dev, "LAUNCHD_PLIST_PATH", Path(self.manifest.target_plist)), \
+             mock.patch.object(dev, "PROD_SHA_PATH", Path(self.manifest.deployed_sha_path)), \
+             mock.patch.object(dev, "_inspect_launchd_job", return_value=inspection), \
+             mock.patch.object(dev, "_current_prod_identity", return_value=identity), \
+             mock.patch.object(dev, "_binary_identity", return_value=identity):
+            installed = dev._installed_launchd_runtime_for_restart()
+        self.assertEqual(installed.pid, self.launch.pid)
+        self.assertTrue(Path(loaded_path).samefile(self.manifest.target_plist))
+        self.assertFalse((self.root / "previous.plist").exists())
+
+    def test_recovery_start_failure_requarantines_published_canonical(self):
+        def fail_start(_old_pid, *, plist_path=None):
+            self.assertEqual(plist_path, self.manifest.target_plist)
+            self.assertTrue(Path(plist_path).is_file())
+            self.launch.starts.append(plist_path)
+            self.launch.pid = 99
+            raise helper.ActivationError("bootstrap failed after loading")
+        with mock.patch.object(helper, "_reserve_before_boundary", side_effect=helper.ActivationError("no reserve")), \
+             mock.patch.object(self.launch, "start", side_effect=fail_start):
+            self.assertEqual(self.activate(), "failed")
+        self.assertEqual(self.launch.starts, [self.manifest.target_plist])
+        self.assertEqual(self.launch.pid, 99)
+        self.assertEqual(self.launch.stops, 1)
+        self.assertFalse(Path(self.manifest.target_plist).exists())
+        self.assertTrue((self.root / "previous.plist").exists())
+        self.assertTrue(Path(self.manifest.active_path).exists())
+        self.assertIn("teardown uncertain", self.status()["failure"])
+
+    def test_recovery_changed_pid_is_not_stopped(self):
+        def changed_pid(_manifest, _identity):
+            self.launch.pid = 12345
+            raise helper.ActivationError("another runtime appeared")
+        with mock.patch.object(helper, "_reserve_before_boundary", side_effect=helper.ActivationError("no reserve")):
+            self.assertEqual(self.activate(changed_pid), "failed")
+        self.assertEqual(self.launch.pid, 12345)
+        self.assertEqual(self.launch.stops, 1)
+        self.assertFalse(Path(self.manifest.target_plist).exists())
+        self.assertTrue((self.root / "previous.plist").exists())
+        self.assertTrue(Path(self.manifest.active_path).exists())
+        self.assertIn("teardown uncertain", self.status()["failure"])
+
+    def test_real_launchctl_stop_rechecks_expected_recovery_pid(self):
+        launch = helper.Launchctl(self.manifest)
+        with mock.patch.object(launch, "inspect", return_value=("running", 12345)), \
+             mock.patch.object(launch, "run") as run:
+            with self.assertRaisesRegex(helper.ActivationError, "changed before bootout"):
+                launch.stop(expected_pid=99)
+        run.assert_not_called()
+
+    def test_recovery_health_failure_requarantines_published_canonical(self):
+        with mock.patch.object(helper, "_reserve_before_boundary", side_effect=helper.ActivationError("no reserve")):
+            self.assertEqual(self.activate(helper.ActivationError("predecessor health failed")), "failed")
+        self.assertEqual(self.launch.starts, [self.manifest.target_plist])
+        self.assertIsNone(self.launch.pid)
+        self.assertEqual(self.launch.stops, 2)
+        self.assertFalse(Path(self.manifest.target_plist).exists())
+        self.assertTrue((self.root / "previous.plist").exists())
+        self.assertTrue(Path(self.manifest.active_path).exists())
+
+    def test_recovery_publication_ambiguous_failure_requarantines_canonical(self):
+        original = helper.atomic_write
+        def ambiguous(path, data, mode=0o600):
+            result = original(path, data, mode)
+            if path == Path(self.manifest.target_plist):
+                raise OSError("publication fsync uncertain")
+            return result
+        with mock.patch.object(helper, "_reserve_before_boundary", side_effect=helper.ActivationError("no reserve")), \
+             mock.patch.object(helper, "atomic_write", side_effect=ambiguous):
+            self.assertEqual(self.activate(), "failed")
+        self.assertEqual(self.launch.starts, [])
+        self.assertFalse(Path(self.manifest.target_plist).exists())
+        self.assertTrue((self.root / "previous.plist").exists())
+        self.assertTrue(Path(self.manifest.active_path).exists())
+
+    def test_recovery_publication_failure_never_starts_and_requarantines(self):
         capacity = helper._preflight_backup_capacity
         original_write = helper.atomic_write
         calls = 0
@@ -448,7 +614,7 @@ if sys.argv[1:] == ["--build-identity"]:
             helper, "atomic_write", side_effect=fail_canonical,
         ):
             self.assertEqual(self.activate(), "failed")
-        self.assertEqual(self.launch.starts, [str(self.root / "previous.plist")])
+        self.assertEqual(self.launch.starts, [])
         self.assertIsNone(self.launch.pid)
         self.assertFalse(Path(self.manifest.target_plist).exists())
         self.assertTrue((self.root / "previous.plist").exists())
@@ -521,7 +687,7 @@ if sys.argv[1:] == ["--build-identity"]:
         with mock.patch.object(helper, "_reserve_before_boundary", side_effect=helper.ActivationError("no reserve")), \
              mock.patch.object(helper, "write_status", side_effect=failed_status):
             self.assertEqual(self.activate(), "failed")
-        self.assertEqual(self.launch.starts, [str(self.root / "previous.plist")])
+        self.assertEqual(self.launch.starts, [self.manifest.target_plist])
         self.assertTrue(Path(self.manifest.active_path).exists())
         self.assertEqual(self.status()["state"], "stopping")
 
