@@ -1,6 +1,6 @@
 import React from 'react';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api } from '../api';
 import type { UserQuestion } from '../api';
 import { QuestionPanel } from './QuestionPanel';
@@ -40,6 +40,160 @@ function RequestBoundPanel({ requestId, text }: { requestId: string; text: strin
     />
   );
 }
+
+describe('QuestionPanel focus lifecycle', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  function content(questions = [question('Q1?'), question('Q2?')]) {
+    return <>
+      <button>Outside</button>
+      <QuestionPanel
+        questions={questions}
+        conversationId="conversation"
+        requestId="request-q1"
+        showToast={() => {}}
+        onAnswered={() => {}}
+        onDismissed={() => {}}
+      />
+    </>;
+  }
+
+  function flushFrame() {
+    act(() => vi.advanceTimersByTime(20));
+  }
+
+  it('preserves outside focus across same-value background refreshes', () => {
+    const view = render(content());
+    flushFrame();
+    const outside = screen.getByRole('button', { name: 'Outside' });
+    outside.focus();
+
+    view.rerender(content());
+    flushFrame();
+
+    expect(outside).toHaveFocus();
+  });
+
+  it('preserves confirmation focus across same-value background refreshes', () => {
+    const view = render(content());
+    flushFrame();
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+    const cancel = screen.getByRole('button', { name: 'Cancel' });
+    expect(cancel).toHaveFocus();
+
+    view.rerender(content());
+    flushFrame();
+
+    expect(cancel).toHaveFocus();
+  });
+
+  it('does not let a pending mount frame steal confirmation focus', () => {
+    render(content());
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+    flushFrame();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toHaveFocus();
+  });
+
+  it('preserves the confirmation opener restore without scheduling panel focus on close', () => {
+    const view = render(content());
+    flushFrame();
+    const dismiss = screen.getByRole('button', { name: 'Dismiss' });
+    dismiss.focus();
+    fireEvent.click(dismiss);
+    flushFrame();
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(dismiss).toHaveFocus();
+    flushFrame();
+    expect(dismiss).toHaveFocus();
+
+    const outside = screen.getByRole('button', { name: 'Outside' });
+    outside.focus();
+    view.rerender(content());
+    flushFrame();
+    expect(outside).toHaveFocus();
+  });
+
+  it('lets confirmation own focus when it opens before a step frame runs', () => {
+    render(content());
+    flushFrame();
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+    flushFrame();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toHaveFocus();
+  });
+
+  it('focuses a newly mounted request even with same-value questions', () => {
+    const view = render(<RequestBoundPanel key="first" requestId="first" text="Q1?" />);
+    flushFrame();
+    view.rerender(<RequestBoundPanel key="second" requestId="second" text="Q1?" />);
+    flushFrame();
+    expect(view.container.querySelector('.question-panel')).toHaveFocus();
+  });
+
+  it('focuses on appearance and explicit step navigation for keyboard interaction', () => {
+    const view = render(content());
+    const panel = view.container.querySelector<HTMLDivElement>('.question-panel')!;
+    flushFrame();
+    expect(panel).toHaveFocus();
+    fireEvent.keyDown(document.activeElement!, { key: 'Enter' });
+    expect(view.container.querySelector('input[name="Q1?"]')).toBeChecked();
+
+    const next = screen.getByRole('button', { name: 'Next' });
+    next.focus();
+    fireEvent.click(next);
+    flushFrame();
+    expect(panel).toHaveFocus();
+    fireEvent.keyDown(document.activeElement!, { key: 'ArrowDown' });
+    fireEvent.keyDown(document.activeElement!, { key: 'Enter' });
+    expect(view.container.querySelectorAll('input[name="Q2?"]')[1]).toBeChecked();
+    fireEvent.keyDown(document.activeElement!, { key: 'Tab', shiftKey: true });
+    flushFrame();
+    expect(panel).toHaveFocus();
+    expect(screen.getByText('Q1?')).toBeInTheDocument();
+  });
+
+  it('focuses when an absent question first appears', () => {
+    const view = render(content([]));
+    flushFrame();
+    screen.getByRole('button', { name: 'Outside' }).focus();
+    view.rerender(content());
+    flushFrame();
+    expect(view.container.querySelector('.question-panel')).toHaveFocus();
+  });
+
+  it('cancels the superseded frame when the step changes before focus runs', () => {
+    const request = vi.spyOn(window, 'requestAnimationFrame');
+    const cancel = vi.spyOn(window, 'cancelAnimationFrame');
+    const view = render(content());
+    const frame = request.mock.results[0]!.value;
+    const panel = view.container.querySelector<HTMLDivElement>('.question-panel')!;
+    const focus = vi.spyOn(panel, 'focus');
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(cancel).toHaveBeenCalledWith(frame);
+    flushFrame();
+    expect(focus).toHaveBeenCalledOnce();
+    expect(panel).toHaveFocus();
+  });
+
+  it('cancels a pending focus frame on unmount', () => {
+    const request = vi.spyOn(window, 'requestAnimationFrame');
+    const cancel = vi.spyOn(window, 'cancelAnimationFrame');
+    const view = render(content());
+    const frame = request.mock.results[0]!.value;
+    const panel = view.container.querySelector<HTMLDivElement>('.question-panel')!;
+    const focus = vi.spyOn(panel, 'focus');
+    view.unmount();
+    expect(cancel).toHaveBeenCalledWith(frame);
+    flushFrame();
+    expect(focus).not.toHaveBeenCalled();
+  });
+});
 
 describe('QuestionPanel request identity', () => {
   afterEach(() => {
