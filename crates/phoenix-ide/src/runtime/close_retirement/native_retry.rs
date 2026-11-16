@@ -388,8 +388,7 @@ impl super::RuntimeManager {
                             snapshot: context.snapshot.clone(),
                             resource: effect.resource.clone(),
                             administrative_dir: administrative_dir.clone(),
-                            administrative_dir_incarnation: administrative_dir_incarnation
-                                .clone(),
+                            administrative_dir_incarnation: administrative_dir_incarnation.clone(),
                         },
                     )
                     .await,

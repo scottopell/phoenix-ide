@@ -74,10 +74,7 @@ where
                 attempt_gate,
             )
             .await;
-        let fatal = matches!(
-            result,
-            Err(NativeCloseApplicationError::FatalAuthority)
-        );
+        let fatal = matches!(result, Err(NativeCloseApplicationError::FatalAuthority));
         let _ = response.send(result);
         fatal
     }

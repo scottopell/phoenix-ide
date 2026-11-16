@@ -16885,9 +16885,7 @@ pub(crate) mod creation_completion_lifecycle_tests {
             .with_fatal_local_authority_fence(fatal_local_authority_fence);
         harness.runtime.context.conversation_id = source_transcript_id;
         harness.runtime.context.is_coordinator = true;
-        harness.runtime = harness
-            .runtime
-            .with_native_task_admission_database(db);
+        harness.runtime = harness.runtime.with_native_task_admission_database(db);
         let (sender, receiver) = mpsc::channel(1);
         harness.runtime = harness.runtime.with_acknowledged_event_receiver(receiver);
         let task = tokio::spawn(async move {
