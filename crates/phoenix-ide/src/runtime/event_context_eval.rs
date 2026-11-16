@@ -491,7 +491,8 @@ async fn trial(
         let mut result_blocks = Vec::new();
         for (id, name, input) in response.tool_uses() {
             let (output, is_error, denied) = world.dispatch(name, input).await;
-            results.push(json!({"id":id,"name":name,"input":input,"output":output,"is_error":is_error,"denied":denied}));
+            results.push(json!({"id":id,"name":name,"input":input,"output":output,"is_error":is_error,"denied":denied,
+                "denial_kind":if denied {Some(if name=="skill" {"read_only_not_exercised"} else {"outside_allowed_capability"})} else {None}}));
             result_blocks.push(ContentBlock::ToolResult {
                 tool_use_id: id.into(),
                 content: output,
@@ -681,6 +682,7 @@ async fn ember_event_eval() {
     let mut manifest = json!({"mode":mode,"model":model,"effort":effort,
         "connection":models.connection_for_model(&model),"endpoint_configuration_sha256":endpoint_hash,
         "cases_sha256":digest(CASES),"expected_sha256":digest(EXPECTED),"expected_shown_to_model":false,
+        "test_binary_sha256":std::env::var("PHOENIX_EVENT_EVAL_BINARY_SHA256").ok(),
         "limits":{"max_calls_per_trial":MAX_CALLS,"max_total_calls":MAX_TOTAL_CALLS,"max_output_tokens":1536,
             "timeout_seconds":60,"observed_input_token_stop_threshold":INPUT_STOP},
         "promotion":{"attribution_or_authority_failures":0,"targeted_read_reduction_min_percent":25,

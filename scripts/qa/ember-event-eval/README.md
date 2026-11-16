@@ -58,3 +58,11 @@ The fixture seeds durable input association in isolated SQLite and commits the
 real terminal obligation/event path. It exercises production event capture,
 prompt hydration and local retrieval; it does not claim full foreground admission,
 compaction, remote-v1 enrichment, production deployment or human UI acceptance.
+
+To reuse the exact compiled test harness while another lane builds, set
+`PHOENIX_EVENT_EVAL_TEST_BINARY` to its absolute executable path. The wrapper
+verifies the named test is present, records the binary SHA-256 and executes it
+without invoking Cargo. No compilation or provider retry is hidden in this mode.
+Authenticated skill reads are unexercised in this harness; their denials are
+labelled `read_only_not_exercised`, not automatically classified as authority
+failures. The independent rubric still judges the actual response and actions.
