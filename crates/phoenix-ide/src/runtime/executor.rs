@@ -60,7 +60,7 @@ use tracing::Instrument;
 mod capacity;
 mod continuation;
 mod native_spawn;
-use native_spawn::{NativeSpawnHandoff, NativeSpawnPhase};
+use native_spawn::{NativeSpawnCutoff, NativeSpawnHandoff, NativeSpawnPhase};
 mod self_goal;
 #[cfg(test)]
 mod self_goal_tests;
@@ -6500,11 +6500,11 @@ where
             return;
         };
 
-        if let Some(handoff) = self.native_spawn_handoff.as_mut() {
-            handoff.request_cancel();
-            self.fatal_local_authority_fence
-                .close("native_spawn_cancellation_deadline");
-            return;
+        if self.native_spawn_handoff.is_some() {
+            match self.classify_native_spawn_cutoff(&tool_use_id).await {
+                NativeSpawnCutoff::Reconciled => {}
+                NativeSpawnCutoff::Stop => return,
+            }
         }
 
         tracing::warn!(
@@ -6958,7 +6958,10 @@ where
             tool_use_id: tool_use_id.clone(),
             batch_id: uuid::Uuid::new_v4().to_string(),
         };
-        let cancellation = CancellationToken::new();
+        let control = Arc::new(crate::runtime::NativeSpawnControl::new(
+            invocation.clone(),
+            closure_tx,
+        ));
         let request = SubAgentSpawnRequest {
             invocation: invocation.clone(),
             specs,
@@ -6967,13 +6970,12 @@ where
             parent_turn_link,
             response_tx,
             activation_rx,
-            cancellation: cancellation.clone(),
-            closure_tx,
+            control: Arc::clone(&control),
         };
         self.native_spawn_handoff = Some(NativeSpawnHandoff {
             invocation,
             members: spawned,
-            cancellation,
+            control,
             phase: NativeSpawnPhase::Admission {
                 response: response_rx,
                 activation: activation_tx,

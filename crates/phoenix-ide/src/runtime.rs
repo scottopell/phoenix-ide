@@ -12,7 +12,8 @@
 mod agent_execution;
 mod native_spawn;
 pub use native_spawn::{
-    NativeSpawnClosureReceipt, NativeSpawnTerminalEvidence, SubAgentAdmissionReceipt,
+    NativeSpawnClosureReceipt, NativeSpawnControl, NativeSpawnTerminalEvidence,
+    SubAgentAdmissionReceipt,
 };
 pub(crate) mod close_retirement;
 pub(crate) mod creation_worker;
@@ -241,8 +242,7 @@ pub struct SubAgentSpawnRequest {
     pub parent_turn_link: opentelemetry::trace::SpanContext,
     pub response_tx: oneshot::Sender<SubAgentAdmissionReceipt>,
     pub activation_rx: oneshot::Receiver<()>,
-    pub cancellation: tokio_util::sync::CancellationToken,
-    pub closure_tx: oneshot::Sender<NativeSpawnClosureReceipt>,
+    pub control: Arc<NativeSpawnControl>,
 }
 
 /// Request to cancel sub-agents
@@ -4845,8 +4845,7 @@ impl RuntimeManager {
             parent_turn_link,
             response_tx,
             activation_rx,
-            cancellation,
-            closure_tx,
+            control,
         } = req;
         let batch = phoenix_db::SubAgentBatchAdmission {
             batch_id: invocation.batch_id.clone(),
@@ -4870,6 +4869,7 @@ impl RuntimeManager {
                 &invocation.parent_conversation_id,
                 parent_scope,
                 parallel_work_qualified,
+                &control,
             )
             .await
         {
@@ -4885,21 +4885,16 @@ impl RuntimeManager {
                 } else {
                     tokio::select! {
                         biased;
-                        () = cancellation.cancelled() => false,
-                        activation = activation_rx => activation.is_ok() && !cancellation.is_cancelled(),
+                        () = control.cancelled() => false,
+                        activation = activation_rx => activation.is_ok() && !control.is_cancelled(),
                     }
                 };
                 if activate {
+                    control.activated();
                     self.kick_admitted_sub_agent_batch(specs, parent_turn_link);
                 } else {
                     let evidence = self.close_native_spawn_batch(&batch).await;
-                    if closure_tx
-                        .send(NativeSpawnClosureReceipt {
-                            invocation,
-                            evidence,
-                        })
-                        .is_err()
-                    {
+                    if !control.publish(evidence) {
                         tracing::error!(batch_id = %batch.batch_id, "native spawn closure owner disappeared; terminal evidence retained without parent acceptance");
                     }
                 }
@@ -4910,20 +4905,14 @@ impl RuntimeManager {
                     invocation: invocation.clone(),
                     outcome: SubAgentAdmissionResponse::Unclassified,
                 });
-                let _ = closure_tx.send(NativeSpawnClosureReceipt {
-                    invocation,
-                    evidence: NativeSpawnTerminalEvidence::Unclassified,
-                });
+                control.publish(NativeSpawnTerminalEvidence::Unclassified);
             }
             Err(error) => {
                 let _ = response_tx.send(SubAgentAdmissionReceipt {
                     invocation: invocation.clone(),
                     outcome: SubAgentAdmissionResponse::Rejected(error),
                 });
-                let _ = closure_tx.send(NativeSpawnClosureReceipt {
-                    invocation,
-                    evidence: NativeSpawnTerminalEvidence::NotAdmitted,
-                });
+                control.publish(NativeSpawnTerminalEvidence::NotAdmitted);
             }
         }
     }
@@ -4947,6 +4936,7 @@ impl RuntimeManager {
         parent_conversation_id: &str,
         parent_scope: Option<WorkScopeId>,
         parallel_work_qualified: bool,
+        control: &NativeSpawnControl,
     ) -> Result<(), String> {
         let parent = self
             .db
@@ -5029,6 +5019,9 @@ impl RuntimeManager {
             "native spawn admission was not issued because local write admission is closed"
                 .to_string()
         })?;
+        if !control.try_issue() {
+            return Err("native spawn admission was revoked before its database command".into());
+        }
         let mut authority = native_spawn::NativeSpawnWriteAuthority { owner: Some(owner) };
         let result = self.db.admit_sub_agent_batch_atomically(&admission).await;
         if matches!(
@@ -10789,6 +10782,7 @@ mod scope_liveness_tests {
             agent_name: None,
             persona: None,
         };
+        let control = NativeSpawnControl::test_for_batch(&parent.id, "trusted-batch");
         let admit = || {
             manager.admit_sub_agent_batch(
                 "trusted-batch",
@@ -10796,6 +10790,7 @@ mod scope_liveness_tests {
                 &parent.id,
                 parent.attached_work_scope_id.clone(),
                 true,
+                &control,
             )
         };
         assert!(admit().await.unwrap_err().contains("Work authority"));
@@ -10881,7 +10876,7 @@ mod scope_liveness_tests {
             async move {
                 manager
                     .handle_spawn_request(SubAgentSpawnRequest {
-                        invocation: phoenix_db::SubAgentSpawnInvocation { batch_id: "atomic-subagent-batch".into(), parent_conversation_id: parent.id, assistant_message_id: "assistant".into(), tool_use_id: "spawn".into() },
+                        invocation: phoenix_db::SubAgentSpawnInvocation { batch_id: "atomic-subagent-batch".into(), parent_conversation_id: parent.id.clone(), assistant_message_id: "assistant".into(), tool_use_id: "spawn".into() },
                         specs: vec![SubAgentSpec {
                             agent_id: agent_id.to_string(),
                             task: "persist all child semantics".to_string(),
@@ -10900,8 +10895,7 @@ mod scope_liveness_tests {
                         parent_turn_link: opentelemetry::trace::SpanContext::NONE,
                         response_tx,
                         activation_rx,
-                        cancellation: tokio_util::sync::CancellationToken::new(),
-                        closure_tx: oneshot::channel().0,
+                        control: NativeSpawnControl::test_for_batch(&parent.id, "atomic-subagent-batch"),
                     })
                     .await;
             }
@@ -10990,8 +10984,10 @@ mod scope_liveness_tests {
                 parallel_work_qualified: false,
                 parent_turn_link: opentelemetry::trace::SpanContext::NONE,
                 response_tx,
-                cancellation: tokio_util::sync::CancellationToken::new(),
-                closure_tx: oneshot::channel().0,
+                control: NativeSpawnControl::test_for_batch(
+                    &parent.id,
+                    "cancel-during-materialization-batch",
+                ),
                 activation_rx: {
                     let (tx, rx) = oneshot::channel();
                     let _ = tx.send(());
@@ -11146,6 +11142,7 @@ mod scope_liveness_tests {
                 &parent.id,
                 parent.attached_work_scope_id.clone(),
                 false,
+                &NativeSpawnControl::test_for_batch(&parent.id, "cancellation-boundary-batch"),
             )
             .await
             .unwrap();
@@ -11483,6 +11480,7 @@ mod scope_liveness_tests {
                 "ordinary-parent",
                 owner.work_scope_id().cloned(),
                 false,
+                &NativeSpawnControl::test_for_batch("ordinary-parent", "ordinary-cancel-batch"),
             )
             .await
             .unwrap();
@@ -11645,6 +11643,7 @@ mod scope_liveness_tests {
                     &parent.id,
                     parent.attached_work_scope_id.clone(),
                     false,
+                    &NativeSpawnControl::test_for_batch(&parent.id, "durable-controller-batch"),
                 )
                 .await
                 .unwrap();

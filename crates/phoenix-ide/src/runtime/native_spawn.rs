@@ -1,5 +1,145 @@
 use super::{AdmittedOperation, RuntimeManager, SubAgentAdmissionResponse};
 use chrono::Utc;
+use std::sync::Mutex;
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
+
+#[derive(Debug)]
+enum NativeSpawnAdmissionGate {
+    Unissued(oneshot::Sender<NativeSpawnClosureReceipt>),
+    Issued(oneshot::Sender<NativeSpawnClosureReceipt>),
+    Closed,
+}
+
+#[derive(Debug)]
+pub struct NativeSpawnControl {
+    invocation: phoenix_db::SubAgentSpawnInvocation,
+    cancellation: CancellationToken,
+    gate: Mutex<NativeSpawnAdmissionGate>,
+    #[cfg(test)]
+    issue_attempt: tokio::sync::watch::Sender<Option<bool>>,
+    #[cfg(test)]
+    publications: std::sync::atomic::AtomicUsize,
+}
+
+impl NativeSpawnControl {
+    pub(super) fn new(
+        invocation: phoenix_db::SubAgentSpawnInvocation,
+        reply: oneshot::Sender<NativeSpawnClosureReceipt>,
+    ) -> Self {
+        Self {
+            invocation,
+            cancellation: CancellationToken::new(),
+            gate: Mutex::new(NativeSpawnAdmissionGate::Unissued(reply)),
+            #[cfg(test)]
+            issue_attempt: tokio::sync::watch::channel(None).0,
+            #[cfg(test)]
+            publications: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn take_reply(
+        gate: &mut NativeSpawnAdmissionGate,
+    ) -> Option<oneshot::Sender<NativeSpawnClosureReceipt>> {
+        match std::mem::replace(gate, NativeSpawnAdmissionGate::Closed) {
+            NativeSpawnAdmissionGate::Unissued(reply) | NativeSpawnAdmissionGate::Issued(reply) => {
+                Some(reply)
+            }
+            NativeSpawnAdmissionGate::Closed => None,
+        }
+    }
+
+    fn send(
+        &self,
+        reply: oneshot::Sender<NativeSpawnClosureReceipt>,
+        evidence: NativeSpawnTerminalEvidence,
+    ) -> bool {
+        #[cfg(test)]
+        self.publications
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        reply
+            .send(NativeSpawnClosureReceipt {
+                invocation: self.invocation.clone(),
+                evidence,
+            })
+            .is_ok()
+    }
+
+    pub(super) fn request_cancel(&self) {
+        let mut gate = self.gate.lock().expect("native spawn gate poisoned");
+        self.cancellation.cancel();
+        if matches!(*gate, NativeSpawnAdmissionGate::Unissued(_)) {
+            let reply = Self::take_reply(&mut gate).expect("unissued gate owns reply");
+            self.send(reply, NativeSpawnTerminalEvidence::NotAdmitted);
+        }
+    }
+
+    pub(super) fn try_issue(&self) -> bool {
+        let issued = {
+            let mut gate = self.gate.lock().expect("native spawn gate poisoned");
+            match std::mem::replace(&mut *gate, NativeSpawnAdmissionGate::Closed) {
+                NativeSpawnAdmissionGate::Unissued(reply) => {
+                    *gate = NativeSpawnAdmissionGate::Issued(reply);
+                    true
+                }
+                NativeSpawnAdmissionGate::Issued(reply) => {
+                    *gate = NativeSpawnAdmissionGate::Issued(reply);
+                    false
+                }
+                NativeSpawnAdmissionGate::Closed => false,
+            }
+        };
+        #[cfg(test)]
+        let _ = self.issue_attempt.send_replace(Some(issued));
+        issued
+    }
+
+    pub(super) fn publish(&self, evidence: NativeSpawnTerminalEvidence) -> bool {
+        let mut gate = self.gate.lock().expect("native spawn gate poisoned");
+        Self::take_reply(&mut gate).is_some_and(|reply| self.send(reply, evidence))
+    }
+
+    pub(super) fn activated(&self) {
+        let mut gate = self.gate.lock().expect("native spawn gate poisoned");
+        drop(Self::take_reply(&mut gate));
+    }
+
+    pub(super) async fn cancelled(&self) {
+        self.cancellation.cancelled().await;
+    }
+    pub(super) fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_for_batch(parent: &str, batch: &str) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::new(
+            phoenix_db::SubAgentSpawnInvocation {
+                parent_conversation_id: parent.into(),
+                assistant_message_id: "assistant".into(),
+                tool_use_id: "spawn".into(),
+                batch_id: batch.into(),
+            },
+            oneshot::channel().0,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(super) fn subscribe_issue_attempt(&self) -> tokio::sync::watch::Receiver<Option<bool>> {
+        self.issue_attempt.subscribe()
+    }
+    #[cfg(test)]
+    pub(super) fn is_closed(&self) -> bool {
+        matches!(
+            *self.gate.lock().expect("native spawn gate poisoned"),
+            NativeSpawnAdmissionGate::Closed
+        )
+    }
+    #[cfg(test)]
+    pub(super) fn publication_count(&self) -> usize {
+        self.publications.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
 
 #[derive(Debug)]
 pub struct SubAgentAdmissionReceipt {

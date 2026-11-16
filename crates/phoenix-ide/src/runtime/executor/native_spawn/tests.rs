@@ -107,6 +107,23 @@ async fn cancel(runtime: &mut TestRuntime) {
     assert!(matches!(runtime.state, ConvState::CancellingTool { .. }));
 }
 
+async fn issue_native_spawn(
+    manager: &Arc<RuntimeManager>,
+    request: SubAgentSpawnRequest,
+) -> tokio::task::JoinHandle<()> {
+    let mut issued = request.control.subscribe_issue_attempt();
+    let manager = Arc::clone(manager);
+    let task = tokio::spawn(async move { manager.handle_spawn_request(request).await });
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        issued.wait_for(|issued| *issued == Some(true)),
+    )
+    .await
+    .expect("native database command was issued")
+    .unwrap();
+    task
+}
+
 #[tokio::test]
 async fn native_prewrite_refusal_is_known_without_unknown_authority_or_false_completion() {
     let (manager, mut runtime, request) = pending_native_spawn().await;
@@ -140,6 +157,7 @@ async fn native_prewrite_refusal_is_known_without_unknown_authority_or_false_com
             &request.invocation.parent_conversation_id,
             request.parent_scope.clone(),
             request.parallel_work_qualified,
+            &request.control,
         )
         .await
         .unwrap();
@@ -176,9 +194,10 @@ async fn native_prewrite_refusal_is_known_without_unknown_authority_or_false_com
 async fn native_run_loop_accepts_cancellation_while_admission_response_is_outstanding() {
     let (manager, runtime, request) = pending_native_spawn().await;
     let origin = request.invocation.clone();
+    let control = Arc::clone(&request.control);
+    let manager_task = issue_native_spawn(&manager, request).await;
     let event_tx = runtime.event_tx.clone();
     let (state_tx, mut state_rx) = watch::channel(runtime.state.clone());
-    let task = tokio::spawn(runtime.with_state_watcher(state_tx).run());
     event_tx
         .send(Event::UserCancel {
             reason: None,
@@ -186,17 +205,10 @@ async fn native_run_loop_accepts_cancellation_while_admission_response_is_outsta
         })
         .await
         .unwrap();
-    tokio::time::timeout(
-        Duration::from_secs(60),
-        state_rx.wait_for(|state| matches!(state, ConvState::CancellingTool { .. })),
-    )
-    .await
-    .expect("live native wait remains cancellable")
-    .unwrap();
-    tokio::time::timeout(Duration::from_secs(60), request.cancellation.cancelled())
+    let task = tokio::spawn(runtime.with_state_watcher(state_tx).run());
+    tokio::time::timeout(Duration::from_secs(60), control.cancelled())
         .await
         .expect("native cancellation disposition was signalled");
-    manager.handle_spawn_request(request).await;
     tokio::time::timeout(
         Duration::from_secs(60),
         state_rx.wait_for(|state| matches!(state, ConvState::Idle)),
@@ -212,6 +224,7 @@ async fn native_run_loop_accepts_cancellation_while_admission_response_is_outsta
         .is_empty());
     let accepted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sub_agent_runs WHERE parent_accepted_at_unix_micros IS NOT NULL AND initial_dispatch_claimed_at_unix_micros IS NULL").fetch_one(manager.db().pool()).await.unwrap();
     assert_eq!(accepted, 2);
+    manager_task.await.unwrap();
     event_tx.send(Event::Shutdown).await.unwrap();
     assert_eq!(
         task.await.unwrap(),
@@ -233,6 +246,8 @@ async fn native_cancel_and_late_admission_join_one_closure_then_atomic_fan_in() 
         .await
         .unwrap();
     sqlx::query("CREATE TRIGGER count_live_closure AFTER UPDATE OF cancellation_requested_at_unix_micros ON sub_agent_runs BEGIN INSERT INTO closure_counts VALUES (NEW.child_conversation_id, 1) ON CONFLICT(child) DO UPDATE SET n = n + 1; END").execute(manager.db().pool()).await.unwrap();
+    let control = Arc::clone(&request.control);
+    let manager_task = issue_native_spawn(&manager, request).await;
     cancel(&mut runtime).await;
     let cancellation_entered_at = runtime.state_updated_at;
     let cancellation_deadline = runtime.deadline;
@@ -241,7 +256,8 @@ async fn native_cancel_and_late_admission_join_one_closure_then_atomic_fan_in() 
         .as_mut()
         .unwrap()
         .request_cancel();
-    manager.handle_spawn_request(request).await;
+    manager_task.await.unwrap();
+    assert_eq!(control.publication_count(), 1);
     let observation = runtime.observe_native_spawn().await;
     let event = runtime
         .native_spawn_observed(observation)
@@ -324,13 +340,13 @@ async fn native_lost_admission_response_reconciles_without_administrative_accept
     let (replacement, dropped) = oneshot::channel();
     drop(dropped);
     drop(std::mem::replace(&mut request.response_tx, replacement));
+    manager.handle_spawn_request(request).await;
     let response_loss = runtime.observe_native_spawn().await;
     assert!(runtime
         .native_spawn_observed(response_loss)
         .await
         .unwrap()
         .is_none());
-    manager.handle_spawn_request(request).await;
     let closure = runtime.observe_native_spawn().await;
     let completion = runtime
         .native_spawn_observed(closure)
@@ -403,8 +419,9 @@ async fn native_activation_loss_is_observed_by_retained_admitted_owner() {
 async fn native_definite_closure_failure_is_non_resumable_and_keeps_admission() {
     let (manager, mut runtime, request) = pending_native_spawn().await;
     sqlx::query("CREATE TRIGGER reject_live_closure BEFORE UPDATE OF terminal_cause ON sub_agent_runs BEGIN SELECT RAISE(ABORT, 'known live closure failure'); END").execute(manager.db().pool()).await.unwrap();
+    let manager_task = issue_native_spawn(&manager, request).await;
     cancel(&mut runtime).await;
-    manager.handle_spawn_request(request).await;
+    manager_task.await.unwrap();
     let closure = runtime.observe_native_spawn().await;
     assert!(runtime
         .native_spawn_observed(closure)
@@ -432,6 +449,8 @@ async fn native_definite_closure_failure_is_non_resumable_and_keeps_admission() 
 #[tokio::test]
 async fn native_queued_behind_fork_command_cancellation_cutoff_is_not_sqlite_uncertainty() {
     let (manager, mut runtime, request) = pending_native_spawn().await;
+    let control = Arc::clone(&request.control);
+    let mut issue_attempt = control.subscribe_issue_attempt();
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     *manager.fork_command_barrier.lock().await = Some(Arc::clone(&barrier));
     manager.start_sub_agent_handler().await;
@@ -458,6 +477,18 @@ async fn native_queued_behind_fork_command_cancellation_cutoff_is_not_sqlite_unc
         "an exactly owned unissued batch can be revoked without inventing unknown SQLite authority"
     );
     assert!(matches!(runtime.state, ConvState::Idle));
+    assert!(
+        control.is_closed(),
+        "revocation permanently closes admission for this exact native command"
+    );
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        issue_attempt.wait_for(|issued| *issued == Some(false)),
+    )
+    .await
+    .expect("queued manager reaches revoked command gate")
+    .unwrap();
+    assert_eq!(control.publication_count(), 1);
     let admitted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sub_agent_runs")
         .fetch_one(manager.db().pool())
         .await
@@ -466,9 +497,13 @@ async fn native_queued_behind_fork_command_cancellation_cutoff_is_not_sqlite_unc
 }
 
 #[tokio::test]
-async fn native_unresolved_backstop_cannot_acknowledge_or_replace_origin() {
+async fn native_issued_unresolved_backstop_cannot_acknowledge_or_replace_origin() {
     let (manager, mut runtime, request) = pending_native_spawn().await;
     let origin = request.invocation.clone();
+    assert!(request.control.try_issue());
+    let _issued_write = crate::runtime::native_spawn::NativeSpawnWriteAuthority {
+        owner: Some(manager.acquire_local_authority_pass().unwrap()),
+    };
     cancel(&mut runtime).await;
     runtime.handle_cancelling_tool_timeout().await;
     assert!(runtime
@@ -489,8 +524,9 @@ async fn native_unresolved_backstop_cannot_acknowledge_or_replace_origin() {
 #[tokio::test]
 async fn native_membership_write_failure_cannot_publish_reconciled_or_accept_children() {
     let (manager, mut runtime, request) = pending_native_spawn().await;
+    let manager_task = issue_native_spawn(&manager, request).await;
     cancel(&mut runtime).await;
-    manager.handle_spawn_request(request).await;
+    manager_task.await.unwrap();
     sqlx::query("CREATE TRIGGER reject_native_membership BEFORE UPDATE OF state ON conversations WHEN json_array_length(json_extract(NEW.state, '$.pending_sub_agents')) > 0 BEGIN SELECT RAISE(ABORT, 'known native membership failure'); END").execute(manager.db().pool()).await.unwrap();
     let closure = runtime.observe_native_spawn().await;
     assert!(runtime
@@ -545,30 +581,24 @@ async fn native_unclassified_receipt_closes_shared_fence_even_after_origin_repla
 }
 
 #[tokio::test]
-async fn native_missing_classified_owner_reports_failure_without_inventing_sqlite_unknown() {
+async fn native_missing_prewrite_owner_uses_affirmative_no_command_proof() {
     let (manager, mut runtime, request) = pending_native_spawn().await;
-    cancel(&mut runtime).await;
     drop(request);
+    cancel(&mut runtime).await;
     let observation = runtime.observe_native_spawn().await;
-    assert!(runtime
+    let event = runtime
         .native_spawn_observed(observation)
         .await
         .unwrap()
-        .is_none());
-    assert!(matches!(
-        runtime.state,
-        ConvState::Error {
-            error_kind: crate::db::ErrorKind::SubAgentError,
-            ..
-        }
-    ));
+        .expect("exact unissued owner proves no admission");
+    runtime.process_event(event).await.unwrap();
+    assert!(matches!(runtime.state, ConvState::Idle));
     assert!(!manager.fatal_local_authority_fence.is_closed());
-    assert!(manager
-        .db()
-        .get_messages(&runtime.context.conversation_id)
+    let admitted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sub_agent_runs")
+        .fetch_one(manager.db().pool())
         .await
-        .unwrap()
-        .is_empty());
+        .unwrap();
+    assert_eq!(admitted, 0);
 }
 
 #[tokio::test]
@@ -581,6 +611,7 @@ async fn native_postcommit_activation_receiver_loss_stops_effect_tail_without_fe
             &request.invocation.parent_conversation_id,
             request.parent_scope,
             request.parallel_work_qualified,
+            &request.control,
         )
         .await
         .unwrap();
@@ -637,7 +668,9 @@ async fn native_postcommit_activation_receiver_loss_stops_effect_tail_without_fe
         .is_some_and(|handoff| handoff.invocation == request.invocation));
     let accepted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sub_agent_runs WHERE parent_accepted_at_unix_micros IS NOT NULL OR initial_dispatch_claimed_at_unix_micros IS NOT NULL").fetch_one(manager.db().pool()).await.unwrap();
     assert_eq!(accepted, 0);
-    drop(request.closure_tx);
+    assert!(request.control.publish(NativeSpawnTerminalEvidence::Failed(
+        "activation owner was lost after classified admission".into()
+    )));
     let missing_receipt = runtime.observe_native_spawn().await;
     assert!(runtime
         .native_spawn_observed(missing_receipt)

@@ -5,11 +5,11 @@ use super::{
     ToolExecutor, ToolResult,
 };
 use crate::runtime::{
-    NativeSpawnClosureReceipt, NativeSpawnTerminalEvidence, SubAgentAdmissionReceipt,
-    SubAgentAdmissionResponse,
+    NativeSpawnClosureReceipt, NativeSpawnControl, NativeSpawnTerminalEvidence,
+    SubAgentAdmissionReceipt, SubAgentAdmissionResponse,
 };
+use std::sync::Arc;
 use tokio::sync::oneshot;
-use tokio_util::sync::CancellationToken;
 
 pub(super) enum NativeSpawnPhase {
     Admission {
@@ -33,7 +33,7 @@ mod tests;
 pub(super) struct NativeSpawnHandoff {
     pub(super) invocation: phoenix_db::SubAgentSpawnInvocation,
     pub(super) members: Vec<crate::state_machine::state::PendingSubAgent>,
-    pub(super) cancellation: CancellationToken,
+    pub(super) control: Arc<NativeSpawnControl>,
     pub(super) phase: NativeSpawnPhase,
     pub(super) closure: oneshot::Receiver<NativeSpawnClosureReceipt>,
 }
@@ -43,9 +43,14 @@ pub(super) enum NativeSpawnObservation {
     Closure(Result<NativeSpawnClosureReceipt, oneshot::error::RecvError>),
 }
 
+pub(super) enum NativeSpawnCutoff {
+    Reconciled,
+    Stop,
+}
+
 impl NativeSpawnHandoff {
     pub(super) fn request_cancel(&mut self) {
-        self.cancellation.cancel();
+        self.control.request_cancel();
         self.phase = NativeSpawnPhase::Closing;
     }
 
@@ -70,13 +75,56 @@ where
     L: LlmClient + 'static,
     T: ToolExecutor + 'static,
 {
+    pub(super) async fn classify_native_spawn_cutoff(
+        &mut self,
+        expected_tool: &str,
+    ) -> NativeSpawnCutoff {
+        let Some(handoff) = self.native_spawn_handoff.as_mut() else {
+            return NativeSpawnCutoff::Stop;
+        };
+        handoff.request_cancel();
+        match handoff.closure.try_recv() {
+            Ok(receipt) => match self
+                .native_spawn_observed(NativeSpawnObservation::Closure(Ok(receipt)))
+                .await
+            {
+                Ok(Some(Event::ToolAborted { tool_use_id })) if tool_use_id == expected_tool => {
+                    NativeSpawnCutoff::Reconciled
+                }
+                Ok(_) => NativeSpawnCutoff::Stop,
+                Err(error) => {
+                    tracing::error!(%error, "native spawn cutoff could not establish reconciliation");
+                    NativeSpawnCutoff::Stop
+                }
+            },
+            Err(oneshot::error::TryRecvError::Empty) => {
+                self.fatal_local_authority_fence
+                    .close("native_spawn_cancellation_deadline");
+                NativeSpawnCutoff::Stop
+            }
+            Err(oneshot::error::TryRecvError::Closed) => {
+                if let Err(error) = self
+                    .fail_native_spawn(
+                        "native spawn owner disappeared without classified closure".into(),
+                    )
+                    .await
+                {
+                    tracing::error!(%error, "native spawn cutoff failure could not settle");
+                }
+                NativeSpawnCutoff::Stop
+            }
+        }
+    }
+
     pub(super) fn native_spawn_adoption_matches(&self, proposed: &ConvState) -> bool {
         self.native_spawn_handoff.as_ref().is_some_and(|handoff| {
             if let NativeSpawnPhase::Adopting {
                 expected_parent, ..
             } = &handoff.phase
             {
-                return **expected_parent == *proposed;
+                let original_selection = matches!(&self.state, ConvState::ToolExecuting { current_tool, assistant_message, .. }
+                    if current_tool.id == handoff.invocation.tool_use_id && assistant_message.message_id == handoff.invocation.assistant_message_id);
+                return **expected_parent == *proposed && (**expected_parent == self.state || original_selection);
             }
             matches!(handoff.phase, NativeSpawnPhase::Admitted { .. })
                 && handoff.invocation.owns_state(&self.state)
@@ -167,20 +215,24 @@ where
         else {
             panic!("activation fixture requires tool round");
         };
+        let invocation = phoenix_db::SubAgentSpawnInvocation {
+            parent_conversation_id: self.context.conversation_id.clone(),
+            assistant_message_id: assistant_message.message_id.clone(),
+            tool_use_id: current_tool.id.clone(),
+            batch_id: "fixture-batch".into(),
+        };
+        let (reply, closure) = oneshot::channel();
+        let control = Arc::new(NativeSpawnControl::new(invocation.clone(), reply));
+        assert!(control.try_issue());
         self.native_spawn_handoff = Some(NativeSpawnHandoff {
-            invocation: phoenix_db::SubAgentSpawnInvocation {
-                parent_conversation_id: self.context.conversation_id.clone(),
-                assistant_message_id: assistant_message.message_id.clone(),
-                tool_use_id: current_tool.id.clone(),
-                batch_id: "fixture-batch".into(),
-            },
+            invocation,
             members: pending_sub_agents.clone(),
-            cancellation: CancellationToken::new(),
+            control,
             phase: NativeSpawnPhase::Adopting {
                 expected_parent: Box::new(expected_parent),
                 activation: sender,
             },
-            closure: oneshot::channel().1,
+            closure,
         });
     }
 
