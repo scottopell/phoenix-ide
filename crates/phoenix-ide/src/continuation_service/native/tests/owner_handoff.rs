@@ -4,7 +4,7 @@ use phoenix_core::domain::db_schema::ToolContent;
 use phoenix_core::domain::llm_types::ContentBlock;
 use phoenix_core::domain::sm_state::ToolCall;
 use phoenix_db::coordinator_tracking::{TrackingDetail, TrackingReceipt};
-use phoenix_db::coordinator_watches::{EndingResponse, WatchEndingEvidence};
+use phoenix_db::{EndingResponse, WatchEndingEvidence};
 use phoenix_llm::{LlmError, LlmRequest, LlmResponse, LlmService};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -69,12 +69,12 @@ async fn next_capture(
     captures: &mut mpsc::UnboundedReceiver<CapturedRequest>,
     ordinal: usize,
 ) -> String {
-    let captured = tokio::time::timeout(std::time::Duration::from_secs(30), captures.recv())
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(30), captures.recv())
         .await
         .expect("runtime must reach the gated provider")
         .expect("provider must retain the capture sender");
-    assert_eq!(captured.ordinal, ordinal);
-    format!("{:?}", captured.request)
+    assert_eq!(observed.ordinal, ordinal);
+    format!("{:?}", observed.request)
 }
 
 async fn native_send(tool: &dyn Tool, source: &str, target: &str, id: Uuid, text: &str) -> Value {
@@ -346,9 +346,9 @@ async fn assert_no_ending_for_input(db: &Database, input_message_id: &str) {
     reason = "one composed owner recovery must retain the same runtime, instruction identity, tracking item, and evidence"
 )]
 async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_retention() {
-    let (captures, mut captured) = mpsc::unbounded_channel();
+    let (sender, mut captured) = mpsc::unbounded_channel();
     let provider = Arc::new(HandoffProvider {
-        captures,
+        captures: sender,
         ordinal: AtomicUsize::new(0),
         release: Semaphore::new(0),
     });
@@ -360,34 +360,16 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
         f.db.get_conversation(&f.source)
             .await
             .unwrap()
-            .unwrap()
             .product_conversation_id;
     f.runtime.start_direct_turn_worker().await.unwrap();
-    let mut tools: Vec<_> = f
+    let tools = f
         .runtime
         .coordinator_tool_registry(&f.source, None)
         .await
-        .unwrap()
-        .into_tools()
-        .collect();
-    let send = tools.remove(
-        tools
-            .iter()
-            .position(|tool| tool.name() == "send_conversation_message")
-            .unwrap(),
-    );
-    let tracking = tools.remove(
-        tools
-            .iter()
-            .position(|tool| tool.name() == "tracking")
-            .unwrap(),
-    );
-    let continue_owner = tools.remove(
-        tools
-            .iter()
-            .position(|tool| tool.name() == "continue_conversation")
-            .unwrap(),
-    );
+        .unwrap();
+    let send = tools.find_tool("send_conversation_message").unwrap();
+    let tracking = tools.find_tool("tracking").unwrap();
+    let continue_owner = tools.find_tool("continue_conversation").unwrap();
     let tracked = record_paused_concern(&f, tracking.as_ref()).await;
     f.db.watch_product_conversation(&f.product).await.unwrap();
     let target = format!("@conv:{}", f.product);
