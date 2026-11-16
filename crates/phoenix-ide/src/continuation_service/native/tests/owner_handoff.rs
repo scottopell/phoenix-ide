@@ -68,12 +68,19 @@ impl LlmService for HandoffProvider {
 async fn next_capture(
     captures: &mut mpsc::UnboundedReceiver<CapturedRequest>,
     ordinal: usize,
+    conversation_id: &str,
 ) -> String {
     let observed = tokio::time::timeout(std::time::Duration::from_secs(30), captures.recv())
         .await
         .expect("runtime must reach the gated provider")
         .expect("provider must retain the capture sender");
     assert_eq!(observed.ordinal, ordinal);
+    assert_eq!(
+        observed.request.telemetry.as_ref().unwrap().conversation_id,
+        conversation_id,
+        "captured request must belong to the addressed turn: {:?}",
+        observed.request
+    );
     format!("{:?}", observed.request)
 }
 
@@ -381,7 +388,6 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
             .await
             .unwrap()
             .product_conversation_id;
-    f.runtime.start_direct_turn_worker().await.unwrap();
     let tools = f
         .runtime
         .coordinator_tool_registry(&f.source, None)
@@ -401,7 +407,11 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
     let old_key = Uuid::new_v4();
     let old_receipt = native_send(send.as_ref(), &f.source, &target, old_key, OLD_INPUT).await;
     assert_eq!(old_receipt["outcome"], "delivered");
-    let old_request = next_capture(&mut captured, 0).await;
+    f.runtime
+        .dispatch_standalone_turn(&f.predecessor)
+        .await
+        .unwrap();
+    let old_request = next_capture(&mut captured, 0, &f.predecessor).await;
     assert!(old_request.contains(OLD_INPUT));
     assert!(!old_request.contains(RECOVERY));
     let mut predecessor_events = f.runtime.subscribe(&f.predecessor).await.unwrap();
@@ -503,7 +513,11 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
     let continued: Value = serde_json::from_str(continued.output()).unwrap();
     assert_eq!(continued["conversation_id"], successor);
     assert_eq!(continued["status"], "already_exists");
-    let opening_request = next_capture(&mut captured, 1).await;
+    f.runtime
+        .dispatch_standalone_turn(&successor)
+        .await
+        .unwrap();
+    let opening_request = next_capture(&mut captured, 1, &successor).await;
     assert!(opening_request.contains(SUMMARY));
     assert!(!opening_request.contains(RECOVERY));
     assert!(!opening_request.contains(REJECT_ONLY));
@@ -548,11 +562,14 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
     assert_tracking_unchanged(&f.db, &f.source, &tracked).await;
 
     provider.release.add_permits(1);
-    let recovery_request = next_capture(&mut captured, 2).await;
-    assert!(recovery_request.contains(&format!(
-        "[Message from conversation {coordinator_product}, transcript {}]",
-        f.source
-    )));
+    let recovery_request = next_capture(&mut captured, 2, &successor).await;
+    assert!(
+        recovery_request.contains(&format!(
+            "[Message from conversation {coordinator_product}, transcript {}]",
+            f.source
+        )),
+        "recovery request must retain Coordinator provenance: {recovery_request}"
+    );
     assert_eq!(recovery_request.matches(RECOVERY).count(), 1);
     assert!(!recovery_request.contains(REJECT_ONLY));
     assert!(!recovery_request.contains("Changed recovery payload"));
@@ -645,7 +662,11 @@ async fn native_owner_rejection_continuation_busy_recovery_and_coordinator_reten
         )
         .await
         .unwrap();
-    let coordinator_request = next_capture(&mut captured, 3).await;
+    f.runtime
+        .dispatch_standalone_turn(&coordinator.conversation_id)
+        .await
+        .unwrap();
+    let coordinator_request = next_capture(&mut captured, 3, &coordinator.conversation_id).await;
     assert!(coordinator_request.contains(&tracked.item.id));
     assert!(coordinator_request.contains("Paused release concern: do not deploy"));
     assert!(coordinator_request.contains("historical"));
