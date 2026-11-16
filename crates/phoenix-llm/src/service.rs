@@ -268,6 +268,10 @@ impl LlmService for LlmServiceImpl {
         &self.spec.id
     }
 
+    fn outbound_model_name(&self) -> Option<&str> {
+        Some(self.request_name.as_str())
+    }
+
     fn diagnostic_route_class(&self) -> phoenix_core::domain::request_capacity::SafeRouteClass {
         use phoenix_core::domain::request_capacity::SafeRouteClass as R;
         match self.spec.backend.api_format() {

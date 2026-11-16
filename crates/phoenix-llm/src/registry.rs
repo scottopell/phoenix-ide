@@ -2025,6 +2025,37 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn actual_outbound_model_name_survives_registry_logging_and_request_overrides() {
+        let overrides = RequestModelOverrides::parse(
+            r#"{"openai_responses":{"gpt-6-luna":"gpt-6-astra"}}"#,
+            &all_models(),
+        )
+        .unwrap();
+        let direct = ModelRegistry::new(&LlmConfig {
+            openai_api_key: Some("offline-not-dispatched".into()),
+            request_models: overrides.clone(),
+            ..Default::default()
+        });
+        let service = direct.get("gpt-6-luna").unwrap();
+        assert_eq!(service.model_id(), "gpt-6-luna");
+        assert_eq!(service.outbound_model_name(), Some("gpt-6-astra"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let codex = ModelRegistry::new_with_codex_catalog(
+            &LlmConfig {
+                use_codex_auth: true,
+                codex_credential: Some(fake_codex_credential(&directory)),
+                request_models: overrides,
+                ..Default::default()
+            },
+            Some(&HashSet::from(["gpt-6-luna".to_owned()])),
+        );
+        let service = codex.get("gpt-6-luna").unwrap();
+        assert!(service.uses_codex_bridge());
+        assert_eq!(service.outbound_model_name(), Some("gpt-6-luna"));
+    }
+
+    #[test]
     fn request_model_map_validates_exact_routes_and_catalog_identity() {
         let specs = merge_model_specs(all_models(), &[external_gateway_model()]);
         let valid = RequestModelOverrides::parse(
