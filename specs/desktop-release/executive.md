@@ -89,3 +89,7 @@ Producer source integrates the legitimately merged installer main `7e5ef0e525426
 ## Post-upload evidence guard qualification
 
 Exact-source full devpy qualification at `61a4791e19ec` exposed the missing-upload negative fixture returning success on the admitted macOS Bash3.2.57. A same-environment no-file probe confirmed that its failed standalone `[[ ]]` guard continued despite `set -e`; the Linux producer's hosted Ubuntu behavior was not implicated by that probe. Both receipt-digest and artifact-ID guards now terminate explicitly before summary/output publication. The fixture retains empty-value rejection and adds zero/malformed-ID and wrong-length/nonhex-digest cases, requiring nonzero exit and no evidence files. This enforces the existing receipt-authentication boundary, not a new compatibility or publication guarantee. Focused fixture/module and full-lane successor qualification remain pending; no release, dispatch, artifact, or deployment execution is credited.
+
+### Frozen RC7 publication
+
+The single-use protected `release-frozen-rc7` operation selects version-only candidate `86071b4cc2ab0f9efdb8a3debf03b8569baf26f9` over frozen base `d3b57573ccf8662d05125338aad2307bb03da598`; see ADR-267. The workflow gates on exact-candidate CI and signing/native acceptance before publication. Successful exact-controller CI is an operator/merge precondition, not a gate queried by the release workflow. No deployment is implied.
