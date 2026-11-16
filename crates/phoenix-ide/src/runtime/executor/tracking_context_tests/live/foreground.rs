@@ -355,7 +355,7 @@ impl Session {
                                             ContentBlock::ToolUse { name, input, .. }
                                                 if name == "ask_user_question" =>
                                             {
-                                                prose.push(input.to_string())
+                                                prose.push(input.to_string());
                                             }
                                             _ => {}
                                         }

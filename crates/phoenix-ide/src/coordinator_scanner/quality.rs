@@ -97,14 +97,15 @@ struct PreparedCase {
     event_aliases: BTreeMap<String, String>,
 }
 
-fn digest(bytes: impl AsRef<[u8]>) -> String {
+fn hex(bytes: impl AsRef<[u8]>) -> String {
     use std::fmt::Write as _;
-    Sha256::digest(bytes.as_ref())
-        .iter()
-        .fold(String::new(), |mut s, b| {
-            write!(s, "{b:02x}").unwrap();
-            s
-        })
+    bytes.as_ref().iter().fold(String::new(), |mut text, byte| {
+        write!(text, "{byte:02x}").expect("String formatting cannot fail");
+        text
+    })
+}
+fn digest(bytes: impl AsRef<[u8]>) -> String {
+    hex(Sha256::digest(bytes.as_ref()))
 }
 fn time(value: &str) -> i64 {
     chrono::DateTime::parse_from_rfc3339(value)
@@ -394,7 +395,15 @@ async fn fixture(
                     .is_none());
                 InputOrigin::SubscriptionEvent { event_id: actual }
             }
-            original => original.clone(),
+            original @ (InputOrigin::UnknownHistorical
+            | InputOrigin::UserApi
+            | InputOrigin::InternalConversation { .. }
+            | InputOrigin::SystemGenerated
+            | InputOrigin::SlackGateway { .. }
+            | InputOrigin::RemoteApi { .. }
+            | InputOrigin::RemoteConversation { .. }
+            | InputOrigin::RemoteCoordinator { .. }
+            | InputOrigin::ScheduledReminder { .. }) => original.clone(),
         };
         db.add_message_with_seq_and_origin(
             &message.message_id,
@@ -432,7 +441,9 @@ async fn prepare(db: &Database, profile: &ScanProfile, now: i64) -> Box<Prepared
         {
             ScanPreparation::Ready(batch) => return batch,
             ScanPreparation::Progress => {}
-            other => panic!("fixture did not produce actual inference batch: {other:?}"),
+            other @ (ScanPreparation::Wait { .. } | ScanPreparation::Idle) => {
+                panic!("fixture did not produce actual inference batch: {other:?}")
+            }
         }
     }
     panic!("fixture exceeded host-only enrollment progress bound")
@@ -481,7 +492,11 @@ fn proposal_audit(
                 } else {
                     f.text
                         .char_indices()
-                        .filter(|(offset, _)| f.text[*offset..].starts_with(&quote.quotation))
+                        .filter(|(offset, _)| {
+                            f.text
+                                .get(*offset..)
+                                .is_some_and(|tail| tail.starts_with(&quote.quotation))
+                        })
                         .count()
                 }
             });
@@ -545,7 +560,15 @@ fn validate_prepared(
                     event_id: event_aliases[logical].clone(),
                 }
             }
-            original => original.clone(),
+            original @ (InputOrigin::UnknownHistorical
+            | InputOrigin::UserApi
+            | InputOrigin::InternalConversation { .. }
+            | InputOrigin::SystemGenerated
+            | InputOrigin::SlackGateway { .. }
+            | InputOrigin::RemoteApi { .. }
+            | InputOrigin::RemoteConversation { .. }
+            | InputOrigin::RemoteCoordinator { .. }
+            | InputOrigin::ScheduledReminder { .. }) => original.clone(),
         };
         assert_eq!(
             actual.origin, expected_origin,
@@ -646,7 +669,7 @@ impl LlmService for RecordingService {
 
 fn identity(service: &dyn LlmService, profile: &ScanProfile) -> Value {
     json!({"catalog_model":service.model_id(),"outbound_model":service.outbound_model_name(),"effort":"low",
-        "connection":profile.connection,"endpoint_sha256":model::endpoint_hash(service).iter().map(|byte|format!("{byte:02x}")).collect::<String>(),
+        "connection":profile.connection,"endpoint_sha256":hex(model::endpoint_hash(service)),
         "prompt_sha256":digest(prompt::INSTRUCTIONS),"instruction_bytes":profile.instruction_bytes,
         "accepted_output_tokens":model::MAX_OUTPUT_TOKENS,"accepted_output_utf8_bytes":model::MAX_OUTPUT_BYTES,
         "requested_output_tokens":model::MAX_OUTPUT_TOKENS,"codex_generation_billing_cap":false,

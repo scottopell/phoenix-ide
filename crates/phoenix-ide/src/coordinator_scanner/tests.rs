@@ -66,12 +66,18 @@ fn scanner_request_bounds_full_serialized_content_and_contains_no_tools() {
 
 #[test]
 fn scanner_rejects_incomplete_or_nontext_provider_results() {
-    let mut complete =
-        LlmResponse::non_streaming(vec![ContentBlock::text("{}")], true, Default::default());
+    let mut complete = LlmResponse::non_streaming(
+        vec![ContentBlock::text("{}")],
+        true,
+        phoenix_llm::Usage::default(),
+    );
     complete.usage_observation.output = true;
     assert_eq!(model::complete_text(&complete).unwrap(), "{}");
-    let mut incomplete =
-        LlmResponse::non_streaming(vec![ContentBlock::text("{}")], false, Default::default());
+    let mut incomplete = LlmResponse::non_streaming(
+        vec![ContentBlock::text("{}")],
+        false,
+        phoenix_llm::Usage::default(),
+    );
     incomplete.usage_observation.output = true;
     assert!(model::complete_text(&incomplete).is_err());
     let mut tool = LlmResponse::non_streaming(
@@ -81,11 +87,11 @@ fn scanner_rejects_incomplete_or_nontext_provider_results() {
             json!({"thoughts":"not allowed"}),
         )],
         true,
-        Default::default(),
+        phoenix_llm::Usage::default(),
     );
     tool.usage_observation.output = true;
     assert!(model::complete_text(&tool).is_err());
-    let mut empty = LlmResponse::non_streaming(vec![], true, Default::default());
+    let mut empty = LlmResponse::non_streaming(vec![], true, phoenix_llm::Usage::default());
     empty.usage_observation.output = true;
     assert!(model::complete_text(&empty).is_err());
 }
@@ -177,7 +183,7 @@ async fn scanner_dropped_write_owner_closes_real_runtime_authority() {
 }
 
 enum ScriptedOutcome {
-    Response(LlmResponse),
+    Response(Box<LlmResponse>),
     Pending,
     Panic,
 }
@@ -196,7 +202,7 @@ impl phoenix_llm::LlmService for ScriptedService {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         assert!(request.tool_availability.declarations().is_empty());
         match &self.response {
-            ScriptedOutcome::Response(response) => Ok(response.clone()),
+            ScriptedOutcome::Response(response) => Ok(response.as_ref().clone()),
             ScriptedOutcome::Pending => std::future::pending().await,
             ScriptedOutcome::Panic => panic!("isolated provider panic"),
         }
@@ -226,8 +232,8 @@ async fn scanner_inference_enforces_closed_schema_and_keeps_reported_usage_on_re
         cache_write: true,
     };
     let service = ScriptedService {
-        response: ScriptedOutcome::Response(response),
-        calls: Default::default(),
+        response: ScriptedOutcome::Response(Box::new(response)),
+        calls: std::sync::atomic::AtomicUsize::default(),
     };
     let request =
         model::BoundedRequest::new(super::prompt::INSTRUCTIONS, &json!({"fragments":[]})).unwrap();
@@ -246,7 +252,7 @@ async fn scanner_inference_enforces_closed_schema_and_keeps_reported_usage_on_re
 async fn scanner_inference_times_out_without_unbudgeted_retry_or_fabricated_usage() {
     let service = ScriptedService {
         response: ScriptedOutcome::Pending,
-        calls: Default::default(),
+        calls: std::sync::atomic::AtomicUsize::default(),
     };
     let request =
         model::BoundedRequest::new(super::prompt::INSTRUCTIONS, &json!({"fragments":[]})).unwrap();
@@ -263,7 +269,7 @@ async fn scanner_inference_times_out_without_unbudgeted_retry_or_fabricated_usag
 async fn scanner_provider_panic_returns_failure_without_hidden_retry() {
     let service = ScriptedService {
         response: ScriptedOutcome::Panic,
-        calls: Default::default(),
+        calls: std::sync::atomic::AtomicUsize::default(),
     };
     let request =
         model::BoundedRequest::new(super::prompt::INSTRUCTIONS, &json!({"fragments":[]})).unwrap();
@@ -351,8 +357,8 @@ async fn scanner_oversized_complete_result_is_rejected_before_closed_json_accept
     );
     response.usage_observation.output = true;
     let service = ScriptedService {
-        response: ScriptedOutcome::Response(response),
-        calls: Default::default(),
+        response: ScriptedOutcome::Response(Box::new(response)),
+        calls: std::sync::atomic::AtomicUsize::default(),
     };
     let request =
         model::BoundedRequest::new(super::prompt::INSTRUCTIONS, &json!({"fragments":[]})).unwrap();
@@ -468,7 +474,7 @@ async fn scanner_whole_pass_uses_real_prepare_reserve_apply_without_foreground_w
         .await
         .unwrap();
     let service = std::sync::Arc::new(CaptureService {
-        calls: Default::default(),
+        calls: std::sync::atomic::AtomicUsize::default(),
     });
     dispatch_one_prepared_pass(&runtime, &service).await;
     let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM coordinator_tracking_items")
@@ -496,7 +502,7 @@ async fn scanner_whole_pass_classifies_known_storage_failure_and_preserves_parti
     let (runtime, coordinator) = whole_pass_fixture().await;
     sqlx::query("CREATE TRIGGER scanner_test_known_storage_failure BEFORE INSERT ON coordinator_tracking_items BEGIN SELECT RAISE(ABORT,'isolated scanner storage failure'); END;").execute(runtime.db().pool()).await.unwrap();
     let service = std::sync::Arc::new(CaptureService {
-        calls: Default::default(),
+        calls: std::sync::atomic::AtomicUsize::default(),
     });
     dispatch_one_prepared_pass(&runtime, &service).await;
     let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM coordinator_tracking_items")
