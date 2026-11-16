@@ -4183,6 +4183,10 @@ where
             ) {
                 self.settle_llm_trusted_context(&result);
             }
+            self.interrupt_native_before_cancellation_checkpoint(
+                &terminal_event,
+                &result.new_state,
+            );
             if matches!(
                 terminal_event,
                 Event::UserCancel {
@@ -4198,9 +4202,14 @@ where
                         | ConvState::CancellingSubAgents { .. }
                 )
             {
-                self.storage
+                if let Err(error) = self
+                    .storage
                     .record_execution_cancel(&self.context.conversation_id)
-                    .await?;
+                    .await
+                {
+                    self.observe_native_cancel_persistence_failure(&terminal_event, &error);
+                    return Err(error);
+                }
             }
             self.classify_active_direct_turn_terminal(&terminal_event, &result.new_state);
             self.pending_sub_agent_acceptance
@@ -4242,6 +4251,7 @@ where
             let generated = match application {
                 Ok(generated) => generated,
                 Err(error) => {
+                    self.observe_native_cancel_persistence_failure(&terminal_event, &error);
                     if accepted_sub_agent.as_ref().is_some_and(|agent_id| {
                         self.pending_sub_agent_acceptance.as_deref() == Some(agent_id.as_str())
                             && self.sub_agent_result_is_pending(agent_id)
@@ -6967,6 +6977,7 @@ where
                 activation: activation_tx,
             },
             closure: closure_rx,
+            cancel_persistence_failure: None,
         });
         match spawn_tx.try_send(request) {
             Ok(()) => {}

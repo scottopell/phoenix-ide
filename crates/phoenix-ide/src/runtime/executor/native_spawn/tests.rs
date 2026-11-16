@@ -216,13 +216,16 @@ async fn native_full_submission_stays_owned_and_cancels_in_the_real_loop() {
         })
         .await
         .unwrap();
+    let interrupted = tokio::time::timeout(Duration::from_millis(100), control.cancelled())
+        .await
+        .is_ok();
+    tokio::time::resume();
     let settled_before_capacity = tokio::time::timeout(
-        Duration::from_millis(100),
+        Duration::from_secs(60),
         states.wait_for(|state| matches!(state, ConvState::Idle)),
     )
     .await
     .is_ok();
-    tokio::time::resume();
     let filler = requests.try_recv().unwrap();
     let no_late_request = matches!(requests.try_recv(), Err(mpsc::error::TryRecvError::Empty));
     event_tx.send(Event::Shutdown).await.unwrap();
@@ -231,6 +234,7 @@ async fn native_full_submission_stays_owned_and_cancels_in_the_real_loop() {
         RuntimeExitDisposition::CoordinatedShutdown
     );
     manager.handle_spawn_request(filler).await;
+    assert!(interrupted, "native interruption must occur within 100ms");
     assert!(
         settled_before_capacity,
         "cancellation must not await bounded send capacity"
@@ -398,12 +402,13 @@ async fn native_cancel_persistence_failure_retains_closing_origin_and_stops_queu
         "native interruption must precede the failing cancellation evidence write"
     );
     assert!(matches!(
-        runtime.state,
+        &runtime.state,
         ConvState::Error {
             error_kind: crate::db::ErrorKind::SubAgentError,
-            ..
-        }
+            message, ..
+        } if message.contains("native cancellation persistence failed")
     ));
+    assert_eq!(runtime.tool_execution.generation(), 0);
     assert!(tools.recorded_executions().is_empty());
     assert!(runtime.llm_client.recorded_requests().is_empty());
     assert!(!manager.fatal_local_authority_fence.is_closed());

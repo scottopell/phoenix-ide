@@ -43,6 +43,7 @@ pub(super) struct NativeSpawnHandoff {
     pub(super) control: Arc<NativeSpawnControl>,
     pub(super) phase: NativeSpawnPhase,
     pub(super) closure: oneshot::Receiver<NativeSpawnClosureReceipt>,
+    pub(super) cancel_persistence_failure: Option<String>,
 }
 
 pub(super) enum NativeSpawnObservation {
@@ -112,6 +113,40 @@ where
     L: LlmClient + 'static,
     T: ToolExecutor + 'static,
 {
+    pub(super) fn interrupt_native_before_cancellation_checkpoint(
+        &mut self,
+        event: &Event,
+        next: &ConvState,
+    ) {
+        if !matches!(event, Event::UserCancel { .. })
+            || !matches!(self.state, ConvState::ToolExecuting { .. })
+            || !matches!(next, ConvState::CancellingTool { .. })
+        {
+            return;
+        }
+        if let Some(handoff) = self.native_spawn_handoff.as_mut() {
+            if handoff.invocation.parent_conversation_id == self.context.conversation_id
+                && handoff.invocation.owns_state(&self.state)
+                && handoff.invocation.owns_state(next)
+            {
+                handoff.request_cancel();
+            }
+        }
+    }
+
+    pub(super) fn observe_native_cancel_persistence_failure(&mut self, event: &Event, error: &str) {
+        if !matches!(event, Event::UserCancel { .. }) {
+            return;
+        }
+        if let Some(handoff) = self.native_spawn_handoff.as_mut() {
+            if handoff.control.is_cancelled() && handoff.invocation.owns_state(&self.state) {
+                handoff
+                    .cancel_persistence_failure
+                    .get_or_insert_with(|| error.to_owned());
+            }
+        }
+    }
+
     pub(super) async fn classify_native_spawn_cutoff(
         &mut self,
         expected_tool: &str,
@@ -270,6 +305,7 @@ where
                 activation: sender,
             },
             closure,
+            cancel_persistence_failure: None,
         });
     }
 
@@ -342,7 +378,9 @@ where
             NativeSpawnObservation::Admission(Ok(receipt)) => match receipt.outcome {
                 SubAgentAdmissionResponse::Admitted => {
                     let handoff = self.native_spawn_handoff.as_mut().expect("origin retained");
-                    if matches!(self.state, ConvState::CancellingTool { .. }) {
+                    if matches!(self.state, ConvState::CancellingTool { .. })
+                        || handoff.control.is_cancelled()
+                    {
                         handoff.request_cancel();
                         return Ok(None);
                     }
@@ -483,6 +521,14 @@ where
                             }));
                     }
                 }
+                if let Some(error) = self
+                    .native_spawn_handoff
+                    .as_mut()
+                    .and_then(|handoff| handoff.cancel_persistence_failure.take())
+                {
+                    self.fail_native_spawn(error).await?;
+                    return Ok(None);
+                }
                 self.native_spawn_handoff = None;
                 if matches!(self.state, ConvState::CancellingTool { .. }) {
                     Ok(Some(Event::ToolAborted {
@@ -502,7 +548,14 @@ where
     }
 
     pub(super) async fn fail_native_spawn(&mut self, error: String) -> Result<(), String> {
-        let handoff = self.native_spawn_handoff.take();
+        let mut handoff = self.native_spawn_handoff.take();
+        let error = match handoff
+            .as_mut()
+            .and_then(|handoff| handoff.cancel_persistence_failure.take())
+        {
+            Some(cause) => format!("{cause}; native reconciliation failed: {error}"),
+            None => error,
+        };
         tracing::error!(invocation = ?handoff.as_ref().map(|owner| &owner.invocation), %error, "native spawn cannot complete its live handoff");
         let new_state = ConvState::Error {
             message: error,
