@@ -123,7 +123,7 @@ final class ConversationSession {
         return snapshot.conversation
     }
 
-    private var transcriptGeneration: Int64?
+    private(set) var transcriptGeneration: Int64?
     private var deliveryAllowed = true
     private(set) var snapshotSyncedAt: Date?
 

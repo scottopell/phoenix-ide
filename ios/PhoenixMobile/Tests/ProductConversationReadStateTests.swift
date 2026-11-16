@@ -24,6 +24,19 @@ final class ProductConversationReadStateTests: XCTestCase {
         XCTAssertThrowsError(try decode(ProductConversationReadState.self, #"{"state":"archived"}"#))
     }
 
+    func testReadAdvanceAcknowledgesOnceThenObserves() {
+        XCTAssertEqual(
+            ProductConversationReadPolicy.advance(
+                productConversationId: "product",
+                acknowledgedProductId: nil),
+            .acknowledged)
+        XCTAssertEqual(
+            ProductConversationReadPolicy.advance(
+                productConversationId: "product",
+                acknowledgedProductId: "product"),
+            .observed)
+    }
+
     func testRoundTripsThroughEncoding() throws {
         for state in [ProductConversationReadState.read, .unread(.marked), .unread(.newActivity)] {
             let data = try JSONEncoder().encode(state)

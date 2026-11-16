@@ -230,6 +230,15 @@ final class SSEParserTests: XCTestCase {
                 .isPermanentStreamAuthenticationFailure)
     }
 
+    func testStaleProductConversationCursorRequiresTypedServerError() {
+        XCTAssertTrue(APIError.http(
+            status: 400,
+            body: #"{"error_type":"stale_product_conversation_cursor"}"#)
+            .isStaleProductConversationCursor)
+        XCTAssertFalse(
+            APIError.http(status: 400, body: "{}").isStaleProductConversationCursor)
+    }
+
     func testStateChangeRetainsServerTimestamp() {
         let json = """
         {

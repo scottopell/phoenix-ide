@@ -949,6 +949,7 @@ pub struct ProductConversationWorkIdentityView {
 pub struct ProductConversationSegmentView {
     pub segment_ordinal: i64,
     pub transcript_row_id: String,
+    pub transcript_generation: i64,
     pub slug: Option<String>,
     pub title: Option<String>,
     pub messages: Vec<crate::api::wire::EnrichedMessage>,

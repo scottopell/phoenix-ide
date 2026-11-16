@@ -9,7 +9,7 @@ struct CachedProductHistory: Codable, Equatable, Sendable {
 
 @MainActor
 enum ProductHistorySnapshotStore {
-    static let schemaVersion = 2
+    static let schemaVersion = 3
 
     static func cacheName(productConversationId: String) -> String {
         "product-history-\(productConversationId)"
@@ -54,6 +54,9 @@ enum ProductHistorySnapshotStore {
             if var existing = segmentsByOrdinal[segment.segment_ordinal] {
                 guard existing.transcript_row_id == segment.transcript_row_id else {
                     throw ProductHistoryLoadError.segmentIdentityChanged
+                }
+                guard existing.transcript_generation == segment.transcript_generation else {
+                    throw ProductHistoryLoadError.staleServerGeneration
                 }
                 var messagesById: [String: Message] = [:]
                 for message in existing.messages + segment.messages
@@ -607,13 +610,24 @@ final class AppModel {
 
     nonisolated static func composedMessages(
         snapshot: [Message],
-        live: [Message]
+        snapshotGeneration: Int64,
+        live: [Message],
+        liveGeneration: Int64?
     ) -> [Message] {
         var messagesById: [String: Message] = [:]
-        for message in snapshot {
-            messagesById[message.message_id] = message
+        let authoritativeMessages: [Message]
+        if let liveGeneration {
+            if liveGeneration < snapshotGeneration {
+                authoritativeMessages = snapshot
+            } else if liveGeneration == snapshotGeneration {
+                authoritativeMessages = snapshot + live
+            } else {
+                authoritativeMessages = live
+            }
+        } else {
+            authoritativeMessages = snapshot
         }
-        for message in live {
+        for message in authoritativeMessages {
             messagesById[message.message_id] = message
         }
         return messagesById.values.sorted {
@@ -840,51 +854,65 @@ final class AppModel {
         var snapshot: ProductConversationSnapshot?
         var before: String?
         var seenCursors: Set<String> = []
-        do {
-            repeat {
-                let page = try await api.getProductConversation(
-                    reference: productConversationId,
-                    before: before)
-                guard !Task.isCancelled,
-                      apiGeneration == startedGeneration,
-                      productHistoryGenerations.isCurrent(
-                          startedHistoryGeneration,
-                          productConversationId: productConversationId)
+        var restartedAfterStaleCursor = false
+        pagination: while true {
+            do {
+                repeat {
+                    let page = try await api.getProductConversation(
+                        reference: productConversationId,
+                        before: before)
+                    guard !Task.isCancelled,
+                          apiGeneration == startedGeneration,
+                          productHistoryGenerations.isCurrent(
+                              startedHistoryGeneration,
+                              productConversationId: productConversationId)
+                    else {
+                        throw ProductHistoryLoadError.staleServerGeneration
+                    }
+                    guard page.product_conversation_id == productConversationId else {
+                        throw ProductHistoryLoadError.aggregateIdentityChanged
+                    }
+                    snapshot = try await Task.detached(priority: .userInitiated) {
+                        try ProductHistorySnapshotStore.merging(snapshot, page: page)
+                    }.value
+                    guard page.has_older else { break }
+                    guard let next = page.before, !next.isEmpty else {
+                        throw ProductHistoryLoadError.missingCursor
+                    }
+                    guard seenCursors.insert(next).inserted else {
+                        throw ProductHistoryLoadError.repeatedCursor
+                    }
+                    before = next
+                } while true
+            } catch let error as APIError
+                where error.isStaleProductConversationCursor
+                    && before != nil
+                    && !restartedAfterStaleCursor
+            {
+                restartedAfterStaleCursor = true
+                snapshot = nil
+                before = nil
+                seenCursors.removeAll(keepingCapacity: true)
+                continue pagination
+            } catch let error as APIError where error.isNotFound {
+                guard apiGeneration == startedGeneration else {
+                    throw ProductHistoryLoadError.staleServerGeneration
+                }
+                let cachedTranscriptIds = cachedProductHistory(productConversationId: productConversationId)?
+                    .snapshot.segments.map(\.transcript_row_id) ?? []
+                let transcriptIds = Set(
+                    listStore.transcriptRowIds(forAggregateId: productConversationId)
+                        + cachedTranscriptIds)
+                guard await removeProductHistoryLocally(
+                    productConversationId: productConversationId,
+                    transcriptIds: transcriptIds,
+                    startedGeneration: startedGeneration)
                 else {
                     throw ProductHistoryLoadError.staleServerGeneration
                 }
-                guard page.product_conversation_id == productConversationId else {
-                    throw ProductHistoryLoadError.aggregateIdentityChanged
-                }
-                snapshot = try await Task.detached(priority: .userInitiated) {
-                    try ProductHistorySnapshotStore.merging(snapshot, page: page)
-                }.value
-                guard page.has_older else { break }
-                guard let next = page.before, !next.isEmpty else {
-                    throw ProductHistoryLoadError.missingCursor
-                }
-                guard seenCursors.insert(next).inserted else {
-                    throw ProductHistoryLoadError.repeatedCursor
-                }
-                before = next
-            } while true
-        } catch let error as APIError where error.isNotFound {
-            guard apiGeneration == startedGeneration else {
-                throw ProductHistoryLoadError.staleServerGeneration
+                throw ProductHistoryLoadError.notFound
             }
-            let cachedTranscriptIds = cachedProductHistory(productConversationId: productConversationId)?
-                .snapshot.segments.map(\.transcript_row_id) ?? []
-            let transcriptIds = Set(
-                listStore.transcriptRowIds(forAggregateId: productConversationId)
-                    + cachedTranscriptIds)
-            guard await removeProductHistoryLocally(
-                productConversationId: productConversationId,
-                transcriptIds: transcriptIds,
-                startedGeneration: startedGeneration)
-            else {
-                throw ProductHistoryLoadError.staleServerGeneration
-            }
-            throw ProductHistoryLoadError.notFound
+            break
         }
 
         guard !Task.isCancelled,

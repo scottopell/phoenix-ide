@@ -509,6 +509,8 @@ struct ProductHistoryLoadKey: Equatable {
     var isOnline: Bool
     var fallbackTranscriptRowId = ""
     var historyOnly = false
+    var delegateTranscriptGeneration: Int64? = nil
+    var fallbackSessionIsLive = false
 }
 
 enum ProductConversationDetailPolicy {
@@ -523,12 +525,19 @@ enum ProductConversationDetailPolicy {
 
 private struct ProductConversationDetailView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.scenePhase) private var scenePhase
     let productConversationId: String
     let historyOnly: Bool
     let fallbackTranscriptRowId: String
     @State private var cached: CachedProductHistory?
     @State private var error: ProductHistoryLoadError?
     @State private var onlineRefreshSucceeded = false
+    @State private var draft = ""
+    @State private var acknowledgedProductId: String?
+    @State private var readAdvanceInFlight = false
+    @State private var readAdvancePending = false
+    @State private var readVisitGeneration = 0
+    @State private var isVisible = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -549,11 +558,13 @@ private struct ProductConversationDetailView: View {
                     ProductConversationTranscript(
                         snapshot: cached.snapshot,
                         delegate: delegate)
-                        .id(delegate?.conversationId)
                 } else if !historyOnly,
-                          !model.connectivity.isOnline,
+                          !fallbackTranscriptRowId.isEmpty,
                           let session = model.session(for: fallbackTranscriptRowId) {
-                    ConversationView(session: session)
+                    ConversationView(
+                        session: session,
+                        showsComposer: false,
+                        advancesRead: false)
                 } else if error == .notFound {
                     ContentUnavailableView(
                         "Conversation deleted",
@@ -568,22 +579,29 @@ private struct ProductConversationDetailView: View {
                     ProgressView("Loading history…")
                 }
             }
+            if let session = composerSession {
+                ComposerView(session: session, draft: $draft)
+            }
         }
         .task(id: ProductHistoryLoadKey(
             productConversationId: productConversationId,
             isOnline: model.connectivity.isOnline,
             fallbackTranscriptRowId: fallbackTranscriptRowId,
-            historyOnly: historyOnly)
+            historyOnly: historyOnly,
+            delegateTranscriptGeneration: currentDelegateGeneration,
+            fallbackSessionIsLive: fallbackSessionIsLive)
         ) {
-            if cached == nil {
-                cached = model.cachedProductHistory(productConversationId: productConversationId)
+            if cached == nil,
+               let stored = model.cachedProductHistory(productConversationId: productConversationId) {
+                cached = stored
             }
             error = nil
             if !model.connectivity.isOnline {
                 onlineRefreshSucceeded = false
             }
             do {
-                cached = try await model.loadProductHistory(productConversationId: productConversationId)
+                cached = try await model.loadProductHistory(
+                    productConversationId: productConversationId)
                 onlineRefreshSucceeded = model.connectivity.isOnline
             } catch is CancellationError {
                 return
@@ -598,6 +616,85 @@ private struct ProductConversationDetailView: View {
                 if cached == nil {
                     self.error = .emptyResponse
                 }
+            }
+        }
+        .onAppear {
+            isVisible = true
+            readVisitGeneration += 1
+            advanceRead()
+        }
+        .onDisappear {
+            isVisible = false
+            readVisitGeneration += 1
+            readAdvancePending = false
+            acknowledgedProductId = nil
+        }
+        .onChange(of: productConversationId) { _, _ in
+            readVisitGeneration += 1
+            readAdvancePending = false
+            acknowledgedProductId = nil
+            advanceRead()
+        }
+        .onChange(of: composerSession?.messages.last?.message_id) { _, _ in
+            advanceRead()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                advanceRead()
+            }
+        }
+        .onChange(of: model.connectivity.isOnline) { _, _ in
+            advanceRead()
+        }
+    }
+
+    private var composerSession: ConversationSession? {
+        if let cached {
+            return delegateSession(for: cached.snapshot)
+        }
+        guard !historyOnly, !fallbackTranscriptRowId.isEmpty else { return nil }
+        return model.session(for: fallbackTranscriptRowId)
+    }
+
+    private var fallbackSessionIsLive: Bool {
+        guard cached == nil,
+              !historyOnly,
+              !fallbackTranscriptRowId.isEmpty,
+              let session = model.session(for: fallbackTranscriptRowId)
+        else { return false }
+        return session.connection == .live
+    }
+
+    private var currentDelegateGeneration: Int64? {
+        guard let cached else { return nil }
+        return delegateSession(for: cached.snapshot)?.transcriptGeneration
+    }
+
+    private func advanceRead() {
+        guard isVisible, scenePhase == .active else { return }
+        if readAdvanceInFlight {
+            readAdvancePending = true
+            return
+        }
+        readAdvanceInFlight = true
+        let visitGeneration = readVisitGeneration
+        let productId = productConversationId
+        let advance = ProductConversationReadPolicy.advance(
+            productConversationId: productId,
+            acknowledgedProductId: acknowledgedProductId)
+        Task {
+            let advanced = await model.advanceRead(
+                productConversationId: productId,
+                advance: advance)
+            readAdvanceInFlight = false
+            if isVisible, visitGeneration == readVisitGeneration,
+               advanced, advance == .acknowledged
+            {
+                acknowledgedProductId = productId
+            }
+            if isVisible, readAdvancePending {
+                readAdvancePending = false
+                advanceRead()
             }
         }
     }
@@ -652,44 +749,58 @@ struct UnreadDot: View {
 }
 
 struct ProductConversationTranscript: View {
-
+    @Environment(AppModel.self) private var model
     let snapshot: ProductConversationSnapshot
     let delegate: ConversationSession?
-    @State private var draft = ""
 
     var body: some View {
         VStack(spacing: 0) {
-            List(snapshot.segments, id: \.segment_ordinal) { segment in
-                Section(segment.title ?? segment.slug ?? "Conversation") {
-                    let messages = messages(for: segment)
-                    if messages.isEmpty {
-                        Text("No messages")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        let toolIndex = ConversationSession.toolUseIndex(for: messages)
-                        ForEach(messages) { message in
-                            MessageView(message: message, toolIndex: toolIndex)
+            ScrollViewReader { proxy in
+                List {
+                    ForEach(snapshot.segments, id: \.segment_ordinal) { segment in
+                        Section(segment.title ?? segment.slug ?? "Conversation") {
+                            let messages = messages(for: segment)
+                            if messages.isEmpty {
+                                Text("No messages")
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                let toolIndex = ConversationSession.toolUseIndex(for: messages)
+                                ForEach(messages) { message in
+                                    MessageView(message: message, toolIndex: toolIndex)
+                                }
+                            }
+                            if segment.transcript_row_id == delegate?.conversationId,
+                               let delegate,
+                               !delegate.streamingText.isEmpty {
+                                StreamingBubble(text: delegate.streamingText)
+                            }
+                            if let handoff = segment.handoff {
+                                ProductHistoryHandoffView(handoff: handoff)
+                            }
                         }
                     }
-                    if segment.transcript_row_id == delegate?.conversationId,
-                       let delegate,
-                       !delegate.streamingText.isEmpty {
-                        StreamingBubble(text: delegate.streamingText)
+                    if let delegate {
+                        OutboxSection(
+                            session: delegate,
+                            authoritativeMessageIds: authoritativeMessageIds(for: delegate))
                     }
-                    if let handoff = segment.handoff {
-                        ProductHistoryHandoffView(handoff: handoff)
+                    Color.clear.frame(height: 1).id(ScrollTarget.bottom)
+                }
+                .listStyle(.plain)
+                .defaultScrollAnchor(.bottom)
+                .onChange(of: renderedMessageCount) {
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        proxy.scrollTo(ScrollTarget.bottom, anchor: .bottom)
                     }
                 }
+                .onChange(of: delegate?.streamingText) {
+                    proxy.scrollTo(ScrollTarget.bottom, anchor: .bottom)
+                }
+                .accessibilityIdentifier("product-conversation-history")
             }
-            .listStyle(.plain)
-            .accessibilityIdentifier("product-conversation-history")
 
             if let delegate {
-                OutboxSection(
-                    session: delegate,
-                    authoritativeMessageIds: authoritativeMessageIds(for: delegate))
                 StateDetailView(session: delegate)
-                ComposerView(session: delegate, draft: $draft)
             }
         }
         .navigationTitle(snapshot.canonical_root.title ?? "Conversation")
@@ -702,8 +813,23 @@ struct ProductConversationTranscript: View {
         } message: {
             Text(delegate?.lastErrorToast ?? "")
         }
-        .onAppear { delegate?.start() }
+        .onChange(of: delegate?.conversationId, initial: true) { oldId, newId in
+            if oldId != newId, let oldId {
+                model.session(for: oldId)?.closeView()
+            }
+            delegate?.start()
+        }
         .onDisappear { delegate?.closeView() }
+    }
+
+    private enum ScrollTarget: Hashable {
+        case bottom
+    }
+
+    private var renderedMessageCount: Int {
+        snapshot.segments.reduce(into: 0) { count, segment in
+            count += messages(for: segment).count
+        }
     }
 
     private func authoritativeMessageIds(for delegate: ConversationSession) -> Set<String> {
@@ -717,6 +843,10 @@ struct ProductConversationTranscript: View {
         guard segment.transcript_row_id == delegate?.conversationId, let delegate else {
             return segment.messages
         }
-        return AppModel.composedMessages(snapshot: segment.messages, live: delegate.messages)
+        return AppModel.composedMessages(
+            snapshot: segment.messages,
+            snapshotGeneration: segment.transcript_generation,
+            live: delegate.messages,
+            liveGeneration: delegate.transcriptGeneration)
     }
 }

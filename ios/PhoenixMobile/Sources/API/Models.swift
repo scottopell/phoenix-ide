@@ -403,6 +403,7 @@ struct ProductConversationChainQaCompatibility: Codable, Equatable, Sendable {
 struct ProductConversationSegment: Codable, Equatable, Sendable {
     var segment_ordinal: Int64
     var transcript_row_id: String
+    var transcript_generation: Int64
     var slug: String?
     var title: String?
     var messages: [Message]

@@ -120,11 +120,13 @@ final class AppModelProductConversationTests: XCTestCase {
                 message("duplicate", sequence: 2),
                 message("same-sequence-z", sequence: 4),
             ],
+            snapshotGeneration: 7,
             live: [
                 liveReplacement,
                 message("tail", sequence: 3),
                 message("same-sequence-a", sequence: 4),
-            ])
+            ],
+            liveGeneration: 7)
 
         XCTAssertEqual(composed.map(\.message_id), [
             "snapshot",
@@ -134,6 +136,36 @@ final class AppModelProductConversationTests: XCTestCase {
             "same-sequence-z",
         ])
         XCTAssertEqual(composed[1].content, .object(["text": .string("live")]))
+    }
+
+    func testComposedMessagesDropsSnapshotWhenLiveGenerationChanges() {
+        let composed = AppModel.composedMessages(
+            snapshot: [message("stale-prefix", sequence: 1)],
+            snapshotGeneration: 7,
+            live: [message("authoritative-tail", sequence: 2)],
+            liveGeneration: 8)
+
+        XCTAssertEqual(composed.map(\.message_id), ["authoritative-tail"])
+    }
+
+    func testComposedMessagesDropsStaleLiveMessagesWhenSnapshotGenerationIsNewer() {
+        let composed = AppModel.composedMessages(
+            snapshot: [message("authoritative-snapshot", sequence: 2)],
+            snapshotGeneration: 8,
+            live: [message("stale-live", sequence: 1)],
+            liveGeneration: 7)
+
+        XCTAssertEqual(composed.map(\.message_id), ["authoritative-snapshot"])
+    }
+
+    func testComposedMessagesUsesSnapshotUntilLiveGenerationIsKnown() {
+        let composed = AppModel.composedMessages(
+            snapshot: [message("authoritative-snapshot", sequence: 1)],
+            snapshotGeneration: 8,
+            live: [message("unproven-live", sequence: 2)],
+            liveGeneration: nil)
+
+        XCTAssertEqual(composed.map(\.message_id), ["authoritative-snapshot"])
     }
 
     func testProductConversationDetailDelegatesOpenAggregateToAuthoritativeTranscript() {
@@ -478,6 +510,7 @@ final class AppModelProductConversationTests: XCTestCase {
                 ProductConversationSegment(
                     segment_ordinal: 1,
                     transcript_row_id: "successor",
+                    transcript_generation: 11,
                     slug: "successor",
                     title: "Successor",
                     messages: [message("m4", sequence: 2), message("m3", sequence: 1)],
@@ -485,6 +518,7 @@ final class AppModelProductConversationTests: XCTestCase {
                 ProductConversationSegment(
                     segment_ordinal: 0,
                     transcript_row_id: "root",
+                    transcript_generation: 7,
                     slug: "root",
                     title: "Root",
                     messages: [message("m2", sequence: 2)],
@@ -501,6 +535,7 @@ final class AppModelProductConversationTests: XCTestCase {
             ProductConversationSegment(
                 segment_ordinal: 0,
                 transcript_row_id: "root",
+                transcript_generation: 7,
                 slug: "root",
                 title: "Root",
                 messages: [message("m2", sequence: 2), message("m1", sequence: 1)],
@@ -526,6 +561,7 @@ final class AppModelProductConversationTests: XCTestCase {
             ProductConversationSegment(
                 segment_ordinal: 0,
                 transcript_row_id: "root",
+                transcript_generation: 7,
                 slug: "root",
                 title: "Root",
                 messages: [message("cached", sequence: 1)],
@@ -554,6 +590,7 @@ final class AppModelProductConversationTests: XCTestCase {
             ProductConversationSegment(
                 segment_ordinal: 0,
                 transcript_row_id: "root",
+                transcript_generation: 7,
                 slug: "root",
                 title: "Root",
                 messages: [message("cached", sequence: 1)],
@@ -752,6 +789,18 @@ final class AppModelProductConversationTests: XCTestCase {
             isOnline: false,
             fallbackTranscriptRowId: "first",
             historyOnly: true))
+        XCTAssertNotEqual(initial, ProductHistoryLoadKey(
+            productConversationId: "product",
+            isOnline: false,
+            fallbackTranscriptRowId: "first",
+            historyOnly: false,
+            delegateTranscriptGeneration: 2))
+        XCTAssertNotEqual(initial, ProductHistoryLoadKey(
+            productConversationId: "product",
+            isOnline: false,
+            fallbackTranscriptRowId: "first",
+            historyOnly: false,
+            fallbackSessionIsLive: true))
     }
 
     func testCloseCompletionGenerationsAreScopedByProduct() {
