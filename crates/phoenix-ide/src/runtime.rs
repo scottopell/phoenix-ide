@@ -5040,14 +5040,12 @@ impl RuntimeManager {
         authority.owner = None;
         match result {
             phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
-                result.map_err(|error| error.to_string())?;
+                result.map(|_| ()).map_err(|error| error.to_string())
             }
             phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
-                return Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: sub-agent batch admission commit could not be classified".to_string());
+                Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: sub-agent batch admission commit could not be classified".to_string())
             }
         }
-
-        Ok(())
     }
 
     fn kick_admitted_sub_agent_batch(

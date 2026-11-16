@@ -5578,14 +5578,7 @@ where
             }
         }
         if let Some(activation) = activation {
-            if activation.sender.send(()).is_err() && self.native_spawn_handoff.is_some() {
-                self.native_spawn_handoff
-                    .as_mut()
-                    .expect("native owner retained")
-                    .phase = NativeSpawnPhase::ActivationOwnerLost;
-            } else {
-                self.native_spawn_handoff = None;
-            }
+            self.release_native_spawn_activation(activation);
         }
 
         if broadcast {

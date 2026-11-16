@@ -1,4 +1,5 @@
-use super::*;
+use super::{AdmittedOperation, RuntimeManager, SubAgentAdmissionResponse};
+use chrono::Utc;
 
 #[derive(Debug)]
 pub struct SubAgentAdmissionReceipt {
@@ -68,6 +69,8 @@ impl RuntimeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use tokio::sync::oneshot;
 
     #[tokio::test]
     async fn native_write_owner_abort_or_panic_closes_shared_authority() {
@@ -78,9 +81,7 @@ mod tests {
             let task = tokio::spawn(async move {
                 let _authority = NativeSpawnWriteAuthority { owner: Some(owner) };
                 started.send(()).unwrap();
-                if panic {
-                    panic!("injected native write owner panic");
-                }
+                assert!(!panic, "injected native write owner panic");
                 std::future::pending::<()>().await;
             });
             observed.await.unwrap();
