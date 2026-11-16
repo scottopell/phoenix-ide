@@ -1,0 +1,299 @@
+-- allium: 3
+-- REQ-SCAN-001 through REQ-SCAN-008. Source/coverage lifecycle; no worker scheduling.
+use "../coordinator-tracking/coordinator-tracking.allium" as tracking
+
+enum ScanLane { live historical }
+enum BatchState { captured validated applied rejected }
+enum AttemptState { reserved completed failed }
+
+entity MemberCoverage {
+    registry: tracking/TrackingRegistry
+    transcript_id: String
+    source_generation: Integer
+    covered_generation: Integer
+    frontier_revision: Integer
+    activation_boundary: Integer
+    live_complete: Boolean
+    historical_complete: Boolean
+    source_is_stale: source_generation != covered_generation
+    fully_covered: not source_is_stale and live_complete and historical_complete
+
+    @invariant OwnContinuationMembership
+        -- Enrollment comes only from validated singleton continuation topology.
+        -- Shared product/WorkScope or root association never enrolls a child,
+        -- worker or remote transcript. Coverage is prose coverage, not review.
+
+    @invariant ExactFragmentCoverage
+        -- Each lane retains its message/UTF8 fragment position and source digest.
+        -- A partial fragment never covers the unread suffix. New append progress
+        -- cannot cover an older historical gap or transfer across generations.
+}
+
+entity ScanBatch {
+    member: MemberCoverage
+    state: BatchState
+    lane: ScanLane
+    captured_generation: Integer
+    captured_frontier_revision: Integer
+    captured_registry_revision: Integer
+    source_digest: String
+    encoded_input_bytes: Integer
+    retry_cycle: RetryCycle
+
+    transitions state {
+        captured -> validated
+        captured -> rejected
+        validated -> applied
+        validated -> rejected
+    }
+
+    @invariant HostOwnedAuthority
+        -- Only host snapshot preparation mints this binding. It is not a native
+        -- SourceToolCall or synthetic ToolExecuting round. Input includes origin,
+        -- chronological prose/quotation/answer boundaries and bounded candidates;
+        -- scanner/meta observations and raw tool dumps cannot feed discovery.
+        -- User-role UnknownHistorical prose is processed without relabelling it
+        -- UserApi/human. Clear apparent intent can be captured provisionally with
+        -- its original Unknown source; ambiguous reports/quotes are not commissions.
+
+    @invariant BoundedCandidates
+        -- Source <=8 KiB encoded, registry <=8 KiB with <=16 compact candidates,
+        -- individual title/context fields <=256 encoded bytes with clipping flags,
+        -- total inference content <=24 KiB. Omissions are explicit. Matching is
+        -- source-overlap then recent active/retired candidates, not a global mirror.
+}
+
+entity RetryCycle {
+    binding_digest: String
+    attempts_reserved: Integer
+    resumes_at_us: Integer?
+
+    @invariant DurableExactBindingCycle
+        -- Binding includes owner/member/generation/lane/frontier/source/registry
+        -- plus selected prompt/route identity. New nonce, recapture and restart do
+        -- not reset it. Real binding changes create a new cycle; exhausted cycles
+        -- resume only at their persisted time, under unchanged global budgets.
+}
+
+entity BudgetWindow {
+    daily_calls: Integer
+    hourly_calls: Integer
+    daily_input_bytes: Integer
+    historical_daily_calls: Integer
+    historical_hourly_calls: Integer
+}
+
+entity ScanAttempt {
+    batch: ScanBatch
+    state: AttemptState
+    charged_input_bytes: Integer
+
+    transitions state {
+        reserved -> completed
+        reserved -> failed
+    }
+
+    @invariant ChargedBeforeDispatch
+        -- Reservation commits before provider dispatch and is not refunded on
+        -- cancellation/error/restart. Retrying reserves another charged attempt;
+        -- no exactly-once billing or provider-call claim follows from application.
+}
+
+config {
+    daily_calls: Integer = 128
+    hourly_calls: Integer = 16
+    daily_input_bytes: Integer = 3145728
+    historical_daily_calls: Integer = 64
+    historical_hourly_calls: Integer = 4
+    max_input_bytes: Integer = 24576
+    max_output_tokens: Integer = 2048
+    attempts_per_cycle: Integer = 2
+    retry_backoff_us: Integer = 300000000
+    inference_timeout_seconds: Integer = 30
+}
+
+rule EnrollOwnContinuationMember {
+    when: ValidatedMemberDiscovered(registry, transcript_id, generation, boundary, is_new_continuation)
+    requires: registry.runtime_authority_open
+    requires: not is_new_continuation or boundary = 0
+    ensures:
+        MemberCoverage.created(registry: registry, transcript_id: transcript_id,
+            source_generation: generation, covered_generation: generation,
+            frontier_revision: 0, activation_boundary: boundary,
+            live_complete: false, historical_complete: is_new_continuation)
+    @guidance
+        -- The discovery proof comes from actual singleton continuation membership,
+        -- not a model verdict or a shared scope/product/root association.
+}
+
+rule InvalidateChangedGeneration {
+    when: SourceGenerationObserved(member, new_generation, new_boundary)
+    requires: member.covered_generation != new_generation
+    ensures:
+        member.source_generation = new_generation
+        member.covered_generation = new_generation
+        member.activation_boundary = new_boundary
+        member.frontier_revision = member.frontier_revision + 1
+        member.live_complete = false
+        member.historical_complete = false
+    @guidance
+        -- Reset that member's lane positions under its new frozen boundary.
+        -- Preserve tracking rows, immutable evidence and retirement reasons.
+        -- Startup and bounded cyclic revisits find generation-only mutations.
+}
+
+rule ReserveInferenceAttempt {
+    when: InferencePrepared(batch, budget, now_us)
+    requires: batch.state = captured
+    requires: batch.member.registry.runtime_authority_open
+    requires: batch.encoded_input_bytes <= config.max_input_bytes
+    requires: batch.retry_cycle.attempts_reserved < config.attempts_per_cycle
+    requires: budget.daily_calls < config.daily_calls
+    requires: budget.hourly_calls < config.hourly_calls
+    requires: budget.daily_input_bytes + batch.encoded_input_bytes <= config.daily_input_bytes
+    requires: batch.lane != historical or budget.historical_daily_calls < config.historical_daily_calls
+    requires: batch.lane != historical or budget.historical_hourly_calls < config.historical_hourly_calls
+    ensures:
+        ScanAttempt.created(batch: batch, state: reserved, charged_input_bytes: batch.encoded_input_bytes)
+        budget.daily_calls = budget.daily_calls + 1
+        budget.hourly_calls = budget.hourly_calls + 1
+        budget.daily_input_bytes = budget.daily_input_bytes + batch.encoded_input_bytes
+        batch.retry_cycle.attempts_reserved = batch.retry_cycle.attempts_reserved + 1
+        if batch.retry_cycle.attempts_reserved = config.attempts_per_cycle:
+            batch.retry_cycle.resumes_at_us = now_us + config.retry_backoff_us
+        if batch.lane = historical:
+            budget.historical_daily_calls = budget.historical_daily_calls + 1
+            budget.historical_hourly_calls = budget.historical_hourly_calls + 1
+    @guidance
+        -- Exact eligible gpt-6-luna/Low connection only; missing route/budget waits
+        -- visibly without blocking foreground turns. No cheap/default fallback.
+        -- Select3live:1historical when both pending and limits permit; revisit
+        -- members fairly so live work/new members and generation changes progress.
+}
+
+rule ResumeExhaustedRetryCycle {
+    when: RetryResumeObserved(cycle, now_us)
+    requires: cycle.attempts_reserved = config.attempts_per_cycle
+    requires: cycle.resumes_at_us != null
+    requires: cycle.resumes_at_us <= now_us
+    ensures:
+        cycle.attempts_reserved = 0
+        cycle.resumes_at_us = null
+    @guidance
+        -- Reservation, not provider result, charges the cycle before dispatch.
+        -- Reserve+crash+restart consumes an attempt. The existing runner's bounded
+        -- revisit resumes after5minutes; no extra scheduler or permanent poison.
+}
+
+rule AcceptCompleteSourceValidResult {
+    when: CompleteResultValidated(batch, attempt)
+    requires: batch.state = captured
+    requires: attempt.batch = batch
+    requires: attempt.state = reserved
+    ensures:
+        batch.state = validated
+        attempt.state = completed
+    @guidance
+        -- Closed output permits only new unreviewed captures, existing-candidate
+        -- evidence or no action. Host validates all proposals, including rejected
+        -- ones in quality accounting. Model gives fragment/message ID+exact quote;
+        -- host resolves a unique UTF8 span inside captured generation/digest bounds.
+        -- Ambiguous/missing/forged quotes, tool calls and incomplete/truncated
+        -- output cannot become this validated state or advance any coverage.
+}
+
+rule CommitValidatedBatch {
+    when: ApplyBatch(batch, registry_delta, covered_live_tail, covered_historical_range)
+    requires: batch.state = validated
+    requires: registry_delta = 0 or registry_delta = 1
+    requires: batch.member.registry.runtime_authority_open
+    requires: batch.captured_generation = batch.member.source_generation
+    requires: batch.captured_generation = batch.member.covered_generation
+    requires: batch.captured_frontier_revision = batch.member.frontier_revision
+    requires: batch.captured_registry_revision = batch.member.registry.revision
+    ensures:
+        batch.state = applied
+        batch.member.frontier_revision = batch.member.frontier_revision + 1
+        batch.member.registry.revision = batch.member.registry.revision + registry_delta
+        batch.member.live_complete = covered_live_tail
+        batch.member.historical_complete = covered_historical_range
+    @guidance
+        -- Revalidate exact source content/own membership and host range before
+        -- committing writes plus position in one transaction. Coverage completion
+        -- derives from the host range, never an invented model byte frontier.
+        -- Empty complete output still advances only its bounded covered range.
+        -- Registry delta is1 exactly when item/evidence changes commit, otherwise0.
+        -- New items are unreviewed; evidence appends invalidate reviewed resumption.
+        -- Same item+source locator+quote digest dedups across unchanged generation
+        -- rescans. Never rewrite/review/retire/reopen or grant execution authority.
+        -- A later explicit human renewal may create a distinct visible unreviewed
+        -- request while its older retired record remains closed.
+}
+
+rule RejectConflictedBatch {
+    when: BatchConflictObserved(batch)
+    requires: batch.state = captured or batch.state = validated
+    ensures: batch.state = rejected
+    @guidance
+        -- No item/evidence/coverage writes commit. Keep work discoverable and
+        -- retry within charged limits; no new human message is required for liveness.
+}
+
+rule FailInferenceAttempt {
+    when: InvalidOrFailedInference(batch, attempt)
+    requires: batch.state = captured
+    requires: attempt.state = reserved
+    ensures:
+        batch.state = rejected
+        attempt.state = failed
+    @guidance
+        -- Coverage stays pending/degraded with distinct route, budget, retry or
+        -- incomplete-source reasons. No foreground wake or source fabrication.
+}
+
+rule CloseUnclassifiedScannerAuthority {
+    when: ScannerWriteUnclassified(registry)
+    ensures: registry.runtime_authority_open = false
+}
+
+invariant NoCoveredStaleGeneration {
+    for member in MemberCoverages:
+        member.fully_covered implies member.covered_generation = member.source_generation
+}
+
+surface ScannerHost {
+    facing batch: ScanBatch
+    context budget: BudgetWindow
+    exposes:
+        batch.member.transcript_id
+        batch.member.source_generation
+        batch.member.covered_generation
+        batch.member.frontier_revision
+        batch.member.activation_boundary
+        batch.member.live_complete
+        batch.member.historical_complete
+        batch.member.source_is_stale
+        batch.member.fully_covered
+        batch.state
+        batch.lane
+        batch.source_digest
+        batch.encoded_input_bytes
+        batch.retry_cycle.binding_digest
+        batch.retry_cycle.attempts_reserved
+        batch.retry_cycle.resumes_at_us
+        budget.daily_calls
+        budget.hourly_calls
+        budget.daily_input_bytes
+        budget.historical_daily_calls
+        budget.historical_hourly_calls
+    provides:
+        ValidatedMemberDiscovered(registry, transcript_id, generation, boundary, is_new_continuation)
+        SourceGenerationObserved(batch.member, new_generation, new_boundary)
+        InferencePrepared(batch, budget, now_us)
+        RetryResumeObserved(batch.retry_cycle, now_us)
+        CompleteResultValidated(batch, attempt)
+        ApplyBatch(batch, registry_delta, covered_live_tail, covered_historical_range)
+        BatchConflictObserved(batch)
+        InvalidOrFailedInference(batch, attempt)
+        ScannerWriteUnclassified(batch.member.registry)
+}
