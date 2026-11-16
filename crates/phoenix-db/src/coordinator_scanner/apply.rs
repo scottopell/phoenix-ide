@@ -1,4 +1,10 @@
-use super::{source::*, storage::*, *};
+use super::{
+    source::{advance, encoded, hash, invalid},
+    storage::{batch_current, complete_attempt, finish, set_blocker, validate_attempt, write_tx},
+    InputOrigin, PreparedScanBatch, ReservedScanAttempt, ScanAction, ScanApplyOutcome, ScanBlocker,
+    ScanFragment, ScanMetrics, ScanQuote, ScanRejection, ScanResult, ScanRole,
+    SCAN_MAX_OUTPUT_BYTES, SCAN_MAX_OUTPUT_TOKENS,
+};
 use crate::{
     coordinator_tracking::{self, TrackingEvidence, TrackingInitialReview, TrackingRecord},
     workflow::LocalAuthorityResult,
@@ -55,7 +61,12 @@ fn quotes<'a>(
         let matches = fragment
             .text
             .char_indices()
-            .filter(|(offset, _)| fragment.text[*offset..].starts_with(&quote.quotation))
+            .filter(|(offset, _)| {
+                fragment
+                    .text
+                    .get(*offset..)
+                    .is_some_and(|tail| tail.starts_with(&quote.quotation))
+            })
             .take(2)
             .map(|(offset, _)| offset)
             .collect::<Vec<_>>();

@@ -135,7 +135,7 @@ impl PreparedScanBatch {
 #[derive(Debug)]
 pub struct ReservedScanAttempt {
     pub(crate) id: i64,
-    pub(crate) batch: PreparedScanBatch,
+    pub(crate) batch: Box<PreparedScanBatch>,
 }
 impl ReservedScanAttempt {
     #[must_use]
@@ -165,7 +165,7 @@ pub enum ScanBlocker {
 }
 #[derive(Debug)]
 pub enum ScanPreparation {
-    Ready(PreparedScanBatch),
+    Ready(Box<PreparedScanBatch>),
     Progress,
     Wait {
         reason: ScanBlocker,

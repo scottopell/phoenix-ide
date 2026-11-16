@@ -1,9 +1,13 @@
-use super::*;
+use super::{
+    InputOrigin, ScanCandidate, ScanFragment, ScanLane, ScanPosition, ScanRole,
+    TrackingDisposition, TrackingKind,
+};
 use crate::{Database, DbError, DbResult, MessageContent};
 use phoenix_core::domain::{
     llm_types::ContentBlock,
     product_conversation::{ProductConversationId, ProductConversationKind},
 };
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, Transaction};
 
@@ -11,7 +15,13 @@ pub(super) fn invalid(value: impl Into<String>) -> DbError {
     DbError::Serialization(value.into())
 }
 pub(super) fn hex(bytes: impl AsRef<[u8]>) -> String {
-    bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    {
+        use std::fmt::Write as _;
+        bytes.as_ref().iter().fold(String::new(), |mut text, byte| {
+            write!(text, "{byte:02x}").expect("String formatting cannot fail");
+            text
+        })
+    }
 }
 pub(super) fn hash(bytes: impl AsRef<[u8]>) -> String {
     hex(Sha256::digest(bytes.as_ref()))
@@ -180,8 +190,19 @@ pub(super) async fn capture_range(
                 for (ordinal, block) in blocks.into_iter().enumerate() {
                     match block {
                         ContentBlock::Text { text } => parts.push((ordinal, text)),
-                        other => {
-                            tracing::debug!(message_id=%message.message_id,block=?std::mem::discriminant(&other),"scanner excludes non-prose assistant block")
+                        other @ (ContentBlock::Image { .. }
+                        | ContentBlock::ToolUse { .. }
+                        | ContentBlock::ToolResult { .. }
+                        | ContentBlock::ServerToolUse { .. }
+                        | ContentBlock::ToolSearchToolResult { .. }
+                        | ContentBlock::WebSearchToolResult { .. }
+                        | ContentBlock::WebFetchToolResult { .. }
+                        | ContentBlock::CodeExecutionToolResult { .. }
+                        | ContentBlock::BashCodeExecutionToolResult { .. }
+                        | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+                        | ContentBlock::McpToolUse { .. }
+                        | ContentBlock::McpToolResult { .. }) => {
+                            tracing::debug!(message_id=%message.message_id,block=?std::mem::discriminant(&other),"scanner excludes non-prose assistant block");
                         }
                     }
                 }
@@ -231,7 +252,7 @@ pub(super) async fn capture_range(
                         0
                     }
                 }
-                _ => 0,
+                ScanPosition::Boundary { .. } | ScanPosition::Fragment { .. } => 0,
             };
             if offset >= text.len() {
                 continue;
@@ -254,7 +275,9 @@ pub(super) async fn capture_range(
                     }
                     *utf8_offset
                 }
-                _ => text.len(),
+                None | Some(ScanPosition::Boundary { .. } | ScanPosition::Fragment { .. }) => {
+                    text.len()
+                }
             };
             let mut fragment;
             loop {
@@ -279,7 +302,10 @@ pub(super) async fn capture_range(
                     utf8_end: stop,
                     complete_message: offset == 0 && stop == text.len() && parts.len() == 1,
                     prose_digest: digest.clone(),
-                    text: text[offset..stop].to_owned(),
+                    text: text
+                        .get(offset..stop)
+                        .ok_or_else(|| invalid("invalid UTF8 source fragment boundary"))?
+                        .to_owned(),
                 };
                 let mut trial = fragments.clone();
                 trial.push(fragment.clone());
@@ -295,7 +321,7 @@ pub(super) async fn capture_range(
                 }
                 stop = offset + remaining / 2;
                 while !text.is_char_boundary(stop) {
-                    stop -= 1
+                    stop -= 1;
                 }
             }
             end = ScanPosition::Fragment {
@@ -397,13 +423,26 @@ fn project_source(row: &sqlx::sqlite::SqliteRow) -> DbResult<ProseProjection> {
 
 fn clip(value: &str, limit: usize) -> DbResult<(String, bool)> {
     let mut end = value.len();
-    while encoded(&value[..end])?.len() > limit {
+    while encoded(
+        value
+            .get(..end)
+            .ok_or_else(|| invalid("invalid UTF8 candidate clip boundary"))?,
+    )?
+    .len()
+        > limit
+    {
         end = end.saturating_sub(1);
         while !value.is_char_boundary(end) {
-            end -= 1
+            end -= 1;
         }
     }
-    Ok((value[..end].to_owned(), end < value.len()))
+    Ok((
+        value
+            .get(..end)
+            .ok_or_else(|| invalid("invalid UTF8 candidate clip boundary"))?
+            .to_owned(),
+        end < value.len(),
+    ))
 }
 pub(super) async fn candidates(
     tx: &mut Transaction<'_, Sqlite>,
@@ -454,7 +493,7 @@ pub(super) async fn candidates(
             break;
         }
         if disposition == TrackingDisposition::Tracking {
-            included_active += 1
+            included_active += 1;
         }
     }
     let included_retired = out.len() - included_active;

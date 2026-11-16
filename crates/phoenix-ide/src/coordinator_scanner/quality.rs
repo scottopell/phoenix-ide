@@ -421,7 +421,7 @@ async fn fixture(
     }
     (source, aliases, event_aliases)
 }
-async fn prepare(db: &Database, profile: &ScanProfile, now: i64) -> PreparedScanBatch {
+async fn prepare(db: &Database, profile: &ScanProfile, now: i64) -> Box<PreparedScanBatch> {
     for _ in 0..4 {
         match db
             .prepare_coordinator_scan(Some(profile), now)

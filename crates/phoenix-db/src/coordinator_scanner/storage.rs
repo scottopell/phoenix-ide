@@ -1,4 +1,13 @@
-use super::{source::*, *};
+use super::{
+    source::{
+        advance, candidates, capture, capture_range, encoded, hash, hex, invalid, lane_name,
+        position, seq, topology,
+    },
+    PreparedScanBatch, ReservedScanAttempt, ScanBlocker, ScanContext, ScanCoveragePage,
+    ScanCoverageState, ScanCoverageSummary, ScanFailure, ScanFreshness, ScanInput, ScanLane,
+    ScanMemberCoverage, ScanMetrics, ScanPosition, ScanPreparation, ScanProfile, ScanReservation,
+    SCAN_MAX_INPUT_BYTES, SCAN_RETRY_BACKOFF_US,
+};
 use crate::{coordinator_tracking, workflow::LocalAuthorityResult, Database, DbResult};
 use sqlx::{Connection, Row, Sqlite, Transaction};
 
@@ -53,7 +62,7 @@ impl Database {
     /// Storage failures preserve the local authority classification.
     pub async fn reserve_coordinator_scan(
         &self,
-        batch: PreparedScanBatch,
+        batch: Box<PreparedScanBatch>,
         input_bytes: usize,
         now_us: i64,
     ) -> LocalAuthorityResult<DbResult<ScanReservation>> {
@@ -139,14 +148,14 @@ async fn prepare(
         .take(8)
         .collect::<Vec<_>>();
     if selected.is_empty() {
-        selected = members.iter().take(8).collect()
+        selected = members.iter().take(8).collect();
     }
     if let Some(head) = members.last() {
         if !selected
             .iter()
             .any(|m| m.conversation.id == head.conversation.id)
         {
-            selected.push(head)
+            selected.push(head);
         }
     }
     for member in &selected {
@@ -280,7 +289,7 @@ async fn prepare(
             {
                 return Err(invalid("scanner composed request exceeds input budget"));
             }
-            return Ok(ScanPreparation::Ready(PreparedScanBatch {
+            return Ok(ScanPreparation::Ready(Box::new(PreparedScanBatch {
                 input,
                 binding_id,
                 profile: profile.clone(),
@@ -289,7 +298,7 @@ async fn prepare(
                 frontier_revision,
                 source_digest: captured.source_digest,
                 owner_product_id: owner,
-            }));
+            })));
         }
     }
     if let Some((reason, next_at_us)) = waiting {
@@ -371,7 +380,7 @@ pub(super) async fn batch_current(
 }
 async fn reserve(
     tx: &mut Transaction<'_, Sqlite>,
-    batch: PreparedScanBatch,
+    batch: Box<PreparedScanBatch>,
     input_bytes: usize,
     now: i64,
 ) -> DbResult<ScanReservation> {
@@ -467,9 +476,11 @@ pub(super) async fn complete_attempt(
     let detail = failure.map(|(_, s)| {
         let mut end = s.len().min(1024);
         while !s.is_char_boundary(end) {
-            end -= 1
+            end -= 1;
         }
-        s[..end].to_owned()
+        s.get(..end)
+            .expect("validated UTF8 failure-detail boundary")
+            .to_owned()
     });
     let usage = metrics.usage.as_ref();
     let n = |v: u64| i64::try_from(v).map_err(|e| invalid(e.to_string()));
@@ -532,19 +543,19 @@ async fn coverage(
             let generation: i64 = row.try_get("generation")?;
             let live = position(row, ScanLane::Live)?;
             let historical = position(row, ScanLane::Historical)?;
-            let stale = generation != member.conversation.transcript_generation;
-            let live_pending = stale
+            let generation_changed = generation != member.conversation.transcript_generation;
+            let live_pending = generation_changed
                 || matches!(live, ScanPosition::Fragment { .. })
                 || seq(&live) < member.tail_sequence_id;
-            let historical_pending = stale || seq(&historical) > 0;
-            if stale {
-                summary.generation_stale_members += 1
+            let historical_pending = generation_changed || seq(&historical) > 0;
+            if generation_changed {
+                summary.generation_stale_members += 1;
             }
             if live_pending {
-                summary.pending_live_members += 1
+                summary.pending_live_members += 1;
             }
             if historical_pending {
-                summary.pending_historical_members += 1
+                summary.pending_historical_members += 1;
             }
             (
                 Some(generation),
@@ -552,7 +563,7 @@ async fn coverage(
                 Some(row.try_get("activation_boundary")?),
                 Some(live),
                 Some(historical),
-                if stale {
+                if generation_changed {
                     ScanCoverageState::GenerationStale
                 } else if live_pending || historical_pending {
                     ScanCoverageState::Incomplete

@@ -44,7 +44,7 @@ async fn message(db: &Database, source: &str, sequence: i64, text: &str, origin:
     .await
     .unwrap();
 }
-async fn prepare(db: &Database, now: i64) -> PreparedScanBatch {
+async fn prepare(db: &Database, now: i64) -> Box<PreparedScanBatch> {
     for _ in 0..20 {
         match db
             .prepare_coordinator_scan(Some(&profile()), now)
@@ -55,12 +55,14 @@ async fn prepare(db: &Database, now: i64) -> PreparedScanBatch {
         {
             ScanPreparation::Ready(batch) => return batch,
             ScanPreparation::Progress => {}
-            other => panic!("unexpected preparation: {other:?}"),
+            other @ (ScanPreparation::Wait { .. } | ScanPreparation::Idle) => {
+                panic!("unexpected preparation: {other:?}")
+            }
         }
     }
     panic!("preparation did not progress")
 }
-async fn reserve(db: &Database, batch: PreparedScanBatch, now: i64) -> ReservedScanAttempt {
+async fn reserve(db: &Database, batch: Box<PreparedScanBatch>, now: i64) -> ReservedScanAttempt {
     let bytes = serde_json::to_vec(batch.input()).unwrap().len() + 64;
     match db
         .reserve_coordinator_scan(batch, bytes, now)
@@ -70,7 +72,9 @@ async fn reserve(db: &Database, batch: PreparedScanBatch, now: i64) -> ReservedS
         .unwrap()
     {
         ScanReservation::Reserved(attempt) => attempt,
-        other => panic!("unexpected reservation: {other:?}"),
+        other @ (ScanReservation::Paused { .. } | ScanReservation::Conflict) => {
+            panic!("unexpected reservation: {other:?}")
+        }
     }
 }
 fn capture(batch: &PreparedScanBatch) -> ScanResult {
@@ -660,7 +664,9 @@ async fn scanner_budget_charges_crashes_and_keeps_partially_observed_usage() {
                     assert_eq!(count, 4);
                     return;
                 }
-                other => panic!("{other:?}"),
+                other @ (ScanPreparation::Progress
+                | ScanPreparation::Wait { .. }
+                | ScanPreparation::Idle) => panic!("{other:?}"),
             };
             let bytes = serde_json::to_vec(batch.input()).unwrap().len() + 64;
             match db
@@ -683,7 +689,9 @@ async fn scanner_budget_charges_crashes_and_keeps_partially_observed_usage() {
                     assert_eq!(count, 4);
                     return;
                 }
-                other => panic!("{other:?}"),
+                other @ (ScanReservation::Paused { .. } | ScanReservation::Conflict) => {
+                    panic!("{other:?}")
+                }
             }
         }
     }
@@ -1320,7 +1328,8 @@ async fn continue_head(db: &Database, source: &str) -> String {
     .unwrap();
     match db.continue_conversation(source).await.unwrap() {
         crate::ContinueOutcome::Created(next) => next.id,
-        other => panic!("{other:?}"),
+        other @ (crate::ContinueOutcome::AlreadyContinued(_)
+        | crate::ContinueOutcome::ParentNotContextExhausted { .. }) => panic!("{other:?}"),
     }
 }
 async fn drain_empty(db: &Database, now: &mut i64, append: Option<(&str, &str)>) {
@@ -1372,7 +1381,7 @@ async fn drain_empty(db: &Database, now: &mut i64, append: Option<(&str, &str)>)
                 next_at_us: Some(resume),
                 ..
             } => *now = resume,
-            other => panic!("{other:?}"),
+            other @ ScanPreparation::Wait { .. } => panic!("{other:?}"),
         }
     }
     panic!("bounded drain did not finish")
@@ -1399,7 +1408,7 @@ async fn scanner_restart_finds_old_generation_edit_without_append_across_two_con
                 "Please retain Cobalt.",
                 &InputOrigin::UserApi,
             )
-            .await
+            .await;
         } else {
             db.add_message_with_seq(
                 &format!("system-{sequence}"),
@@ -1459,7 +1468,7 @@ async fn scanner_restart_finds_old_generation_edit_without_append_across_two_con
                 captured = Some(created_item_ids[0].clone());
                 break;
             }
-            other => panic!("{other:?}"),
+            other @ (ScanPreparation::Wait { .. } | ScanPreparation::Idle) => panic!("{other:?}"),
         }
     }
     let item = captured.unwrap();
