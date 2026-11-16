@@ -284,7 +284,7 @@ fn native_close_retry_remaining_effects(
 fn close_safe_retry_effects(
     remaining_resources: &[CloseCleanupFailureResource],
 ) -> Result<Vec<CloseSafeRetryEffect>, String> {
-    let plan = remaining_resources
+    let mut plan = remaining_resources
         .iter()
         .map(|remaining| {
             if remaining.disposition == CloseCleanupResourceDisposition::Unknown
@@ -314,6 +314,9 @@ fn close_safe_retry_effects(
     {
         return Err("safe retry requires distinct exact remaining resources".into());
     }
+    // Proof/child identity order is not dispatch order. Establish dependencies
+    // before admission, which rejects work-scope teardown ahead of its resources.
+    plan.sort_by_key(close_safe_retry_effect_rank);
     Ok(plan)
 }
 
@@ -745,14 +748,18 @@ enum CloseSafeRetryTmuxError {
     PersistenceOrUncertain(String),
 }
 
-fn close_safe_retry_execution_order(plan: &[CloseSafeRetryEffect]) -> Vec<usize> {
-    let mut indices = (0..plan.len()).collect::<Vec<_>>();
-    indices.sort_by_key(|&index| match plan[index].resource.kind() {
+fn close_safe_retry_effect_rank(effect: &CloseSafeRetryEffect) -> u8 {
+    match effect.resource.kind() {
         RetiredResourceKind::TmuxServer => 0,
         RetiredResourceKind::Worktree => 1,
         RetiredResourceKind::WorkScope => 2,
         _ => 3,
-    });
+    }
+}
+
+fn close_safe_retry_execution_order(plan: &[CloseSafeRetryEffect]) -> Vec<usize> {
+    let mut indices = (0..plan.len()).collect::<Vec<_>>();
+    indices.sort_by_key(|&index| close_safe_retry_effect_rank(&plan[index]));
     indices
 }
 
@@ -8144,6 +8151,20 @@ mod tests {
             super::close_safe_retry_execution_order(&plan),
             vec![2, 1, 0]
         );
+        let remaining = plan
+            .iter()
+            .map(|effect| crate::db::CloseCleanupFailureResource {
+                scope: effect.scope.clone(),
+                resource: effect.resource.clone(),
+                disposition: crate::db::CloseCleanupResourceDisposition::Failed,
+            })
+            .collect::<Vec<_>>();
+        let admitted_plan = super::close_safe_retry_effects(&remaining).unwrap();
+        assert_eq!(admitted_plan, vec![plan[2].clone(), plan[1].clone(), plan[0].clone()]);
+        assert_eq!(
+            super::close_safe_retry_execution_order(&admitted_plan),
+            vec![0, 1, 2]
+        );
     }
 
     async fn assert_close_admission_fenced(
@@ -9862,15 +9883,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(assessment.original, original);
-        assert_eq!(assessment.remaining_effects.len(), 2);
-        assert!(assessment
-            .remaining_effects
-            .iter()
-            .any(|effect| effect.resource.kind() == super::RetiredResourceKind::Worktree));
-        assert!(assessment
-            .remaining_effects
-            .iter()
-            .any(|effect| effect.resource.kind() == super::RetiredResourceKind::WorkScope));
+        assert_eq!(
+            assessment
+                .remaining_effects
+                .iter()
+                .map(|effect| effect.resource.kind())
+                .collect::<Vec<_>>(),
+            vec![super::RetiredResourceKind::Worktree, super::RetiredResourceKind::WorkScope]
+        );
+        for effect in &assessment.remaining_effects {
+            assert!(original.resources.iter().any(|resource| {
+                resource.scope == effect.scope && resource.resource == effect.resource
+            }));
+        }
 
         let source_conversation = db
             .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
