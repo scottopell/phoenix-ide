@@ -316,6 +316,11 @@ mod live {
     }
     impl BoundedClient {
         fn admit(&self, request: &LlmRequest) -> Result<(), LlmError> {
+            use sha2::Digest;
+            let system_hash = format!(
+                "{:x}",
+                sha2::Sha256::digest(format!("{:?}", request.system).as_bytes())
+            );
             let calls = self.budget.calls.fetch_add(1, Ordering::SeqCst) + 1;
             let request_bytes = format!("{request:?}").len();
             let bytes = self
@@ -323,7 +328,7 @@ mod live {
                 .request_bytes
                 .fetch_add(request_bytes, Ordering::SeqCst)
                 + request_bytes;
-            eprintln!("tracking_eval_request model={} attempt={calls} effort={:?} route={:?} max_output={} debug_request_bytes={request_bytes}",self.model,request.effective_effort,self.inner.diagnostic_route().0,request.max_tokens);
+            eprintln!("tracking_eval_request model={} attempt={calls} effort={:?} route={:?} max_output={} system_debug_sha256={system_hash} debug_request_bytes={request_bytes}",self.model,request.effective_effort,self.inner.diagnostic_route().0,request.max_tokens);
             if calls > 15 || bytes > 2_000_000 || request.max_tokens > 2048 {
                 return Err(LlmError::invalid_request(
                     "tracking evaluation budget exhausted",
@@ -988,6 +993,24 @@ mod live {
             recovered.contains("Cobalt"),
             "due forgotten request returns without user naming it: {recovered}"
         );
+        let state = db.get_conversation(&successor.id).await.unwrap().state;
+        if matches!(state, ConvState::Idle)
+            && budget.calls.load(Ordering::SeqCst) < 14
+            && budget.request_bytes.load(Ordering::SeqCst) < 1_750_000
+        {
+            let calls_before = fixture.calls.lock().unwrap().len();
+            let quiet = fixture.turn(&successor.id, "What is 5+6?").await;
+            assert!(quiet.contains("11"));
+            assert!(!quiet.contains("Cobalt") && !quiet.contains("Orchard"));
+            assert_eq!(
+                fixture.calls.lock().unwrap().len(),
+                calls_before,
+                "historical cue must not cause another review"
+            );
+            eprintln!("tracking_eval_post_due_quiet passed");
+        } else {
+            eprintln!("tracking_eval_post_due_quiet not_run state={state:?} calls={} request_debug_bytes={}",budget.calls.load(Ordering::SeqCst),budget.request_bytes.load(Ordering::SeqCst));
+        }
         let denied = fixture.denied.lock().unwrap().clone();
         assert!(
             denied.is_empty(),

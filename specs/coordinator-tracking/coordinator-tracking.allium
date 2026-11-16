@@ -206,6 +206,11 @@ rule SurfaceDueRequest {
         -- ties. Surfacing never changes reviewed_at_us or reviewed_evidence_ordinal.
         -- Contextual foreground inspection shares this cue budget. A cue applies
         -- only after its owning input; a later input makes it historical.
+        -- After handling the current request, inspect the selected item through one
+        -- bounded read and reconcile new evidence. Advance only a permitted step,
+        -- preserve/record a concrete wait or restriction, or finish quietly when no
+        -- useful action exists. This host review instruction is not a new user
+        -- commission, execution permission, mandatory recital or worker nudge.
         -- No eligible item means no recital, redundant worker nudge or new wakeup.
 }
 
