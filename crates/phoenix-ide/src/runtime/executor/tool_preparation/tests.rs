@@ -191,10 +191,19 @@ async fn stale_clear_deny_and_read_error_cannot_touch_same_id_successor() {
         let mut runtime = runtime_for(original.clone()).await;
         selected(&mut runtime, "original", &original);
         let (entered, release) = runtime.storage.hold_next_tool_policy_read();
+        if disposition == "error" {
+            let owner = runtime.fatal_local_authority_fence.try_acquire().unwrap();
+            runtime.required_settlement_authority =
+                Some(super::super::RequiredSettlementScope::new(
+                    owner,
+                    super::super::RequiredSettlementBoundary::Tool,
+                ));
+        }
         runtime
             .execute_effect(Effect::ExecuteTool { tool: original })
             .await
             .unwrap();
+        runtime.required_settlement_authority = None;
         let mut pending = runtime.tool_preparation.take().unwrap();
         let observation = async {
             let observation = pending.observe();
@@ -231,6 +240,7 @@ async fn stale_clear_deny_and_read_error_cannot_touch_same_id_successor() {
         assert_eq!(runtime.tool_execution.generation(), generation);
         assert!(runtime.tool_executor.recorded_executions().is_empty());
         assert!(runtime.storage.recorded_messages().is_empty());
+        assert!(!runtime.fatal_local_authority_fence.is_closed());
         runtime.abort_external_effects_in_memory();
     }
 }

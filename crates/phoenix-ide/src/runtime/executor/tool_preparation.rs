@@ -71,7 +71,23 @@ type PreparationFuture = Pin<Box<dyn Future<Output = Result<PreparedTool, String
 
 pub(super) struct ToolPreparation {
     selection: Arc<DispatchSelection>,
+    failure_boundary: PreparationFailureBoundary,
     phase: PreparationPhase,
+}
+
+#[derive(Clone, Copy)]
+enum PreparationFailureBoundary {
+    Caller,
+    Required(super::RequiredSettlementBoundary),
+}
+
+impl PreparationFailureBoundary {
+    fn settle_executor_failure(self, fence: &crate::runtime::FatalLocalAuthorityFence) {
+        match self {
+            Self::Caller => {}
+            Self::Required(boundary) => fence.close(boundary.settlement()),
+        }
+    }
 }
 
 enum PreparationPhase {
@@ -134,6 +150,12 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             context: self.context.clone(),
             direct_turn: self.active_direct_turn.as_deref().cloned(),
         });
+        let failure_boundary = self
+            .required_settlement_authority
+            .as_ref()
+            .map_or(PreparationFailureBoundary::Caller, |scope| {
+                PreparationFailureBoundary::Required(scope.boundary)
+            });
         let storage = self.storage.clone();
         let executor = self.tool_executor.clone();
         let surface = if selection.context.is_sub_agent && self.grace_turn_granted {
@@ -160,6 +182,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         );
         self.tool_preparation = Some(ToolPreparation {
             selection,
+            failure_boundary,
             phase: PreparationPhase::Reading(Mutex::new(Box::pin(read))),
         });
         Ok(None)
@@ -212,6 +235,9 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             }
             PreparationDisposition::Ready(Ok(prepared)) => prepared,
             PreparationDisposition::Ready(Err(error)) => {
+                pending
+                    .failure_boundary
+                    .settle_executor_failure(&self.fatal_local_authority_fence);
                 pending.phase = PreparationPhase::NoRead;
                 self.tool_preparation = Some(pending);
                 return Err(error);
