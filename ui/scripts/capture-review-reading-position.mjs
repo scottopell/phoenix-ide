@@ -366,7 +366,22 @@ try {
           return [...content.querySelectorAll('p')].find(p => p.getBoundingClientRect().top >= box.top && p.getBoundingClientRect().bottom <= box.bottom)?.querySelector('.annotatable__btn')?.getAttribute('aria-label');
         }) : 'Add note to line 1';
         assert(lineAction, 'Annotation action must belong to a visible paragraph');
-        await viewer.getByRole('button', { name: lineAction, exact: true }).click({ force: true });
+        if (idleAudit && width === 390) {
+          const point = await viewer.locator('.annotatable').filter({ has: page.locator(`button[aria-label=${JSON.stringify(lineAction)}]`) }).evaluate(block => {
+            const rect = block.getBoundingClientRect();
+            return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+          });
+          const touch = await context.newCDPSession(page);
+          try {
+            await touch.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [point] });
+            await page.locator('.annotation-dialog-input').waitFor({ state: 'visible' });
+          } finally {
+            await touch.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+            await touch.detach();
+          }
+        } else {
+          await viewer.getByRole('button', { name: lineAction, exact: true }).click({ force: true });
+        }
         const note = `reading-position-note-${id}`;
         await page.locator('.annotation-dialog-input').fill(note);
         if (idleAudit) {
