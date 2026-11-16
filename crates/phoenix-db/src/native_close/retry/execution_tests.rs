@@ -19,6 +19,7 @@ async fn generic_resource_failure_still_terminalizes_and_replays_non_native_retr
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn native_retry_worktree_metadata_is_source_bound_to_pending_original_g1_effect() {
     let (db, assessment, receipt) = native_resource_failure_fixture().await;
     let effect = assessment.request.remaining_effects.iter()

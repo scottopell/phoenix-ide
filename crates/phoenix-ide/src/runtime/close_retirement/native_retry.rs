@@ -83,15 +83,15 @@ impl super::RuntimeManager {
             match effect.resource.kind() {
                 RetiredResourceKind::TmuxServer => {
                     self.native_retry_tmux(command, admitted, &context, effect)
-                        .await?
+                        .await?;
                 }
                 RetiredResourceKind::Worktree => {
                     self.native_retry_worktree(command, admitted, &context, &run, effect)
-                        .await?
+                        .await?;
                 }
                 RetiredResourceKind::WorkScope => {
                     self.native_retry_scope(command, admitted, &context, effect)
-                        .await?
+                        .await?;
                 }
                 _ => {
                     return self
@@ -121,6 +121,7 @@ impl super::RuntimeManager {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn native_retry_tmux(
         &self,
         command: &NativeCloseCommand,
@@ -376,9 +377,7 @@ impl super::RuntimeManager {
                 super::exact_worktree_administrative_dir(inspection_path, &common)?;
             let administrative_dir_incarnation =
                 super::observe_administrative_dir_incarnation(&administrative_dir)?;
-            self.native_retry_metadata(
-                command,
-                admitted,
+            Self::native_retry_metadata(
                 self.db()
                     .record_native_close_retry_worktree_cleanup_plan(
                         command,
@@ -570,9 +569,6 @@ impl super::RuntimeManager {
     }
 
     fn native_retry_metadata(
-        &self,
-        _command: &NativeCloseCommand,
-        _admitted: &NativeCloseRunRef,
         result: LocalAuthorityResult<crate::db::DbResult<()>>,
     ) -> Result<(), NativeRetryExecutionError> {
         match result {
