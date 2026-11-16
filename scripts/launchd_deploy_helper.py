@@ -304,9 +304,11 @@ class Launchctl:
                 raise ActivationError(f"timed out waiting for launchd {description}; state={observed[0]} pid={observed[1]}")
             time.sleep(0.1)
 
-    def stop(self) -> int | None:
+    def stop(self, *, expected_pid: int | None = None) -> int | None:
         state, old_pid = self.inspect()
         if state != "not_loaded":
+            if expected_pid is not None and old_pid != expected_pid:
+                raise ActivationError(f"recovery target changed before bootout: {state} pid={old_pid}")
             result = self.run(["launchctl", "bootout", self.target], capture_output=True, text=True, timeout=10)
             if result.returncode != 0:
                 raise ActivationError(f"launchctl bootout failed with exit {result.returncode}")
@@ -374,7 +376,7 @@ def _database_size_bytes(database_path: str) -> int:
     if not path.is_absolute() or path.is_symlink() or not path.is_file():
         raise ActivationError("configured production database must be an existing regular file")
     try:
-        with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5) as database:
+        with sqlite3.connect(f"{path.absolute().as_uri()}?mode=ro", uri=True, timeout=5) as database:
             page_count = database.execute("PRAGMA page_count").fetchone()[0]
             page_size = database.execute("PRAGMA page_size").fetchone()[0]
     except (sqlite3.Error, OSError, TypeError) as exc:
@@ -413,7 +415,7 @@ def sqlite_writer_guard(database_path: str, *, timeout: float = 5):
 
     # A separate read/write connection reserves the writer slot while the native
     # backup reads through its own read-only connection.
-    with contextlib.closing(sqlite3.connect(f"file:{Path(database_path)}?mode=rw", uri=True,
+    with contextlib.closing(sqlite3.connect(f"{Path(database_path).absolute().as_uri()}?mode=rw", uri=True,
                                             timeout=timeout)) as guard:
         guard.execute(f"PRAGMA busy_timeout={max(1, int(timeout * 1000))}")
         guard.execute("BEGIN IMMEDIATE")
@@ -443,7 +445,7 @@ def create_verified_database_backup(database_path: str, directory: Path, *, time
 
     try:
         os.chmod(backup_path, 0o600)
-        with contextlib.closing(sqlite3.connect(f"file:{source_path}?mode=ro", uri=True, timeout=remaining())) as source:
+        with contextlib.closing(sqlite3.connect(f"{source_path.absolute().as_uri()}?mode=ro", uri=True, timeout=remaining())) as source:
             source.execute(f"PRAGMA busy_timeout={max(1, min(100, int(remaining() * 1000)))}")
             source.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, 1000)
             with contextlib.closing(sqlite3.connect(backup_path, timeout=remaining())) as backup:
@@ -583,17 +585,16 @@ def restore_predecessor(manifest: Manifest, launchctl: "Launchctl", captured: di
     if not predecessor_unchanged(manifest, captured):
         raise ActivationError("predecessor recovery uncertain: captured binary or plist identity changed")
     identity = Identity(**captured["identity"])
+    recovered_pid = None
     try:
-        recovered_pid = launchctl.start(captured["pid"], plist_path=str(previous_plist))
+        atomic_write(Path(manifest.target_plist), previous_plist.read_bytes(), 0o600)
+        recovered_pid = launchctl.start(captured["pid"], plist_path=manifest.target_plist)
         wait_for_identity(manifest, identity)
         observed_state, observed_pid = launchctl.inspect()
         if observed_state not in {"running", "active"} or observed_pid != recovered_pid:
             raise ActivationError("recovered PID changed during verification")
-        # Persist recovery verification before publishing the canonical service plist.
-        write_proof(manifest, recovery_outcome="predecessor_verified_private",
+        write_proof(manifest, recovery_outcome="predecessor_recovered_verified",
                     predecessor_verified=True, recovered_pid=recovered_pid)
-        atomic_write(Path(manifest.target_plist), previous_plist.read_bytes(), 0o600)
-        write_proof(manifest, recovery_outcome="predecessor_recovered_verified")
         previous_plist.unlink()
         fsync_dir(previous_plist.parent)
         return recovered_pid
@@ -602,9 +603,9 @@ def restore_predecessor(manifest: Manifest, launchctl: "Launchctl", captured: di
         try:
             state, pid = launchctl.inspect()
             if state != "not_loaded":
-                if pid != locals().get("recovered_pid"):
+                if recovered_pid is None or pid != recovered_pid or pid == captured["pid"]:
                     raise ActivationError(f"recovery target changed before teardown: {state} pid={pid}")
-                launchctl.stop()
+                launchctl.stop(expected_pid=recovered_pid)
             stopped_state, stopped_pid = launchctl.inspect()
             if stopped_state != "not_loaded" or stopped_pid is not None:
                 raise ActivationError(f"recovery process remains loaded as {stopped_state} pid={stopped_pid}")

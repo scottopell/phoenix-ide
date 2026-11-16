@@ -118,8 +118,8 @@ value TargetService {
 --   candidate migration was attempted; missing or ambiguous proof is insufficient.
 -- predecessor_recovery_proven(transaction) -> Boolean
 --   Captured predecessor PID is gone, target absent, binary/plist unchanged,
---   and a new stable PID serves the exact predecessor identity after private
---   startup and canonical publication.
+--   and a new stable PID serves the exact predecessor identity after durable
+--   canonical publication and bootstrap from that same canonical path.
 -- deployment_without_schema_controller(transaction) -> Boolean
 --   Backup verification is permitted; migration registry parsing, schema-specific
 --   upgrade admission and rehearsal are not. No automatic database restore.
@@ -300,8 +300,9 @@ rule RecoverUnchangedPredecessor {
     ensures: OnlyOwnedClaimReleased(transaction)
 
     @guidance
-        -- Privately bootstrap only the captured unchanged predecessor; verify
-        -- exact health identity and stable new PID before canonical publication.
+        -- Durably publish only the captured unchanged predecessor at its canonical
+        -- path, bootstrap that path, then verify exact health identity and stable PID.
+        -- The loaded plist must remain the same file normal restart validates.
         -- If any proof fails, retain quarantine and ownership for an operator.
 }
 
