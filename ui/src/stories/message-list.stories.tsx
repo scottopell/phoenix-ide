@@ -1,3 +1,4 @@
+import { FindFinalizationFixture } from '../fixtures/messageList/findFinalization';
 import type { Story } from '@ladle/react';
 import { MessageListFixture, getMessageListScenario, messageListScenarios } from '../fixtures/messageList';
 
@@ -40,3 +41,6 @@ MarkdownImageDark.storyName = 'markdown-image-dark';
 
 export const DelayedImageScroll = storyFor('delayed-image-scroll');
 DelayedImageScroll.storyName = 'delayed-image-scroll';
+
+export const FindIdenticalFinalization: Story = () => <FindFinalizationFixture />;
+FindIdenticalFinalization.storyName = 'find-identical-finalization';

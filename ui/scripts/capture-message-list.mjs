@@ -1,3 +1,4 @@
+import { captureFindFinalization } from './message-list-find-finalization.mjs';
 import { runSurfaceCapture } from './capture-ladle-surface.mjs';
 import { captureDelayedImages, prepareDelayedImages } from './message-list-delayed-image.mjs';
 import { writeFile } from 'node:fs/promises';
@@ -436,6 +437,7 @@ runSurfaceCapture({
   preparePage: prepareDelayedImages,
   captureStory: async (context) => (
     await captureDelayedImages(context)
+      || await captureFindFinalization(context)
       || await verifyWideTable(context)
       || await captureCompactChronology(context)
       || await verifyNarrowMarkdownTable(context)
