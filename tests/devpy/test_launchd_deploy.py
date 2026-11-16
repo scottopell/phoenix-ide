@@ -1179,7 +1179,7 @@ class PreparationTests(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, "unmocked subprocess"):
                     operation(command)
 
-    def staged_deploy(self, *, protocol="2", bootstrap_error=False):
+    def staged_deploy(self, *, protocol="3", bootstrap_error=False):
         root = self.dev.LAUNCHD_DEPLOY_DIR.parent
         binary = root / "built-candidate"
         binary.write_bytes(b"candidate bytes")
@@ -1208,7 +1208,7 @@ class PreparationTests(unittest.TestCase):
                     raise subprocess.CalledProcessError(5, command)
             return subprocess.CompletedProcess(command, 0, "", "")
         with mock.patch.object(self.dev, "_launchd_candidate_env", return_value=({"PHOENIX_PASSWORD": "fixture"}, None)), mock.patch.object(self.dev, "_prepare_local_candidate", return_value=candidate), mock.patch.object(self.dev, "_binary_identity", return_value=identity), mock.patch.object(self.dev, "capture_login_shell_path", return_value=("/usr/bin:/bin", "test")), mock.patch.object(self.dev, "print_launchd_path_report"), mock.patch.object(self.dev, "_materialize_helper", side_effect=materialize), mock.patch.object(self.dev, "_ensure_newsyslog_config"), mock.patch.object(self.dev.subprocess, "run", side_effect=run):
-            if protocol != "2":
+            if protocol != "3":
                 with self.assertRaisesRegex(SystemExit, "unsupported deployment helper protocol"):
                     self.dev.launchd_prod_deploy()
             elif bootstrap_error:
@@ -1222,10 +1222,10 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(1, len(transactions))
         return transactions[0], events
 
-    def test_installer_stages_only_protocol_two_ordinary_handoff(self):
+    def test_installer_stages_only_protocol_three_ordinary_handoff(self):
         staging, events = self.staged_deploy()
         manifest = json.loads((staging / "manifest.json").read_text())
-        self.assertEqual(2, manifest["manifest_version"])
+        self.assertEqual(3, manifest["manifest_version"])
         loaded = helper.Manifest.load(staging / "manifest.json")
         self.assertEqual("a" * 40, loaded.expected.git_sha)
         self.assertEqual(self.dev.LAUNCHD_DEPLOY_ACTIVE_PATH.read_text().strip(), manifest["transaction_id"])
@@ -1245,6 +1245,22 @@ class PreparationTests(unittest.TestCase):
         self.staged_deploy(bootstrap_error=True)
         self.assertTrue(self.dev.LAUNCHD_DEPLOY_ACTIVE_PATH.exists())
         self.assertEqual("prepared", json.loads(self.dev.LAUNCHD_DEPLOY_STATUS_PATH.read_text())["state"])
+
+    def test_verified_predecessor_recovery_status_does_not_claim_manual_recovery(self):
+        status = self.dev.LAUNCHD_DEPLOY_STATUS_PATH
+        status.parent.mkdir(parents=True)
+        status.write_text(json.dumps({"transaction_id": "failed", "state": "failed", "failure": "stop failed"}))
+        status.with_suffix(".proof.json").write_text(json.dumps({
+            "transaction_id": "failed", "recovery_outcome": "predecessor_recovered_verified",
+            "predecessor_verified": True, "boundary": "not_crossed",
+            "backup": {"backup_path": "/retained/db.sqlite", "backup_bytes": 4096, "backup_sha256": "abc"},
+        }))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.dev._print_launchd_deploy_status()
+        self.assertIn("privately bootstrapped and health/PID verified", output.getvalue())
+        self.assertIn("Verified backup: /retained/db.sqlite", output.getvalue())
+        self.assertNotIn("Manual recovery required", output.getvalue())
 
     def test_failed_status_reports_full_diagnostic_and_manual_recovery(self):
         status = self.dev.LAUNCHD_DEPLOY_STATUS_PATH

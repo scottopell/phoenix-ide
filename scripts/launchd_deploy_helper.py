@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""Independent launchd activation: prepare, stop, migrate, start, verify.
-
-The helper does not inspect application data or recover a failed deployment.
-Its immutable inputs and diagnostics remain available for manual recovery.
-"""
+"""Independent launchd activation with verified backup and bounded pre-migration recovery."""
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import datetime as dt
 import fcntl
@@ -26,7 +23,7 @@ import urllib.request
 from pathlib import Path
 from typing import Callable
 
-HANDOFF_PROTOCOL_VERSION = 2
+HANDOFF_PROTOCOL_VERSION = 3
 DEPLOY_HELPER_LABEL_PREFIX = "com.phoenix-ide.deploy"
 DEFAULT_TRANSITION_TIMEOUT_SECS = 30.0
 DEFAULT_HEALTH_TIMEOUT_SECS = 120.0
@@ -370,6 +367,297 @@ def warn_committed(message: str) -> None:
         pass
 
 
+def _database_size_bytes(database_path: str) -> int:
+    import sqlite3
+
+    path = Path(database_path)
+    if not path.is_absolute() or path.is_symlink() or not path.is_file():
+        raise ActivationError("configured production database must be an existing regular file")
+    try:
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5) as database:
+            page_count = database.execute("PRAGMA page_count").fetchone()[0]
+            page_size = database.execute("PRAGMA page_size").fetchone()[0]
+    except (sqlite3.Error, OSError, TypeError) as exc:
+        raise ActivationError(f"cannot inspect production database capacity: {exc}") from exc
+    if type(page_count) is not int or type(page_size) is not int or page_count < 0 or page_size <= 0:
+        raise ActivationError("production database returned invalid SQLite capacity")
+    return page_count * page_size
+
+
+def _logical_digest(database, deadline: float) -> str:
+    digest = hashlib.sha256()
+    database.set_progress_handler(
+        lambda: 1 if time.monotonic() >= deadline else 0, 1000,
+    )
+    try:
+        for line in database.iterdump():
+            if time.monotonic() >= deadline:
+                raise ActivationError("SQLite logical verification deadline exceeded")
+            encoded = line.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+    except Exception as exc:
+        if isinstance(exc, ActivationError):
+            raise
+        if time.monotonic() >= deadline:
+            raise ActivationError("SQLite logical verification deadline exceeded") from exc
+        raise
+    finally:
+        database.set_progress_handler(None, 0)
+    return digest.hexdigest()
+
+
+@contextlib.contextmanager
+def sqlite_writer_guard(database_path: str, *, timeout: float = 5):
+    import sqlite3
+
+    # A separate read/write connection reserves the writer slot while the native
+    # backup reads through its own read-only connection.
+    with contextlib.closing(sqlite3.connect(f"file:{Path(database_path)}?mode=rw", uri=True,
+                                            timeout=timeout)) as guard:
+        guard.execute(f"PRAGMA busy_timeout={max(1, int(timeout * 1000))}")
+        guard.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        finally:
+            guard.rollback()
+
+
+def create_verified_database_backup(database_path: str, directory: Path, *, timeout: float = 600) -> Path:
+    import sqlite3
+
+    source_path = Path(database_path)
+    deadline = time.monotonic() + timeout
+    fd, name = tempfile.mkstemp(prefix="database-backup-", suffix=".sqlite", dir=directory)
+    os.close(fd)
+    backup_path = Path(name)
+
+    def remaining() -> float:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise ActivationError("SQLite backup and verification deadline exceeded")
+        return left
+
+    def progress(_status: int, _remaining_pages: int, _total_pages: int) -> None:
+        remaining()
+
+    try:
+        os.chmod(backup_path, 0o600)
+        with contextlib.closing(sqlite3.connect(f"file:{source_path}?mode=ro", uri=True, timeout=remaining())) as source:
+            source.execute(f"PRAGMA busy_timeout={max(1, min(100, int(remaining() * 1000)))}")
+            source.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, 1000)
+            with contextlib.closing(sqlite3.connect(backup_path, timeout=remaining())) as backup:
+                backup.execute(f"PRAGMA busy_timeout={max(1, min(100, int(remaining() * 1000)))}")
+                backup.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, 1000)
+                source.backup(backup, pages=128, progress=progress, sleep=0.05)
+                remaining()
+                check = backup.execute("PRAGMA integrity_check").fetchone()
+                if time.monotonic() >= deadline:
+                    raise ActivationError("SQLite integrity verification deadline exceeded")
+                if check != ("ok",):
+                    raise ActivationError(f"SQLite backup integrity check failed: {check!r}")
+                if _logical_digest(source, deadline) != _logical_digest(backup, deadline):
+                    raise ActivationError("SQLite backup logical contents differ from the stopped source")
+        remaining()
+        fd = os.open(backup_path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        fsync_dir(directory)
+        return backup_path
+    except BaseException as exc:
+        backup_path.unlink(missing_ok=True)
+        if isinstance(exc, sqlite3.Error) and time.monotonic() >= deadline:
+            raise ActivationError("SQLite backup and verification deadline exceeded") from exc
+        raise
+
+
+def _first_install_capacity(database_path: str) -> int:
+    path = Path(database_path)
+    if not path.is_absolute() or os.path.lexists(path):
+        raise ActivationError("first-install database must still be absent")
+    if not path.parent.is_dir():
+        raise ActivationError("first-install database parent must be an existing directory")
+    reserve = 16 * 1024 * 1024
+    available = shutil.disk_usage(path.parent).free
+    if available < reserve:
+        raise ActivationError(
+            f"insufficient space for first-install database and deploy overhead: need {reserve} bytes, have {available}"
+        )
+    return reserve
+
+
+def _preflight_backup_capacity(database_path: str, directory: Path) -> int:
+    database_bytes = _database_size_bytes(database_path)
+    # Native backup may need one full DB copy; 16 MiB covers bounded status,
+    # service, journal, and filesystem metadata overhead without a size floor.
+    required = database_bytes + 16 * 1024 * 1024
+    available = shutil.disk_usage(directory).free
+    if available < required:
+        raise ActivationError(
+            f"insufficient space for verified SQLite backup and deploy overhead: need {required} bytes, have {available}"
+        )
+    return required
+
+
+def write_proof(manifest: Manifest, **fields) -> None:
+    path = Path(manifest.status_path).with_suffix(".proof.json")
+    previous = {}
+    if path.is_file() and not path.is_symlink():
+        try:
+            loaded = json.loads(path.read_text())
+            if loaded.get("transaction_id") == manifest.transaction_id:
+                previous = loaded
+        except (OSError, ValueError, AttributeError):
+            pass
+    previous.update({"transaction_id": manifest.transaction_id, "updated_at": utc_now(), **fields})
+    atomic_write(path, (json.dumps(previous, indent=2) + "\n").encode())
+
+
+def capture_predecessor(manifest: Manifest, launchctl: "Launchctl") -> dict | None:
+    try:
+        state, pid = launchctl.inspect()
+        if state not in {"running", "active"} or type(pid) is not int or pid <= 1:
+            return None
+        identity = fetch_identity(manifest.health_url, insecure_tls=manifest.health_insecure_tls)
+        if launchctl.inspect() != (state, pid):
+            return None
+        plist = Path(manifest.target_plist)
+        binary = Path(manifest.target_binary)
+        if (plist.is_symlink() or not plist.is_file() or binary.is_symlink() or not binary.is_file()):
+            return None
+        with plist.open("rb") as stream:
+            config = plistlib.load(stream)
+        if config.get("Label") != manifest.label or config.get("ProgramArguments") != [str(binary)]:
+            return None
+        embedded = subprocess.run([str(binary), "--build-identity"], capture_output=True, text=True, timeout=10)
+        if embedded.returncode != 0 or json.loads(embedded.stdout) != dataclasses.asdict(identity):
+            return None
+        if launchctl.inspect() != (state, pid):
+            return None
+        return {"pid": pid, "identity": dataclasses.asdict(identity),
+                "binary_sha256": sha256(binary), "plist_sha256": sha256(plist)}
+    except Exception:
+        return None
+
+
+def predecessor_unchanged(manifest: Manifest, captured: dict) -> bool:
+    try:
+        return (sha256(Path(manifest.target_binary)) == captured["binary_sha256"]
+                and sha256(Path(manifest.candidate_plist).parent / "previous.plist") == captured["plist_sha256"])
+    except (OSError, KeyError, TypeError):
+        return False
+
+
+def stop_captured_predecessor(launchctl: "Launchctl", observed: tuple[str, int | None]) -> bool:
+    state, pid = launchctl.inspect()
+    if (state, pid) != observed:
+        raise ActivationError(f"service changed before stop: captured={observed}, observed={(state, pid)}")
+    if state == "not_loaded":
+        return False
+    result = launchctl.run(["launchctl", "bootout", launchctl.target], capture_output=True, text=True, timeout=10)
+    if result.returncode != 0:
+        raise ActivationError(f"launchctl bootout failed with exit {result.returncode}")
+    launchctl.wait(lambda state, current: state == "not_loaded" and current is None,
+                   time.monotonic() + launchctl.manifest.transition_timeout_secs, "teardown")
+    return pid is not None and state in {"running", "active"}
+
+
+def _confirm_pid_gone(pid: int | None) -> bool:
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+def restore_predecessor(manifest: Manifest, launchctl: "Launchctl", captured: dict, previous_plist: Path) -> int:
+    state, pid = launchctl.inspect()
+    if state != "not_loaded" or pid is not None:
+        raise ActivationError(f"predecessor recovery uncertain: target is {state} pid={pid}")
+    if not predecessor_unchanged(manifest, captured):
+        raise ActivationError("predecessor recovery uncertain: captured binary or plist identity changed")
+    identity = Identity(**captured["identity"])
+    try:
+        recovered_pid = launchctl.start(captured["pid"], plist_path=str(previous_plist))
+        wait_for_identity(manifest, identity)
+        observed_state, observed_pid = launchctl.inspect()
+        if observed_state not in {"running", "active"} or observed_pid != recovered_pid:
+            raise ActivationError("recovered PID changed during verification")
+        # Persist recovery verification before publishing the canonical service plist.
+        write_proof(manifest, recovery_outcome="predecessor_verified_private",
+                    predecessor_verified=True, recovered_pid=recovered_pid)
+        atomic_write(Path(manifest.target_plist), previous_plist.read_bytes(), 0o600)
+        write_proof(manifest, recovery_outcome="predecessor_recovered_verified")
+        previous_plist.unlink()
+        fsync_dir(previous_plist.parent)
+        return recovered_pid
+    except Exception as exc:
+        teardown_error = None
+        try:
+            state, pid = launchctl.inspect()
+            if state != "not_loaded":
+                if pid != locals().get("recovered_pid"):
+                    raise ActivationError(f"recovery target changed before teardown: {state} pid={pid}")
+                launchctl.stop()
+            stopped_state, stopped_pid = launchctl.inspect()
+            if stopped_state != "not_loaded" or stopped_pid is not None:
+                raise ActivationError(f"recovery process remains loaded as {stopped_state} pid={stopped_pid}")
+        except Exception as stop_exc:
+            teardown_error = str(stop_exc)
+        quarantine_error = None
+        try:
+            canonical = Path(manifest.target_plist)
+            if os.path.lexists(canonical):
+                if not previous_plist.exists():
+                    os.replace(canonical, previous_plist)
+                    fsync_dir(canonical.parent)
+                    fsync_dir(previous_plist.parent)
+                else:
+                    canonical.unlink()
+                    fsync_dir(canonical.parent)
+        except Exception as quarantine_exc:
+            quarantine_error = str(quarantine_exc)
+        details = "; ".join(filter(None, (f"predecessor recovery uncertain: {exc}",
+                                        f"teardown uncertain: {teardown_error}" if teardown_error else None,
+                                        f"requarantine uncertain: {quarantine_error}" if quarantine_error else None)))
+        raise ActivationError(details) from exc
+
+
+def _backup_proof(path: Path, deadline: float) -> dict:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while True:
+            if time.monotonic() >= deadline:
+                raise ActivationError("SQLite backup and verification deadline exceeded during proof hashing")
+            block = stream.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    if time.monotonic() >= deadline:
+        raise ActivationError("SQLite backup and verification deadline exceeded during proof hashing")
+    return {"backup_path": str(path), "backup_bytes": path.stat().st_size,
+            "backup_sha256": digest.hexdigest()}
+
+
+def _reserve_before_boundary(database_path: str, directory: Path) -> int:
+    # Backup bytes are already durable and retained; only the residual bounded
+    # operational reserve remains to be checked at the irreversible boundary.
+    database_bytes = _database_size_bytes(database_path)
+    available = shutil.disk_usage(directory).free
+    reserve = 16 * 1024 * 1024 + min(database_bytes, 64 * 1024 * 1024)
+    if available < reserve:
+        raise ActivationError(
+            f"insufficient residual deploy space before migration boundary: need {reserve} bytes, have {available}"
+        )
+    return database_bytes + reserve
+
+
 def activate(manifest: Manifest) -> str:
     validate_manifest_identities(manifest)
     with Path(manifest.lock_path).open("a+") as lock:
@@ -386,10 +674,37 @@ def activate(manifest: Manifest) -> str:
         prepared: list[Path] = []
         disrupted = False
         publication_attempted = False
+        boundary_attempted = False
+        stop_confirmed = False
+        captured_stop = False
+        previous_plist: Path | None = None
+        old_pid: int | None = None
+        predecessor: dict | None = None
+        predecessor_recovered = False
+        backup: Path | None = None
         phase = "preparing"
         launchctl = Launchctl(manifest)
         try:
             environment = validate_pre_disruption_handoff(manifest)
+            database_path = environment["PHOENIX_DB_PATH"]
+            backup_directory = Path(manifest.candidate_binary).parent
+            source_absent = not os.path.lexists(database_path)
+            if source_absent:
+                _first_install_capacity(database_path)
+            else:
+                _preflight_backup_capacity(database_path, backup_directory)
+            predecessor = capture_predecessor(manifest, launchctl)
+            observed_service = launchctl.inspect()
+            if source_absent and (predecessor is not None or observed_service != ("not_loaded", None)
+                                  or os.path.lexists(manifest.target_binary)
+                                  or os.path.lexists(manifest.target_plist)):
+                raise ActivationError("missing production database with an existing predecessor or installation")
+            if predecessor is not None and (observed_service[0] not in {"running", "active"}
+                                            or observed_service[1] != predecessor["pid"]):
+                raise ActivationError("captured predecessor changed before stop")
+            write_proof(manifest, phase="preparing", predecessor=predecessor,
+                        recovery_eligible=predecessor is not None, boundary="not_crossed",
+                        database_source="absent" if source_absent else "existing")
             previous_plist = Path(manifest.candidate_plist).parent / "previous.plist"
             if os.path.lexists(previous_plist):
                 raise ActivationError("previous plist already exists; activation cannot be replayed")
@@ -405,10 +720,40 @@ def activate(manifest: Manifest) -> str:
                 os.replace(canonical, previous_plist)
                 fsync_dir(canonical.parent)
                 fsync_dir(previous_plist.parent)
-            old_pid = launchctl.stop()
+            captured_stop = stop_captured_predecessor(launchctl, observed_service)
+            stop_confirmed = True
+            old_pid = predecessor["pid"] if predecessor else None
+            if predecessor is not None:
+                captured_stop = (captured_stop and _confirm_pid_gone(predecessor["pid"])
+                                 and predecessor_unchanged(manifest, predecessor))
+            write_proof(manifest, phase="stopped", stop_confirmed=True,
+                        captured_pid=predecessor["pid"] if predecessor else None,
+                        captured_pid_gone=(captured_stop if predecessor else False))
+            if source_absent:
+                _first_install_capacity(database_path)
+                backup_proof = None
+                write_proof(manifest, phase="source_absent", backup=None)
+                phase = "migration_started"
+                _first_install_capacity(database_path)
+                boundary_attempted = True
+                write_proof(manifest, phase=phase, boundary="attempted", backup=None)
+                write_status(manifest, phase)
+            else:
+                _preflight_backup_capacity(database_path, backup_directory)
+                with sqlite_writer_guard(database_path):
+                    backup_deadline = time.monotonic() + 600
+                    backup = create_verified_database_backup(
+                        database_path, backup_directory, timeout=backup_deadline - time.monotonic(),
+                    )
+                    backup_proof = _backup_proof(backup, backup_deadline)
+                    write_proof(manifest, phase="backup_verified", backup=backup_proof)
+                    print(f"{manifest.transaction_id}: verified SQLite backup retained at {backup}", flush=True)
+                    phase = "migration_started"
+                    _reserve_before_boundary(database_path, backup_directory)
+                    boundary_attempted = True
+                    write_proof(manifest, phase=phase, boundary="attempted", backup=backup_proof)
+                    write_status(manifest, phase)
             commit_atomic_install(staged_binary, Path(manifest.target_binary))
-            phase = "migration_started"
-            write_status(manifest, phase)
             print(f"{manifest.transaction_id}: running candidate migrations (timeout {MIGRATION_TIMEOUT_SECS}s)", flush=True)
             migration = subprocess.run([manifest.candidate_binary, "--migrate-only"],
                                        env={**os.environ, **environment}, stdin=subprocess.DEVNULL,
@@ -429,10 +774,12 @@ def activate(manifest: Manifest) -> str:
             publication_attempted = True
             commit_atomic_install(staged_plist, canonical)
             atomic_write(Path(manifest.deployed_sha_path), (manifest.source_commit + "\n").encode())
+            write_proof(manifest, phase="candidate_verified", boundary="crossed", outcome="candidate_verified",
+                        candidate_pid=candidate_pid, backup=backup_proof)
             write_status(manifest, "committed")
         except Exception as exc:
             stop_failure = None
-            if disrupted:
+            if disrupted and boundary_attempted:
                 try:
                     launchctl.stop()
                 except Exception as stop_exc:
@@ -443,22 +790,70 @@ def activate(manifest: Manifest) -> str:
                         fsync_dir(Path(manifest.target_plist).parent)
                     except OSError as unlink_exc:
                         stop_failure = "; ".join(filter(None, (stop_failure, f"candidate plist removal failed: {unlink_exc}")))
+            elif disrupted and not boundary_attempted and not source_absent:
+                try:
+                    if (not stop_confirmed or not captured_stop or predecessor is None
+                            or previous_plist is None or not previous_plist.is_file()):
+                        raise ActivationError("predecessor recovery is uncertain: captured identity/stop proof unavailable")
+                    restore_predecessor(manifest, launchctl, predecessor, previous_plist)
+                    predecessor_recovered = True
+                except Exception as recovery_exc:
+                    stop_failure = "; ".join(filter(None, (
+                        stop_failure, f"predecessor recovery uncertainty: {recovery_exc}"
+                    )))
+                    try:
+                        write_proof(manifest, recovery_outcome="uncertain", recovery_uncertainty=str(recovery_exc),
+                                    quarantine_path=str(previous_plist) if previous_plist else None)
+                    except OSError as proof_exc:
+                        stop_failure += f"; recovery proof persistence failed: {proof_exc}"
             state = "failed" if disrupted else "precondition_failed"
             failure = f"{phase}: {exc}"
+            if predecessor_recovered:
+                failure += "; unchanged predecessor restored and exact identity verified"
             if stop_failure:
                 failure += f"; stopping failed: {stop_failure}"
-            write_status(manifest, state, failure=failure)
-            if not disrupted:
-                release_claim(manifest)
-            print(f"{manifest.transaction_id}: {failure}", file=sys.stderr, flush=True)
-            if disrupted:
-                print("Production requires manual recovery. The candidate may have changed the database; "
-                      "do not start an older binary without restoring its matching database. "
-                      "Inspect activation.log and the retained transaction.", file=sys.stderr, flush=True)
+            try:
+                write_proof(manifest, phase=phase, boundary="attempted" if boundary_attempted else "not_crossed",
+                            outcome="failed", failure=failure)
+            except OSError as proof_exc:
+                failure += f"; failure proof persistence failed: {proof_exc}"
+            status_durable = False
+            try:
+                write_status(manifest, state, failure=failure)
+                status_durable = True
+            except OSError as status_exc:
+                failure += f"; terminal status persistence failed: {status_exc}"
+            if status_durable and (not disrupted or predecessor_recovered):
+                try:
+                    release_claim(manifest)
+                except OSError as release_exc:
+                    failure += f"; claim release failed: {release_exc}"
+            try:
+                print(f"{manifest.transaction_id}: {failure}", file=sys.stderr, flush=True)
+            except (OSError, ValueError):
+                pass
+            if disrupted and not predecessor_recovered:
+                try:
+                    if stop_failure and "predecessor recovery uncertainty" in stop_failure:
+                        print(f"Predecessor recovery is uncertain; quarantined plist retained at {previous_plist}. "
+                              "Do not publish or start it until the uncertainty is resolved.", file=sys.stderr, flush=True)
+                    else:
+                        print("Production requires manual recovery. The candidate may have changed the database; "
+                              "do not start an older binary without restoring its matching database. "
+                              "Inspect activation.log and the retained transaction.", file=sys.stderr, flush=True)
+                except (OSError, ValueError):
+                    pass
             return state
         finally:
             for path in prepared:
-                path.unlink(missing_ok=True)
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as cleanup_exc:
+                    try:
+                        print(f"{manifest.transaction_id}: staged artifact cleanup failed: {cleanup_exc}",
+                              file=sys.stderr, flush=True)
+                    except (OSError, ValueError):
+                        pass
         claim_released = False
         try:
             claim_released = release_claim(manifest)

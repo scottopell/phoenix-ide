@@ -23,6 +23,8 @@ SPEC.loader.exec_module(helper)
 class FakeLaunchctl:
     def __init__(self, manifest):
         self.manifest = manifest
+        self.target = f"gui/{manifest.uid}/{manifest.label}"
+        self.domain = f"gui/{manifest.uid}"
         self.pid = 41
         self.starts = []
         self.stops = 0
@@ -36,6 +38,17 @@ class FakeLaunchctl:
         with (Path(self.manifest.candidate_binary).parent / "events").open("a") as stream:
             stream.write("stop\n")
         return old
+
+    def run(self, command, **kwargs):
+        if command[:2] == ["launchctl", "bootout"]:
+            self.stop()
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    def wait(self, predicate, _deadline, _description):
+        observed = self.inspect()
+        if not predicate(*observed):
+            raise AssertionError(f"unexpected launchd state: {observed}")
+        return observed
 
     def start(self, old_pid, *, plist_path=None):
         self.starts.append(plist_path)
@@ -63,6 +76,7 @@ assert status["state"] == "migration_started"
 with Path(os.environ["TEST_EVENTS"]).open("a") as stream:
     stream.write("migrate\\n")
 with sqlite3.connect(os.environ["PHOENIX_DB_PATH"]) as db:
+    db.execute("CREATE TABLE IF NOT EXISTS changes(phase TEXT)")
     db.execute("INSERT INTO changes VALUES (?)", (status["state"],))
 if os.environ.get("FAIL_MIGRATION"):
     print("actual migration failure detail", file=sys.stderr, flush=True)
@@ -80,7 +94,7 @@ if os.environ.get("FAIL_MIGRATION"):
         }
         self.write_plist(candidate_plist)
         self.manifest = helper.Manifest(
-            manifest_version=2, transaction_id="unit-test", source_kind="local_head",
+            manifest_version=helper.HANDOFF_PROTOCOL_VERSION, transaction_id="unit-test", source_kind="local_head",
             source_commit="a" * 40, expected=helper.Identity("1.0", "a" * 40),
             candidate_binary=str(binary), candidate_binary_sha256=helper.sha256(binary),
             candidate_plist=str(candidate_plist), candidate_plist_sha256=helper.sha256(candidate_plist),
@@ -91,8 +105,14 @@ if os.environ.get("FAIL_MIGRATION"):
             deployed_sha_path=str(self.root / "deployed.sha"), lock_path=str(self.root / "activate.lock"),
             claim_lock_path=str(self.root / "claim.lock"), created_at=helper.utc_now(),
         )
-        Path(self.manifest.target_binary).write_bytes(b"previous binary")
-        Path(self.manifest.target_plist).write_bytes(b"previous plist")
+        self.previous_binary = f'''#!{sys.executable}
+import json, sys
+if sys.argv[1:] == ["--build-identity"]:
+    print(json.dumps({{"version": "0.9", "git_sha": "{'b' * 40}"}}))
+'''.encode()
+        Path(self.manifest.target_binary).write_bytes(self.previous_binary)
+        Path(self.manifest.target_binary).chmod(0o755)
+        Path(self.manifest.target_plist).write_bytes(Path(self.manifest.candidate_plist).read_bytes())
         Path(self.manifest.active_path).write_text(self.manifest.transaction_id)
         helper.write_status(self.manifest, "prepared")
         self.launch = FakeLaunchctl(self.manifest)
@@ -111,7 +131,9 @@ if os.environ.get("FAIL_MIGRATION"):
     def activate(self, health_error=None):
         with mock.patch.object(helper, "Launchctl", return_value=self.launch), mock.patch.object(
             helper, "wait_for_identity", side_effect=health_error,
-        ):
+        ), mock.patch.object(
+            helper, "fetch_identity", return_value=helper.Identity("0.9", "b" * 40),
+        ), mock.patch.object(helper, "_confirm_pid_gone", return_value=True):
             return helper.activate(self.manifest)
 
     def status(self):
@@ -124,12 +146,16 @@ if os.environ.get("FAIL_MIGRATION"):
     def test_success_invokes_migration_once_after_durable_checkpoint_and_stop(self):
         previous_binary = self.root / "previous-phoenix-ide"
         previous_binary.write_bytes(b"previous binary")
-        with mock.patch.object(sqlite3, "connect", side_effect=AssertionError("helper opened application DB")):
-            self.assertEqual(self.activate(), "committed")
+        self.assertEqual(self.activate(), "committed")
+        backups = list(self.root.glob("database-backup-*.sqlite"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
+        with sqlite3.connect(backups[0]) as backup:
+            self.assertEqual(backup.execute("PRAGMA integrity_check").fetchone(), ("ok",))
         self.assertEqual(self.changes(), [("migration_started",)])
         self.assertEqual((self.root / "events").read_text().splitlines(), ["stop", "migrate", "start"])
         self.assertEqual(self.launch.starts, [self.manifest.candidate_plist])
-        self.assertEqual((self.root / "previous.plist").read_bytes(), b"previous plist")
+        self.assertEqual((self.root / "previous.plist").read_bytes(), Path(self.manifest.candidate_plist).read_bytes())
         self.assertEqual(Path(self.manifest.target_plist).read_bytes(), Path(self.manifest.candidate_plist).read_bytes())
         self.assertTrue(Path(self.manifest.target_plist).samefile(self.manifest.candidate_plist))
         self.assertEqual(Path(self.manifest.target_plist).stat().st_mode & 0o777, 0o600)
@@ -138,6 +164,405 @@ if os.environ.get("FAIL_MIGRATION"):
         self.assertFalse(Path(self.manifest.candidate_binary).exists())
         self.assertFalse(previous_binary.exists())
         self.assertEqual(self.status()["state"], "committed")
+
+    def first_install(self):
+        self.database.unlink()
+        Path(self.manifest.target_binary).unlink()
+        Path(self.manifest.target_plist).unlink()
+        self.launch.pid = None
+
+    def test_first_install_missing_database_runs_candidate_without_backup(self):
+        self.first_install()
+        self.assertEqual(self.activate(), "committed")
+        self.assertEqual(self.changes(), [("migration_started",)])
+        self.assertEqual((self.root / "events").read_text().splitlines(), ["migrate", "start"])
+        self.assertEqual(list(self.root.glob("database-backup-*.sqlite")), [])
+        proof = json.loads((self.root / "status.proof.json").read_text())
+        self.assertEqual(proof["database_source"], "absent")
+        self.assertIsNone(proof["backup"])
+        self.assertEqual(proof["boundary"], "crossed")
+        self.assertFalse(proof["recovery_eligible"])
+
+    def test_missing_database_with_predecessor_rejects_before_disruption(self):
+        self.database.unlink()
+        self.assertEqual(self.activate(), "precondition_failed")
+        self.assertIn("existing predecessor", self.status()["failure"])
+        self.assertEqual(self.launch.stops, 0)
+        self.assertEqual(self.launch.starts, [])
+        self.assertFalse((self.root / "events").exists())
+        self.assertEqual(Path(self.manifest.target_binary).read_bytes(), self.previous_binary)
+
+    def test_missing_database_with_installed_artifacts_rejects_even_if_unloaded(self):
+        self.database.unlink()
+        self.launch.pid = None
+        self.assertEqual(self.activate(), "precondition_failed")
+        self.assertIn("existing predecessor or installation", self.status()["failure"])
+        self.assertFalse((self.root / "events").exists())
+
+    def test_symlink_database_cannot_be_treated_as_first_install(self):
+        self.first_install()
+        self.database.symlink_to(self.root / "missing-target.db")
+        self.assertEqual(self.activate(), "precondition_failed")
+        self.assertIn("existing regular file", self.status()["failure"])
+        self.assertFalse((self.root / "events").exists())
+        self.assertTrue(self.database.is_symlink())
+
+    def test_first_install_database_appearing_before_boundary_fails_without_candidate(self):
+        self.first_install()
+        check = helper._first_install_capacity
+        calls = 0
+
+        def appear_before_boundary(database_path):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                self.database.write_bytes(b"unexpected database")
+            return check(database_path)
+
+        with mock.patch.object(helper, "_first_install_capacity", side_effect=appear_before_boundary):
+            self.assertEqual(self.activate(), "failed")
+        self.assertEqual(calls, 3)
+        self.assertIn("must still be absent", self.status()["failure"])
+        self.assertEqual(list(self.root.glob("database-backup-*.sqlite")), [])
+        self.assertFalse((self.root / "events").exists())
+        self.assertFalse(Path(self.manifest.target_binary).exists())
+        proof = json.loads((self.root / "status.proof.json").read_text())
+        self.assertEqual(proof["database_source"], "absent")
+        self.assertIsNone(proof["backup"])
+        self.assertEqual(proof["boundary"], "not_crossed")
+
+    def test_first_install_space_reserve_uses_database_parent(self):
+        self.first_install()
+        usage = type("Usage", (), {"free": 16 * 1024 * 1024})()
+        with mock.patch.object(helper.shutil, "disk_usage", return_value=usage) as disk_usage:
+            self.assertEqual(helper._first_install_capacity(str(self.database)), 16 * 1024 * 1024)
+        disk_usage.assert_called_once_with(self.database.parent)
+
+    def test_first_install_insufficient_space_refuses_before_disruption(self):
+        self.first_install()
+        usage = type("Usage", (), {"free": 16 * 1024 * 1024 - 1})()
+        with mock.patch.object(helper.shutil, "disk_usage", return_value=usage):
+            self.assertEqual(self.activate(), "precondition_failed")
+        self.assertIn("insufficient space", self.status()["failure"])
+        self.assertFalse((self.root / "events").exists())
+
+    def test_first_install_requires_durable_boundary_before_candidate(self):
+        self.first_install()
+        actual = helper.write_status
+
+        def fail_boundary(manifest, state, **kwargs):
+            if state == "migration_started":
+                raise OSError("boundary status not durable")
+            return actual(manifest, state, **kwargs)
+
+        with mock.patch.object(helper, "write_status", side_effect=fail_boundary):
+            self.assertEqual(self.activate(), "failed")
+        self.assertEqual((self.root / "events").read_text().splitlines(), ["stop"])
+        self.assertFalse(Path(self.manifest.target_binary).exists())
+        self.assertTrue(Path(self.manifest.active_path).exists())
+        proof = json.loads((self.root / "status.proof.json").read_text())
+        self.assertEqual(proof["database_source"], "absent")
+        self.assertIsNone(proof["backup"])
+        self.assertEqual(proof["boundary"], "attempted")
+
+    def test_native_backup_includes_committed_wal_and_matches_logical_contents(self):
+        with sqlite3.connect(self.database) as database:
+            database.execute("PRAGMA journal_mode=WAL")
+            database.execute("INSERT INTO changes VALUES ('committed-in-wal')")
+        wal = Path(str(self.database) + "-wal")
+        self.assertTrue(wal.exists())
+        backup = helper.create_verified_database_backup(str(self.database), self.root)
+        with sqlite3.connect(backup) as database:
+            self.assertEqual(database.execute("PRAGMA integrity_check").fetchone(), ("ok",))
+            self.assertEqual(database.execute("SELECT phase FROM changes").fetchall(), [("committed-in-wal",)])
+
+    def test_large_database_backup_uses_streaming_logical_verification(self):
+        payload = b"z" * (8 * 1024 * 1024)
+        with sqlite3.connect(self.database) as database:
+            database.execute("CREATE TABLE large_payloads (id INTEGER PRIMARY KEY, data BLOB NOT NULL)")
+            database.executemany("INSERT INTO large_payloads(data) VALUES (?)", [(payload,) for _ in range(4)])
+        backup = helper.create_verified_database_backup(str(self.database), self.root, timeout=30)
+        with sqlite3.connect(backup) as database:
+            self.assertEqual(database.execute("SELECT count(*) FROM large_payloads").fetchone(), (4,))
+            self.assertEqual(database.execute("PRAGMA integrity_check").fetchone(), ("ok",))
+
+    def test_capacity_reserve_is_db_sized_not_an_arbitrary_large_floor(self):
+        size = helper._database_size_bytes(str(self.database))
+        available = 17 * 1024 * 1024
+        usage = type("Usage", (), {"free": available})()
+        with mock.patch.object(helper.shutil, "disk_usage", return_value=usage):
+            required = helper._preflight_backup_capacity(str(self.database), self.root)
+        self.assertEqual(required, size + 16 * 1024 * 1024)
+        self.assertLess(required, 1024 * 1024 * 1024)
+
+    def test_backup_and_verification_share_a_bounded_deadline(self):
+        with sqlite3.connect(self.database) as database:
+            database.execute("INSERT INTO changes VALUES (?)", ("x" * 2_000_000,))
+        started = helper.time.monotonic()
+        with self.assertRaisesRegex(helper.ActivationError, "deadline"):
+            helper.create_verified_database_backup(str(self.database), self.root, timeout=0.000001)
+        self.assertLess(helper.time.monotonic() - started, 1.0)
+        self.assertEqual(list(self.root.glob("database-backup-*.sqlite")), [])
+
+    def test_backup_busy_wait_obeys_deadline_and_leaves_no_partial_copy(self):
+        blocker = sqlite3.connect(self.database, timeout=0.1)
+        self.addCleanup(blocker.close)
+        blocker.execute("BEGIN EXCLUSIVE")
+        started = helper.time.monotonic()
+        try:
+            with self.assertRaises((helper.ActivationError, sqlite3.OperationalError)):
+                helper.create_verified_database_backup(str(self.database), self.root, timeout=0.15)
+        finally:
+            blocker.rollback()
+        self.assertLess(helper.time.monotonic() - started, 0.75)
+        self.assertEqual(list(self.root.glob("database-backup-*.sqlite")), [])
+
+    def test_backup_proof_hashing_obeys_the_backup_deadline(self):
+        backup = self.root / "large-backup.sqlite"
+        backup.write_bytes(b"z" * (4 * 1024 * 1024))
+        real_clock = helper.time.monotonic
+        ticks = iter((real_clock(), real_clock(), real_clock() + 10))
+        with mock.patch.object(helper.time, "monotonic", side_effect=lambda: next(ticks)):
+            with self.assertRaisesRegex(helper.ActivationError, "deadline exceeded during proof hashing"):
+                helper._backup_proof(backup, real_clock() + 1)
+
+    def test_writer_guard_blocks_competing_writer_until_migration_handoff(self):
+        original = helper._backup_proof
+        attempted = []
+
+        def compete(backup, deadline):
+            with sqlite3.connect(self.database, timeout=0.05) as writer:
+                writer.execute("PRAGMA busy_timeout=50")
+                with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                    writer.execute("INSERT INTO changes VALUES ('competing writer')")
+            attempted.append(True)
+            return original(backup, deadline)
+
+        with mock.patch.object(helper, "_backup_proof", side_effect=compete):
+            self.assertEqual(self.activate(), "committed")
+        self.assertEqual(attempted, [True])
+        self.assertEqual(self.changes(), [("migration_started",)])
+
+    def test_writer_guard_acquisition_is_bounded_before_boundary(self):
+        blocker = sqlite3.connect(self.database, timeout=0.05)
+        self.addCleanup(blocker.close)
+        blocker.execute("BEGIN IMMEDIATE")
+        started = helper.time.monotonic()
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                with helper.sqlite_writer_guard(str(self.database), timeout=0.05):
+                    self.fail("writer guard acquired despite competing reservation")
+        finally:
+            blocker.rollback()
+        self.assertLess(helper.time.monotonic() - started, 0.75)
+
+    def test_writer_guard_released_before_predecessor_recovery(self):
+        def failed_backup(*_args, **_kwargs):
+            with sqlite3.connect(self.database, timeout=0.05) as writer:
+                with self.assertRaises(sqlite3.OperationalError):
+                    writer.execute("INSERT INTO changes VALUES ('blocked')")
+            raise helper.ActivationError("backup failed")
+
+        def recover(_manifest, _launchctl, _captured, _previous_plist):
+            with sqlite3.connect(self.database, timeout=0.05) as writer:
+                writer.execute("INSERT INTO changes VALUES ('after guard release')")
+            return 99
+
+        with mock.patch.object(helper, "create_verified_database_backup", side_effect=failed_backup), \
+             mock.patch.object(helper, "restore_predecessor", side_effect=recover):
+            self.assertEqual(self.activate(), "failed")
+        self.assertEqual(self.changes(), [("after guard release",)])
+
+    def test_deploy_manifest_protocol_three_accepts_and_two_rejects(self):
+        raw = dataclasses.asdict(self.manifest)
+        raw["expected"] = dataclasses.asdict(self.manifest.expected)
+        path = self.root / "manifest.json"
+        raw["manifest_version"] = 3
+        path.write_text(json.dumps(raw))
+        self.assertEqual(helper.Manifest.load(path).manifest_version, 3)
+        raw["manifest_version"] = 2
+        path.write_text(json.dumps(raw))
+        with self.assertRaisesRegex(helper.ActivationError, "unsupported deployment manifest"):
+            helper.Manifest.load(path)
+
+    def test_success_records_durable_backup_proof(self):
+        self.assertEqual(self.activate(), "committed")
+        proof = json.loads((self.root / "status.proof.json").read_text())
+        self.assertEqual(proof["outcome"], "candidate_verified")
+        self.assertEqual(proof["backup"]["backup_sha256"], helper.sha256(Path(proof["backup"]["backup_path"])))
+        self.assertEqual(proof["boundary"], "crossed")
+
+    def test_unhealthy_predecessor_without_captured_identity_does_not_block_forward_repair(self):
+        with mock.patch.object(helper, "capture_predecessor", return_value=None):
+            self.assertEqual(self.activate(), "committed")
+        self.assertEqual(self.launch.pid, 99)
+        proof = json.loads((self.root / "status.proof.json").read_text())
+        self.assertFalse(proof["recovery_eligible"])
+        self.assertIsNone(proof["predecessor"])
+
+    def test_pre_stop_capacity_failure_preserves_predecessor_without_quarantine(self):
+        with mock.patch.object(helper, "_preflight_backup_capacity", side_effect=helper.ActivationError("no capacity")):
+            self.assertEqual(self.activate(), "precondition_failed")
+        self.assertEqual(self.launch.stops, 0)
+        self.assertEqual(self.launch.starts, [])
+        self.assertEqual(self.launch.pid, 41)
+        self.assertEqual(Path(self.manifest.target_binary).read_bytes(), self.previous_binary)
+        self.assertEqual(Path(self.manifest.target_plist).read_bytes(), Path(self.manifest.candidate_plist).read_bytes())
+
+    def test_post_stop_capacity_failure_restores_only_verified_absent_predecessor(self):
+        capacity = helper._preflight_backup_capacity
+        calls = 0
+        def fail_after_stop(database_path, directory):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise helper.ActivationError("capacity changed after stop")
+            return capacity(database_path, directory)
+        with mock.patch.object(helper, "_preflight_backup_capacity", side_effect=fail_after_stop):
+            self.assertEqual(self.activate(), "failed")
+        self.assertEqual(self.launch.starts, [str(self.root / "previous.plist")])
+        self.assertEqual(self.launch.pid, 99)
+        self.assertTrue(Path(self.manifest.target_plist).exists())
+        self.assertEqual(Path(self.manifest.target_binary).read_bytes(), self.previous_binary)
+        self.assertFalse(Path(self.manifest.active_path).exists())
+        self.assertIn("unchanged predecessor restored and exact identity verified", self.status()["failure"])
+
+    def test_recovery_publication_failure_stops_private_job_and_requarantines(self):
+        capacity = helper._preflight_backup_capacity
+        original_write = helper.atomic_write
+        calls = 0
+
+        def fail_after_stop(database_path, directory):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise helper.ActivationError("capacity changed after stop")
+            return capacity(database_path, directory)
+
+        def fail_canonical(path, data, mode=0o600):
+            if path == Path(self.manifest.target_plist):
+                raise OSError("cannot publish predecessor")
+            return original_write(path, data, mode)
+
+        with mock.patch.object(helper, "_preflight_backup_capacity", side_effect=fail_after_stop), mock.patch.object(
+            helper, "atomic_write", side_effect=fail_canonical,
+        ):
+            self.assertEqual(self.activate(), "failed")
+        self.assertEqual(self.launch.starts, [str(self.root / "previous.plist")])
+        self.assertIsNone(self.launch.pid)
+        self.assertFalse(Path(self.manifest.target_plist).exists())
+        self.assertTrue((self.root / "previous.plist").exists())
+        self.assertTrue(Path(self.manifest.active_path).exists())
+        proof = json.loads((self.root / "status.proof.json").read_text())
+        self.assertNotEqual(proof.get("recovery_outcome"), "predecessor_recovered_verified")
+        self.assertIn("recovery uncertainty", self.status()["failure"])
+
+    def test_untrusted_predecessor_does_not_block_forward_repair(self):
+        Path(self.manifest.target_binary).write_bytes(b"untrusted artifact")
+        self.assertEqual(self.activate(), "committed")
+        self.assertEqual(self.launch.stops, 1)
+        self.assertEqual(self.changes(), [("migration_started",)])
+        self.assertIsNone(json.loads((self.root / "status.proof.json").read_text())["predecessor"])
+
+    def test_boundary_write_ambiguity_never_starts_or_restores_predecessor(self):
+        actual = helper.write_status
+        def ambiguous(manifest, state, **kwargs):
+            if state == "migration_started":
+                actual(manifest, state, **kwargs)
+                raise OSError("directory fsync result ambiguous")
+            return actual(manifest, state, **kwargs)
+        with mock.patch.object(helper, "write_status", side_effect=ambiguous):
+            self.assertEqual(self.activate(), "failed")
+        self.assertEqual(self.launch.starts, [])
+        self.assertIsNone(self.launch.pid)
+        self.assertEqual(Path(self.manifest.target_binary).read_bytes(), self.previous_binary)
+        self.assertTrue(Path(self.manifest.active_path).exists())
+
+    def test_poststart_failure_proof_write_error_does_not_prevent_teardown(self):
+        original = helper.write_proof
+
+        def failed_proof(manifest, **fields):
+            if fields.get("outcome") == "failed":
+                raise OSError(28, "No space left on device")
+            return original(manifest, **fields)
+
+        with mock.patch.object(helper, "write_proof", side_effect=failed_proof):
+            self.assertEqual(self.activate(helper.ActivationError("unhealthy candidate")), "failed")
+        self.assertIsNone(self.launch.pid)
+        self.assertEqual(self.launch.stops, 2)
+        self.assertFalse(Path(self.manifest.target_plist).exists())
+        self.assertTrue(Path(self.manifest.active_path).exists())
+        self.assertIn("failure proof persistence failed", self.status()["failure"])
+
+    def test_poststart_terminal_status_failure_keeps_claim_after_candidate_stop(self):
+        actual = helper.write_status
+
+        def failed_status(manifest, state, **kwargs):
+            if state == "failed":
+                raise OSError(28, "No space left on device")
+            return actual(manifest, state, **kwargs)
+
+        with mock.patch.object(helper, "write_status", side_effect=failed_status):
+            self.assertEqual(self.activate(helper.ActivationError("unhealthy candidate")), "failed")
+        self.assertIsNone(self.launch.pid)
+        self.assertEqual(self.launch.stops, 2)
+        self.assertFalse(Path(self.manifest.target_plist).exists())
+        self.assertTrue(Path(self.manifest.active_path).exists())
+        self.assertEqual(self.status()["state"], "verifying")
+
+    def test_terminal_status_write_error_retains_claim_after_safe_recovery(self):
+        actual = helper.write_status
+
+        def failed_status(manifest, state, **kwargs):
+            if state == "failed":
+                raise OSError(28, "No space left on device")
+            return actual(manifest, state, **kwargs)
+
+        with mock.patch.object(helper, "_reserve_before_boundary", side_effect=helper.ActivationError("no reserve")), \
+             mock.patch.object(helper, "write_status", side_effect=failed_status):
+            self.assertEqual(self.activate(), "failed")
+        self.assertEqual(self.launch.starts, [str(self.root / "previous.plist")])
+        self.assertTrue(Path(self.manifest.active_path).exists())
+        self.assertEqual(self.status()["state"], "stopping")
+
+    def test_ambiguous_boundary_and_failure_persistence_errors_still_stop_candidate(self):
+        actual_status = helper.write_status
+        actual_proof = helper.write_proof
+
+        def ambiguous(manifest, state, **kwargs):
+            if state == "migration_started":
+                actual_status(manifest, state, **kwargs)
+                raise OSError("directory fsync result ambiguous")
+            if state == "failed":
+                raise OSError(28, "No space left on device")
+            return actual_status(manifest, state, **kwargs)
+
+        def failed_proof(manifest, **fields):
+            if fields.get("outcome") == "failed":
+                raise OSError(28, "No space left on device")
+            return actual_proof(manifest, **fields)
+
+        with mock.patch.object(helper, "write_status", side_effect=ambiguous), \
+             mock.patch.object(helper, "write_proof", side_effect=failed_proof):
+            self.assertEqual(self.activate(), "failed")
+        self.assertEqual(self.launch.starts, [])
+        self.assertIsNone(self.launch.pid)
+        self.assertTrue(Path(self.manifest.active_path).exists())
+        self.assertEqual(self.status()["state"], "migration_started")
+
+    def test_staged_cleanup_failure_does_not_override_failure_or_claim(self):
+        unlink = Path.unlink
+
+        def fail_staged_cleanup(path, *args, **kwargs):
+            if path.name.startswith(".installed.") and not path.name.startswith(".installed.plist."):
+                raise OSError("staged binary busy")
+            return unlink(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", autospec=True, side_effect=fail_staged_cleanup):
+            self.assertEqual(self.activate(helper.ActivationError("unhealthy candidate")), "failed")
+        self.assertIsNone(self.launch.pid)
+        self.assertEqual(self.status()["state"], "failed")
+        self.assertTrue(Path(self.manifest.active_path).exists())
 
     def test_success_cleanup_error_keeps_verified_runtime_running(self):
         candidate = Path(self.manifest.candidate_binary)
@@ -253,9 +678,24 @@ from pathlib import Path
 spec = importlib.util.spec_from_file_location("runner_helper", sys.argv[1])
 h = importlib.util.module_from_spec(spec); sys.modules[spec.name] = h; spec.loader.exec_module(h)
 class Launch:
-    def __init__(self, manifest): pass
-    def stop(self): return 41
+    def __init__(self, manifest):
+        self.manifest = manifest; self.pid = 41
+        self.target = f"gui/{manifest.uid}/{manifest.label}"
+        self.domain = f"gui/{manifest.uid}"
+    def inspect(self):
+        return ("running", self.pid) if self.pid is not None else ("not_loaded", None)
+    def wait(self, predicate, _deadline, _description):
+        state = self.inspect()
+        if not predicate(*state): raise RuntimeError(f"unexpected fake state: {state}")
+        return state
+    def run(self, command, **kwargs):
+        if command[:2] == ["launchctl", "bootout"]: self.pid = None
+        return h.subprocess.CompletedProcess(command, 0, "", "")
+    def stop(self):
+        old, self.pid = self.pid, None
+        return old
 h.Launchctl = Launch
+h.fetch_identity = lambda *args, **kwargs: h.Identity("0.9", "b" * 40)
 result = h.activate(h.Manifest.load(Path(sys.argv[2])))
 raise SystemExit(0 if result == "committed" else 1)
 '''
@@ -293,8 +733,8 @@ raise SystemExit(0 if result == "committed" else 1)
         self.assertEqual(self.activate(), "precondition_failed")
         self.assertEqual(self.launch.stops, 0)
         self.assertEqual(self.launch.pid, 41)
-        self.assertEqual(Path(self.manifest.target_binary).read_bytes(), b"previous binary")
-        self.assertEqual(Path(self.manifest.target_plist).read_bytes(), b"previous plist")
+        self.assertEqual(Path(self.manifest.target_binary).read_bytes(), self.previous_binary)
+        self.assertEqual(Path(self.manifest.target_plist).read_bytes(), Path(self.manifest.candidate_plist).read_bytes())
         self.assertFalse(Path(self.manifest.active_path).exists())
         self.assertEqual(self.changes(), [])
 
@@ -302,7 +742,7 @@ raise SystemExit(0 if result == "committed" else 1)
         with mock.patch.object(helper, "prepare_atomic_install", side_effect=OSError("no space")):
             self.assertEqual(self.activate(), "precondition_failed")
         self.assertEqual(self.launch.stops, 0)
-        self.assertEqual(Path(self.manifest.target_plist).read_bytes(), b"previous plist")
+        self.assertEqual(Path(self.manifest.target_plist).read_bytes(), Path(self.manifest.candidate_plist).read_bytes())
 
     def test_wrong_embedded_identity_is_refused_before_stop(self):
         expected = helper.Identity("different-version", "a" * 40)
@@ -338,7 +778,8 @@ raise SystemExit(0 if result == "committed" else 1)
         def health(_manifest):
             self.launch.pid = 100
         with mock.patch.object(helper, "Launchctl", return_value=self.launch), \
-             mock.patch.object(helper, "wait_for_identity", side_effect=health):
+             mock.patch.object(helper, "wait_for_identity", side_effect=health), \
+             mock.patch.object(helper, "fetch_identity", return_value=helper.Identity("0.9", "b" * 40)):
             self.assertEqual(helper.activate(self.manifest), "failed")
         self.assertIsNone(self.launch.pid)
         self.assertIn("PID changed", self.status()["failure"])
